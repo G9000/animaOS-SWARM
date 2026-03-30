@@ -23,7 +23,7 @@
     "@animaOS-SWARM/swarm": "workspace:*",
     "@animaOS-SWARM/tui": "workspace:*",
     "commander": "^14.0.3",
-    "ink": "^5.2.0",
+    "ink": "^6.8.0",
     "react": "^19.0.0",
     "tslib": "^2.3.0"
   },

@@ -19,7 +19,7 @@
     "build": "tsc --build tsconfig.lib.json"
   },
   "dependencies": {
-    "ink": "^5.2.0",
+    "ink": "^6.8.0",
     "react": "^19.0.0",
     "@animaOS-SWARM/core": "workspace:*",
     "@animaOS-SWARM/swarm": "workspace:*",
