@@ -251,6 +251,21 @@ export function useEventLog({
       ),
     )
 
+    // agent:tokens
+    unsubs.push(
+      eventBus.on<{ agentId: string; usage: { totalTokens: number } }>(
+        "agent:tokens",
+        (evt: Event<{ agentId: string; usage: { totalTokens: number } }>) => {
+          const { agentId, usage } = evt.data
+          setAgents((prev) =>
+            prev.map((a) =>
+              a.id === agentId ? { ...a, tokens: usage.totalTokens } : a,
+            ),
+          )
+        },
+      ),
+    )
+
     // agent:terminated
     unsubs.push(
       eventBus.on<{ agentId: string }>(

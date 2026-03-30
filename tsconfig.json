@@ -29,6 +29,9 @@
     },
     {
       "path": "./apps/ui"
+    },
+    {
+      "path": "./packages/tui"
     }
   ]
 }

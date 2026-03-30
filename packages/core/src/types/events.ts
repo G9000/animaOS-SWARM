@@ -10,6 +10,7 @@ export type EventType =
 	| "task:failed"
 	| "tool:before"
 	| "tool:after"
+	| "agent:tokens"
 	| "swarm:created"
 	| "swarm:completed"
 

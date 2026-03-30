@@ -212,6 +212,11 @@ export class AgentRuntime implements IAgentRuntime {
 		this.state.tokenUsage.completionTokens += result.usage.completionTokens
 		this.state.tokenUsage.totalTokens += result.usage.totalTokens
 
+		await this.eventBus.emit("agent:tokens", {
+			agentId: this.agentId,
+			usage: { ...this.state.tokenUsage },
+		}, this.agentId)
+
 		return result
 	}
 
