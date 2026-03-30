@@ -80,5 +80,5 @@ export {
 	globAction,
 	listDirAction,
 	multiEditAction,
-	allToolActions,
+	ALL_TOOL_ACTIONS,
 } from "@animaOS-SWARM/tools"
