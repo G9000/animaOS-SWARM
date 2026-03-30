@@ -1,107 +1,122 @@
-# New Nx Repository
+# animaOS-SWARM
 
-<a alt="Nx logo" href="https://nx.dev" target="_blank" rel="noreferrer"><img src="https://raw.githubusercontent.com/nrwl/nx/master/images/nx-logo.png" width="45"></a>
+Agent swarm framework. Command and control your AI agents -- spawn, coordinate, and manage swarms that get things done.
 
-✨ Your new, shiny [Nx workspace](https://nx.dev) is ready ✨.
+## Features
 
-[Learn more about this workspace setup and its capabilities](https://nx.dev/nx-api/js?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or run `npx nx graph` to visually explore what was created. Now, let's get you up to speed!
-## Finish your Nx platform setup
+- **Agent Runtime** -- LLM loop with tool calling, token tracking, and plugin registration
+- **Swarm Coordination** -- Supervisor, dynamic, and round-robin strategies
+- **Agent-to-Agent Communication** -- Direct messaging, broadcast, dynamic spawning
+- **Plugin System** -- Action / Provider / Evaluator pattern
+- **Model Agnostic** -- OpenAI, Anthropic, Ollama adapters included
+- **BM25 Search** -- Task history and document retrieval with zero token cost
+- **Built-in Tools** -- bash, read, write, edit, grep, glob, process manager
 
-🚀 [Finish setting up your workspace](https://cloud.nx.app/connect/b8Hy4BkQcR) to get faster builds with remote caching, distributed task execution, and self-healing CI. [Learn more about Nx Cloud](https://nx.dev/ci/intro/why-nx-cloud).
-
-## Generate a library
-
-```sh
-npx nx g @nx/js:lib packages/pkg1 --publishable --importPath=@my-org/pkg1
-```
-
-## Run tasks
-
-To build the library use:
-
-```sh
-npx nx build pkg1
-```
-
-To run any task with Nx use:
-
-```sh
-npx nx <target> <project-name>
-```
-
-These targets are either [inferred automatically](https://nx.dev/concepts/inferred-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) or defined in the `project.json` or `package.json` files.
-
-[More about running tasks in the docs &raquo;](https://nx.dev/features/run-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-## Versioning and releasing
-
-To version and release the library use
+## Architecture
 
 ```
-npx nx release
+animaos-swarm/
+├── packages/
+│   ├── core       — Agent runtime, types, model adapters, plugin system
+│   ├── swarm      — Swarm coordinator, strategies, agent-to-agent messaging
+│   ├── tools      — Tool registry + executor with permission checks
+│   ├── memory     — BM25 search, task history, document ingestion
+│   ├── sdk        — Public SDK that re-exports clean developer API
+│   └── cli        — CLI commands (run, chat)
+└── apps/
+    ├── server     — REST API server
+    └── ui         — Web dashboard (React + Vite)
 ```
 
-Pass `--dry-run` to see what would happen without actually releasing the library.
+## Quick Start
 
-[Learn more about Nx release &raquo;](https://nx.dev/features/manage-releases?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-## Keep TypeScript project references up to date
-
-Nx automatically updates TypeScript [project references](https://www.typescriptlang.org/docs/handbook/project-references.html) in `tsconfig.json` files to ensure they remain accurate based on your project dependencies (`import` or `require` statements). This sync is automatically done when running tasks such as `build` or `typecheck`, which require updated references to function correctly.
-
-To manually trigger the process to sync the project graph dependencies information to the TypeScript project references, run the following command:
-
-```sh
-npx nx sync
+```bash
+bun install
 ```
 
-You can enforce that the TypeScript project references are always in the correct state when running in CI by adding a step to your CI job configuration that runs the following command:
+### Run a single task
 
-```sh
-npx nx sync:check
+```bash
+animaos-swarm run "What is 42 * 17?" --model gpt-4o-mini
 ```
 
-[Learn more about nx sync](https://nx.dev/reference/nx-commands#sync)
+### Interactive chat
 
-## Nx Cloud
-
-Nx Cloud ensures a [fast and scalable CI](https://nx.dev/ci/intro/why-nx-cloud?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects) pipeline. It includes features such as:
-
-- [Remote caching](https://nx.dev/ci/features/remote-cache?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Task distribution across multiple machines](https://nx.dev/ci/features/distribute-task-execution?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Automated e2e test splitting](https://nx.dev/ci/features/split-e2e-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Task flakiness detection and rerunning](https://nx.dev/ci/features/flaky-tasks?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-
-### Set up CI (non-Github Actions CI)
-
-**Note:** This is only required if your CI provider is not GitHub Actions.
-
-Use the following command to configure a CI workflow for your workspace:
-
-```sh
-npx nx g ci-workflow
+```bash
+animaos-swarm chat --model gpt-4o
 ```
 
-[Learn more about Nx on CI](https://nx.dev/ci/intro/ci-with-nx#ready-get-started-with-your-provider?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+### Run a swarm
 
-## Install Nx Console
+```bash
+animaos-swarm swarm run --strategy supervisor "Write a report on AI trends"
+```
 
-Nx Console is an editor extension that enriches your developer experience. It lets you run tasks, generate code, and improves code autocompletion in your IDE. It is available for VSCode and IntelliJ.
+## Usage
 
-[Install Nx Console &raquo;](https://nx.dev/getting-started/editor-setup?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+```ts
+import { agent, swarm, tools } from "@animaOS-SWARM/sdk"
 
-## Useful links
+const researcher = agent({
+  name: "researcher",
+  model: "gpt-4o",
+  system: "You research topics thoroughly.",
+  tools: [tools.webSearch, tools.scrape],
+})
 
-Learn more:
+const writer = agent({
+  name: "writer",
+  model: "gpt-4o",
+  system: "You write clear, concise content.",
+  tools: [tools.draft],
+})
 
-- [Learn more about this workspace setup](https://nx.dev/nx-api/js?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Learn about Nx on CI](https://nx.dev/ci/intro/ci-with-nx?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [Releasing Packages with Nx release](https://nx.dev/features/manage-releases?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
-- [What are Nx plugins?](https://nx.dev/concepts/nx-plugins?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+const mySwarm = swarm({
+  strategy: "supervisor",
+  manager: researcher,
+  workers: [writer],
+})
 
-And join the Nx community:
+await mySwarm.run("Write a blog post about AI agents")
+```
 
-- [Discord](https://go.nx.dev/community)
-- [Follow us on X](https://twitter.com/nxdevtools) or [LinkedIn](https://www.linkedin.com/company/nrwl)
-- [Our Youtube channel](https://www.youtube.com/@nxdevtools)
-- [Our blog](https://nx.dev/blog?utm_source=nx_project&utm_medium=readme&utm_campaign=nx_projects)
+### Agent-to-agent communication
+
+```ts
+// Direct message
+await agent.send("writer", { text: "draft the intro", metadata: { context: data } })
+
+// Broadcast
+await agent.broadcast({ text: "research complete" })
+
+// Spawn child agent
+const analyst = await agent.spawn({
+  role: "analyst",
+  tools: [tools.queryDB],
+  task: "Analyze this dataset",
+})
+```
+
+## Development
+
+```bash
+# Build all packages
+bun nx run-many -t build
+
+# Run tests
+bun nx run-many -t test
+
+# Start the server
+bun nx serve server
+
+# Start the UI
+bun nx dev ui
+```
+
+## Tech Stack
+
+Bun, TypeScript, Nx, Vitest, Vite, React
+
+## License
+
+MIT
