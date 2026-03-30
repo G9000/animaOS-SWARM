@@ -1,0 +1,34 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compileOnSave": false,
+  "files": [],
+  "references": [
+    {
+      "path": "./packages/core"
+    },
+    {
+      "path": "./packages/swarm"
+    },
+    {
+      "path": "./packages/tools"
+    },
+    {
+      "path": "./packages/memory"
+    },
+    {
+      "path": "./packages/sdk"
+    },
+    {
+      "path": "./packages/cli"
+    },
+    {
+      "path": "./apps/server"
+    },
+    {
+      "path": "./apps/ui-e2e"
+    },
+    {
+      "path": "./apps/ui"
+    }
+  ]
+}

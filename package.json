@@ -1,0 +1,45 @@
+{
+  "name": "animaOS-SWARM",
+  "version": "0.0.0",
+  "license": "MIT",
+  "scripts": {},
+  "private": true,
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@nx/devkit": "22.6.3",
+    "@nx/esbuild": "22.6.3",
+    "@nx/js": "22.6.3",
+    "@nx/node": "^22.6.3",
+    "@nx/playwright": "22.6.3",
+    "@nx/react": "^22.6.3",
+    "@nx/vite": "22.6.3",
+    "@nx/vitest": "22.6.2",
+    "@nx/web": "^22.6.3",
+    "@playwright/test": "^1.36.0",
+    "@swc-node/register": "1.11.1",
+    "@swc/core": "1.15.8",
+    "@swc/helpers": "0.5.18",
+    "@types/node": "20.19.9",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "@vitest/coverage-v8": "~4.0.0",
+    "@vitest/ui": "~4.0.0",
+    "esbuild": "^0.19.2",
+    "jiti": "2.4.2",
+    "jsdom": "~22.1.0",
+    "nx": "22.6.2",
+    "prettier": "^2.6.2",
+    "tslib": "^2.3.0",
+    "typescript": "~5.9.2",
+    "vite": "^8.0.0",
+    "vitest": "~4.0.8"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "name": "@animaOS-SWARM/core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "@org/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
+    "openai": "^6.33.0",
+    "tslib": "^2.3.0"
+  }
+}

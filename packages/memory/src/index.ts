@@ -1,0 +1,6 @@
+export { BM25 } from "./bm25.js"
+export type { SearchResult } from "./bm25.js"
+export { TaskHistory } from "./task-history.js"
+export type { TaskEntry } from "./task-history.js"
+export { DocumentStore } from "./document-store.js"
+export type { DocumentChunk, DocumentSearchResult } from "./document-store.js"
