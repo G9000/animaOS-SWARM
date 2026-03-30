@@ -36,8 +36,29 @@ export class OpenAIAdapter implements IModelAdapter {
 		]
 
 		for (const msg of options.messages) {
-			if (msg.role === "tool") {
-				messages.push({ role: "assistant", content: msg.content.text })
+			if (msg.role === "assistant" && msg.content.metadata?.toolCalls) {
+				// Assistant message that requested tool calls
+				const toolCalls = msg.content.metadata.toolCalls as ToolCall[]
+				messages.push({
+					role: "assistant",
+					content: msg.content.text || null,
+					tool_calls: toolCalls.map((tc) => ({
+						id: tc.id,
+						type: "function" as const,
+						function: {
+							name: tc.name,
+							arguments: JSON.stringify(tc.args),
+						},
+					})),
+				})
+			} else if (msg.role === "tool") {
+				// Tool result — must reference the tool_call_id
+				const toolCallId = (msg.content.metadata?.toolCallId as string) ?? msg.id
+				messages.push({
+					role: "tool",
+					tool_call_id: toolCallId,
+					content: msg.content.text,
+				})
 			} else {
 				messages.push({
 					role: msg.role as "user" | "assistant",

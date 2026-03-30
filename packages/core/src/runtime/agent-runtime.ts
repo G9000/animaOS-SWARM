@@ -128,6 +128,19 @@ export class AgentRuntime implements IAgentRuntime {
 			while (result.stopReason === "tool_call" && result.toolCalls && iterations < maxIterations) {
 				iterations++
 
+				// Add the assistant's response (with tool calls) to the conversation
+				messages.push({
+					id: randomUUID() as UUID,
+					agentId: this.agentId,
+					roomId: userMessage.roomId,
+					content: {
+						text: result.content.text ?? "",
+						metadata: { toolCalls: result.toolCalls },
+					},
+					role: "assistant",
+					createdAt: Date.now(),
+				})
+
 				for (const toolCall of result.toolCalls) {
 					const toolResult = await this.executeTool(toolCall, userMessage)
 
@@ -135,7 +148,10 @@ export class AgentRuntime implements IAgentRuntime {
 						id: randomUUID() as UUID,
 						agentId: this.agentId,
 						roomId: userMessage.roomId,
-						content: { text: JSON.stringify(toolResult) },
+						content: {
+							text: JSON.stringify(toolResult),
+							metadata: { toolCallId: toolCall.id },
+						},
 						role: "tool",
 						createdAt: Date.now(),
 					})

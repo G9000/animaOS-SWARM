@@ -49,3 +49,6 @@ Thumbs.db
 vitest.config.*.timestamp*
 vite.config.*.timestamp*
 test-output
+
+# superpowers specs
+docs/superpowers
