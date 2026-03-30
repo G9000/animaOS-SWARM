@@ -16,18 +16,23 @@
     }
   },
   "bin": {
-    "animaos-swarm": "./dist/index.js"
+    "animaos": "./dist/index.js"
   },
   "dependencies": {
     "@animaOS-SWARM/core": "workspace:*",
     "@animaOS-SWARM/swarm": "workspace:*",
+    "@animaOS-SWARM/tools": "workspace:*",
     "@animaOS-SWARM/tui": "workspace:*",
+    "@clack/prompts": "^0.10.0",
     "commander": "^14.0.3",
     "ink": "^6.8.0",
+    "js-yaml": "^4.1.0",
+    "picocolors": "^1.1.0",
     "react": "^19.0.0",
     "tslib": "^2.3.0"
   },
   "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
     "@types/react": "^19.0.0"
   }
 }

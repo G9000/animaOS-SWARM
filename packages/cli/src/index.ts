@@ -2,15 +2,19 @@
 import { Command } from "commander"
 import { runCommand } from "./commands/run.js"
 import { chatCommand } from "./commands/chat.js"
+import { createCommand } from "./commands/create.js"
+import { launchCommand } from "./commands/launch.js"
 
 const program = new Command()
 
 program
-	.name("animaos-swarm")
-	.description("AnimaOS Kit — Task Agent Swarm Framework")
+	.name("animaos")
+	.description("animaOS-SWARM — Command & control your AI agent swarms")
 	.version("0.0.1")
 
 program.addCommand(runCommand)
 program.addCommand(chatCommand)
+program.addCommand(createCommand)
+program.addCommand(launchCommand)
 
 program.parse()

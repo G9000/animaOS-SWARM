@@ -18,6 +18,7 @@ import {
   bgStopAction,
   bgListAction,
 } from "./tools/process-manager.js";
+import { webFetchAction } from "./tools/web-fetch.js";
 
 /** All built-in tool actions. */
 export const ALL_TOOL_ACTIONS: Action[] = [
@@ -35,6 +36,7 @@ export const ALL_TOOL_ACTIONS: Action[] = [
   bgOutputAction,
   bgStopAction,
   bgListAction,
+  webFetchAction,
 ];
 
 /** Tool schema type — matches the Action parameters shape. */

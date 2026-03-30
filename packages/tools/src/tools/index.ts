@@ -47,3 +47,6 @@ export {
   bgListAction,
 } from "./process-manager.js";
 export type { BgStartArgs, BgOutputArgs, BgStopArgs } from "./process-manager.js";
+
+export { executeWebFetch, webFetchAction } from "./web-fetch.js";
+export type { WebFetchArgs } from "./web-fetch.js";

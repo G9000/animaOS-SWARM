@@ -2,58 +2,11 @@ import { Command } from "commander"
 import {
 	AgentRuntime,
 	EventBus,
-	OpenAIAdapter,
-	AnthropicAdapter,
-	OllamaAdapter,
-	action,
 } from "@animaOS-SWARM/core"
 import type { AgentConfig, IModelAdapter } from "@animaOS-SWARM/core"
 import { SwarmCoordinator } from "@animaOS-SWARM/swarm"
-
-const builtinTools = [
-	action({
-		name: "get_current_time",
-		description: "Get the current date and time",
-		parameters: { type: "object", properties: {}, required: [] },
-		handler: async () => ({
-			status: "success" as const,
-			data: new Date().toISOString(),
-			durationMs: 0,
-		}),
-	}),
-	action({
-		name: "calculate",
-		description: "Evaluate a math expression and return the result",
-		parameters: {
-			type: "object",
-			properties: {
-				expression: { type: "string", description: "The math expression to evaluate" },
-			},
-			required: ["expression"],
-		},
-		handler: async (_runtime, _message, args) => {
-			try {
-				const expr = args.expression as string
-				const result = Function(`"use strict"; return (${expr})`)()
-				return { status: "success" as const, data: String(result), durationMs: 0 }
-			} catch (err) {
-				return { status: "error" as const, error: String(err), durationMs: 0 }
-			}
-		},
-	}),
-]
-
-function createAdapter(provider: string, apiKey?: string): IModelAdapter {
-	switch (provider) {
-		case "anthropic":
-			return new AnthropicAdapter(apiKey ?? process.env.ANTHROPIC_API_KEY)
-		case "ollama":
-			return new OllamaAdapter(process.env.OLLAMA_BASE_URL)
-		case "openai":
-		default:
-			return new OpenAIAdapter(apiKey ?? process.env.OPENAI_API_KEY)
-	}
-}
+import { allTools } from "../tools.js"
+import { createAdapter } from "../agency/generator.js"
 
 interface RunOptions {
 	model: string
@@ -96,7 +49,7 @@ async function runSwarm(
 		model: opts.model,
 		system:
 			"You are a task manager. Break complex tasks into subtasks and delegate to workers. Synthesize results into a final answer.",
-		tools: builtinTools,
+		tools: allTools,
 	}
 
 	const workerConfig: AgentConfig = {
@@ -104,7 +57,7 @@ async function runSwarm(
 		model: opts.model,
 		system:
 			"You are a helpful worker agent. Complete the assigned task concisely and accurately.",
-		tools: builtinTools,
+		tools: allTools,
 	}
 
 	const coordinator = new SwarmCoordinator(
@@ -181,7 +134,7 @@ async function runSingleAgent(
 			name: opts.name,
 			model: opts.model,
 			system: "You are a helpful task agent. Use tools when needed. Be concise.",
-			tools: builtinTools,
+			tools: allTools,
 		},
 		modelAdapter: adapter,
 		eventBus: bus,

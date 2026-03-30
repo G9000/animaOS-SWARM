@@ -112,7 +112,11 @@ export class AgentRuntime implements IAgentRuntime {
 			}
 
 			// Build system prompt
-			const systemParts = [this.config.system ?? "You are a helpful task agent."]
+			const systemParts: string[] = []
+			if (this.config.bio) {
+				systemParts.push(`## Who You Are\n${this.config.bio}`)
+			}
+			systemParts.push(this.config.system ?? "You are a helpful task agent.")
 			if (contextParts.length > 0) {
 				systemParts.push("\n## Context\n" + contextParts.join("\n"))
 			}

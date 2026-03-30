@@ -5,6 +5,7 @@ import type { Plugin } from "./plugin.js"
 export interface AgentConfig {
 	name: string
 	model: string
+	bio?: string
 	provider?: string
 	system?: string
 	tools?: Action[]

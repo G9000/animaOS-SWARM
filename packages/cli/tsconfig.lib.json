@@ -20,6 +20,9 @@
     },
     {
       "path": "../tui/tsconfig.lib.json"
+    },
+    {
+      "path": "../tools/tsconfig.lib.json"
     }
   ],
   "exclude": [
