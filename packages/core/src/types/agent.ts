@@ -6,6 +6,11 @@ export interface AgentConfig {
 	name: string
 	model: string
 	bio?: string
+	lore?: string
+	knowledge?: string[]
+	topics?: string[]
+	adjectives?: string[]
+	style?: string
 	provider?: string
 	system?: string
 	tools?: Action[]

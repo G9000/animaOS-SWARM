@@ -116,6 +116,21 @@ export class AgentRuntime implements IAgentRuntime {
 			if (this.config.bio) {
 				systemParts.push(`## Who You Are\n${this.config.bio}`)
 			}
+			if (this.config.lore) {
+				systemParts.push(`## Your Backstory\n${this.config.lore}`)
+			}
+			if (this.config.adjectives && this.config.adjectives.length > 0) {
+				systemParts.push(`## Your Personality\nYou are ${this.config.adjectives.join(", ")}.`)
+			}
+			if (this.config.topics && this.config.topics.length > 0) {
+				systemParts.push(`## Your Expertise\nYou specialize in: ${this.config.topics.join(", ")}.`)
+			}
+			if (this.config.knowledge && this.config.knowledge.length > 0) {
+				systemParts.push(`## What You Know\n${this.config.knowledge.map((k) => `- ${k}`).join("\n")}`)
+			}
+			if (this.config.style) {
+				systemParts.push(`## How You Communicate\n${this.config.style}`)
+			}
 			systemParts.push(this.config.system ?? "You are a helpful task agent.")
 			if (contextParts.length > 0) {
 				systemParts.push("\n## Context\n" + contextParts.join("\n"))

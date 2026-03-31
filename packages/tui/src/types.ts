@@ -40,3 +40,16 @@ export interface SwarmStats {
   agentCount: number
   strategy: string
 }
+
+/** An agent's full profile — used for the agents panel and editing */
+export interface AgentProfile {
+  name: string
+  role?: "orchestrator" | "worker"
+  bio?: string
+  lore?: string
+  adjectives?: string[]
+  topics?: string[]
+  knowledge?: string[]
+  style?: string
+  system?: string
+}

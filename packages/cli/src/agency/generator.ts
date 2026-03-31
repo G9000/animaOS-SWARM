@@ -56,9 +56,14 @@ export async function generateAgentTeam(
 		"Respond with ONLY valid JSON — an array of agent objects. No markdown, no explanation.",
 		"Each object must have these fields:",
 		'  - "name": a short snake_case identifier',
-		'  - "bio": who this agent is — personality, expertise, what makes them good at their role (1-2 sentences)',
-		'  - "system": the system prompt instruction for this agent (2-3 sentences)',
 		'  - "role": either "orchestrator" or "worker"',
+		'  - "bio": 1-2 sentences describing who this agent is — personality and expertise',
+		'  - "lore": 1-2 sentences of backstory — what shaped them, their origin',
+		'  - "adjectives": array of 3-5 personality trait words (e.g. ["analytical", "thorough", "methodical"])',
+		'  - "topics": array of 3-6 short expertise tags (e.g. ["web research", "data analysis", "fact checking"])',
+		'  - "knowledge": array of 2-4 specific things this agent knows deeply',
+		'  - "style": 1-2 sentences describing how this agent communicates',
+		'  - "system": core instruction — what they do and how (2-3 sentences)',
 	].join("\n")
 
 	const result = await opts.adapter.generate(config, {
@@ -100,8 +105,13 @@ export async function generateAgentTeam(
 
 	return parsed.map((item: Record<string, unknown>) => ({
 		name: (item.name as string) ?? "unnamed",
-		bio: (item.bio as string) ?? "",
-		system: (item.system as string) ?? "",
 		role: ((item.role as string) ?? "worker") as "orchestrator" | "worker",
+		bio: (item.bio as string) ?? "",
+		lore: (item.lore as string | undefined),
+		adjectives: Array.isArray(item.adjectives) ? (item.adjectives as string[]) : undefined,
+		topics: Array.isArray(item.topics) ? (item.topics as string[]) : undefined,
+		knowledge: Array.isArray(item.knowledge) ? (item.knowledge as string[]) : undefined,
+		style: (item.style as string | undefined),
+		system: (item.system as string) ?? "",
 	}))
 }

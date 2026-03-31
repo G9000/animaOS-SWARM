@@ -21,6 +21,7 @@ export interface UseEventLogResult {
   done: boolean
   result: string | null
   error: string | null
+  reset: () => void
 }
 
 let nextMsgId = 0
@@ -39,6 +40,16 @@ export function useEventLog({
 
   // Use a ref for startTime so it doesn't cause re-renders
   const startTimeRef = useRef(Date.now())
+
+  const reset = useCallback(() => {
+    setAgents([])
+    setMessages([])
+    setTools([])
+    setDone(false)
+    setResult(null)
+    setError(null)
+    startTimeRef.current = Date.now()
+  }, [])
 
   const updateAgent = useCallback(
     (
@@ -322,5 +333,5 @@ export function useEventLog({
     strategy,
   }
 
-  return { agents, messages, tools, stats, done, result, error }
+  return { agents, messages, tools, stats, done, result, error, reset }
 }

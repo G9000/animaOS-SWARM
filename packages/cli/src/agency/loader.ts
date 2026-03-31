@@ -51,25 +51,28 @@ export function loadAgency(dir: string): AgencyConfig {
 
 	const agents = Array.isArray(parsed.agents) ? parsed.agents : []
 
+	function loadAgent(a: Record<string, unknown>) {
+		return {
+			name: (a.name as string) ?? "unnamed",
+			bio: (a.bio as string) ?? "",
+			lore: a.lore as string | undefined,
+			adjectives: Array.isArray(a.adjectives) ? (a.adjectives as string[]) : undefined,
+			topics: Array.isArray(a.topics) ? (a.topics as string[]) : undefined,
+			knowledge: Array.isArray(a.knowledge) ? (a.knowledge as string[]) : undefined,
+			style: a.style as string | undefined,
+			system: (a.system as string) ?? "",
+			model: a.model as string | undefined,
+			tools: a.tools as string[] | undefined,
+		}
+	}
+
 	return {
 		name: parsed.name as string,
 		description: (parsed.description as string) ?? "",
 		model: (parsed.model as string) ?? "gpt-4o",
 		provider: (parsed.provider as string) ?? "openai",
 		strategy: (parsed.strategy as AgencyConfig["strategy"]) ?? "supervisor",
-		orchestrator: {
-			name: orchestrator.name as string,
-			bio: orchestrator.bio as string,
-			system: orchestrator.system as string,
-			model: orchestrator.model as string | undefined,
-			tools: orchestrator.tools as string[] | undefined,
-		},
-		agents: agents.map((a: Record<string, unknown>) => ({
-			name: (a.name as string) ?? "unnamed",
-			bio: (a.bio as string) ?? "",
-			system: (a.system as string) ?? "",
-			model: a.model as string | undefined,
-			tools: a.tools as string[] | undefined,
-		})),
+		orchestrator: loadAgent(orchestrator),
+		agents: agents.map((a: Record<string, unknown>) => loadAgent(a)),
 	}
 }

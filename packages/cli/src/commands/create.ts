@@ -87,11 +87,21 @@ export const createCommand = new Command("create")
 			orchestrator: {
 				name: orchestrator.name,
 				bio: orchestrator.bio,
+				lore: orchestrator.lore,
+				adjectives: orchestrator.adjectives,
+				topics: orchestrator.topics,
+				knowledge: orchestrator.knowledge,
+				style: orchestrator.style,
 				system: orchestrator.system,
 			},
 			agents: workers.map((a) => ({
 				name: a.name,
 				bio: a.bio,
+				lore: a.lore,
+				adjectives: a.adjectives,
+				topics: a.topics,
+				knowledge: a.knowledge,
+				style: a.style,
 				system: a.system,
 			})),
 		}
