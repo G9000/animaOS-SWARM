@@ -61,4 +61,10 @@ export class MessageBus implements IMessageBus {
 		this.inboxes.clear()
 		this.allMessages = []
 	}
+
+	clearInboxes(): void {
+		for (const inbox of this.inboxes.values()) {
+			inbox.length = 0
+		}
+	}
 }

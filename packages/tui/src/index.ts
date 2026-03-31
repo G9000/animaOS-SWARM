@@ -36,3 +36,6 @@ export type { InputBarProps, SlashCommand } from "./components/input-bar.js"
 
 export { ResultLog } from "./components/result-log.js"
 export type { ResultLogProps, ResultEntry } from "./components/result-log.js"
+
+export { ResultView } from "./components/result-view.js"
+export type { ResultViewProps } from "./components/result-view.js"

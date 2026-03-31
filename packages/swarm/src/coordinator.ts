@@ -14,6 +14,8 @@ import { supervisorStrategy } from "./strategies/supervisor.js"
 import { dynamicStrategy } from "./strategies/dynamic.js"
 import { roundRobinStrategy } from "./strategies/round-robin.js"
 
+type AgentHandle = { id: string; run: (input: string) => Promise<TaskResult> }
+
 export class SwarmCoordinator {
 	readonly id: UUID
 	private config: SwarmConfig
@@ -22,6 +24,12 @@ export class SwarmCoordinator {
 	private messageBus: MessageBus
 	private agents = new Map<string, AgentRuntime>()
 	private state: SwarmState
+
+	/** Pool of long-running agents keyed by config.name — populated by start() */
+	private pool = new Map<string, AgentHandle>()
+
+	/** Serial task chain — ensures only one dispatch runs at a time */
+	private taskChain: Promise<unknown> = Promise.resolve()
 
 	constructor(config: SwarmConfig, modelAdapter: IModelAdapter, eventBus?: IEventBus) {
 		this.id = randomUUID() as UUID
@@ -39,18 +47,87 @@ export class SwarmCoordinator {
 		}
 	}
 
-	async run(task: string): Promise<TaskResult> {
-		this.state.status = "running"
-		this.state.startedAt = Date.now()
+	// ─── persistent lifecycle ─────────────────────────────────────────────────
+
+	/**
+	 * Spawn all configured agents and keep them alive.
+	 * Call once at startup; agents persist across multiple dispatch() calls.
+	 */
+	async start(): Promise<void> {
 		await this.eventBus.emit("swarm:created", { swarmId: this.id, strategy: this.config.strategy })
 
+		// Pre-spawn workers only. The manager is spawned fresh per task by each strategy
+		// so it receives the correct strategy-specific tools (e.g. delegate_task, choose_speaker).
+		await Promise.all(
+			this.config.workers.map(async (config) => {
+				const handle = await this.spawnAgent(config)
+				this.pool.set(config.name, handle)
+			}),
+		)
+
+		this.state.status = "idle"
+	}
+
+	/**
+	 * Dispatch a task to the running agent pool.
+	 * Tasks are serialised — concurrent calls queue up and run one at a time.
+	 * Agents are reused across tasks (no spawn/terminate overhead).
+	 */
+	dispatch(task: string): Promise<TaskResult> {
+		let resolve!: (r: TaskResult) => void
+		const promise = new Promise<TaskResult>((r) => (resolve = r))
+
+		this.taskChain = this.taskChain
+			.catch(() => {}) // don't let a previous task error break the chain
+			.then(async () => {
+				const result = await this._runTask(task)
+				resolve(result)
+			})
+
+		return promise
+	}
+
+	/**
+	 * Gracefully stop all agents.
+	 * Waits for any running dispatch() to complete first.
+	 */
+	async stop(): Promise<void> {
+		await this.taskChain.catch(() => {})
+		this.pool.clear()
+		await this.terminateAll()
+		await this.eventBus.emit("swarm:stopped", { swarmId: this.id })
+		this.state.status = "idle"
+	}
+
+	// ─── internal task runner (used by both dispatch() and run()) ─────────────
+
+	private async _runTask(task: string): Promise<TaskResult> {
+		this.state.status = "running"
+		this.state.startedAt = Date.now()
+
+		// Clear per-agent inboxes so messages from previous tasks don't bleed in
+		this.messageBus.clearInboxes()
+
+		// Re-announce pool agents to the TUI after each reset() clears the display
+		for (const [name, handle] of this.pool) {
+			await this.eventBus.emit("agent:spawned", { agentId: handle.id, name })
+		}
+
 		const strategyFn = this.getStrategy()
+
+		// Pool-aware spawnAgent: returns existing long-running agent if available,
+		// otherwise spawns a fresh one (single-shot / run() compatibility)
+		const poolAwareSpawn = async (config: AgentConfig): Promise<AgentHandle> => {
+			const existing = this.pool.get(config.name)
+			if (existing) return existing
+			return this.spawnAgent(config)
+		}
 
 		const ctx: StrategyContext = {
 			task,
 			managerConfig: this.config.manager,
 			workerConfigs: this.config.workers,
-			spawnAgent: (config) => this.spawnAgent(config),
+			spawnAgent: poolAwareSpawn,
 			messageBus: this.messageBus,
 			maxTurns: this.config.maxTurns ?? this.config.workers.length + 1,
 		}
@@ -58,29 +135,55 @@ export class SwarmCoordinator {
 		try {
 			const result = await strategyFn(ctx)
 
-			this.state.status = "completed"
+			this.state.status = "idle"
 			this.state.completedAt = Date.now()
 			this.state.results.push(result)
+			// Capture token usage while agents are still alive (fixes the post-terminateAll bug)
 			this.aggregateTokenUsage()
 
+			// Terminate per-task agents (manager spawned by strategy with strategy-specific tools).
+			// Pool agents (workers) are identified by their handle id and must persist.
+			const poolIds = new Set([...this.pool.values()].map((h) => h.id))
+			for (const agentId of [...this.agents.keys()]) {
+				if (!poolIds.has(agentId)) {
+					await this.terminate(agentId)
+				}
+			}
+
 			await this.eventBus.emit("swarm:completed", { swarmId: this.id, result })
-			return result
+			return { ...result, durationMs: Date.now() - (this.state.startedAt ?? Date.now()) }
 		} catch (err) {
 			this.state.status = "failed"
 			this.state.completedAt = Date.now()
 
-			const result: TaskResult = {
+			return {
 				status: "error",
 				error: err instanceof Error ? err.message : String(err),
 				durationMs: Date.now() - (this.state.startedAt ?? Date.now()),
 			}
-			return result
+		}
+	}
+
+	// ─── single-shot run() — backward compatible ──────────────────────────────
+
+	/**
+	 * Single-shot: spawn agents, run task, terminate agents.
+	 * Kept for backward compatibility. Prefer start() + dispatch() + stop() for
+	 * interactive/multi-task use (persistent agents).
+	 */
+	async run(task: string): Promise<TaskResult> {
+		await this.eventBus.emit("swarm:created", { swarmId: this.id, strategy: this.config.strategy })
+
+		try {
+			return await this._runTask(task)
 		} finally {
 			await this.terminateAll()
 		}
 	}
 
-	private async spawnAgent(config: AgentConfig): Promise<{ id: string; run: (input: string) => Promise<TaskResult> }> {
+	// ─── agent management ─────────────────────────────────────────────────────
+
+	private async spawnAgent(config: AgentConfig): Promise<AgentHandle> {
 		const maxAgents = this.config.maxConcurrentAgents ?? 20
 		if (this.agents.size >= maxAgents) {
 			throw new Error(`Max concurrent agents (${maxAgents}) reached`)
@@ -153,7 +256,11 @@ export class SwarmCoordinator {
 	}
 
 	getState(): SwarmState {
-		this.aggregateTokenUsage()
+		// Only re-aggregate if agents are still alive (persistent mode)
+		// In single-shot mode agents are cleared by terminateAll(), so preserve the last captured value
+		if (this.agents.size > 0) {
+			this.aggregateTokenUsage()
+		}
 		return { ...this.state }
 	}
 

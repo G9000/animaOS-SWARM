@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@animaOS-SWARM/core": "workspace:*",
+    "@animaOS-SWARM/memory": "workspace:*",
     "@animaOS-SWARM/swarm": "workspace:*",
     "@animaOS-SWARM/tools": "workspace:*",
     "@animaOS-SWARM/tui": "workspace:*",

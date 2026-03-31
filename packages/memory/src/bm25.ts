@@ -1,5 +1,4 @@
 // BM25 search engine with simple stemming
-// Inspired by elizaOS search.ts (MIT licensed)
 
 const STOP_WORDS = new Set([
 	"a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",

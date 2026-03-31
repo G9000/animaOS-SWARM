@@ -5,6 +5,7 @@ import yaml from "js-yaml"
 import { EventBus } from "@animaOS-SWARM/core"
 import type { AgentConfig, IEventBus, TaskResult } from "@animaOS-SWARM/core"
 import { SwarmCoordinator } from "@animaOS-SWARM/swarm"
+import { MemoryManager, createMemoryPlugin } from "@animaOS-SWARM/memory"
 import { loadAgency, agencyExists } from "../agency/loader.js"
 import { createAdapter } from "../agency/generator.js"
 import { allTools } from "../tools.js"
@@ -17,7 +18,11 @@ interface LaunchOptions {
 	tui: boolean
 }
 
-function agentDefToConfig(agent: AgentDefinition, defaultModel: string): AgentConfig {
+function agentDefToConfig(
+	agent: AgentDefinition,
+	defaultModel: string,
+	memory?: MemoryManager,
+): AgentConfig {
 	return {
 		name: agent.name,
 		bio: agent.bio,
@@ -29,6 +34,7 @@ function agentDefToConfig(agent: AgentDefinition, defaultModel: string): AgentCo
 		model: agent.model ?? defaultModel,
 		system: agent.system,
 		tools: allTools,
+		plugins: memory ? [createMemoryPlugin(memory)] : [],
 	}
 }
 
@@ -48,18 +54,22 @@ export const launchCommand = new Command("launch")
 			process.exit(1)
 		}
 
-		// Keep agency mutable so /agents edits propagate to next coordinator
+		// Keep agency mutable so /agents edits propagate to the coordinator
 		const agency = loadAgency(opts.dir)
 		const adapter = createAdapter(agency.provider, opts.apiKey)
 		const bus = new EventBus()
 
-		/** Creates a fresh coordinator from current agency state */
-		function makeCoordinator() {
+		// Memory — persists to <agency-dir>/.anima-memory.json
+		const memory = new MemoryManager(join(opts.dir, ".anima-memory.json"))
+		memory.load()
+
+		/** Build a SwarmCoordinator from current agency state */
+		function buildCoordinator() {
 			return new SwarmCoordinator(
 				{
 					strategy: agency.strategy,
-					manager: agentDefToConfig(agency.orchestrator, agency.model),
-					workers: agency.agents.map((a) => agentDefToConfig(a, agency.model)),
+					manager: agentDefToConfig(agency.orchestrator, agency.model, memory),
+					workers: agency.agents.map((a) => agentDefToConfig(a, agency.model, memory)),
 				},
 				adapter,
 				bus,
@@ -100,7 +110,23 @@ export const launchCommand = new Command("launch")
 			}
 
 			if (interactive) {
-				const onTask = async (input: string): Promise<TaskResult> => makeCoordinator().run(input)
+				// start a persistent coordinator once, reuse agents across tasks
+				const coordinator = buildCoordinator()
+				await coordinator.start()
+
+				process.once("SIGINT", async () => {
+					await coordinator.stop()
+					process.exit(0)
+				})
+
+				const onTask = async (input: string): Promise<TaskResult> => {
+					const result = await coordinator.dispatch(input)
+					const text = result.status === "success"
+						? (result.data as { text?: string })?.text ?? JSON.stringify(result.data, null, 2)
+						: `Error: ${result.error}`
+					writeFileSync(join(opts.dir, "anima-result.md"), `# Task\n\n${input}\n\n# Result\n\n${text}\n`)
+					return result
+				}
 
 				const element = React.createElement(App, {
 					eventBus: bus as IEventBus,
@@ -113,7 +139,8 @@ export const launchCommand = new Command("launch")
 				render(element)
 				// Stay alive until Ctrl+C
 			} else {
-				const coordinator = makeCoordinator()
+				// Single-shot TUI: spawn → run → unmount
+				const coordinator = buildCoordinator()
 				const element = React.createElement(App, {
 					eventBus: bus as IEventBus,
 					strategy: agency.strategy,
@@ -141,16 +168,26 @@ export const launchCommand = new Command("launch")
 			})
 
 			if (interactive) {
+				// persistent coordinator for the whole session
+				const coordinator = buildCoordinator()
+				await coordinator.start()
+
 				const { createInterface } = await import("node:readline")
 				const rl = createInterface({ input: process.stdin, output: process.stdout })
 				console.log(`${agency.name} — ${agency.strategy} strategy — ${agency.model}`)
 				console.log('Type "exit" to quit.\n')
 
+				rl.once("close", async () => { await coordinator.stop() })
+
 				const prompt = () => {
 					rl.question("task > ", async (input) => {
 						const trimmed = input.trim()
-						if (!trimmed || trimmed === "exit") { console.log("Bye."); rl.close(); return }
-						const result = await makeCoordinator().run(trimmed)
+						if (!trimmed || trimmed === "exit") {
+							console.log("Bye.")
+							rl.close()
+							return
+						}
+						const result = await coordinator.dispatch(trimmed)
 						console.log("\n--- Result ---")
 						if (result.status === "success") {
 							console.log((result.data as { text?: string })?.text ?? JSON.stringify(result.data))
@@ -163,8 +200,9 @@ export const launchCommand = new Command("launch")
 				}
 				prompt()
 			} else {
+				// Single-shot plain text
 				console.log(`Launching "${agency.name}" with strategy "${agency.strategy}" and model ${agency.model}...\n`)
-				const result = await makeCoordinator().run(task!)
+				const result = await buildCoordinator().run(task!)
 				console.log("\n--- Result ---")
 				if (result.status === "success") {
 					console.log((result.data as { text?: string })?.text ?? JSON.stringify(result.data))

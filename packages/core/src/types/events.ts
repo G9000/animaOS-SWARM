@@ -13,6 +13,7 @@ export type EventType =
 	| "agent:tokens"
 	| "swarm:created"
 	| "swarm:completed"
+	| "swarm:stopped"
 
 export interface Event<T = unknown> {
 	type: EventType

@@ -4,14 +4,15 @@ import type { StrategyContext } from "../types.js"
 export async function roundRobinStrategy(ctx: StrategyContext): Promise<TaskResult> {
 	const startTime = Date.now()
 
-	// Spawn all agents (manager + workers treated equally)
+	// Spawn all agents in parallel (manager + workers treated equally)
+	// Pool-aware spawnAgent returns existing agents instantly on subsequent tasks
 	const allConfigs = [ctx.managerConfig, ...ctx.workerConfigs]
-	const agents: Array<{ id: string; name: string; run: (input: string) => Promise<TaskResult> }> = []
-
-	for (const config of allConfigs) {
-		const a = await ctx.spawnAgent(config)
-		agents.push({ id: a.id, name: config.name, run: a.run })
-	}
+	const agents = await Promise.all(
+		allConfigs.map(async (config) => {
+			const a = await ctx.spawnAgent(config)
+			return { id: a.id, name: config.name, run: a.run }
+		}),
+	)
 
 	const chatHistory: Array<{ speaker: string; content: string }> = []
 	let lastResult: TaskResult | null = null

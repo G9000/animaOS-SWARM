@@ -48,4 +48,6 @@ export interface IMessageBus {
 	getMessages(agentId: string): AgentMessage[]
 	getAllMessages(): AgentMessage[]
 	clear(): void
+	/** Clear per-agent inboxes between tasks without losing the global message history. */
+	clearInboxes(): void
 }

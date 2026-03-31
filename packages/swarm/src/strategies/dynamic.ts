@@ -4,12 +4,13 @@ import type { StrategyContext } from "../types.js"
 export async function dynamicStrategy(ctx: StrategyContext): Promise<TaskResult> {
 	const startTime = Date.now()
 
-	// Spawn all workers
-	const agents: Array<{ id: string; name: string; run: (input: string) => Promise<TaskResult> }> = []
-	for (const wc of ctx.workerConfigs) {
-		const w = await ctx.spawnAgent(wc)
-		agents.push({ id: w.id, name: wc.name, run: w.run })
-	}
+	// Spawn all workers in parallel — pool-aware spawnAgent returns existing agents instantly
+	const agents = await Promise.all(
+		ctx.workerConfigs.map(async (wc) => {
+			const w = await ctx.spawnAgent(wc)
+			return { id: w.id, name: wc.name, run: w.run }
+		}),
+	)
 
 	const chatHistory: Array<{ speaker: string; content: string }> = []
 

@@ -9,6 +9,7 @@ import { ToolPanel } from "./components/tool-panel.js"
 import { StatusBar } from "./components/status-bar.js"
 import { InputBar } from "./components/input-bar.js"
 import { ResultLog } from "./components/result-log.js"
+import { ResultView } from "./components/result-view.js"
 import { AgentsPanel } from "./components/agents-panel.js"
 import type { ResultEntry } from "./components/result-log.js"
 import type { SlashCommand } from "./components/input-bar.js"
@@ -31,12 +32,13 @@ export interface AppProps {
 
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: "agents",  description: "browse and edit agents" },
+  { name: "result",  description: "view the full last result" },
   { name: "help",    description: "show available commands" },
   { name: "clear",   description: "clear session history" },
   { name: "exit",    description: "exit the session" },
 ]
 
-type AppView = "swarm" | "agents"
+type AppView = "swarm" | "agents" | "result"
 
 export function App({
   eventBus,
@@ -75,6 +77,16 @@ export function App({
           } else {
             setView("agents")
           }
+          break
+        case "result":
+          if (resultLog.length === 0) {
+            showMsg("No results yet. Run a task first.")
+          } else {
+            setView("result")
+          }
+          break
+        case "back":
+          setView("swarm")
           break
         case "exit":
         case "quit":
@@ -141,6 +153,21 @@ export function App({
           profiles={profiles}
           onBack={() => setView("swarm")}
           onSave={handleSaveAgent}
+        />
+      </Box>
+    )
+  }
+
+  // ── Result view ──
+  if (view === "result" && resultLog.length > 0) {
+    const last = resultLog[resultLog.length - 1]
+    return (
+      <Box flexDirection="column">
+        <ResultView entry={last} onBack={() => setView("swarm")} />
+        <InputBar
+          onSubmit={handleTaskSubmit}
+          disabled={false}
+          commands={[{ name: "back", description: "return to swarm view" }]}
         />
       </Box>
     )
