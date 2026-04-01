@@ -1,69 +1,105 @@
-use std::io::{Read, Write};
+mod http;
+mod json;
+mod routes;
+mod state;
+
+use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use anima_core::HealthStatus;
-use anima_memory::MemoryManager;
-use anima_swarm::SwarmCoordinator;
+use crate::http::{
+    parse_request, prepare_stream, read_http_request, write_http_response, Response,
+};
+use crate::routes::route_request;
+use crate::state::DaemonState;
 
-const NOT_FOUND_JSON: &str = "{\"error\":\"not found\"}";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaemonConfig {
+    pub max_request_bytes: usize,
+    pub request_read_timeout: Duration,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: 64 * 1024,
+            request_read_timeout: Duration::from_millis(200),
+        }
+    }
+}
 
 pub struct Daemon {
     listener: TcpListener,
-    _memory: MemoryManager,
-    _swarm: SwarmCoordinator,
+    state: Arc<Mutex<DaemonState>>,
+    config: DaemonConfig,
 }
 
 impl Daemon {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> std::io::Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        Self::bind_with_config(addr, DaemonConfig::default())
+    }
+
+    pub fn bind_with_config<A: ToSocketAddrs>(addr: A, config: DaemonConfig) -> io::Result<Self> {
         let listener = TcpListener::bind(addr)?;
         Ok(Self {
             listener,
-            _memory: MemoryManager::new(),
-            _swarm: SwarmCoordinator::new(),
+            state: Arc::new(Mutex::new(DaemonState::new())),
+            config,
         })
     }
 
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
     }
 
-    pub fn serve_one(self) -> std::io::Result<()> {
-        let (stream, _) = self.listener.accept()?;
-        handle_connection(stream)
+    pub fn serve_one(self) -> io::Result<()> {
+        self.serve_n(1)
     }
 
-    pub fn serve(self) -> std::io::Result<()> {
+    pub fn serve_n(self, limit: usize) -> io::Result<()> {
+        for _ in 0..limit {
+            let (stream, _) = self.listener.accept()?;
+            handle_connection(stream, &self.state, self.config)?;
+        }
+        Ok(())
+    }
+
+    pub fn serve(self) -> io::Result<()> {
         for stream in self.listener.incoming() {
-            handle_connection(stream?)?;
+            handle_connection(stream?, &self.state, self.config)?;
         }
         Ok(())
     }
 }
 
-fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
-    let mut buffer = [0_u8; 1024];
-    let bytes_read = stream.read(&mut buffer)?;
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-
-    let (status_line, body) = if is_health_request(&request) {
-        ("HTTP/1.1 200 OK", HealthStatus::ok().as_json())
-    } else {
-        ("HTTP/1.1 404 Not Found", NOT_FOUND_JSON)
+fn handle_connection(
+    mut stream: TcpStream,
+    state: &Arc<Mutex<DaemonState>>,
+    config: DaemonConfig,
+) -> io::Result<()> {
+    prepare_stream(&stream, config)?;
+    let request_bytes = match read_http_request(&mut stream, config) {
+        Ok(request_bytes) => request_bytes,
+        Err(_) => {
+            let _ = write_http_response(
+                &mut stream,
+                Response::error("HTTP/1.1 400 Bad Request", "malformed request"),
+            );
+            return Ok(());
+        }
     };
+    let request = match parse_request(&request_bytes) {
+        Ok(request) => request,
+        Err(_) => {
+            let _ = write_http_response(
+                &mut stream,
+                Response::error("HTTP/1.1 400 Bad Request", "malformed request"),
+            );
+            return Ok(());
+        }
+    };
+    let response = route_request(request, state);
 
-    let response = format!(
-        "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-
-    stream.write_all(response.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn is_health_request(request: &str) -> bool {
-    request
-        .lines()
-        .next()
-        .is_some_and(|line| line.starts_with("GET /health "))
+    write_http_response(&mut stream, response)
 }
