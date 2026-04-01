@@ -1,8 +1,8 @@
-#[derive(Default)]
-pub struct MemoryManager;
+mod bm25;
+mod memory_manager;
 
-impl MemoryManager {
-    pub fn new() -> Self {
-        Self
-    }
-}
+pub use bm25::{SearchResult, BM25};
+pub use memory_manager::{
+    Memory, MemoryManager, MemorySearchOptions, MemorySearchResult, MemoryType, NewMemory,
+    RecentMemoryOptions,
+};

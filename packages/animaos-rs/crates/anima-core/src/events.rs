@@ -1,10 +1,76 @@
+use crate::primitives::DataValue;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventType {
-    HealthCheck,
+    AgentSpawned,
+    AgentStarted,
+    AgentCompleted,
+    AgentFailed,
+    AgentTerminated,
+    AgentMessage,
+    TaskStarted,
+    TaskCompleted,
+    TaskFailed,
+    ToolBefore,
+    ToolAfter,
+    AgentTokens,
+    SwarmCreated,
+    SwarmCompleted,
+    SwarmStopped,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EngineEvent {
+impl EventType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentSpawned => "agent:spawned",
+            Self::AgentStarted => "agent:started",
+            Self::AgentCompleted => "agent:completed",
+            Self::AgentFailed => "agent:failed",
+            Self::AgentTerminated => "agent:terminated",
+            Self::AgentMessage => "agent:message",
+            Self::TaskStarted => "task:started",
+            Self::TaskCompleted => "task:completed",
+            Self::TaskFailed => "task:failed",
+            Self::ToolBefore => "tool:before",
+            Self::ToolAfter => "tool:after",
+            Self::AgentTokens => "agent:tokens",
+            Self::SwarmCreated => "swarm:created",
+            Self::SwarmCompleted => "swarm:completed",
+            Self::SwarmStopped => "swarm:stopped",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineEvent<T = DataValue> {
     pub event_type: EventType,
-    pub timestamp_ms: u128,
+    pub agent_id: Option<String>,
+    pub timestamp: u128,
+    pub data: T,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EngineEvent, EventType};
+    use crate::primitives::DataValue;
+
+    #[test]
+    fn event_type_strings_match_ts_contract() {
+        assert_eq!(EventType::AgentSpawned.as_str(), "agent:spawned");
+        assert_eq!(EventType::ToolAfter.as_str(), "tool:after");
+        assert_eq!(EventType::SwarmStopped.as_str(), "swarm:stopped");
+    }
+
+    #[test]
+    fn engine_event_holds_agent_id_and_payload() {
+        let event = EngineEvent {
+            event_type: EventType::TaskCompleted,
+            agent_id: Some("agent-1".into()),
+            timestamp: 123,
+            data: DataValue::String("done".into()),
+        };
+
+        assert_eq!(event.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(event.timestamp, 123);
+    }
 }
