@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
+
 use crate::agent::{AgentConfig, TokenUsage};
 use crate::primitives::{Content, DataValue, Message};
 
@@ -43,10 +45,11 @@ pub struct ToolCall {
     pub args: BTreeMap<String, DataValue>,
 }
 
+#[async_trait]
 pub trait ModelAdapter: Send + Sync {
     fn provider(&self) -> &str;
 
-    fn generate(
+    async fn generate(
         &self,
         config: &AgentConfig,
         request: &ModelGenerateRequest,

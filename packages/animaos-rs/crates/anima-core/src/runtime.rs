@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -138,21 +139,28 @@ impl AgentRuntime {
         message
     }
 
-    pub fn run(&mut self, input: Content) -> TaskResult<Content> {
+    pub async fn run(&mut self, input: Content) -> TaskResult<Content> {
         self.run_with_tools(input, |_, _, tool_call| {
-            TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0)
+            let tool_name = tool_call.name.clone();
+            async move { TaskResult::error(format!("Unknown tool: {tool_name}"), 0) }
         })
+        .await
     }
 
-    pub fn run_with_tools<F>(&mut self, input: Content, mut execute_tool: F) -> TaskResult<Content>
+    pub async fn run_with_tools<F, Fut>(
+        &mut self,
+        input: Content,
+        mut execute_tool: F,
+    ) -> TaskResult<Content>
     where
-        F: FnMut(&AgentState, &Message, &ToolCall) -> TaskResult<Content>,
+        F: FnMut(&AgentState, &Message, &ToolCall) -> Fut,
+        Fut: Future<Output = TaskResult<Content>>,
     {
         let start = now_millis();
         let room_id = next_id("room", &NEXT_ROOM_ID);
         self.mark_running();
         let user_message = self.record_message_in_room(room_id.clone(), MessageRole::User, input);
-        let context_parts = match self.build_provider_context(&user_message) {
+        let context_parts = match self.build_provider_context(&user_message).await {
             Ok(context_parts) => context_parts,
             Err(error) => {
                 let duration_ms = now_millis().saturating_sub(start);
@@ -184,14 +192,18 @@ impl AgentRuntime {
                     .and_then(|settings| settings.max_tokens),
             };
 
-            match self.model_adapter.generate(&self.state.config, &request) {
+            match self
+                .model_adapter
+                .generate(&self.state.config, &request)
+                .await
+            {
                 Ok(response) => {
                     self.apply_token_usage(&response.usage);
 
                     match response.stop_reason {
                         ModelStopReason::End | ModelStopReason::MaxTokens => {
                             if let Err(error) =
-                                self.run_evaluators(&user_message, &response.content)
+                                self.run_evaluators(&user_message, &response.content).await
                             {
                                 let duration_ms = now_millis().saturating_sub(start);
                                 self.mark_failed(error, duration_ms);
@@ -254,7 +266,7 @@ impl AgentRuntime {
                                 );
                                 let tool_started = now_millis();
                                 let tool_result =
-                                    execute_tool(&self.state, &user_message, &tool_call);
+                                    execute_tool(&self.state, &user_message, &tool_call).await;
                                 let tool_duration = now_millis().saturating_sub(tool_started);
                                 self.record_event(
                                     EventType::ToolAfter,
@@ -393,19 +405,19 @@ impl AgentRuntime {
         parts.join("\n\n")
     }
 
-    fn build_provider_context(&self, message: &Message) -> Result<Vec<String>, String> {
+    async fn build_provider_context(&self, message: &Message) -> Result<Vec<String>, String> {
         let mut context_parts = Vec::new();
         for provider in &self.providers {
-            let result = provider.get(self, message)?;
+            let result = provider.get(self, message).await?;
             context_parts.push(format!("[{}]: {}", provider.name(), result.text));
         }
         Ok(context_parts)
     }
 
-    fn run_evaluators(&self, message: &Message, response: &Content) -> Result<(), String> {
+    async fn run_evaluators(&self, message: &Message, response: &Content) -> Result<(), String> {
         for evaluator in &self.evaluators {
-            if evaluator.validate(self, message)? {
-                let _ = evaluator.evaluate(self, message, response)?;
+            if evaluator.validate(self, message).await? {
+                let _ = evaluator.evaluate(self, message, response).await?;
             }
         }
         Ok(())
@@ -619,24 +631,34 @@ mod tests {
         Attachment, AttachmentType, Content, DataValue, Message, MessageRole, TaskResult,
         TaskStatus,
     };
+    use async_trait::async_trait;
     use std::collections::BTreeMap;
+    use std::future::Future;
+    use std::pin::pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
 
     struct StaticModelAdapter;
     struct ToolCallingModelAdapter;
     struct ContextAwareModelAdapter;
+    struct AsyncBoundaryModelAdapter;
 
     struct StaticProvider;
+    struct AsyncProvider;
     struct RecordingEvaluator {
         calls: Arc<Mutex<Vec<String>>>,
     }
+    struct AsyncRecordingEvaluator {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
 
+    #[async_trait]
     impl ModelAdapter for StaticModelAdapter {
         fn provider(&self) -> &str {
             "static"
         }
 
-        fn generate(
+        async fn generate(
             &self,
             config: &AgentConfig,
             request: &ModelGenerateRequest,
@@ -663,12 +685,13 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl ModelAdapter for ToolCallingModelAdapter {
         fn provider(&self) -> &str {
             "tool-calling"
         }
 
-        fn generate(
+        async fn generate(
             &self,
             config: &AgentConfig,
             request: &ModelGenerateRequest,
@@ -732,12 +755,13 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl ModelAdapter for ContextAwareModelAdapter {
         fn provider(&self) -> &str {
             "context-aware"
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _config: &AgentConfig,
             request: &ModelGenerateRequest,
@@ -764,6 +788,40 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelAdapter for AsyncBoundaryModelAdapter {
+        fn provider(&self) -> &str {
+            "async-boundary"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let output = if request.system.contains("[clock]: noon UTC") {
+                "async provider context applied"
+            } else {
+                "async provider context missing"
+            };
+
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: output.into(),
+                    ..Content::default()
+                },
+                tool_calls: None,
+                usage: TokenUsage {
+                    prompt_tokens: 11,
+                    completion_tokens: 13,
+                    total_tokens: 24,
+                },
+                stop_reason: ModelStopReason::End,
+            })
+        }
+    }
+
+    #[async_trait]
     impl Provider for StaticProvider {
         fn name(&self) -> &str {
             "clock"
@@ -773,7 +831,7 @@ mod tests {
             "Provides the current clock context"
         }
 
-        fn get(
+        async fn get(
             &self,
             _runtime: &AgentRuntime,
             _message: &Message,
@@ -785,6 +843,29 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl Provider for AsyncProvider {
+        fn name(&self) -> &str {
+            "clock"
+        }
+
+        fn description(&self) -> &str {
+            "Provides async clock context"
+        }
+
+        async fn get(
+            &self,
+            _runtime: &AgentRuntime,
+            _message: &Message,
+        ) -> Result<ProviderResult, String> {
+            Ok(ProviderResult {
+                text: "noon UTC".into(),
+                metadata: None,
+            })
+        }
+    }
+
+    #[async_trait]
     impl Evaluator for RecordingEvaluator {
         fn name(&self) -> &str {
             "recorder"
@@ -794,11 +875,15 @@ mod tests {
             "Records evaluated responses"
         }
 
-        fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
+        async fn validate(
+            &self,
+            _runtime: &AgentRuntime,
+            _message: &Message,
+        ) -> Result<bool, String> {
             Ok(true)
         }
 
-        fn evaluate(
+        async fn evaluate(
             &self,
             _runtime: &AgentRuntime,
             _message: &Message,
@@ -809,6 +894,54 @@ mod tests {
                 .expect("recording evaluator mutex should not be poisoned")
                 .push(response.text.clone());
             Ok(EvaluatorResult::default())
+        }
+    }
+
+    #[async_trait]
+    impl Evaluator for AsyncRecordingEvaluator {
+        fn name(&self) -> &str {
+            "async-recorder"
+        }
+
+        fn description(&self) -> &str {
+            "Records evaluated responses through async hooks"
+        }
+
+        async fn validate(
+            &self,
+            _runtime: &AgentRuntime,
+            _message: &Message,
+        ) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn evaluate(
+            &self,
+            _runtime: &AgentRuntime,
+            _message: &Message,
+            response: &Content,
+        ) -> Result<EvaluatorResult, String> {
+            self.calls
+                .lock()
+                .expect("recording evaluator mutex should not be poisoned")
+                .push(response.text.clone());
+            Ok(EvaluatorResult::default())
+        }
+    }
+
+    fn block_on<F>(future: F) -> F::Output
+    where
+        F: Future,
+    {
+        let waker = Waker::noop();
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(waker);
+
+        loop {
+            match future.as_mut().poll(&mut context) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
         }
     }
 
@@ -964,10 +1097,10 @@ mod tests {
         let mut runtime = runtime();
         runtime.init();
 
-        let result = runtime.run(Content {
+        let result = block_on(runtime.run(Content {
             text: "Inspect memory state".into(),
             ..Content::default()
-        });
+        }));
         let snapshot = runtime.snapshot();
 
         assert_eq!(result.status, TaskStatus::Success);
@@ -998,10 +1131,10 @@ mod tests {
         let mut runtime = runtime();
         runtime.init();
 
-        runtime.run(Content {
+        block_on(runtime.run(Content {
             text: "Keep one room".into(),
             ..Content::default()
-        });
+        }));
 
         assert_eq!(runtime.messages().len(), 2);
         assert_eq!(runtime.messages()[0].room_id, runtime.messages()[1].room_id);
@@ -1012,22 +1145,24 @@ mod tests {
         let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
         runtime.init();
 
-        let result = runtime.run_with_tools(
+        let result = block_on(runtime.run_with_tools(
             Content {
                 text: "search memory".into(),
                 ..Content::default()
             },
             |_, _, tool_call| {
                 assert_eq!(tool_call.name, "memory_search");
-                TaskResult::success(
-                    Content {
-                        text: "memory hit".into(),
-                        ..Content::default()
-                    },
-                    1,
-                )
+                async move {
+                    TaskResult::success(
+                        Content {
+                            text: "memory hit".into(),
+                            ..Content::default()
+                        },
+                        1,
+                    )
+                }
             },
-        );
+        ));
 
         let snapshot = runtime.snapshot();
         assert_eq!(result.status, TaskStatus::Success);
@@ -1045,36 +1180,42 @@ mod tests {
         let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
         runtime.init();
 
-        let first = runtime.run_with_tools(
+        let first = block_on(runtime.run_with_tools(
             Content {
                 text: "alpha".into(),
                 ..Content::default()
             },
             |_, user_message, _| {
-                TaskResult::success(
-                    Content {
-                        text: format!("{} hit", user_message.content.text),
-                        ..Content::default()
-                    },
-                    1,
-                )
+                let output = format!("{} hit", user_message.content.text);
+                async move {
+                    TaskResult::success(
+                        Content {
+                            text: output,
+                            ..Content::default()
+                        },
+                        1,
+                    )
+                }
             },
-        );
-        let second = runtime.run_with_tools(
+        ));
+        let second = block_on(runtime.run_with_tools(
             Content {
                 text: "beta".into(),
                 ..Content::default()
             },
             |_, user_message, _| {
-                TaskResult::success(
-                    Content {
-                        text: format!("{} hit", user_message.content.text),
-                        ..Content::default()
-                    },
-                    1,
-                )
+                let output = format!("{} hit", user_message.content.text);
+                async move {
+                    TaskResult::success(
+                        Content {
+                            text: output,
+                            ..Content::default()
+                        },
+                        1,
+                    )
+                }
             },
-        );
+        ));
 
         assert_eq!(
             first.data.as_ref().map(|content| content.text.as_str()),
@@ -1091,13 +1232,13 @@ mod tests {
         let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
         runtime.init();
 
-        let result = runtime.run_with_tools(
+        let result = block_on(runtime.run_with_tools(
             Content {
                 text: "search failure".into(),
                 ..Content::default()
             },
-            |_, _, _| TaskResult::error("boom", 3),
-        );
+            |_, _, _| async move { TaskResult::error("boom", 3) },
+        ));
 
         let output = result
             .data
@@ -1123,12 +1264,12 @@ mod tests {
         let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
         runtime.init();
 
-        let result = runtime.run_with_tools(
+        let result = block_on(runtime.run_with_tools(
             Content {
                 text: "shape check".into(),
                 ..Content::default()
             },
-            |_, _, _| {
+            |_, _, _| async move {
                 let mut metadata = BTreeMap::new();
                 metadata.insert("source".into(), DataValue::String("tool".into()));
                 TaskResult::success(
@@ -1144,7 +1285,7 @@ mod tests {
                     2,
                 )
             },
-        );
+        ));
 
         let tool_message = runtime
             .messages()
@@ -1186,10 +1327,10 @@ mod tests {
         runtime.register_provider(Arc::new(StaticProvider));
         runtime.init();
 
-        let result = runtime.run(Content {
+        let result = block_on(runtime.run(Content {
             text: "what time is it".into(),
             ..Content::default()
-        });
+        }));
 
         assert_eq!(result.status, TaskStatus::Success);
         assert_eq!(
@@ -1207,10 +1348,10 @@ mod tests {
         }));
         runtime.init();
 
-        let result = runtime.run(Content {
+        let result = block_on(runtime.run(Content {
             text: "evaluate this".into(),
             ..Content::default()
-        });
+        }));
 
         assert_eq!(result.status, TaskStatus::Success);
         let recorded = calls
@@ -1218,5 +1359,64 @@ mod tests {
             .expect("recording evaluator mutex should not be poisoned");
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0], "researcher handled task: evaluate this");
+    }
+
+    #[test]
+    fn runtime_run_awaits_async_boundaries() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = AgentRuntime::new(config(), Arc::new(AsyncBoundaryModelAdapter));
+        runtime.register_provider(Arc::new(AsyncProvider));
+        runtime.register_evaluator(Arc::new(AsyncRecordingEvaluator {
+            calls: Arc::clone(&calls),
+        }));
+        runtime.init();
+
+        let result = block_on(runtime.run(Content {
+            text: "check async boundaries".into(),
+            ..Content::default()
+        }));
+
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(
+            result.data.as_ref().map(|content| content.text.as_str()),
+            Some("async provider context applied")
+        );
+        assert_eq!(runtime.snapshot().state.token_usage.total_tokens, 24);
+        let recorded = calls
+            .lock()
+            .expect("recording evaluator mutex should not be poisoned");
+        assert_eq!(recorded.as_slice(), ["async provider context applied"]);
+    }
+
+    #[test]
+    fn runtime_run_with_tools_awaits_async_tool_execution() {
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+
+        let result = block_on(runtime.run_with_tools(
+            Content {
+                text: "search memory".into(),
+                ..Content::default()
+            },
+            |_, _, tool_call| {
+                let tool_name = tool_call.name.clone();
+                async move {
+                    assert_eq!(tool_name, "memory_search");
+                    TaskResult::success(
+                        Content {
+                            text: "async memory hit".into(),
+                            ..Content::default()
+                        },
+                        1,
+                    )
+                }
+            },
+        ));
+
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(
+            result.data.as_ref().map(|content| content.text.as_str()),
+            Some("researcher used tool result: async memory hit")
+        );
     }
 }
