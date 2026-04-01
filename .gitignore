@@ -52,6 +52,7 @@ test-output
 
 # superpowers specs
 docs/superpowers
+.superpowers
 
 # git worktrees
 .worktrees
