@@ -1,3 +1,4 @@
+mod agents;
 mod health;
 mod memories;
 
@@ -9,11 +10,22 @@ use crate::state::DaemonState;
 const NOT_FOUND_JSON: &str = "{\"error\":\"not found\"}";
 
 pub(crate) fn route_request(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response {
-    match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/health") | ("GET", "/api/health") => health::handle_health(),
-        ("POST", "/api/memories") => memories::handle_create_memory(request.body, state),
-        ("GET", "/api/memories/search") => memories::handle_search_memories(request.query, state),
-        ("GET", "/api/memories/recent") => memories::handle_recent_memories(request.query, state),
-        _ => Response::json("HTTP/1.1 404 Not Found", NOT_FOUND_JSON.to_string()),
+    if request.method == "GET" && (request.path == "/health" || request.path == "/api/health") {
+        return health::handle_health();
     }
+
+    if request.method == "POST" && request.path == "/api/memories" {
+        return memories::handle_create_memory(request.body, state);
+    }
+
+    if request.method == "GET" && request.path == "/api/memories/search" {
+        return memories::handle_search_memories(request.query, state);
+    }
+
+    if request.method == "GET" && request.path == "/api/memories/recent" {
+        return memories::handle_recent_memories(request.query, state);
+    }
+
+    agents::route_agent_request(request, state)
+        .unwrap_or_else(|| Response::json("HTTP/1.1 404 Not Found", NOT_FOUND_JSON.to_string()))
 }

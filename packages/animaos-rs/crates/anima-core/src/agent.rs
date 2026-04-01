@@ -2,6 +2,27 @@ use std::collections::BTreeMap;
 
 use crate::primitives::{DataValue, UuidString};
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolExample {
+    pub input: String,
+    pub args: BTreeMap<String, DataValue>,
+    pub output: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub parameters: BTreeMap<String, DataValue>,
+    pub examples: Option<Vec<ToolExample>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginDescriptor {
+    pub name: String,
+    pub description: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentSettings {
     pub temperature: Option<f64>,
@@ -23,8 +44,8 @@ pub struct AgentConfig {
     pub style: Option<String>,
     pub provider: Option<String>,
     pub system: Option<String>,
-    pub tools: Option<Vec<String>>,
-    pub plugins: Option<Vec<String>>,
+    pub tools: Option<Vec<ToolDescriptor>>,
+    pub plugins: Option<Vec<PluginDescriptor>>,
     pub settings: Option<AgentSettings>,
 }
 
@@ -35,6 +56,18 @@ pub enum AgentStatus {
     Completed,
     Failed,
     Terminated,
+}
+
+impl AgentStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Terminated => "terminated",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -56,7 +89,11 @@ pub struct AgentState {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentConfig, AgentSettings, AgentState, AgentStatus, TokenUsage};
+    use super::{
+        AgentConfig, AgentSettings, AgentState, AgentStatus, PluginDescriptor, TokenUsage,
+        ToolDescriptor,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn agent_state_keeps_ts_shape_fields() {
@@ -71,8 +108,16 @@ mod tests {
             style: None,
             provider: Some("openai".into()),
             system: None,
-            tools: Some(vec!["search".into()]),
-            plugins: Some(vec!["notes".into()]),
+            tools: Some(vec![ToolDescriptor {
+                name: "search".into(),
+                description: "Search the web".into(),
+                parameters: BTreeMap::new(),
+                examples: None,
+            }]),
+            plugins: Some(vec![PluginDescriptor {
+                name: "notes".into(),
+                description: "Workspace notes".into(),
+            }]),
             settings: Some(AgentSettings {
                 temperature: Some(0.2),
                 ..AgentSettings::default()
@@ -91,5 +136,13 @@ mod tests {
         assert_eq!(state.name, "researcher");
         assert_eq!(state.status, AgentStatus::Idle);
         assert_eq!(state.config.model, "gpt-5.4");
+        assert_eq!(
+            state
+                .config
+                .tools
+                .as_ref()
+                .map(|tools| tools[0].name.as_str()),
+            Some("search")
+        );
     }
 }

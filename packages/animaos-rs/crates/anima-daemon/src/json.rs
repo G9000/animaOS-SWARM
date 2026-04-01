@@ -3,7 +3,7 @@ use std::str;
 
 pub(crate) enum JsonValue {
     Null,
-    Bool,
+    Bool(bool),
     Number(f64),
     String(String),
     Array(Vec<JsonValue>),
@@ -55,11 +55,11 @@ impl<'a> JsonParser<'a> {
             }
             Some(b't') => {
                 self.expect_literal("true")?;
-                Ok(JsonValue::Bool)
+                Ok(JsonValue::Bool(true))
             }
             Some(b'f') => {
                 self.expect_literal("false")?;
-                Ok(JsonValue::Bool)
+                Ok(JsonValue::Bool(false))
             }
             _ => Err(()),
         }
