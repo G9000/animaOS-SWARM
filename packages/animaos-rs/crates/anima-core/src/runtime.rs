@@ -153,7 +153,7 @@ impl AgentRuntime {
         mut execute_tool: F,
     ) -> TaskResult<Content>
     where
-        F: FnMut(&AgentState, &Message, &ToolCall) -> Fut,
+        F: FnMut(AgentState, Message, ToolCall) -> Fut,
         Fut: Future<Output = TaskResult<Content>>,
     {
         let start = now_millis();
@@ -265,8 +265,12 @@ impl AgentRuntime {
                                     tool_event_data(&tool_call.name, "running", 0),
                                 );
                                 let tool_started = now_millis();
-                                let tool_result =
-                                    execute_tool(&self.state, &user_message, &tool_call).await;
+                                let tool_result = execute_tool(
+                                    self.state.clone(),
+                                    user_message.clone(),
+                                    tool_call.clone(),
+                                )
+                                .await;
                                 let tool_duration = now_millis().saturating_sub(tool_started);
                                 self.record_event(
                                     EventType::ToolAfter,
@@ -622,7 +626,7 @@ fn next_id(prefix: &str, counter: &AtomicU64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{data_value_json, AgentRuntime};
-    use crate::agent::{AgentConfig, AgentStatus, TokenUsage, ToolDescriptor};
+    use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage, ToolDescriptor};
     use crate::components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
     use crate::model::{
         ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
@@ -632,11 +636,10 @@ mod tests {
         TaskStatus,
     };
     use async_trait::async_trait;
+    use futures::executor::block_on;
     use std::collections::BTreeMap;
-    use std::future::Future;
-    use std::pin::pin;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Waker};
+    use std::task::{Context, Poll};
 
     struct StaticModelAdapter;
     struct ToolCallingModelAdapter;
@@ -650,6 +653,10 @@ mod tests {
     }
     struct AsyncRecordingEvaluator {
         calls: Arc<Mutex<Vec<String>>>,
+    }
+    struct PendingOnce<T> {
+        value: Option<T>,
+        pending: bool,
     }
 
     #[async_trait]
@@ -929,18 +936,28 @@ mod tests {
         }
     }
 
-    fn block_on<F>(future: F) -> F::Output
-    where
-        F: Future,
-    {
-        let waker = Waker::noop();
-        let mut future = pin!(future);
-        let mut context = Context::from_waker(waker);
+    impl<T: Unpin> std::future::Future for PendingOnce<T> {
+        type Output = T;
 
-        loop {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => std::thread::yield_now(),
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<Self::Output> {
+            if self.pending {
+                self.pending = false;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(self.value.take().expect("pending-once value should exist"))
+            }
+        }
+    }
+
+    impl<T> PendingOnce<T> {
+        fn new(value: T) -> Self {
+            Self {
+                value: Some(value),
+                pending: true,
             }
         }
     }
@@ -1417,6 +1434,40 @@ mod tests {
         assert_eq!(
             result.data.as_ref().map(|content| content.text.as_str()),
             Some("researcher used tool result: async memory hit")
+        );
+    }
+
+    #[test]
+    fn runtime_run_with_tools_supports_owned_inputs_across_pending_await() {
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+
+        let result = block_on(runtime.run_with_tools(
+            Content {
+                text: "search memory".into(),
+                ..Content::default()
+            },
+            |state: AgentState, message: Message, tool_call: ToolCall| async move {
+                let rendered = PendingOnce::new(format!(
+                    "{}:{}:{}",
+                    state.name, message.content.text, tool_call.name
+                ))
+                .await;
+
+                TaskResult::success(
+                    Content {
+                        text: rendered,
+                        ..Content::default()
+                    },
+                    1,
+                )
+            },
+        ));
+
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(
+            result.data.as_ref().map(|content| content.text.as_str()),
+            Some("researcher used tool result: researcher:search memory:memory_search")
         );
     }
 }
