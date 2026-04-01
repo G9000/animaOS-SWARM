@@ -2,6 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use anima_daemon::{Daemon, DaemonConfig};
+use futures::executor::block_on;
 
 fn main() -> io::Result<()> {
     let host = std::env::var("ANIMAOS_RS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
@@ -23,7 +24,7 @@ fn main() -> io::Result<()> {
     let local_addr = daemon.local_addr()?;
     println!("anima-daemon listening on http://{local_addr}");
 
-    daemon.serve()
+    block_on(daemon.serve())
 }
 
 fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {

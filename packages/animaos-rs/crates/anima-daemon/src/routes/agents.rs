@@ -11,24 +11,24 @@ use crate::http::{Request, Response};
 use crate::json::{escape_json, JsonParser, JsonValue};
 use crate::state::DaemonState;
 
-pub(crate) fn route_agent_request(
+pub(crate) async fn route_agent_request(
     request: Request,
     state: &Arc<Mutex<DaemonState>>,
 ) -> Option<Response> {
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/api/agents") => Some(handle_create_agent(request.body, state)),
         ("GET", "/api/agents") => Some(handle_list_agents(state)),
-        _ => route_agent_path(request, state),
+        _ => route_agent_path(request, state).await,
     }
 }
 
-fn route_agent_path(request: Request, state: &Arc<Mutex<DaemonState>>) -> Option<Response> {
+async fn route_agent_path(request: Request, state: &Arc<Mutex<DaemonState>>) -> Option<Response> {
     let path = request.path.strip_prefix("/api/agents/")?;
     let segments: Vec<_> = path.split('/').collect();
 
     match (request.method.as_str(), segments.as_slice()) {
         ("GET", [agent_id]) => Some(handle_get_agent(agent_id, state)),
-        ("POST", [agent_id, "run"]) => Some(handle_run_agent(agent_id, request.body, state)),
+        ("POST", [agent_id, "run"]) => Some(handle_run_agent(agent_id, request.body, state).await),
         ("GET", [agent_id, "memories", "recent"]) => {
             Some(handle_recent_agent_memories(agent_id, request.query, state))
         }
@@ -147,7 +147,7 @@ pub(crate) fn handle_recent_agent_memories(
     }
 }
 
-pub(crate) fn handle_run_agent(
+pub(crate) async fn handle_run_agent(
     agent_id: &str,
     body: Vec<u8>,
     state: &Arc<Mutex<DaemonState>>,
@@ -181,7 +181,7 @@ pub(crate) fn handle_run_agent(
         let mut guard = state
             .lock()
             .expect("daemon state mutex should not be poisoned");
-        guard.run_agent(agent_id, content)
+        guard.run_agent(agent_id, content).await
     };
 
     match run_result {

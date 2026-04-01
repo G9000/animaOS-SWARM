@@ -8,7 +8,6 @@ use anima_core::{
 };
 use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
 use anima_swarm::SwarmCoordinator;
-use futures::executor::block_on;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::model::DeterministicModelAdapter;
@@ -86,17 +85,17 @@ impl DaemonState {
         )
     }
 
-    pub(crate) fn run_agent(
+    pub(crate) async fn run_agent(
         &mut self,
         agent_id: &str,
         input: Content,
     ) -> Option<(AgentRuntimeSnapshot, TaskResult<Content>)> {
         let mut runtime = self.agents.remove(agent_id)?;
-        let result = block_on(
-            runtime.run_with_tools(input, |agent, user_message, tool_call| {
+        let result = runtime
+            .run_with_tools(input, |agent, user_message, tool_call| {
                 ready(self.execute_tool(agent, user_message, tool_call))
-            }),
-        );
+            })
+            .await;
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;

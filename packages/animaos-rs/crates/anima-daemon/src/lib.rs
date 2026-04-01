@@ -56,27 +56,27 @@ impl Daemon {
         self.listener.local_addr()
     }
 
-    pub fn serve_one(self) -> io::Result<()> {
-        self.serve_n(1)
+    pub async fn serve_one(self) -> io::Result<()> {
+        self.serve_n(1).await
     }
 
-    pub fn serve_n(self, limit: usize) -> io::Result<()> {
+    pub async fn serve_n(self, limit: usize) -> io::Result<()> {
         for _ in 0..limit {
             let (stream, _) = self.listener.accept()?;
-            handle_connection(stream, &self.state, self.config)?;
+            handle_connection(stream, &self.state, self.config).await?;
         }
         Ok(())
     }
 
-    pub fn serve(self) -> io::Result<()> {
+    pub async fn serve(self) -> io::Result<()> {
         for stream in self.listener.incoming() {
-            handle_connection(stream?, &self.state, self.config)?;
+            handle_connection(stream?, &self.state, self.config).await?;
         }
         Ok(())
     }
 }
 
-fn handle_connection(
+async fn handle_connection(
     mut stream: TcpStream,
     state: &Arc<Mutex<DaemonState>>,
     config: DaemonConfig,
@@ -102,7 +102,7 @@ fn handle_connection(
             return Ok(());
         }
     };
-    let response = route_request(request, state);
+    let response = route_request(request, state).await;
 
     write_http_response(&mut stream, response)
 }

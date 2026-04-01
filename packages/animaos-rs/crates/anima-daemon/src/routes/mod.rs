@@ -9,7 +9,7 @@ use crate::state::DaemonState;
 
 const NOT_FOUND_JSON: &str = "{\"error\":\"not found\"}";
 
-pub(crate) fn route_request(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response {
+pub(crate) async fn route_request(request: Request, state: &Arc<Mutex<DaemonState>>) -> Response {
     if request.method == "GET" && (request.path == "/health" || request.path == "/api/health") {
         return health::handle_health();
     }
@@ -27,5 +27,6 @@ pub(crate) fn route_request(request: Request, state: &Arc<Mutex<DaemonState>>) -
     }
 
     agents::route_agent_request(request, state)
+        .await
         .unwrap_or_else(|| Response::json("HTTP/1.1 404 Not Found", NOT_FOUND_JSON.to_string()))
 }
