@@ -9,6 +9,8 @@ authors.workspace = true
 anima-core = { path = "../anima-core" }
 anima-memory = { path = "../anima-memory" }
 anima-swarm = { path = "../anima-swarm" }
+async-trait = "0.1"
+futures = "0.3"
 
 [lints]
 workspace = true

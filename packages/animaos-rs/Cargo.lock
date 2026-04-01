@@ -17,6 +17,8 @@ dependencies = [
  "anima-core",
  "anima-memory",
  "anima-swarm",
+ "async-trait",
+ "futures",
 ]
 
 [[package]]

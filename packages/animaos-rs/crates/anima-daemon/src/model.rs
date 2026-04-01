@@ -2,16 +2,18 @@ use anima_core::{
     AgentConfig, Content, DataValue, MessageRole, ModelAdapter, ModelGenerateRequest,
     ModelGenerateResponse, ModelStopReason, TokenUsage, ToolCall,
 };
+use async_trait::async_trait;
 use std::collections::BTreeMap;
 
 pub(crate) struct DeterministicModelAdapter;
 
+#[async_trait]
 impl ModelAdapter for DeterministicModelAdapter {
     fn provider(&self) -> &str {
         "deterministic"
     }
 
-    fn generate(
+    async fn generate(
         &self,
         config: &AgentConfig,
         request: &ModelGenerateRequest,
@@ -345,6 +347,7 @@ mod tests {
         AgentConfig, Content, DataValue, Message, MessageRole, ModelAdapter, ModelGenerateRequest,
         TaskResult,
     };
+    use futures::executor::block_on;
     use std::collections::BTreeMap;
 
     #[test]
@@ -377,8 +380,7 @@ mod tests {
             max_tokens: None,
         };
 
-        let response = adapter
-            .generate(&config_with_memory_search(), &request)
+        let response = block_on(adapter.generate(&config_with_memory_search(), &request))
             .expect("adapter should generate");
 
         assert!(

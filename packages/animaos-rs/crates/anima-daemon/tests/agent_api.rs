@@ -435,6 +435,57 @@ fn run_agent_uses_recent_memory_provider_context() {
 }
 
 #[test]
+fn run_agent_reuses_async_runtime_state_across_provider_and_tool_paths() {
+    let (addr, server) = spawn_daemon(5);
+    let create_response = create_agent(
+        addr,
+        r#"{"name":"operator","model":"gpt-5.4","tools":[{"name":"recent_memories","description":"List recent memories","parameters":{"limit":{"type":"number"}}}]}"#,
+    );
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let memory_body = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"operator\",\"type\":\"fact\",\"content\":\"provider context memory\",\"importance\":0.8}}"
+    );
+    let memory_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        memory_body.len(),
+        memory_body
+    );
+    let _ = send_request(addr, &memory_request);
+
+    let provider_run = run_agent(addr, &agent_id, r#"{"text":"recall context"}"#);
+    let tool_run = run_agent(addr, &agent_id, r#"{"text":"recent 1"}"#);
+    let recent_response = send_request(
+        addr,
+        &format!(
+            "GET /api/agents/{agent_id}/memories/recent?limit=3 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    server.join().expect("server thread joins");
+
+    assert!(
+        provider_run.starts_with("HTTP/1.1 200 OK"),
+        "unexpected provider run response: {provider_run}"
+    );
+    assert!(
+        provider_run.contains("operator recalled context: provider context memory"),
+        "provider-backed response should include injected memory context: {provider_run}"
+    );
+    assert!(
+        tool_run.starts_with("HTTP/1.1 200 OK"),
+        "unexpected tool run response: {tool_run}"
+    );
+    assert!(
+        tool_run.contains("provider context memory"),
+        "tool-backed response should include the recent memory result: {tool_run}"
+    );
+    assert!(
+        recent_response.contains("\"type\":\"reflection\""),
+        "follow-up runs should still persist evaluator reflection memory: {recent_response}"
+    );
+}
+
+#[test]
 fn run_agent_persists_reflection_memory_from_evaluator() {
     let (addr, server) = spawn_daemon(3);
     let create_response = create_agent(addr, r#"{"name":"operator","model":"gpt-5.4"}"#);

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::ready;
 use std::sync::{Arc, Mutex};
 
 use anima_core::{
@@ -7,6 +8,7 @@ use anima_core::{
 };
 use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
 use anima_swarm::SwarmCoordinator;
+use futures::executor::block_on;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::model::DeterministicModelAdapter;
@@ -90,9 +92,11 @@ impl DaemonState {
         input: Content,
     ) -> Option<(AgentRuntimeSnapshot, TaskResult<Content>)> {
         let mut runtime = self.agents.remove(agent_id)?;
-        let result = runtime.run_with_tools(input, |agent, user_message, tool_call| {
-            self.execute_tool(agent, user_message, tool_call)
-        });
+        let result = block_on(
+            runtime.run_with_tools(input, |agent, user_message, tool_call| {
+                ready(self.execute_tool(agent, user_message, tool_call))
+            }),
+        );
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;
@@ -118,13 +122,13 @@ impl DaemonState {
 
     fn execute_tool(
         &mut self,
-        agent: &AgentState,
-        user_message: &Message,
-        tool_call: &ToolCall,
+        agent: AgentState,
+        user_message: Message,
+        tool_call: ToolCall,
     ) -> TaskResult<Content> {
         let handler = self.tool_registry.lookup(&tool_call.name);
         match handler {
-            Some(handler) => handler(self, agent, user_message, tool_call),
+            Some(handler) => handler(self, &agent, &user_message, &tool_call),
             None => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
         }
     }

@@ -5,6 +5,7 @@ use anima_core::{
     AgentRuntime, Content, DataValue, Evaluator, EvaluatorResult, Message, Provider, ProviderResult,
 };
 use anima_memory::{MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
+use async_trait::async_trait;
 
 pub(crate) fn default_providers(memory: Arc<Mutex<MemoryManager>>) -> Vec<Arc<dyn Provider>> {
     vec![Arc::new(RecentMemoriesProvider { memory })]
@@ -18,6 +19,7 @@ struct RecentMemoriesProvider {
     memory: Arc<Mutex<MemoryManager>>,
 }
 
+#[async_trait]
 impl Provider for RecentMemoriesProvider {
     fn name(&self) -> &str {
         "recent_memories"
@@ -27,7 +29,11 @@ impl Provider for RecentMemoriesProvider {
         "Provides the agent's recent memories as run context"
     }
 
-    fn get(&self, runtime: &AgentRuntime, _message: &Message) -> Result<ProviderResult, String> {
+    async fn get(
+        &self,
+        runtime: &AgentRuntime,
+        _message: &Message,
+    ) -> Result<ProviderResult, String> {
         let memories = self
             .memory
             .lock()
@@ -62,6 +68,7 @@ struct ReflectionMemoryEvaluator {
     memory: Arc<Mutex<MemoryManager>>,
 }
 
+#[async_trait]
 impl Evaluator for ReflectionMemoryEvaluator {
     fn name(&self) -> &str {
         "reflection_memory"
@@ -71,11 +78,11 @@ impl Evaluator for ReflectionMemoryEvaluator {
         "Persists a reflection memory for each completed response"
     }
 
-    fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
-    fn evaluate(
+    async fn evaluate(
         &self,
         runtime: &AgentRuntime,
         _message: &Message,
