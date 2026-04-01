@@ -57,10 +57,14 @@ pub(crate) fn handle_create_memory(body: Vec<u8>, state: &Arc<Mutex<DaemonState>
     };
 
     let memory = {
-        let mut guard = state
-            .lock()
-            .expect("daemon state mutex should not be poisoned");
-        match guard.memory.add(NewMemory {
+        let memory = {
+            let guard = state
+                .lock()
+                .expect("daemon state mutex should not be poisoned");
+            Arc::clone(&guard.memory)
+        };
+        let mut memory_guard = memory.lock().expect("memory mutex should not be poisoned");
+        match memory_guard.add(NewMemory {
             agent_id,
             agent_name,
             memory_type,
@@ -108,10 +112,14 @@ pub(crate) fn handle_search_memories(
     };
 
     let results = {
-        let guard = state
-            .lock()
-            .expect("daemon state mutex should not be poisoned");
-        guard.memory.search(
+        let memory = {
+            let guard = state
+                .lock()
+                .expect("daemon state mutex should not be poisoned");
+            Arc::clone(&guard.memory)
+        };
+        let memory_guard = memory.lock().expect("memory mutex should not be poisoned");
+        memory_guard.search(
             &search_query,
             MemorySearchOptions {
                 agent_id: query.get("agentId").cloned(),
@@ -139,10 +147,14 @@ pub(crate) fn handle_recent_memories(
     };
 
     let memories = {
-        let guard = state
-            .lock()
-            .expect("daemon state mutex should not be poisoned");
-        guard.memory.get_recent(RecentMemoryOptions {
+        let memory = {
+            let guard = state
+                .lock()
+                .expect("daemon state mutex should not be poisoned");
+            Arc::clone(&guard.memory)
+        };
+        let memory_guard = memory.lock().expect("memory mutex should not be poisoned");
+        memory_guard.get_recent(RecentMemoryOptions {
             agent_id: query.get("agentId").cloned(),
             agent_name: query.get("agentName").cloned(),
             limit,

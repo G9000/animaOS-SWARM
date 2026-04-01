@@ -237,11 +237,30 @@ fn create_agent_rejects_missing_required_fields() {
 }
 
 #[test]
+fn create_agent_rejects_unknown_tools() {
+    let (addr, server) = spawn_daemon(1);
+    let response = create_agent(
+        addr,
+        r#"{"name":"broken-agent","model":"gpt-5.4","tools":["missing_tool"]}"#,
+    );
+    server.join().expect("server thread joins");
+
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("\"error\":\"unknown tool: missing_tool\""),
+        "missing unknown tool error: {response}"
+    );
+}
+
+#[test]
 fn create_agent_accepts_object_tools_and_plugins() {
     let (addr, server) = spawn_daemon(1);
     let response = create_agent(
         addr,
-        r#"{"name":"builder","model":"gpt-5.4","tools":[{"name":"search","description":"Search docs","parameters":{"query":{"type":"string"}}}],"plugins":[{"name":"notes","description":"Workspace notes"}]}"#,
+        r#"{"name":"builder","model":"gpt-5.4","tools":[{"name":"memory_search","description":"Search docs","parameters":{"query":{"type":"string"}}}],"plugins":[{"name":"notes","description":"Workspace notes"}]}"#,
     );
     server.join().expect("server thread joins");
 
@@ -250,12 +269,109 @@ fn create_agent_accepts_object_tools_and_plugins() {
         "unexpected response: {response}"
     );
     assert!(
-        response.contains("\"tools\":[{\"name\":\"search\""),
+        response.contains("\"tools\":[{\"name\":\"memory_search\""),
         "response missing serialized tool object: {response}"
     );
     assert!(
         response.contains("\"plugins\":[{\"name\":\"notes\""),
         "response missing serialized plugin object: {response}"
+    );
+}
+
+#[test]
+fn run_agent_executes_memory_add_tool_round_trip() {
+    let (addr, server) = spawn_daemon(3);
+    let create_response = create_agent(
+        addr,
+        r#"{"name":"reviewer","model":"gpt-5.4","tools":[{"name":"memory_add","description":"Store a memory","parameters":{"content":{"type":"string"},"type":{"type":"string"},"importance":{"type":"number"}}}]}"#,
+    );
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let run_response = run_agent(addr, &agent_id, r#"{"text":"remember ship the patch"}"#);
+    let recent_response = send_request(
+        addr,
+        &format!(
+            "GET /api/agents/{agent_id}/memories/recent HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    server.join().expect("server thread joins");
+
+    assert!(
+        run_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected run response: {run_response}"
+    );
+    assert!(
+        run_response.contains("\"messageCount\":4"),
+        "tool loop should add assistant and tool messages: {run_response}"
+    );
+    assert!(
+        run_response.contains("stored memory"),
+        "tool-backed response should mention stored memory: {run_response}"
+    );
+    assert!(
+        recent_response.contains("\"content\":\"ship the patch\""),
+        "memory_add should persist the raw remembered content: {recent_response}"
+    );
+    assert!(
+        recent_response.contains("\"type\":\"fact\""),
+        "memory_add should create a fact memory by default: {recent_response}"
+    );
+    assert!(
+        recent_response.contains("\"tool-memory-add\""),
+        "memory_add should tag stored memories: {recent_response}"
+    );
+}
+
+#[test]
+fn run_agent_executes_recent_memories_tool_round_trip() {
+    let (addr, server) = spawn_daemon(4);
+    let create_response = create_agent(
+        addr,
+        r#"{"name":"reviewer","model":"gpt-5.4","tools":[{"name":"recent_memories","description":"List recent memories","parameters":{"limit":{"type":"number"}}}]}"#,
+    );
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let older_memory = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"reviewer\",\"type\":\"fact\",\"content\":\"older memory\",\"importance\":0.8}}"
+    );
+    let older_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        older_memory.len(),
+        older_memory
+    );
+    let newer_memory = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"reviewer\",\"type\":\"observation\",\"content\":\"newer memory\",\"importance\":0.8}}"
+    );
+    let newer_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        newer_memory.len(),
+        newer_memory
+    );
+
+    let _ = send_request(addr, &older_request);
+    let _ = send_request(addr, &newer_request);
+    let run_response = run_agent(addr, &agent_id, r#"{"text":"recent 2"}"#);
+    server.join().expect("server thread joins");
+
+    assert!(
+        run_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected run response: {run_response}"
+    );
+    assert!(
+        run_response.contains("\"messageCount\":4"),
+        "tool loop should add assistant and tool messages: {run_response}"
+    );
+    assert!(
+        run_response.contains("newer memory"),
+        "tool-backed response should include newest memory: {run_response}"
+    );
+    assert!(
+        run_response.contains("older memory"),
+        "tool-backed response should include older memory: {run_response}"
+    );
+    assert!(
+        run_response.find("newer memory") < run_response.find("older memory"),
+        "recent_memories should return newest-first order: {run_response}"
     );
 }
 
@@ -286,6 +402,64 @@ fn run_agent_returns_task_result_and_completed_runtime_state() {
     assert!(
         run_response.contains("\"text\":\"operator handled task: Summarize the latest task\""),
         "run response missing deterministic output: {run_response}"
+    );
+}
+
+#[test]
+fn run_agent_uses_recent_memory_provider_context() {
+    let (addr, server) = spawn_daemon(3);
+    let create_response = create_agent(addr, r#"{"name":"operator","model":"gpt-5.4"}"#);
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let memory_body = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"operator\",\"type\":\"fact\",\"content\":\"provider context memory\",\"importance\":0.8}}"
+    );
+    let memory_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        memory_body.len(),
+        memory_body
+    );
+    let _ = send_request(addr, &memory_request);
+
+    let run_response = run_agent(addr, &agent_id, r#"{"text":"recall context"}"#);
+    server.join().expect("server thread joins");
+
+    assert!(
+        run_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected run response: {run_response}"
+    );
+    assert!(
+        run_response.contains("operator recalled context: provider context memory"),
+        "provider-backed response should include injected memory context: {run_response}"
+    );
+}
+
+#[test]
+fn run_agent_persists_reflection_memory_from_evaluator() {
+    let (addr, server) = spawn_daemon(3);
+    let create_response = create_agent(addr, r#"{"name":"operator","model":"gpt-5.4"}"#);
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let run_response = run_agent(addr, &agent_id, r#"{"text":"Reflect on response"}"#);
+    let recent_response = send_request(
+        addr,
+        &format!(
+            "GET /api/agents/{agent_id}/memories/recent?limit=3 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+        ),
+    );
+    server.join().expect("server thread joins");
+
+    assert!(
+        run_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected run response: {run_response}"
+    );
+    assert!(
+        recent_response.contains("\"type\":\"reflection\""),
+        "evaluator should persist a reflection memory: {recent_response}"
+    );
+    assert!(
+        recent_response.contains("evaluated response: operator handled task: Reflect on response"),
+        "reflection memory should include the evaluated response text: {recent_response}"
     );
 }
 

@@ -127,7 +127,13 @@ impl MemoryManager {
             .cloned()
             .collect();
 
-        memories.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        memories.sort_by(|left, right| {
+            right.created_at.cmp(&left.created_at).then_with(|| {
+                memory_id_sequence(&right.id)
+                    .cmp(&memory_id_sequence(&left.id))
+                    .then_with(|| right.id.cmp(&left.id))
+            })
+        });
         memories.truncate(opts.limit.unwrap_or(20));
         memories
     }
@@ -231,4 +237,11 @@ fn now_millis() -> u128 {
 fn next_memory_id() -> String {
     let next = NEXT_MEMORY_ID.fetch_add(1, Ordering::Relaxed);
     format!("mem-{}-{next}", now_millis())
+}
+
+fn memory_id_sequence(id: &str) -> u64 {
+    id.rsplit('-')
+        .next()
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
 }

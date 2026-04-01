@@ -1,8 +1,10 @@
+mod components;
 mod http;
 mod json;
 mod model;
 mod routes;
 mod state;
+mod tools;
 
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};

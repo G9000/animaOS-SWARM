@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod components;
 pub mod events;
 pub mod model;
 pub mod primitives;
@@ -8,6 +9,7 @@ pub use agent::{
     AgentConfig, AgentSettings, AgentState, AgentStatus, PluginDescriptor, TokenUsage,
     ToolDescriptor, ToolExample,
 };
+pub use components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
 pub use events::{EngineEvent, EventType};
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,

@@ -66,7 +66,15 @@ pub(crate) fn handle_create_agent(body: Vec<u8>, state: &Arc<Mutex<DaemonState>>
         let mut guard = state
             .lock()
             .expect("daemon state mutex should not be poisoned");
-        guard.create_agent(config)
+        match guard.create_agent(config) {
+            Ok(snapshot) => snapshot,
+            Err(message) => {
+                return Response::json(
+                    "HTTP/1.1 400 Bad Request",
+                    format!("{{\"error\":\"{}\"}}", escape_json(&message)),
+                )
+            }
+        }
     };
 
     Response::json(

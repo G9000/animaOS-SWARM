@@ -404,6 +404,32 @@ fn get_recent_returns_newest_first() {
 }
 
 #[test]
+fn get_recent_breaks_same_timestamp_ties_by_insertion_order() {
+    let mut manager = MemoryManager::new();
+    let first = add_memory(&mut manager, base(|memory| memory.content = "first".into()));
+    let second = add_memory(
+        &mut manager,
+        base(|memory| memory.content = "second".into()),
+    );
+
+    manager
+        .memories
+        .get_mut(&first.id)
+        .expect("first memory should exist")
+        .created_at = 100;
+    manager
+        .memories
+        .get_mut(&second.id)
+        .expect("second memory should exist")
+        .created_at = 100;
+
+    let recent = manager.get_recent(RecentMemoryOptions::default());
+
+    assert_eq!(recent[0].content, "second");
+    assert_eq!(recent[1].content, "first");
+}
+
+#[test]
 fn get_recent_respects_limit() {
     let mut manager = MemoryManager::new();
     add_memory(&mut manager, base(|memory| memory.content = "a".into()));

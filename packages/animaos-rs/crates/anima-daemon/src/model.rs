@@ -27,6 +27,7 @@ impl ModelAdapter for DeterministicModelAdapter {
             .find(|message| matches!(message.role, MessageRole::User))
             .map(|message| message.content.text.as_str())
             .unwrap_or("");
+        let recent_context = recent_memory_context(&request.system);
 
         if !tool_results.is_empty() {
             let output_text = format!("{} handled task: {}", config.name, tool_results.join("\n"));
@@ -54,11 +55,107 @@ impl ModelAdapter for DeterministicModelAdapter {
             });
         }
 
-        if config
-            .tools
-            .as_ref()
-            .is_some_and(|tools| tools.iter().any(|tool| tool.name == "memory_search"))
-        {
+        if input.eq_ignore_ascii_case("recall context") {
+            if let Some(context) = recent_context {
+                let output_text = format!("{} recalled context: {}", config.name, context);
+                let prompt_tokens = count_tokens(&request.system)
+                    + request
+                        .messages
+                        .iter()
+                        .map(|message| count_tokens(&message.content.text))
+                        .sum::<u64>();
+                let completion_tokens = count_tokens(&output_text);
+
+                return Ok(ModelGenerateResponse {
+                    content: Content {
+                        text: output_text,
+                        attachments: None,
+                        metadata: None,
+                    },
+                    tool_calls: None,
+                    usage: TokenUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    },
+                    stop_reason: ModelStopReason::End,
+                });
+            }
+        }
+
+        if has_tool(config, "memory_add") {
+            if let Some(content) = input
+                .strip_prefix("remember ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let mut args = BTreeMap::new();
+                args.insert("content".into(), DataValue::String(content.to_string()));
+                args.insert("type".into(), DataValue::String("fact".into()));
+                args.insert("importance".into(), DataValue::Number(0.8));
+
+                let prompt_tokens = count_tokens(&request.system)
+                    + request
+                        .messages
+                        .iter()
+                        .map(|message| count_tokens(&message.content.text))
+                        .sum::<u64>();
+
+                return Ok(ModelGenerateResponse {
+                    content: Content {
+                        text: "storing memory".into(),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    tool_calls: Some(vec![ToolCall {
+                        id: format!("tool-call-add-{}", count_tokens(input)),
+                        name: "memory_add".into(),
+                        args,
+                    }]),
+                    usage: TokenUsage {
+                        prompt_tokens,
+                        completion_tokens: 1,
+                        total_tokens: prompt_tokens + 1,
+                    },
+                    stop_reason: ModelStopReason::ToolCall,
+                });
+            }
+        }
+
+        if has_tool(config, "recent_memories") {
+            if let Some(limit) = parse_recent_limit(input) {
+                let mut args = BTreeMap::new();
+                args.insert("limit".into(), DataValue::Number(limit as f64));
+
+                let prompt_tokens = count_tokens(&request.system)
+                    + request
+                        .messages
+                        .iter()
+                        .map(|message| count_tokens(&message.content.text))
+                        .sum::<u64>();
+
+                return Ok(ModelGenerateResponse {
+                    content: Content {
+                        text: "loading recent memories".into(),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    tool_calls: Some(vec![ToolCall {
+                        id: format!("tool-call-recent-{}", count_tokens(input)),
+                        name: "recent_memories".into(),
+                        args,
+                    }]),
+                    usage: TokenUsage {
+                        prompt_tokens,
+                        completion_tokens: 1,
+                        total_tokens: prompt_tokens + 1,
+                    },
+                    stop_reason: ModelStopReason::ToolCall,
+                });
+            }
+        }
+
+        if has_tool(config, "memory_search") {
             let mut args = BTreeMap::new();
             args.insert("query".into(), DataValue::String(input.to_string()));
 
@@ -118,6 +215,35 @@ impl ModelAdapter for DeterministicModelAdapter {
 fn count_tokens(value: &str) -> u64 {
     let count = value.split_whitespace().count() as u64;
     count.max(1)
+}
+
+fn has_tool(config: &AgentConfig, tool_name: &str) -> bool {
+    config
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|tool| tool.name == tool_name))
+}
+
+fn parse_recent_limit(input: &str) -> Option<u64> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("recent") {
+        return None;
+    }
+
+    let suffix = trimmed["recent".len()..].trim();
+    if suffix.is_empty() {
+        return Some(3);
+    }
+
+    suffix.parse::<u64>().ok().filter(|value| *value > 0)
+}
+
+fn recent_memory_context(system: &str) -> Option<String> {
+    system
+        .lines()
+        .find_map(|line| line.strip_prefix("[recent_memories]: "))
+        .filter(|value| !value.is_empty() && *value != "no recent memories")
+        .map(ToString::to_string)
 }
 
 fn trailing_tool_messages(messages: &[anima_core::Message]) -> Vec<&anima_core::Message> {

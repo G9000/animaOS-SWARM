@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage};
+use crate::components::{Evaluator, Provider};
 use crate::events::{EngineEvent, EventType};
 use crate::model::{ModelAdapter, ModelGenerateRequest, ModelStopReason, ToolCall};
 use crate::primitives::{Content, DataValue, Message, MessageRole, TaskResult, TaskStatus};
@@ -26,6 +27,8 @@ pub struct AgentRuntime {
     messages: Vec<Message>,
     last_task: Option<TaskResult<Content>>,
     events: Vec<EngineEvent>,
+    providers: Vec<Arc<dyn Provider>>,
+    evaluators: Vec<Arc<dyn Evaluator>>,
     model_adapter: Arc<dyn ModelAdapter>,
 }
 
@@ -46,6 +49,8 @@ impl AgentRuntime {
             messages: Vec::new(),
             last_task: None,
             events: Vec::new(),
+            providers: Vec::new(),
+            evaluators: Vec::new(),
             model_adapter,
         }
     }
@@ -84,6 +89,22 @@ impl AgentRuntime {
 
     pub fn events(&self) -> &[EngineEvent] {
         &self.events
+    }
+
+    pub fn register_provider(&mut self, provider: Arc<dyn Provider>) {
+        self.providers.push(provider);
+    }
+
+    pub fn set_providers(&mut self, providers: Vec<Arc<dyn Provider>>) {
+        self.providers = providers;
+    }
+
+    pub fn register_evaluator(&mut self, evaluator: Arc<dyn Evaluator>) {
+        self.evaluators.push(evaluator);
+    }
+
+    pub fn set_evaluators(&mut self, evaluators: Vec<Arc<dyn Evaluator>>) {
+        self.evaluators = evaluators;
     }
 
     pub fn last_task(&self) -> Option<&TaskResult<Content>> {
@@ -131,12 +152,23 @@ impl AgentRuntime {
         let room_id = next_id("room", &NEXT_ROOM_ID);
         self.mark_running();
         let user_message = self.record_message_in_room(room_id.clone(), MessageRole::User, input);
+        let context_parts = match self.build_provider_context(&user_message) {
+            Ok(context_parts) => context_parts,
+            Err(error) => {
+                let duration_ms = now_millis().saturating_sub(start);
+                self.mark_failed(error, duration_ms);
+                return self
+                    .last_task
+                    .clone()
+                    .unwrap_or_else(|| TaskResult::error("provider context failed", duration_ms));
+            }
+        };
         let mut conversation = vec![user_message.clone()];
         let mut iterations = 0;
 
         loop {
             let request = ModelGenerateRequest {
-                system: self.build_system_prompt(),
+                system: self.build_system_prompt(&context_parts),
                 messages: conversation.clone(),
                 temperature: self
                     .state
@@ -158,6 +190,15 @@ impl AgentRuntime {
 
                     match response.stop_reason {
                         ModelStopReason::End | ModelStopReason::MaxTokens => {
+                            if let Err(error) =
+                                self.run_evaluators(&user_message, &response.content)
+                            {
+                                let duration_ms = now_millis().saturating_sub(start);
+                                self.mark_failed(error, duration_ms);
+                                return self.last_task.clone().unwrap_or_else(|| {
+                                    TaskResult::error("evaluator execution failed", duration_ms)
+                                });
+                            }
                             let duration_ms = now_millis().saturating_sub(start);
                             self.mark_completed_in_room(
                                 room_id.clone(),
@@ -286,7 +327,7 @@ impl AgentRuntime {
         });
     }
 
-    fn build_system_prompt(&self) -> String {
+    fn build_system_prompt(&self, context_parts: &[String]) -> String {
         let mut parts = Vec::new();
 
         if let Some(bio) = &self.state.config.bio {
@@ -345,8 +386,29 @@ impl AgentRuntime {
                 .clone()
                 .unwrap_or_else(|| "You are a helpful task agent.".to_string()),
         );
+        if !context_parts.is_empty() {
+            parts.push(format!("## Context\n{}", context_parts.join("\n")));
+        }
 
         parts.join("\n\n")
+    }
+
+    fn build_provider_context(&self, message: &Message) -> Result<Vec<String>, String> {
+        let mut context_parts = Vec::new();
+        for provider in &self.providers {
+            let result = provider.get(self, message)?;
+            context_parts.push(format!("[{}]: {}", provider.name(), result.text));
+        }
+        Ok(context_parts)
+    }
+
+    fn run_evaluators(&self, message: &Message, response: &Content) -> Result<(), String> {
+        for evaluator in &self.evaluators {
+            if evaluator.validate(self, message)? {
+                let _ = evaluator.evaluate(self, message, response)?;
+            }
+        }
+        Ok(())
     }
 
     fn apply_token_usage(&mut self, usage: &TokenUsage) {
@@ -549,6 +611,7 @@ fn next_id(prefix: &str, counter: &AtomicU64) -> String {
 mod tests {
     use super::{data_value_json, AgentRuntime};
     use crate::agent::{AgentConfig, AgentStatus, TokenUsage, ToolDescriptor};
+    use crate::components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
     use crate::model::{
         ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
     };
@@ -557,10 +620,16 @@ mod tests {
         TaskStatus,
     };
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     struct StaticModelAdapter;
     struct ToolCallingModelAdapter;
+    struct ContextAwareModelAdapter;
+
+    struct StaticProvider;
+    struct RecordingEvaluator {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
 
     impl ModelAdapter for StaticModelAdapter {
         fn provider(&self) -> &str {
@@ -660,6 +729,86 @@ mod tests {
                     args,
                 }]),
             })
+        }
+    }
+
+    impl ModelAdapter for ContextAwareModelAdapter {
+        fn provider(&self) -> &str {
+            "context-aware"
+        }
+
+        fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let output = if request.system.contains("[clock]: noon UTC") {
+                "provider context applied"
+            } else {
+                "provider context missing"
+            };
+
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: output.into(),
+                    ..Content::default()
+                },
+                tool_calls: None,
+                usage: TokenUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                },
+                stop_reason: ModelStopReason::End,
+            })
+        }
+    }
+
+    impl Provider for StaticProvider {
+        fn name(&self) -> &str {
+            "clock"
+        }
+
+        fn description(&self) -> &str {
+            "Provides the current clock context"
+        }
+
+        fn get(
+            &self,
+            _runtime: &AgentRuntime,
+            _message: &Message,
+        ) -> Result<ProviderResult, String> {
+            Ok(ProviderResult {
+                text: "noon UTC".into(),
+                metadata: None,
+            })
+        }
+    }
+
+    impl Evaluator for RecordingEvaluator {
+        fn name(&self) -> &str {
+            "recorder"
+        }
+
+        fn description(&self) -> &str {
+            "Records evaluated responses"
+        }
+
+        fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn evaluate(
+            &self,
+            _runtime: &AgentRuntime,
+            _message: &Message,
+            response: &Content,
+        ) -> Result<EvaluatorResult, String> {
+            self.calls
+                .lock()
+                .expect("recording evaluator mutex should not be poisoned")
+                .push(response.text.clone());
+            Ok(EvaluatorResult::default())
         }
     }
 
@@ -1029,5 +1178,45 @@ mod tests {
             result.data.as_ref().map(|content| content.text.as_str()),
             Some("researcher used tool result: rich tool result")
         );
+    }
+
+    #[test]
+    fn runtime_run_includes_provider_context_in_system_prompt() {
+        let mut runtime = AgentRuntime::new(config(), Arc::new(ContextAwareModelAdapter));
+        runtime.register_provider(Arc::new(StaticProvider));
+        runtime.init();
+
+        let result = runtime.run(Content {
+            text: "what time is it".into(),
+            ..Content::default()
+        });
+
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(
+            result.data.as_ref().map(|content| content.text.as_str()),
+            Some("provider context applied")
+        );
+    }
+
+    #[test]
+    fn runtime_run_executes_evaluators_after_final_response() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = runtime();
+        runtime.register_evaluator(Arc::new(RecordingEvaluator {
+            calls: Arc::clone(&calls),
+        }));
+        runtime.init();
+
+        let result = runtime.run(Content {
+            text: "evaluate this".into(),
+            ..Content::default()
+        });
+
+        assert_eq!(result.status, TaskStatus::Success);
+        let recorded = calls
+            .lock()
+            .expect("recording evaluator mutex should not be poisoned");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], "researcher handled task: evaluate this");
     }
 }
