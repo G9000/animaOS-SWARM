@@ -1,0 +1,14 @@
+[package]
+name = "anima-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anima-core = { path = "../anima-core" }
+anima-memory = { path = "../anima-memory" }
+anima-swarm = { path = "../anima-swarm" }
+
+[lints]
+workspace = true
