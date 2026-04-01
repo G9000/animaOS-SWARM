@@ -1,5 +1,6 @@
 mod http;
 mod json;
+mod model;
 mod routes;
 mod state;
 

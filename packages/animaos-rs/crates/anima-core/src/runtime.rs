@@ -1,13 +1,17 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage};
 use crate::events::{EngineEvent, EventType};
+use crate::model::{ModelAdapter, ModelGenerateRequest, ModelStopReason, ToolCall};
 use crate::primitives::{Content, DataValue, Message, MessageRole, TaskResult};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_ROOM_ID: AtomicU64 = AtomicU64::new(0);
+const MAX_TOOL_ITERATIONS: usize = 8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentRuntimeSnapshot {
@@ -17,16 +21,16 @@ pub struct AgentRuntimeSnapshot {
     pub last_task: Option<TaskResult<Content>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
 pub struct AgentRuntime {
     state: AgentState,
     messages: Vec<Message>,
     last_task: Option<TaskResult<Content>>,
     events: Vec<EngineEvent>,
+    model_adapter: Arc<dyn ModelAdapter>,
 }
 
 impl AgentRuntime {
-    pub fn new(config: AgentConfig) -> Self {
+    pub fn new(config: AgentConfig, model_adapter: Arc<dyn ModelAdapter>) -> Self {
         let agent_id = next_id("agent", &NEXT_AGENT_ID);
         let name = config.name.clone();
 
@@ -42,6 +46,7 @@ impl AgentRuntime {
             messages: Vec::new(),
             last_task: None,
             events: Vec::new(),
+            model_adapter,
         }
     }
 
@@ -113,22 +118,129 @@ impl AgentRuntime {
     }
 
     pub fn run(&mut self, input: Content) -> TaskResult<Content> {
+        self.run_with_tools(input, |_, _, tool_call| {
+            TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0)
+        })
+    }
+
+    pub fn run_with_tools<F>(&mut self, input: Content, mut execute_tool: F) -> TaskResult<Content>
+    where
+        F: FnMut(&AgentState, &Message, &ToolCall) -> TaskResult<Content>,
+    {
         let start = now_millis();
         let room_id = next_id("room", &NEXT_ROOM_ID);
         self.mark_running();
-        self.record_message_in_room(room_id.clone(), MessageRole::User, input.clone());
+        let user_message = self.record_message_in_room(room_id.clone(), MessageRole::User, input);
+        let mut iterations = 0;
 
-        let output = Content {
-            text: format!("{} handled task: {}", self.state.name, input.text),
-            attachments: None,
-            metadata: None,
-        };
+        loop {
+            let request = ModelGenerateRequest {
+                system: self.build_system_prompt(),
+                messages: self.messages.clone(),
+                temperature: self
+                    .state
+                    .config
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.temperature),
+                max_tokens: self
+                    .state
+                    .config
+                    .settings
+                    .as_ref()
+                    .and_then(|settings| settings.max_tokens),
+            };
 
-        let duration_ms = now_millis().saturating_sub(start);
-        self.mark_completed_in_room(room_id, output.clone(), duration_ms);
-        self.last_task
-            .clone()
-            .unwrap_or_else(|| TaskResult::success(output, duration_ms))
+            match self.model_adapter.generate(&self.state.config, &request) {
+                Ok(response) => {
+                    self.apply_token_usage(&response.usage);
+
+                    match response.stop_reason {
+                        ModelStopReason::End | ModelStopReason::MaxTokens => {
+                            let duration_ms = now_millis().saturating_sub(start);
+                            self.mark_completed_in_room(
+                                room_id.clone(),
+                                response.content.clone(),
+                                duration_ms,
+                            );
+                            self.record_token_event();
+                            return self.last_task.clone().unwrap_or_else(|| {
+                                TaskResult::success(response.content, duration_ms)
+                            });
+                        }
+                        ModelStopReason::ToolCall => {
+                            if iterations >= MAX_TOOL_ITERATIONS {
+                                let duration_ms = now_millis().saturating_sub(start);
+                                self.mark_failed("tool iteration limit exceeded", duration_ms);
+                                return self.last_task.clone().unwrap_or_else(|| {
+                                    TaskResult::error("tool iteration limit exceeded", duration_ms)
+                                });
+                            }
+
+                            let Some(tool_calls) = response
+                                .tool_calls
+                                .clone()
+                                .filter(|calls| !calls.is_empty())
+                            else {
+                                let duration_ms = now_millis().saturating_sub(start);
+                                self.mark_failed(
+                                    "model requested tools without tool calls",
+                                    duration_ms,
+                                );
+                                return self.last_task.clone().unwrap_or_else(|| {
+                                    TaskResult::error(
+                                        "model requested tools without tool calls",
+                                        duration_ms,
+                                    )
+                                });
+                            };
+
+                            iterations += 1;
+                            let assistant_content =
+                                content_with_tool_calls(response.content, &tool_calls);
+                            self.record_message_in_room(
+                                room_id.clone(),
+                                MessageRole::Assistant,
+                                assistant_content,
+                            );
+
+                            for tool_call in tool_calls {
+                                self.record_event(
+                                    EventType::ToolBefore,
+                                    tool_event_data(&tool_call.name, "running", 0),
+                                );
+                                let tool_started = now_millis();
+                                let tool_result =
+                                    execute_tool(&self.state, &user_message, &tool_call);
+                                let tool_duration = now_millis().saturating_sub(tool_started);
+                                self.record_event(
+                                    EventType::ToolAfter,
+                                    tool_event_data(
+                                        &tool_call.name,
+                                        tool_result.status.as_str(),
+                                        tool_duration,
+                                    ),
+                                );
+                                self.record_message_in_room(
+                                    room_id.clone(),
+                                    MessageRole::Tool,
+                                    content_from_tool_result(&tool_call, tool_result),
+                                );
+                            }
+
+                            self.record_token_event();
+                        }
+                    }
+                }
+                Err(error) => {
+                    let duration_ms = now_millis().saturating_sub(start);
+                    self.mark_failed(error, duration_ms);
+                    return self.last_task.clone().unwrap_or_else(|| {
+                        TaskResult::error("model generation failed", duration_ms)
+                    });
+                }
+            }
+        }
     }
 
     pub fn mark_running(&mut self) {
@@ -170,6 +282,144 @@ impl AgentRuntime {
             data,
         });
     }
+
+    fn build_system_prompt(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(bio) = &self.state.config.bio {
+            parts.push(format!("## Who You Are\n{bio}"));
+        }
+        if let Some(lore) = &self.state.config.lore {
+            parts.push(format!("## Your Backstory\n{lore}"));
+        }
+        if let Some(adjectives) = self
+            .state
+            .config
+            .adjectives
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
+            parts.push(format!(
+                "## Your Personality\nYou are {}.",
+                adjectives.join(", ")
+            ));
+        }
+        if let Some(topics) = self
+            .state
+            .config
+            .topics
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
+            parts.push(format!(
+                "## Your Expertise\nYou specialize in: {}.",
+                topics.join(", ")
+            ));
+        }
+        if let Some(knowledge) = self
+            .state
+            .config
+            .knowledge
+            .as_ref()
+            .filter(|values| !values.is_empty())
+        {
+            parts.push(format!(
+                "## What You Know\n{}",
+                knowledge
+                    .iter()
+                    .map(|entry| format!("- {entry}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
+        if let Some(style) = &self.state.config.style {
+            parts.push(format!("## How You Communicate\n{style}"));
+        }
+        parts.push(
+            self.state
+                .config
+                .system
+                .clone()
+                .unwrap_or_else(|| "You are a helpful task agent.".to_string()),
+        );
+
+        parts.join("\n\n")
+    }
+
+    fn apply_token_usage(&mut self, usage: &TokenUsage) {
+        self.state.token_usage.prompt_tokens += usage.prompt_tokens;
+        self.state.token_usage.completion_tokens += usage.completion_tokens;
+        self.state.token_usage.total_tokens += usage.total_tokens;
+    }
+
+    fn record_token_event(&mut self) {
+        let mut usage = BTreeMap::new();
+        usage.insert(
+            "promptTokens".to_string(),
+            DataValue::Number(self.state.token_usage.prompt_tokens as f64),
+        );
+        usage.insert(
+            "completionTokens".to_string(),
+            DataValue::Number(self.state.token_usage.completion_tokens as f64),
+        );
+        usage.insert(
+            "totalTokens".to_string(),
+            DataValue::Number(self.state.token_usage.total_tokens as f64),
+        );
+        self.record_event(EventType::AgentTokens, DataValue::Object(usage));
+    }
+}
+
+fn content_with_tool_calls(mut content: Content, tool_calls: &[ToolCall]) -> Content {
+    let mut metadata = content.metadata.take().unwrap_or_default();
+    metadata.insert(
+        "toolCalls".into(),
+        DataValue::Array(
+            tool_calls
+                .iter()
+                .map(|tool_call| {
+                    let mut value = BTreeMap::new();
+                    value.insert("id".into(), DataValue::String(tool_call.id.clone()));
+                    value.insert("name".into(), DataValue::String(tool_call.name.clone()));
+                    value.insert("args".into(), DataValue::Object(tool_call.args.clone()));
+                    DataValue::Object(value)
+                })
+                .collect(),
+        ),
+    );
+    content.metadata = Some(metadata);
+    content
+}
+
+fn content_from_tool_result(tool_call: &ToolCall, result: TaskResult<Content>) -> Content {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("toolCallId".into(), DataValue::String(tool_call.id.clone()));
+
+    match (result.data, result.error) {
+        (Some(mut content), _) => {
+            let content_metadata = content.metadata.get_or_insert_with(BTreeMap::new);
+            content_metadata.extend(metadata);
+            content
+        }
+        (None, Some(error)) => Content {
+            text: error,
+            attachments: None,
+            metadata: Some(metadata),
+        },
+        (None, None) => Content {
+            text: String::new(),
+            attachments: None,
+            metadata: Some(metadata),
+        },
+    }
+}
+
+fn tool_event_data(name: &str, status: &str, duration_ms: u128) -> DataValue {
+    let mut value = BTreeMap::new();
+    value.insert("name".into(), DataValue::String(name.to_string()));
+    value.insert("status".into(), DataValue::String(status.to_string()));
+    value.insert("durationMs".into(), DataValue::Number(duration_ms as f64));
+    DataValue::Object(value)
 }
 
 fn now_millis() -> u128 {
@@ -187,8 +437,115 @@ fn next_id(prefix: &str, counter: &AtomicU64) -> String {
 #[cfg(test)]
 mod tests {
     use super::AgentRuntime;
-    use crate::agent::{AgentConfig, AgentStatus};
-    use crate::primitives::{Content, MessageRole, TaskStatus};
+    use crate::agent::{AgentConfig, AgentStatus, TokenUsage, ToolDescriptor};
+    use crate::model::{
+        ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
+    };
+    use crate::primitives::{Content, MessageRole, TaskResult, TaskStatus};
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    struct StaticModelAdapter;
+    struct ToolCallingModelAdapter;
+
+    impl ModelAdapter for StaticModelAdapter {
+        fn provider(&self) -> &str {
+            "static"
+        }
+
+        fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let input = request
+                .messages
+                .last()
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: format!("{} handled task: {}", config.name, input),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage {
+                    prompt_tokens: 5,
+                    completion_tokens: 7,
+                    total_tokens: 12,
+                },
+                stop_reason: ModelStopReason::End,
+            })
+        }
+    }
+
+    impl ModelAdapter for ToolCallingModelAdapter {
+        fn provider(&self) -> &str {
+            "tool-calling"
+        }
+
+        fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let tool_result = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message.role, MessageRole::Tool))
+                .map(|message| message.content.text.clone());
+
+            if let Some(tool_result) = tool_result {
+                return Ok(ModelGenerateResponse {
+                    content: Content {
+                        text: format!("{} used tool result: {tool_result}", config.name),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    usage: TokenUsage {
+                        prompt_tokens: 2,
+                        completion_tokens: 3,
+                        total_tokens: 5,
+                    },
+                    stop_reason: ModelStopReason::End,
+                    tool_calls: None,
+                });
+            }
+
+            let mut args = BTreeMap::new();
+            args.insert(
+                "query".into(),
+                crate::primitives::DataValue::String(
+                    request
+                        .messages
+                        .last()
+                        .map(|message| message.content.text.clone())
+                        .unwrap_or_default(),
+                ),
+            );
+
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: "searching memories".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                stop_reason: ModelStopReason::ToolCall,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tool-1".into(),
+                    name: "memory_search".into(),
+                    args,
+                }]),
+            })
+        }
+    }
 
     fn config() -> AgentConfig {
         AgentConfig {
@@ -208,9 +565,25 @@ mod tests {
         }
     }
 
+    fn tool_config() -> AgentConfig {
+        AgentConfig {
+            tools: Some(vec![ToolDescriptor {
+                name: "memory_search".into(),
+                description: "Search memories".into(),
+                parameters: BTreeMap::new(),
+                examples: None,
+            }]),
+            ..config()
+        }
+    }
+
+    fn runtime() -> AgentRuntime {
+        AgentRuntime::new(config(), Arc::new(StaticModelAdapter))
+    }
+
     #[test]
     fn runtime_tracks_lifecycle_state() {
-        let mut runtime = AgentRuntime::new(config());
+        let mut runtime = runtime();
         runtime.init();
 
         assert_eq!(runtime.state().status, AgentStatus::Idle);
@@ -241,7 +614,7 @@ mod tests {
 
     #[test]
     fn runtime_records_messages_in_context() {
-        let mut runtime = AgentRuntime::new(config());
+        let mut runtime = runtime();
         runtime.init();
         runtime.record_message(
             MessageRole::User,
@@ -258,7 +631,7 @@ mod tests {
 
     #[test]
     fn runtime_stop_marks_terminated() {
-        let mut runtime = AgentRuntime::new(config());
+        let mut runtime = runtime();
         runtime.init();
         runtime.stop();
 
@@ -276,7 +649,7 @@ mod tests {
 
     #[test]
     fn runtime_run_records_result_and_context() {
-        let mut runtime = AgentRuntime::new(config());
+        let mut runtime = runtime();
         runtime.init();
 
         let result = runtime.run(Content {
@@ -292,12 +665,25 @@ mod tests {
         );
         assert_eq!(snapshot.state.status, AgentStatus::Completed);
         assert_eq!(snapshot.message_count, 2);
-        assert_eq!(snapshot.event_count, 7);
+        assert_eq!(snapshot.event_count, 8);
+        assert_eq!(snapshot.state.token_usage.prompt_tokens, 5);
+        assert_eq!(snapshot.state.token_usage.completion_tokens, 7);
+        assert_eq!(snapshot.state.token_usage.total_tokens, 12);
+        assert!(snapshot.state.token_usage.total_tokens > 0);
+        assert_eq!(
+            runtime
+                .events()
+                .last()
+                .expect("token event should exist")
+                .event_type
+                .as_str(),
+            "agent:tokens"
+        );
     }
 
     #[test]
     fn runtime_run_reuses_one_room_for_conversation_messages() {
-        let mut runtime = AgentRuntime::new(config());
+        let mut runtime = runtime();
         runtime.init();
 
         runtime.run(Content {
@@ -307,5 +693,38 @@ mod tests {
 
         assert_eq!(runtime.messages().len(), 2);
         assert_eq!(runtime.messages()[0].room_id, runtime.messages()[1].room_id);
+    }
+
+    #[test]
+    fn runtime_run_executes_tool_round_trip() {
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+
+        let result = runtime.run_with_tools(
+            Content {
+                text: "search memory".into(),
+                ..Content::default()
+            },
+            |_, _, tool_call| {
+                assert_eq!(tool_call.name, "memory_search");
+                TaskResult::success(
+                    Content {
+                        text: "memory hit".into(),
+                        ..Content::default()
+                    },
+                    1,
+                )
+            },
+        );
+
+        let snapshot = runtime.snapshot();
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(
+            result.data.as_ref().map(|content| content.text.as_str()),
+            Some("researcher used tool result: memory hit")
+        );
+        assert_eq!(snapshot.message_count, 4);
+        assert_eq!(runtime.messages()[0].room_id, runtime.messages()[3].room_id);
+        assert!(snapshot.state.token_usage.total_tokens >= 7);
     }
 }

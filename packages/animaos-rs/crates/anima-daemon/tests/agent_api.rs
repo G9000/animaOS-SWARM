@@ -280,6 +280,10 @@ fn run_agent_returns_task_result_and_completed_runtime_state() {
         "task result should be success: {run_response}"
     );
     assert!(
+        run_response.contains("\"totalTokens\":"),
+        "run response should include token usage: {run_response}"
+    );
+    assert!(
         run_response.contains("\"text\":\"operator handled task: Summarize the latest task\""),
         "run response missing deterministic output: {run_response}"
     );
@@ -308,8 +312,12 @@ fn get_agent_reflects_runtime_context_after_run() {
         "runtime should track user and assistant messages: {get_response}"
     );
     assert!(
-        get_response.contains("\"eventCount\":7"),
+        get_response.contains("\"eventCount\":8"),
         "runtime should track lifecycle and message events: {get_response}"
+    );
+    assert!(
+        !get_response.contains("\"promptTokens\":0,\"completionTokens\":0,\"totalTokens\":0"),
+        "runtime should update token usage after run: {get_response}"
     );
     assert!(
         get_response.contains("\"lastTask\":{"),
@@ -381,5 +389,41 @@ fn run_agent_persists_task_result_memory() {
     assert!(
         recent_response.contains("\"content\":\"operator handled task: Produce final answer\""),
         "run output should be persisted as recent memory: {recent_response}"
+    );
+}
+
+#[test]
+fn run_agent_executes_memory_search_tool_round_trip() {
+    let (addr, server) = spawn_daemon(3);
+    let create_response = create_agent(
+        addr,
+        r#"{"name":"reviewer","model":"gpt-5.4","tools":[{"name":"memory_search","description":"Search memories","parameters":{"query":{"type":"string"}}}]}"#,
+    );
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let memory_body = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"reviewer\",\"type\":\"fact\",\"content\":\"remembered prior answer\",\"importance\":0.8}}"
+    );
+    let memory_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        memory_body.len(),
+        memory_body
+    );
+    let _ = send_request(addr, &memory_request);
+
+    let run_response = run_agent(addr, &agent_id, r#"{"text":"remembered"}"#);
+    server.join().expect("server thread joins");
+
+    assert!(
+        run_response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected run response: {run_response}"
+    );
+    assert!(
+        run_response.contains("\"messageCount\":4"),
+        "tool loop should add assistant and tool messages: {run_response}"
+    );
+    assert!(
+        run_response.contains("remembered prior answer"),
+        "tool-backed response should include memory search result: {run_response}"
     );
 }

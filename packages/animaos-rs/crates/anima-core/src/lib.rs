@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod events;
+pub mod model;
 pub mod primitives;
 pub mod runtime;
 
@@ -8,6 +9,9 @@ pub use agent::{
     ToolDescriptor, ToolExample,
 };
 pub use events::{EngineEvent, EventType};
+pub use model::{
+    ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
+};
 pub use primitives::{
     AgentId, Attachment, AttachmentType, Content, DataValue, HealthStatus, Message, MessageId,
     MessageRole, RoomId, TaskResult, TaskStatus, UuidString, HEALTH_OK_JSON,

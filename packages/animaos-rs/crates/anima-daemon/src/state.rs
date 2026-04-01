@@ -1,26 +1,40 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use anima_core::{AgentConfig, AgentRuntime, AgentRuntimeSnapshot, Content, TaskResult};
-use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
+use anima_core::{
+    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, DataValue, Message,
+    ModelAdapter, TaskResult, ToolCall,
+};
+use anima_memory::{
+    Memory, MemoryManager, MemorySearchOptions, MemoryType, NewMemory, RecentMemoryOptions,
+};
 use anima_swarm::SwarmCoordinator;
+
+use crate::model::DeterministicModelAdapter;
 
 pub(crate) struct DaemonState {
     pub(crate) memory: MemoryManager,
     pub(crate) agents: HashMap<String, AgentRuntime>,
+    pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) _swarm: SwarmCoordinator,
 }
 
 impl DaemonState {
     pub(crate) fn new() -> Self {
+        Self::with_model_adapter(Arc::new(DeterministicModelAdapter))
+    }
+
+    pub(crate) fn with_model_adapter(model_adapter: Arc<dyn ModelAdapter>) -> Self {
         Self {
             memory: MemoryManager::new(),
             agents: HashMap::new(),
+            model_adapter,
             _swarm: SwarmCoordinator::new(),
         }
     }
 
     pub(crate) fn create_agent(&mut self, config: AgentConfig) -> AgentRuntimeSnapshot {
-        let mut runtime = AgentRuntime::new(config);
+        let mut runtime = AgentRuntime::new(config, Arc::clone(&self.model_adapter));
         runtime.init();
         let agent_id = runtime.id().to_string();
         let snapshot = runtime.snapshot();
@@ -62,8 +76,11 @@ impl DaemonState {
         input: Content,
     ) -> Option<(AgentRuntimeSnapshot, TaskResult<Content>)> {
         let (agent_id, agent_name, snapshot, result) = {
+            let memory = &self.memory;
             let runtime = self.agents.get_mut(agent_id)?;
-            let result = runtime.run(input);
+            let result = runtime.run_with_tools(input, |agent, user_message, tool_call| {
+                execute_tool(memory, agent, user_message, tool_call)
+            });
             let snapshot = runtime.snapshot();
             let agent_id = runtime.id().to_string();
             let agent_name = runtime.state().name;
@@ -85,4 +102,73 @@ impl DaemonState {
 
         Some((snapshot, result))
     }
+}
+
+fn execute_tool(
+    memory: &MemoryManager,
+    agent: &AgentState,
+    _user_message: &Message,
+    tool_call: &ToolCall,
+) -> TaskResult<Content> {
+    match tool_call.name.as_str() {
+        "memory_search" => execute_memory_search(memory, agent, tool_call),
+        _ => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
+    }
+}
+
+fn execute_memory_search(
+    memory: &MemoryManager,
+    agent: &AgentState,
+    tool_call: &ToolCall,
+) -> TaskResult<Content> {
+    let query = match tool_call.args.get("query") {
+        Some(DataValue::String(value)) if !value.is_empty() => value.clone(),
+        _ => {
+            return TaskResult::error("memory_search query must be a non-empty string", 0);
+        }
+    };
+
+    let limit = match tool_call.args.get("limit") {
+        Some(DataValue::Number(value))
+            if value.is_finite() && *value >= 1.0 && value.fract() == 0.0 =>
+        {
+            *value as usize
+        }
+        Some(DataValue::Number(_)) | Some(_) => {
+            return TaskResult::error("memory_search limit must be a positive integer", 0);
+        }
+        None => 3,
+    };
+
+    let results = memory.search(
+        &query,
+        MemorySearchOptions {
+            agent_id: Some(agent.id.clone()),
+            limit: Some(limit),
+            ..MemorySearchOptions::default()
+        },
+    );
+
+    let mut metadata = std::collections::BTreeMap::new();
+    metadata.insert("query".into(), DataValue::String(query));
+    metadata.insert("matchCount".into(), DataValue::Number(results.len() as f64));
+
+    let text = if results.is_empty() {
+        "no memory matches".to_string()
+    } else {
+        results
+            .into_iter()
+            .map(|result| result.content)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    TaskResult::success(
+        Content {
+            text,
+            attachments: None,
+            metadata: Some(metadata),
+        },
+        0,
+    )
 }
