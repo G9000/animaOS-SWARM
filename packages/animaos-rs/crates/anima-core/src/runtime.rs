@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage};
 use crate::events::{EngineEvent, EventType};
 use crate::model::{ModelAdapter, ModelGenerateRequest, ModelStopReason, ToolCall};
-use crate::primitives::{Content, DataValue, Message, MessageRole, TaskResult};
+use crate::primitives::{Content, DataValue, Message, MessageRole, TaskResult, TaskStatus};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -131,12 +131,13 @@ impl AgentRuntime {
         let room_id = next_id("room", &NEXT_ROOM_ID);
         self.mark_running();
         let user_message = self.record_message_in_room(room_id.clone(), MessageRole::User, input);
+        let mut conversation = vec![user_message.clone()];
         let mut iterations = 0;
 
         loop {
             let request = ModelGenerateRequest {
                 system: self.build_system_prompt(),
-                messages: self.messages.clone(),
+                messages: conversation.clone(),
                 temperature: self
                     .state
                     .config
@@ -198,11 +199,12 @@ impl AgentRuntime {
                             iterations += 1;
                             let assistant_content =
                                 content_with_tool_calls(response.content, &tool_calls);
-                            self.record_message_in_room(
+                            let assistant_message = self.record_message_in_room(
                                 room_id.clone(),
                                 MessageRole::Assistant,
                                 assistant_content,
                             );
+                            conversation.push(assistant_message);
 
                             for tool_call in tool_calls {
                                 self.record_event(
@@ -221,11 +223,12 @@ impl AgentRuntime {
                                         tool_duration,
                                     ),
                                 );
-                                self.record_message_in_room(
+                                let tool_message = self.record_message_in_room(
                                     room_id.clone(),
                                     MessageRole::Tool,
                                     content_from_tool_result(&tool_call, tool_result),
                                 );
+                                conversation.push(tool_message);
                             }
 
                             self.record_token_event();
@@ -394,23 +397,21 @@ fn content_with_tool_calls(mut content: Content, tool_calls: &[ToolCall]) -> Con
 fn content_from_tool_result(tool_call: &ToolCall, result: TaskResult<Content>) -> Content {
     let mut metadata = BTreeMap::new();
     metadata.insert("toolCallId".into(), DataValue::String(tool_call.id.clone()));
+    let task_result = task_result_data_value(&result);
+    metadata.insert("taskResult".into(), task_result.clone());
 
-    match (result.data, result.error) {
-        (Some(mut content), _) => {
+    if result.status == TaskStatus::Success {
+        if let Some(mut content) = result.data {
             let content_metadata = content.metadata.get_or_insert_with(BTreeMap::new);
             content_metadata.extend(metadata);
-            content
+            return content;
         }
-        (None, Some(error)) => Content {
-            text: error,
-            attachments: None,
-            metadata: Some(metadata),
-        },
-        (None, None) => Content {
-            text: String::new(),
-            attachments: None,
-            metadata: Some(metadata),
-        },
+    }
+
+    Content {
+        text: data_value_json(&task_result),
+        attachments: None,
+        metadata: Some(metadata),
     }
 }
 
@@ -420,6 +421,116 @@ fn tool_event_data(name: &str, status: &str, duration_ms: u128) -> DataValue {
     value.insert("status".into(), DataValue::String(status.to_string()));
     value.insert("durationMs".into(), DataValue::Number(duration_ms as f64));
     DataValue::Object(value)
+}
+
+fn task_result_data_value(result: &TaskResult<Content>) -> DataValue {
+    let mut value = BTreeMap::new();
+    value.insert(
+        "status".into(),
+        DataValue::String(result.status.as_str().to_string()),
+    );
+    value.insert("data".into(), content_data_value(result.data.as_ref()));
+    value.insert(
+        "error".into(),
+        match &result.error {
+            Some(error) => DataValue::String(error.clone()),
+            None => DataValue::Null,
+        },
+    );
+    value.insert(
+        "durationMs".into(),
+        DataValue::Number(result.duration_ms as f64),
+    );
+    DataValue::Object(value)
+}
+
+fn content_data_value(content: Option<&Content>) -> DataValue {
+    let Some(content) = content else {
+        return DataValue::Null;
+    };
+
+    let mut value = BTreeMap::new();
+    value.insert("text".into(), DataValue::String(content.text.clone()));
+    value.insert(
+        "attachments".into(),
+        match content.attachments.as_deref() {
+            Some(attachments) => DataValue::Array(
+                attachments
+                    .iter()
+                    .map(|attachment| {
+                        let mut attachment_value = BTreeMap::new();
+                        attachment_value.insert(
+                            "type".into(),
+                            DataValue::String(match attachment.attachment_type {
+                                crate::primitives::AttachmentType::File => "file".into(),
+                                crate::primitives::AttachmentType::Image => "image".into(),
+                                crate::primitives::AttachmentType::Url => "url".into(),
+                            }),
+                        );
+                        attachment_value
+                            .insert("name".into(), DataValue::String(attachment.name.clone()));
+                        attachment_value
+                            .insert("data".into(), DataValue::String(attachment.data.clone()));
+                        DataValue::Object(attachment_value)
+                    })
+                    .collect(),
+            ),
+            None => DataValue::Null,
+        },
+    );
+    value.insert(
+        "metadata".into(),
+        match &content.metadata {
+            Some(metadata) => DataValue::Object(metadata.clone()),
+            None => DataValue::Null,
+        },
+    );
+    DataValue::Object(value)
+}
+
+fn data_value_json(value: &DataValue) -> String {
+    match value {
+        DataValue::Null => "null".to_string(),
+        DataValue::Bool(value) => value.to_string(),
+        DataValue::Number(value) => value.to_string(),
+        DataValue::String(value) => format!("\"{}\"", escape_json(value)),
+        DataValue::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(data_value_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        DataValue::Object(values) => format!(
+            "{{{}}}",
+            values
+                .iter()
+                .map(|(key, value)| format!("\"{}\":{}", escape_json(key), data_value_json(value)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    }
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::new();
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{08}' => escaped.push_str("\\b"),
+            '\u{0C}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => {
+                escaped.push_str(&format!("\\u{:04x}", u32::from(character)))
+            }
+            character => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn now_millis() -> u128 {
@@ -436,12 +547,15 @@ fn next_id(prefix: &str, counter: &AtomicU64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::AgentRuntime;
+    use super::{data_value_json, AgentRuntime};
     use crate::agent::{AgentConfig, AgentStatus, TokenUsage, ToolDescriptor};
     use crate::model::{
         ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
     };
-    use crate::primitives::{Content, MessageRole, TaskResult, TaskStatus};
+    use crate::primitives::{
+        Attachment, AttachmentType, Content, DataValue, Message, MessageRole, TaskResult,
+        TaskStatus,
+    };
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -490,17 +604,19 @@ mod tests {
             config: &AgentConfig,
             request: &ModelGenerateRequest,
         ) -> Result<ModelGenerateResponse, String> {
-            let tool_result = request
-                .messages
-                .iter()
-                .rev()
-                .find(|message| matches!(message.role, MessageRole::Tool))
-                .map(|message| message.content.text.clone());
+            let tool_result = trailing_tool_messages(&request.messages)
+                .into_iter()
+                .map(render_tool_result_for_model)
+                .collect::<Vec<_>>();
 
-            if let Some(tool_result) = tool_result {
+            if !tool_result.is_empty() {
                 return Ok(ModelGenerateResponse {
                     content: Content {
-                        text: format!("{} used tool result: {tool_result}", config.name),
+                        text: format!(
+                            "{} used tool result: {}",
+                            config.name,
+                            tool_result.join("\n")
+                        ),
                         attachments: None,
                         metadata: None,
                     },
@@ -544,6 +660,53 @@ mod tests {
                     args,
                 }]),
             })
+        }
+    }
+
+    fn trailing_tool_messages(messages: &[Message]) -> Vec<&Message> {
+        let mut trailing = messages
+            .iter()
+            .rev()
+            .take_while(|message| matches!(message.role, MessageRole::Tool))
+            .collect::<Vec<_>>();
+        trailing.reverse();
+        trailing
+    }
+
+    fn render_tool_result_for_model(message: &Message) -> String {
+        let Some(task_result) = message
+            .content
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("taskResult"))
+        else {
+            return message.content.text.clone();
+        };
+
+        match task_result {
+            DataValue::Object(task_result) => {
+                let status = task_result.get("status");
+                let data_text = task_result.get("data").and_then(task_result_content_text);
+
+                if matches!(status, Some(DataValue::String(value)) if value == "success") {
+                    if let Some(text) = data_text {
+                        return text.to_string();
+                    }
+                }
+
+                data_value_json(&DataValue::Object(task_result.clone()))
+            }
+            _ => message.content.text.clone(),
+        }
+    }
+
+    fn task_result_content_text(value: &DataValue) -> Option<&str> {
+        match value {
+            DataValue::Object(content) => match content.get("text") {
+                Some(DataValue::String(text)) => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -726,5 +889,145 @@ mod tests {
         assert_eq!(snapshot.message_count, 4);
         assert_eq!(runtime.messages()[0].room_id, runtime.messages()[3].room_id);
         assert!(snapshot.state.token_usage.total_tokens >= 7);
+    }
+
+    #[test]
+    fn runtime_run_does_not_reuse_previous_tool_result_between_runs() {
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+
+        let first = runtime.run_with_tools(
+            Content {
+                text: "alpha".into(),
+                ..Content::default()
+            },
+            |_, user_message, _| {
+                TaskResult::success(
+                    Content {
+                        text: format!("{} hit", user_message.content.text),
+                        ..Content::default()
+                    },
+                    1,
+                )
+            },
+        );
+        let second = runtime.run_with_tools(
+            Content {
+                text: "beta".into(),
+                ..Content::default()
+            },
+            |_, user_message, _| {
+                TaskResult::success(
+                    Content {
+                        text: format!("{} hit", user_message.content.text),
+                        ..Content::default()
+                    },
+                    1,
+                )
+            },
+        );
+
+        assert_eq!(
+            first.data.as_ref().map(|content| content.text.as_str()),
+            Some("researcher used tool result: alpha hit")
+        );
+        assert_eq!(
+            second.data.as_ref().map(|content| content.text.as_str()),
+            Some("researcher used tool result: beta hit")
+        );
+    }
+
+    #[test]
+    fn runtime_run_preserves_structured_tool_errors() {
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+
+        let result = runtime.run_with_tools(
+            Content {
+                text: "search failure".into(),
+                ..Content::default()
+            },
+            |_, _, _| TaskResult::error("boom", 3),
+        );
+
+        let output = result
+            .data
+            .as_ref()
+            .map(|content| content.text.as_str())
+            .expect("result should contain assistant output");
+        assert!(
+            output.contains("\"status\":\"error\""),
+            "missing status in {output}"
+        );
+        assert!(
+            output.contains("\"error\":\"boom\""),
+            "missing error in {output}"
+        );
+        assert!(
+            output.contains("\"durationMs\":3"),
+            "missing duration in {output}"
+        );
+    }
+
+    #[test]
+    fn runtime_run_preserves_successful_tool_content_shape() {
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+
+        let result = runtime.run_with_tools(
+            Content {
+                text: "shape check".into(),
+                ..Content::default()
+            },
+            |_, _, _| {
+                let mut metadata = BTreeMap::new();
+                metadata.insert("source".into(), DataValue::String("tool".into()));
+                TaskResult::success(
+                    Content {
+                        text: "rich tool result".into(),
+                        attachments: Some(vec![Attachment {
+                            attachment_type: AttachmentType::File,
+                            name: "notes.txt".into(),
+                            data: "payload".into(),
+                        }]),
+                        metadata: Some(metadata),
+                    },
+                    2,
+                )
+            },
+        );
+
+        let tool_message = runtime
+            .messages()
+            .iter()
+            .find(|message| matches!(message.role, MessageRole::Tool))
+            .expect("tool message should exist");
+
+        assert_eq!(tool_message.content.text, "rich tool result");
+        assert_eq!(
+            tool_message
+                .content
+                .attachments
+                .as_ref()
+                .map(|attachments| attachments.len()),
+            Some(1)
+        );
+        assert!(
+            tool_message.content.text == "rich tool result",
+            "tool message text should stay as the original content"
+        );
+        assert!(
+            tool_message
+                .content
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source"))
+                .is_some(),
+            "tool message should preserve original metadata"
+        );
+        assert_eq!(
+            result.data.as_ref().map(|content| content.text.as_str()),
+            Some("researcher used tool result: rich tool result")
+        );
     }
 }

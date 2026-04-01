@@ -427,3 +427,49 @@ fn run_agent_executes_memory_search_tool_round_trip() {
         "tool-backed response should include memory search result: {run_response}"
     );
 }
+
+#[test]
+fn run_agent_does_not_reuse_previous_tool_result_between_runs() {
+    let (addr, server) = spawn_daemon(5);
+    let create_response = create_agent(
+        addr,
+        r#"{"name":"reviewer","model":"gpt-5.4","tools":[{"name":"memory_search","description":"Search memories","parameters":{"query":{"type":"string"}}}]}"#,
+    );
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let alpha_memory = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"reviewer\",\"type\":\"fact\",\"content\":\"alpha prior answer\",\"importance\":0.8}}"
+    );
+    let alpha_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        alpha_memory.len(),
+        alpha_memory
+    );
+    let beta_memory = format!(
+        "{{\"agentId\":\"{agent_id}\",\"agentName\":\"reviewer\",\"type\":\"fact\",\"content\":\"beta prior answer\",\"importance\":0.8}}"
+    );
+    let beta_request = format!(
+        "POST /api/memories HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        beta_memory.len(),
+        beta_memory
+    );
+
+    let _ = send_request(addr, &alpha_request);
+    let first_run = run_agent(addr, &agent_id, r#"{"text":"alpha"}"#);
+    let _ = send_request(addr, &beta_request);
+    let second_run = run_agent(addr, &agent_id, r#"{"text":"beta"}"#);
+    server.join().expect("server thread joins");
+
+    assert!(
+        first_run.contains("alpha prior answer"),
+        "first run should use alpha result: {first_run}"
+    );
+    assert!(
+        second_run.contains("beta prior answer"),
+        "second run should use beta result: {second_run}"
+    );
+    assert!(
+        !second_run.contains("alpha prior answer"),
+        "second run should not reuse alpha result: {second_run}"
+    );
+}
