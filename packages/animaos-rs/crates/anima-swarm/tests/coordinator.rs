@@ -8,11 +8,11 @@ use std::thread;
 use std::time::Duration;
 
 use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
-use anima_swarm::{
-    CoordinatorAgentFactoryFn, CoordinatorAgentRef, CoordinatorAgentShell,
-    CoordinatorDispatchContext, CoordinatorStrategyFn, SwarmConfig, SwarmCoordinator, SwarmStatus,
-    SwarmStrategy,
+use anima_swarm::coordinator::{
+    CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentShell,
+    CoordinatorDispatchContext, CoordinatorStrategyFn,
 };
+use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmStatus, SwarmStrategy};
 
 fn worker_config(name: &str) -> AgentConfig {
     AgentConfig {
@@ -99,7 +99,7 @@ impl TestHarness {
         let shared = self.state.clone();
         let tokens = self.tokens.clone();
 
-        Arc::new(move |config: AgentConfig| {
+        Arc::new(move |context: CoordinatorAgentFactoryContext| {
             let shared = shared.clone();
             let tokens = tokens.clone();
 
@@ -108,38 +108,56 @@ impl TestHarness {
                     let mut state = shared
                         .lock()
                         .expect("test harness state mutex should not be poisoned");
-                    let count = *state
+                    let _ = state
                         .spawn_counts
-                        .entry(config.name.clone())
+                        .entry(context.config.name.clone())
                         .and_modify(|value| *value += 1)
                         .or_insert(1);
-                    state.spawn_log.push(config.name.clone());
+                    state.spawn_log.push(context.config.name.clone());
 
-                    let agent_id = format!("{}-{}", config.name, count);
                     let token_usage = tokens
-                        .get(&config.name)
+                        .get(&context.config.name)
                         .cloned()
                         .unwrap_or_else(TokenUsage::default);
-                    (agent_id, token_usage)
+                    (context.agent_id.clone(), token_usage)
                 };
 
                 let run_state = shared.clone();
                 let run_id = agent_id.clone();
+                let send = context.send.clone();
+                let broadcast = context.broadcast.clone();
                 let stop_state = shared.clone();
                 let stop_id = agent_id.clone();
                 let clear_state = shared.clone();
                 let clear_id = agent_id.clone();
 
                 Ok(CoordinatorAgentShell {
-                    agent: CoordinatorAgentRef::new(agent_id.clone(), move |input| {
+                    run: Arc::new(move |input| {
                         let run_state = run_state.clone();
                         let run_id = run_id.clone();
+                        let send = send.clone();
+                        let broadcast = broadcast.clone();
                         Box::pin(async move {
                             run_state
                                 .lock()
                                 .expect("test harness state mutex should not be poisoned")
                                 .run_log
                                 .push(format!("{run_id}:{input}"));
+                            if let Some(rest) = input.strip_prefix("send:") {
+                                let mut parts = rest.splitn(2, ':');
+                                let target =
+                                    parts.next().expect("send target should exist").to_string();
+                                let message =
+                                    parts.next().expect("send payload should exist").to_string();
+                                send(target, text_content(&message))
+                                    .await
+                                    .expect("send hook should succeed");
+                            }
+                            if let Some(message) = input.strip_prefix("broadcast:") {
+                                broadcast(text_content(message))
+                                    .await
+                                    .expect("broadcast hook should succeed");
+                            }
                             TaskResult::success(
                                 text_content(&format!("{run_id} handled {input}")),
                                 1,
@@ -363,12 +381,13 @@ fn dispatch_is_serial_and_clears_inboxes_between_tasks() {
     let coordinator =
         SwarmCoordinator::with_hooks(base_config(&["worker-a"]), strategy, harness.factory());
     block_on(coordinator.start()).expect("start should succeed");
+    let worker_id = coordinator.get_state().agent_ids[0].clone();
 
     coordinator
         .get_message_bus()
         .lock()
         .expect("message bus mutex should not be poisoned")
-        .send("manager", "worker-a-1", text_content("stale"));
+        .send("manager", &worker_id, text_content("stale"));
 
     let first_coordinator = coordinator.clone();
     let first = thread::spawn(move || block_on(first_coordinator.dispatch("task one")));
@@ -592,4 +611,74 @@ fn get_state_preserves_results_and_get_message_bus_is_stable() {
 
     block_on(coordinator.stop()).expect("stop should succeed");
     assert_eq!(coordinator.get_state().token_usage.total_tokens, 14);
+}
+
+#[test]
+fn dispatch_injects_runtime_managed_send_and_broadcast_hooks() {
+    let harness = TestHarness::new(HashMap::from([
+        (
+            "worker-a".into(),
+            TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        ),
+        (
+            "manager".into(),
+            TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 2,
+                total_tokens: 4,
+            },
+        ),
+    ]));
+
+    let strategy: Arc<CoordinatorStrategyFn> = Arc::new(|ctx: CoordinatorDispatchContext| {
+        Box::pin(async move {
+            let manager = ctx
+                .spawn_agent(ctx.manager_config().clone())
+                .await
+                .expect("manager spawn should succeed");
+            let worker = ctx
+                .spawn_agent(ctx.worker_configs()[0].clone())
+                .await
+                .expect("worker spawn should succeed");
+
+            let broadcast_result = manager.run("broadcast:team update".into()).await;
+            assert_eq!(broadcast_result.status, TaskStatus::Success);
+
+            let send_result = worker
+                .run(format!("send:{}:worker reply", manager.id))
+                .await;
+            assert_eq!(send_result.status, TaskStatus::Success);
+
+            let bus = ctx.message_bus();
+            let bus = bus
+                .lock()
+                .expect("message bus mutex should not be poisoned");
+            let manager_inbox = bus.get_messages(&manager.id);
+            let worker_inbox = bus.get_messages(&worker.id);
+            let all_messages = bus.get_all_messages();
+
+            assert_eq!(manager_inbox.len(), 1);
+            assert_eq!(manager_inbox[0].from, worker.id);
+            assert_eq!(manager_inbox[0].content.text, "worker reply");
+            assert_eq!(worker_inbox.len(), 1);
+            assert_eq!(worker_inbox[0].from, manager.id);
+            assert_eq!(worker_inbox[0].to, "broadcast");
+            assert_eq!(worker_inbox[0].content.text, "team update");
+            assert_eq!(all_messages.len(), 2);
+
+            TaskResult::success(text_content("hooks exercised"), 1)
+        })
+    });
+
+    let coordinator =
+        SwarmCoordinator::with_hooks(base_config(&["worker-a"]), strategy, harness.factory());
+
+    block_on(coordinator.start()).expect("start should succeed");
+    let result = block_on(coordinator.dispatch("exercise hooks"));
+
+    assert_eq!(result.status, TaskStatus::Success);
 }

@@ -12,14 +12,30 @@ use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
 use crate::{MessageBus, SwarmConfig, SwarmState, SwarmStatus};
 
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 
 pub type CoordinatorFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub type CoordinatorStrategyFn =
     dyn Fn(CoordinatorDispatchContext) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
 
-pub type CoordinatorAgentFactoryFn =
-    dyn Fn(AgentConfig) -> CoordinatorFuture<Result<CoordinatorAgentShell, String>> + Send + Sync;
+pub type CoordinatorSendFn =
+    dyn Fn(String, Content) -> CoordinatorFuture<Result<(), String>> + Send + Sync;
+
+pub type CoordinatorBroadcastFn =
+    dyn Fn(Content) -> CoordinatorFuture<Result<(), String>> + Send + Sync;
+
+pub type CoordinatorAgentFactoryFn = dyn Fn(CoordinatorAgentFactoryContext) -> CoordinatorFuture<Result<CoordinatorAgentShell, String>>
+    + Send
+    + Sync;
+
+#[derive(Clone)]
+pub struct CoordinatorAgentFactoryContext {
+    pub config: AgentConfig,
+    pub agent_id: String,
+    pub send: Arc<CoordinatorSendFn>,
+    pub broadcast: Arc<CoordinatorBroadcastFn>,
+}
 
 #[derive(Clone)]
 pub struct CoordinatorAgentRef {
@@ -45,7 +61,7 @@ impl CoordinatorAgentRef {
 
 #[derive(Clone)]
 pub struct CoordinatorAgentShell {
-    pub agent: CoordinatorAgentRef,
+    pub run: Arc<dyn Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync>,
     pub token_usage: Arc<dyn Fn() -> TokenUsage + Send + Sync>,
     pub clear_task_state: Arc<dyn Fn() + Send + Sync>,
     pub stop: Arc<dyn Fn() -> CoordinatorFuture<()> + Send + Sync>,
@@ -321,8 +337,18 @@ impl SwarmCoordinator {
             return Err(format!("Max concurrent agents ({max_agents}) reached"));
         }
 
-        let shell = (self.inner.agent_factory)(config).await?;
-        let agent_id = shell.agent.id.clone();
+        let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
+        let shell = (self.inner.agent_factory)(CoordinatorAgentFactoryContext {
+            config,
+            agent_id: agent_id.clone(),
+            send: self.build_send_hook(&agent_id),
+            broadcast: self.build_broadcast_hook(&agent_id),
+        })
+        .await?;
+        let agent = CoordinatorAgentRef {
+            id: agent_id.clone(),
+            run: shell.run.clone(),
+        };
 
         {
             let mut bus = self
@@ -341,7 +367,7 @@ impl SwarmCoordinator {
             state.agent_ids.push(agent_id.clone());
         });
 
-        Ok(shell.agent)
+        Ok(agent)
     }
 
     fn get_pool_agent(&self, name: &str) -> Option<CoordinatorAgentRef> {
@@ -357,7 +383,10 @@ impl SwarmCoordinator {
             .lock()
             .expect("coordinator agents mutex should not be poisoned")
             .get(&pool_agent_id)
-            .map(|agent| agent.agent.clone())
+            .map(|agent| CoordinatorAgentRef {
+                id: pool_agent_id,
+                run: agent.run.clone(),
+            })
     }
 
     fn reset_task_state(&self) {
@@ -439,6 +468,38 @@ impl SwarmCoordinator {
         });
     }
 
+    fn build_send_hook(&self, from_agent_id: &str) -> Arc<CoordinatorSendFn> {
+        let message_bus = self.inner.message_bus.clone();
+        let from_agent_id = from_agent_id.to_string();
+        Arc::new(move |to_agent_id: String, content: Content| {
+            let message_bus = message_bus.clone();
+            let from_agent_id = from_agent_id.clone();
+            Box::pin(async move {
+                message_bus
+                    .lock()
+                    .expect("message bus mutex should not be poisoned")
+                    .send(&from_agent_id, &to_agent_id, content);
+                Ok(())
+            })
+        })
+    }
+
+    fn build_broadcast_hook(&self, from_agent_id: &str) -> Arc<CoordinatorBroadcastFn> {
+        let message_bus = self.inner.message_bus.clone();
+        let from_agent_id = from_agent_id.to_string();
+        Arc::new(move |content: Content| {
+            let message_bus = message_bus.clone();
+            let from_agent_id = from_agent_id.clone();
+            Box::pin(async move {
+                message_bus
+                    .lock()
+                    .expect("message bus mutex should not be poisoned")
+                    .broadcast(&from_agent_id, content);
+                Ok(())
+            })
+        })
+    }
+
     fn with_state(&self, update: impl FnOnce(&mut SwarmState)) {
         let mut state = self
             .inner
@@ -479,11 +540,11 @@ fn default_swarm_config() -> SwarmConfig {
 }
 
 fn default_agent_factory() -> Arc<CoordinatorAgentFactoryFn> {
-    Arc::new(|config| {
+    Arc::new(|context| {
         Box::pin(async move {
             Err(format!(
                 "No coordinator agent factory configured for {}",
-                config.name
+                context.config.name
             ))
         })
     })
