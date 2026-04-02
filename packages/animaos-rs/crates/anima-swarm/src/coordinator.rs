@@ -289,7 +289,19 @@ impl SwarmCoordinator {
 
     pub async fn dispatch(&self, task: impl Into<String>) -> TaskResult<Content> {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
-        self.run_task(task.into()).await
+        self.run_task(task.into(), None).await
+    }
+
+    pub async fn dispatch_with_running_hook<F>(
+        &self,
+        task: impl Into<String>,
+        on_running: F,
+    ) -> TaskResult<Content>
+    where
+        F: FnOnce(SwarmState) + Send + 'static,
+    {
+        let _dispatch_guard = self.inner.dispatch_lock.lock().await;
+        self.run_task(task.into(), Some(Box::new(on_running))).await
     }
 
     pub async fn stop(&self) -> Result<(), String> {
@@ -356,13 +368,20 @@ impl SwarmCoordinator {
         self.inner.message_bus.clone()
     }
 
-    async fn run_task(&self, task: String) -> TaskResult<Content> {
+    async fn run_task(
+        &self,
+        task: String,
+        on_running: Option<Box<dyn FnOnce(SwarmState) + Send + 'static>>,
+    ) -> TaskResult<Content> {
         self.with_state(|state| {
             state.status = SwarmStatus::Running;
             state.started_at = Some(now_millis());
             state.completed_at = None;
         });
         self.reset_task_state();
+        if let Some(on_running) = on_running {
+            on_running(self.state_snapshot());
+        }
 
         let spawn_coordinator = self.clone();
         let spawn_agent = Arc::new(
@@ -406,6 +425,14 @@ impl SwarmCoordinator {
         });
 
         result
+    }
+
+    fn state_snapshot(&self) -> SwarmState {
+        self.inner
+            .state
+            .lock()
+            .expect("coordinator state mutex should not be poisoned")
+            .clone()
     }
 
     async fn spawn_for_dispatch(

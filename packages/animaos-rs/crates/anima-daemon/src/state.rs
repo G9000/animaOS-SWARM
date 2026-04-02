@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anima_core::{
@@ -244,21 +245,38 @@ impl DaemonState {
                     Arc::clone(&model_adapter),
                     Arc::clone(&memory),
                 )));
+                let config = context.config.clone();
                 let token_usage = Arc::new(Mutex::new(TokenUsage::default()));
+                let needs_reset = Arc::new(AtomicBool::new(false));
 
                 Ok(CoordinatorAgentShell {
                     run: Arc::new({
                         let runtime = Arc::clone(&runtime);
+                        let config = config.clone();
+                        let memory = Arc::clone(&memory);
+                        let model_adapter = Arc::clone(&model_adapter);
                         let token_usage = Arc::clone(&token_usage);
+                        let needs_reset = Arc::clone(&needs_reset);
                         let delegate_task = context.delegate_task.clone();
                         let tool_context = tool_context.clone();
                         move |input: String| {
                             let runtime = Arc::clone(&runtime);
+                            let config = config.clone();
+                            let memory = Arc::clone(&memory);
+                            let model_adapter = Arc::clone(&model_adapter);
                             let token_usage = Arc::clone(&token_usage);
+                            let needs_reset = Arc::clone(&needs_reset);
                             let delegate_task = delegate_task.clone();
                             let tool_context = tool_context.clone();
                             Box::pin(async move {
                                 let mut runtime = runtime.lock().await;
+                                if needs_reset.swap(false, Ordering::AcqRel) {
+                                    *runtime = build_swarm_runtime(
+                                        config,
+                                        Arc::clone(&model_adapter),
+                                        Arc::clone(&memory),
+                                    );
+                                }
                                 let result = runtime
                                     .run_with_tools(
                                         Content {
@@ -301,8 +319,17 @@ impl DaemonState {
                                 .clone()
                         }
                     }),
-                    // The core runtime does not yet expose a narrower task-state reset hook.
-                    clear_task_state: Arc::new(|| {}),
+                    clear_task_state: Arc::new({
+                        let needs_reset = Arc::clone(&needs_reset);
+                        let token_usage = Arc::clone(&token_usage);
+                        move || {
+                            needs_reset.store(true, Ordering::Release);
+                            *token_usage
+                                .lock()
+                                .expect("swarm token mutex should not be poisoned") =
+                                TokenUsage::default();
+                        }
+                    }),
                     stop: Arc::new({
                         let runtime = Arc::clone(&runtime);
                         let token_usage = Arc::clone(&token_usage);

@@ -54,10 +54,8 @@ async fn send_empty_request(app: &Router, method: &str, uri: &str) -> (StatusCod
 }
 
 async fn create_swarm(app: &Router) -> (StatusCode, String) {
-    send_json_request(
+    create_swarm_with_body(
         app,
-        "POST",
-        "/api/swarms",
         r#"{
             "strategy":"round-robin",
             "manager":{"name":"manager","model":"gpt-5.4"},
@@ -66,6 +64,10 @@ async fn create_swarm(app: &Router) -> (StatusCode, String) {
         }"#,
     )
     .await
+}
+
+async fn create_swarm_with_body(app: &Router, body: &str) -> (StatusCode, String) {
+    send_json_request(app, "POST", "/api/swarms", body).await
 }
 
 async fn run_swarm(app: &Router, swarm_id: &str, body: &str) -> (StatusCode, String) {
@@ -81,6 +83,32 @@ fn extract_json_string_field(response: &str, field: &str) -> String {
     let rest = &response[start..];
     let end = rest.find('"').expect("field should terminate");
     rest[..end].to_string()
+}
+
+fn extract_json_u64_field(response: &str, field: &str) -> u64 {
+    let needle = format!("\"{field}\":");
+    let start = response
+        .find(&needle)
+        .map(|index| index + needle.len())
+        .expect("field should exist");
+    let rest = &response[start..];
+    let end = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end]
+        .parse::<u64>()
+        .expect("field should be an unsigned integer")
+}
+
+fn extract_sse_event_data<'a>(stream: &'a str, event_name: &str) -> Option<&'a str> {
+    let marker = format!("event: {event_name}\n");
+    let start = stream.find(&marker)? + marker.len();
+    let rest = &stream[start..];
+    let data_marker = "data: ";
+    let data_start = rest.find(data_marker)? + data_marker.len();
+    let data = &rest[data_start..];
+    let end = data.find("\n\n").unwrap_or(data.len());
+    Some(&data[..end])
 }
 
 #[tokio::test]
@@ -192,4 +220,38 @@ async fn swarm_event_stream_emits_running_and_completed_events() {
     assert!(chunks.contains("event: swarm:running"));
     assert!(chunks.contains("event: swarm:completed"));
     assert!(chunks.contains(&format!("\"swarmId\":\"{swarm_id}\"")));
+
+    let running_data =
+        extract_sse_event_data(&chunks, "swarm:running").expect("running event data exists");
+    assert!(running_data.contains(&format!("\"swarmId\":\"{swarm_id}\"")));
+    assert!(running_data.contains("\"status\":\"running\""));
+    assert!(running_data.contains("\"result\":null"));
+
+    let completed_data =
+        extract_sse_event_data(&chunks, "swarm:completed").expect("completed event data exists");
+    assert!(completed_data.contains(&format!("\"swarmId\":\"{swarm_id}\"")));
+    assert!(completed_data.contains("\"result\":{"));
+    assert!(completed_data.contains("\"status\":\"success\""));
+}
+
+#[tokio::test]
+async fn repeated_swarm_runs_do_not_reuse_stale_runtime_context() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let (first_status, first_response) =
+        run_swarm(&app, &swarm_id, r#"{"text":"Repeat the same task"}"#).await;
+    let (second_status, second_response) =
+        run_swarm(&app, &swarm_id, r#"{"text":"Repeat the same task"}"#).await;
+    let first_total_tokens = extract_json_u64_field(&first_response, "totalTokens");
+    let second_total_tokens = extract_json_u64_field(&second_response, "totalTokens");
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert!(first_response.contains("\"status\":\"success\""));
+    assert_eq!(second_status, StatusCode::OK);
+    assert!(
+        second_total_tokens == first_total_tokens,
+        "pooled worker token usage should reset between runs; first={first_total_tokens}, second={second_total_tokens}, response={second_response}"
+    );
 }

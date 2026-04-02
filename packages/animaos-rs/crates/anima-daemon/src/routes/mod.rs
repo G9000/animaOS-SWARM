@@ -1,4 +1,5 @@
 mod agents;
+mod api;
 mod health;
 mod memories;
 mod swarms;
