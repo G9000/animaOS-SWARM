@@ -70,6 +70,20 @@ fn round_robin_config_with_turns(worker_names: &[&str], max_turns: usize) -> Swa
     }
 }
 
+fn dynamic_config(worker_names: &[&str]) -> SwarmConfig {
+    SwarmConfig {
+        strategy: SwarmStrategy::Dynamic,
+        manager: worker_config("manager"),
+        workers: worker_names
+            .iter()
+            .map(|name| worker_config(name))
+            .collect(),
+        max_concurrent_agents: None,
+        max_turns: Some(4),
+        token_budget: None,
+    }
+}
+
 fn text_content(text: &str) -> Content {
     Content {
         text: text.into(),
@@ -1794,4 +1808,327 @@ fn round_robin_strategy_records_error_turns_in_history() {
             "worker-a:Continue working on this task: The actual task text\n\nIt's your turn to contribute.\n\nConversation so far:\n[manager]: Error: manager failed",
         ]
     );
+}
+
+#[test]
+fn dynamic_strategy_routes_workers_through_choose_speaker_and_preserves_history() {
+    let spawn_order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let worker_inputs = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let manager_inputs = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let spawn_order = Arc::clone(&spawn_order);
+        let worker_inputs = Arc::clone(&worker_inputs);
+        let manager_inputs = Arc::clone(&manager_inputs);
+
+        move |context: CoordinatorAgentFactoryContext| {
+            let spawn_order = Arc::clone(&spawn_order);
+            let worker_inputs = Arc::clone(&worker_inputs);
+            let manager_inputs = Arc::clone(&manager_inputs);
+
+            Box::pin(async move {
+                spawn_order
+                    .lock()
+                    .expect("spawn order mutex should not be poisoned")
+                    .push(context.config.name.clone());
+
+                match context.config.name.as_str() {
+                    "analyst" => {
+                        let run = Arc::new(move |input: String| {
+                            let worker_inputs = Arc::clone(&worker_inputs);
+                            Box::pin(async move {
+                                worker_inputs
+                                    .lock()
+                                    .expect("worker input mutex should not be poisoned")
+                                    .push(("analyst".into(), input.clone()));
+                                TaskResult::success(
+                                    text_content("analyst response: pattern one"),
+                                    1,
+                                )
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    "writer" => {
+                        let run = Arc::new(move |input: String| {
+                            let worker_inputs = Arc::clone(&worker_inputs);
+                            Box::pin(async move {
+                                worker_inputs
+                                    .lock()
+                                    .expect("worker input mutex should not be poisoned")
+                                    .push(("writer".into(), input.clone()));
+                                assert!(input.contains("Draft the summary"));
+                                assert!(input.contains("Conversation so far:"));
+                                assert!(input.contains("[analyst]: analyst response: pattern one"));
+
+                                TaskResult::success(
+                                    text_content("writer response: summary ready"),
+                                    1,
+                                )
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    "manager" => {
+                        let system = context.config.system.as_deref().unwrap_or_default();
+                        assert!(
+                            system.contains("choose_speaker"),
+                            "dynamic manager prompt should mention choose_speaker"
+                        );
+
+                        let tool_names = context
+                            .config
+                            .tools
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>();
+                        assert!(
+                            tool_names.contains(&"choose_speaker"),
+                            "dynamic manager should receive choose_speaker tool"
+                        );
+
+                        let choose_speaker = context
+                            .delegate_task
+                            .as_ref()
+                            .expect("dynamic manager should receive choose_speaker callback")
+                            .clone();
+
+                        let run = Arc::new(move |input: String| {
+                            let manager_inputs = Arc::clone(&manager_inputs);
+                            let choose_speaker = Arc::clone(&choose_speaker);
+                            let worker_inputs = Arc::clone(&worker_inputs);
+                            Box::pin(async move {
+                                manager_inputs
+                                    .lock()
+                                    .expect("manager input mutex should not be poisoned")
+                                    .push(input.clone());
+
+                                let analyst_result =
+                                    choose_speaker("analyst".into(), "Analyse the task".into())
+                                        .await;
+                                assert_eq!(analyst_result.status, TaskStatus::Success);
+                                assert_eq!(
+                                    analyst_result
+                                        .data
+                                        .as_ref()
+                                        .map(|content| content.text.as_str()),
+                                    Some("analyst response: pattern one")
+                                );
+
+                                let writer_result =
+                                    choose_speaker("writer".into(), "Draft the summary".into())
+                                        .await;
+                                assert_eq!(writer_result.status, TaskStatus::Success);
+                                assert_eq!(
+                                    writer_result
+                                        .data
+                                        .as_ref()
+                                        .map(|content| content.text.as_str()),
+                                    Some("writer response: summary ready")
+                                );
+
+                                let recorded_writer_input = worker_inputs
+                                    .lock()
+                                    .expect("worker input mutex should not be poisoned")
+                                    .iter()
+                                    .find(|(name, _)| name == "writer")
+                                    .map(|(_, input)| input.clone())
+                                    .expect("writer input should be recorded");
+                                assert!(recorded_writer_input.contains("Conversation so far:"));
+                                assert!(recorded_writer_input
+                                    .contains("[analyst]: analyst response: pattern one"));
+
+                                let done_result =
+                                    choose_speaker("DONE".into(), "Finish the synthesis".into())
+                                        .await;
+                                assert_eq!(done_result.status, TaskStatus::Success);
+                                assert_eq!(
+                                    done_result
+                                        .data
+                                        .as_ref()
+                                        .map(|content| content.text.as_str()),
+                                    Some("DONE")
+                                );
+
+                                TaskResult::success(text_content("Final synthesis complete."), 2)
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    other => Err(format!("unexpected agent config: {other}")),
+                }
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        dynamic_config(&["analyst", "writer"]),
+        resolve_strategy(SwarmStrategy::Dynamic),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("Orchestrate a conversation"));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        result.data.as_ref().map(|content| content.text.as_str()),
+        Some("Final synthesis complete.")
+    );
+    assert_eq!(
+        spawn_order
+            .lock()
+            .expect("spawn order mutex should not be poisoned")
+            .as_slice(),
+        ["analyst", "writer", "manager"]
+    );
+    assert_eq!(
+        manager_inputs
+            .lock()
+            .expect("manager input mutex should not be poisoned")
+            .as_slice(),
+        ["Orchestrate a conversation"]
+    );
+    assert_eq!(
+        worker_inputs
+            .lock()
+            .expect("worker input mutex should not be poisoned")
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["analyst", "writer"]
+    );
+}
+
+#[test]
+fn dynamic_strategy_returns_error_for_unknown_agent_choice() {
+    let spawn_order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let worker_inputs = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let spawn_order = Arc::clone(&spawn_order);
+        let worker_inputs = Arc::clone(&worker_inputs);
+
+        move |context: CoordinatorAgentFactoryContext| {
+            let spawn_order = Arc::clone(&spawn_order);
+            let worker_inputs = Arc::clone(&worker_inputs);
+
+            Box::pin(async move {
+                spawn_order
+                    .lock()
+                    .expect("spawn order mutex should not be poisoned")
+                    .push(context.config.name.clone());
+
+                match context.config.name.as_str() {
+                    "analyst" | "writer" => {
+                        let agent_name = context.config.name.clone();
+                        let run = Arc::new(move |input: String| {
+                            let worker_inputs = Arc::clone(&worker_inputs);
+                            let agent_name = agent_name.clone();
+                            Box::pin(async move {
+                                worker_inputs
+                                    .lock()
+                                    .expect("worker input mutex should not be poisoned")
+                                    .push((agent_name.clone(), input.clone()));
+                                TaskResult::success(text_content("worker response"), 1)
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    "manager" => {
+                        let choose_speaker = context
+                            .delegate_task
+                            .as_ref()
+                            .expect("dynamic manager should receive choose_speaker callback")
+                            .clone();
+
+                        let run = Arc::new(move |input: String| {
+                            let choose_speaker = Arc::clone(&choose_speaker);
+                            Box::pin(async move {
+                                assert_eq!(input, "Talk to ghost");
+
+                                let result =
+                                    choose_speaker("ghost".into(), "Investigate".into()).await;
+                                assert_eq!(result.status, TaskStatus::Error);
+                                assert_eq!(
+                                    result.error.as_deref(),
+                                    Some(
+                                        "Agent \"ghost\" not found. Available: \"analyst\", \"writer\""
+                                    )
+                                );
+
+                                TaskResult::success(
+                                    text_content("Recovered from missing agent."),
+                                    2,
+                                )
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    other => Err(format!("unexpected agent config: {other}")),
+                }
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        dynamic_config(&["analyst", "writer"]),
+        resolve_strategy(SwarmStrategy::Dynamic),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("Talk to ghost"));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        result.data.as_ref().map(|content| content.text.as_str()),
+        Some("Recovered from missing agent.")
+    );
+    assert_eq!(
+        spawn_order
+            .lock()
+            .expect("spawn order mutex should not be poisoned")
+            .as_slice(),
+        ["analyst", "writer", "manager"]
+    );
+    assert!(worker_inputs
+        .lock()
+        .expect("worker input mutex should not be poisoned")
+        .is_empty());
 }
