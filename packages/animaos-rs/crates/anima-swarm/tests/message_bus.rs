@@ -1,7 +1,12 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
+
 use anima_core::{AgentConfig, Content, TaskResult, TokenUsage};
 use anima_swarm::{
-    AgentMessage, MessageBus, StrategyContext, SwarmAgentHandle, SwarmConfig, SwarmFuture,
-    SwarmState, SwarmStatus, SwarmStrategy,
+    AgentMessage, MessageBus, StrategyContext, StrategyFn, SwarmAgentHandle, SwarmConfig,
+    SwarmFuture, SwarmState, SwarmStatus, SwarmStrategy,
 };
 
 fn worker_config(name: &str) -> AgentConfig {
@@ -26,6 +31,25 @@ fn text_content(text: &str) -> Content {
     Content {
         text: text.into(),
         ..Content::default()
+    }
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Waker::from(Arc::new(NoopWake));
+    let mut future = Pin::from(Box::new(future));
+    let mut context = Context::from_waker(&waker);
+
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
     }
 }
 
@@ -86,8 +110,21 @@ fn strategy_context_keeps_async_spawn_agent_handle_shape() {
             }
         })
     };
+    let strategy: &StrategyFn = &|ctx| {
+        Box::pin(async move {
+            let handle = (ctx.spawn_agent)(ctx.worker_configs[0].clone()).await;
+            let result = (handle.run)("delegate research".into()).await;
+            TaskResult::success(
+                Content {
+                    text: format!("{}:{}", handle.id, result.data.unwrap().text),
+                    ..Content::default()
+                },
+                2,
+            )
+        })
+    };
 
-    let context = StrategyContext {
+    let mut context = StrategyContext {
         task: "delegate research".into(),
         manager_config: worker_config("manager"),
         worker_configs: vec![worker_config("worker-a")],
@@ -100,6 +137,13 @@ fn strategy_context_keeps_async_spawn_agent_handle_shape() {
     assert_eq!(context.manager_config.name, "manager");
     assert_eq!(context.worker_configs.len(), 1);
     assert_eq!(context.max_turns, 6);
+
+    let result = block_on(strategy(&mut context));
+    assert_eq!(result.status, anima_core::TaskStatus::Success);
+    assert_eq!(
+        result.data.as_ref().map(|content| content.text.as_str()),
+        Some("worker-a-id:delegate research")
+    );
 }
 
 #[test]

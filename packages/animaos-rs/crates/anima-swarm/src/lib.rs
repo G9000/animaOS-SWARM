@@ -5,8 +5,8 @@ pub use message_bus::MessageBus;
 #[derive(Default)]
 pub struct SwarmCoordinator;
 pub use types::{
-    AgentMessage, StrategyContext, SwarmAgentHandle, SwarmAgentRunFn, SwarmConfig, SwarmFuture,
-    SwarmMessageBus, SwarmState, SwarmStatus, SwarmStrategy,
+    AgentMessage, StrategyContext, StrategyFn, SwarmAgentHandle, SwarmAgentRunFn, SwarmConfig,
+    SwarmFuture, SwarmMessageBus, SwarmState, SwarmStatus, SwarmStrategy,
 };
 
 impl SwarmCoordinator {

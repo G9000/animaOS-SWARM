@@ -78,7 +78,7 @@ pub trait SwarmMessageBus {
     fn clear_inboxes(&mut self);
 }
 
-pub type SwarmFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub type SwarmFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 pub type SwarmAgentRunFn =
     dyn Fn(String) -> SwarmFuture<'static, TaskResult<Content>> + Send + Sync + 'static;
@@ -96,3 +96,8 @@ pub struct StrategyContext<'a> {
     pub message_bus: &'a mut dyn SwarmMessageBus,
     pub max_turns: usize,
 }
+
+pub type StrategyFn = dyn for<'a> Fn(&'a mut StrategyContext<'a>) -> SwarmFuture<'a, TaskResult<Content>>
+    + Send
+    + Sync
+    + 'static;
