@@ -63,6 +63,13 @@ fn round_robin_config(worker_names: &[&str]) -> SwarmConfig {
     }
 }
 
+fn round_robin_config_with_turns(worker_names: &[&str], max_turns: usize) -> SwarmConfig {
+    SwarmConfig {
+        max_turns: Some(max_turns),
+        ..round_robin_config(worker_names)
+    }
+}
+
 fn text_content(text: &str) -> Content {
     Content {
         text: text.into(),
@@ -1677,5 +1684,114 @@ fn round_robin_strategy_cycles_agents_and_aggregates_history() {
             .expect("spawn log mutex should not be poisoned")
             .as_slice(),
         ["manager", "worker-a", "worker-b"]
+    );
+}
+
+#[test]
+fn round_robin_strategy_rejects_zero_turns_before_spawning_agents() {
+    let spawn_log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let spawn_log = Arc::clone(&spawn_log);
+        move |context: CoordinatorAgentFactoryContext| {
+            let spawn_log = Arc::clone(&spawn_log);
+            Box::pin(async move {
+                spawn_log
+                    .lock()
+                    .expect("spawn log mutex should not be poisoned")
+                    .push(context.config.name.clone());
+
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(|_input: String| {
+                        Box::pin(async move {
+                            panic!("zero-turn round robin should not invoke any agent")
+                        })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        round_robin_config_with_turns(&["worker-a", "worker-b"], 0),
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("The actual task text"));
+
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Round-robin strategy requires at least one turn")
+    );
+    assert!(result.data.is_none());
+    assert!(spawn_log
+        .lock()
+        .expect("spawn log mutex should not be poisoned")
+        .is_empty());
+}
+
+#[test]
+fn round_robin_strategy_records_error_turns_in_history() {
+    let run_log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let run_log = Arc::clone(&run_log);
+        move |context: CoordinatorAgentFactoryContext| {
+            let run_log = Arc::clone(&run_log);
+            Box::pin(async move {
+                let agent_name = context.config.name.clone();
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(move |input: String| {
+                        let run_log = Arc::clone(&run_log);
+                        let agent_name = agent_name.clone();
+                        Box::pin(async move {
+                            run_log
+                                .lock()
+                                .expect("run log mutex should not be poisoned")
+                                .push(format!("{agent_name}:{input}"));
+
+                            if agent_name == "manager" {
+                                TaskResult::error("manager failed", 1)
+                            } else {
+                                TaskResult::success(text_content(&format!("{agent_name} ok")), 1)
+                            }
+                        })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        round_robin_config_with_turns(&["worker-a"], 2),
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("The actual task text"));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert!(result.error.is_none());
+    assert_eq!(
+        result.data.as_ref().map(|content| content.text.as_str()),
+        Some("[manager]: Error: manager failed\n\n[worker-a]: worker-a ok")
+    );
+    assert_eq!(
+        run_log
+            .lock()
+            .expect("run log mutex should not be poisoned")
+            .as_slice(),
+        [
+            "manager:The actual task text",
+            "worker-a:Continue working on this task: The actual task text\n\nIt's your turn to contribute.\n\nConversation so far:\n[manager]: Error: manager failed",
+        ]
     );
 }

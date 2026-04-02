@@ -11,6 +11,14 @@ pub fn round_robin_strategy(
 ) -> CoordinatorFuture<TaskResult<Content>> {
     Box::pin(async move {
         let start = Instant::now();
+        let max_turns = ctx.max_turns();
+        if max_turns == 0 {
+            return TaskResult::error(
+                "Round-robin strategy requires at least one turn",
+                start.elapsed().as_millis(),
+            );
+        }
+
         let all_configs = std::iter::once(ctx.manager_config().clone())
             .chain(ctx.worker_configs().iter().cloned())
             .collect::<Vec<_>>();
@@ -28,17 +36,10 @@ pub fn round_robin_strategy(
             });
         }
 
-        if agents.is_empty() {
-            return TaskResult::error(
-                "Round-robin strategy requires at least one agent",
-                start.elapsed().as_millis(),
-            );
-        }
-
         let mut history = Vec::new();
         let mut last_result = None;
 
-        for turn in 0..ctx.max_turns() {
+        for turn in 0..max_turns {
             let agent = &agents[turn % agents.len()];
             let prompt = if turn == 0 {
                 ctx.task().to_string()
