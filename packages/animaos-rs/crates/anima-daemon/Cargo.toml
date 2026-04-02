@@ -12,7 +12,7 @@ anima-swarm = { path = "../anima-swarm" }
 async-trait = "0.1"
 axum = "0.7"
 futures = "0.3"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 http-body-util = "0.1"

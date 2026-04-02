@@ -8,6 +8,7 @@ use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOpt
 use anima_swarm::SwarmCoordinator;
 
 use crate::components::{default_evaluators, default_providers};
+use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::model::DeterministicModelAdapter;
 use crate::tools::{ToolExecutionContext, ToolRegistry};
 
@@ -16,23 +17,47 @@ pub(crate) struct DaemonState {
     pub(crate) agents: HashMap<String, AgentRuntime>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
+    #[allow(dead_code)]
+    pub(crate) event_fanout: EventFanout,
     pub(crate) _swarm: SwarmCoordinator,
 }
 
 impl DaemonState {
+    #[allow(dead_code)]
     pub(crate) fn new() -> Self {
-        Self::with_model_adapter(Arc::new(DeterministicModelAdapter))
+        Self::with_model_adapter_and_events(
+            Arc::new(DeterministicModelAdapter),
+            EventFanout::new(DEFAULT_EVENT_BUFFER),
+        )
     }
 
+    pub(crate) fn with_events(event_fanout: EventFanout) -> Self {
+        Self::with_model_adapter_and_events(Arc::new(DeterministicModelAdapter), event_fanout)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn with_model_adapter(model_adapter: Arc<dyn ModelAdapter>) -> Self {
+        Self::with_model_adapter_and_events(model_adapter, EventFanout::new(DEFAULT_EVENT_BUFFER))
+    }
+
+    pub(crate) fn with_model_adapter_and_events(
+        model_adapter: Arc<dyn ModelAdapter>,
+        event_fanout: EventFanout,
+    ) -> Self {
         let memory = Arc::new(Mutex::new(MemoryManager::new()));
         Self {
             memory,
             agents: HashMap::new(),
             model_adapter,
             tool_registry: ToolRegistry::new(),
+            event_fanout,
             _swarm: SwarmCoordinator::new(),
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn event_fanout(&self) -> EventFanout {
+        self.event_fanout.clone()
     }
 
     pub(crate) fn create_agent(

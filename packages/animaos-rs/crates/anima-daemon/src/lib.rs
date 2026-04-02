@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod events;
 mod json;
 mod model;
 mod routes;

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use tokio::net::TcpListener;
 
+use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::routes;
 use crate::state::DaemonState;
 
@@ -27,7 +28,11 @@ pub fn app() -> Router {
 }
 
 pub fn app_with_config(config: DaemonConfig) -> Router {
-    app_with_state(Arc::new(Mutex::new(DaemonState::new())), config)
+    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    app_with_state(
+        Arc::new(Mutex::new(DaemonState::with_events(event_fanout))),
+        config,
+    )
 }
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
@@ -35,7 +40,13 @@ pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> 
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
-    serve_with_state(listener, Arc::new(Mutex::new(DaemonState::new())), config).await
+    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    serve_with_state(
+        listener,
+        Arc::new(Mutex::new(DaemonState::with_events(event_fanout))),
+        config,
+    )
+    .await
 }
 
 pub(crate) async fn serve_with_state(
