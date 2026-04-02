@@ -1,84 +1,33 @@
-// Core — types, runtime, adapters, helpers
+export { AgentsClient, action, agent, plugin } from "./agents.js"
+export type { AgentMemory, AgentRunResponse, AgentSnapshot } from "./agents.js"
+
 export {
-	// Helpers
-	agent,
-	plugin,
-	action,
-	// Runtime
-	AgentRuntime,
-	EventBus,
-	// Adapters
-	OpenAIAdapter,
-	AnthropicAdapter,
-	OllamaAdapter,
-} from "@animaOS-SWARM/core"
+	DaemonClient,
+	DaemonHttpError,
+	createDaemonClient,
+} from "./client.js"
+export type { DaemonClientOptions, DaemonEvent, FetchLike } from "./client.js"
+
+export { SwarmsClient, swarm } from "./swarms.js"
+export type { SwarmEventPayload, SwarmRunResponse } from "./swarms.js"
 
 export type {
-	// Types
-	UUID,
-	Content,
-	Message,
-	TaskResult,
+	Action,
 	AgentConfig,
+	AgentSettings,
 	AgentState,
 	AgentStatus,
-	IAgentRuntime,
-	Action,
-	Provider,
-	Evaluator,
+	Attachment,
+	Content,
 	Plugin,
-	IModelAdapter,
-	ModelConfig,
-	GenerateOptions,
-	GenerateResult,
-	ToolCall,
-	StreamChunk,
-	EventType,
-	Event,
-	EventHandler,
-	IEventBus,
+	TaskResult,
+	TokenUsage,
+	UUID,
 } from "@animaOS-SWARM/core"
 
-// Swarm — coordinator, strategies, message bus
-export {
-	SwarmCoordinator,
-	MessageBus,
-	swarm,
-	supervisorStrategy,
-	dynamicStrategy,
-	roundRobinStrategy,
-} from "@animaOS-SWARM/swarm"
-
 export type {
-	SwarmConfig,
-	SwarmStrategy,
-	SwarmState,
 	AgentMessage,
+	SwarmConfig,
+	SwarmState,
+	SwarmStrategy,
 } from "@animaOS-SWARM/swarm"
-
-// Memory — BM25, task history, document store
-export {
-	BM25,
-	TaskHistory,
-	DocumentStore,
-} from "@animaOS-SWARM/memory"
-
-export type {
-	SearchResult,
-	TaskEntry,
-	DocumentChunk,
-	DocumentSearchResult,
-} from "@animaOS-SWARM/memory"
-
-// Tools
-export {
-	bashAction,
-	readAction,
-	writeAction,
-	editAction,
-	grepAction,
-	globAction,
-	listDirAction,
-	multiEditAction,
-	ALL_TOOL_ACTIONS,
-} from "@animaOS-SWARM/tools"
