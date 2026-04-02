@@ -1,4 +1,4 @@
-use anima_daemon::app as daemon_app;
+use anima_daemon::{app as daemon_app, app_with_config, DaemonConfig};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -196,4 +196,16 @@ async fn create_memory_rejects_unescaped_newline_in_json_string() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(response.contains("\"error\":\"request body must be valid JSON\""));
+}
+
+#[tokio::test]
+async fn app_with_config_enforces_max_request_bytes() {
+    let app = app_with_config(DaemonConfig {
+        max_request_bytes: 32,
+    });
+    let body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":"body is larger than the configured max","importance":0.8}"#;
+
+    let (status, _) = send_json_request(&app, "POST", "/api/memories", body).await;
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }

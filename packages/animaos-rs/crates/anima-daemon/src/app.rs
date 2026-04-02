@@ -1,6 +1,5 @@
 use std::io;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use axum::Router;
 use tokio::net::TcpListener;
@@ -13,14 +12,12 @@ pub(crate) type SharedDaemonState = Arc<Mutex<DaemonState>>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub max_request_bytes: usize,
-    pub request_read_timeout: Duration,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             max_request_bytes: 64 * 1024,
-            request_read_timeout: Duration::from_millis(200),
         }
     }
 }

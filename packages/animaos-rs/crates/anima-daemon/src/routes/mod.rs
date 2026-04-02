@@ -6,93 +6,150 @@ use std::collections::HashMap;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response as AxumResponse};
-use axum::routing::{get, post};
+use axum::routing::any;
 use axum::Router;
 
 use crate::app::{DaemonConfig, SharedDaemonState};
-use crate::http::Response;
+use crate::json::escape_json;
 
 const NOT_FOUND_JSON: &str = "{\"error\":\"not found\"}";
 
+pub(crate) struct Response {
+    pub(crate) status_line: &'static str,
+    pub(crate) body: String,
+}
+
+impl Response {
+    pub(crate) fn json(status_line: &'static str, body: String) -> Self {
+        Self { status_line, body }
+    }
+
+    pub(crate) fn error(status_line: &'static str, message: &'static str) -> Self {
+        Self::json(
+            status_line,
+            format!("{{\"error\":\"{}\"}}", escape_json(message)),
+        )
+    }
+}
+
 pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
     Router::new()
-        .route("/health", get(handle_health))
-        .route("/api/health", get(handle_health))
-        .route("/api/memories", post(handle_create_memory))
-        .route("/api/memories/search", get(handle_search_memories))
-        .route("/api/memories/recent", get(handle_recent_memories))
-        .route(
-            "/api/agents",
-            post(handle_create_agent).get(handle_list_agents),
-        )
-        .route("/api/agents/:agent_id", get(handle_get_agent))
-        .route("/api/agents/:agent_id/run", post(handle_run_agent))
+        .route("/health", any(health_entry))
+        .route("/api/health", any(health_entry))
+        .route("/api/memories", any(memories_collection_entry))
+        .route("/api/memories/search", any(memories_search_entry))
+        .route("/api/memories/recent", any(memories_recent_entry))
+        .route("/api/agents", any(agents_collection_entry))
+        .route("/api/agents/:agent_id", any(agent_detail_entry))
+        .route("/api/agents/:agent_id/run", any(agent_run_entry))
         .route(
             "/api/agents/:agent_id/memories/recent",
-            get(handle_recent_agent_memories),
+            any(agent_recent_memories_entry),
         )
         .fallback(not_found)
         .layer(DefaultBodyLimit::max(config.max_request_bytes))
         .with_state(state)
 }
 
-async fn handle_health() -> AxumResponse {
-    json_response(health::handle_health())
-}
-
-async fn handle_create_memory(State(state): State<SharedDaemonState>, body: Bytes) -> AxumResponse {
-    json_response(memories::handle_create_memory(body.to_vec(), &state))
-}
-
-async fn handle_search_memories(State(state): State<SharedDaemonState>, uri: Uri) -> AxumResponse {
-    match request_query(&uri) {
-        Ok(query) => json_response(memories::handle_search_memories(query, &state)),
-        Err(()) => bad_request(),
+async fn health_entry(method: Method) -> AxumResponse {
+    match method {
+        Method::GET => json_response(health::handle_health()),
+        _ => not_found().await,
     }
 }
 
-async fn handle_recent_memories(State(state): State<SharedDaemonState>, uri: Uri) -> AxumResponse {
-    match request_query(&uri) {
-        Ok(query) => json_response(memories::handle_recent_memories(query, &state)),
-        Err(()) => bad_request(),
+async fn memories_collection_entry(
+    method: Method,
+    State(state): State<SharedDaemonState>,
+    body: Bytes,
+) -> AxumResponse {
+    match method {
+        Method::POST => json_response(memories::handle_create_memory(body.to_vec(), &state)),
+        _ => not_found().await,
     }
 }
 
-async fn handle_create_agent(State(state): State<SharedDaemonState>, body: Bytes) -> AxumResponse {
-    json_response(agents::handle_create_agent(body.to_vec(), &state))
+async fn memories_search_entry(
+    method: Method,
+    State(state): State<SharedDaemonState>,
+    uri: Uri,
+) -> AxumResponse {
+    match method {
+        Method::GET => match request_query(&uri) {
+            Ok(query) => json_response(memories::handle_search_memories(query, &state)),
+            Err(()) => bad_request(),
+        },
+        _ => not_found().await,
+    }
 }
 
-async fn handle_list_agents(State(state): State<SharedDaemonState>) -> AxumResponse {
-    json_response(agents::handle_list_agents(&state))
+async fn memories_recent_entry(
+    method: Method,
+    State(state): State<SharedDaemonState>,
+    uri: Uri,
+) -> AxumResponse {
+    match method {
+        Method::GET => match request_query(&uri) {
+            Ok(query) => json_response(memories::handle_recent_memories(query, &state)),
+            Err(()) => bad_request(),
+        },
+        _ => not_found().await,
+    }
 }
 
-async fn handle_get_agent(
+async fn agents_collection_entry(
+    method: Method,
+    State(state): State<SharedDaemonState>,
+    body: Bytes,
+) -> AxumResponse {
+    match method {
+        Method::GET => json_response(agents::handle_list_agents(&state)),
+        Method::POST => json_response(agents::handle_create_agent(body.to_vec(), &state)),
+        _ => not_found().await,
+    }
+}
+
+async fn agent_detail_entry(
+    method: Method,
     State(state): State<SharedDaemonState>,
     Path(agent_id): Path<String>,
 ) -> AxumResponse {
-    json_response(agents::handle_get_agent(&agent_id, &state))
+    match method {
+        Method::GET => json_response(agents::handle_get_agent(&agent_id, &state)),
+        _ => not_found().await,
+    }
 }
 
-async fn handle_run_agent(
+async fn agent_run_entry(
+    method: Method,
     State(state): State<SharedDaemonState>,
     Path(agent_id): Path<String>,
     body: Bytes,
 ) -> AxumResponse {
-    json_response(agents::handle_run_agent(&agent_id, body.to_vec(), &state).await)
+    match method {
+        Method::POST => {
+            json_response(agents::handle_run_agent(&agent_id, body.to_vec(), &state).await)
+        }
+        _ => not_found().await,
+    }
 }
 
-async fn handle_recent_agent_memories(
+async fn agent_recent_memories_entry(
+    method: Method,
     State(state): State<SharedDaemonState>,
     Path(agent_id): Path<String>,
     uri: Uri,
 ) -> AxumResponse {
-    match request_query(&uri) {
-        Ok(query) => json_response(agents::handle_recent_agent_memories(
-            &agent_id, query, &state,
-        )),
-        Err(()) => bad_request(),
+    match method {
+        Method::GET => match request_query(&uri) {
+            Ok(query) => json_response(agents::handle_recent_agent_memories(
+                &agent_id, query, &state,
+            )),
+            Err(()) => bad_request(),
+        },
+        _ => not_found().await,
     }
 }
 

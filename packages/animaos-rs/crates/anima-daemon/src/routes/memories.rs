@@ -6,7 +6,7 @@ use anima_memory::{
     Memory, MemorySearchOptions, MemorySearchResult, MemoryType, NewMemory, RecentMemoryOptions,
 };
 
-use crate::http::Response;
+use super::Response;
 use crate::json::{escape_json, JsonParser, JsonValue};
 use crate::state::DaemonState;
 

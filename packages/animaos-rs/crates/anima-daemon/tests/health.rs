@@ -33,3 +33,34 @@ async fn health_endpoint_returns_ok_json() {
         "{\"status\":\"ok\"}"
     );
 }
+
+#[tokio::test]
+async fn health_endpoint_returns_not_found_json_for_wrong_method() {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("app responds");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .expect("content-type header exists"),
+        "application/json"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    assert_eq!(
+        std::str::from_utf8(&body).expect("body is utf-8"),
+        "{\"error\":\"not found\"}"
+    );
+}

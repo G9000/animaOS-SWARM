@@ -1,6 +1,5 @@
 mod app;
 mod components;
-mod http;
 mod json;
 mod model;
 mod routes;
