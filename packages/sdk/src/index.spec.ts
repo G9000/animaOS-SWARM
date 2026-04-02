@@ -287,4 +287,50 @@ describe("@animaOS-SWARM/sdk daemon clients", () => {
 			},
 		])
 	})
+
+	it("tears down swarm SSE subscriptions when iteration stops early", async () => {
+		const cancelSpy = vi.fn()
+		let requestSignal: AbortSignal | undefined
+
+		fetchMock.mockImplementationOnce((_url: string, init?: RequestInit) => {
+			requestSignal = init?.signal as AbortSignal | undefined
+
+			return Promise.resolve(
+				new Response(
+					new ReadableStream({
+						start(controller) {
+							controller.enqueue(
+								new TextEncoder().encode(
+									'event: swarm:running\ndata: {"swarmId":"swarm-1"}\n\n',
+								),
+							)
+						},
+						cancel(reason) {
+							cancelSpy(reason)
+						},
+					}),
+					{
+						headers: {
+							"content-type": "text/event-stream",
+						},
+					},
+				),
+			)
+		})
+
+		const client = createDaemonClient({ baseUrl: "http://daemon.test" })
+
+		for await (const event of client.swarms.subscribe("swarm-1")) {
+			expect(event).toEqual({
+				event: "swarm:running",
+				data: {
+					swarmId: "swarm-1",
+				},
+			})
+			break
+		}
+
+		expect(cancelSpy).toHaveBeenCalledOnce()
+		expect(requestSignal?.aborted).toBe(true)
+	})
 })

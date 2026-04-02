@@ -91,6 +91,8 @@ export class DaemonClient {
 		path: string,
 		init: RequestInit = {},
 	): AsyncGenerator<DaemonEvent<T>> {
+		const abortController = new AbortController()
+		const detachAbortRelay = relayAbort(init.signal, abortController)
 		const response = await this.fetchImpl(this.url(path), {
 			...init,
 			method: init.method ?? "GET",
@@ -98,13 +100,16 @@ export class DaemonClient {
 				accept: "text/event-stream",
 				...headersToObject(init.headers),
 			},
+			signal: abortController.signal,
 		})
 
 		if (!response.ok) {
+			detachAbortRelay()
 			throw new DaemonHttpError(response.status, await readResponseBody(response))
 		}
 
 		if (!response.body) {
+			detachAbortRelay()
 			throw new Error("daemon event stream did not include a response body")
 		}
 
@@ -142,6 +147,9 @@ export class DaemonClient {
 				yield trailingEvent as DaemonEvent<T>
 			}
 		} finally {
+			abortController.abort()
+			detachAbortRelay()
+			await reader.cancel("subscription closed").catch(() => undefined)
 			reader.releaseLock()
 		}
 	}
@@ -305,5 +313,29 @@ function parseJsonLike(value: string): unknown {
 		return JSON.parse(value) as unknown
 	} catch {
 		return value
+	}
+}
+
+function relayAbort(
+	source: AbortSignal | null | undefined,
+	target: AbortController,
+): () => void {
+	if (!source) {
+		return () => {}
+	}
+
+	if (source.aborted) {
+		target.abort()
+		return () => {}
+	}
+
+	const onAbort = () => {
+		target.abort()
+	}
+
+	source.addEventListener("abort", onAbort, { once: true })
+
+	return () => {
+		source.removeEventListener("abort", onAbort)
 	}
 }
