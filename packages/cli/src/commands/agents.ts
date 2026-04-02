@@ -41,9 +41,9 @@ function renderAgentDetails(agent: AgentSnapshot) {
 }
 
 export async function executeAgentsListCommand(
-	client: Pick<CliDaemonClient, "listAgents"> = createCliDaemonClient(),
+	client: Pick<CliDaemonClient, "agents"> = createCliDaemonClient(),
 ): Promise<void> {
-	const agents = await client.listAgents()
+	const agents = await client.agents.list()
 
 	if (agents.length === 0) {
 		console.log("No daemon-backed agents are currently registered.")
@@ -59,9 +59,9 @@ export async function executeAgentsListCommand(
 
 export async function executeAgentsShowCommand(
 	nameOrId: string,
-	client: Pick<CliDaemonClient, "listAgents" | "getAgent"> = createCliDaemonClient(),
+	client: Pick<CliDaemonClient, "agents"> = createCliDaemonClient(),
 ): Promise<void> {
-	const agents = await client.listAgents()
+	const agents = await client.agents.list()
 	const match = agents.find(
 		(agent) => agent.state.id === nameOrId || agent.state.name === nameOrId,
 	)
@@ -73,7 +73,7 @@ export async function executeAgentsShowCommand(
 		return
 	}
 
-	const snapshot = await client.getAgent(match.state.id)
+	const snapshot = await client.agents.get(match.state.id)
 	renderAgentDetails(snapshot)
 }
 

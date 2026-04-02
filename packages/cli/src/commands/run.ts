@@ -1,5 +1,6 @@
 import { Command } from "commander"
 import { createCliDaemonClient, type CliDaemonClient } from "../client.js"
+import type { SwarmConfig } from "@animaOS-SWARM/sdk"
 
 export interface RunOptions {
 	model: string
@@ -15,23 +16,45 @@ export async function executeRunCommand(
 	opts: RunOptions,
 	client: CliDaemonClient = createCliDaemonClient(),
 ): Promise<void> {
+	if (opts.apiKey) {
+		console.error(
+			"Error:",
+			"--api-key is not supported by the daemon-backed run command. Configure credentials in the daemon environment.",
+		)
+		process.exitCode = 1
+		return
+	}
+
 	if (opts.tui) {
 		console.log("TUI mode is not available for daemon-backed runs yet. Falling back to plain text.\n")
 	}
 
-	const execution = await client.runTask(task, {
+	try {
+		if (opts.strategy) {
+			await runSwarm(task, opts, client)
+		} else {
+			await runSingleAgent(task, opts, client)
+		}
+	} catch (error) {
+		console.error("Error:", getErrorMessage(error))
+		process.exitCode = 1
+	}
+}
+
+async function runSingleAgent(
+	task: string,
+	opts: RunOptions,
+	client: Pick<CliDaemonClient, "agents">,
+): Promise<void> {
+	const agent = await client.agents.create({
+		name: opts.name,
 		model: opts.model,
 		provider: opts.provider,
-		name: opts.name,
-		strategy: opts.strategy,
+		system: "You are a helpful task agent. Use tools when needed. Be concise.",
 	})
+	const execution = await client.agents.run(agent.state.id, { text: task })
 
-	if (execution.mode === "swarm") {
-		console.log(`Swarm running with strategy "${opts.strategy}" and model ${opts.model}...\n`)
-	} else {
-		console.log(`Agent "${opts.name}" running with ${opts.model}...\n`)
-	}
-
+	console.log(`Agent "${opts.name}" running with ${opts.model}...\n`)
 	console.log("--- Result ---")
 	if (execution.result.status === "success") {
 		const output =
@@ -47,11 +70,60 @@ export async function executeRunCommand(
 	}
 
 	const duration = execution.result.durationMs ?? 0
-	if (execution.mode === "swarm") {
-		console.log(`\nDuration: ${duration}ms | Tokens: ${execution.swarm.tokenUsage.totalTokens}`)
+	console.log(`\nDuration: ${duration}ms | Tokens: ${execution.agent.state.tokenUsage.totalTokens}`)
+}
+
+async function runSwarm(
+	task: string,
+	opts: RunOptions,
+	client: Pick<CliDaemonClient, "swarms">,
+): Promise<void> {
+	const swarm = await client.swarms.create(buildRunSwarmConfig(opts))
+	const execution = await client.swarms.run(swarm.id, { text: task })
+
+	console.log(`Swarm running with strategy "${opts.strategy}" and model ${opts.model}...\n`)
+	console.log("--- Result ---")
+	if (execution.result.status === "success") {
+		const output =
+			typeof execution.result.data === "object" &&
+			execution.result.data !== null &&
+			"text" in execution.result.data
+				? execution.result.data.text
+				: JSON.stringify(execution.result.data)
+		console.log(output)
 	} else {
-		console.log(`\nDuration: ${duration}ms | Tokens: ${execution.agent.state.tokenUsage.totalTokens}`)
+		console.error("Error:", execution.result.error)
+		process.exitCode = 1
 	}
+
+	const duration = execution.result.durationMs ?? 0
+	console.log(`\nDuration: ${duration}ms | Tokens: ${execution.swarm.tokenUsage.totalTokens}`)
+}
+
+function buildRunSwarmConfig(opts: RunOptions): SwarmConfig {
+	return {
+		strategy: opts.strategy!,
+		manager: {
+			name: "manager",
+			model: opts.model,
+			provider: opts.provider,
+			system:
+				"You are a task manager. Break complex tasks into subtasks and delegate to workers. Synthesize results into a final answer.",
+		},
+		workers: [
+			{
+				name: "worker",
+				model: opts.model,
+				provider: opts.provider,
+				system:
+					"You are a helpful worker agent. Complete the assigned task concisely and accurately.",
+			},
+		],
+	}
+}
+
+function getErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error)
 }
 
 export const runCommand = new Command("run")
@@ -61,6 +133,6 @@ export const runCommand = new Command("run")
 	.option("-p, --provider <provider>", "Provider: openai, anthropic, ollama", "openai")
 	.option("-n, --name <name>", "Agent name (single-agent mode)", "task-agent")
 	.option("-s, --strategy <strategy>", "Swarm strategy: supervisor, dynamic, round-robin")
-	.option("--api-key <key>", "API key override")
+	.option("--api-key <key>", "API key override (unsupported with daemon-backed execution)")
 	.option("--no-tui", "Disable TUI, use plain text output")
-	.action(executeRunCommand)
+	.action((task: string, opts: RunOptions) => executeRunCommand(task, opts))
