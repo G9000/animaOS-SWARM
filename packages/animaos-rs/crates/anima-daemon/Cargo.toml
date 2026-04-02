@@ -10,7 +10,13 @@ anima-core = { path = "../anima-core" }
 anima-memory = { path = "../anima-memory" }
 anima-swarm = { path = "../anima-swarm" }
 async-trait = "0.1"
+axum = "0.7"
 futures = "0.3"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

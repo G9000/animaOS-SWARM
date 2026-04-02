@@ -1,37 +1,35 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
-use std::thread;
-use std::time::Duration;
+use anima_daemon::app;
+use axum::body::{to_bytes, Body};
+use axum::http::{Request, StatusCode};
+use tower::util::ServiceExt;
 
-use anima_daemon::Daemon;
+#[tokio::test]
+async fn health_endpoint_returns_ok_json() {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("app responds");
 
-#[test]
-fn health_endpoint_returns_ok_json() {
-    let daemon = Daemon::bind("127.0.0.1:0").expect("daemon binds");
-    let addr = daemon.local_addr().expect("daemon reports local addr");
-
-    let server = thread::spawn(move || {
-        daemon.serve_one().expect("daemon serves one request");
-    });
-
-    thread::sleep(Duration::from_millis(25));
-
-    let mut stream = TcpStream::connect(addr).expect("client connects");
-    stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        .expect("request written");
-
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("response read");
-
-    server.join().expect("server thread joins");
-
-    assert!(
-        response.starts_with("HTTP/1.1 200 OK"),
-        "unexpected response: {response}"
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .expect("content-type header exists"),
+        "application/json"
     );
-    assert!(
-        response.contains("{\"status\":\"ok\"}"),
-        "health body missing ok status: {response}"
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    assert_eq!(
+        std::str::from_utf8(&body).expect("body is utf-8"),
+        "{\"status\":\"ok\"}"
     );
 }

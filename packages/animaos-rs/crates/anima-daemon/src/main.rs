@@ -1,9 +1,11 @@
 use std::io;
 use std::time::Duration;
 
-use anima_daemon::{Daemon, DaemonConfig};
+use anima_daemon::{serve, DaemonConfig};
+use tokio::net::TcpListener;
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let host = std::env::var("ANIMAOS_RS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let port = std::env::var("ANIMAOS_RS_PORT").unwrap_or_else(|_| "8080".to_string());
     let bind_addr = format!("{host}:{port}");
@@ -19,11 +21,11 @@ fn main() -> io::Result<()> {
         )?),
     };
 
-    let daemon = Daemon::bind_with_config(bind_addr.as_str(), config)?;
-    let local_addr = daemon.local_addr()?;
+    let listener = TcpListener::bind(bind_addr.as_str()).await?;
+    let local_addr = listener.local_addr()?;
     println!("anima-daemon listening on http://{local_addr}");
 
-    daemon.serve()
+    serve(listener, config).await
 }
 
 fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
