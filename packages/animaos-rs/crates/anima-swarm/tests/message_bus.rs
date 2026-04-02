@@ -1,5 +1,8 @@
 use anima_core::{AgentConfig, Content, TaskResult, TokenUsage};
-use anima_swarm::{AgentMessage, MessageBus, SwarmConfig, SwarmState, SwarmStatus, SwarmStrategy};
+use anima_swarm::{
+    AgentMessage, MessageBus, StrategyContext, SwarmAgentHandle, SwarmConfig, SwarmFuture,
+    SwarmState, SwarmStatus, SwarmStrategy,
+};
 
 fn worker_config(name: &str) -> AgentConfig {
     AgentConfig {
@@ -68,6 +71,35 @@ fn swarm_types_keep_ts_shape_fields() {
     assert_eq!(state.token_usage.total_tokens, 12);
     assert_eq!(message.to, "worker-a");
     assert_eq!(message.content.text, "delegate");
+}
+
+#[test]
+fn strategy_context_keeps_async_spawn_agent_handle_shape() {
+    let mut bus = MessageBus::new();
+    let mut spawn_agent = |config: AgentConfig| -> SwarmFuture<'_, SwarmAgentHandle> {
+        Box::pin(async move {
+            SwarmAgentHandle {
+                id: format!("{}-id", config.name),
+                run: Box::new(|input: String| {
+                    Box::pin(async move { TaskResult::success(text_content(&input), 1) })
+                }),
+            }
+        })
+    };
+
+    let context = StrategyContext {
+        task: "delegate research".into(),
+        manager_config: worker_config("manager"),
+        worker_configs: vec![worker_config("worker-a")],
+        spawn_agent: &mut spawn_agent,
+        message_bus: &mut bus,
+        max_turns: 6,
+    };
+
+    assert_eq!(context.task, "delegate research");
+    assert_eq!(context.manager_config.name, "manager");
+    assert_eq!(context.worker_configs.len(), 1);
+    assert_eq!(context.max_turns, 6);
 }
 
 #[test]

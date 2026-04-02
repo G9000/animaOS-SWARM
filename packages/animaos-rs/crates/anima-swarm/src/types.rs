@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::pin::Pin;
+
 use anima_core::{AgentConfig, Content, TaskResult, TokenUsage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,11 +78,21 @@ pub trait SwarmMessageBus {
     fn clear_inboxes(&mut self);
 }
 
+pub type SwarmFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub type SwarmAgentRunFn =
+    dyn Fn(String) -> SwarmFuture<'static, TaskResult<Content>> + Send + Sync + 'static;
+
+pub struct SwarmAgentHandle {
+    pub id: String,
+    pub run: Box<SwarmAgentRunFn>,
+}
+
 pub struct StrategyContext<'a> {
     pub task: String,
     pub manager_config: AgentConfig,
     pub worker_configs: Vec<AgentConfig>,
-    pub spawn_agent: &'a mut dyn FnMut(AgentConfig) -> TaskResult<Content>,
+    pub spawn_agent: &'a mut dyn FnMut(AgentConfig) -> SwarmFuture<'a, SwarmAgentHandle>,
     pub message_bus: &'a mut dyn SwarmMessageBus,
     pub max_turns: usize,
 }
