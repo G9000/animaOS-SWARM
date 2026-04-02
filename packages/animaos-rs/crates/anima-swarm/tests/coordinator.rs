@@ -312,19 +312,16 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
     let spawn_order = Arc::new(Mutex::new(Vec::<String>::new()));
     let worker_inputs = Arc::new(Mutex::new(Vec::<String>::new()));
     let manager_inputs = Arc::new(Mutex::new(Vec::<String>::new()));
-    let worker_shell_cell = Arc::new(Mutex::new(None::<CoordinatorAgentShell>));
 
     let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
         let spawn_order = Arc::clone(&spawn_order);
         let worker_inputs = Arc::clone(&worker_inputs);
         let manager_inputs = Arc::clone(&manager_inputs);
-        let worker_shell_cell = Arc::clone(&worker_shell_cell);
 
         move |context: CoordinatorAgentFactoryContext| {
             let spawn_order = Arc::clone(&spawn_order);
             let worker_inputs = Arc::clone(&worker_inputs);
             let manager_inputs = Arc::clone(&manager_inputs);
-            let worker_shell_cell = Arc::clone(&worker_shell_cell);
 
             Box::pin(async move {
                 spawn_order
@@ -355,10 +352,6 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
                             clear_task_state: Arc::new(|| {}),
                             stop: Arc::new(|| Box::pin(async {})),
                         };
-                        *worker_shell_cell
-                            .lock()
-                            .expect("worker shell mutex should not be poisoned") =
-                            Some(shell.clone());
                         Ok(shell)
                     }
                     "manager" => {
@@ -380,23 +373,23 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
                             tool_names.contains(&"delegate_task"),
                             "supervisor manager should receive delegate_task tool"
                         );
+                        let delegate_task = context
+                            .delegate_task
+                            .as_ref()
+                            .expect("supervisor manager should receive delegate_task callback")
+                            .clone();
 
                         let run = Arc::new(move |input: String| {
                             let manager_inputs = Arc::clone(&manager_inputs);
-                            let worker_shell_cell = Arc::clone(&worker_shell_cell);
+                            let delegate_task = Arc::clone(&delegate_task);
                             Box::pin(async move {
                                 manager_inputs
                                     .lock()
                                     .expect("manager input mutex should not be poisoned")
                                     .push(input);
 
-                                let worker_shell = worker_shell_cell
-                                    .lock()
-                                    .expect("worker shell mutex should not be poisoned")
-                                    .clone()
-                                    .expect("worker shell should be available before manager runs");
-
-                                let worker_result = (worker_shell.run)("Do research".into()).await;
+                                let worker_result =
+                                    delegate_task("worker".into(), "Do research".into()).await;
                                 assert_eq!(worker_result.status, TaskStatus::Success);
                                 assert_eq!(
                                     worker_result

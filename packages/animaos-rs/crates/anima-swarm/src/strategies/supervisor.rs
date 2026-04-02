@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anima_core::{Content, DataValue, TaskResult, ToolDescriptor};
 
-use crate::coordinator::{CoordinatorDispatchContext, CoordinatorFuture};
+use crate::coordinator::{CoordinatorDelegateFn, CoordinatorDispatchContext, CoordinatorFuture};
 
 pub fn supervisor_strategy(
     ctx: CoordinatorDispatchContext,
@@ -15,16 +17,40 @@ pub fn supervisor_strategy(
             .iter()
             .map(|config| config.name.clone())
             .collect::<Vec<_>>();
-
+        let mut worker_refs = HashMap::new();
         for config in ctx.worker_configs().iter().cloned() {
+            let worker_name = config.name.clone();
             match ctx.spawn_agent(config).await {
-                Ok(_) => {}
+                Ok(worker) => {
+                    worker_refs.insert(worker_name, worker);
+                }
                 Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
             }
         }
 
+        let worker_refs = Arc::new(worker_refs);
+        let delegate_task: Arc<CoordinatorDelegateFn> = {
+            let worker_refs = Arc::clone(&worker_refs);
+            Arc::new(move |worker_name: String, task: String| {
+                let worker_refs = Arc::clone(&worker_refs);
+                Box::pin(async move {
+                    let Some(worker) = worker_refs.get(&worker_name) else {
+                        return TaskResult::error(
+                            format!(
+                                "Worker \"{worker_name}\" not found. Available: {}",
+                                worker_refs.keys().cloned().collect::<Vec<_>>().join(", ")
+                            ),
+                            0,
+                        );
+                    };
+
+                    worker.run(task).await
+                })
+            })
+        };
+
         let mut manager_config = ctx.manager_config().clone();
-        let delegate_task = ToolDescriptor {
+        let delegate_tool = ToolDescriptor {
             name: "delegate_task".into(),
             description: format!(
                 "Delegate a subtask to a worker agent. Available workers: {}",
@@ -39,14 +65,14 @@ pub fn supervisor_strategy(
         };
 
         let mut tools = manager_config.tools.take().unwrap_or_default();
-        tools.push(delegate_task);
+        tools.push(delegate_tool);
         manager_config.tools = Some(tools);
         manager_config.system = Some(supervisor_system_prompt(
             manager_config.system.take(),
             &worker_names,
         ));
 
-        let manager = match ctx.spawn_agent(manager_config).await {
+        let manager = match ctx.spawn_manager(manager_config, delegate_task).await {
             Ok(manager) => manager,
             Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
         };

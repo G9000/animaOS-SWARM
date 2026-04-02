@@ -26,6 +26,9 @@ pub type CoordinatorSendFn =
 pub type CoordinatorBroadcastFn =
     dyn Fn(Content) -> CoordinatorFuture<Result<(), String>> + Send + Sync;
 
+pub type CoordinatorDelegateFn =
+    dyn Fn(String, String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
+
 pub type CoordinatorAgentFactoryFn = dyn Fn(CoordinatorAgentFactoryContext) -> CoordinatorFuture<Result<CoordinatorAgentShell, String>>
     + Send
     + Sync;
@@ -36,6 +39,7 @@ pub struct CoordinatorAgentFactoryContext {
     pub agent_id: String,
     pub send: Arc<CoordinatorSendFn>,
     pub broadcast: Arc<CoordinatorBroadcastFn>,
+    pub delegate_task: Option<Arc<CoordinatorDelegateFn>>,
 }
 
 #[derive(Clone)]
@@ -94,7 +98,12 @@ pub struct CoordinatorDispatchContext {
     max_turns: usize,
     message_bus: Arc<Mutex<MessageBus>>,
     spawn_agent: Arc<
-        dyn Fn(AgentConfig) -> CoordinatorFuture<Result<CoordinatorAgentRef, String>> + Send + Sync,
+        dyn Fn(
+                AgentConfig,
+                Option<Arc<CoordinatorDelegateFn>>,
+            ) -> CoordinatorFuture<Result<CoordinatorAgentRef, String>>
+            + Send
+            + Sync,
     >,
 }
 
@@ -106,7 +115,10 @@ impl CoordinatorDispatchContext {
         max_turns: usize,
         message_bus: Arc<Mutex<MessageBus>>,
         spawn_agent: Arc<
-            dyn Fn(AgentConfig) -> CoordinatorFuture<Result<CoordinatorAgentRef, String>>
+            dyn Fn(
+                    AgentConfig,
+                    Option<Arc<CoordinatorDelegateFn>>,
+                ) -> CoordinatorFuture<Result<CoordinatorAgentRef, String>>
                 + Send
                 + Sync,
         >,
@@ -142,7 +154,15 @@ impl CoordinatorDispatchContext {
     }
 
     pub async fn spawn_agent(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
-        (self.spawn_agent)(config).await
+        (self.spawn_agent)(config, None).await
+    }
+
+    pub async fn spawn_manager(
+        &self,
+        config: AgentConfig,
+        delegate_task: Arc<CoordinatorDelegateFn>,
+    ) -> Result<CoordinatorAgentRef, String> {
+        (self.spawn_agent)(config, Some(delegate_task)).await
     }
 }
 
@@ -244,7 +264,7 @@ impl SwarmCoordinator {
                 continue;
             }
 
-            match self.spawn_new_agent(config.clone()).await {
+            match self.spawn_new_agent(config.clone(), None).await {
                 Ok(agent) => {
                     self.inner
                         .pool
@@ -345,11 +365,16 @@ impl SwarmCoordinator {
         self.reset_task_state();
 
         let spawn_coordinator = self.clone();
-        let spawn_agent = Arc::new(move |config: AgentConfig| {
-            let spawn_coordinator = spawn_coordinator.clone();
-            Box::pin(async move { spawn_coordinator.spawn_for_dispatch(config).await })
-                as CoordinatorFuture<Result<CoordinatorAgentRef, String>>
-        });
+        let spawn_agent = Arc::new(
+            move |config: AgentConfig, delegate_task: Option<Arc<CoordinatorDelegateFn>>| {
+                let spawn_coordinator = spawn_coordinator.clone();
+                Box::pin(async move {
+                    spawn_coordinator
+                        .spawn_for_dispatch(config, delegate_task)
+                        .await
+                }) as CoordinatorFuture<Result<CoordinatorAgentRef, String>>
+            },
+        );
         let max_turns = self
             .inner
             .config
@@ -383,15 +408,23 @@ impl SwarmCoordinator {
         result
     }
 
-    async fn spawn_for_dispatch(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
+    async fn spawn_for_dispatch(
+        &self,
+        config: AgentConfig,
+        delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+    ) -> Result<CoordinatorAgentRef, String> {
         if let Some(agent) = self.get_pool_agent(&config.name) {
             return Ok(agent);
         }
 
-        self.spawn_new_agent(config).await
+        self.spawn_new_agent(config, delegate_task).await
     }
 
-    async fn spawn_new_agent(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
+    async fn spawn_new_agent(
+        &self,
+        config: AgentConfig,
+        delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+    ) -> Result<CoordinatorAgentRef, String> {
         let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
         let liveness = Arc::new(CoordinatorAgentLiveness::default());
         self.reserve_agent_slot(&agent_id)?;
@@ -400,6 +433,7 @@ impl SwarmCoordinator {
             agent_id: agent_id.clone(),
             send: self.build_send_hook(&agent_id, liveness.clone()),
             broadcast: self.build_broadcast_hook(&agent_id, liveness.clone()),
+            delegate_task,
         })
         .await
         .inspect_err(|_| self.release_agent_slot(&agent_id))?;
