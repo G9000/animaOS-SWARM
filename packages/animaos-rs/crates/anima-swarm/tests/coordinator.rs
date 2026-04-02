@@ -330,7 +330,7 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
                     .push(context.config.name.clone());
 
                 match context.config.name.as_str() {
-                    "worker" => {
+                    "worker-a" | "worker-b" => {
                         let run = Arc::new(move |input: String| {
                             let worker_inputs = Arc::clone(&worker_inputs);
                             Box::pin(async move {
@@ -389,7 +389,7 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
                                     .push(input);
 
                                 let worker_result =
-                                    delegate_task("worker".into(), "Do research".into()).await;
+                                    delegate_task("worker-b".into(), "Do research".into()).await;
                                 assert_eq!(worker_result.status, TaskStatus::Success);
                                 assert_eq!(
                                     worker_result
@@ -397,6 +397,17 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
                                         .as_ref()
                                         .map(|content| content.text.as_str()),
                                     Some("worker result: research complete")
+                                );
+
+                                let unknown_worker_result =
+                                    delegate_task("missing-worker".into(), "Do research".into())
+                                        .await;
+                                assert_eq!(unknown_worker_result.status, TaskStatus::Error);
+                                assert_eq!(
+                                    unknown_worker_result.error.as_deref(),
+                                    Some(
+                                        "Worker \"missing-worker\" not found. Available: \"worker-a\", \"worker-b\""
+                                    )
                                 );
 
                                 TaskResult::success(
@@ -421,7 +432,7 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
     });
 
     let coordinator = SwarmCoordinator::with_hooks(
-        base_config(&["worker"]),
+        base_config(&["worker-a", "worker-b"]),
         Arc::new(supervisor_strategy),
         factory,
     );
@@ -438,7 +449,7 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
             .lock()
             .expect("spawn order mutex should not be poisoned")
             .as_slice(),
-        ["worker", "manager"]
+        ["worker-a", "worker-b", "manager"]
     );
     assert_eq!(
         worker_inputs

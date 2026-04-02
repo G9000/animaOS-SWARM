@@ -17,6 +17,11 @@ pub fn supervisor_strategy(
             .iter()
             .map(|config| config.name.clone())
             .collect::<Vec<_>>();
+        let available_workers = worker_names
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut worker_refs = HashMap::new();
         for config in ctx.worker_configs().iter().cloned() {
             let worker_name = config.name.clone();
@@ -31,14 +36,16 @@ pub fn supervisor_strategy(
         let worker_refs = Arc::new(worker_refs);
         let delegate_task: Arc<CoordinatorDelegateFn> = {
             let worker_refs = Arc::clone(&worker_refs);
+            let available_workers = available_workers.clone();
             Arc::new(move |worker_name: String, task: String| {
                 let worker_refs = Arc::clone(&worker_refs);
+                let available_workers = available_workers.clone();
                 Box::pin(async move {
                     let Some(worker) = worker_refs.get(&worker_name) else {
                         return TaskResult::error(
                             format!(
                                 "Worker \"{worker_name}\" not found. Available: {}",
-                                worker_refs.keys().cloned().collect::<Vec<_>>().join(", ")
+                                available_workers
                             ),
                             0,
                         );
