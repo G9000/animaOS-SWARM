@@ -427,6 +427,9 @@ impl SwarmCoordinator {
     ) -> Result<CoordinatorAgentRef, String> {
         let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
         let liveness = Arc::new(CoordinatorAgentLiveness::default());
+        let delegate_task = delegate_task.map(|delegate_task| {
+            self.build_delegate_hook(&agent_id, liveness.clone(), delegate_task)
+        });
         self.reserve_agent_slot(&agent_id)?;
         let shell = (self.inner.agent_factory)(CoordinatorAgentFactoryContext {
             config,
@@ -766,6 +769,27 @@ impl SwarmCoordinator {
         self.with_state(|state| {
             state.agent_ids.clear();
         });
+    }
+
+    fn build_delegate_hook(
+        &self,
+        from_agent_id: &str,
+        liveness: Arc<CoordinatorAgentLiveness>,
+        delegate_task: Arc<CoordinatorDelegateFn>,
+    ) -> Arc<CoordinatorDelegateFn> {
+        let from_agent_id = from_agent_id.to_string();
+        Arc::new(move |worker_name: String, task: String| {
+            let liveness = liveness.clone();
+            let from_agent_id = from_agent_id.clone();
+            let delegate_task = delegate_task.clone();
+            Box::pin(async move {
+                if !liveness.is_active() {
+                    return TaskResult::error(inactive_agent_error(&from_agent_id), 0);
+                }
+
+                delegate_task(worker_name, task).await
+            })
+        })
     }
 }
 
