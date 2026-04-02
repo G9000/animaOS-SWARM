@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,7 @@ pub struct CoordinatorAgentFactoryContext {
 #[derive(Clone)]
 pub struct CoordinatorAgentRef {
     pub id: String,
+    liveness: Arc<CoordinatorAgentLiveness>,
     run: Arc<dyn Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync>,
 }
 
@@ -48,13 +49,30 @@ impl CoordinatorAgentRef {
     where
         F: Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync + 'static,
     {
+        let id = id.into();
         Self {
-            id: id.into(),
+            id,
+            liveness: Arc::new(CoordinatorAgentLiveness::default()),
             run: Arc::new(run),
         }
     }
 
+    fn with_liveness(
+        id: impl Into<String>,
+        run: Arc<dyn Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync>,
+        liveness: Arc<CoordinatorAgentLiveness>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            liveness,
+            run,
+        }
+    }
+
     pub async fn run(&self, input: String) -> TaskResult<Content> {
+        if !self.liveness.is_active() {
+            return inactive_agent_result(&self.id);
+        }
         (self.run)(input).await
     }
 }
@@ -138,10 +156,37 @@ struct CoordinatorInner {
     message_bus: Arc<Mutex<MessageBus>>,
     strategy: Arc<CoordinatorStrategyFn>,
     agent_factory: Arc<CoordinatorAgentFactoryFn>,
-    agents: Mutex<HashMap<String, CoordinatorAgentShell>>,
+    agents: Mutex<HashMap<String, CoordinatorManagedAgent>>,
     admitted_agent_ids: Mutex<HashSet<String>>,
     pool: Mutex<HashMap<String, String>>,
     dispatch_lock: AsyncMutex<()>,
+}
+
+struct CoordinatorAgentLiveness {
+    active: AtomicBool,
+}
+
+impl Default for CoordinatorAgentLiveness {
+    fn default() -> Self {
+        Self {
+            active: AtomicBool::new(true),
+        }
+    }
+}
+
+impl CoordinatorAgentLiveness {
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn deactivate(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+struct CoordinatorManagedAgent {
+    shell: CoordinatorAgentShell,
+    liveness: Arc<CoordinatorAgentLiveness>,
 }
 
 impl SwarmCoordinator {
@@ -231,7 +276,13 @@ impl SwarmCoordinator {
                 .agents
                 .lock()
                 .expect("coordinator agents mutex should not be poisoned");
-            let drained = agents.drain().collect::<Vec<_>>();
+            let drained = agents
+                .drain()
+                .map(|(agent_id, agent)| {
+                    agent.liveness.deactivate();
+                    (agent_id, agent.shell)
+                })
+                .collect::<Vec<_>>();
             self.inner
                 .pool
                 .lock()
@@ -248,6 +299,8 @@ impl SwarmCoordinator {
                 .expect("message bus mutex should not be poisoned");
             bus.clear();
         }
+
+        self.clear_live_agent_ids();
 
         for (agent_id, agent) in agents {
             self.release_agent_slot(&agent_id);
@@ -344,10 +397,12 @@ impl SwarmCoordinator {
         })
         .await
         .inspect_err(|_| self.release_agent_slot(&agent_id))?;
-        let agent = CoordinatorAgentRef {
-            id: agent_id.clone(),
-            run: shell.run.clone(),
-        };
+        let liveness = Arc::new(CoordinatorAgentLiveness::default());
+        let agent = CoordinatorAgentRef::with_liveness(
+            agent_id.clone(),
+            shell.run.clone(),
+            liveness.clone(),
+        );
 
         {
             let mut bus = self
@@ -361,7 +416,10 @@ impl SwarmCoordinator {
             .agents
             .lock()
             .expect("coordinator agents mutex should not be poisoned")
-            .insert(agent_id.clone(), shell.clone());
+            .insert(
+                agent_id.clone(),
+                CoordinatorManagedAgent { shell, liveness },
+            );
         self.with_state(|state| {
             state.agent_ids.push(agent_id.clone());
         });
@@ -382,9 +440,12 @@ impl SwarmCoordinator {
             .lock()
             .expect("coordinator agents mutex should not be poisoned")
             .get(&pool_agent_id)
-            .map(|agent| CoordinatorAgentRef {
-                id: pool_agent_id,
-                run: agent.run.clone(),
+            .map(|agent| {
+                CoordinatorAgentRef::with_liveness(
+                    pool_agent_id,
+                    agent.shell.run.clone(),
+                    agent.liveness.clone(),
+                )
             })
     }
 
@@ -395,14 +456,17 @@ impl SwarmCoordinator {
             .expect("message bus mutex should not be poisoned")
             .clear_inboxes();
 
-        for agent in self
+        let clear_hooks = self
             .inner
             .agents
             .lock()
             .expect("coordinator agents mutex should not be poisoned")
             .values()
-        {
-            (agent.clear_task_state)();
+            .map(|agent| agent.shell.clear_task_state.clone())
+            .collect::<Vec<_>>();
+
+        for clear_task_state in clear_hooks {
+            clear_task_state();
         }
     }
 
@@ -429,9 +493,16 @@ impl SwarmCoordinator {
                 .collect::<Vec<_>>();
             ephemeral_ids
                 .into_iter()
-                .filter_map(|agent_id| agents.remove(&agent_id).map(|agent| (agent_id, agent)))
+                .filter_map(|agent_id| {
+                    agents.remove(&agent_id).map(|agent| {
+                        agent.liveness.deactivate();
+                        (agent_id, agent.shell)
+                    })
+                })
                 .collect::<Vec<_>>()
         };
+
+        self.remove_live_agent_ids(ephemeral.iter().map(|(agent_id, _)| agent_id.as_str()));
 
         for (agent_id, agent) in ephemeral {
             self.inner
@@ -445,19 +516,22 @@ impl SwarmCoordinator {
     }
 
     fn capture_live_token_usage(&self) {
-        let agents = self
+        let token_hooks = self
             .inner
             .agents
             .lock()
-            .expect("coordinator agents mutex should not be poisoned");
+            .expect("coordinator agents mutex should not be poisoned")
+            .values()
+            .map(|agent| agent.shell.token_usage.clone())
+            .collect::<Vec<_>>();
 
-        if agents.is_empty() {
+        if token_hooks.is_empty() {
             return;
         }
 
         let mut token_usage = TokenUsage::default();
-        for agent in agents.values() {
-            let snapshot = (agent.token_usage)();
+        for token_hook in token_hooks {
+            let snapshot = token_hook();
             token_usage.prompt_tokens += snapshot.prompt_tokens;
             token_usage.completion_tokens += snapshot.completion_tokens;
             token_usage.total_tokens += snapshot.total_tokens;
@@ -573,9 +647,10 @@ impl SwarmCoordinator {
             created_ids
                 .iter()
                 .filter_map(|agent_id| {
-                    agents
-                        .remove(agent_id)
-                        .map(|agent| (agent_id.clone(), agent))
+                    agents.remove(agent_id).map(|agent| {
+                        agent.liveness.deactivate();
+                        (agent_id.clone(), agent.shell)
+                    })
                 })
                 .collect::<Vec<_>>()
         };
@@ -614,6 +689,28 @@ impl SwarmCoordinator {
             self.release_agent_slot(&agent_id);
             (agent.stop)().await;
         }
+    }
+
+    fn remove_live_agent_ids<'a>(&self, removed_ids: impl IntoIterator<Item = &'a str>) {
+        let removed_ids = removed_ids
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        if removed_ids.is_empty() {
+            return;
+        }
+
+        self.with_state(|state| {
+            state
+                .agent_ids
+                .retain(|agent_id| !removed_ids.contains(agent_id));
+        });
+    }
+
+    fn clear_live_agent_ids(&self) {
+        self.with_state(|state| {
+            state.agent_ids.clear();
+        });
     }
 }
 
@@ -666,4 +763,11 @@ fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_millis()
+}
+
+fn inactive_agent_result(agent_id: &str) -> TaskResult<Content> {
+    TaskResult::error(
+        format!("Coordinator agent {agent_id} is no longer active"),
+        0,
+    )
 }

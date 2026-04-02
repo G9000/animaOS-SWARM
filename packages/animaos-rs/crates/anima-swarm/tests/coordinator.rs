@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
 use anima_swarm::coordinator::{
-    CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentShell,
-    CoordinatorDispatchContext, CoordinatorStrategyFn,
+    CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentRef,
+    CoordinatorAgentShell, CoordinatorDispatchContext, CoordinatorStrategyFn,
 };
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmStatus, SwarmStrategy};
 
@@ -775,7 +775,7 @@ fn spawn_agent_enforces_max_concurrent_agents_atomically_under_parallel_spawn() 
             .len(),
         1
     );
-    assert_eq!(coordinator.get_state().agent_ids.len(), 1);
+    assert!(coordinator.get_state().agent_ids.is_empty());
 }
 
 #[test]
@@ -859,4 +859,282 @@ fn get_state_refreshes_live_token_usage_for_persistent_workers() {
     assert_eq!(state.token_usage.prompt_tokens, 5);
     assert_eq!(state.token_usage.completion_tokens, 6);
     assert_eq!(state.token_usage.total_tokens, 11);
+}
+
+#[test]
+fn dispatch_releases_agents_lock_before_clear_task_state_hooks() {
+    let hook_gate = Arc::new(Mutex::new(()));
+    let (hook_entered_tx, hook_entered_rx) = mpsc::channel();
+    let hook_entered_tx = Arc::new(Mutex::new(Some(hook_entered_tx)));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let hook_gate = hook_gate.clone();
+        let hook_entered_tx = hook_entered_tx.clone();
+        move |_context: CoordinatorAgentFactoryContext| {
+            let hook_gate = hook_gate.clone();
+            let hook_entered_tx = hook_entered_tx.clone();
+            Box::pin(async move {
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(|input: String| {
+                        Box::pin(async move { TaskResult::success(text_content(&input), 1) })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(move || {
+                        if let Some(sender) = hook_entered_tx
+                            .lock()
+                            .expect("channel mutex should not be poisoned")
+                            .take()
+                        {
+                            sender.send(()).expect("hook entered signal should send");
+                        }
+                        let _guard = hook_gate
+                            .lock()
+                            .expect("hook gate mutex should not be poisoned");
+                    }),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a"]),
+        Arc::new(|_| Box::pin(async { TaskResult::success(text_content("ok"), 0) })),
+        factory,
+    );
+
+    block_on(coordinator.start()).expect("start should succeed");
+
+    let held_gate = hook_gate
+        .lock()
+        .expect("hook gate mutex should not be poisoned");
+    let dispatch_coordinator = coordinator.clone();
+    let dispatch = thread::spawn(move || block_on(dispatch_coordinator.dispatch("task")));
+
+    hook_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("clear_task_state hook should be reached");
+
+    let (state_done_tx, state_done_rx) = mpsc::channel();
+    let state_coordinator = coordinator.clone();
+    let state_thread = thread::spawn(move || {
+        let state = state_coordinator.get_state();
+        state_done_tx
+            .send(state.status)
+            .expect("state completion signal should send");
+    });
+
+    assert_eq!(
+        state_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("get_state should not be blocked by clear_task_state"),
+        SwarmStatus::Running
+    );
+
+    drop(held_gate);
+
+    let result = dispatch.join().expect("dispatch thread should join");
+    assert_eq!(result.status, TaskStatus::Success);
+    state_thread.join().expect("state thread should join");
+}
+
+#[test]
+fn get_state_releases_agents_lock_before_token_usage_hooks() {
+    let hook_gate = Arc::new(Mutex::new(()));
+    let (hook_entered_tx, hook_entered_rx) = mpsc::channel();
+    let hook_entered_tx = Arc::new(Mutex::new(Some(hook_entered_tx)));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let hook_gate = hook_gate.clone();
+        let hook_entered_tx = hook_entered_tx.clone();
+        move |_context: CoordinatorAgentFactoryContext| {
+            let hook_gate = hook_gate.clone();
+            let hook_entered_tx = hook_entered_tx.clone();
+            Box::pin(async move {
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(|input: String| {
+                        Box::pin(async move { TaskResult::success(text_content(&input), 1) })
+                    }),
+                    token_usage: Arc::new(move || {
+                        if let Some(sender) = hook_entered_tx
+                            .lock()
+                            .expect("channel mutex should not be poisoned")
+                            .take()
+                        {
+                            sender.send(()).expect("hook entered signal should send");
+                        }
+                        let _guard = hook_gate
+                            .lock()
+                            .expect("hook gate mutex should not be poisoned");
+                        TokenUsage::default()
+                    }),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a"]),
+        Arc::new(|_| Box::pin(async { TaskResult::success(text_content("ok"), 0) })),
+        factory,
+    );
+
+    block_on(coordinator.start()).expect("start should succeed");
+
+    let held_gate = hook_gate
+        .lock()
+        .expect("hook gate mutex should not be poisoned");
+    let state_coordinator = coordinator.clone();
+    let state_thread = thread::spawn(move || state_coordinator.get_state());
+
+    hook_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("token_usage hook should be reached");
+
+    let (stop_done_tx, stop_done_rx) = mpsc::channel();
+    let stop_coordinator = coordinator.clone();
+    let stop_thread = thread::spawn(move || {
+        block_on(stop_coordinator.stop()).expect("stop should succeed");
+        stop_done_tx
+            .send(())
+            .expect("stop completion signal should send");
+    });
+
+    stop_done_rx
+        .recv_timeout(Duration::from_millis(200))
+        .expect("stop should not be blocked by token_usage");
+
+    drop(held_gate);
+
+    state_thread.join().expect("state thread should join");
+    stop_thread.join().expect("stop thread should join");
+}
+
+#[test]
+fn dispatch_cleanup_prunes_agent_ids_and_invalidates_removed_refs() {
+    let harness = TestHarness::new(HashMap::from([
+        (
+            "worker-a".into(),
+            TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        ),
+        (
+            "manager".into(),
+            TokenUsage {
+                prompt_tokens: 2,
+                completion_tokens: 2,
+                total_tokens: 4,
+            },
+        ),
+    ]));
+    let saved_manager = Arc::new(Mutex::new(None::<CoordinatorAgentRef>));
+
+    let strategy: Arc<CoordinatorStrategyFn> = Arc::new({
+        let saved_manager = saved_manager.clone();
+        move |ctx: CoordinatorDispatchContext| {
+            let saved_manager = saved_manager.clone();
+            Box::pin(async move {
+                let worker = ctx
+                    .spawn_agent(ctx.worker_configs()[0].clone())
+                    .await
+                    .expect("worker spawn should succeed");
+                let manager = ctx
+                    .spawn_agent(ctx.manager_config().clone())
+                    .await
+                    .expect("manager spawn should succeed");
+                saved_manager
+                    .lock()
+                    .expect("saved manager mutex should not be poisoned")
+                    .replace(manager.clone());
+
+                let worker_result = worker.run(ctx.task().to_string()).await;
+                let worker_text = worker_result
+                    .data
+                    .as_ref()
+                    .map(|content| content.text.as_str())
+                    .expect("worker result should contain text");
+                manager.run(worker_text.to_string()).await
+            })
+        }
+    });
+
+    let coordinator =
+        SwarmCoordinator::with_hooks(base_config(&["worker-a"]), strategy, harness.factory());
+
+    block_on(coordinator.start()).expect("start should succeed");
+    let pooled_agent_ids = coordinator.get_state().agent_ids;
+    let result = block_on(coordinator.dispatch("task one"));
+    assert_eq!(result.status, TaskStatus::Success);
+
+    let state = coordinator.get_state();
+    assert_eq!(state.agent_ids, pooled_agent_ids);
+
+    let manager = saved_manager
+        .lock()
+        .expect("saved manager mutex should not be poisoned")
+        .clone()
+        .expect("manager ref should be captured");
+    let expected_error = format!("Coordinator agent {} is no longer active", manager.id);
+    let stale_result = block_on(manager.run("should fail".into()));
+    assert_eq!(stale_result.status, TaskStatus::Error);
+    assert_eq!(stale_result.error.as_deref(), Some(expected_error.as_str()));
+}
+
+#[test]
+fn stop_prunes_agent_ids_and_invalidates_pooled_refs() {
+    let harness = TestHarness::new(HashMap::from([(
+        "worker-a".into(),
+        TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+        },
+    )]));
+    let saved_worker = Arc::new(Mutex::new(None::<CoordinatorAgentRef>));
+
+    let strategy: Arc<CoordinatorStrategyFn> = Arc::new({
+        let saved_worker = saved_worker.clone();
+        move |ctx: CoordinatorDispatchContext| {
+            let saved_worker = saved_worker.clone();
+            Box::pin(async move {
+                let worker = ctx
+                    .spawn_agent(ctx.worker_configs()[0].clone())
+                    .await
+                    .expect("worker spawn should succeed");
+                saved_worker
+                    .lock()
+                    .expect("saved worker mutex should not be poisoned")
+                    .replace(worker.clone());
+                worker.run(ctx.task().to_string()).await
+            })
+        }
+    });
+
+    let coordinator =
+        SwarmCoordinator::with_hooks(base_config(&["worker-a"]), strategy, harness.factory());
+
+    block_on(coordinator.start()).expect("start should succeed");
+    let dispatch_result = block_on(coordinator.dispatch("task one"));
+    assert_eq!(dispatch_result.status, TaskStatus::Success);
+    assert_eq!(coordinator.get_state().agent_ids.len(), 1);
+
+    block_on(coordinator.stop()).expect("stop should succeed");
+
+    let state = coordinator.get_state();
+    assert!(state.agent_ids.is_empty());
+
+    let worker = saved_worker
+        .lock()
+        .expect("saved worker mutex should not be poisoned")
+        .clone()
+        .expect("worker ref should be captured");
+    let expected_error = format!("Coordinator agent {} is no longer active", worker.id);
+    let stale_result = block_on(worker.run("should fail".into()));
+    assert_eq!(stale_result.status, TaskStatus::Error);
+    assert_eq!(stale_result.error.as_deref(), Some(expected_error.as_str()));
 }
