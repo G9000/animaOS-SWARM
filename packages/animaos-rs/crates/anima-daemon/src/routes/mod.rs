@@ -1,6 +1,7 @@
 mod agents;
 mod health;
 mod memories;
+mod swarms;
 
 use std::collections::HashMap;
 
@@ -59,6 +60,10 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             "/api/agents/:agent_id/memories/recent",
             any(agent_recent_memories_entry),
         )
+        .route("/api/swarms", any(swarms_collection_entry))
+        .route("/api/swarms/:swarm_id", any(swarm_detail_entry))
+        .route("/api/swarms/:swarm_id/run", any(swarm_run_entry))
+        .route("/api/swarms/:swarm_id/events", any(swarm_events_entry))
         .fallback(not_found)
         .with_state(app_state)
 }
@@ -170,6 +175,59 @@ async fn agent_recent_memories_entry(
             )),
             Err(()) => bad_request(),
         },
+        _ => not_found().await,
+    }
+}
+
+async fn swarms_collection_entry(
+    method: Method,
+    State(state): State<AppState>,
+    request: Request,
+) -> AxumResponse {
+    match method {
+        Method::POST => match read_limited_body(request, state.config.max_request_bytes).await {
+            Ok(body) => json_response(swarms::handle_create_swarm(body, &state.daemon).await),
+            Err(response) => response,
+        },
+        _ => not_found().await,
+    }
+}
+
+async fn swarm_detail_entry(
+    method: Method,
+    State(state): State<AppState>,
+    Path(swarm_id): Path<String>,
+) -> AxumResponse {
+    match method {
+        Method::GET => json_response(swarms::handle_get_swarm(&swarm_id, &state.daemon)),
+        _ => not_found().await,
+    }
+}
+
+async fn swarm_run_entry(
+    method: Method,
+    State(state): State<AppState>,
+    Path(swarm_id): Path<String>,
+    request: Request,
+) -> AxumResponse {
+    match method {
+        Method::POST => match read_limited_body(request, state.config.max_request_bytes).await {
+            Ok(body) => {
+                json_response(swarms::handle_run_swarm(&swarm_id, body, &state.daemon).await)
+            }
+            Err(response) => response,
+        },
+        _ => not_found().await,
+    }
+}
+
+async fn swarm_events_entry(
+    method: Method,
+    State(state): State<AppState>,
+    Path(swarm_id): Path<String>,
+) -> AxumResponse {
+    match method {
+        Method::GET => swarms::handle_subscribe_swarm_events(&swarm_id, &state.daemon),
         _ => not_found().await,
     }
 }
