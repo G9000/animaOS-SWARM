@@ -84,15 +84,22 @@ struct TestHarnessState {
 #[derive(Clone)]
 struct TestHarness {
     state: Arc<Mutex<TestHarnessState>>,
-    tokens: Arc<HashMap<String, TokenUsage>>,
+    tokens: Arc<Mutex<HashMap<String, TokenUsage>>>,
 }
 
 impl TestHarness {
     fn new(tokens: HashMap<String, TokenUsage>) -> Self {
         Self {
             state: Arc::new(Mutex::new(TestHarnessState::default())),
-            tokens: Arc::new(tokens),
+            tokens: Arc::new(Mutex::new(tokens)),
         }
+    }
+
+    fn set_tokens(&self, agent_name: &str, token_usage: TokenUsage) {
+        self.tokens
+            .lock()
+            .expect("token usage mutex should not be poisoned")
+            .insert(agent_name.to_string(), token_usage);
     }
 
     fn factory(&self) -> Arc<CoordinatorAgentFactoryFn> {
@@ -104,7 +111,7 @@ impl TestHarness {
             let tokens = tokens.clone();
 
             Box::pin(async move {
-                let (agent_id, token_usage) = {
+                let agent_id = {
                     let mut state = shared
                         .lock()
                         .expect("test harness state mutex should not be poisoned");
@@ -115,11 +122,7 @@ impl TestHarness {
                         .or_insert(1);
                     state.spawn_log.push(context.config.name.clone());
 
-                    let token_usage = tokens
-                        .get(&context.config.name)
-                        .cloned()
-                        .unwrap_or_else(TokenUsage::default);
-                    (context.agent_id.clone(), token_usage)
+                    context.agent_id.clone()
                 };
 
                 let run_state = shared.clone();
@@ -164,7 +167,18 @@ impl TestHarness {
                             )
                         })
                     }),
-                    token_usage: Arc::new(move || token_usage.clone()),
+                    token_usage: Arc::new({
+                        let tokens = tokens.clone();
+                        let agent_name = context.config.name.clone();
+                        move || {
+                            tokens
+                                .lock()
+                                .expect("token usage mutex should not be poisoned")
+                                .get(&agent_name)
+                                .cloned()
+                                .unwrap_or_else(TokenUsage::default)
+                        }
+                    }),
                     clear_task_state: Arc::new(move || {
                         clear_state
                             .lock()
@@ -289,7 +303,7 @@ fn start_populates_workers_and_dispatch_reuses_the_pool() {
 
     let state = coordinator.get_state();
     assert_eq!(state.results.len(), 2);
-    assert_eq!(state.token_usage.total_tokens, 21);
+    assert_eq!(state.token_usage.total_tokens, 12);
 }
 
 #[test]
@@ -607,10 +621,10 @@ fn get_state_preserves_results_and_get_message_bus_is_stable() {
     assert_eq!(state.results.len(), 2);
     assert_eq!(state.results[0].status, TaskStatus::Success);
     assert_eq!(state.results[1].status, TaskStatus::Success);
-    assert_eq!(state.token_usage.total_tokens, 14);
+    assert_eq!(state.token_usage.total_tokens, 6);
 
     block_on(coordinator.stop()).expect("stop should succeed");
-    assert_eq!(coordinator.get_state().token_usage.total_tokens, 14);
+    assert_eq!(coordinator.get_state().token_usage.total_tokens, 6);
 }
 
 #[test]
@@ -681,4 +695,168 @@ fn dispatch_injects_runtime_managed_send_and_broadcast_hooks() {
     let result = block_on(coordinator.dispatch("exercise hooks"));
 
     assert_eq!(result.status, TaskStatus::Success);
+}
+
+#[test]
+fn spawn_agent_enforces_max_concurrent_agents_atomically_under_parallel_spawn() {
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let started = started.clone();
+        move |context: CoordinatorAgentFactoryContext| {
+            let started = started.clone();
+            Box::pin(async move {
+                started
+                    .lock()
+                    .expect("started mutex should not be poisoned")
+                    .push(context.config.name.clone());
+                thread::sleep(Duration::from_millis(50));
+
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(move |input: String| {
+                        Box::pin(async move { TaskResult::success(text_content(&input), 1) })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let strategy: Arc<CoordinatorStrategyFn> = Arc::new(|ctx: CoordinatorDispatchContext| {
+        Box::pin(async move {
+            let first_ctx = ctx.clone();
+            let first_config = ctx.worker_configs()[0].clone();
+            let first = thread::spawn(move || block_on(first_ctx.spawn_agent(first_config)));
+
+            let second_ctx = ctx.clone();
+            let second_config = ctx.worker_configs()[1].clone();
+            let second = thread::spawn(move || block_on(second_ctx.spawn_agent(second_config)));
+
+            let first_result = first.join().expect("first spawn thread should join");
+            let second_result = second.join().expect("second spawn thread should join");
+
+            let errors = [first_result.as_ref().err(), second_result.as_ref().err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+            let successes = [first_result.as_ref().ok(), second_result.as_ref().ok()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+
+            assert_eq!(successes.len(), 1);
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors[0].contains("Max concurrent agents (1) reached"),
+                "unexpected error: {}",
+                errors[0]
+            );
+
+            TaskResult::success(text_content("atomic limit enforced"), 1)
+        })
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        SwarmConfig {
+            max_concurrent_agents: Some(1),
+            ..base_config(&["worker-a", "worker-b"])
+        },
+        strategy,
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("parallel spawn"));
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        started
+            .lock()
+            .expect("started mutex should not be poisoned")
+            .len(),
+        1
+    );
+    assert_eq!(coordinator.get_state().agent_ids.len(), 1);
+}
+
+#[test]
+fn start_rolls_back_workers_created_before_a_later_spawn_failure() {
+    let harness = TestHarness::new(HashMap::from([(
+        "worker-a".into(),
+        TokenUsage {
+            prompt_tokens: 2,
+            completion_tokens: 2,
+            total_tokens: 4,
+        },
+    )]));
+    let failing_factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let base_factory = harness.factory();
+        move |context: CoordinatorAgentFactoryContext| {
+            if context.config.name == "worker-b" {
+                return Box::pin(async { Err("worker-b failed to start".into()) });
+            }
+            base_factory(context)
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a", "worker-b"]),
+        Arc::new(|_| Box::pin(async { TaskResult::success(text_content("unused"), 0) })),
+        failing_factory,
+    );
+
+    let error = block_on(coordinator.start()).expect_err("start should fail");
+    assert_eq!(error, "worker-b failed to start");
+
+    let snapshot = harness.snapshot();
+    assert_eq!(snapshot.spawn_counts.get("worker-a"), Some(&1));
+    assert_eq!(snapshot.spawn_counts.get("worker-b"), None);
+    assert_eq!(snapshot.stop_log.len(), 1);
+
+    let state = coordinator.get_state();
+    assert!(state.agent_ids.is_empty());
+    assert!(state.results.is_empty());
+    assert_eq!(state.token_usage.total_tokens, 0);
+    assert!(coordinator
+        .get_message_bus()
+        .lock()
+        .expect("message bus mutex should not be poisoned")
+        .get_all_messages()
+        .is_empty());
+
+    block_on(coordinator.stop()).expect("stop after rollback should succeed");
+    assert_eq!(harness.snapshot().stop_log.len(), 1);
+}
+
+#[test]
+fn get_state_refreshes_live_token_usage_for_persistent_workers() {
+    let harness = TestHarness::new(HashMap::from([(
+        "worker-a".into(),
+        TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+        },
+    )]));
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a"]),
+        Arc::new(|_| Box::pin(async { TaskResult::success(text_content("unused"), 0) })),
+        harness.factory(),
+    );
+
+    block_on(coordinator.start()).expect("start should succeed");
+    assert_eq!(coordinator.get_state().token_usage.total_tokens, 3);
+
+    harness.set_tokens(
+        "worker-a",
+        TokenUsage {
+            prompt_tokens: 5,
+            completion_tokens: 6,
+            total_tokens: 11,
+        },
+    );
+
+    let state = coordinator.get_state();
+    assert_eq!(state.token_usage.prompt_tokens, 5);
+    assert_eq!(state.token_usage.completion_tokens, 6);
+    assert_eq!(state.token_usage.total_tokens, 11);
 }

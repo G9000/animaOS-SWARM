@@ -139,6 +139,7 @@ struct CoordinatorInner {
     strategy: Arc<CoordinatorStrategyFn>,
     agent_factory: Arc<CoordinatorAgentFactoryFn>,
     agents: Mutex<HashMap<String, CoordinatorAgentShell>>,
+    admitted_agent_ids: Mutex<HashSet<String>>,
     pool: Mutex<HashMap<String, String>>,
     dispatch_lock: AsyncMutex<()>,
 }
@@ -176,6 +177,7 @@ impl SwarmCoordinator {
                 strategy,
                 agent_factory,
                 agents: Mutex::new(HashMap::new()),
+                admitted_agent_ids: Mutex::new(HashSet::new()),
                 pool: Mutex::new(HashMap::new()),
                 dispatch_lock: AsyncMutex::new(()),
             }),
@@ -184,9 +186,28 @@ impl SwarmCoordinator {
 
     pub async fn start(&self) -> Result<(), String> {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
+        let mut created_workers = Vec::new();
 
         for config in self.inner.config.workers.clone() {
-            self.spawn_worker(config).await?;
+            if let Some(agent) = self.get_pool_agent(&config.name) {
+                let _ = agent;
+                continue;
+            }
+
+            match self.spawn_new_agent(config.clone()).await {
+                Ok(agent) => {
+                    self.inner
+                        .pool
+                        .lock()
+                        .expect("coordinator pool mutex should not be poisoned")
+                        .insert(config.name.clone(), agent.id.clone());
+                    created_workers.push((config.name, agent.id));
+                }
+                Err(error) => {
+                    self.rollback_started_workers(&created_workers).await;
+                    return Err(error);
+                }
+            }
         }
 
         self.with_state(|state| {
@@ -210,7 +231,7 @@ impl SwarmCoordinator {
                 .agents
                 .lock()
                 .expect("coordinator agents mutex should not be poisoned");
-            let drained = agents.drain().map(|(_, agent)| agent).collect::<Vec<_>>();
+            let drained = agents.drain().collect::<Vec<_>>();
             self.inner
                 .pool
                 .lock()
@@ -228,7 +249,8 @@ impl SwarmCoordinator {
             bus.clear();
         }
 
-        for agent in agents {
+        for (agent_id, agent) in agents {
+            self.release_agent_slot(&agent_id);
             (agent.stop)().await;
         }
 
@@ -241,6 +263,10 @@ impl SwarmCoordinator {
     }
 
     pub fn get_state(&self) -> SwarmState {
+        if self.has_live_agents() {
+            self.capture_live_token_usage();
+        }
+
         self.inner
             .state
             .lock()
@@ -299,20 +325,6 @@ impl SwarmCoordinator {
         result
     }
 
-    async fn spawn_worker(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
-        if let Some(agent) = self.get_pool_agent(&config.name) {
-            return Ok(agent);
-        }
-
-        let agent = self.spawn_new_agent(config.clone()).await?;
-        self.inner
-            .pool
-            .lock()
-            .expect("coordinator pool mutex should not be poisoned")
-            .insert(config.name, agent.id.clone());
-        Ok(agent)
-    }
-
     async fn spawn_for_dispatch(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
         if let Some(agent) = self.get_pool_agent(&config.name) {
             return Ok(agent);
@@ -322,29 +334,16 @@ impl SwarmCoordinator {
     }
 
     async fn spawn_new_agent(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
-        let max_agents = self
-            .inner
-            .config
-            .max_concurrent_agents
-            .unwrap_or(usize::MAX);
-        let agent_count = self
-            .inner
-            .agents
-            .lock()
-            .expect("coordinator agents mutex should not be poisoned")
-            .len();
-        if agent_count >= max_agents {
-            return Err(format!("Max concurrent agents ({max_agents}) reached"));
-        }
-
         let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
+        self.reserve_agent_slot(&agent_id)?;
         let shell = (self.inner.agent_factory)(CoordinatorAgentFactoryContext {
             config,
             agent_id: agent_id.clone(),
             send: self.build_send_hook(&agent_id),
             broadcast: self.build_broadcast_hook(&agent_id),
         })
-        .await?;
+        .await
+        .inspect_err(|_| self.release_agent_slot(&agent_id))?;
         let agent = CoordinatorAgentRef {
             id: agent_id.clone(),
             run: shell.run.clone(),
@@ -440,6 +439,7 @@ impl SwarmCoordinator {
                 .lock()
                 .expect("message bus mutex should not be poisoned")
                 .unregister_agent(&agent_id);
+            self.release_agent_slot(&agent_id);
             (agent.stop)().await;
         }
     }
@@ -466,6 +466,41 @@ impl SwarmCoordinator {
         self.with_state(|state| {
             state.token_usage = token_usage;
         });
+    }
+
+    fn has_live_agents(&self) -> bool {
+        !self
+            .inner
+            .agents
+            .lock()
+            .expect("coordinator agents mutex should not be poisoned")
+            .is_empty()
+    }
+
+    fn reserve_agent_slot(&self, agent_id: &str) -> Result<(), String> {
+        let max_agents = self
+            .inner
+            .config
+            .max_concurrent_agents
+            .unwrap_or(usize::MAX);
+        let mut admitted = self
+            .inner
+            .admitted_agent_ids
+            .lock()
+            .expect("admission mutex should not be poisoned");
+        if admitted.len() >= max_agents {
+            return Err(format!("Max concurrent agents ({max_agents}) reached"));
+        }
+        admitted.insert(agent_id.to_string());
+        Ok(())
+    }
+
+    fn release_agent_slot(&self, agent_id: &str) {
+        self.inner
+            .admitted_agent_ids
+            .lock()
+            .expect("admission mutex should not be poisoned")
+            .remove(agent_id);
     }
 
     fn build_send_hook(&self, from_agent_id: &str) -> Arc<CoordinatorSendFn> {
@@ -507,6 +542,78 @@ impl SwarmCoordinator {
             .lock()
             .expect("coordinator state mutex should not be poisoned");
         update(&mut state);
+    }
+
+    async fn rollback_started_workers(&self, created_workers: &[(String, String)]) {
+        if created_workers.is_empty() {
+            return;
+        }
+
+        let created_names = created_workers
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>();
+        let created_ids = created_workers
+            .iter()
+            .map(|(_, agent_id)| agent_id.clone())
+            .collect::<HashSet<_>>();
+
+        self.inner
+            .pool
+            .lock()
+            .expect("coordinator pool mutex should not be poisoned")
+            .retain(|name, _| !created_names.contains(name));
+
+        let removed_agents = {
+            let mut agents = self
+                .inner
+                .agents
+                .lock()
+                .expect("coordinator agents mutex should not be poisoned");
+            created_ids
+                .iter()
+                .filter_map(|agent_id| {
+                    agents
+                        .remove(agent_id)
+                        .map(|agent| (agent_id.clone(), agent))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        {
+            let mut bus = self
+                .inner
+                .message_bus
+                .lock()
+                .expect("message bus mutex should not be poisoned");
+            for agent_id in &created_ids {
+                bus.unregister_agent(agent_id);
+            }
+        }
+
+        let should_reset_tokens = {
+            let agents = self
+                .inner
+                .agents
+                .lock()
+                .expect("coordinator agents mutex should not be poisoned");
+            agents.is_empty()
+        };
+
+        self.with_state(|state| {
+            state
+                .agent_ids
+                .retain(|agent_id| !created_ids.contains(agent_id));
+            state.status = SwarmStatus::Idle;
+            if should_reset_tokens {
+                state.token_usage = TokenUsage::default();
+            }
+        });
+
+        for (agent_id, agent) in removed_agents {
+            self.release_agent_slot(&agent_id);
+            (agent.stop)().await;
+        }
     }
 }
 
