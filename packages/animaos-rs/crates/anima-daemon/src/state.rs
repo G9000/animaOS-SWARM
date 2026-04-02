@@ -1,17 +1,15 @@
 use std::collections::HashMap;
-use std::future::ready;
 use std::sync::{Arc, Mutex};
 
 use anima_core::{
-    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, Message, ModelAdapter,
-    TaskResult, ToolCall,
+    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, Content, ModelAdapter, TaskResult,
 };
 use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
 use anima_swarm::SwarmCoordinator;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::model::DeterministicModelAdapter;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolExecutionContext, ToolRegistry};
 
 pub(crate) struct DaemonState {
     pub(crate) memory: Arc<Mutex<MemoryManager>>,
@@ -85,17 +83,21 @@ impl DaemonState {
         )
     }
 
-    pub(crate) async fn run_agent(
+    pub(crate) fn take_agent_runtime(
         &mut self,
         agent_id: &str,
-        input: Content,
-    ) -> Option<(AgentRuntimeSnapshot, TaskResult<Content>)> {
-        let mut runtime = self.agents.remove(agent_id)?;
-        let result = runtime
-            .run_with_tools(input, |agent, user_message, tool_call| {
-                ready(self.execute_tool(agent, user_message, tool_call))
-            })
-            .await;
+    ) -> Option<(AgentRuntime, ToolExecutionContext)> {
+        let runtime = self.agents.remove(agent_id)?;
+        let tool_context =
+            ToolExecutionContext::new(Arc::clone(&self.memory), self.tool_registry.clone());
+        Some((runtime, tool_context))
+    }
+
+    pub(crate) fn complete_agent_run(
+        &mut self,
+        runtime: AgentRuntime,
+        result: &TaskResult<Content>,
+    ) -> AgentRuntimeSnapshot {
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;
@@ -116,19 +118,6 @@ impl DaemonState {
                 .expect("runtime task_result memory should be valid");
         }
 
-        Some((snapshot, result))
-    }
-
-    fn execute_tool(
-        &mut self,
-        agent: AgentState,
-        user_message: Message,
-        tool_call: ToolCall,
-    ) -> TaskResult<Content> {
-        let handler = self.tool_registry.lookup(&tool_call.name);
-        match handler {
-            Some(handler) => handler(self, &agent, &user_message, &tool_call),
-            None => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
-        }
+        snapshot
     }
 }

@@ -4,7 +4,6 @@ use std::thread;
 use std::time::Duration;
 
 use anima_daemon::Daemon;
-use futures::executor::block_on;
 
 #[test]
 fn health_endpoint_returns_ok_json() {
@@ -12,7 +11,7 @@ fn health_endpoint_returns_ok_json() {
     let addr = daemon.local_addr().expect("daemon reports local addr");
 
     let server = thread::spawn(move || {
-        block_on(daemon.serve_one()).expect("daemon serves one request");
+        daemon.serve_one().expect("daemon serves one request");
     });
 
     thread::sleep(Duration::from_millis(25));

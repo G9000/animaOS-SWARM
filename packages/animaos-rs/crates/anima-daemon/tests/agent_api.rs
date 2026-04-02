@@ -5,14 +5,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anima_daemon::Daemon;
-use futures::executor::block_on;
 
 fn spawn_daemon(request_limit: usize) -> (SocketAddr, JoinHandle<()>) {
     let daemon = Daemon::bind("127.0.0.1:0").expect("daemon binds");
     let addr = daemon.local_addr().expect("daemon reports local addr");
 
     let server = thread::spawn(move || {
-        block_on(daemon.serve_n(request_limit)).expect("daemon serves expected number of requests");
+        daemon
+            .serve_n(request_limit)
+            .expect("daemon serves expected number of requests");
     });
 
     thread::sleep(Duration::from_millis(25));

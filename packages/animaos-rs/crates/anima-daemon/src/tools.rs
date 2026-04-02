@@ -1,14 +1,43 @@
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall, ToolDescriptor};
-use anima_memory::{MemorySearchOptions, MemoryType, NewMemory};
+use anima_memory::{MemoryManager, MemorySearchOptions, MemoryType, NewMemory};
 
-use crate::state::DaemonState;
+type ToolHandler =
+    fn(&ToolExecutionContext, &AgentState, &Message, &ToolCall) -> TaskResult<Content>;
 
-type ToolHandler = fn(&mut DaemonState, &AgentState, &Message, &ToolCall) -> TaskResult<Content>;
-
+#[derive(Clone)]
 pub(crate) struct ToolRegistry {
     handlers: HashMap<String, ToolHandler>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ToolExecutionContext {
+    memory: Arc<Mutex<MemoryManager>>,
+    tool_registry: ToolRegistry,
+}
+
+impl ToolExecutionContext {
+    pub(crate) fn new(memory: Arc<Mutex<MemoryManager>>, tool_registry: ToolRegistry) -> Self {
+        Self {
+            memory,
+            tool_registry,
+        }
+    }
+
+    pub(crate) fn execute_tool(
+        &self,
+        agent: AgentState,
+        user_message: Message,
+        tool_call: ToolCall,
+    ) -> TaskResult<Content> {
+        let handler = self.tool_registry.lookup(&tool_call.name);
+        match handler {
+            Some(handler) => handler(self, &agent, &user_message, &tool_call),
+            None => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
+        }
+    }
 }
 
 impl ToolRegistry {
@@ -46,7 +75,7 @@ impl ToolRegistry {
 }
 
 fn execute_memory_search(
-    state: &mut DaemonState,
+    context: &ToolExecutionContext,
     agent: &AgentState,
     _user_message: &Message,
     tool_call: &ToolCall,
@@ -70,7 +99,7 @@ fn execute_memory_search(
         None => 3,
     };
 
-    let results = state
+    let results = context
         .memory
         .lock()
         .expect("memory mutex should not be poisoned")
@@ -108,7 +137,7 @@ fn execute_memory_search(
 }
 
 fn execute_memory_add(
-    state: &mut DaemonState,
+    context: &ToolExecutionContext,
     agent: &AgentState,
     _user_message: &Message,
     tool_call: &ToolCall,
@@ -142,7 +171,7 @@ fn execute_memory_add(
         }
     };
 
-    let memory = match state
+    let memory = match context
         .memory
         .lock()
         .expect("memory mutex should not be poisoned")
@@ -176,7 +205,7 @@ fn execute_memory_add(
 }
 
 fn execute_recent_memories(
-    state: &mut DaemonState,
+    context: &ToolExecutionContext,
     agent: &AgentState,
     _user_message: &Message,
     tool_call: &ToolCall,
@@ -193,7 +222,7 @@ fn execute_recent_memories(
         None => 3,
     };
 
-    let memories = state
+    let memories = context
         .memory
         .lock()
         .expect("memory mutex should not be poisoned")
