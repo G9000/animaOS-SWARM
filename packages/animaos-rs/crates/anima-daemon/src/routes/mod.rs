@@ -4,8 +4,8 @@ mod memories;
 
 use std::collections::HashMap;
 
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::body::to_bytes;
+use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use axum::routing::any;
@@ -15,6 +15,12 @@ use crate::app::{DaemonConfig, SharedDaemonState};
 use crate::json::escape_json;
 
 const NOT_FOUND_JSON: &str = "{\"error\":\"not found\"}";
+
+#[derive(Clone)]
+struct AppState {
+    daemon: SharedDaemonState,
+    config: DaemonConfig,
+}
 
 pub(crate) struct Response {
     pub(crate) status_line: &'static str,
@@ -35,6 +41,11 @@ impl Response {
 }
 
 pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
+    let app_state = AppState {
+        daemon: state,
+        config,
+    };
+
     Router::new()
         .route("/health", any(health_entry))
         .route("/api/health", any(health_entry))
@@ -49,8 +60,7 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             any(agent_recent_memories_entry),
         )
         .fallback(not_found)
-        .layer(DefaultBodyLimit::max(config.max_request_bytes))
-        .with_state(state)
+        .with_state(app_state)
 }
 
 async fn health_entry(method: Method) -> AxumResponse {
@@ -62,23 +72,26 @@ async fn health_entry(method: Method) -> AxumResponse {
 
 async fn memories_collection_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
-    body: Bytes,
+    State(state): State<AppState>,
+    request: Request,
 ) -> AxumResponse {
     match method {
-        Method::POST => json_response(memories::handle_create_memory(body.to_vec(), &state)),
+        Method::POST => match read_limited_body(request, state.config.max_request_bytes).await {
+            Ok(body) => json_response(memories::handle_create_memory(body, &state.daemon)),
+            Err(response) => response,
+        },
         _ => not_found().await,
     }
 }
 
 async fn memories_search_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
+    State(state): State<AppState>,
     uri: Uri,
 ) -> AxumResponse {
     match method {
         Method::GET => match request_query(&uri) {
-            Ok(query) => json_response(memories::handle_search_memories(query, &state)),
+            Ok(query) => json_response(memories::handle_search_memories(query, &state.daemon)),
             Err(()) => bad_request(),
         },
         _ => not_found().await,
@@ -87,12 +100,12 @@ async fn memories_search_entry(
 
 async fn memories_recent_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
+    State(state): State<AppState>,
     uri: Uri,
 ) -> AxumResponse {
     match method {
         Method::GET => match request_query(&uri) {
-            Ok(query) => json_response(memories::handle_recent_memories(query, &state)),
+            Ok(query) => json_response(memories::handle_recent_memories(query, &state.daemon)),
             Err(()) => bad_request(),
         },
         _ => not_found().await,
@@ -101,56 +114,71 @@ async fn memories_recent_entry(
 
 async fn agents_collection_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
-    body: Bytes,
+    State(state): State<AppState>,
+    request: Request,
 ) -> AxumResponse {
     match method {
-        Method::GET => json_response(agents::handle_list_agents(&state)),
-        Method::POST => json_response(agents::handle_create_agent(body.to_vec(), &state)),
+        Method::GET => json_response(agents::handle_list_agents(&state.daemon)),
+        Method::POST => match read_limited_body(request, state.config.max_request_bytes).await {
+            Ok(body) => json_response(agents::handle_create_agent(body, &state.daemon)),
+            Err(response) => response,
+        },
         _ => not_found().await,
     }
 }
 
 async fn agent_detail_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
+    State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> AxumResponse {
     match method {
-        Method::GET => json_response(agents::handle_get_agent(&agent_id, &state)),
+        Method::GET => json_response(agents::handle_get_agent(&agent_id, &state.daemon)),
         _ => not_found().await,
     }
 }
 
 async fn agent_run_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
+    State(state): State<AppState>,
     Path(agent_id): Path<String>,
-    body: Bytes,
+    request: Request,
 ) -> AxumResponse {
     match method {
-        Method::POST => {
-            json_response(agents::handle_run_agent(&agent_id, body.to_vec(), &state).await)
-        }
+        Method::POST => match read_limited_body(request, state.config.max_request_bytes).await {
+            Ok(body) => {
+                json_response(agents::handle_run_agent(&agent_id, body, &state.daemon).await)
+            }
+            Err(response) => response,
+        },
         _ => not_found().await,
     }
 }
 
 async fn agent_recent_memories_entry(
     method: Method,
-    State(state): State<SharedDaemonState>,
+    State(state): State<AppState>,
     Path(agent_id): Path<String>,
     uri: Uri,
 ) -> AxumResponse {
     match method {
         Method::GET => match request_query(&uri) {
             Ok(query) => json_response(agents::handle_recent_agent_memories(
-                &agent_id, query, &state,
+                &agent_id,
+                query,
+                &state.daemon,
             )),
             Err(()) => bad_request(),
         },
         _ => not_found().await,
     }
+}
+
+async fn read_limited_body(request: Request, limit: usize) -> Result<Vec<u8>, AxumResponse> {
+    to_bytes(request.into_body(), limit)
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|_| bad_request())
 }
 
 async fn not_found() -> AxumResponse {

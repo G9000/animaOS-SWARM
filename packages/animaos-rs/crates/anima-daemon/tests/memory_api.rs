@@ -205,7 +205,8 @@ async fn app_with_config_enforces_max_request_bytes() {
     });
     let body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":"body is larger than the configured max","importance":0.8}"#;
 
-    let (status, _) = send_json_request(&app, "POST", "/api/memories", body).await;
+    let (status, response) = send_json_request(&app, "POST", "/api/memories", body).await;
 
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response, "{\"error\":\"malformed request\"}");
 }
