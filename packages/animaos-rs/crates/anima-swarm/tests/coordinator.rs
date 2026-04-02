@@ -7,12 +7,13 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
-use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
+use anima_core::{AgentConfig, Content, DataValue, TaskResult, TaskStatus, TokenUsage};
 use anima_swarm::coordinator::{
     CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentRef,
     CoordinatorAgentShell, CoordinatorDelegateFn, CoordinatorDispatchContext,
     CoordinatorStrategyFn,
 };
+use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::strategies::supervisor::supervisor_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmStatus, SwarmStrategy};
 
@@ -48,10 +49,38 @@ fn base_config(worker_names: &[&str]) -> SwarmConfig {
     }
 }
 
+fn round_robin_config(worker_names: &[&str]) -> SwarmConfig {
+    SwarmConfig {
+        strategy: SwarmStrategy::RoundRobin,
+        manager: worker_config("manager"),
+        workers: worker_names
+            .iter()
+            .map(|name| worker_config(name))
+            .collect(),
+        max_concurrent_agents: None,
+        max_turns: Some(4),
+        token_budget: None,
+    }
+}
+
 fn text_content(text: &str) -> Content {
     Content {
         text: text.into(),
         ..Content::default()
+    }
+}
+
+fn data_value_as_str(value: &DataValue) -> &str {
+    match value {
+        DataValue::String(text) => text.as_str(),
+        other => panic!("expected string data value, got {other:?}"),
+    }
+}
+
+fn data_value_as_object(value: &DataValue) -> &std::collections::BTreeMap<String, DataValue> {
+    match value {
+        DataValue::Object(object) => object,
+        other => panic!("expected object data value, got {other:?}"),
     }
 }
 
@@ -1542,4 +1571,111 @@ fn stale_send_and_broadcast_hooks_cannot_mutate_message_bus_after_agent_cleanup(
         .expect("message bus mutex should not be poisoned");
     assert!(bus.get_all_messages().is_empty());
     assert!(bus.get_messages(&worker_id).is_empty());
+}
+
+#[test]
+fn round_robin_strategy_cycles_agents_and_aggregates_history() {
+    let spawn_log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let run_log = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let spawn_log = Arc::clone(&spawn_log);
+        let run_log = Arc::clone(&run_log);
+        move |context: CoordinatorAgentFactoryContext| {
+            let spawn_log = Arc::clone(&spawn_log);
+            let run_log = Arc::clone(&run_log);
+            Box::pin(async move {
+                spawn_log
+                    .lock()
+                    .expect("spawn log mutex should not be poisoned")
+                    .push(context.config.name.clone());
+
+                let agent_name = context.config.name.clone();
+                let run_log_for_agent = Arc::clone(&run_log);
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(move |input: String| {
+                        let run_log = Arc::clone(&run_log_for_agent);
+                        let agent_name = agent_name.clone();
+                        Box::pin(async move {
+                            run_log
+                                .lock()
+                                .expect("run log mutex should not be poisoned")
+                                .push(format!("{agent_name}:{input}"));
+                            TaskResult::success(
+                                text_content(&format!("{agent_name} contribution")),
+                                1,
+                            )
+                        })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        round_robin_config(&["worker-a", "worker-b"]),
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("The actual task text"));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        result.data.as_ref().map(|content| content.text.as_str()),
+        Some(concat!(
+            "[manager]: manager contribution\n\n",
+            "[worker-a]: worker-a contribution\n\n",
+            "[worker-b]: worker-b contribution\n\n",
+            "[manager]: manager contribution"
+        ))
+    );
+
+    let metadata = result
+        .data
+        .as_ref()
+        .and_then(|content| content.metadata.as_ref())
+        .expect("round-robin result should include history metadata");
+    let history = metadata
+        .get("history")
+        .expect("history metadata should exist");
+    match history {
+        DataValue::Array(entries) => {
+            assert_eq!(entries.len(), 4);
+            let first = data_value_as_object(&entries[0]);
+            assert_eq!(
+                data_value_as_str(first.get("speaker").expect("speaker should exist")),
+                "manager"
+            );
+            assert_eq!(
+                data_value_as_str(first.get("content").expect("content should exist")),
+                "manager contribution"
+            );
+        }
+        other => panic!("unexpected history metadata: {other:?}"),
+    }
+
+    assert_eq!(
+        run_log
+            .lock()
+            .expect("run log mutex should not be poisoned")
+            .as_slice(),
+        [
+            "manager:The actual task text",
+            "worker-a:Continue working on this task: The actual task text\n\nIt's your turn to contribute.\n\nConversation so far:\n[manager]: manager contribution",
+            "worker-b:Continue working on this task: The actual task text\n\nIt's your turn to contribute.\n\nConversation so far:\n[manager]: manager contribution\n[worker-a]: worker-a contribution",
+            "manager:Continue working on this task: The actual task text\n\nIt's your turn to contribute.\n\nConversation so far:\n[manager]: manager contribution\n[worker-a]: worker-a contribution\n[worker-b]: worker-b contribution",
+        ]
+    );
+
+    assert_eq!(
+        spawn_log
+            .lock()
+            .expect("spawn log mutex should not be poisoned")
+            .as_slice(),
+        ["manager", "worker-a", "worker-b"]
+    );
 }
