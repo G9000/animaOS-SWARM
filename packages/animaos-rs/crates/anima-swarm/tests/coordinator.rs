@@ -1138,3 +1138,102 @@ fn stop_prunes_agent_ids_and_invalidates_pooled_refs() {
     assert_eq!(stale_result.status, TaskStatus::Error);
     assert_eq!(stale_result.error.as_deref(), Some(expected_error.as_str()));
 }
+
+#[test]
+fn stale_send_and_broadcast_hooks_cannot_mutate_message_bus_after_agent_cleanup() {
+    let saved_manager_send = Arc::new(Mutex::new(None));
+    let saved_manager_broadcast = Arc::new(Mutex::new(None));
+    let saved_manager_id = Arc::new(Mutex::new(None::<String>));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let saved_manager_send = saved_manager_send.clone();
+        let saved_manager_broadcast = saved_manager_broadcast.clone();
+        let saved_manager_id = saved_manager_id.clone();
+        move |context: CoordinatorAgentFactoryContext| {
+            let saved_manager_send = saved_manager_send.clone();
+            let saved_manager_broadcast = saved_manager_broadcast.clone();
+            let saved_manager_id = saved_manager_id.clone();
+            Box::pin(async move {
+                if context.config.name == "manager" {
+                    saved_manager_send
+                        .lock()
+                        .expect("saved send mutex should not be poisoned")
+                        .replace(context.send.clone());
+                    saved_manager_broadcast
+                        .lock()
+                        .expect("saved broadcast mutex should not be poisoned")
+                        .replace(context.broadcast.clone());
+                    saved_manager_id
+                        .lock()
+                        .expect("saved manager id mutex should not be poisoned")
+                        .replace(context.agent_id.clone());
+                }
+
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(|input: String| {
+                        Box::pin(async move { TaskResult::success(text_content(&input), 1) })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let strategy: Arc<CoordinatorStrategyFn> = Arc::new(|ctx: CoordinatorDispatchContext| {
+        Box::pin(async move {
+            let manager = ctx
+                .spawn_agent(ctx.manager_config().clone())
+                .await
+                .expect("manager spawn should succeed");
+            manager.run(ctx.task().to_string()).await
+        })
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(base_config(&["worker-a"]), strategy, factory);
+
+    block_on(coordinator.start()).expect("start should succeed");
+    let worker_id = coordinator.get_state().agent_ids[0].clone();
+
+    let dispatch_result = block_on(coordinator.dispatch("task one"));
+    assert_eq!(dispatch_result.status, TaskStatus::Success);
+
+    let manager_id = saved_manager_id
+        .lock()
+        .expect("saved manager id mutex should not be poisoned")
+        .clone()
+        .expect("manager id should be captured");
+    let expected_error = format!("Coordinator agent {manager_id} is no longer active");
+    let send = saved_manager_send
+        .lock()
+        .expect("saved send mutex should not be poisoned")
+        .clone()
+        .expect("manager send hook should be captured");
+    let broadcast = saved_manager_broadcast
+        .lock()
+        .expect("saved broadcast mutex should not be poisoned")
+        .clone()
+        .expect("manager broadcast hook should be captured");
+
+    let bus = coordinator.get_message_bus();
+    assert!(bus
+        .lock()
+        .expect("message bus mutex should not be poisoned")
+        .get_all_messages()
+        .is_empty());
+
+    let send_error = block_on(send(worker_id.clone(), text_content("late direct message")))
+        .expect_err("stale send hook should fail");
+    assert_eq!(send_error, expected_error);
+
+    let broadcast_error = block_on(broadcast(text_content("late broadcast")))
+        .expect_err("stale broadcast hook should fail");
+    assert_eq!(broadcast_error, expected_error);
+
+    let bus = bus
+        .lock()
+        .expect("message bus mutex should not be poisoned");
+    assert!(bus.get_all_messages().is_empty());
+    assert!(bus.get_messages(&worker_id).is_empty());
+}

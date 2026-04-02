@@ -388,16 +388,16 @@ impl SwarmCoordinator {
 
     async fn spawn_new_agent(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
         let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
+        let liveness = Arc::new(CoordinatorAgentLiveness::default());
         self.reserve_agent_slot(&agent_id)?;
         let shell = (self.inner.agent_factory)(CoordinatorAgentFactoryContext {
             config,
             agent_id: agent_id.clone(),
-            send: self.build_send_hook(&agent_id),
-            broadcast: self.build_broadcast_hook(&agent_id),
+            send: self.build_send_hook(&agent_id, liveness.clone()),
+            broadcast: self.build_broadcast_hook(&agent_id, liveness.clone()),
         })
         .await
         .inspect_err(|_| self.release_agent_slot(&agent_id))?;
-        let liveness = Arc::new(CoordinatorAgentLiveness::default());
         let agent = CoordinatorAgentRef::with_liveness(
             agent_id.clone(),
             shell.run.clone(),
@@ -577,13 +577,21 @@ impl SwarmCoordinator {
             .remove(agent_id);
     }
 
-    fn build_send_hook(&self, from_agent_id: &str) -> Arc<CoordinatorSendFn> {
+    fn build_send_hook(
+        &self,
+        from_agent_id: &str,
+        liveness: Arc<CoordinatorAgentLiveness>,
+    ) -> Arc<CoordinatorSendFn> {
         let message_bus = self.inner.message_bus.clone();
         let from_agent_id = from_agent_id.to_string();
         Arc::new(move |to_agent_id: String, content: Content| {
             let message_bus = message_bus.clone();
             let from_agent_id = from_agent_id.clone();
+            let liveness = liveness.clone();
             Box::pin(async move {
+                if !liveness.is_active() {
+                    return Err(inactive_agent_error(&from_agent_id));
+                }
                 message_bus
                     .lock()
                     .expect("message bus mutex should not be poisoned")
@@ -593,13 +601,21 @@ impl SwarmCoordinator {
         })
     }
 
-    fn build_broadcast_hook(&self, from_agent_id: &str) -> Arc<CoordinatorBroadcastFn> {
+    fn build_broadcast_hook(
+        &self,
+        from_agent_id: &str,
+        liveness: Arc<CoordinatorAgentLiveness>,
+    ) -> Arc<CoordinatorBroadcastFn> {
         let message_bus = self.inner.message_bus.clone();
         let from_agent_id = from_agent_id.to_string();
         Arc::new(move |content: Content| {
             let message_bus = message_bus.clone();
             let from_agent_id = from_agent_id.clone();
+            let liveness = liveness.clone();
             Box::pin(async move {
+                if !liveness.is_active() {
+                    return Err(inactive_agent_error(&from_agent_id));
+                }
                 message_bus
                     .lock()
                     .expect("message bus mutex should not be poisoned")
@@ -766,8 +782,9 @@ fn now_millis() -> u128 {
 }
 
 fn inactive_agent_result(agent_id: &str) -> TaskResult<Content> {
-    TaskResult::error(
-        format!("Coordinator agent {agent_id} is no longer active"),
-        0,
-    )
+    TaskResult::error(inactive_agent_error(agent_id), 0)
+}
+
+fn inactive_agent_error(agent_id: &str) -> String {
+    format!("Coordinator agent {agent_id} is no longer active")
 }
