@@ -9,6 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
 
+use crate::strategies::resolve_strategy;
 use crate::{MessageBus, SwarmConfig, SwarmState, SwarmStatus};
 
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(0);
@@ -195,7 +196,11 @@ impl SwarmCoordinator {
     }
 
     pub fn with_config(config: SwarmConfig) -> Self {
-        Self::with_hooks(config, default_strategy(), default_agent_factory())
+        Self::with_hooks(
+            config.clone(),
+            resolve_strategy(config.strategy),
+            default_agent_factory(),
+        )
     }
 
     pub fn with_hooks(
@@ -728,10 +733,6 @@ impl SwarmCoordinator {
             state.agent_ids.clear();
         });
     }
-}
-
-fn default_strategy() -> Arc<CoordinatorStrategyFn> {
-    Arc::new(|_| Box::pin(async { TaskResult::error("No coordinator strategy configured", 0) }))
 }
 
 fn default_swarm_config() -> SwarmConfig {

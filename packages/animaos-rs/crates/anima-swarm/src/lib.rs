@@ -1,5 +1,6 @@
 pub mod coordinator;
 pub mod message_bus;
+pub mod strategies;
 pub mod types;
 
 pub use coordinator::SwarmCoordinator;

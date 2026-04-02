@@ -12,6 +12,7 @@ use anima_swarm::coordinator::{
     CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentRef,
     CoordinatorAgentShell, CoordinatorDispatchContext, CoordinatorStrategyFn,
 };
+use anima_swarm::strategies::supervisor::supervisor_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmStatus, SwarmStrategy};
 
 fn worker_config(name: &str) -> AgentConfig {
@@ -304,6 +305,162 @@ fn start_populates_workers_and_dispatch_reuses_the_pool() {
     let state = coordinator.get_state();
     assert_eq!(state.results.len(), 2);
     assert_eq!(state.token_usage.total_tokens, 12);
+}
+
+#[test]
+fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
+    let spawn_order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let worker_inputs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let manager_inputs = Arc::new(Mutex::new(Vec::<String>::new()));
+    let worker_shell_cell = Arc::new(Mutex::new(None::<CoordinatorAgentShell>));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let spawn_order = Arc::clone(&spawn_order);
+        let worker_inputs = Arc::clone(&worker_inputs);
+        let manager_inputs = Arc::clone(&manager_inputs);
+        let worker_shell_cell = Arc::clone(&worker_shell_cell);
+
+        move |context: CoordinatorAgentFactoryContext| {
+            let spawn_order = Arc::clone(&spawn_order);
+            let worker_inputs = Arc::clone(&worker_inputs);
+            let manager_inputs = Arc::clone(&manager_inputs);
+            let worker_shell_cell = Arc::clone(&worker_shell_cell);
+
+            Box::pin(async move {
+                spawn_order
+                    .lock()
+                    .expect("spawn order mutex should not be poisoned")
+                    .push(context.config.name.clone());
+
+                match context.config.name.as_str() {
+                    "worker" => {
+                        let run = Arc::new(move |input: String| {
+                            let worker_inputs = Arc::clone(&worker_inputs);
+                            Box::pin(async move {
+                                worker_inputs
+                                    .lock()
+                                    .expect("worker input mutex should not be poisoned")
+                                    .push(input);
+                                TaskResult::success(
+                                    text_content("worker result: research complete"),
+                                    1,
+                                )
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        let shell = CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        };
+                        *worker_shell_cell
+                            .lock()
+                            .expect("worker shell mutex should not be poisoned") =
+                            Some(shell.clone());
+                        Ok(shell)
+                    }
+                    "manager" => {
+                        let system = context.config.system.as_deref().unwrap_or_default();
+                        assert!(
+                            system.contains("delegate_task"),
+                            "supervisor manager prompt should mention delegate_task"
+                        );
+
+                        let tool_names = context
+                            .config
+                            .tools
+                            .as_deref()
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|tool| tool.name.as_str())
+                            .collect::<Vec<_>>();
+                        assert!(
+                            tool_names.contains(&"delegate_task"),
+                            "supervisor manager should receive delegate_task tool"
+                        );
+
+                        let run = Arc::new(move |input: String| {
+                            let manager_inputs = Arc::clone(&manager_inputs);
+                            let worker_shell_cell = Arc::clone(&worker_shell_cell);
+                            Box::pin(async move {
+                                manager_inputs
+                                    .lock()
+                                    .expect("manager input mutex should not be poisoned")
+                                    .push(input);
+
+                                let worker_shell = worker_shell_cell
+                                    .lock()
+                                    .expect("worker shell mutex should not be poisoned")
+                                    .clone()
+                                    .expect("worker shell should be available before manager runs");
+
+                                let worker_result = (worker_shell.run)("Do research".into()).await;
+                                assert_eq!(worker_result.status, TaskStatus::Success);
+                                assert_eq!(
+                                    worker_result
+                                        .data
+                                        .as_ref()
+                                        .map(|content| content.text.as_str()),
+                                    Some("worker result: research complete")
+                                );
+
+                                TaskResult::success(
+                                    text_content("Final synthesis: research is complete."),
+                                    2,
+                                )
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    other => Err(format!("unexpected agent config: {other}")),
+                }
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker"]),
+        Arc::new(supervisor_strategy),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("Research and report"));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        result.data.as_ref().map(|content| content.text.as_str()),
+        Some("Final synthesis: research is complete.")
+    );
+    assert_eq!(
+        spawn_order
+            .lock()
+            .expect("spawn order mutex should not be poisoned")
+            .as_slice(),
+        ["worker", "manager"]
+    );
+    assert_eq!(
+        worker_inputs
+            .lock()
+            .expect("worker input mutex should not be poisoned")
+            .as_slice(),
+        ["Do research"]
+    );
+    assert_eq!(
+        manager_inputs
+            .lock()
+            .expect("manager input mutex should not be poisoned")
+            .as_slice(),
+        ["Research and report"]
+    );
 }
 
 #[test]
