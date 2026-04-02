@@ -255,3 +255,72 @@ async fn repeated_swarm_runs_do_not_reuse_stale_runtime_context() {
         "pooled worker token usage should reset between runs; first={first_total_tokens}, second={second_total_tokens}, response={second_response}"
     );
 }
+
+#[tokio::test]
+async fn second_run_running_event_clears_stale_token_usage() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let (first_status, first_response) =
+        run_swarm(&app, &swarm_id, r#"{"text":"Prime pooled worker state"}"#).await;
+    let first_total_tokens = extract_json_u64_field(&first_response, "totalTokens");
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert!(
+        first_total_tokens > 0,
+        "first run should consume tokens so stale usage is observable"
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/swarms/{swarm_id}/events"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("event stream responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let run_handle = {
+        let app = app.clone();
+        let swarm_id = swarm_id.clone();
+        tokio::spawn(async move {
+            run_swarm(&app, &swarm_id, r#"{"text":"Prime pooled worker state"}"#).await
+        })
+    };
+
+    let stream = response.into_body().into_data_stream();
+    pin_mut!(stream);
+
+    let mut chunks = String::new();
+    for _ in 0..256 {
+        match futures::poll!(stream.next()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
+                if chunks.contains("event: swarm:running") {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(Some(Err(error))) => panic!("stream errored: {error}"),
+            std::task::Poll::Ready(None) => break,
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+
+    let (second_status, second_response) = run_handle.await.expect("run task should finish");
+    let running_data =
+        extract_sse_event_data(&chunks, "swarm:running").expect("running event data exists");
+    let running_total_tokens = extract_json_u64_field(running_data, "totalTokens");
+
+    assert_eq!(second_status, StatusCode::OK);
+    assert!(second_response.contains("\"status\":\"success\""));
+    assert_eq!(
+        running_total_tokens, 0,
+        "running event should not inherit prior token totals; first={first_total_tokens}, running={running_total_tokens}, payload={running_data}"
+    );
+}

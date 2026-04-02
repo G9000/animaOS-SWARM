@@ -525,6 +525,10 @@ impl SwarmCoordinator {
             .expect("message bus mutex should not be poisoned")
             .clear_inboxes();
 
+        self.with_state(|state| {
+            state.token_usage = TokenUsage::default();
+        });
+
         let clear_hooks = self
             .inner
             .agents
