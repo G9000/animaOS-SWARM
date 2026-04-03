@@ -1,215 +1,555 @@
-import { Command } from "commander"
-import { writeFileSync } from "node:fs"
-import { join } from "node:path"
-import yaml from "js-yaml"
-import { EventBus } from "@animaOS-SWARM/core"
-import type { AgentConfig, IEventBus, TaskResult } from "@animaOS-SWARM/core"
-import { SwarmCoordinator } from "@animaOS-SWARM/swarm"
-import { MemoryManager, createMemoryPlugin } from "@animaOS-SWARM/memory"
-import { loadAgency, agencyExists } from "../agency/loader.js"
-import { createAdapter } from "../agency/generator.js"
-import { allTools } from "../tools.js"
-import type { AgencyConfig, AgentDefinition } from "../agency/types.js"
-import type { AgentProfile } from "@animaOS-SWARM/tui"
+import { Command } from 'commander';
+import { writeFile, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { Interface } from 'node:readline';
+import yaml from 'js-yaml';
+import type { AgentConfig, IEventBus, TaskResult } from '@animaOS-SWARM/core';
+import type { SwarmConfig } from '@animaOS-SWARM/sdk';
+import { loadAgency, agencyExists } from '../agency/loader.js';
+import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
+import type { AgencyConfig, AgentDefinition } from '../agency/types.js';
+import type { AgentProfile } from '@animaOS-SWARM/tui';
+import {
+  emitLaunchTaskFailure,
+  emitLaunchTaskStart,
+  launchDisplayAgents,
+  relayLaunchSwarmEvent,
+} from './launch-events.js';
+import { extractResultText, getErrorMessage } from './utils.js';
 
-interface LaunchOptions {
-	dir: string
-	apiKey?: string
-	tui: boolean
+export interface LaunchOptions {
+  dir: string;
+  apiKey?: string;
+  tui: boolean;
 }
 
-function agentDefToConfig(
-	agent: AgentDefinition,
-	defaultModel: string,
-	memory?: MemoryManager,
-): AgentConfig {
-	return {
-		name: agent.name,
-		bio: agent.bio,
-		lore: agent.lore,
-		adjectives: agent.adjectives,
-		topics: agent.topics,
-		knowledge: agent.knowledge,
-		style: agent.style,
-		model: agent.model ?? defaultModel,
-		system: agent.system,
-		tools: allTools,
-		plugins: memory ? [createMemoryPlugin(memory)] : [],
-	}
+interface DaemonTuiRuntime {
+  eventBus: IEventBus;
+  render: (element: any) => { unmount: () => void };
+  createElement: (
+    component: unknown,
+    props: Record<string, unknown>
+  ) => unknown;
+  App: unknown;
+}
+
+interface LaunchDeps {
+  client?: Pick<CliDaemonClient, 'swarms'>;
+  createReadline?: () => Pick<Interface, 'question' | 'close'>;
+  createDaemonTuiRuntime?: () => Promise<DaemonTuiRuntime>;
+}
+
+interface DaemonToolDescriptor {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+interface DaemonPluginDescriptor {
+  name: string;
+  description: string;
+}
+
+type DaemonAgentConfig = Omit<AgentConfig, 'tools' | 'plugins'> & {
+  tools?: DaemonToolDescriptor[];
+  plugins?: DaemonPluginDescriptor[];
+};
+
+interface DaemonSwarmConfig extends Omit<SwarmConfig, 'manager' | 'workers'> {
+  manager: DaemonAgentConfig;
+  workers: DaemonAgentConfig[];
+}
+
+type DaemonSwarmSnapshot = Awaited<
+  ReturnType<CliDaemonClient['swarms']['create']>
+>;
+
+const DEFAULT_DAEMON_TOOL_NAMES = ['memory_search', 'recent_memories'] as const;
+
+const DAEMON_MEMORY_PLUGIN: DaemonPluginDescriptor = {
+  name: 'memory',
+  description: 'Built-in daemon memory context and reflection support.',
+};
+
+const DAEMON_TOOL_ALIASES = new Map<string, string>([
+  ['memory_recent', 'recent_memories'],
+]);
+
+const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
+  [
+    'memory_search',
+    {
+      name: 'memory_search',
+      description: 'Search agent memory for relevant facts and prior work.',
+      parameters: {
+        query: { type: 'string' },
+        limit: { type: 'number' },
+      },
+    },
+  ],
+  [
+    'memory_add',
+    {
+      name: 'memory_add',
+      description: 'Store a new memory entry for the current agent.',
+      parameters: {
+        content: { type: 'string' },
+        type: { type: 'string' },
+        importance: { type: 'number' },
+      },
+    },
+  ],
+  [
+    'recent_memories',
+    {
+      name: 'recent_memories',
+      description: "List the current agent's recent memories.",
+      parameters: {
+        limit: { type: 'number' },
+      },
+    },
+  ],
+]);
+
+function daemonToolName(toolName: string): string {
+  return DAEMON_TOOL_ALIASES.get(toolName) ?? toolName;
+}
+
+function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
+  const supportedToolNames = new Set<string>(DEFAULT_DAEMON_TOOL_NAMES);
+  const unsupportedTools: string[] = [];
+
+  for (const rawToolName of agent.tools ?? []) {
+    const toolName = rawToolName.trim();
+    if (!toolName) {
+      continue;
+    }
+
+    const normalizedToolName = daemonToolName(toolName);
+    if (!DAEMON_TOOL_DESCRIPTOR_MAP.has(normalizedToolName)) {
+      unsupportedTools.push(toolName);
+      continue;
+    }
+
+    supportedToolNames.add(normalizedToolName);
+  }
+
+  if (unsupportedTools.length > 0) {
+    throw new Error(
+      `daemon-backed launch does not support tool(s) for agent "${
+        agent.name
+      }": ${unsupportedTools.join(
+        ', '
+      )}. Launch now runs only through the Rust daemon; remove those tools from anima.yaml or implement them in the daemon tool registry.`
+    );
+  }
+
+  return Array.from(supportedToolNames, (toolName) => {
+    const descriptor = DAEMON_TOOL_DESCRIPTOR_MAP.get(toolName);
+    if (!descriptor) {
+      throw new Error(`missing daemon tool descriptor for ${toolName}`);
+    }
+
+    return {
+      name: descriptor.name,
+      description: descriptor.description,
+      parameters: descriptor.parameters,
+    };
+  });
+}
+
+function createDaemonSwarmSession(
+  client: Pick<CliDaemonClient, 'swarms'>,
+  agency: AgencyConfig
+): {
+  getSwarm: () => Promise<DaemonSwarmSnapshot>;
+  invalidate: () => void;
+} {
+  let swarmConfig = buildDaemonSwarmConfig(agency);
+  let swarmPromise: Promise<DaemonSwarmSnapshot> | undefined;
+
+  return {
+    getSwarm() {
+      if (!swarmPromise) {
+        swarmPromise = client.swarms
+          .create(swarmConfig as unknown as SwarmConfig)
+          .catch((error: unknown) => {
+            swarmPromise = undefined;
+            throw error;
+          });
+      }
+
+      return swarmPromise;
+    },
+    invalidate() {
+      swarmConfig = buildDaemonSwarmConfig(agency);
+      swarmPromise = undefined;
+    },
+  };
+}
+
+function agentDefToDaemonConfig(
+  agent: AgentDefinition,
+  defaultModel: string,
+  provider: string
+): DaemonAgentConfig {
+  return {
+    name: agent.name,
+    bio: agent.bio,
+    lore: agent.lore,
+    adjectives: agent.adjectives,
+    topics: agent.topics,
+    knowledge: agent.knowledge,
+    style: agent.style,
+    model: agent.model ?? defaultModel,
+    provider,
+    system: agent.system,
+    tools: daemonToolsForAgent(agent),
+    plugins: [DAEMON_MEMORY_PLUGIN],
+  };
 }
 
 function saveAgency(dir: string, agency: AgencyConfig) {
-	writeFileSync(join(dir, "anima.yaml"), yaml.dump(agency, { lineWidth: 120, noRefs: true }))
+  writeFileSync(
+    join(dir, 'anima.yaml'),
+    yaml.dump(agency, { lineWidth: 120, noRefs: true })
+  );
 }
 
-export const launchCommand = new Command("launch")
-	.description("Launch an agent swarm from an anima.yaml config")
-	.argument("[task]", "The task to execute (omit to open interactive TUI session)")
-	.option("-d, --dir <dir>", "Directory containing anima.yaml", ".")
-	.option("--api-key <key>", "API key override")
-	.option("--no-tui", "Disable TUI, use plain text output")
-	.action(async (task: string | undefined, opts: LaunchOptions) => {
-		if (!agencyExists(opts.dir)) {
-			console.error(`Error: No anima.yaml found in "${opts.dir}". Run "animaos create" first.`)
-			process.exit(1)
-		}
+function buildDaemonSwarmConfig(agency: AgencyConfig): DaemonSwarmConfig {
+  return {
+    strategy: agency.strategy,
+    manager: agentDefToDaemonConfig(
+      agency.orchestrator,
+      agency.model,
+      agency.provider
+    ),
+    workers: agency.agents.map((agent) =>
+      agentDefToDaemonConfig(agent, agency.model, agency.provider)
+    ),
+  };
+}
 
-		// Keep agency mutable so /agents edits propagate to the coordinator
-		const agency = loadAgency(opts.dir)
-		const adapter = createAdapter(agency.provider, opts.apiKey)
-		const bus = new EventBus()
+function resultText(result: TaskResult): string {
+  if (result.status !== 'success') {
+    return `Error: ${result.error}`;
+  }
 
-		// Memory — persists to <agency-dir>/.anima-memory.json
-		const memory = new MemoryManager(join(opts.dir, ".anima-memory.json"))
-		memory.load()
+  return extractResultText(result) ?? JSON.stringify(result.data);
+}
 
-		/** Build a SwarmCoordinator from current agency state */
-		function buildCoordinator() {
-			return new SwarmCoordinator(
-				{
-					strategy: agency.strategy,
-					manager: agentDefToConfig(agency.orchestrator, agency.model, memory),
-					workers: agency.agents.map((a) => agentDefToConfig(a, agency.model, memory)),
-				},
-				adapter,
-				bus,
-			)
-		}
+function printLaunchResult(result: TaskResult, setExitCodeOnError = false) {
+  console.log('\n--- Result ---');
+  if (result.status === 'success') {
+    console.log(resultText(result));
+  } else {
+    console.error('Error:', result.error);
+    if (setExitCodeOnError) {
+      process.exitCode = 1;
+    }
+  }
+  console.log(`\nDuration: ${result.durationMs}ms`);
+}
 
-		const interactive = !task
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-		if (opts.tui) {
-			const { render } = await import("ink")
-			const { default: React } = await import("react")
-			const { App } = await import("@animaOS-SWARM/tui")
+async function loadDaemonTuiRuntime(): Promise<DaemonTuiRuntime> {
+  const [{ EventBus }, { render }, { default: React }, { App }] =
+    await Promise.all([
+      import('@animaOS-SWARM/core'),
+      import('ink'),
+      import('react'),
+      import('@animaOS-SWARM/tui'),
+    ]);
 
-			// Build profiles from current agency (only AgentProfile fields)
-			function toProfile(a: AgentDefinition, role: AgentProfile["role"]): AgentProfile {
-				return {
-					name: a.name, role,
-					bio: a.bio, lore: a.lore,
-					adjectives: a.adjectives, topics: a.topics,
-					knowledge: a.knowledge, style: a.style,
-					system: a.system,
-				}
-			}
-			const agentProfiles: AgentProfile[] = [
-				toProfile(agency.orchestrator, "orchestrator"),
-				...agency.agents.map((a) => toProfile(a, "worker")),
-			]
+  return {
+    eventBus: new EventBus() as IEventBus,
+    render,
+    createElement: React.createElement,
+    App,
+  };
+}
 
-			/** Called when user edits an agent in the TUI — updates in-memory + writes yaml */
-			function onSaveAgent(profile: AgentProfile) {
-				if (profile.name === agency.orchestrator.name) {
-					Object.assign(agency.orchestrator, profile)
-				} else {
-					const idx = agency.agents.findIndex((a) => a.name === profile.name)
-					if (idx >= 0) Object.assign(agency.agents[idx], profile)
-				}
-				saveAgency(opts.dir, agency)
-			}
+async function executeDaemonLaunchCommand(
+  task: string | undefined,
+  opts: LaunchOptions,
+  agency: AgencyConfig,
+  deps: LaunchDeps
+): Promise<void> {
+  if (opts.apiKey) {
+    console.error(
+      'Error:',
+      '--api-key is not supported by daemon-backed launch in plain-text mode. Configure credentials in the daemon environment.'
+    );
+    process.exitCode = 1;
+    return;
+  }
 
-			if (interactive) {
-				// start a persistent coordinator once, reuse agents across tasks
-				const coordinator = buildCoordinator()
-				await coordinator.start()
+  try {
+    const client = deps.client ?? createCliDaemonClient();
+    const swarmSession = createDaemonSwarmSession(client, agency);
 
-				process.once("SIGINT", async () => {
-					await coordinator.stop()
-					process.exit(0)
-				})
+    if (!task) {
+      const { createInterface } = await import('node:readline');
+      const rl =
+        deps.createReadline?.() ??
+        createInterface({
+          input: process.stdin,
+          output: process.stdout,
+        });
 
-				const onTask = async (input: string): Promise<TaskResult> => {
-					const result = await coordinator.dispatch(input)
-					const text = result.status === "success"
-						? (result.data as { text?: string })?.text ?? JSON.stringify(result.data, null, 2)
-						: `Error: ${result.error}`
-					writeFileSync(join(opts.dir, "anima-result.md"), `# Task\n\n${input}\n\n# Result\n\n${text}\n`)
-					return result
-				}
+      console.log(
+        `${agency.name} — ${agency.strategy} strategy — ${agency.model}`
+      );
+      console.log('Type "exit" to quit.\n');
 
-				const element = React.createElement(App, {
-					eventBus: bus as IEventBus,
-					strategy: agency.strategy,
-					interactive: true,
-					onTask,
-					agentProfiles,
-					onSaveAgent,
-				})
-				render(element)
-				// Stay alive until Ctrl+C
-			} else {
-				// Single-shot TUI: spawn → run → unmount
-				const coordinator = buildCoordinator()
-				const element = React.createElement(App, {
-					eventBus: bus as IEventBus,
-					strategy: agency.strategy,
-					task,
-					agentProfiles,
-					onSaveAgent,
-				})
-				const instance = render(element)
+      await new Promise<void>((resolve) => {
+        const prompt = () => {
+          rl.question('task > ', async (input) => {
+            const trimmed = input.trim();
+            if (!trimmed || trimmed === 'exit') {
+              console.log('Bye.');
+              rl.close();
+              resolve();
+              return;
+            }
 
-				const result = await coordinator.run(task!)
-				await new Promise((resolve) => setTimeout(resolve, 500))
-				instance.unmount()
+            try {
+              const swarm = await swarmSession.getSwarm();
+              const execution = await client.swarms.run(swarm.id, {
+                text: trimmed,
+              });
+              printLaunchResult(execution.result);
+            } catch (error) {
+              swarmSession.invalidate();
+              console.error('Error:', getErrorMessage(error));
+            }
 
-				if (result.status === "error") process.exit(1)
-			}
-		} else {
-			// Plain text mode
-			bus.on("agent:spawned", (e) => {
-				const d = e.data as { agentId: string; name: string }
-				console.log(`  [agent] spawned: ${d.name} (${d.agentId})`)
-			})
-			bus.on("tool:before", (e) => {
-				const d = e.data as { toolName: string }
-				console.log(`  [tool] calling: ${d.toolName}`)
-			})
+            console.log();
+            prompt();
+          });
+        };
 
-			if (interactive) {
-				// persistent coordinator for the whole session
-				const coordinator = buildCoordinator()
-				await coordinator.start()
+        prompt();
+      });
+      return;
+    }
 
-				const { createInterface } = await import("node:readline")
-				const rl = createInterface({ input: process.stdin, output: process.stdout })
-				console.log(`${agency.name} — ${agency.strategy} strategy — ${agency.model}`)
-				console.log('Type "exit" to quit.\n')
+    const swarm = await swarmSession.getSwarm();
+    console.log(
+      `Launching "${agency.name}" with strategy "${agency.strategy}" and model ${agency.model}...\n`
+    );
+    const execution = await client.swarms.run(swarm.id, { text: task });
+    printLaunchResult(execution.result, true);
+  } catch (error) {
+    console.error('Error:', getErrorMessage(error));
+    process.exitCode = 1;
+  }
+}
 
-				rl.once("close", async () => { await coordinator.stop() })
+async function executeDaemonTuiLaunchCommand(
+  task: string | undefined,
+  opts: LaunchOptions,
+  agency: AgencyConfig,
+  deps: LaunchDeps
+): Promise<void> {
+  if (opts.apiKey) {
+    console.error(
+      'Error:',
+      '--api-key is not supported by daemon-backed launch in TUI mode. Configure credentials in the daemon environment.'
+    );
+    process.exitCode = 1;
+    return;
+  }
 
-				const prompt = () => {
-					rl.question("task > ", async (input) => {
-						const trimmed = input.trim()
-						if (!trimmed || trimmed === "exit") {
-							console.log("Bye.")
-							rl.close()
-							return
-						}
-						const result = await coordinator.dispatch(trimmed)
-						console.log("\n--- Result ---")
-						if (result.status === "success") {
-							console.log((result.data as { text?: string })?.text ?? JSON.stringify(result.data))
-						} else {
-							console.error("Error:", result.error)
-						}
-						console.log(`Duration: ${result.durationMs}ms\n`)
-						prompt()
-					})
-				}
-				prompt()
-			} else {
-				// Single-shot plain text
-				console.log(`Launching "${agency.name}" with strategy "${agency.strategy}" and model ${agency.model}...\n`)
-				const result = await buildCoordinator().run(task!)
-				console.log("\n--- Result ---")
-				if (result.status === "success") {
-					console.log((result.data as { text?: string })?.text ?? JSON.stringify(result.data))
-				} else {
-					console.error("Error:", result.error)
-				}
-				console.log(`\nDuration: ${result.durationMs}ms`)
-			}
-		}
-	})
+  try {
+    const client = deps.client ?? createCliDaemonClient();
+    const swarmSession = createDaemonSwarmSession(client, agency);
+    const tuiRuntime = deps.createDaemonTuiRuntime
+      ? await deps.createDaemonTuiRuntime()
+      : await loadDaemonTuiRuntime();
+    const bus = tuiRuntime.eventBus;
+
+    function toProfile(
+      a: AgentDefinition,
+      role: AgentProfile['role']
+    ): AgentProfile {
+      return {
+        name: a.name,
+        role,
+        bio: a.bio,
+        lore: a.lore,
+        adjectives: a.adjectives,
+        topics: a.topics,
+        knowledge: a.knowledge,
+        style: a.style,
+        system: a.system,
+      };
+    }
+
+    const agentProfiles: AgentProfile[] = [
+      toProfile(agency.orchestrator, 'orchestrator'),
+      ...agency.agents.map((agent) => toProfile(agent, 'worker')),
+    ];
+
+    function onSaveAgent(profile: AgentProfile) {
+      if (profile.name === agency.orchestrator.name) {
+        Object.assign(agency.orchestrator, profile);
+      } else {
+        const idx = agency.agents.findIndex(
+          (agent) => agent.name === profile.name
+        );
+        if (idx >= 0) Object.assign(agency.agents[idx], profile);
+      }
+      saveAgency(opts.dir, agency);
+      swarmSession.invalidate();
+    }
+
+    const runTask = async (input: string): Promise<TaskResult> => {
+      const displayAgents = launchDisplayAgents(agency);
+      let abortController: AbortController | undefined;
+      let subscription: Promise<void> | undefined;
+      let sawCompletion = false;
+      let subscriptionError: string | undefined;
+
+      try {
+        const swarm = await swarmSession.getSwarm();
+        abortController = new AbortController();
+        subscription = (async () => {
+          try {
+            for await (const event of client.swarms.subscribe(swarm.id, {
+              signal: abortController.signal,
+            })) {
+              await relayLaunchSwarmEvent(bus, displayAgents, event);
+              if (event.event === 'swarm:completed') {
+                sawCompletion = true;
+                break;
+              }
+            }
+          } catch (error) {
+            if (!abortController?.signal.aborted) {
+              subscriptionError = getErrorMessage(error);
+            }
+          }
+        })();
+
+        await emitLaunchTaskStart(bus, displayAgents, input);
+        const execution = await client.swarms.run(swarm.id, { text: input });
+        await Promise.race([subscription, sleep(2000)]);
+        abortController.abort();
+        await subscription;
+
+        if (!sawCompletion) {
+          if (subscriptionError) {
+            console.error('Warning:', subscriptionError);
+          }
+          await relayLaunchSwarmEvent(bus, displayAgents, {
+            event: 'swarm:completed',
+            data: {
+              swarmId: swarm.id,
+              state: execution.swarm,
+              result: execution.result,
+            },
+          });
+        }
+
+        const text = resultText(execution.result);
+        writeFile(
+          join(opts.dir, 'anima-result.md'),
+          `# Task\n\n${input}\n\n# Result\n\n${text}\n`,
+          () => {}
+        );
+        return execution.result;
+      } catch (error) {
+        swarmSession.invalidate();
+        abortController?.abort();
+        await subscription;
+        const message = getErrorMessage(error);
+        await emitLaunchTaskFailure(bus, displayAgents, message);
+        return {
+          status: 'error',
+          error: message,
+          durationMs: 0,
+        };
+      }
+    };
+
+    if (!task) {
+      const element = tuiRuntime.createElement(tuiRuntime.App, {
+        eventBus: bus,
+        strategy: agency.strategy,
+        interactive: true,
+        onTask: runTask,
+        agentProfiles,
+        onSaveAgent,
+      });
+      tuiRuntime.render(element);
+      return;
+    }
+
+    const element = tuiRuntime.createElement(tuiRuntime.App, {
+      eventBus: bus,
+      strategy: agency.strategy,
+      task,
+      agentProfiles,
+      onSaveAgent,
+    });
+    const instance = tuiRuntime.render(element);
+
+    const result = await runTask(task);
+    await sleep(500);
+    instance.unmount();
+
+    if (result.status === 'error') {
+      process.exitCode = 1;
+    }
+  } catch (error) {
+    console.error('Error:', getErrorMessage(error));
+    process.exitCode = 1;
+  }
+}
+
+export async function executeLaunchCommand(
+  task: string | undefined,
+  opts: LaunchOptions,
+  deps: LaunchDeps = {}
+): Promise<void> {
+  if (!agencyExists(opts.dir)) {
+    console.error(
+      `Error: No anima.yaml found in "${opts.dir}". Run "animaos create" first.`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  let agency: AgencyConfig;
+  try {
+    agency = loadAgency(opts.dir);
+  } catch (error) {
+    console.error('Error:', getErrorMessage(error));
+    process.exitCode = 1;
+    return;
+  }
+
+  if (!opts.tui) {
+    await executeDaemonLaunchCommand(task, opts, agency, deps);
+    return;
+  }
+
+  await executeDaemonTuiLaunchCommand(task, opts, agency, deps);
+}
+
+export const launchCommand = new Command('launch')
+  .description('Launch an agent swarm from an anima.yaml config')
+  .argument(
+    '[task]',
+    'The task to execute (omit to open interactive TUI session)'
+  )
+  .option('-d, --dir <dir>', 'Directory containing anima.yaml', '.')
+  .option('--api-key <key>', 'API key override')
+  .option('--no-tui', 'Disable TUI, use plain text output')
+  .action((task: string | undefined, opts: LaunchOptions) =>
+    executeLaunchCommand(task, opts)
+  );

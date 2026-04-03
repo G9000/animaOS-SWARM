@@ -19,9 +19,12 @@ impl JsonValue {
     }
 }
 
+const MAX_NESTING_DEPTH: usize = 128;
+
 pub(crate) struct JsonParser<'a> {
     input: &'a [u8],
     position: usize,
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -29,6 +32,7 @@ impl<'a> JsonParser<'a> {
         Self {
             input: input.as_bytes(),
             position: 0,
+            depth: 0,
         }
     }
 
@@ -66,11 +70,16 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_object_value(&mut self) -> Result<BTreeMap<String, JsonValue>, ()> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(());
+        }
+        self.depth += 1;
         self.expect(b'{')?;
         self.skip_whitespace();
 
         let mut object = BTreeMap::new();
         if self.consume(b'}') {
+            self.depth -= 1;
             return Ok(object);
         }
 
@@ -88,15 +97,21 @@ impl<'a> JsonParser<'a> {
             self.skip_whitespace();
         }
 
+        self.depth -= 1;
         Ok(object)
     }
 
     fn parse_array(&mut self) -> Result<Vec<JsonValue>, ()> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(());
+        }
+        self.depth += 1;
         self.expect(b'[')?;
         self.skip_whitespace();
 
         let mut values = Vec::new();
         if self.consume(b']') {
+            self.depth -= 1;
             return Ok(values);
         }
 
@@ -110,6 +125,7 @@ impl<'a> JsonParser<'a> {
             self.skip_whitespace();
         }
 
+        self.depth -= 1;
         Ok(values)
     }
 
@@ -156,18 +172,43 @@ impl<'a> JsonParser<'a> {
         if self.consume(b'-') {
             // optional minus
         }
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.position += 1;
+
+        // Integer part: no leading zeros unless the value is just `0`.
+        match self.peek() {
+            Some(b'0') => {
+                self.position += 1;
+                // After a leading 0 the next char must NOT be a digit.
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(());
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.position += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.position += 1;
+                }
+            }
+            _ => return Err(()), // lone minus or empty
         }
+
+        // Fractional part — at least one digit required after the dot.
         if self.consume(b'.') {
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(());
+            }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.position += 1;
             }
         }
+
+        // Exponent part — at least one digit required.
         if matches!(self.peek(), Some(b'e' | b'E')) {
             self.position += 1;
             if matches!(self.peek(), Some(b'+' | b'-')) {
                 self.position += 1;
+            }
+            if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                return Err(());
             }
             while matches!(self.peek(), Some(b'0'..=b'9')) {
                 self.position += 1;
@@ -217,7 +258,11 @@ impl<'a> JsonParser<'a> {
 
     fn expect_literal(&mut self, literal: &str) -> Result<(), ()> {
         let bytes = literal.as_bytes();
-        if self.input[self.position..].starts_with(bytes) {
+        if self
+            .input
+            .get(self.position..)
+            .map_or(false, |rest| rest.starts_with(bytes))
+        {
             self.position += bytes.len();
             Ok(())
         } else {
