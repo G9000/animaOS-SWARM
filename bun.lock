@@ -59,6 +59,8 @@
       },
       "dependencies": {
         "@animaOS-SWARM/core": "workspace:*",
+        "@animaOS-SWARM/memory": "workspace:*",
+        "@animaOS-SWARM/sdk": "workspace:*",
         "@animaOS-SWARM/swarm": "workspace:*",
         "@animaOS-SWARM/tools": "workspace:*",
         "@animaOS-SWARM/tui": "workspace:*",
@@ -97,9 +99,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@animaOS-SWARM/core": "workspace:*",
-        "@animaOS-SWARM/memory": "workspace:*",
         "@animaOS-SWARM/swarm": "workspace:*",
-        "@animaOS-SWARM/tools": "workspace:*",
         "tslib": "^2.3.0",
       },
     },

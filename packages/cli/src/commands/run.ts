@@ -1,153 +1,146 @@
-import { Command } from "commander"
+import { Command } from 'commander';
+import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
+import type { SwarmConfig } from '@animaOS-SWARM/sdk';
 import {
-	AgentRuntime,
-	EventBus,
-} from "@animaOS-SWARM/core"
-import type { AgentConfig, IModelAdapter } from "@animaOS-SWARM/core"
-import { SwarmCoordinator } from "@animaOS-SWARM/swarm"
-import { allTools } from "../tools.js"
-import { createAdapter } from "../agency/generator.js"
+  DAEMON_PROVIDER_HELP,
+  getErrorMessage,
+  resolveDaemonModelSettings,
+} from './utils.js';
 
-interface RunOptions {
-	model: string
-	provider: string
-	name: string
-	strategy?: string
-	apiKey?: string
-	tui: boolean
+export interface RunOptions {
+  model: string;
+  provider: string;
+  name: string;
+  strategy?: 'supervisor' | 'dynamic' | 'round-robin';
+  apiKey?: string;
+  tui: boolean;
 }
 
-export const runCommand = new Command("run")
-	.description("Run an agent or swarm with a task")
-	.argument("<task>", "The task to execute")
-	.option("-m, --model <model>", "Model to use", "gpt-4o-mini")
-	.option("-p, --provider <provider>", "Provider: openai, anthropic, ollama", "openai")
-	.option("-n, --name <name>", "Agent name (single-agent mode)", "task-agent")
-	.option("-s, --strategy <strategy>", "Swarm strategy: supervisor, dynamic, round-robin")
-	.option("--api-key <key>", "API key override")
-	.option("--no-tui", "Disable TUI, use plain text output")
-	.action(async (task: string, opts: RunOptions) => {
-		const adapter = createAdapter(opts.provider, opts.apiKey)
-		const bus = new EventBus()
-
-		if (opts.strategy) {
-			await runSwarm(task, opts.strategy, opts, adapter, bus)
-		} else {
-			await runSingleAgent(task, opts, adapter, bus)
-		}
-	})
-
-async function runSwarm(
-	task: string,
-	strategy: string,
-	opts: RunOptions,
-	adapter: IModelAdapter,
-	bus: EventBus,
+export async function executeRunCommand(
+  task: string,
+  opts: RunOptions,
+  client: CliDaemonClient = createCliDaemonClient()
 ): Promise<void> {
-	const managerConfig: AgentConfig = {
-		name: "manager",
-		model: opts.model,
-		system:
-			"You are a task manager. Break complex tasks into subtasks and delegate to workers. Synthesize results into a final answer.",
-		tools: allTools,
-	}
+  if (opts.tui) {
+    console.log(
+      'TUI mode is not available for daemon-backed runs yet. Falling back to plain text.\n'
+    );
+  }
 
-	const workerConfig: AgentConfig = {
-		name: "worker",
-		model: opts.model,
-		system:
-			"You are a helpful worker agent. Complete the assigned task concisely and accurately.",
-		tools: allTools,
-	}
-
-	const coordinator = new SwarmCoordinator(
-		{
-			strategy: strategy as "supervisor" | "dynamic" | "round-robin",
-			manager: managerConfig,
-			workers: [workerConfig],
-		},
-		adapter,
-		bus,
-	)
-
-	if (opts.tui) {
-		const { render } = await import("ink")
-		const { default: React } = await import("react")
-		const { App } = await import("@animaOS-SWARM/tui")
-
-		const element = React.createElement(App, {
-			eventBus: bus,
-			strategy,
-			task,
-		})
-		const instance = render(element)
-
-		const result = await coordinator.run(task)
-		// Wait for final events to flush through the TUI
-		await new Promise((resolve) => setTimeout(resolve, 500))
-		instance.unmount()
-
-		if (result.status === "error") {
-			process.exit(1)
-		}
-	} else {
-		bus.on("agent:spawned", (e) => {
-			const d = e.data as { agentId: string; name: string }
-			console.log(`  [agent] spawned: ${d.name} (${d.agentId})`)
-		})
-		bus.on("tool:before", (e) => {
-			const d = e.data as { toolName: string }
-			console.log(`  [tool] calling: ${d.toolName}`)
-		})
-
-		console.log(`Swarm running with strategy "${strategy}" and model ${opts.model}...\n`)
-		const result = await coordinator.run(task)
-
-		console.log("\n--- Result ---")
-		if (result.status === "success") {
-			const data = result.data as { text?: string } | undefined
-			console.log(data?.text ?? JSON.stringify(result.data))
-		} else {
-			console.error("Error:", result.error)
-		}
-		console.log(`\nDuration: ${result.durationMs}ms`)
-	}
+  try {
+    if (opts.strategy) {
+      await runSwarm(task, opts, client);
+    } else {
+      await runSingleAgent(task, opts, client);
+    }
+  } catch (error) {
+    console.error('Error:', getErrorMessage(error));
+    process.exitCode = 1;
+  }
 }
 
 async function runSingleAgent(
-	task: string,
-	opts: RunOptions,
-	adapter: IModelAdapter,
-	bus: EventBus,
+  task: string,
+  opts: RunOptions,
+  client: Pick<CliDaemonClient, 'agents'>
 ): Promise<void> {
-	bus.on("tool:before", (e) => {
-		const d = e.data as { toolName: string }
-		console.log(`  [tool] calling: ${d.toolName}`)
-	})
-	bus.on("tool:after", (e) => {
-		const d = e.data as { toolName: string; durationMs: number }
-		console.log(`  [tool] done: ${d.toolName} (${d.durationMs}ms)`)
-	})
+  const agent = await client.agents.create({
+    name: opts.name,
+    model: opts.model,
+    provider: opts.provider,
+    system: 'You are a helpful task agent. Use tools when needed. Be concise.',
+    settings: resolveDaemonModelSettings(opts.provider, opts.apiKey),
+  });
+  const execution = await client.agents.run(agent.state.id, { text: task });
 
-	const runtime = new AgentRuntime({
-		config: {
-			name: opts.name,
-			model: opts.model,
-			system: "You are a helpful task agent. Use tools when needed. Be concise.",
-			tools: allTools,
-		},
-		modelAdapter: adapter,
-		eventBus: bus,
-	})
+  console.log(`Agent "${opts.name}" running with ${opts.model}...\n`);
+  console.log('--- Result ---');
+  if (execution.result.status === 'success') {
+    const output =
+      typeof execution.result.data === 'object' &&
+      execution.result.data !== null &&
+      'text' in execution.result.data
+        ? execution.result.data.text
+        : JSON.stringify(execution.result.data);
+    console.log(output);
+  } else {
+    console.error('Error:', execution.result.error);
+    process.exitCode = 1;
+  }
 
-	console.log(`Agent "${opts.name}" running with ${opts.model}...\n`)
-	const result = await runtime.run(task)
-
-	console.log("\n--- Result ---")
-	if (result.status === "success") {
-		console.log((result.data as { text: string })?.text)
-	} else {
-		console.error("Error:", result.error)
-	}
-	console.log(`\nDuration: ${result.durationMs}ms | Tokens: ${runtime.getState().tokenUsage.totalTokens}`)
+  const duration = execution.result.durationMs ?? 0;
+  console.log(
+    `\nDuration: ${duration}ms | Tokens: ${execution.agent.state.tokenUsage.totalTokens}`
+  );
 }
+
+async function runSwarm(
+  task: string,
+  opts: RunOptions,
+  client: Pick<CliDaemonClient, 'swarms'>
+): Promise<void> {
+  const swarm = await client.swarms.create(buildRunSwarmConfig(opts));
+  const execution = await client.swarms.run(swarm.id, { text: task });
+
+  console.log(
+    `Swarm running with strategy "${opts.strategy}" and model ${opts.model}...\n`
+  );
+  console.log('--- Result ---');
+  if (execution.result.status === 'success') {
+    const output =
+      typeof execution.result.data === 'object' &&
+      execution.result.data !== null &&
+      'text' in execution.result.data
+        ? execution.result.data.text
+        : JSON.stringify(execution.result.data);
+    console.log(output);
+  } else {
+    console.error('Error:', execution.result.error);
+    process.exitCode = 1;
+  }
+
+  const duration = execution.result.durationMs ?? 0;
+  console.log(
+    `\nDuration: ${duration}ms | Tokens: ${execution.swarm.tokenUsage.totalTokens}`
+  );
+}
+
+function buildRunSwarmConfig(opts: RunOptions): SwarmConfig {
+  const settings = resolveDaemonModelSettings(opts.provider, opts.apiKey);
+
+  return {
+    strategy: opts.strategy!,
+    manager: {
+      name: 'manager',
+      model: opts.model,
+      provider: opts.provider,
+      system:
+        'You are a task manager. Break complex tasks into subtasks and delegate to workers. Synthesize results into a final answer.',
+      settings,
+    },
+    workers: [
+      {
+        name: 'worker',
+        model: opts.model,
+        provider: opts.provider,
+        system:
+          'You are a helpful worker agent. Complete the assigned task concisely and accurately.',
+        settings,
+      },
+    ],
+  };
+}
+
+export const runCommand = new Command('run')
+  .description('Run an agent or swarm with a task')
+  .argument('<task>', 'The task to execute')
+  .option('-m, --model <model>', 'Model to use', 'gpt-4o-mini')
+  .option('-p, --provider <provider>', DAEMON_PROVIDER_HELP, 'openai')
+  .option('-n, --name <name>', 'Agent name (single-agent mode)', 'task-agent')
+  .option(
+    '-s, --strategy <strategy>',
+    'Swarm strategy: supervisor, dynamic, round-robin'
+  )
+  .option('--api-key <key>', 'API key override')
+  .option('--no-tui', 'Disable TUI, use plain text output')
+  .action((task: string, opts: RunOptions) => executeRunCommand(task, opts));

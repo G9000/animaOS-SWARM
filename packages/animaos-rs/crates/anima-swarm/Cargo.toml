@@ -1,0 +1,15 @@
+[package]
+name = "anima-swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anima-core = { path = "../anima-core" }
+anima-memory = { path = "../anima-memory" }
+futures = "0.3"
+tokio = { version = "1.48.0", features = ["sync"] }
+
+[lints]
+workspace = true

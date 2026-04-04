@@ -1,0 +1,17 @@
+[workspace]
+members = [
+    "crates/anima-core",
+    "crates/anima-memory",
+    "crates/anima-swarm",
+    "crates/anima-daemon",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+authors = ["animaOS contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

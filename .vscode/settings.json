@@ -1,0 +1,6 @@
+{
+  "chat.tools.terminal.autoApprove": {
+    "cargo run": true,
+    "bun": true
+  }
+}

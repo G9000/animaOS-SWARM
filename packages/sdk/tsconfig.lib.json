@@ -12,12 +12,6 @@
   "include": ["src/**/*.ts"],
   "references": [
     {
-      "path": "../memory/tsconfig.lib.json"
-    },
-    {
-      "path": "../tools/tsconfig.lib.json"
-    },
-    {
       "path": "../swarm/tsconfig.lib.json"
     },
     {

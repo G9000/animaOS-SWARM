@@ -1,99 +1,104 @@
-import { Command } from "commander"
-import { createInterface } from "node:readline"
-import { AgentRuntime, EventBus, OpenAIAdapter, action } from "@animaOS-SWARM/core"
+import { Command } from 'commander';
+import { createInterface, type Interface } from 'node:readline';
+import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
+import {
+  DAEMON_PROVIDER_HELP,
+  getErrorMessage,
+  resolveDaemonModelSettings,
+} from './utils.js';
 
-const builtinTools = [
-	action({
-		name: "get_current_time",
-		description: "Get the current date and time",
-		parameters: { type: "object", properties: {}, required: [] },
-		handler: async () => ({
-			status: "success" as const,
-			data: new Date().toISOString(),
-			durationMs: 0,
-		}),
-	}),
-	action({
-		name: "calculate",
-		description: "Evaluate a math expression and return the result",
-		parameters: {
-			type: "object",
-			properties: {
-				expression: { type: "string", description: "The math expression to evaluate" },
-			},
-			required: ["expression"],
-		},
-		handler: async (_runtime, _message, args) => {
-			try {
-				const expr = args.expression as string
-				const result = Function(`"use strict"; return (${expr})`)()
-				return { status: "success" as const, data: String(result), durationMs: 0 }
-			} catch (err) {
-				return { status: "error" as const, error: String(err), durationMs: 0 }
-			}
-		},
-	}),
-]
+export interface ChatOptions {
+  provider?: string;
+  model: string;
+  name: string;
+  apiKey?: string;
+}
 
-export const chatCommand = new Command("chat")
-	.description("Interactive chat with an agent")
-	.option("-m, --model <model>", "Model to use", "gpt-4o-mini")
-	.option("-n, --name <name>", "Agent name", "task-agent")
-	.option("--api-key <key>", "OpenAI API key (or set OPENAI_API_KEY env)")
-	.action(async (opts: { model: string; name: string; apiKey?: string }) => {
-		const apiKey = opts.apiKey ?? process.env.OPENAI_API_KEY
-		if (!apiKey) {
-			console.error("Error: OPENAI_API_KEY is required. Set it via --api-key or environment variable.")
-			process.exit(1)
-		}
+interface ChatDeps {
+  client?: Pick<CliDaemonClient, 'agents'>;
+  createReadline?: () => Pick<Interface, 'question' | 'close'>;
+}
 
-		const bus = new EventBus()
+export async function executeChatCommand(
+  opts: ChatOptions,
+  deps: ChatDeps = {}
+): Promise<void> {
+  const provider = opts.provider?.trim() || 'openai';
 
-		bus.on("tool:before", (e) => {
-			const d = e.data as { toolName: string }
-			process.stdout.write(`  [tool] ${d.toolName}...`)
-		})
-		bus.on("tool:after", (e) => {
-			const d = e.data as { durationMs: number }
-			console.log(` done (${d.durationMs}ms)`)
-		})
+  let client: Pick<CliDaemonClient, 'agents'>;
+  let agent: Awaited<
+    ReturnType<Pick<CliDaemonClient, 'agents'>['agents']['create']>
+  >;
 
-		const runtime = new AgentRuntime({
-			config: {
-				name: opts.name,
-				model: opts.model,
-				system: "You are a helpful task agent. Use tools when needed. Be concise.",
-				tools: builtinTools,
-			},
-			modelAdapter: new OpenAIAdapter(apiKey),
-			eventBus: bus,
-		})
+  try {
+    client = deps.client ?? createCliDaemonClient();
+    agent = await client.agents.create({
+      name: opts.name,
+      model: opts.model,
+      provider,
+      system:
+        'You are a helpful task agent. Use tools when needed. Be concise.',
+      settings: resolveDaemonModelSettings(provider, opts.apiKey),
+    });
+  } catch (error) {
+    console.error('Error:', getErrorMessage(error));
+    process.exitCode = 1;
+    return;
+  }
 
-		console.log(`AnimaOS Kit — ${opts.name} (${opts.model})`)
-		console.log('Type "exit" to quit.\n')
+  console.log(`AnimaOS Kit - ${opts.name} (${opts.model})`);
+  console.log('Type "exit" to quit.\n');
 
-		const rl = createInterface({ input: process.stdin, output: process.stdout })
+  const rl =
+    deps.createReadline?.() ??
+    createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
 
-		const prompt = () => {
-			rl.question("you > ", async (input) => {
-				const trimmed = input.trim()
-				if (!trimmed || trimmed === "exit") {
-					console.log("Bye.")
-					rl.close()
-					return
-				}
+  await new Promise<void>((resolve) => {
+    const prompt = () => {
+      rl.question('you > ', async (input) => {
+        const trimmed = input.trim();
+        if (!trimmed || trimmed === 'exit') {
+          console.log('Bye.');
+          rl.close();
+          resolve();
+          return;
+        }
 
-				const result = await runtime.run(trimmed)
+        try {
+          const result = await client.agents.run(agent.state.id, {
+            text: trimmed,
+          });
 
-				if (result.status === "success") {
-					console.log(`\nagent > ${(result.data as { text: string })?.text}\n`)
-				} else {
-					console.log(`\n[error] ${result.error}\n`)
-				}
+          if (result.result.status === 'success') {
+            const text =
+              typeof result.result.data === 'object' &&
+              result.result.data !== null &&
+              'text' in result.result.data
+                ? result.result.data.text
+                : JSON.stringify(result.result.data);
+            console.log(`\nagent > ${text}\n`);
+          } else {
+            console.log(`\n[error] ${result.result.error}\n`);
+          }
+        } catch (error) {
+          console.log(`\n[error] ${getErrorMessage(error)}\n`);
+        }
 
-				prompt()
-			})
-		}
+        prompt();
+      });
+    };
 
-		prompt()
-	})
+    prompt();
+  });
+}
+
+export const chatCommand = new Command('chat')
+  .description('Interactive chat with an agent')
+  .option('-p, --provider <provider>', DAEMON_PROVIDER_HELP, 'openai')
+  .option('-m, --model <model>', 'Model to use', 'gpt-4o-mini')
+  .option('-n, --name <name>', 'Agent name', 'task-agent')
+  .option('--api-key <key>', 'API key override')
+  .action((opts: ChatOptions) => executeChatCommand(opts));

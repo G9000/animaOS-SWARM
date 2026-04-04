@@ -1,0 +1,12 @@
+[package]
+name = "anima-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anima-core = { path = "../anima-core" }
+
+[lints]
+workspace = true
