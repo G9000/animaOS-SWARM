@@ -6,26 +6,28 @@ const mockDaemonClient = {
     create: vi.fn(),
     run: vi.fn(),
     list: vi.fn(),
+    get: vi.fn(),
+    recentMemories: vi.fn(),
   },
   swarms: {
     create: vi.fn(),
     run: vi.fn(),
+    get: vi.fn(),
+    subscribe: vi.fn(),
   },
-};
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+} as any;
 
 vi.mock('../client.js', () => ({
   DaemonHttpError: class DaemonHttpError extends Error {
-    constructor(
-      public readonly status: number,
-      public readonly body: unknown,
-    ) {
+    constructor(public readonly status: number, public readonly body: unknown) {
       super(
         typeof body === 'object' &&
           body !== null &&
           'error' in body &&
           typeof body.error === 'string'
           ? body.error
-          : `Daemon request failed with status ${status}`,
+          : `Daemon request failed with status ${status}`
       );
     }
   },
@@ -241,7 +243,7 @@ describe('CLI daemon-backed command cutover', () => {
       ],
       {
         from: 'node',
-      },
+      }
     );
 
     expect(mockDaemonClient.swarms.create).toHaveBeenCalledWith({
@@ -292,7 +294,7 @@ describe('CLI daemon-backed command cutover', () => {
       lastTask: null,
     });
     mockDaemonClient.agents.run.mockRejectedValue(
-      new Error('daemon unavailable'),
+      new Error('daemon unavailable')
     );
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -304,14 +306,40 @@ describe('CLI daemon-backed command cutover', () => {
         provider: 'openai',
         name: 'task-agent',
         tui: false,
-      }),
+      })
     ).resolves.toBeUndefined();
 
     expect(errorSpy).toHaveBeenCalledWith('Error:', 'daemon unavailable');
     expect(process.exitCode).toBe(1);
   });
 
-  it('fails fast when an unsupported api-key override is supplied to run', async () => {
+  it('forwards api-key overrides to daemon-backed run', async () => {
+    mockDaemonClient.agents.create.mockResolvedValue({
+      state: {
+        id: 'agent-run-override',
+        name: 'task-agent',
+        status: 'idle',
+        tokenUsage: {
+          totalTokens: 7,
+        },
+      },
+    });
+    mockDaemonClient.agents.run.mockResolvedValue({
+      agent: {
+        state: {
+          tokenUsage: {
+            totalTokens: 7,
+          },
+        },
+      },
+      result: {
+        status: 'success',
+        data: { text: 'daemon handled override' },
+        durationMs: 5,
+      },
+    });
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const { executeRunCommand } = await import('./run.js');
 
@@ -322,16 +350,23 @@ describe('CLI daemon-backed command cutover', () => {
         name: 'task-agent',
         apiKey: 'secret',
         tui: false,
-      }),
+      })
     ).resolves.toBeUndefined();
 
-    expect(mockDaemonClient.agents.create).not.toHaveBeenCalled();
-    expect(mockDaemonClient.agents.run).not.toHaveBeenCalled();
-    expect(errorSpy).toHaveBeenCalledWith(
-      'Error:',
-      '--api-key is not supported by the daemon-backed run command. Configure credentials in the daemon environment.',
+    expect(mockDaemonClient.agents.create).toHaveBeenCalledWith({
+      model: 'gpt-4o-mini',
+      name: 'task-agent',
+      provider: 'openai',
+      settings: { apiKey: 'secret' },
+      system:
+        'You are a helpful task agent. Use tools when needed. Be concise.',
+    });
+    expect(mockDaemonClient.agents.run).toHaveBeenCalledWith(
+      'agent-run-override',
+      { text: 'Reject ignored api key' }
     );
-    expect(process.exitCode).toBe(1);
+    expect(logSpy).toHaveBeenCalled();
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('chat uses a single daemon-backed agent session without forcing a provider', async () => {
@@ -358,7 +393,7 @@ describe('CLI daemon-backed command cutover', () => {
     readline.question.mockImplementation(
       (_prompt: string, callback: (input: string) => void) => {
         callback(inputs.shift() ?? 'exit');
-      },
+      }
     );
 
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -373,12 +408,14 @@ describe('CLI daemon-backed command cutover', () => {
       {
         client: mockDaemonClient,
         createReadline: () => readline,
-      },
+      }
     );
 
     expect(mockDaemonClient.agents.create).toHaveBeenCalledWith({
       model: 'gpt-4o-mini',
       name: 'task-agent',
+      provider: 'openai',
+      settings: undefined,
       system:
         'You are a helpful task agent. Use tools when needed. Be concise.',
     });
@@ -389,7 +426,22 @@ describe('CLI daemon-backed command cutover', () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
-  it('fails fast when an unsupported api-key override is supplied to chat', async () => {
+  it('forwards api-key overrides to daemon-backed chat', async () => {
+    mockDaemonClient.agents.create.mockResolvedValue({
+      state: {
+        id: 'agent-chat-override',
+        name: 'task-agent',
+        status: 'idle',
+      },
+    });
+
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback('exit');
+      }),
+      close: vi.fn(),
+    };
+
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     const { executeChatCommand } = await import('./chat.js');
 
@@ -402,21 +454,26 @@ describe('CLI daemon-backed command cutover', () => {
         },
         {
           client: mockDaemonClient,
-        },
-      ),
+          createReadline: () => readline as any,
+        }
+      )
     ).resolves.toBeUndefined();
 
-    expect(mockDaemonClient.agents.create).not.toHaveBeenCalled();
-    expect(errorSpy).toHaveBeenCalledWith(
-      'Error:',
-      '--api-key is not supported by the daemon-backed chat command. Configure credentials in the daemon environment.',
-    );
-    expect(process.exitCode).toBe(1);
+    expect(mockDaemonClient.agents.create).toHaveBeenCalledWith({
+      model: 'gpt-4o-mini',
+      name: 'task-agent',
+      provider: 'openai',
+      settings: { apiKey: 'secret' },
+      system:
+        'You are a helpful task agent. Use tools when needed. Be concise.',
+    });
+    expect(readline.close).toHaveBeenCalledOnce();
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it('reports daemon setup failures without throwing from chat', async () => {
     mockDaemonClient.agents.create.mockRejectedValue(
-      new Error('daemon unavailable'),
+      new Error('daemon unavailable')
     );
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -430,8 +487,8 @@ describe('CLI daemon-backed command cutover', () => {
         },
         {
           client: mockDaemonClient,
-        },
-      ),
+        }
+      )
     ).resolves.toBeUndefined();
 
     expect(errorSpy).toHaveBeenCalledWith('Error:', 'daemon unavailable');
@@ -473,7 +530,7 @@ describe('CLI daemon-backed command cutover', () => {
 
   it('reports daemon failures without throwing from the agents list command', async () => {
     mockDaemonClient.agents.list.mockRejectedValue(
-      new Error('daemon unavailable'),
+      new Error('daemon unavailable')
     );
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -482,7 +539,7 @@ describe('CLI daemon-backed command cutover', () => {
     await expect(
       buildProgram().parseAsync(['node', 'animaos', 'agents', 'list'], {
         from: 'node',
-      }),
+      })
     ).resolves.toBeInstanceOf(Command);
 
     expect(errorSpy).toHaveBeenCalledWith('Error:', 'daemon unavailable');

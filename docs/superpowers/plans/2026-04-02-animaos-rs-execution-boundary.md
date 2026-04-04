@@ -8,6 +8,29 @@
 
 **Tech Stack:** Rust 2021, Cargo workspace, `async-trait`, `tokio`, `axum`, SSE, Rust unit/integration tests, existing TypeScript runtime/swarm packages, Nx-managed TS verification.
 
+## Status Update (2026-04-03)
+
+This document is now partly historical. The repository already implements the major Rust execution-boundary milestones that were originally planned here.
+
+Implemented in the repo today:
+
+- `packages/animaos-rs` passes `cargo test --manifest-path packages/animaos-rs/Cargo.toml`
+- `anima-core` is already async-aware and covers runtime/tool/provider/evaluator flows
+- `anima-swarm` already includes the coordinator shell, message bus, and strategy implementations
+- `anima-daemon` already runs on `tokio`/`axum` and exposes agent, memory, swarm, and SSE APIs
+- `packages/sdk` is already a thin daemon client surface
+- CLI `run`, `chat`, `agents`, and `launch` are daemon-backed by default on this branch
+- `launch` is now daemon-only; the embedded TypeScript fallback has been removed
+- `launch` TUI is driven through a daemon SSE-to-event-bus bridge
+
+Current remaining work is narrower than the task list below suggests:
+
+- soak-test the daemon path as the only launch runtime
+- keep parity checks focused on deterministic scenarios
+- keep this document aligned with the actual repo state
+
+Treat the detailed tasks below as implementation history and reference material, not as a literal current backlog.
+
 ---
 
 ## Scope Check
@@ -37,6 +60,7 @@ Implementation discipline:
 ## File Structure
 
 ### Core Async Runtime
+
 - **Modify:** `packages/animaos-rs/crates/anima-core/Cargo.toml` - add async-trait support and any minimal async helper dependencies
 - **Modify:** `packages/animaos-rs/crates/anima-core/src/components.rs` - convert provider/evaluator contracts to async-aware traits
 - **Modify:** `packages/animaos-rs/crates/anima-core/src/model.rs` - convert model adapter contract to async-aware generation
@@ -45,6 +69,7 @@ Implementation discipline:
 - **Test:** `packages/animaos-rs/crates/anima-core/src/runtime.rs` and/or `packages/animaos-rs/crates/anima-core/tests/runtime_async.rs` - targeted async runtime parity tests
 
 ### Swarm Coordinator
+
 - **Modify:** `packages/animaos-rs/crates/anima-swarm/Cargo.toml` - add `tokio` and any focused support crates
 - **Create:** `packages/animaos-rs/crates/anima-swarm/src/types.rs` - Rust equivalents of `packages/swarm/src/types.ts`
 - **Create:** `packages/animaos-rs/crates/anima-swarm/src/message_bus.rs` - inboxes, broadcast, clear/reset behavior
@@ -62,6 +87,7 @@ Implementation discipline:
 - **Reference:** `packages/swarm/src/strategies/*.ts`
 
 ### Async Daemon
+
 - **Modify:** `packages/animaos-rs/crates/anima-daemon/Cargo.toml` - add `tokio`, `axum`, and focused serialization/streaming dependencies
 - **Create:** `packages/animaos-rs/crates/anima-daemon/src/app.rs` - `axum` router assembly and shared state wiring
 - **Create:** `packages/animaos-rs/crates/anima-daemon/src/events.rs` - SSE event fanout and subscription helpers
@@ -78,6 +104,7 @@ Implementation discipline:
 - **Create:** `packages/animaos-rs/crates/anima-daemon/tests/swarm_api.rs` - async swarm and SSE integration tests
 
 ### TypeScript Thin Clients
+
 - **Create:** `packages/sdk/src/client.ts` - shared daemon HTTP/SSE client
 - **Create:** `packages/sdk/src/agents.ts` - agent client API wrappers
 - **Create:** `packages/sdk/src/swarms.ts` - swarm client API wrappers
@@ -91,6 +118,7 @@ Implementation discipline:
 - **Test:** `packages/sdk/src/index.ts` and CLI command tests as they are introduced
 
 ### Parity + Cutover
+
 - **Create:** `docs/superpowers/plans/parity-fixtures/` only if lightweight fixtures are needed
 - **Modify:** `docs/superpowers/specs/2026-04-02-animaos-rs-execution-boundary-design.md` only if design changes during execution
 - **Create:** `packages/animaos-rs/crates/anima-daemon/tests/parity.rs` if a focused daemon parity suite is easier than duplicating coverage
@@ -100,6 +128,7 @@ Implementation discipline:
 ## Task 1: Convert `anima-core` Contracts to Async Boundaries
 
 **Files:**
+
 - Modify: `packages/animaos-rs/crates/anima-core/Cargo.toml`
 - Modify: `packages/animaos-rs/crates/anima-core/src/components.rs`
 - Modify: `packages/animaos-rs/crates/anima-core/src/model.rs`
@@ -109,6 +138,7 @@ Implementation discipline:
 - [ ] **Step 1: Write failing async runtime tests**
 
 Cover:
+
 - async model generation
 - async provider context injection
 - async evaluator execution
@@ -123,6 +153,7 @@ Expected: FAIL or compile failure because traits and runtime methods are still s
 - [ ] **Step 3: Add minimal async dependencies and convert trait signatures**
 
 Convert:
+
 - `ModelAdapter::generate`
 - `Provider::get`
 - `Evaluator::validate`
@@ -133,6 +164,7 @@ Use `async-trait` or the smallest equivalent approach that keeps `anima-core` tr
 - [ ] **Step 4: Convert `AgentRuntime` run methods to async**
 
 At minimum:
+
 - `run`
 - `run_with_tools`
 - internal provider/evaluator execution
@@ -160,6 +192,7 @@ git commit -m "feat: make Rust runtime contracts async-aware"
 ## Task 2: Add Real Async Model Adapter Wiring
 
 **Files:**
+
 - Modify: `packages/animaos-rs/crates/anima-daemon/src/model.rs`
 - Modify: `packages/animaos-rs/crates/anima-daemon/src/state.rs`
 - Modify: `packages/animaos-rs/crates/anima-daemon/src/main.rs`
@@ -168,6 +201,7 @@ git commit -m "feat: make Rust runtime contracts async-aware"
 - [ ] **Step 1: Write a failing daemon test for async model-backed agent runs**
 
 Cover:
+
 - daemon can await model generation
 - token usage still updates
 - provider/evaluator hooks still execute through the async path
@@ -181,6 +215,7 @@ Expected: FAIL or compile failure because daemon runtime wiring is still sync.
 - [ ] **Step 3: Convert daemon runtime/model wiring to async**
 
 Keep:
+
 - deterministic adapter for tests
 - room/message/task semantics
 
@@ -189,6 +224,7 @@ Do not add network-specific provider code to `anima-core`.
 - [ ] **Step 4: Add one real provider-backed adapter behind feature/config boundaries**
 
 Recommended:
+
 - keep deterministic adapter for tests
 - add one real HTTP-backed adapter only after the async contract is stable
 
@@ -210,6 +246,7 @@ git commit -m "feat: wire async model adapters through Rust daemon"
 ## Task 3: Port the Swarm Message Bus and Types
 
 **Files:**
+
 - Modify: `packages/animaos-rs/crates/anima-swarm/Cargo.toml`
 - Create: `packages/animaos-rs/crates/anima-swarm/src/types.rs`
 - Create: `packages/animaos-rs/crates/anima-swarm/src/message_bus.rs`
@@ -219,10 +256,12 @@ git commit -m "feat: wire async model adapters through Rust daemon"
 - [ ] **Step 1: Port the TS swarm type shapes into Rust tests first**
 
 Reference:
+
 - `packages/swarm/src/types.ts`
 - `packages/swarm/src/message-bus.ts`
 
 Cover:
+
 - inbox registration
 - direct send
 - broadcast
@@ -237,6 +276,7 @@ Expected: FAIL because the files do not exist yet.
 - [ ] **Step 3: Add `tokio` and implement the message bus**
 
 Keep the bus focused:
+
 - no HTTP
 - no daemon coupling
 - no strategy logic here
@@ -261,6 +301,7 @@ git commit -m "feat: add tokio message bus for Rust swarm"
 ## Task 4: Port the Swarm Coordinator Shell
 
 **Files:**
+
 - Create: `packages/animaos-rs/crates/anima-swarm/src/coordinator.rs`
 - Modify: `packages/animaos-rs/crates/anima-swarm/src/lib.rs`
 - Create: `packages/animaos-rs/crates/anima-swarm/tests/coordinator.rs`
@@ -270,6 +311,7 @@ git commit -m "feat: add tokio message bus for Rust swarm"
 - [ ] **Step 1: Write failing coordinator lifecycle tests**
 
 Cover:
+
 - `start`
 - `dispatch`
 - `stop`
@@ -286,6 +328,7 @@ Expected: FAIL because the coordinator is still a stub.
 - [ ] **Step 3: Implement the coordinator shell with `tokio`**
 
 Port:
+
 - persistent worker pool
 - serial dispatch chain
 - reset behavior before each task
@@ -313,6 +356,7 @@ git commit -m "feat: port Rust swarm coordinator shell"
 ## Task 5: Port Swarm Strategies One by One
 
 **Files:**
+
 - Create: `packages/animaos-rs/crates/anima-swarm/src/strategies/mod.rs`
 - Create: `packages/animaos-rs/crates/anima-swarm/src/strategies/supervisor.rs`
 - Create: `packages/animaos-rs/crates/anima-swarm/src/strategies/round_robin.rs`
@@ -360,6 +404,7 @@ git commit -m "feat: port Rust swarm strategies"
 ## Task 6: Replace the Blocking Daemon With `axum`
 
 **Files:**
+
 - Modify: `packages/animaos-rs/crates/anima-daemon/Cargo.toml`
 - Create: `packages/animaos-rs/crates/anima-daemon/src/app.rs`
 - Create: `packages/animaos-rs/crates/anima-daemon/src/events.rs`
@@ -372,6 +417,7 @@ git commit -m "feat: port Rust swarm strategies"
 - [ ] **Step 1: Write failing async daemon smoke tests**
 
 Cover:
+
 - `GET /health`
 - existing agent routes
 - existing memory routes
@@ -410,6 +456,7 @@ git commit -m "feat: rebuild Rust daemon on axum"
 ## Task 7: Expose Swarm APIs and SSE From the Daemon
 
 **Files:**
+
 - Create: `packages/animaos-rs/crates/anima-daemon/src/routes/swarms.rs`
 - Modify: `packages/animaos-rs/crates/anima-daemon/src/state.rs`
 - Modify: `packages/animaos-rs/crates/anima-daemon/src/routes/mod.rs`
@@ -418,6 +465,7 @@ git commit -m "feat: rebuild Rust daemon on axum"
 - [ ] **Step 1: Write failing swarm daemon integration tests**
 
 Cover:
+
 - create swarm
 - run swarm
 - get swarm state
@@ -432,6 +480,7 @@ Expected: FAIL because swarm routes do not exist yet.
 - [ ] **Step 3: Add swarm registries to daemon state**
 
 Store:
+
 - active swarm coordinators
 - event streams
 - result snapshots
@@ -458,6 +507,7 @@ git commit -m "feat: expose Rust swarm over daemon APIs"
 ## Task 8: Replace SDK Runtime Exports With Daemon Clients
 
 **Files:**
+
 - Create: `packages/sdk/src/client.ts`
 - Create: `packages/sdk/src/agents.ts`
 - Create: `packages/sdk/src/swarms.ts`
@@ -467,6 +517,7 @@ git commit -m "feat: expose Rust swarm over daemon APIs"
 - [ ] **Step 1: Write failing SDK tests or fixtures for daemon client calls**
 
 At minimum cover:
+
 - create/run agent
 - create/run swarm
 - subscribe to events
@@ -480,6 +531,7 @@ Expected: FAIL because the daemon client surface does not exist yet.
 - [ ] **Step 3: Implement a shared daemon HTTP/SSE client**
 
 Keep:
+
 - config builders in TS
 - no embedded runtime logic
 
@@ -505,6 +557,7 @@ git commit -m "feat: switch SDK to Rust daemon clients"
 ## Task 9: Move CLI Commands to the Daemon Client
 
 **Files:**
+
 - Create: `packages/cli/src/client.ts`
 - Modify: `packages/cli/src/index.ts`
 - Modify: `packages/cli/src/commands/run.ts`
@@ -515,6 +568,7 @@ git commit -m "feat: switch SDK to Rust daemon clients"
 - [ ] **Step 1: Write failing CLI command tests or focused command harness checks**
 
 Cover:
+
 - run command uses daemon-backed execution
 - chat uses single-agent daemon flow
 - agents command lists daemon-backed agents
@@ -528,6 +582,7 @@ Expected: FAIL because commands still depend on embedded packages.
 - [ ] **Step 3: Add a thin CLI daemon client wrapper**
 
 Keep the CLI focused on:
+
 - argument parsing
 - presentation
 - daemon transport
@@ -535,6 +590,7 @@ Keep the CLI focused on:
 - [ ] **Step 4: Cut each command over one by one**
 
 Do:
+
 - `run`
 - `chat`
 - `agents`
@@ -559,6 +615,7 @@ git commit -m "feat: move CLI execution to Rust daemon"
 ## Task 10: Add Parity Gates and Cutover Flags
 
 **Files:**
+
 - Modify: `packages/animaos-rs/crates/anima-daemon/tests/agent_api.rs`
 - Modify: `packages/animaos-rs/crates/anima-daemon/tests/swarm_api.rs`
 - Modify: `packages/swarm/src/coordinator.spec.ts`
@@ -568,6 +625,7 @@ git commit -m "feat: move CLI execution to Rust daemon"
 - [ ] **Step 1: Add parity fixtures for agreed deterministic scenarios**
 
 Compare:
+
 - agent run behavior
 - tool loop
 - provider/evaluator hooks
@@ -577,6 +635,7 @@ Compare:
 - [ ] **Step 2: Add an opt-in cutover flag**
 
 TypeScript clients must be able to target either:
+
 - embedded TS engine
 - Rust daemon
 
@@ -591,6 +650,7 @@ Expected: PASS.
 - [ ] **Step 4: Run TypeScript workspace verification**
 
 Run:
+
 - `pnpm nx test @animaOS-SWARM/swarm`
 - `pnpm nx test @animaOS-SWARM/sdk`
 - `pnpm nx test @animaOS-SWARM/cli`
@@ -600,6 +660,7 @@ Expected: PASS.
 - [ ] **Step 5: Format and verify**
 
 Run:
+
 - `cargo fmt --manifest-path packages/animaos-rs/Cargo.toml --all --check`
 - `pnpm nx run-many -t lint --projects @animaOS-SWARM/swarm,@animaOS-SWARM/sdk,@animaOS-SWARM/cli`
 
@@ -623,6 +684,7 @@ Run: `cargo test --manifest-path packages/animaos-rs/Cargo.toml`
 - [ ] **Step 2: Run focused TypeScript verification**
 
 Run:
+
 - `pnpm nx test @animaOS-SWARM/swarm`
 - `pnpm nx test @animaOS-SWARM/sdk`
 - `pnpm nx test @animaOS-SWARM/cli`
@@ -630,12 +692,14 @@ Run:
 - [ ] **Step 3: Run format/lint verification**
 
 Run:
+
 - `cargo fmt --manifest-path packages/animaos-rs/Cargo.toml --all --check`
 - `pnpm nx run-many -t lint --projects @animaOS-SWARM/swarm,@animaOS-SWARM/sdk,@animaOS-SWARM/cli`
 
 - [ ] **Step 4: Document known parity gaps before cutover**
 
 If anything still differs from TS:
+
 - record it explicitly
 - keep the cutover flag opt-in
 - do not remove embedded TS execution yet

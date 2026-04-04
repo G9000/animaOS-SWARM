@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use anima_core::TaskStatus;
 use anima_core::{Content, DataValue, TaskResult, ToolDescriptor};
+use futures::future::try_join_all;
 
 use crate::coordinator::{CoordinatorDelegateFn, CoordinatorDispatchContext, CoordinatorFuture};
 
@@ -28,16 +29,16 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
             .collect::<Vec<_>>()
             .join(", ");
 
-        let mut worker_refs = BTreeMap::new();
-        for config in ctx.worker_configs().iter().cloned() {
+        let worker_refs = match try_join_all(ctx.worker_configs().iter().cloned().map(|config| {
             let worker_name = config.name.clone();
-            match ctx.spawn_agent(config).await {
-                Ok(worker) => {
-                    worker_refs.insert(worker_name, worker);
-                }
-                Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
-            }
-        }
+            let ctx = ctx.clone();
+            async move { ctx.spawn_agent(config).await.map(|worker| (worker_name, worker)) }
+        }))
+        .await
+        {
+            Ok(workers) => workers.into_iter().collect::<BTreeMap<_, _>>(),
+            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+        };
 
         let worker_refs = Arc::new(worker_refs);
         let chat_history = Arc::new(Mutex::new(Vec::<HistoryEntry>::new()));
@@ -141,7 +142,10 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
             &worker_names,
         ));
 
-        let manager = match ctx.spawn_manager(manager_config, choose_speaker).await {
+        let manager = match ctx
+            .spawn_manager(manager_config, choose_speaker, None)
+            .await
+        {
             Ok(manager) => manager,
             Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
         };

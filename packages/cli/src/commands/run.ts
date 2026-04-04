@@ -1,7 +1,11 @@
 import { Command } from 'commander';
 import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
 import type { SwarmConfig } from '@animaOS-SWARM/sdk';
-import { getErrorMessage } from './utils.js';
+import {
+  DAEMON_PROVIDER_HELP,
+  getErrorMessage,
+  resolveDaemonModelSettings,
+} from './utils.js';
 
 export interface RunOptions {
   model: string;
@@ -17,15 +21,6 @@ export async function executeRunCommand(
   opts: RunOptions,
   client: CliDaemonClient = createCliDaemonClient()
 ): Promise<void> {
-  if (opts.apiKey) {
-    console.error(
-      'Error:',
-      '--api-key is not supported by the daemon-backed run command. Configure credentials in the daemon environment.'
-    );
-    process.exitCode = 1;
-    return;
-  }
-
   if (opts.tui) {
     console.log(
       'TUI mode is not available for daemon-backed runs yet. Falling back to plain text.\n'
@@ -54,6 +49,7 @@ async function runSingleAgent(
     model: opts.model,
     provider: opts.provider,
     system: 'You are a helpful task agent. Use tools when needed. Be concise.',
+    settings: resolveDaemonModelSettings(opts.provider, opts.apiKey),
   });
   const execution = await client.agents.run(agent.state.id, { text: task });
 
@@ -110,6 +106,8 @@ async function runSwarm(
 }
 
 function buildRunSwarmConfig(opts: RunOptions): SwarmConfig {
+  const settings = resolveDaemonModelSettings(opts.provider, opts.apiKey);
+
   return {
     strategy: opts.strategy!,
     manager: {
@@ -118,6 +116,7 @@ function buildRunSwarmConfig(opts: RunOptions): SwarmConfig {
       provider: opts.provider,
       system:
         'You are a task manager. Break complex tasks into subtasks and delegate to workers. Synthesize results into a final answer.',
+      settings,
     },
     workers: [
       {
@@ -126,6 +125,7 @@ function buildRunSwarmConfig(opts: RunOptions): SwarmConfig {
         provider: opts.provider,
         system:
           'You are a helpful worker agent. Complete the assigned task concisely and accurately.',
+        settings,
       },
     ],
   };
@@ -135,19 +135,12 @@ export const runCommand = new Command('run')
   .description('Run an agent or swarm with a task')
   .argument('<task>', 'The task to execute')
   .option('-m, --model <model>', 'Model to use', 'gpt-4o-mini')
-  .option(
-    '-p, --provider <provider>',
-    'Provider: openai, anthropic, ollama',
-    'openai'
-  )
+  .option('-p, --provider <provider>', DAEMON_PROVIDER_HELP, 'openai')
   .option('-n, --name <name>', 'Agent name (single-agent mode)', 'task-agent')
   .option(
     '-s, --strategy <strategy>',
     'Swarm strategy: supervisor, dynamic, round-robin'
   )
-  .option(
-    '--api-key <key>',
-    'API key override (unsupported with daemon-backed execution)'
-  )
+  .option('--api-key <key>', 'API key override')
   .option('--no-tui', 'Disable TUI, use plain text output')
   .action((task: string, opts: RunOptions) => executeRunCommand(task, opts));

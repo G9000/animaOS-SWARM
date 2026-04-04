@@ -261,6 +261,7 @@ fn parse_swarm_config(object: &BTreeMap<String, JsonValue>) -> Result<SwarmConfi
         manager,
         workers,
         max_concurrent_agents: optional_usize(object.get("maxConcurrentAgents"))?,
+        max_parallel_delegations: optional_usize(object.get("maxParallelDelegations"))?,
         max_turns: optional_usize(object.get("maxTurns"))?,
         token_budget: optional_u64(object.get("tokenBudget"))?,
     })

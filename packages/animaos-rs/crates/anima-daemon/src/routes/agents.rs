@@ -254,11 +254,12 @@ fn settings_json(settings: Option<&AgentSettings>) -> String {
         fields.push(format!("\"maxRetries\":{value}"));
     }
     for (key, value) in &settings.additional {
-        fields.push(format!(
-            "\"{}\":{}",
-            escape_json(key),
+        let value_json = if key.eq_ignore_ascii_case("apiKey") {
+            "\"[redacted]\"".to_string()
+        } else {
             data_value_json(value)
-        ));
+        };
+        fields.push(format!("\"{}\":{}", escape_json(key), value_json));
     }
 
     format!("{{{}}}", fields.join(","))

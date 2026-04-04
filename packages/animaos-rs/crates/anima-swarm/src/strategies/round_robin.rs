@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use anima_core::{Content, DataValue, TaskResult, TaskStatus};
+use futures::future::try_join_all;
 
 use crate::coordinator::CoordinatorAgentRef;
 use crate::coordinator::{CoordinatorDispatchContext, CoordinatorFuture};
@@ -23,18 +24,21 @@ pub fn round_robin_strategy(
             .chain(ctx.worker_configs().iter().cloned())
             .collect::<Vec<_>>();
 
-        let mut agents = Vec::with_capacity(all_configs.len());
-        for config in all_configs {
-            let agent = match ctx.spawn_agent(config.clone()).await {
-                Ok(agent) => agent,
-                Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
-            };
-
-            agents.push(RoundRobinAgent {
-                name: config.name,
-                agent,
-            });
-        }
+        let agents = match try_join_all(all_configs.into_iter().map(|config| {
+            let agent_name = config.name.clone();
+            let ctx = ctx.clone();
+            async move {
+                ctx.spawn_agent(config).await.map(|agent| RoundRobinAgent {
+                    name: agent_name,
+                    agent,
+                })
+            }
+        }))
+        .await
+        {
+            Ok(agents) => agents,
+            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+        };
 
         let mut history = Vec::new();
         let mut last_result = None;

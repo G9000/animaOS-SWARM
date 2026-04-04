@@ -4,6 +4,7 @@ mod events;
 mod json;
 mod model;
 mod routes;
+mod runtime_model;
 mod state;
 mod tools;
 

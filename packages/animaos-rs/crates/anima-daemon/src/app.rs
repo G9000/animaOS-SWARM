@@ -6,6 +6,7 @@ use tokio::net::TcpListener;
 
 use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::routes;
+use crate::runtime_model::RuntimeModelAdapter;
 use crate::state::DaemonState;
 
 pub(crate) type SharedDaemonState = Arc<Mutex<DaemonState>>;
@@ -43,7 +44,10 @@ pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()
     let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
     serve_with_state(
         listener,
-        Arc::new(Mutex::new(DaemonState::with_events(event_fanout))),
+        Arc::new(Mutex::new(DaemonState::with_model_adapter_and_events(
+            Arc::new(RuntimeModelAdapter::from_env()),
+            event_fanout,
+        ))),
         config,
     )
     .await

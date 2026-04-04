@@ -106,9 +106,9 @@ describe('launch event bridge', () => {
     await relayLaunchSwarmEvent(bus, agents, {
       event: 'swarm:created',
       data: {
-        swarmId: 'swarm-1',
+        swarmId: 'swarm-1' as any,
         state: {
-          id: 'swarm-1',
+          id: 'swarm-1' as any,
           status: 'idle',
           agentIds: [],
           results: [],
@@ -117,8 +117,8 @@ describe('launch event bridge', () => {
             completionTokens: 0,
             totalTokens: 0,
           },
-          startedAt: null,
-          completedAt: null,
+          startedAt: undefined,
+          completedAt: undefined,
         },
         result: null,
       },
@@ -127,9 +127,9 @@ describe('launch event bridge', () => {
     await relayLaunchSwarmEvent(bus, agents, {
       event: 'swarm:running',
       data: {
-        swarmId: 'swarm-1',
+        swarmId: 'swarm-1' as any,
         state: {
-          id: 'swarm-1',
+          id: 'swarm-1' as any,
           status: 'running',
           agentIds: [],
           results: [],
@@ -138,8 +138,8 @@ describe('launch event bridge', () => {
             completionTokens: 0,
             totalTokens: 5,
           },
-          startedAt: null,
-          completedAt: null,
+          startedAt: undefined,
+          completedAt: undefined,
         },
         result: null,
       },
@@ -171,9 +171,9 @@ describe('launch event bridge', () => {
     await relayLaunchSwarmEvent(bus, agents, {
       event: 'swarm:completed',
       data: {
-        swarmId: 'swarm-1',
+        swarmId: 'swarm-1' as any,
         state: {
-          id: 'swarm-1',
+          id: 'swarm-1' as any,
           status: 'idle',
           agentIds: [],
           results: [],
@@ -182,8 +182,8 @@ describe('launch event bridge', () => {
             completionTokens: 0,
             totalTokens: 5,
           },
-          startedAt: null,
-          completedAt: null,
+          startedAt: undefined,
+          completedAt: undefined,
         },
         result: {
           status: 'success',

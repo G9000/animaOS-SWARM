@@ -1,9 +1,14 @@
 import { Command } from 'commander';
 import { createInterface, type Interface } from 'node:readline';
 import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
-import { getErrorMessage } from './utils.js';
+import {
+  DAEMON_PROVIDER_HELP,
+  getErrorMessage,
+  resolveDaemonModelSettings,
+} from './utils.js';
 
 export interface ChatOptions {
+  provider?: string;
   model: string;
   name: string;
   apiKey?: string;
@@ -18,14 +23,7 @@ export async function executeChatCommand(
   opts: ChatOptions,
   deps: ChatDeps = {}
 ): Promise<void> {
-  if (opts.apiKey) {
-    console.error(
-      'Error:',
-      '--api-key is not supported by the daemon-backed chat command. Configure credentials in the daemon environment.'
-    );
-    process.exitCode = 1;
-    return;
-  }
+  const provider = opts.provider?.trim() || 'openai';
 
   let client: Pick<CliDaemonClient, 'agents'>;
   let agent: Awaited<
@@ -37,8 +35,10 @@ export async function executeChatCommand(
     agent = await client.agents.create({
       name: opts.name,
       model: opts.model,
+      provider,
       system:
         'You are a helpful task agent. Use tools when needed. Be concise.',
+      settings: resolveDaemonModelSettings(provider, opts.apiKey),
     });
   } catch (error) {
     console.error('Error:', getErrorMessage(error));
@@ -97,10 +97,8 @@ export async function executeChatCommand(
 
 export const chatCommand = new Command('chat')
   .description('Interactive chat with an agent')
+  .option('-p, --provider <provider>', DAEMON_PROVIDER_HELP, 'openai')
   .option('-m, --model <model>', 'Model to use', 'gpt-4o-mini')
   .option('-n, --name <name>', 'Agent name', 'task-agent')
-  .option(
-    '--api-key <key>',
-    'API key override (unsupported with daemon-backed execution)'
-  )
+  .option('--api-key <key>', 'API key override')
   .action((opts: ChatOptions) => executeChatCommand(opts));

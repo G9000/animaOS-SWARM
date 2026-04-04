@@ -26,6 +26,7 @@ pub struct SwarmConfig {
     pub manager: AgentConfig,
     pub workers: Vec<AgentConfig>,
     pub max_concurrent_agents: Option<usize>,
+    pub max_parallel_delegations: Option<usize>,
     pub max_turns: Option<usize>,
     pub token_budget: Option<u64>,
 }
@@ -83,6 +84,12 @@ pub type SwarmFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub type SwarmAgentRunFn =
     dyn Fn(String) -> SwarmFuture<'static, TaskResult<Content>> + Send + Sync + 'static;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SwarmDelegation {
+    pub worker_name: String,
+    pub task: String,
+}
+
 pub struct SwarmAgentHandle {
     pub id: String,
     pub run: Box<SwarmAgentRunFn>,
@@ -94,6 +101,7 @@ pub struct StrategyContext<'a> {
     pub worker_configs: Vec<AgentConfig>,
     pub spawn_agent: &'a mut dyn FnMut(AgentConfig) -> SwarmFuture<'a, SwarmAgentHandle>,
     pub message_bus: &'a mut dyn SwarmMessageBus,
+    pub max_parallel_delegations: usize,
     pub max_turns: usize,
 }
 

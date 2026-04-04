@@ -258,6 +258,7 @@ impl DaemonState {
                         let token_usage = Arc::clone(&token_usage);
                         let needs_reset = Arc::clone(&needs_reset);
                         let delegate_task = context.delegate_task.clone();
+                        let delegate_tasks = context.delegate_tasks.clone();
                         let tool_context = tool_context.clone();
                         move |input: String| {
                             let runtime = Arc::clone(&runtime);
@@ -267,6 +268,7 @@ impl DaemonState {
                             let token_usage = Arc::clone(&token_usage);
                             let needs_reset = Arc::clone(&needs_reset);
                             let delegate_task = delegate_task.clone();
+                            let delegate_tasks = delegate_tasks.clone();
                             let tool_context = tool_context.clone();
                             Box::pin(async move {
                                 let mut runtime = runtime.lock().await;
@@ -286,10 +288,12 @@ impl DaemonState {
                                         },
                                         |agent, user_message, tool_call| {
                                             let delegate_task = delegate_task.clone();
+                                            let delegate_tasks = delegate_tasks.clone();
                                             let tool_context = tool_context.clone();
                                             async move {
                                                 execute_swarm_tool(
                                                     delegate_task,
+                                                    delegate_tasks,
                                                     tool_context,
                                                     agent,
                                                     user_message,
@@ -366,6 +370,7 @@ fn build_swarm_runtime(
 
 async fn execute_swarm_tool(
     delegate_task: Option<Arc<anima_swarm::coordinator::CoordinatorDelegateFn>>,
+    delegate_tasks: Option<Arc<anima_swarm::coordinator::CoordinatorBatchDelegateFn>>,
     tool_context: ToolExecutionContext,
     agent: AgentState,
     user_message: Message,
@@ -385,6 +390,20 @@ async fn execute_swarm_tool(
             };
 
             delegate_task(worker_name, task).await
+        }
+        "delegate_tasks" => {
+            let Some(delegate_tasks) = delegate_tasks else {
+                return TaskResult::error("delegate_tasks is unavailable", 0);
+            };
+
+            let Some(delegations) = delegation_args(&tool_call, "delegations") else {
+                return TaskResult::error(
+                    "delegate_tasks delegations must be a non-empty array of objects",
+                    0,
+                );
+            };
+
+            delegate_tasks(delegations).await
         }
         "choose_speaker" => {
             let Some(delegate_task) = delegate_task else {
@@ -407,4 +426,37 @@ fn string_arg(tool_call: &ToolCall, key: &str) -> Option<String> {
         Some(DataValue::String(value)) if !value.is_empty() => Some(value.clone()),
         _ => None,
     }
+}
+
+fn delegation_args(tool_call: &ToolCall, key: &str) -> Option<Vec<anima_swarm::SwarmDelegation>> {
+    let DataValue::Array(values) = tool_call.args.get(key)? else {
+        return None;
+    };
+
+    let mut delegations = Vec::with_capacity(values.len());
+    for value in values {
+        let DataValue::Object(entry) = value else {
+            return None;
+        };
+        let Some(DataValue::String(worker_name)) = entry.get("worker_name") else {
+            return None;
+        };
+        let Some(DataValue::String(task)) = entry.get("task") else {
+            return None;
+        };
+        if worker_name.is_empty() || task.is_empty() {
+            return None;
+        }
+
+        delegations.push(anima_swarm::SwarmDelegation {
+            worker_name: worker_name.clone(),
+            task: task.clone(),
+        });
+    }
+
+    if delegations.is_empty() {
+        return None;
+    }
+
+    Some(delegations)
 }

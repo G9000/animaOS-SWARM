@@ -15,7 +15,7 @@ use anima_swarm::coordinator::{
 };
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::strategies::supervisor::supervisor_strategy;
-use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmStatus, SwarmStrategy};
+use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmDelegation, SwarmStatus, SwarmStrategy};
 
 fn worker_config(name: &str) -> AgentConfig {
     AgentConfig {
@@ -44,6 +44,7 @@ fn base_config(worker_names: &[&str]) -> SwarmConfig {
             .map(|name| worker_config(name))
             .collect(),
         max_concurrent_agents: None,
+        max_parallel_delegations: None,
         max_turns: Some(4),
         token_budget: None,
     }
@@ -58,6 +59,7 @@ fn round_robin_config(worker_names: &[&str]) -> SwarmConfig {
             .map(|name| worker_config(name))
             .collect(),
         max_concurrent_agents: None,
+        max_parallel_delegations: None,
         max_turns: Some(4),
         token_budget: None,
     }
@@ -79,6 +81,7 @@ fn dynamic_config(worker_names: &[&str]) -> SwarmConfig {
             .map(|name| worker_config(name))
             .collect(),
         max_concurrent_agents: None,
+        max_parallel_delegations: None,
         max_turns: Some(4),
         token_budget: None,
     }
@@ -137,6 +140,33 @@ struct TestHarnessState {
 struct TestHarness {
     state: Arc<Mutex<TestHarnessState>>,
     tokens: Arc<Mutex<HashMap<String, TokenUsage>>>,
+}
+
+struct PendingOnce<T> {
+    value: Option<T>,
+    pending: bool,
+}
+
+impl<T> PendingOnce<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value: Some(value),
+            pending: true,
+        }
+    }
+}
+
+impl<T: Unpin> Future for PendingOnce<T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.pending {
+            self.pending = false;
+            Poll::Pending
+        } else {
+            Poll::Ready(self.value.take().expect("pending once value should exist"))
+        }
+    }
 }
 
 impl TestHarness {
@@ -528,6 +558,223 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
             .expect("manager input mutex should not be poisoned")
             .as_slice(),
         ["Research and report"]
+    );
+}
+
+#[test]
+fn supervisor_strategy_batch_delegates_workers_concurrently() {
+    let worker_events = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let worker_events = Arc::clone(&worker_events);
+
+        move |context: CoordinatorAgentFactoryContext| {
+            let worker_events = Arc::clone(&worker_events);
+
+            Box::pin(async move {
+                match context.config.name.as_str() {
+                    "worker-a" | "worker-b" => {
+                        let worker_name = context.config.name.clone();
+                        let run = Arc::new(move |input: String| {
+                            let worker_events = Arc::clone(&worker_events);
+                            let worker_name = worker_name.clone();
+                            Box::pin(async move {
+                                worker_events
+                                    .lock()
+                                    .expect("worker events mutex should not be poisoned")
+                                    .push(format!("start:{worker_name}:{input}"));
+                                PendingOnce::new(()).await;
+                                worker_events
+                                    .lock()
+                                    .expect("worker events mutex should not be poisoned")
+                                    .push(format!("end:{worker_name}:{input}"));
+
+                                TaskResult::success(
+                                    text_content(&format!("{worker_name} finished {input}")),
+                                    1,
+                                )
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    "manager" => {
+                        let delegate_tasks = context
+                            .delegate_tasks
+                            .as_ref()
+                            .expect("manager should receive delegate_tasks callback")
+                            .clone();
+
+                        let run = Arc::new(move |_input: String| {
+                            let delegate_tasks = Arc::clone(&delegate_tasks);
+                            Box::pin(async move {
+                                let result = delegate_tasks(vec![
+                                    SwarmDelegation {
+                                        worker_name: "worker-a".into(),
+                                        task: "research alpha".into(),
+                                    },
+                                    SwarmDelegation {
+                                        worker_name: "worker-b".into(),
+                                        task: "research beta".into(),
+                                    },
+                                ])
+                                .await;
+
+                                assert_eq!(result.status, TaskStatus::Success);
+                                let text = result
+                                    .data
+                                    .as_ref()
+                                    .map(|content| content.text.as_str())
+                                    .unwrap_or_default();
+                                assert!(text.contains("[worker-a] worker-a finished research alpha"));
+                                assert!(text.contains("[worker-b] worker-b finished research beta"));
+
+                                TaskResult::success(text_content("batched synthesis"), 1)
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    other => Err(format!("unexpected agent config: {other}")),
+                }
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a", "worker-b"]),
+        Arc::new(supervisor_strategy),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("Research in parallel"));
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        worker_events
+            .lock()
+            .expect("worker events mutex should not be poisoned")
+            .as_slice(),
+        [
+            "start:worker-a:research alpha",
+            "start:worker-b:research beta",
+            "end:worker-a:research alpha",
+            "end:worker-b:research beta",
+        ]
+    );
+}
+
+#[test]
+fn supervisor_strategy_batch_delegation_respects_parallel_limit() {
+    let worker_events = Arc::new(Mutex::new(Vec::<String>::new()));
+
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let worker_events = Arc::clone(&worker_events);
+
+        move |context: CoordinatorAgentFactoryContext| {
+            let worker_events = Arc::clone(&worker_events);
+
+            Box::pin(async move {
+                match context.config.name.as_str() {
+                    "worker-a" | "worker-b" => {
+                        let worker_name = context.config.name.clone();
+                        let run = Arc::new(move |input: String| {
+                            let worker_events = Arc::clone(&worker_events);
+                            let worker_name = worker_name.clone();
+                            Box::pin(async move {
+                                worker_events
+                                    .lock()
+                                    .expect("worker events mutex should not be poisoned")
+                                    .push(format!("start:{worker_name}:{input}"));
+                                PendingOnce::new(()).await;
+                                worker_events
+                                    .lock()
+                                    .expect("worker events mutex should not be poisoned")
+                                    .push(format!("end:{worker_name}:{input}"));
+
+                                TaskResult::success(text_content(&worker_name), 1)
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    "manager" => {
+                        let delegate_tasks = context
+                            .delegate_tasks
+                            .as_ref()
+                            .expect("manager should receive delegate_tasks callback")
+                            .clone();
+
+                        let run = Arc::new(move |_input: String| {
+                            let delegate_tasks = Arc::clone(&delegate_tasks);
+                            Box::pin(async move {
+                                delegate_tasks(vec![
+                                    SwarmDelegation {
+                                        worker_name: "worker-a".into(),
+                                        task: "alpha".into(),
+                                    },
+                                    SwarmDelegation {
+                                        worker_name: "worker-b".into(),
+                                        task: "beta".into(),
+                                    },
+                                ])
+                                .await
+                            })
+                                as Pin<Box<dyn Future<Output = TaskResult<Content>> + Send>>
+                        });
+
+                        Ok(CoordinatorAgentShell {
+                            run,
+                            token_usage: Arc::new(TokenUsage::default),
+                            clear_task_state: Arc::new(|| {}),
+                            stop: Arc::new(|| Box::pin(async {})),
+                        })
+                    }
+                    other => Err(format!("unexpected agent config: {other}")),
+                }
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        SwarmConfig {
+            max_parallel_delegations: Some(1),
+            ..base_config(&["worker-a", "worker-b"])
+        },
+        Arc::new(supervisor_strategy),
+        factory,
+    );
+
+    let result = block_on(coordinator.dispatch("Respect the limit"));
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        worker_events
+            .lock()
+            .expect("worker events mutex should not be poisoned")
+            .as_slice(),
+        [
+            "start:worker-a:alpha",
+            "end:worker-a:alpha",
+            "start:worker-b:beta",
+            "end:worker-b:beta",
+        ]
     );
 }
 

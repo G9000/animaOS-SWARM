@@ -60,6 +60,7 @@ fn swarm_types_keep_ts_shape_fields() {
         manager: worker_config("manager"),
         workers: vec![worker_config("worker-a"), worker_config("worker-b")],
         max_concurrent_agents: Some(2),
+        max_parallel_delegations: Some(2),
         max_turns: Some(8),
         token_budget: Some(4_096),
     };
@@ -130,6 +131,7 @@ fn strategy_context_keeps_async_spawn_agent_handle_shape() {
         worker_configs: vec![worker_config("worker-a")],
         spawn_agent: &mut spawn_agent,
         message_bus: &mut bus,
+        max_parallel_delegations: 2,
         max_turns: 6,
     };
 

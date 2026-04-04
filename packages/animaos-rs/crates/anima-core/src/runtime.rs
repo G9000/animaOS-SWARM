@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::future::join_all;
+
 use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage};
 use crate::components::{Evaluator, Provider};
 use crate::events::{EngineEvent, EventType};
@@ -150,10 +152,10 @@ impl AgentRuntime {
     pub async fn run_with_tools<F, Fut>(
         &mut self,
         input: Content,
-        mut execute_tool: F,
+        execute_tool: F,
     ) -> TaskResult<Content>
     where
-        F: FnMut(AgentState, Message, ToolCall) -> Fut,
+        F: Fn(AgentState, Message, ToolCall) -> Fut,
         Fut: Future<Output = TaskResult<Content>>,
     {
         let start = now_millis();
@@ -259,19 +261,27 @@ impl AgentRuntime {
                             );
                             conversation.push(assistant_message);
 
-                            for tool_call in tool_calls {
+                            for tool_call in &tool_calls {
                                 self.record_event(
                                     EventType::ToolBefore,
                                     tool_event_data(&tool_call.name, "running", 0),
                                 );
+                            }
+
+                            let tool_results = join_all(tool_calls.iter().cloned().map(|tool_call| {
                                 let tool_started = now_millis();
-                                let tool_result = execute_tool(
-                                    self.state.clone(),
-                                    user_message.clone(),
-                                    tool_call.clone(),
-                                )
-                                .await;
-                                let tool_duration = now_millis().saturating_sub(tool_started);
+                                let state = self.state.clone();
+                                let user_message = user_message.clone();
+                                let future = execute_tool(state, user_message, tool_call.clone());
+                                async move {
+                                    let tool_result = future.await;
+                                    let tool_duration = now_millis().saturating_sub(tool_started);
+                                    (tool_call, tool_result, tool_duration)
+                                }
+                            }))
+                            .await;
+
+                            for (tool_call, tool_result, tool_duration) in tool_results {
                                 self.record_event(
                                     EventType::ToolAfter,
                                     tool_event_data(
@@ -643,6 +653,7 @@ mod tests {
 
     struct StaticModelAdapter;
     struct ToolCallingModelAdapter;
+    struct MultiToolCallingModelAdapter;
     struct ContextAwareModelAdapter;
     struct AsyncBoundaryModelAdapter;
 
@@ -758,6 +769,77 @@ mod tests {
                     name: "memory_search".into(),
                     args,
                 }]),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for MultiToolCallingModelAdapter {
+        fn provider(&self) -> &str {
+            "multi-tool-calling"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let tool_result = trailing_tool_messages(&request.messages)
+                .into_iter()
+                .map(render_tool_result_for_model)
+                .collect::<Vec<_>>();
+
+            if tool_result.len() >= 2 {
+                return Ok(ModelGenerateResponse {
+                    content: Content {
+                        text: format!(
+                            "{} used tool result: {}",
+                            config.name,
+                            tool_result.join("\n")
+                        ),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    tool_calls: None,
+                    usage: TokenUsage {
+                        prompt_tokens: 4,
+                        completion_tokens: 3,
+                        total_tokens: 7,
+                    },
+                    stop_reason: ModelStopReason::End,
+                });
+            }
+
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: "delegate both tasks".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "tool-1".into(),
+                        name: "memory_search".into(),
+                        args: BTreeMap::from([(
+                            "query".into(),
+                            DataValue::String("alpha".into()),
+                        )]),
+                    },
+                    ToolCall {
+                        id: "tool-2".into(),
+                        name: "memory_search".into(),
+                        args: BTreeMap::from([(
+                            "query".into(),
+                            DataValue::String("beta".into()),
+                        )]),
+                    },
+                ]),
+                usage: TokenUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                },
+                stop_reason: ModelStopReason::ToolCall,
             })
         }
     }
@@ -1468,6 +1550,55 @@ mod tests {
         assert_eq!(
             result.data.as_ref().map(|content| content.text.as_str()),
             Some("researcher used tool result: researcher:search memory:memory_search")
+        );
+    }
+
+    #[test]
+    fn runtime_run_executes_multiple_tool_calls_concurrently() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime =
+            AgentRuntime::new(tool_config(), Arc::new(MultiToolCallingModelAdapter));
+        runtime.init();
+
+        let result = block_on(runtime.run_with_tools(
+            Content {
+                text: "search memory twice".into(),
+                ..Content::default()
+            },
+            {
+                let order = Arc::clone(&order);
+                move |_, _, tool_call| {
+                    let order = Arc::clone(&order);
+                    async move {
+                        order
+                            .lock()
+                            .expect("tool order mutex should not be poisoned")
+                            .push(format!("start:{}", tool_call.id));
+                        PendingOnce::new(()).await;
+                        order
+                            .lock()
+                            .expect("tool order mutex should not be poisoned")
+                            .push(format!("end:{}", tool_call.id));
+
+                        TaskResult::success(
+                            Content {
+                                text: format!("{} hit", tool_call.id),
+                                ..Content::default()
+                            },
+                            1,
+                        )
+                    }
+                }
+            },
+        ));
+
+        assert_eq!(result.status, TaskStatus::Success);
+        assert_eq!(
+            order
+                .lock()
+                .expect("tool order mutex should not be poisoned")
+                .as_slice(),
+            ["start:tool-1", "start:tool-2", "end:tool-1", "end:tool-2"]
         );
     }
 }

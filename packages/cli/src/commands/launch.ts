@@ -15,7 +15,11 @@ import {
   launchDisplayAgents,
   relayLaunchSwarmEvent,
 } from './launch-events.js';
-import { extractResultText, getErrorMessage } from './utils.js';
+import {
+  extractResultText,
+  getErrorMessage,
+  resolveDaemonModelSettings,
+} from './utils.js';
 
 export interface LaunchOptions {
   dir: string;
@@ -25,7 +29,10 @@ export interface LaunchOptions {
 
 interface DaemonTuiRuntime {
   eventBus: IEventBus;
-  render: (element: any) => { unmount: () => void };
+  render: (element: any) => {
+    unmount: () => void;
+    waitUntilExit: () => Promise<unknown>;
+  };
   createElement: (
     component: unknown,
     props: Record<string, unknown>
@@ -75,16 +82,30 @@ const DAEMON_TOOL_ALIASES = new Map<string, string>([
   ['memory_recent', 'recent_memories'],
 ]);
 
+function daemonObjectToolParameters(
+  properties: Record<string, unknown>,
+  required: string[] = []
+): Record<string, unknown> {
+  return {
+    type: 'object',
+    properties,
+    ...(required.length > 0 ? { required } : {}),
+  };
+}
+
 const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
   [
     'memory_search',
     {
       name: 'memory_search',
       description: 'Search agent memory for relevant facts and prior work.',
-      parameters: {
-        query: { type: 'string' },
-        limit: { type: 'number' },
-      },
+      parameters: daemonObjectToolParameters(
+        {
+          query: { type: 'string' },
+          limit: { type: 'number' },
+        },
+        ['query']
+      ),
     },
   ],
   [
@@ -92,11 +113,14 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
     {
       name: 'memory_add',
       description: 'Store a new memory entry for the current agent.',
-      parameters: {
-        content: { type: 'string' },
-        type: { type: 'string' },
-        importance: { type: 'number' },
-      },
+      parameters: daemonObjectToolParameters(
+        {
+          content: { type: 'string' },
+          type: { type: 'string' },
+          importance: { type: 'number' },
+        },
+        ['content']
+      ),
     },
   ],
   [
@@ -104,9 +128,9 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
     {
       name: 'recent_memories',
       description: "List the current agent's recent memories.",
-      parameters: {
+      parameters: daemonObjectToolParameters({
         limit: { type: 'number' },
-      },
+      }),
     },
   ],
 ]);
@@ -160,12 +184,13 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
 
 function createDaemonSwarmSession(
   client: Pick<CliDaemonClient, 'swarms'>,
-  agency: AgencyConfig
+  agency: AgencyConfig,
+  opts: Pick<LaunchOptions, 'apiKey'>
 ): {
   getSwarm: () => Promise<DaemonSwarmSnapshot>;
   invalidate: () => void;
 } {
-  let swarmConfig = buildDaemonSwarmConfig(agency);
+  let swarmConfig = buildDaemonSwarmConfig(agency, opts);
   let swarmPromise: Promise<DaemonSwarmSnapshot> | undefined;
 
   return {
@@ -182,7 +207,7 @@ function createDaemonSwarmSession(
       return swarmPromise;
     },
     invalidate() {
-      swarmConfig = buildDaemonSwarmConfig(agency);
+      swarmConfig = buildDaemonSwarmConfig(agency, opts);
       swarmPromise = undefined;
     },
   };
@@ -191,7 +216,8 @@ function createDaemonSwarmSession(
 function agentDefToDaemonConfig(
   agent: AgentDefinition,
   defaultModel: string,
-  provider: string
+  provider: string,
+  settings?: AgentConfig['settings']
 ): DaemonAgentConfig {
   return {
     name: agent.name,
@@ -206,6 +232,7 @@ function agentDefToDaemonConfig(
     system: agent.system,
     tools: daemonToolsForAgent(agent),
     plugins: [DAEMON_MEMORY_PLUGIN],
+    settings,
   };
 }
 
@@ -216,16 +243,25 @@ function saveAgency(dir: string, agency: AgencyConfig) {
   );
 }
 
-function buildDaemonSwarmConfig(agency: AgencyConfig): DaemonSwarmConfig {
+function buildDaemonSwarmConfig(
+  agency: AgencyConfig,
+  opts: Pick<LaunchOptions, 'apiKey'>
+): DaemonSwarmConfig {
+  const settings = resolveDaemonModelSettings(agency.provider, opts.apiKey);
+
   return {
     strategy: agency.strategy,
+    ...(agency.maxParallelDelegations
+      ? { maxParallelDelegations: agency.maxParallelDelegations }
+      : {}),
     manager: agentDefToDaemonConfig(
       agency.orchestrator,
       agency.model,
-      agency.provider
+      agency.provider,
+      settings
     ),
     workers: agency.agents.map((agent) =>
-      agentDefToDaemonConfig(agent, agency.model, agency.provider)
+      agentDefToDaemonConfig(agent, agency.model, agency.provider, settings)
     ),
   };
 }
@@ -278,18 +314,9 @@ async function executeDaemonLaunchCommand(
   agency: AgencyConfig,
   deps: LaunchDeps
 ): Promise<void> {
-  if (opts.apiKey) {
-    console.error(
-      'Error:',
-      '--api-key is not supported by daemon-backed launch in plain-text mode. Configure credentials in the daemon environment.'
-    );
-    process.exitCode = 1;
-    return;
-  }
-
   try {
     const client = deps.client ?? createCliDaemonClient();
-    const swarmSession = createDaemonSwarmSession(client, agency);
+    const swarmSession = createDaemonSwarmSession(client, agency, opts);
 
     if (!task) {
       const { createInterface } = await import('node:readline');
@@ -355,18 +382,9 @@ async function executeDaemonTuiLaunchCommand(
   agency: AgencyConfig,
   deps: LaunchDeps
 ): Promise<void> {
-  if (opts.apiKey) {
-    console.error(
-      'Error:',
-      '--api-key is not supported by daemon-backed launch in TUI mode. Configure credentials in the daemon environment.'
-    );
-    process.exitCode = 1;
-    return;
-  }
-
   try {
     const client = deps.client ?? createCliDaemonClient();
-    const swarmSession = createDaemonSwarmSession(client, agency);
+    const swarmSession = createDaemonSwarmSession(client, agency, opts);
     const tuiRuntime = deps.createDaemonTuiRuntime
       ? await deps.createDaemonTuiRuntime()
       : await loadDaemonTuiRuntime();
@@ -499,12 +517,12 @@ async function executeDaemonTuiLaunchCommand(
     const instance = tuiRuntime.render(element);
 
     const result = await runTask(task);
-    await sleep(500);
-    instance.unmount();
 
     if (result.status === 'error') {
       process.exitCode = 1;
     }
+
+    await instance.waitUntilExit();
   } catch (error) {
     console.error('Error:', getErrorMessage(error));
     process.exitCode = 1;

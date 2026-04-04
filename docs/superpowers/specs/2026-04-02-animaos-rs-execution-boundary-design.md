@@ -28,16 +28,31 @@ The target architecture is:
 
 The current TypeScript implementation remains the reference until Rust parity is proven.
 
+## Implementation Status (2026-04-03)
+
+The repository is already much closer to the target state than the original migration framing implied.
+
+Implemented today:
+
+- the Rust workspace passes `cargo test --manifest-path packages/animaos-rs/Cargo.toml`
+- Rust owns the core runtime, swarm coordination, and daemon HTTP/SSE boundary in the current repo implementation
+- the SDK is already a daemon-client layer
+- CLI `run`, `chat`, `agents`, and `launch` use the daemon path by default on this branch
+- `launch` is now daemon-only on this branch; the embedded TypeScript fallback has been removed
+- `launch` TUI consumes daemon swarm SSE through a TypeScript event-bus bridge instead of an in-process runtime loop
+
+That means the remaining migration risk is no longer the core Rust port. It is daemon-path hardening: soak testing, parity checks, and filling any remaining daemon-side tool or provider gaps.
+
 ---
 
 ## Crate Responsibilities
 
-| Crate | Responsibility | Know about HTTP? | Know about async? |
-|---|---|---:|---:|
-| `anima-core` | `AgentRuntime`, types, contracts, task loop, events | No | Yes, at interfaces only |
-| `anima-swarm` | Coordinator, strategies, worker pool, message bus, dispatch queue, timeouts | No | Yes, `tokio` |
-| `anima-daemon` | HTTP/SSE boundary, registries, wires core + swarm | Yes | Yes, `tokio` + `axum` |
-| TypeScript SDK/CLI | HTTP client, plugin registration, config builders | Yes | Yes, `async/await` |
+| Crate              | Responsibility                                                              | Know about HTTP? |       Know about async? |
+| ------------------ | --------------------------------------------------------------------------- | ---------------: | ----------------------: |
+| `anima-core`       | `AgentRuntime`, types, contracts, task loop, events                         |               No | Yes, at interfaces only |
+| `anima-swarm`      | Coordinator, strategies, worker pool, message bus, dispatch queue, timeouts |               No |            Yes, `tokio` |
+| `anima-daemon`     | HTTP/SSE boundary, registries, wires core + swarm                           |              Yes |   Yes, `tokio` + `axum` |
+| TypeScript SDK/CLI | HTTP client, plugin registration, config builders                           |              Yes |      Yes, `async/await` |
 
 ### `anima-core`
 
@@ -92,12 +107,12 @@ TypeScript continues to own ecosystem reach:
 - config builders
 - external app integrations
 
-The TypeScript layer should become a thin client to the daemon:
+The TypeScript layer should be a thin client to the daemon:
 
 - HTTP for control-plane requests
 - SSE for lifecycle and event streaming
 
-TypeScript should stop embedding engine execution once Rust parity is proven.
+TypeScript should not embed engine execution.
 
 ---
 

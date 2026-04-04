@@ -5,11 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
 
 use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
 
 use crate::strategies::resolve_strategy;
+use crate::types::SwarmDelegation;
 use crate::{MessageBus, SwarmConfig, SwarmState, SwarmStatus};
 
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(0);
@@ -29,6 +31,9 @@ pub type CoordinatorBroadcastFn =
 pub type CoordinatorDelegateFn =
     dyn Fn(String, String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
 
+pub type CoordinatorBatchDelegateFn =
+    dyn Fn(Vec<SwarmDelegation>) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
+
 pub type CoordinatorAgentFactoryFn = dyn Fn(CoordinatorAgentFactoryContext) -> CoordinatorFuture<Result<CoordinatorAgentShell, String>>
     + Send
     + Sync;
@@ -40,6 +45,7 @@ pub struct CoordinatorAgentFactoryContext {
     pub send: Arc<CoordinatorSendFn>,
     pub broadcast: Arc<CoordinatorBroadcastFn>,
     pub delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+    pub delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
 }
 
 #[derive(Clone)]
@@ -95,12 +101,14 @@ pub struct CoordinatorDispatchContext {
     task: String,
     manager_config: AgentConfig,
     worker_configs: Vec<AgentConfig>,
+    max_parallel_delegations: usize,
     max_turns: usize,
     message_bus: Arc<Mutex<MessageBus>>,
     spawn_agent: Arc<
         dyn Fn(
                 AgentConfig,
                 Option<Arc<CoordinatorDelegateFn>>,
+                Option<Arc<CoordinatorBatchDelegateFn>>,
             ) -> CoordinatorFuture<Result<CoordinatorAgentRef, String>>
             + Send
             + Sync,
@@ -112,12 +120,14 @@ impl CoordinatorDispatchContext {
         task: String,
         manager_config: AgentConfig,
         worker_configs: Vec<AgentConfig>,
+        max_parallel_delegations: usize,
         max_turns: usize,
         message_bus: Arc<Mutex<MessageBus>>,
         spawn_agent: Arc<
             dyn Fn(
                     AgentConfig,
                     Option<Arc<CoordinatorDelegateFn>>,
+                    Option<Arc<CoordinatorBatchDelegateFn>>,
                 ) -> CoordinatorFuture<Result<CoordinatorAgentRef, String>>
                 + Send
                 + Sync,
@@ -127,6 +137,7 @@ impl CoordinatorDispatchContext {
             task,
             manager_config,
             worker_configs,
+            max_parallel_delegations,
             max_turns,
             message_bus,
             spawn_agent,
@@ -149,20 +160,25 @@ impl CoordinatorDispatchContext {
         self.max_turns
     }
 
+    pub fn max_parallel_delegations(&self) -> usize {
+        self.max_parallel_delegations
+    }
+
     pub fn message_bus(&self) -> Arc<Mutex<MessageBus>> {
         self.message_bus.clone()
     }
 
     pub async fn spawn_agent(&self, config: AgentConfig) -> Result<CoordinatorAgentRef, String> {
-        (self.spawn_agent)(config, None).await
+        (self.spawn_agent)(config, None, None).await
     }
 
     pub async fn spawn_manager(
         &self,
         config: AgentConfig,
         delegate_task: Arc<CoordinatorDelegateFn>,
+        delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
     ) -> Result<CoordinatorAgentRef, String> {
-        (self.spawn_agent)(config, Some(delegate_task)).await
+        (self.spawn_agent)(config, Some(delegate_task), delegate_tasks).await
     }
 }
 
@@ -256,27 +272,51 @@ impl SwarmCoordinator {
 
     pub async fn start(&self) -> Result<(), String> {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
-        let mut created_workers = Vec::new();
+        let pending_configs = self
+            .inner
+            .config
+            .workers
+            .clone()
+            .into_iter()
+            .filter(|config| self.get_pool_agent(&config.name).is_none())
+            .collect::<Vec<_>>();
 
-        for config in self.inner.config.workers.clone() {
-            if let Some(agent) = self.get_pool_agent(&config.name) {
-                let _ = agent;
-                continue;
+        let start_results = join_all(pending_configs.into_iter().map(|config| {
+            let coordinator = self.clone();
+            async move {
+                let worker_name = config.name.clone();
+                coordinator
+                    .spawn_new_agent(config, None, None)
+                    .await
+                    .map(|agent| (worker_name, agent.id))
             }
+        }))
+        .await;
 
-            match self.spawn_new_agent(config.clone(), None).await {
-                Ok(agent) => {
-                    self.inner
-                        .pool
-                        .lock()
-                        .expect("coordinator pool mutex should not be poisoned")
-                        .insert(config.name.clone(), agent.id.clone());
-                    created_workers.push((config.name, agent.id));
-                }
-                Err(error) => {
-                    self.rollback_started_workers(&created_workers).await;
-                    return Err(error);
-                }
+        let mut created_workers = Vec::new();
+        let mut first_error = None;
+
+        for result in start_results {
+            match result {
+                Ok(worker) => created_workers.push(worker),
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+
+        if let Some(error) = first_error {
+            self.rollback_started_workers(&created_workers).await;
+            return Err(error);
+        }
+
+        {
+            let mut pool = self
+                .inner
+                .pool
+                .lock()
+                .expect("coordinator pool mutex should not be poisoned");
+            for (worker_name, agent_id) in &created_workers {
+                pool.insert(worker_name.clone(), agent_id.clone());
             }
         }
 
@@ -385,15 +425,24 @@ impl SwarmCoordinator {
 
         let spawn_coordinator = self.clone();
         let spawn_agent = Arc::new(
-            move |config: AgentConfig, delegate_task: Option<Arc<CoordinatorDelegateFn>>| {
+            move |
+                config: AgentConfig,
+                delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+                delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
+            | {
                 let spawn_coordinator = spawn_coordinator.clone();
                 Box::pin(async move {
                     spawn_coordinator
-                        .spawn_for_dispatch(config, delegate_task)
+                        .spawn_for_dispatch(config, delegate_task, delegate_tasks)
                         .await
                 }) as CoordinatorFuture<Result<CoordinatorAgentRef, String>>
             },
         );
+        let max_parallel_delegations = self
+            .inner
+            .config
+            .max_parallel_delegations
+            .unwrap_or_else(|| self.inner.config.workers.len().max(1));
         let max_turns = self
             .inner
             .config
@@ -403,6 +452,7 @@ impl SwarmCoordinator {
             task,
             self.inner.config.manager.clone(),
             self.inner.config.workers.clone(),
+            max_parallel_delegations,
             max_turns,
             self.inner.message_bus.clone(),
             spawn_agent,
@@ -439,23 +489,28 @@ impl SwarmCoordinator {
         &self,
         config: AgentConfig,
         delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+        delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
     ) -> Result<CoordinatorAgentRef, String> {
         if let Some(agent) = self.get_pool_agent(&config.name) {
             return Ok(agent);
         }
 
-        self.spawn_new_agent(config, delegate_task).await
+        self.spawn_new_agent(config, delegate_task, delegate_tasks).await
     }
 
     async fn spawn_new_agent(
         &self,
         config: AgentConfig,
         delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+        delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
     ) -> Result<CoordinatorAgentRef, String> {
         let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
         let liveness = Arc::new(CoordinatorAgentLiveness::default());
         let delegate_task = delegate_task.map(|delegate_task| {
             self.build_delegate_hook(&agent_id, liveness.clone(), delegate_task)
+        });
+        let delegate_tasks = delegate_tasks.map(|delegate_tasks| {
+            self.build_batch_delegate_hook(&agent_id, liveness.clone(), delegate_tasks)
         });
         self.reserve_agent_slot(&agent_id)?;
         let shell = (self.inner.agent_factory)(CoordinatorAgentFactoryContext {
@@ -464,6 +519,7 @@ impl SwarmCoordinator {
             send: self.build_send_hook(&agent_id, liveness.clone()),
             broadcast: self.build_broadcast_hook(&agent_id, liveness.clone()),
             delegate_task,
+            delegate_tasks,
         })
         .await
         .inspect_err(|_| self.release_agent_slot(&agent_id))?;
@@ -822,6 +878,27 @@ impl SwarmCoordinator {
             })
         })
     }
+
+    fn build_batch_delegate_hook(
+        &self,
+        from_agent_id: &str,
+        liveness: Arc<CoordinatorAgentLiveness>,
+        delegate_tasks: Arc<CoordinatorBatchDelegateFn>,
+    ) -> Arc<CoordinatorBatchDelegateFn> {
+        let from_agent_id = from_agent_id.to_string();
+        Arc::new(move |delegations: Vec<SwarmDelegation>| {
+            let liveness = liveness.clone();
+            let from_agent_id = from_agent_id.clone();
+            let delegate_tasks = delegate_tasks.clone();
+            Box::pin(async move {
+                if !liveness.is_active() {
+                    return TaskResult::error(inactive_agent_error(&from_agent_id), 0);
+                }
+
+                delegate_tasks(delegations).await
+            })
+        })
+    }
 }
 
 fn default_swarm_config() -> SwarmConfig {
@@ -844,6 +921,7 @@ fn default_swarm_config() -> SwarmConfig {
         },
         workers: Vec::new(),
         max_concurrent_agents: None,
+        max_parallel_delegations: None,
         max_turns: None,
         token_budget: None,
     }
