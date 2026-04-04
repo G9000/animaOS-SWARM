@@ -6,7 +6,9 @@
   "scripts": {
     "build:cli-sdk": "tsc -b packages/sdk/tsconfig.lib.json packages/cli/tsconfig.lib.json",
     "daemon": "cargo run --manifest-path packages/animaos-rs/Cargo.toml -p anima-daemon",
-    "animaos": "node packages/cli/dist/index.js"
+    "animaos": "node packages/cli/dist/index.js",
+    "lint": "oxlint --config .oxlintrc.json packages/*/src apps/*/src",
+    "lint:fix": "oxlint --fix --config .oxlintrc.json packages/*/src apps/*/src"
   },
   "private": true,
   "dependencies": {
@@ -37,6 +39,7 @@
     "jiti": "2.4.2",
     "jsdom": "~22.1.0",
     "nx": "22.6.2",
+    "oxlint": "^1.58.0",
     "prettier": "^2.6.2",
     "tslib": "^2.3.0",
     "typescript": "~5.9.2",

@@ -4,7 +4,7 @@ import { agent, createDaemonClient, swarm } from './index.js';
 
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(
   globalThis,
-  'fetch',
+  'fetch'
 );
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
@@ -12,7 +12,7 @@ function jsonResponse(body: unknown, init?: ResponseInit): Response {
     status: init?.status ?? 200,
     headers: {
       'content-type': 'application/json',
-      ...(init?.headers ?? {}),
+      ...init?.headers,
     },
   });
 }
@@ -33,7 +33,7 @@ function sseResponse(messages: string[]): Response {
       headers: {
         'content-type': 'text/event-stream',
       },
-    },
+    }
   );
 }
 
@@ -74,8 +74,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               lastTask: null,
             },
           },
-          { status: 201 },
-        ),
+          { status: 201 }
+        )
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -102,7 +102,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             },
             durationMs: 12,
           },
-        }),
+        })
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test/' });
@@ -110,7 +110,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
       agent({
         name: 'researcher',
         model: 'gpt-5.4',
-      }),
+      })
     );
     const runResult = await client.agents.run('agent-1', {
       text: 'Find the answer',
@@ -141,7 +141,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           name: 'researcher',
           model: 'gpt-5.4',
         }),
-      }),
+      })
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -151,7 +151,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         body: JSON.stringify({
           text: 'Find the answer',
         }),
-      }),
+      })
     );
   });
 
@@ -166,8 +166,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               agentIds: ['manager', 'worker-a'],
             },
           },
-          { status: 201 },
-        ),
+          { status: 201 }
+        )
       )
       .mockResolvedValueOnce(
         jsonResponse({
@@ -182,7 +182,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               text: '[manager]: coordinated',
             },
           },
-        }),
+        })
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -200,7 +200,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           },
         ],
         maxTurns: 2,
-      }),
+      })
     );
     const runResult = await client.swarms.run('swarm-1', {
       text: 'Coordinate the patch',
@@ -235,7 +235,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           ],
           maxTurns: 2,
         }),
-      }),
+      })
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -245,7 +245,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         body: JSON.stringify({
           text: 'Coordinate the patch',
         }),
-      }),
+      })
     );
   });
 
@@ -254,7 +254,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
       sseResponse([
         'event: swarm:running\ndata: {"swarmId":"swarm-1","state":{"status":"running"},"result":null}\n\n',
         'event: swarm:completed\ndata: {"swarmId":"swarm-1","state":{"status":"idle"},"result":{"status":"success"}}\n\n',
-      ]),
+      ])
     );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -274,7 +274,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         headers: expect.objectContaining({
           accept: 'text/event-stream',
         }),
-      }),
+      })
     );
     expect(received).toEqual([
       {
@@ -315,8 +315,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             start(controller) {
               controller.enqueue(
                 new TextEncoder().encode(
-                  'event: swarm:running\ndata: {"swarmId":"swarm-1"}\n\n',
-                ),
+                  'event: swarm:running\ndata: {"swarmId":"swarm-1"}\n\n'
+                )
               );
             },
             cancel(reason) {
@@ -327,8 +327,8 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             headers: {
               'content-type': 'text/event-stream',
             },
-          },
-        ),
+          }
+        )
       );
     });
 

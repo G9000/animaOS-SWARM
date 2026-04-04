@@ -10,6 +10,25 @@ export function agencyExists(dir: string): boolean {
   return existsSync(join(dir, 'anima.yaml'));
 }
 
+function loadAgent(a: Record<string, unknown>) {
+  return {
+    name: (a.name as string) ?? 'unnamed',
+    bio: (a.bio as string) ?? '',
+    lore: a.lore as string | undefined,
+    adjectives: Array.isArray(a.adjectives)
+      ? (a.adjectives as string[])
+      : undefined,
+    topics: Array.isArray(a.topics) ? (a.topics as string[]) : undefined,
+    knowledge: Array.isArray(a.knowledge)
+      ? (a.knowledge as string[])
+      : undefined,
+    style: a.style as string | undefined,
+    system: (a.system as string) ?? '',
+    model: a.model as string | undefined,
+    tools: a.tools as string[] | undefined,
+  };
+}
+
 /**
  * Load and validate an `anima.yaml` config file from the given directory.
  *
@@ -52,25 +71,6 @@ export function loadAgency(dir: string): AgencyConfig {
   }
 
   const agents = Array.isArray(parsed.agents) ? parsed.agents : [];
-
-  function loadAgent(a: Record<string, unknown>) {
-    return {
-      name: (a.name as string) ?? 'unnamed',
-      bio: (a.bio as string) ?? '',
-      lore: a.lore as string | undefined,
-      adjectives: Array.isArray(a.adjectives)
-        ? (a.adjectives as string[])
-        : undefined,
-      topics: Array.isArray(a.topics) ? (a.topics as string[]) : undefined,
-      knowledge: Array.isArray(a.knowledge)
-        ? (a.knowledge as string[])
-        : undefined,
-      style: a.style as string | undefined,
-      system: (a.system as string) ?? '',
-      model: a.model as string | undefined,
-      tools: a.tools as string[] | undefined,
-    };
-  }
 
   return {
     name: parsed.name as string,

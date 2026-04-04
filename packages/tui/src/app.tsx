@@ -124,7 +124,7 @@ export function App({
           showMsg(`Unknown command: /${name}. Type /help for commands.`);
       }
     },
-    [exit, reset, profiles, showMsg]
+    [exit, reset, profiles, showMsg, resultLog.length]
   );
 
   const handleTaskSubmit = useCallback(

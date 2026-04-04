@@ -376,6 +376,23 @@ async function executeDaemonLaunchCommand(
   }
 }
 
+function toProfile(
+  a: AgentDefinition,
+  role: AgentProfile['role']
+): AgentProfile {
+  return {
+    name: a.name,
+    role,
+    bio: a.bio,
+    lore: a.lore,
+    adjectives: a.adjectives,
+    topics: a.topics,
+    knowledge: a.knowledge,
+    style: a.style,
+    system: a.system,
+  };
+}
+
 async function executeDaemonTuiLaunchCommand(
   task: string | undefined,
   opts: LaunchOptions,
@@ -389,23 +406,6 @@ async function executeDaemonTuiLaunchCommand(
       ? await deps.createDaemonTuiRuntime()
       : await loadDaemonTuiRuntime();
     const bus = tuiRuntime.eventBus;
-
-    function toProfile(
-      a: AgentDefinition,
-      role: AgentProfile['role']
-    ): AgentProfile {
-      return {
-        name: a.name,
-        role,
-        bio: a.bio,
-        lore: a.lore,
-        adjectives: a.adjectives,
-        topics: a.topics,
-        knowledge: a.knowledge,
-        style: a.style,
-        system: a.system,
-      };
-    }
 
     const agentProfiles: AgentProfile[] = [
       toProfile(agency.orchestrator, 'orchestrator'),

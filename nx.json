@@ -57,6 +57,10 @@
   "nxCloudId": "69c972d6cb537b8bb0c15baf",
   "analytics": false,
   "targetDefaults": {
+    "lint": {
+      "command": "oxlint {projectRoot}/src --config .oxlintrc.json --tsconfig {projectRoot}/tsconfig.json",
+      "cache": true
+    },
     "test": {
       "dependsOn": ["^build"]
     },

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "plugins": ["typescript", "unicorn", "import", "react", "vitest"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "rules": {
+    "react/react-in-jsx-scope": "off",
+    "vitest/require-mock-type-parameters": "off",
+    "no-await-in-loop": "off",
+    "unicorn/no-array-sort": "off",
+    "typescript/no-explicit-any": "off",
+    "no-console": "off",
+    "import/no-named-as-default-member": "off",
+    "unicorn/filename-case": "off",
+    "unicorn/no-null": "off",
+    "import/no-cycle": "error",
+    "no-unused-vars": "warn"
+  },
+  "ignorePatterns": [
+    "dist",
+    "node_modules",
+    "packages/animaos-rs/target",
+    "coverage",
+    "*.d.ts"
+  ]
+}
