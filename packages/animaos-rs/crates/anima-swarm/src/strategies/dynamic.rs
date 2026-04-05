@@ -32,7 +32,11 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
         let worker_refs = match try_join_all(ctx.worker_configs().iter().cloned().map(|config| {
             let worker_name = config.name.clone();
             let ctx = ctx.clone();
-            async move { ctx.spawn_agent(config).await.map(|worker| (worker_name, worker)) }
+            async move {
+                ctx.spawn_agent(config)
+                    .await
+                    .map(|worker| (worker_name, worker))
+            }
         }))
         .await
         {

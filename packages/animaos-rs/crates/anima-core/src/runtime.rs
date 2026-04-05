@@ -30,6 +30,7 @@ pub struct AgentRuntime {
     messages: Vec<Message>,
     last_task: Option<TaskResult<Content>>,
     events: Vec<EngineEvent>,
+    event_listener: Option<Arc<dyn Fn(EngineEvent) + Send + Sync>>,
     providers: Vec<Arc<dyn Provider>>,
     evaluators: Vec<Arc<dyn Evaluator>>,
     model_adapter: Arc<dyn ModelAdapter>,
@@ -52,10 +53,15 @@ impl AgentRuntime {
             messages: Vec::new(),
             last_task: None,
             events: Vec::new(),
+            event_listener: None,
             providers: Vec::new(),
             evaluators: Vec::new(),
             model_adapter,
         }
+    }
+
+    pub fn set_event_listener(&mut self, listener: Arc<dyn Fn(EngineEvent) + Send + Sync>) {
+        self.event_listener = Some(listener);
     }
 
     pub fn init(&mut self) {
@@ -264,27 +270,30 @@ impl AgentRuntime {
                             for tool_call in &tool_calls {
                                 self.record_event(
                                     EventType::ToolBefore,
-                                    tool_event_data(&tool_call.name, "running", 0),
+                                    tool_before_event_data(tool_call),
                                 );
                             }
 
-                            let tool_results = join_all(tool_calls.iter().cloned().map(|tool_call| {
-                                let tool_started = now_millis();
-                                let state = self.state.clone();
-                                let user_message = user_message.clone();
-                                let future = execute_tool(state, user_message, tool_call.clone());
-                                async move {
-                                    let tool_result = future.await;
-                                    let tool_duration = now_millis().saturating_sub(tool_started);
-                                    (tool_call, tool_result, tool_duration)
-                                }
-                            }))
-                            .await;
+                            let tool_results =
+                                join_all(tool_calls.iter().cloned().map(|tool_call| {
+                                    let tool_started = now_millis();
+                                    let state = self.state.clone();
+                                    let user_message = user_message.clone();
+                                    let future =
+                                        execute_tool(state, user_message, tool_call.clone());
+                                    async move {
+                                        let tool_result = future.await;
+                                        let tool_duration =
+                                            now_millis().saturating_sub(tool_started);
+                                        (tool_call, tool_result, tool_duration)
+                                    }
+                                }))
+                                .await;
 
                             for (tool_call, tool_result, tool_duration) in tool_results {
                                 self.record_event(
                                     EventType::ToolAfter,
-                                    tool_event_data(
+                                    tool_after_event_data(
                                         &tool_call.name,
                                         tool_result.status.as_str(),
                                         tool_duration,
@@ -335,8 +344,8 @@ impl AgentRuntime {
         let error = error.into();
         self.state.status = AgentStatus::Failed;
         self.last_task = Some(TaskResult::error(error.clone(), duration_ms));
-        self.record_event(EventType::AgentFailed, DataValue::String(error));
-        self.record_event(EventType::TaskFailed, DataValue::Null);
+        self.record_event(EventType::AgentFailed, DataValue::String(error.clone()));
+        self.record_event(EventType::TaskFailed, DataValue::String(error));
     }
 
     pub fn stop(&mut self) {
@@ -345,12 +354,16 @@ impl AgentRuntime {
     }
 
     fn record_event(&mut self, event_type: EventType, data: DataValue) {
-        self.events.push(EngineEvent {
+        let event = EngineEvent {
             event_type,
             agent_id: Some(self.state.id.clone()),
             timestamp: now_millis(),
             data,
-        });
+        };
+        self.events.push(event.clone());
+        if let Some(listener) = &self.event_listener {
+            listener(event);
+        }
     }
 
     fn build_system_prompt(&self, context_parts: &[String]) -> String {
@@ -503,7 +516,16 @@ fn content_from_tool_result(tool_call: &ToolCall, result: TaskResult<Content>) -
     }
 }
 
-fn tool_event_data(name: &str, status: &str, duration_ms: u128) -> DataValue {
+fn tool_before_event_data(tool_call: &ToolCall) -> DataValue {
+    let mut value = BTreeMap::new();
+    value.insert("name".into(), DataValue::String(tool_call.name.clone()));
+    value.insert("args".into(), DataValue::Object(tool_call.args.clone()));
+    value.insert("status".into(), DataValue::String("running".to_string()));
+    value.insert("durationMs".into(), DataValue::Number(0.0));
+    DataValue::Object(value)
+}
+
+fn tool_after_event_data(name: &str, status: &str, duration_ms: u128) -> DataValue {
     let mut value = BTreeMap::new();
     value.insert("name".into(), DataValue::String(name.to_string()));
     value.insert("status".into(), DataValue::String(status.to_string()));
@@ -820,18 +842,12 @@ mod tests {
                     ToolCall {
                         id: "tool-1".into(),
                         name: "memory_search".into(),
-                        args: BTreeMap::from([(
-                            "query".into(),
-                            DataValue::String("alpha".into()),
-                        )]),
+                        args: BTreeMap::from([("query".into(), DataValue::String("alpha".into()))]),
                     },
                     ToolCall {
                         id: "tool-2".into(),
                         name: "memory_search".into(),
-                        args: BTreeMap::from([(
-                            "query".into(),
-                            DataValue::String("beta".into()),
-                        )]),
+                        args: BTreeMap::from([("query".into(), DataValue::String("beta".into()))]),
                     },
                 ]),
                 usage: TokenUsage {
@@ -1123,6 +1139,37 @@ mod tests {
 
     fn runtime() -> AgentRuntime {
         AgentRuntime::new(config(), Arc::new(StaticModelAdapter))
+    }
+
+    #[test]
+    fn runtime_notifies_event_listener_with_live_events() {
+        let mut runtime = runtime();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        runtime.set_event_listener(Arc::new({
+            let events = Arc::clone(&events);
+            move |event| {
+                events
+                    .lock()
+                    .expect("listener mutex should not be poisoned")
+                    .push(event.event_type.as_str().to_string());
+            }
+        }));
+
+        runtime.init();
+        let result = block_on(runtime.run(Content {
+            text: "ship it".into(),
+            ..Content::default()
+        }));
+
+        assert_eq!(result.status, TaskStatus::Success);
+        let events = events
+            .lock()
+            .expect("listener mutex should not be poisoned")
+            .clone();
+        assert!(events.iter().any(|event| event == "agent:spawned"));
+        assert!(events.iter().any(|event| event == "task:started"));
+        assert!(events.iter().any(|event| event == "agent:tokens"));
+        assert!(events.iter().any(|event| event == "task:completed"));
     }
 
     #[test]
@@ -1556,8 +1603,7 @@ mod tests {
     #[test]
     fn runtime_run_executes_multiple_tool_calls_concurrently() {
         let order = Arc::new(Mutex::new(Vec::new()));
-        let mut runtime =
-            AgentRuntime::new(tool_config(), Arc::new(MultiToolCallingModelAdapter));
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(MultiToolCallingModelAdapter));
         runtime.init();
 
         let result = block_on(runtime.run_with_tools(

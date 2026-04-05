@@ -151,14 +151,103 @@ describe('launch event bridge', () => {
         data: { swarmId: 'swarm-1' },
         agentId: 'launch:manager',
       },
+    ]);
+  });
+
+  it('relays live worker activity from daemon SSE into the TUI bus', async () => {
+    const { bus, events } = createRecordingBus();
+    const agents = launchDisplayAgents(agency);
+
+    await relayLaunchSwarmEvent(bus, agents, {
+      event: 'task:started',
+      data: {
+        agentId: 'worker-a-1',
+        agentName: 'worker-a',
+      },
+    });
+
+    await relayLaunchSwarmEvent(bus, agents, {
+      event: 'tool:before',
+      data: {
+        agentId: 'worker-a-1',
+        agentName: 'worker-a',
+        toolName: 'memory_search',
+        args: { query: 'campaign ideas' },
+      },
+    });
+
+    await relayLaunchSwarmEvent(bus, agents, {
+      event: 'agent:tokens',
+      data: {
+        agentId: 'worker-a-1',
+        agentName: 'worker-a',
+        usage: {
+          promptTokens: 3,
+          completionTokens: 2,
+          totalTokens: 5,
+        },
+      },
+    });
+
+    await relayLaunchSwarmEvent(bus, agents, {
+      event: 'tool:after',
+      data: {
+        agentId: 'worker-a-1',
+        agentName: 'worker-a',
+        toolName: 'memory_search',
+        status: 'success',
+        durationMs: 42,
+      },
+    });
+
+    await relayLaunchSwarmEvent(bus, agents, {
+      event: 'task:completed',
+      data: {
+        agentId: 'worker-a-1',
+        agentName: 'worker-a',
+      },
+    });
+
+    expect(events).toEqual([
       {
-        type: 'agent:tokens',
-        data: { agentId: 'launch:manager', usage: { totalTokens: 3 } },
-        agentId: 'launch:manager',
+        type: 'task:started',
+        data: { agentId: 'launch:worker-a' },
+        agentId: 'launch:worker-a',
+      },
+      {
+        type: 'tool:before',
+        data: {
+          agentId: 'launch:worker-a',
+          toolName: 'memory_search',
+          args: { query: 'campaign ideas' },
+        },
+        agentId: 'launch:worker-a',
       },
       {
         type: 'agent:tokens',
-        data: { agentId: 'launch:worker-a', usage: { totalTokens: 2 } },
+        data: {
+          agentId: 'launch:worker-a',
+          usage: {
+            promptTokens: 3,
+            completionTokens: 2,
+            totalTokens: 5,
+          },
+        },
+        agentId: 'launch:worker-a',
+      },
+      {
+        type: 'tool:after',
+        data: {
+          agentId: 'launch:worker-a',
+          toolName: 'memory_search',
+          status: 'success',
+          durationMs: 42,
+        },
+        agentId: 'launch:worker-a',
+      },
+      {
+        type: 'task:completed',
+        data: { agentId: 'launch:worker-a' },
         agentId: 'launch:worker-a',
       },
     ]);
@@ -194,16 +283,6 @@ describe('launch event bridge', () => {
     });
 
     expect(events).toEqual([
-      {
-        type: 'agent:tokens',
-        data: { agentId: 'launch:manager', usage: { totalTokens: 3 } },
-        agentId: 'launch:manager',
-      },
-      {
-        type: 'agent:tokens',
-        data: { agentId: 'launch:worker-a', usage: { totalTokens: 2 } },
-        agentId: 'launch:worker-a',
-      },
       {
         type: 'agent:terminated',
         data: { agentId: 'launch:worker-a' },

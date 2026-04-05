@@ -5,7 +5,16 @@ export { DaemonClient, DaemonHttpError, createDaemonClient } from './client.js';
 export type { DaemonClientOptions, DaemonEvent, FetchLike } from './client.js';
 
 export { SwarmsClient, swarm } from './swarms.js';
-export type { SwarmEventPayload, SwarmRunResponse } from './swarms.js';
+export type {
+  SwarmAgentEventPayload,
+  SwarmAgentTokensPayload,
+  SwarmEventPayload,
+  SwarmStreamEventPayload,
+  SwarmTaskFailedPayload,
+  SwarmToolAfterPayload,
+  SwarmToolBeforePayload,
+  SwarmRunResponse,
+} from './swarms.js';
 
 export type {
   Action,

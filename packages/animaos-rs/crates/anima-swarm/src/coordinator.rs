@@ -425,11 +425,9 @@ impl SwarmCoordinator {
 
         let spawn_coordinator = self.clone();
         let spawn_agent = Arc::new(
-            move |
-                config: AgentConfig,
-                delegate_task: Option<Arc<CoordinatorDelegateFn>>,
-                delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
-            | {
+            move |config: AgentConfig,
+                  delegate_task: Option<Arc<CoordinatorDelegateFn>>,
+                  delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>| {
                 let spawn_coordinator = spawn_coordinator.clone();
                 Box::pin(async move {
                     spawn_coordinator
@@ -495,7 +493,8 @@ impl SwarmCoordinator {
             return Ok(agent);
         }
 
-        self.spawn_new_agent(config, delegate_task, delegate_tasks).await
+        self.spawn_new_agent(config, delegate_task, delegate_tasks)
+            .await
     }
 
     async fn spawn_new_agent(

@@ -159,7 +159,7 @@ async fn get_swarm_returns_latest_state_snapshot() {
 }
 
 #[tokio::test]
-async fn swarm_event_stream_emits_running_and_completed_events() {
+async fn swarm_event_stream_emits_live_agent_activity_and_lifecycle_events() {
     let app = test_app();
     let (_, create_response) = create_swarm(&app).await;
     let swarm_id = extract_json_string_field(&create_response, "id");
@@ -202,6 +202,8 @@ async fn swarm_event_stream_emits_running_and_completed_events() {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
                 if chunks.contains("event: swarm:running")
+                    && chunks.contains("event: task:started")
+                    && chunks.contains("event: agent:tokens")
                     && chunks.contains("event: swarm:completed")
                 {
                     break;
@@ -218,8 +220,11 @@ async fn swarm_event_stream_emits_running_and_completed_events() {
     assert_eq!(run_status, StatusCode::OK);
     assert!(run_response.contains("\"status\":\"success\""));
     assert!(chunks.contains("event: swarm:running"));
+    assert!(chunks.contains("event: task:started"));
+    assert!(chunks.contains("event: agent:tokens"));
     assert!(chunks.contains("event: swarm:completed"));
     assert!(chunks.contains(&format!("\"swarmId\":\"{swarm_id}\"")));
+    assert!(chunks.contains("\"agentName\":\"worker-a\""));
 
     let running_data =
         extract_sse_event_data(&chunks, "swarm:running").expect("running event data exists");

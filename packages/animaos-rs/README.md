@@ -1,6 +1,6 @@
 # animaOS Rust Workspace
 
-This workspace contains the Rust rewrite of the animaOS engine.
+This workspace contains the canonical runtime core for animaOS.
 
 Phase 0 guarantees only:
 
@@ -8,4 +8,4 @@ Phase 0 guarantees only:
 - four compilable crates: `anima-core`, `anima-memory`, `anima-swarm`, `anima-daemon`
 - a daemon milestone that responds to `GET /health`
 
-The existing TypeScript packages remain the reference implementation while the Rust engine reaches parity.
+The Rust crates now own runtime execution, swarm coordination, memory services, and the daemon API boundary. The TypeScript packages are the SDK, CLI, UI, and shared-support layer around that runtime.

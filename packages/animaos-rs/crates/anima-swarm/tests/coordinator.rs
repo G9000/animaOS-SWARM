@@ -632,7 +632,9 @@ fn supervisor_strategy_batch_delegates_workers_concurrently() {
                                     .as_ref()
                                     .map(|content| content.text.as_str())
                                     .unwrap_or_default();
-                                assert!(text.contains("[worker-a] worker-a finished research alpha"));
+                                assert!(
+                                    text.contains("[worker-a] worker-a finished research alpha")
+                                );
                                 assert!(text.contains("[worker-b] worker-b finished research beta"));
 
                                 TaskResult::success(text_content("batched synthesis"), 1)

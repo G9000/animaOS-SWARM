@@ -1,4 +1,4 @@
-import type { Content, TaskResult } from '@animaOS-SWARM/core';
+import type { Content, TaskResult, TokenUsage } from '@animaOS-SWARM/core';
 import type { SwarmConfig, SwarmState } from '@animaOS-SWARM/swarm';
 
 import type { DaemonClient, DaemonEvent } from './client.js';
@@ -15,6 +15,38 @@ export interface SwarmEventPayload<T = unknown> {
   state: SwarmState;
   result: TaskResult<T> | null;
 }
+
+export interface SwarmAgentEventPayload {
+  agentId: string;
+  agentName: string;
+}
+
+export interface SwarmTaskFailedPayload extends SwarmAgentEventPayload {
+  error: string;
+}
+
+export interface SwarmToolBeforePayload extends SwarmAgentEventPayload {
+  toolName: string;
+  args: Record<string, unknown>;
+}
+
+export interface SwarmToolAfterPayload extends SwarmAgentEventPayload {
+  toolName: string;
+  status: string;
+  durationMs: number;
+}
+
+export interface SwarmAgentTokensPayload extends SwarmAgentEventPayload {
+  usage: TokenUsage;
+}
+
+export type SwarmStreamEventPayload<T = unknown> =
+  | SwarmEventPayload<T>
+  | SwarmAgentEventPayload
+  | SwarmTaskFailedPayload
+  | SwarmToolBeforePayload
+  | SwarmToolAfterPayload
+  | SwarmAgentTokensPayload;
 
 export function swarm<T extends SwarmConfig>(config: T): T {
   return config;
@@ -57,8 +89,8 @@ export class SwarmsClient {
   subscribe<T = unknown>(
     swarmId: string,
     init: RequestInit = {}
-  ): AsyncGenerator<DaemonEvent<SwarmEventPayload<T>>> {
-    return this.client.subscribe<SwarmEventPayload<T>>(
+  ): AsyncGenerator<DaemonEvent<SwarmStreamEventPayload<T>>> {
+    return this.client.subscribe<SwarmStreamEventPayload<T>>(
       `/api/swarms/${encodeURIComponent(swarmId)}/events`,
       init
     );

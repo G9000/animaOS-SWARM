@@ -2,6 +2,34 @@
 
 Agent swarm framework. Command and control your AI agents -- spawn, coordinate, and manage swarms that get things done.
 
+## Quick Start (CLI)
+
+Create and run an agency in 3 steps - **no code required**:
+
+```bash
+# 1. Build the CLI
+bun run build:cli-sdk
+
+# 2. Create an agency (no daemon needed)
+export OPENAI_API_KEY="sk-..."
+bun run animaos create my-agency --provider openai --model gpt-4o-mini
+
+# 3. Start daemon & launch tasks
+bun run daemon          # In a new terminal
+cd my-agency
+bun run animaos launch "Write a blog post about AI" --no-tui
+```
+
+See [docs/SDK_USAGE.md](docs/SDK_USAGE.md) for full documentation and SDK examples.
+
+## Runtime Architecture
+
+The canonical runtime lives in Rust under `packages/animaos-rs`.
+
+- `anima-core`, `anima-swarm`, `anima-memory`, and `anima-daemon` own execution, coordination, memory, and the HTTP/SSE boundary.
+- `packages/sdk` is the public TypeScript client for that runtime.
+- `packages/core` is shared TypeScript support used by the SDK, CLI, and UI. It is not the source of truth for execution behavior.
+
 ## Development
 
 ```bash
@@ -32,16 +60,16 @@ bun run build:cli-sdk
 export OPENAI_API_KEY=...
 
 # Create an agency locally (no daemon required)
-bun run animaos -- create content-team --provider openai --model gpt-4o-mini --api-key "$OPENAI_API_KEY"
+bun run animaos create content-team --provider openai --model gpt-4o-mini
 
 # Equivalent direct invocation without Bun as the runner
-node packages/cli/dist/index.js create content-team --provider openai --model gpt-4o-mini --api-key "$OPENAI_API_KEY"
+node packages/cli/dist/index.js create content-team --provider openai --model gpt-4o-mini
 
 # Start the Rust daemon in another terminal for launch/run/chat
 bun run daemon
 
 cd content-team
-bun run animaos -- launch "your task" --no-tui
+bun run animaos launch "your task" --no-tui
 ```
 
 ## Provider Support

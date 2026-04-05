@@ -32,7 +32,11 @@ pub fn supervisor_strategy(
         let worker_refs = match try_join_all(ctx.worker_configs().iter().cloned().map(|config| {
             let worker_name = config.name.clone();
             let ctx = ctx.clone();
-            async move { ctx.spawn_agent(config).await.map(|worker| (worker_name, worker)) }
+            async move {
+                ctx.spawn_agent(config)
+                    .await
+                    .map(|worker| (worker_name, worker))
+            }
         }))
         .await
         {
@@ -79,39 +83,41 @@ pub fn supervisor_strategy(
                 let delegation_limit = Arc::clone(&delegation_limit);
                 Box::pin(async move {
                     if delegations.is_empty() {
-                        return TaskResult::error("delegate_tasks requires at least one delegation", 0);
+                        return TaskResult::error(
+                            "delegate_tasks requires at least one delegation",
+                            0,
+                        );
                     }
 
-                    let results: Vec<(String, TaskResult<Content>)> = join_all(
-                        delegations.into_iter().map(|delegation| {
-                        let worker_refs = Arc::clone(&worker_refs);
-                        let available_workers = available_workers.clone();
-                        let delegation_limit = Arc::clone(&delegation_limit);
-                        async move {
-                            let SwarmDelegation { worker_name, task } = delegation;
-                            let Some(worker) = worker_refs.get(&worker_name) else {
-                                let missing_worker = worker_name.clone();
-                                return (
-                                    worker_name,
-                                    TaskResult::error(
-                                        format!(
+                    let results: Vec<(String, TaskResult<Content>)> =
+                        join_all(delegations.into_iter().map(|delegation| {
+                            let worker_refs = Arc::clone(&worker_refs);
+                            let available_workers = available_workers.clone();
+                            let delegation_limit = Arc::clone(&delegation_limit);
+                            async move {
+                                let SwarmDelegation { worker_name, task } = delegation;
+                                let Some(worker) = worker_refs.get(&worker_name) else {
+                                    let missing_worker = worker_name.clone();
+                                    return (
+                                        worker_name,
+                                        TaskResult::error(
+                                            format!(
                                             "Worker \"{missing_worker}\" not found. Available: {}",
                                             available_workers
                                         ),
-                                        0,
-                                    ),
-                                );
-                            };
+                                            0,
+                                        ),
+                                    );
+                                };
 
-                            let _permit = delegation_limit
-                                .acquire_owned()
-                                .await
-                                .expect("delegation semaphore should not close");
-                            (worker_name, worker.run(task).await)
-                        }
-                    }),
-                    )
-                    .await;
+                                let _permit = delegation_limit
+                                    .acquire_owned()
+                                    .await
+                                    .expect("delegation semaphore should not close");
+                                (worker_name, worker.run(task).await)
+                            }
+                        }))
+                        .await;
 
                     let mut lines = Vec::with_capacity(results.len());
                     let mut any_error = false;
@@ -339,10 +345,7 @@ fn delegate_tasks_parameters() -> BTreeMap<String, DataValue> {
         "properties".into(),
         DataValue::Object(delegation_properties),
     );
-    delegation_item.insert(
-        "required".into(),
-        DataValue::Array(delegation_required),
-    );
+    delegation_item.insert("required".into(), DataValue::Array(delegation_required));
 
     let mut delegations = BTreeMap::new();
     delegations.insert("type".into(), DataValue::String("array".into()));

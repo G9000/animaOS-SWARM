@@ -1,5 +1,14 @@
 import type { IEventBus, TaskResult } from '@animaOS-SWARM/core';
-import type { DaemonEvent, SwarmEventPayload } from '@animaOS-SWARM/sdk';
+import type {
+  DaemonEvent,
+  SwarmAgentEventPayload,
+  SwarmAgentTokensPayload,
+  SwarmEventPayload,
+  SwarmStreamEventPayload,
+  SwarmTaskFailedPayload,
+  SwarmToolAfterPayload,
+  SwarmToolBeforePayload,
+} from '@animaOS-SWARM/sdk';
 
 import type { AgencyConfig } from '../agency/types.js';
 import { extractResultText } from './utils.js';
@@ -104,18 +113,117 @@ export async function emitLaunchTaskFailure(
 export async function relayLaunchSwarmEvent(
   eventBus: IEventBus,
   agents: LaunchDisplayAgent[],
-  event: DaemonEvent<SwarmEventPayload>
+  event: DaemonEvent<SwarmStreamEventPayload>
 ): Promise<void> {
   const primaryAgent = agents[0];
   if (!primaryAgent) {
     return;
   }
 
+  if (event.event === 'task:started') {
+    const data = event.data as SwarmAgentEventPayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'task:started',
+      {
+        agentId: agent.id,
+      },
+      agent.id
+    );
+    return;
+  }
+
+  if (event.event === 'task:completed') {
+    const data = event.data as SwarmAgentEventPayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'task:completed',
+      {
+        agentId: agent.id,
+      },
+      agent.id
+    );
+    return;
+  }
+
+  if (event.event === 'task:failed') {
+    const data = event.data as SwarmTaskFailedPayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'task:failed',
+      {
+        agentId: agent.id,
+        error: data.error,
+      },
+      agent.id
+    );
+    return;
+  }
+
+  if (event.event === 'tool:before') {
+    const data = event.data as SwarmToolBeforePayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'tool:before',
+      {
+        agentId: agent.id,
+        toolName: data.toolName,
+        args: data.args,
+      },
+      agent.id
+    );
+    return;
+  }
+
+  if (event.event === 'tool:after') {
+    const data = event.data as SwarmToolAfterPayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'tool:after',
+      {
+        agentId: agent.id,
+        toolName: data.toolName,
+        status: data.status,
+        durationMs: data.durationMs,
+      },
+      agent.id
+    );
+    return;
+  }
+
+  if (event.event === 'agent:tokens') {
+    const data = event.data as SwarmAgentTokensPayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'agent:tokens',
+      {
+        agentId: agent.id,
+        usage: data.usage,
+      },
+      agent.id
+    );
+    return;
+  }
+
+  if (event.event === 'agent:terminated') {
+    const data = event.data as SwarmAgentEventPayload;
+    const agent = resolveDisplayAgent(agents, data);
+    await eventBus.emit(
+      'agent:terminated',
+      {
+        agentId: agent.id,
+      },
+      agent.id
+    );
+    return;
+  }
+
   if (event.event === 'swarm:created') {
+    const data = event.data as SwarmEventPayload;
     await eventBus.emit(
       'swarm:created',
       {
-        swarmId: event.data.swarmId,
+        swarmId: data.swarmId,
       },
       primaryAgent.id
     );
@@ -123,11 +231,6 @@ export async function relayLaunchSwarmEvent(
   }
 
   if (event.event === 'swarm:running') {
-    await emitLaunchAgentTokens(
-      eventBus,
-      agents,
-      event.data.state.tokenUsage.totalTokens
-    );
     return;
   }
 
@@ -135,12 +238,8 @@ export async function relayLaunchSwarmEvent(
     return;
   }
 
-  const result = normalizeResult(event.data.result);
-  await emitLaunchAgentTokens(
-    eventBus,
-    agents,
-    event.data.state.tokenUsage.totalTokens
-  );
+  const data = event.data as SwarmEventPayload;
+  const result = normalizeResult(data.result);
 
   for (const agent of agents) {
     if (agent.role === 'worker') {
@@ -198,6 +297,19 @@ export async function relayLaunchSwarmEvent(
   );
 }
 
+function resolveDisplayAgent(
+  agents: LaunchDisplayAgent[],
+  payload: SwarmAgentEventPayload
+): LaunchDisplayAgent {
+  return (
+    agents.find((agent) => agent.name === payload.agentName) ?? {
+      id: payload.agentId,
+      name: payload.agentName,
+      role: 'worker',
+    }
+  );
+}
+
 function normalizeResult(result: SwarmEventPayload['result']): TaskResult {
   if (result) {
     return result;
@@ -208,42 +320,4 @@ function normalizeResult(result: SwarmEventPayload['result']): TaskResult {
     error: 'swarm completed without a result',
     durationMs: 0,
   };
-}
-
-async function emitLaunchAgentTokens(
-  eventBus: IEventBus,
-  agents: LaunchDisplayAgent[],
-  totalTokens: number
-): Promise<void> {
-  const tokenShares = distributeTokens(totalTokens, agents.length);
-
-  for (const [index, agent] of agents.entries()) {
-    await eventBus.emit(
-      'agent:tokens',
-      {
-        agentId: agent.id,
-        usage: {
-          totalTokens: tokenShares[index] ?? 0,
-        },
-      },
-      agent.id
-    );
-  }
-}
-
-function distributeTokens(totalTokens: number, count: number): number[] {
-  if (count <= 0) {
-    return [];
-  }
-
-  const base = Math.floor(totalTokens / count);
-  let remainder = totalTokens % count;
-
-  return Array.from({ length: count }, () => {
-    const next = remainder > 0 ? base + 1 : base;
-    if (remainder > 0) {
-      remainder -= 1;
-    }
-    return next;
-  });
 }

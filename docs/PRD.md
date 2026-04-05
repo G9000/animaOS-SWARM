@@ -39,18 +39,23 @@ AnimaOS Kit is a lightweight TypeScript agent swarm framework for enterprise use
 ```
 animaos-swarm/
 ├── packages/
-│   ├── @animaOS-SWARM/core      — Agent runtime, types, model adapters, plugin system
+│   ├── @animaOS-SWARM/core      — Shared TS contracts, adapters, and compatibility utilities
 │   ├── @animaOS-SWARM/swarm     — Swarm coordinator, strategies, agent-to-agent messaging
 │   ├── @animaOS-SWARM/tools     — Tool registry (bash, read, write, grep, glob, etc.)
 │   ├── @animaOS-SWARM/memory    — BM25 search, task history, document ingestion
-│   ├── @animaOS-SWARM/sdk       — Public SDK that re-exports clean developer API
+│   ├── @animaOS-SWARM/sdk       — Public TypeScript SDK for the Rust daemon
 │   └── @animaOS-SWARM/cli       — CLI commands (run, chat, create, agents, swarm)
+├── packages/animaos-rs/
+│   ├── anima-core               — Canonical runtime core
+│   ├── anima-swarm              — Canonical swarm coordination
+│   ├── anima-memory             — Canonical memory services
+│   └── anima-daemon             — Canonical HTTP/SSE execution boundary
 └── apps/
     ├── @animaOS-SWARM/server    — REST API + WebSocket server
     └── @animaOS-SWARM/ui        — Web dashboard (React + Vite)
 ```
 
-**Tech Stack:** Bun, TypeScript, NX (monorepo), Vitest, Biome, Drizzle ORM, pglite (default DB)
+**Tech Stack:** Rust, Bun, TypeScript, NX (monorepo), Cargo, Vitest, Biome, Drizzle ORM, pglite (default DB)
 
 ---
 
@@ -61,9 +66,9 @@ animaos-swarm/
 | Component | Status | Details |
 |---|---|---|
 | Monorepo scaffold | ✅ Done | NX + Bun, all packages and apps created |
-| Core types | ✅ Done | Agent, Action, Provider, Evaluator, Plugin, Model, Events |
-| Agent runtime | ✅ Done | LLM loop (call → tools → repeat), token tracking, plugin registration |
-| Event bus | ✅ Done | Pub/sub for lifecycle events |
+| Rust runtime core | ✅ Done | `anima-core`, `anima-swarm`, `anima-memory`, and `anima-daemon` are the canonical execution path |
+| TypeScript shared core | ✅ Done | `@animaOS-SWARM/core` still provides shared TS contracts and utilities for client-side packages |
+| Runtime events | ✅ Done | Canonical lifecycle and SSE event flow now comes from the Rust daemon |
 | OpenAI adapter | ✅ Done | Full tool-call support |
 | Anthropic adapter | ✅ Done | Claude tool_use support + streaming |
 | Ollama adapter | ✅ Done | OpenAI-compatible API, no key required |
@@ -76,7 +81,7 @@ animaos-swarm/
 | Task history | ✅ Done | Record, search, getRecent, getByAgent |
 | Document store | ✅ Done | Ingest, chunk, search via BM25 |
 | CLI (run + chat) | ✅ Done | Single task execution + interactive chat |
-| SDK | ✅ Done | Clean re-export of all packages |
+| SDK | ✅ Done | TypeScript daemon client and shared type surface |
 | Server (REST API) | ✅ Done | Agents, swarms, search, documents, health endpoints |
 | Helper factories | ✅ Done | `agent()`, `plugin()`, `action()`, `swarm()` |
 | Tests | ✅ Done | 21 tests passing (core + memory) |

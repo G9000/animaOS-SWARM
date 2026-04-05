@@ -1,6 +1,8 @@
 # core
 
-This library was generated with [Nx](https://nx.dev).
+Shared TypeScript contracts and utilities for the SDK, CLI, and UI.
+
+This package is not the canonical execution runtime. Runtime execution, swarm coordination, memory services, and daemon-backed streaming live in the Rust workspace under `packages/animaos-rs`.
 
 ## Building
 

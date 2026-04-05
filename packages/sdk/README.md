@@ -1,6 +1,8 @@
 # sdk
 
-This library was generated with [Nx](https://nx.dev).
+Public TypeScript SDK for animaOS.
+
+This package builds agent and swarm configs, re-exports shared TypeScript types, and talks to the Rust daemon over HTTP and SSE. It does not embed the execution runtime.
 
 ## Building
 
