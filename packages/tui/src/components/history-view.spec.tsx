@@ -125,6 +125,51 @@ describe('HistoryView interactions', () => {
     expect(onBack).toHaveBeenCalledOnce();
   });
 
+  it('shows undo affordances in the empty state when deleted runs are queued', async () => {
+    const onBack = vi.fn();
+    const onUndoDelete = vi.fn();
+    const onDropOldestUndo = vi.fn();
+
+    const rendered = renderInk(
+      <HistoryView
+        results={[]}
+        onBack={onBack}
+        onUndoDelete={onUndoDelete}
+        onDropOldestUndo={onDropOldestUndo}
+        undoDeleteLabel="release prep"
+        dropOldestUndoLabel="hotfix prep"
+        undoDeleteCount={2}
+        title="Resume"
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('No runs recorded yet.');
+    expect(rendered.lastFrame()).toContain('u undo delete');
+    expect(rendered.lastFrame()).toContain('D drop oldest undo');
+    expect(rendered.lastFrame()).toContain('Press u to restore release prep.');
+    expect(rendered.lastFrame()).toContain('1 more deleted saved run queued.');
+    expect(rendered.lastFrame()).toContain(
+      'Press D to discard oldest queued undo: hotfix prep.'
+    );
+
+    await pressInkKey(rendered, 'u');
+
+    expect(onUndoDelete).toHaveBeenCalledOnce();
+
+    await pressInkKey(rendered, 'D');
+
+    expect(onDropOldestUndo).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain('D confirm drop oldest undo');
+    expect(rendered.lastFrame()).toContain('Confirm oldest undo discard');
+    expect(rendered.lastFrame()).toContain(
+      'Press D again to discard oldest queued undo: hotfix prep.'
+    );
+
+    await pressInkKey(rendered, 'D');
+
+    expect(onDropOldestUndo).toHaveBeenCalledOnce();
+  });
+
   it('selects the highlighted run with enter when a picker action is provided', async () => {
     const onBack = vi.fn();
     const onSelect = vi.fn();
@@ -163,5 +208,89 @@ describe('HistoryView interactions', () => {
         task: 'First task',
       })
     );
+  });
+
+  it('deletes the highlighted run with x when a delete action is provided', async () => {
+    const onBack = vi.fn();
+    const onDelete = vi.fn();
+
+    const first = createResultEntry({
+      id: 'run-1',
+      task: 'First task',
+      result: 'First result',
+      label: 'release prep',
+    });
+    const second = createResultEntry({
+      id: 'run-2',
+      timestamp: 2,
+      task: 'Second task',
+      result: 'Second result',
+    });
+
+    const rendered = renderInk(
+      <HistoryView
+        results={[first, second]}
+        onBack={onBack}
+        onDelete={onDelete}
+        title="Resume"
+        selectActionLabel="resume"
+        initialSelection="first"
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('x delete');
+    expect(rendered.lastFrame()).toContain('release prep');
+
+    await pressInkKey(rendered, 'x');
+
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain('x confirm delete');
+    expect(rendered.lastFrame()).toContain('Confirm delete');
+    expect(rendered.lastFrame()).toContain(
+      'Press x again to delete this saved run.'
+    );
+
+    await pressInkKey(rendered, 'x');
+
+    expect(onDelete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'release prep',
+      })
+    );
+  });
+
+  it('restores the last deleted run with u when undo is available', async () => {
+    const onBack = vi.fn();
+    const onUndoDelete = vi.fn();
+
+    const rendered = renderInk(
+      <HistoryView
+        results={[
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+          }),
+        ]}
+        onBack={onBack}
+        onUndoDelete={onUndoDelete}
+        undoDeleteLabel="release prep"
+        undoDeleteCount={2}
+        title="Resume"
+        selectActionLabel="resume"
+        initialSelection="first"
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('u undo delete');
+    expect(rendered.lastFrame()).toContain('Undo delete');
+    expect(rendered.lastFrame()).toContain('Press u to restore release prep.');
+    expect(rendered.lastFrame()).toContain('1 more deleted saved run queued.');
+
+    await pressInkKey(rendered, 'u');
+
+    expect(onUndoDelete).toHaveBeenCalledOnce();
   });
 });

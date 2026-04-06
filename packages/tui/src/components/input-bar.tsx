@@ -7,12 +7,19 @@ export interface SlashCommand {
   args?: string;
 }
 
+export interface InputSuggestion {
+  label: string;
+  value: string;
+  description?: string;
+}
+
 export interface InputBarProps {
   onSubmit: (value: string) => void;
   disabled?: boolean;
   placeholder?: string;
   commands?: SlashCommand[];
   history?: string[];
+  suggestions?: (value: string) => InputSuggestion[];
 }
 
 export function InputBar({
@@ -21,6 +28,7 @@ export function InputBar({
   placeholder = 'type your task... or /help for commands',
   commands = [],
   history = [],
+  suggestions,
 }: InputBarProps): React.ReactElement {
   const [value, setValue] = useState('');
   const [selectedIdx, setSelectedIdx] = useState(0);
@@ -33,9 +41,14 @@ export function InputBar({
   >(null);
 
   const isSlash = value.startsWith('/');
-  const matches = isSlash
+  const commandMatches = isSlash
     ? commands.filter((c) => `/${c.name}`.startsWith(value.toLowerCase()))
     : [];
+  const inputSuggestions = suggestions?.(value) ?? [];
+  const showingCommandMatches = commandMatches.length > 0;
+  const activeMatchCount = showingCommandMatches
+    ? commandMatches.length
+    : inputSuggestions.length;
   const canRecallHistory = !isSlash && history.length > 0;
   const normalizedHistorySearchQuery = historySearchQuery.trim().toLowerCase();
   const historySearchMatches = history
@@ -49,7 +62,7 @@ export function InputBar({
 
   // Keep selectedIdx in bounds whenever matches change
   const clampedIdx =
-    matches.length > 0 ? Math.min(selectedIdx, matches.length - 1) : 0;
+    activeMatchCount > 0 ? Math.min(selectedIdx, activeMatchCount - 1) : 0;
 
   function clearHistoryNavigation() {
     setHistoryIdx(null);
@@ -148,25 +161,39 @@ export function InputBar({
         return;
       }
 
-      if (matches.length > 0) {
+      if (activeMatchCount > 0) {
         if (key.upArrow) {
           setSelectedIdx((i) => Math.max(0, i - 1));
           return;
         }
         if (key.downArrow) {
-          setSelectedIdx((i) => Math.min(matches.length - 1, i + 1));
+          setSelectedIdx((i) => Math.min(activeMatchCount - 1, i + 1));
           return;
         }
         if (key.return) {
-          const cmd = matches[clampedIdx];
-          if (cmd.args) {
-            // Has args — autocomplete name and let user fill args
-            setValue(`/${cmd.name} `);
-            setSelectedIdx(0);
-            clearHistoryNavigation();
-          } else {
-            // No args — submit directly
-            onSubmit(`/${cmd.name}`);
+          if (showingCommandMatches) {
+            const match = commandMatches[clampedIdx];
+            if (!match) {
+              return;
+            }
+
+            if (match.args) {
+              // Has args — autocomplete name and let user fill args
+              setValue(`/${match.name} `);
+              setSelectedIdx(0);
+              clearHistoryNavigation();
+            } else {
+              // No args — submit directly
+              onSubmit(`/${match.name}`);
+              setValue('');
+              setSelectedIdx(0);
+              clearHistoryNavigation();
+            }
+            return;
+          }
+
+          if (value.trim()) {
+            onSubmit(value.trim());
             setValue('');
             setSelectedIdx(0);
             clearHistoryNavigation();
@@ -174,8 +201,21 @@ export function InputBar({
           return;
         }
         if (key.tab) {
-          const cmd = matches[clampedIdx];
-          setValue(cmd.args ? `/${cmd.name} ` : `/${cmd.name}`);
+          if (showingCommandMatches) {
+            const match = commandMatches[clampedIdx];
+            if (!match) {
+              return;
+            }
+
+            setValue(match.args ? `/${match.name} ` : `/${match.name}`);
+          } else {
+            const match = inputSuggestions[clampedIdx];
+            if (!match) {
+              return;
+            }
+
+            setValue(match.value);
+          }
           setSelectedIdx(0);
           clearHistoryNavigation();
           return;
@@ -279,34 +319,58 @@ export function InputBar({
       )}
 
       {/* Command palette */}
-      {matches.length > 0 && !historySearchMode && (
+      {activeMatchCount > 0 && !historySearchMode && (
         <Box flexDirection="column" paddingX={2}>
-          {matches.map((cmd, i) => {
-            const active = i === clampedIdx;
-            return (
-              <Box key={cmd.name}>
-                <Text color={active ? 'magenta' : 'gray'} bold={active}>
-                  {active ? '❯ ' : '  '}
-                </Text>
-                <Text color={active ? 'magenta' : 'gray'} bold={active}>
-                  {'/'}
-                  {cmd.name}
-                  {cmd.args ? <Text color="gray"> {cmd.args}</Text> : null}
-                </Text>
-                <Text color={active ? 'white' : 'gray'}>
-                  {'  '}
-                  {cmd.description}
-                </Text>
-              </Box>
-            );
-          })}
+          {showingCommandMatches
+            ? commandMatches.map((match, i) => {
+                const active = i === clampedIdx;
+                return (
+                  <Box key={match.name}>
+                    <Text color={active ? 'magenta' : 'gray'} bold={active}>
+                      {active ? '❯ ' : '  '}
+                    </Text>
+                    <Text color={active ? 'magenta' : 'gray'} bold={active}>
+                      {'/'}
+                      {match.name}
+                      {match.args ? (
+                        <Text color="gray"> {match.args}</Text>
+                      ) : null}
+                    </Text>
+                    <Text color={active ? 'white' : 'gray'}>
+                      {'  '}
+                      {match.description}
+                    </Text>
+                  </Box>
+                );
+              })
+            : inputSuggestions.map((match, i) => {
+                const active = i === clampedIdx;
+                return (
+                  <Box key={`${match.value}-${String(i)}`}>
+                    <Text color={active ? 'magenta' : 'gray'} bold={active}>
+                      {active ? '❯ ' : '  '}
+                    </Text>
+                    <Text color={active ? 'magenta' : 'gray'} bold={active}>
+                      {match.label}
+                    </Text>
+                    {match.description ? (
+                      <Text color={active ? 'white' : 'gray'}>
+                        {'  '}
+                        {match.description}
+                      </Text>
+                    ) : null}
+                  </Box>
+                );
+              })}
           <Text color="gray" dimColor>
-            {'  ↑↓ navigate · enter select · tab complete'}
+            {showingCommandMatches
+              ? '  ↑↓ navigate · enter select · tab complete'
+              : '  ↑↓ navigate · tab complete · enter submit'}
           </Text>
         </Box>
       )}
 
-      {matches.length === 0 &&
+      {activeMatchCount === 0 &&
         history.length > 0 &&
         !disabled &&
         !historySearchMode && (

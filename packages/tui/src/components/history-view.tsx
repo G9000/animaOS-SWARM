@@ -44,6 +44,12 @@ export interface HistoryViewProps {
   onBack: () => void;
   onRetry?: (entry: ResultEntry) => void;
   onSelect?: (entry: ResultEntry) => void;
+  onDelete?: (entry: ResultEntry) => void;
+  onUndoDelete?: () => void;
+  onDropOldestUndo?: () => void;
+  undoDeleteLabel?: string;
+  dropOldestUndoLabel?: string;
+  undoDeleteCount?: number;
   title?: string;
   selectActionLabel?: string;
   initialSelection?: 'first' | 'last';
@@ -68,6 +74,12 @@ export function HistoryView({
   onBack,
   onRetry,
   onSelect,
+  onDelete,
+  onUndoDelete,
+  onDropOldestUndo,
+  undoDeleteLabel,
+  dropOldestUndoLabel,
+  undoDeleteCount,
   title = 'History',
   selectActionLabel = 'open',
   initialSelection = 'last',
@@ -81,10 +93,13 @@ export function HistoryView({
   });
   const [searchMode, setSearchMode] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [pendingDropOldestUndo, setPendingDropOldestUndo] = useState(false);
 
   const clampedIdx =
     results.length === 0 ? 0 : Math.min(selectedIdx, results.length - 1);
   const selected = results[clampedIdx];
+  const pendingDeleteForSelected = pendingDeleteId === selected?.id;
   const normalizedQuery = searchQuery.trim().toLowerCase();
   const matchIndexes = normalizedQuery
     ? results.flatMap((entry, idx) =>
@@ -96,6 +111,8 @@ export function HistoryView({
   const visible = results.slice(start, start + 8);
 
   function updateSearch(nextQuery: string) {
+    setPendingDeleteId(null);
+    setPendingDropOldestUndo(false);
     setSearchQuery(nextQuery);
 
     const normalized = nextQuery.trim().toLowerCase();
@@ -117,6 +134,8 @@ export function HistoryView({
   function moveSearch(direction: 1 | -1) {
     const nextIdx = nextMatchIndex(matchIndexes, clampedIdx, direction);
     if (nextIdx !== null) {
+      setPendingDeleteId(null);
+      setPendingDropOldestUndo(false);
       setSelectedIdx(nextIdx);
     }
   }
@@ -125,6 +144,12 @@ export function HistoryView({
     if (key.escape && (searchMode || normalizedQuery)) {
       setSearchMode(false);
       setSearchQuery('');
+      return;
+    }
+
+    if (key.escape && (pendingDeleteId || pendingDropOldestUndo)) {
+      setPendingDeleteId(null);
+      setPendingDropOldestUndo(false);
       return;
     }
 
@@ -146,6 +171,8 @@ export function HistoryView({
     }
 
     if (!key.ctrl && !key.meta && input === '/') {
+      setPendingDeleteId(null);
+      setPendingDropOldestUndo(false);
       setSearchMode(true);
       return;
     }
@@ -161,21 +188,76 @@ export function HistoryView({
     }
 
     if (key.upArrow) {
+      setPendingDeleteId(null);
+      setPendingDropOldestUndo(false);
       setSelectedIdx((current) => Math.max(0, current - 1));
       return;
     }
 
     if (key.downArrow) {
+      setPendingDeleteId(null);
+      setPendingDropOldestUndo(false);
       setSelectedIdx((current) => Math.min(results.length - 1, current + 1));
       return;
     }
 
+    if (input.toLowerCase() === 'x' && selected && onDelete) {
+      if (pendingDeleteForSelected) {
+        setPendingDeleteId(null);
+        setPendingDropOldestUndo(false);
+        onDelete(selected);
+        return;
+      }
+
+      setPendingDropOldestUndo(false);
+      setPendingDeleteId(selected.id);
+      return;
+    }
+
     if (input.toLowerCase() === 'r' && selected && onRetry) {
+      if (pendingDeleteId) {
+        setPendingDeleteId(null);
+      }
+      if (pendingDropOldestUndo) {
+        setPendingDropOldestUndo(false);
+      }
       onRetry(selected);
       return;
     }
 
+    if (input.toLowerCase() === 'u' && onUndoDelete && undoDeleteLabel) {
+      if (pendingDeleteId) {
+        setPendingDeleteId(null);
+      }
+      if (pendingDropOldestUndo) {
+        setPendingDropOldestUndo(false);
+      }
+      onUndoDelete();
+      return;
+    }
+
+    if (input === 'D' && onDropOldestUndo && dropOldestUndoLabel) {
+      if (pendingDropOldestUndo) {
+        setPendingDropOldestUndo(false);
+        setPendingDeleteId(null);
+        onDropOldestUndo();
+        return;
+      }
+
+      if (pendingDeleteId) {
+        setPendingDeleteId(null);
+      }
+      setPendingDropOldestUndo(true);
+      return;
+    }
+
     if (key.return && selected && onSelect) {
+      if (pendingDeleteId) {
+        setPendingDeleteId(null);
+      }
+      if (pendingDropOldestUndo) {
+        setPendingDropOldestUndo(false);
+      }
       onSelect(selected);
       return;
     }
@@ -196,11 +278,58 @@ export function HistoryView({
           <Text bold color="cyan">
             {title}
           </Text>
-          <Text color="gray"> q or esc to return</Text>
+          <Text color="gray">
+            {' '}
+            {[
+              onUndoDelete && undoDeleteLabel ? 'u undo delete' : null,
+              onDropOldestUndo && dropOldestUndoLabel
+                ? pendingDropOldestUndo
+                  ? 'D confirm drop oldest undo'
+                  : 'D drop oldest undo'
+                : null,
+              'q or esc to return',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+          </Text>
         </Box>
         <Box marginTop={1}>
           <Text dimColor>No runs recorded yet.</Text>
         </Box>
+        {undoDeleteLabel ? (
+          <Box marginTop={1} flexDirection="column">
+            <Text bold color="yellow">
+              Undo delete
+            </Text>
+            <Text color="gray" wrap="wrap">
+              Press u to restore {undoDeleteLabel}.
+            </Text>
+            {undoDeleteCount && undoDeleteCount > 1 ? (
+              <Text color="gray" wrap="wrap">
+                {String(undoDeleteCount - 1)} more deleted saved run
+                {undoDeleteCount - 1 === 1 ? '' : 's'} queued.
+              </Text>
+            ) : null}
+            {onDropOldestUndo && dropOldestUndoLabel ? (
+              <Text color="gray" wrap="wrap">
+                {pendingDropOldestUndo
+                  ? `Press D again to discard oldest queued undo: ${dropOldestUndoLabel}.`
+                  : `Press D to discard oldest queued undo: ${dropOldestUndoLabel}.`}
+              </Text>
+            ) : null}
+            {pendingDropOldestUndo && dropOldestUndoLabel ? (
+              <Box marginTop={1} flexDirection="column">
+                <Text bold color="yellow">
+                  Confirm oldest undo discard
+                </Text>
+                <Text color="gray" wrap="wrap">
+                  Press D again to discard oldest queued undo:{' '}
+                  {dropOldestUndoLabel}. Press Esc to cancel.
+                </Text>
+              </Box>
+            ) : null}
+          </Box>
+        ) : null}
       </Box>
     );
   }
@@ -220,6 +349,18 @@ export function HistoryView({
             'N prev',
             onSelect ? `enter ${selectActionLabel}` : null,
             onRetry ? 'r retry' : null,
+            onDelete
+              ? pendingDeleteForSelected
+                ? 'x confirm delete'
+                : 'x delete'
+              : null,
+            onUndoDelete && undoDeleteLabel ? 'u undo delete' : null,
+            onDropOldestUndo && dropOldestUndoLabel
+              ? pendingDropOldestUndo
+                ? 'D confirm drop oldest undo'
+                : 'D drop oldest undo'
+              : null,
+            pendingDeleteForSelected ? 'esc cancel' : null,
             'q back',
           ]
             .filter(Boolean)
@@ -324,6 +465,50 @@ export function HistoryView({
             </Text>
             <Text wrap="wrap">{selected.result}</Text>
           </Box>
+          {pendingDeleteForSelected ? (
+            <Box marginTop={1} flexDirection="column">
+              <Text bold color="yellow">
+                Confirm delete
+              </Text>
+              <Text color="gray" wrap="wrap">
+                Press x again to delete this saved run. Press Esc to cancel.
+              </Text>
+            </Box>
+          ) : null}
+          {undoDeleteLabel && !pendingDeleteForSelected ? (
+            <Box marginTop={1} flexDirection="column">
+              <Text bold color="yellow">
+                Undo delete
+              </Text>
+              <Text color="gray" wrap="wrap">
+                Press u to restore {undoDeleteLabel}.
+              </Text>
+              {undoDeleteCount && undoDeleteCount > 1 ? (
+                <Text color="gray" wrap="wrap">
+                  {String(undoDeleteCount - 1)} more deleted saved run
+                  {undoDeleteCount - 1 === 1 ? '' : 's'} queued.
+                </Text>
+              ) : null}
+              {onDropOldestUndo && dropOldestUndoLabel ? (
+                <Text color="gray" wrap="wrap">
+                  {pendingDropOldestUndo
+                    ? `Press D again to discard oldest queued undo: ${dropOldestUndoLabel}.`
+                    : `Press D to discard oldest queued undo: ${dropOldestUndoLabel}.`}
+                </Text>
+              ) : null}
+            </Box>
+          ) : null}
+          {pendingDropOldestUndo && dropOldestUndoLabel ? (
+            <Box marginTop={1} flexDirection="column">
+              <Text bold color="yellow">
+                Confirm oldest undo discard
+              </Text>
+              <Text color="gray" wrap="wrap">
+                Press D again to discard oldest queued undo:{' '}
+                {dropOldestUndoLabel}. Press Esc to cancel.
+              </Text>
+            </Box>
+          ) : null}
         </Box>
       </Box>
     </Box>

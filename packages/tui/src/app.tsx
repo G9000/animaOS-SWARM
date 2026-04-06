@@ -14,7 +14,7 @@ import { AgentsPanel } from './components/agents-panel.js';
 import { TraceView } from './components/trace-view.js';
 import { HistoryView } from './components/history-view.js';
 import type { ResultEntry } from './components/result-log.js';
-import type { SlashCommand } from './components/input-bar.js';
+import type { InputSuggestion, SlashCommand } from './components/input-bar.js';
 import type { AgentProfile } from './types.js';
 
 export interface AppProps {
@@ -47,6 +47,14 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'history', description: 'browse past runs' },
   { name: 'resume', description: 'browse saved runs or resume by label' },
   { name: 'rename', description: 'name the current saved run' },
+  {
+    name: 'delete',
+    description: 'delete a saved run by label',
+    args: '<label>',
+  },
+  { name: 'undo', description: 'restore the last deleted saved run' },
+  { name: 'undo-drop', description: 'discard the oldest queued undo' },
+  { name: 'undo-status', description: 'show deleted-run undo queue' },
   { name: 'trace', description: 'inspect messages and tool activity' },
   { name: 'result', description: 'view the full last result' },
   { name: 'status', description: 'show current session state' },
@@ -58,7 +66,26 @@ const SLASH_COMMANDS: SlashCommand[] = [
 
 type AppView = 'swarm' | 'agents' | 'history' | 'trace' | 'result';
 type HistoryMode = 'history' | 'resume';
+type ResumeAssistState = {
+  kind: 'matches' | 'suggestions';
+  query: string;
+  entries: ResultEntry[];
+  selectedIdx: number;
+};
+type PendingDeleteCommandState = {
+  targetId: string;
+  label: string;
+  confirmationCommand: string;
+};
+type PendingDropOldestUndoCommandState = {
+  label: string;
+};
+type DeletedSavedRunState = {
+  entry: ResultEntry;
+  index: number;
+};
 const MAX_PROMPT_HISTORY = 100;
+const MAX_DELETED_SAVED_RUN_UNDOS = 5;
 
 function hasSavedRunLabel(
   entry: ResultEntry
@@ -109,6 +136,53 @@ function findSavedRunByLabel(
   );
 }
 
+function findSavedRunByExactLabel(
+  entries: ResultEntry[],
+  query: string
+): ResultEntry | undefined {
+  const normalized = query.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+
+  return sortResumeEntries(entries)
+    .filter(hasSavedRunLabel)
+    .find((entry) => entry.label.toLowerCase() === normalized);
+}
+
+function buildDeleteConfirmationCommand(label?: string): string {
+  const normalizedLabel = label?.trim().toLowerCase();
+  return normalizedLabel ? `/delete ${normalizedLabel}` : '/delete';
+}
+
+function formatUndoQueueStatus(
+  deletedSavedRunStack: DeletedSavedRunState[]
+): string {
+  if (deletedSavedRunStack.length === 0) {
+    return 'Undo queue empty. Delete a saved run first.';
+  }
+
+  const nextEntry =
+    deletedSavedRunStack[deletedSavedRunStack.length - 1]?.entry;
+  const oldestEntry = deletedSavedRunStack[0]?.entry;
+  const nextLabel = nextEntry?.label?.trim() || nextEntry?.task || 'unknown';
+  const oldestLabel =
+    oldestEntry?.label?.trim() || oldestEntry?.task || 'unknown';
+  const queueCount = deletedSavedRunStack.length;
+
+  return [
+    `Undo queue: ${String(queueCount)} deleted saved run${
+      queueCount === 1 ? '' : 's'
+    }.`,
+    `Next restore ${nextLabel}.`,
+    queueCount > 1 ? `Oldest queued ${oldestLabel}.` : null,
+    `Limit ${String(MAX_DELETED_SAVED_RUN_UNDOS)}.`,
+    'Open /resume and press u to restore.',
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
 function formatSavedRunMatchSummary(entries: ResultEntry[]): string {
   const preview = entries
     .slice(0, 3)
@@ -120,6 +194,188 @@ function formatSavedRunMatchSummary(entries: ResultEntry[]): string {
   }
 
   return `${preview}, +${String(entries.length - 3)} more`;
+}
+
+function subsequenceScore(source: string, query: string): number {
+  let score = 0;
+  let sourceIndex = 0;
+  let lastMatchIndex = -2;
+
+  for (const char of query) {
+    const matchIndex = source.indexOf(char, sourceIndex);
+    if (matchIndex === -1) {
+      return 0;
+    }
+
+    score += matchIndex === lastMatchIndex + 1 ? 3 : 1;
+    sourceIndex = matchIndex + 1;
+    lastMatchIndex = matchIndex;
+  }
+
+  return score;
+}
+
+function savedRunSuggestionScore(entry: ResultEntry, query: string): number {
+  if (!hasSavedRunLabel(entry)) {
+    return 0;
+  }
+
+  const normalizedLabel = entry.label.toLowerCase();
+  const normalizedQuery = query.trim().toLowerCase();
+  if (!normalizedQuery) {
+    return 0;
+  }
+
+  if (normalizedLabel === normalizedQuery) {
+    return 1000;
+  }
+
+  if (normalizedLabel.startsWith(normalizedQuery)) {
+    return 800 - normalizedLabel.length;
+  }
+
+  const includeIndex = normalizedLabel.indexOf(normalizedQuery);
+  if (includeIndex >= 0) {
+    return 600 - includeIndex;
+  }
+
+  return subsequenceScore(normalizedLabel, normalizedQuery);
+}
+
+function suggestSavedRunsByLabel(
+  entries: ResultEntry[],
+  query: string,
+  limit = 3
+): ResultEntry[] {
+  return sortResumeEntries(entries)
+    .map((entry) => ({
+      entry,
+      score: savedRunSuggestionScore(entry, query),
+    }))
+    .filter((candidate) => candidate.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, limit)
+    .map((candidate) => candidate.entry);
+}
+
+function uniqueSavedRunLabels(entries: ResultEntry[]): ResultEntry[] {
+  const seen = new Set<string>();
+
+  return entries.filter((entry) => {
+    if (!hasSavedRunLabel(entry)) {
+      return false;
+    }
+
+    const normalizedLabel = entry.label.toLowerCase();
+    if (seen.has(normalizedLabel)) {
+      return false;
+    }
+
+    seen.add(normalizedLabel);
+    return true;
+  });
+}
+
+function normalizeSavedRunLabel(label: string): string {
+  return label.trim().toLowerCase();
+}
+
+function suggestNextSavedRunLabel(
+  entries: ResultEntry[],
+  requestedLabel: string,
+  targetId?: string
+): string {
+  const normalizedRequested = requestedLabel.trim();
+  if (!normalizedRequested) {
+    return normalizedRequested;
+  }
+
+  const usedLabels = new Set(
+    entries
+      .filter((entry) => entry.id !== targetId)
+      .filter(hasSavedRunLabel)
+      .map((entry) => normalizeSavedRunLabel(entry.label))
+  );
+
+  if (!usedLabels.has(normalizeSavedRunLabel(normalizedRequested))) {
+    return normalizedRequested;
+  }
+
+  const suffixMatch = /^(.*?)(?:\s+(\d+))$/.exec(normalizedRequested);
+  const baseLabel = suffixMatch?.[1]?.trim() || normalizedRequested;
+  const hasExistingBaseLabel = usedLabels.has(
+    normalizeSavedRunLabel(baseLabel)
+  );
+  const candidateBase = hasExistingBaseLabel ? baseLabel : normalizedRequested;
+  let nextSuffix =
+    hasExistingBaseLabel && suffixMatch?.[2] ? Number(suffixMatch[2]) + 1 : 2;
+
+  let candidate = `${candidateBase} ${String(nextSuffix)}`;
+  while (usedLabels.has(normalizeSavedRunLabel(candidate))) {
+    nextSuffix += 1;
+    candidate = `${candidateBase} ${String(nextSuffix)}`;
+  }
+
+  return candidate;
+}
+
+function findSavedRunLabelSuggestionEntries(
+  entries: ResultEntry[],
+  query: string,
+  limit = 5
+): ResultEntry[] {
+  const normalizedQuery = query.trim();
+
+  if (!normalizedQuery) {
+    return uniqueSavedRunLabels(sortResumeEntries(entries)).slice(0, limit);
+  }
+
+  const directMatches = uniqueSavedRunLabels(
+    findSavedRunByLabel(entries, normalizedQuery)
+  );
+  if (directMatches.length > 0) {
+    return directMatches.slice(0, limit);
+  }
+
+  return uniqueSavedRunLabels(
+    suggestSavedRunsByLabel(entries, normalizedQuery, limit * 2)
+  ).slice(0, limit);
+}
+
+function buildSavedRunLabelInputSuggestions(
+  entries: ResultEntry[],
+  value: string,
+  commandName: 'resume' | 'rename' | 'delete',
+  limit = 5
+): InputSuggestion[] {
+  const match = new RegExp(`^/${commandName}(?:\\s+(.*))?$`, 'i').exec(value);
+  if (!match) {
+    return [];
+  }
+
+  const query = match[1]?.trim() ?? '';
+  const candidates = findSavedRunLabelSuggestionEntries(entries, query, limit);
+
+  const suggestions = candidates.map((entry) => ({
+    label: entry.label ?? entry.task,
+    value: `/${commandName} ${entry.label ?? entry.task}`,
+    description: entry.task,
+  }));
+
+  if (commandName === 'rename' && query) {
+    const suggestedLabel = suggestNextSavedRunLabel(entries, query);
+    if (
+      normalizeSavedRunLabel(suggestedLabel) !== normalizeSavedRunLabel(query)
+    ) {
+      suggestions.unshift({
+        label: suggestedLabel,
+        value: `/rename ${suggestedLabel}`,
+        description: 'next available label',
+      });
+    }
+  }
+
+  return suggestions.slice(0, limit);
 }
 
 export function App({
@@ -156,6 +412,16 @@ export function App({
   const [promptHistory, setPromptHistory] = useState<string[]>(
     initialResults.map((entry) => entry.task).slice(-MAX_PROMPT_HISTORY)
   );
+  const [resumeAssist, setResumeAssist] = useState<ResumeAssistState | null>(
+    null
+  );
+  const [pendingDeleteCommand, setPendingDeleteCommand] =
+    useState<PendingDeleteCommandState | null>(null);
+  const [pendingDropOldestUndoCommand, setPendingDropOldestUndoCommand] =
+    useState<PendingDropOldestUndoCommandState | null>(null);
+  const [deletedSavedRunStack, setDeletedSavedRunStack] = useState<
+    DeletedSavedRunState[]
+  >([]);
   const [systemMsg, setSystemMsg] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<AgentProfile[]>(agentProfiles);
   const [activeResultId, setActiveResultId] = useState<string | null>(
@@ -170,6 +436,19 @@ export function App({
     (activeResultId
       ? resultLog.find((entry) => entry.id === activeResultId)
       : undefined) ?? resultLog[resultLog.length - 1];
+  const nextUndoEntry =
+    deletedSavedRunStack[deletedSavedRunStack.length - 1]?.entry;
+  const nextUndoLabel =
+    nextUndoEntry?.label?.trim() || nextUndoEntry?.task || undefined;
+  const oldestUndoEntry = deletedSavedRunStack[0]?.entry;
+  const oldestUndoLabel =
+    oldestUndoEntry?.label?.trim() || oldestUndoEntry?.task || undefined;
+  const pendingDropOldestUndoLabel =
+    pendingDropOldestUndoCommand?.label === oldestUndoLabel
+      ? oldestUndoLabel
+      : undefined;
+  const undoQueueIsFull =
+    deletedSavedRunStack.length === MAX_DELETED_SAVED_RUN_UNDOS;
   const displayedHistoryResults =
     historyMode === 'resume' ? sortResumeEntries(resultLog) : resultLog;
   const canExitOneShot =
@@ -211,6 +490,27 @@ export function App({
     showMsg,
   ]);
 
+  const clearResumeAssist = useCallback(() => {
+    setResumeAssist(null);
+  }, []);
+
+  const moveResumeAssistSelection = useCallback((direction: 1 | -1) => {
+    setResumeAssist((current) => {
+      if (!current || current.entries.length === 0) {
+        return current;
+      }
+
+      const nextIdx =
+        (current.selectedIdx + direction + current.entries.length) %
+        current.entries.length;
+
+      return {
+        ...current,
+        selectedIdx: nextIdx,
+      };
+    });
+  }, []);
+
   const renameSavedRun = useCallback(
     (targetId: string, nextLabel: string) => {
       const normalizedLabel = nextLabel.trim();
@@ -222,6 +522,25 @@ export function App({
       const targetExists = resultLog.some((entry) => entry.id === targetId);
       if (!targetExists) {
         showMsg('Saved run no longer exists. Open /resume and try again.');
+        return;
+      }
+
+      const duplicateLabelEntry = resultLog.find(
+        (entry) =>
+          entry.id !== targetId &&
+          hasSavedRunLabel(entry) &&
+          normalizeSavedRunLabel(entry.label) ===
+            normalizeSavedRunLabel(normalizedLabel)
+      );
+      if (duplicateLabelEntry) {
+        const suggestedLabel = suggestNextSavedRunLabel(
+          resultLog,
+          normalizedLabel,
+          targetId
+        );
+        showMsg(
+          `Saved run label "${normalizedLabel}" is already used. Try /rename ${suggestedLabel} to keep /resume unambiguous.`
+        );
         return;
       }
 
@@ -241,12 +560,139 @@ export function App({
     [onHistoryUpdated, resultLog, showMsg]
   );
 
-  const openResultEntry = useCallback((entry: ResultEntry, resume = false) => {
-    setCurrentTask(entry.task);
-    setActiveResultId(entry.id);
-    setResumeEntryId(resume ? entry.id : null);
-    setView('result');
-  }, []);
+  const deleteSavedRun = useCallback(
+    (targetId: string) => {
+      const targetEntry = resultLog.find((entry) => entry.id === targetId);
+      if (!targetEntry) {
+        showMsg('Saved run no longer exists. Open /resume and try again.');
+        return;
+      }
+
+      const targetIndex = resultLog.findIndex((entry) => entry.id === targetId);
+
+      const next = resultLog.filter((entry) => entry.id !== targetId);
+      const nextDeletedSavedRunStack = [
+        ...deletedSavedRunStack,
+        {
+          entry: targetEntry,
+          index: targetIndex,
+        },
+      ];
+      const droppedUndoEntry =
+        nextDeletedSavedRunStack.length > MAX_DELETED_SAVED_RUN_UNDOS
+          ? nextDeletedSavedRunStack[0]
+          : undefined;
+
+      setResultLog(next);
+      setPendingDeleteCommand(null);
+      setPendingDropOldestUndoCommand(null);
+      setDeletedSavedRunStack(
+        nextDeletedSavedRunStack.slice(-MAX_DELETED_SAVED_RUN_UNDOS)
+      );
+      onHistoryUpdated?.(next);
+
+      if (activeResultId === targetId) {
+        setActiveResultId(next[next.length - 1]?.id ?? null);
+      }
+
+      if (resumeEntryId === targetId) {
+        setResumeEntryId(null);
+      }
+
+      showMsg(
+        `Deleted saved run: ${
+          targetEntry.label?.trim() || targetEntry.task
+        }. Press u to undo from /resume.${
+          droppedUndoEntry
+            ? ` Oldest undo dropped: ${
+                droppedUndoEntry.entry.label?.trim() ||
+                droppedUndoEntry.entry.task
+              }.`
+            : ''
+        }`
+      );
+    },
+    [
+      activeResultId,
+      deletedSavedRunStack,
+      onHistoryUpdated,
+      resultLog,
+      resumeEntryId,
+      showMsg,
+    ]
+  );
+
+  const undoDeleteSavedRun = useCallback(() => {
+    const lastDeletedSavedRun =
+      deletedSavedRunStack[deletedSavedRunStack.length - 1];
+    if (!lastDeletedSavedRun) {
+      showMsg('No deleted saved run to restore.');
+      return;
+    }
+
+    const insertIndex = Math.min(
+      Math.max(lastDeletedSavedRun.index, 0),
+      resultLog.length
+    );
+    const next = [
+      ...resultLog.slice(0, insertIndex),
+      lastDeletedSavedRun.entry,
+      ...resultLog.slice(insertIndex),
+    ];
+
+    setResultLog(next);
+    setPendingDropOldestUndoCommand(null);
+    setDeletedSavedRunStack((prev) => prev.slice(0, -1));
+    onHistoryUpdated?.(next);
+    const remainingUndos = deletedSavedRunStack.length - 1;
+    showMsg(
+      `Restored saved run: ${
+        lastDeletedSavedRun.entry.label?.trim() ||
+        lastDeletedSavedRun.entry.task
+      }${
+        remainingUndos > 0
+          ? `. ${String(remainingUndos)} more deleted run${
+              remainingUndos === 1 ? '' : 's'
+            } queued for undo.`
+          : ''
+      }`
+    );
+  }, [deletedSavedRunStack, onHistoryUpdated, resultLog, showMsg]);
+
+  const dropOldestDeletedSavedRun = useCallback(() => {
+    const oldestDeletedSavedRun = deletedSavedRunStack[0];
+    if (!oldestDeletedSavedRun) {
+      showMsg('No queued undo to discard.');
+      return;
+    }
+
+    setPendingDropOldestUndoCommand(null);
+    setDeletedSavedRunStack((prev) => prev.slice(1));
+    const remainingUndos = deletedSavedRunStack.length - 1;
+    showMsg(
+      `Dropped oldest queued undo: ${
+        oldestDeletedSavedRun.entry.label?.trim() ||
+        oldestDeletedSavedRun.entry.task
+      }${
+        remainingUndos > 0
+          ? `. ${String(remainingUndos)} deleted run${
+              remainingUndos === 1 ? '' : 's'
+            } still queued.`
+          : ''
+      }`
+    );
+  }, [deletedSavedRunStack, showMsg]);
+
+  const openResultEntry = useCallback(
+    (entry: ResultEntry, resume = false) => {
+      clearResumeAssist();
+      setCurrentTask(entry.task);
+      setActiveResultId(entry.id);
+      setResumeEntryId(resume ? entry.id : null);
+      setView('result');
+    },
+    [clearResumeAssist]
+  );
 
   const rememberPrompt = useCallback((input: string) => {
     setPromptHistory((prev) => [...prev, input].slice(-MAX_PROMPT_HISTORY));
@@ -259,6 +705,9 @@ export function App({
       }
 
       rememberPrompt(input);
+      clearResumeAssist();
+      setPendingDeleteCommand(null);
+      setPendingDropOldestUndoCommand(null);
       setCurrentTask(input);
       setActiveResultId(null);
       setResumeEntryId(null);
@@ -284,7 +733,7 @@ export function App({
       onResultRecorded?.(entry);
       setPhase('waiting');
     },
-    [onTask, rememberPrompt, reset, onResultRecorded]
+    [clearResumeAssist, onTask, rememberPrompt, reset, onResultRecorded]
   );
 
   useInput(
@@ -336,17 +785,58 @@ export function App({
         return;
       }
 
+      clearResumeAssist();
       setHistoryMode('resume');
       setView('history');
     },
     { isActive: interactive && phase === 'waiting' && view === 'swarm' }
   );
 
+  useInput(
+    (input, key) => {
+      if (!resumeAssist) {
+        return;
+      }
+
+      if (key.escape) {
+        clearResumeAssist();
+        return;
+      }
+
+      if (key.ctrl && input.toLowerCase() === 'n') {
+        moveResumeAssistSelection(1);
+        return;
+      }
+
+      if (key.ctrl && input.toLowerCase() === 'p') {
+        moveResumeAssistSelection(-1);
+        return;
+      }
+
+      if (key.ctrl && input.toLowerCase() === 'y') {
+        const entry = resumeAssist.entries[resumeAssist.selectedIdx];
+        if (entry) {
+          openResultEntry(entry, true);
+        }
+      }
+    },
+    { isActive: interactive && phase === 'waiting' && view === 'swarm' }
+  );
+
   const handleSlashCommand = useCallback(
     async (cmd: string) => {
+      clearResumeAssist();
       const [name, ...rest] = cmd.slice(1).trim().split(/\s+/);
       const args = rest.join(' ').trim();
-      switch (name.toLowerCase()) {
+      const commandName = name.toLowerCase();
+
+      if (commandName !== 'delete' && pendingDeleteCommand) {
+        setPendingDeleteCommand(null);
+      }
+      if (commandName !== 'undo-drop' && pendingDropOldestUndoCommand) {
+        setPendingDropOldestUndoCommand(null);
+      }
+      switch (commandName) {
         case 'agents':
           if (profiles.length === 0) {
             showMsg('No agent profiles loaded. Create an agency first.');
@@ -368,6 +858,15 @@ export function App({
           } else if (args) {
             const matchedEntries = findSavedRunByLabel(resultLog, args);
             if (matchedEntries.length === 0) {
+              const suggestions = suggestSavedRunsByLabel(resultLog, args);
+              if (suggestions.length > 0) {
+                setResumeAssist({
+                  kind: 'suggestions',
+                  query: args,
+                  entries: suggestions,
+                  selectedIdx: 0,
+                });
+              }
               showMsg(
                 `No saved run named "${args}". Type /resume to browse saved runs.`
               );
@@ -375,6 +874,12 @@ export function App({
             }
 
             if (matchedEntries.length > 1) {
+              setResumeAssist({
+                kind: 'matches',
+                query: args,
+                entries: matchedEntries.slice(0, 3),
+                selectedIdx: 0,
+              });
               showMsg(
                 `Multiple saved runs match "${args}": ${formatSavedRunMatchSummary(
                   matchedEntries
@@ -407,6 +912,63 @@ export function App({
           renameSavedRun(renameEntry.id, args || renameEntry.task);
           break;
         }
+        case 'delete': {
+          if (resultLog.length === 0) {
+            showMsg('No saved runs yet. Run a task first.');
+            break;
+          }
+
+          const targetEntry = args
+            ? findSavedRunByExactLabel(resultLog, args)
+            : view === 'result' && activeResult
+            ? activeResult
+            : undefined;
+
+          if (!args && !targetEntry) {
+            showMsg(
+              'Open a result or provide a saved run label, for example /delete release prep.'
+            );
+            break;
+          }
+
+          if (args && !targetEntry) {
+            showMsg(
+              `No saved run named "${args}". Use Tab completion or /resume to inspect saved runs.`
+            );
+            break;
+          }
+
+          if (!targetEntry) {
+            break;
+          }
+
+          const targetLabel = targetEntry.label?.trim() || args;
+          const confirmationCommand = args
+            ? buildDeleteConfirmationCommand(targetLabel)
+            : buildDeleteConfirmationCommand();
+
+          if (
+            pendingDeleteCommand?.targetId === targetEntry.id &&
+            pendingDeleteCommand.confirmationCommand === confirmationCommand
+          ) {
+            deleteSavedRun(targetEntry.id);
+            break;
+          }
+
+          setPendingDeleteCommand({
+            targetId: targetEntry.id,
+            label: targetEntry.label?.trim() || targetEntry.task,
+            confirmationCommand,
+          });
+          showMsg(
+            args
+              ? `Confirm delete: repeat /delete ${targetLabel} to remove this saved run.`
+              : `Confirm delete: repeat /delete to remove ${
+                  targetEntry.label?.trim() || targetEntry.task
+                }.`
+          );
+          break;
+        }
         case 'result':
           if (resultLog.length === 0) {
             showMsg('No results yet. Run a task first.');
@@ -419,6 +981,35 @@ export function App({
           break;
         case 'status':
           showStatus();
+          break;
+        case 'undo':
+          undoDeleteSavedRun();
+          break;
+        case 'undo-drop':
+          if (deletedSavedRunStack.length === 0) {
+            dropOldestDeletedSavedRun();
+            break;
+          }
+
+          if (
+            pendingDropOldestUndoCommand?.label === oldestUndoLabel &&
+            oldestUndoLabel
+          ) {
+            dropOldestDeletedSavedRun();
+            break;
+          }
+
+          if (oldestUndoLabel) {
+            setPendingDropOldestUndoCommand({
+              label: oldestUndoLabel,
+            });
+            showMsg(
+              `Confirm oldest undo discard: repeat /undo-drop to discard ${oldestUndoLabel}.`
+            );
+          }
+          break;
+        case 'undo-status':
+          showMsg(formatUndoQueueStatus(deletedSavedRunStack));
           break;
         case 'trace':
           if (!hasTrace) {
@@ -450,6 +1041,9 @@ export function App({
           setResultLog([]);
           setHistoryMode('history');
           setPromptHistory([]);
+          setPendingDeleteCommand(null);
+          setPendingDropOldestUndoCommand(null);
+          setDeletedSavedRunStack([]);
           reset();
           setCurrentTask('');
           setActiveResultId(null);
@@ -478,7 +1072,16 @@ export function App({
       activeResult,
       view,
       hasTrace,
+      clearResumeAssist,
+      deletedSavedRunStack,
+      moveResumeAssistSelection,
+      pendingDeleteCommand,
+      pendingDropOldestUndoCommand,
       renameSavedRun,
+      deleteSavedRun,
+      undoDeleteSavedRun,
+      dropOldestDeletedSavedRun,
+      oldestUndoLabel,
       openResultEntry,
       runTask,
       onClearHistory,
@@ -505,6 +1108,15 @@ export function App({
       onSaveAgent?.(profile);
     },
     [onSaveAgent]
+  );
+
+  const inputSuggestions = useCallback(
+    (value: string) => [
+      ...buildSavedRunLabelInputSuggestions(resultLog, value, 'resume'),
+      ...buildSavedRunLabelInputSuggestions(resultLog, value, 'rename'),
+      ...buildSavedRunLabelInputSuggestions(resultLog, value, 'delete'),
+    ],
+    [resultLog]
   );
 
   // ── Agents view ──
@@ -544,7 +1156,54 @@ export function App({
                 }
               : undefined
           }
+          onDelete={
+            interactive && historyMode === 'resume'
+              ? (entry: ResultEntry) => {
+                  deleteSavedRun(entry.id);
+                }
+              : undefined
+          }
+          onUndoDelete={
+            interactive &&
+            historyMode === 'resume' &&
+            deletedSavedRunStack.length > 0
+              ? () => {
+                  undoDeleteSavedRun();
+                }
+              : undefined
+          }
+          onDropOldestUndo={
+            interactive &&
+            historyMode === 'resume' &&
+            deletedSavedRunStack.length > 0
+              ? () => {
+                  dropOldestDeletedSavedRun();
+                }
+              : undefined
+          }
+          undoDeleteLabel={
+            historyMode === 'resume' && deletedSavedRunStack.length > 0
+              ? deletedSavedRunStack[
+                  deletedSavedRunStack.length - 1
+                ]?.entry.label?.trim() ||
+                deletedSavedRunStack[deletedSavedRunStack.length - 1]?.entry
+                  .task
+              : undefined
+          }
+          dropOldestUndoLabel={
+            historyMode === 'resume' && deletedSavedRunStack.length > 0
+              ? oldestUndoLabel
+              : undefined
+          }
+          undoDeleteCount={
+            historyMode === 'resume' ? deletedSavedRunStack.length : undefined
+          }
         />
+        {systemMsg ? (
+          <Box paddingX={2}>
+            <Text color="cyan">{systemMsg}</Text>
+          </Box>
+        ) : null}
       </Box>
     );
   }
@@ -574,6 +1233,10 @@ export function App({
       interactive && !activeResult.label
         ? 'Type /rename <label> to name this saved run.'
         : undefined;
+    const pendingDeleteNotice =
+      pendingDeleteCommand?.targetId === activeResult.id
+        ? `Repeat ${pendingDeleteCommand.confirmationCommand} to remove ${pendingDeleteCommand.label}. Any other command cancels.`
+        : undefined;
     return (
       <Box flexDirection="column">
         <ResultView
@@ -581,6 +1244,7 @@ export function App({
           onBack={() => setView('swarm')}
           hint={hint}
           note={note}
+          pendingDeleteNotice={pendingDeleteNotice}
         />
         {systemMsg ? (
           <Box paddingX={2}>
@@ -591,6 +1255,7 @@ export function App({
           onSubmit={handleTaskSubmit}
           disabled={false}
           history={promptHistory}
+          suggestions={inputSuggestions}
           commands={[
             { name: 'back', description: 'return to swarm view' },
             ...(resultLog.length > 0
@@ -603,6 +1268,22 @@ export function App({
                     name: 'rename',
                     description: 'name the current saved run',
                     args: '<label>',
+                  },
+                  {
+                    name: 'delete',
+                    description: 'delete the current saved run',
+                  },
+                  {
+                    name: 'undo',
+                    description: 'restore the last deleted saved run',
+                  },
+                  {
+                    name: 'undo-drop',
+                    description: 'discard the oldest queued undo',
+                  },
+                  {
+                    name: 'undo-status',
+                    description: 'show deleted-run undo queue',
                   },
                 ]
               : []),
@@ -677,6 +1358,33 @@ export function App({
         </Box>
       ) : null}
 
+      {interactive && phase === 'waiting' && deletedSavedRunStack.length > 0 ? (
+        <Box paddingX={1}>
+          <Text color="gray">
+            {`Undo queued: ${nextUndoLabel}${
+              deletedSavedRunStack.length > 1
+                ? ` (+${String(deletedSavedRunStack.length - 1)} more)`
+                : ''
+            }.${
+              undoQueueIsFull && oldestUndoLabel
+                ? ` Queue full. Next delete drops oldest: ${oldestUndoLabel}.`
+                : ''
+            } Use /undo or /undo-status.`}
+          </Text>
+        </Box>
+      ) : null}
+
+      {interactive && phase === 'waiting' && pendingDropOldestUndoLabel ? (
+        <Box paddingX={1}>
+          <Text color="yellow" bold>
+            Undo discard armed.
+          </Text>
+          <Text color="yellow">
+            {` Repeat /undo-drop to discard ${pendingDropOldestUndoLabel}. Any other command cancels.`}
+          </Text>
+        </Box>
+      ) : null}
+
       {interactive && phase === 'running' ? (
         <Box paddingX={1}>
           <Text color="gray">
@@ -691,11 +1399,48 @@ export function App({
         </Box>
       ) : null}
 
+      {resumeAssist && view === 'swarm' ? (
+        <Box
+          flexDirection="column"
+          borderStyle="single"
+          paddingX={1}
+          marginX={1}
+        >
+          <Text bold color="yellow">
+            {resumeAssist.kind === 'matches'
+              ? `Saved run matches for "${resumeAssist.query}"`
+              : `Closest saved runs for "${resumeAssist.query}"`}
+          </Text>
+          {resumeAssist.entries.map((entry, idx) => {
+            const active = idx === resumeAssist.selectedIdx;
+            return (
+              <Box key={entry.id} flexDirection="column" marginTop={1}>
+                <Text color={active ? 'magenta' : 'gray'} bold={active}>
+                  {active ? '❯ ' : '  '}
+                  {entry.label}
+                </Text>
+                <Text color="gray">
+                  {'  '}
+                  {entry.task}
+                </Text>
+              </Box>
+            );
+          })}
+          <Box marginTop={1}>
+            <Text color="gray" dimColor>
+              Retry with /resume {'<label>'}, Ctrl+N/Ctrl+P to move, Ctrl+Y to
+              open, or Ctrl+O to browse all saved runs.
+            </Text>
+          </Box>
+        </Box>
+      ) : null}
+
       {interactive ? (
         <InputBar
           onSubmit={handleTaskSubmit}
           disabled={phase === 'running'}
           history={promptHistory}
+          suggestions={inputSuggestions}
           commands={SLASH_COMMANDS}
         />
       ) : null}

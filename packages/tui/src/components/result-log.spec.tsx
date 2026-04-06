@@ -61,7 +61,7 @@ describe('ResultLog rendering', () => {
     expect(rendered.lastFrame()).not.toContain(longResult);
     expect(rendered.lastFrame()).toMatch(/R{3,}\.\.\./);
     expect(rendered.lastFrame()).toContain(
-      '/history browse all  /retry rerun last'
+      '/history browse all /retry rerun last'
     );
   });
 

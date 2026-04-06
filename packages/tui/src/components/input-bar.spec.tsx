@@ -1,6 +1,10 @@
 import React from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { InputBar, type SlashCommand } from './input-bar.js';
+import {
+  InputBar,
+  type InputSuggestion,
+  type SlashCommand,
+} from './input-bar.js';
 import {
   cleanupInk,
   pressInkKey,
@@ -77,6 +81,54 @@ describe('InputBar interactions', () => {
     await pressInkKey(rendered, '\r');
 
     expect(onSubmit).toHaveBeenCalledWith('/open session-1');
+  });
+
+  it('shows input suggestions for slash command arguments and submits the completed value', async () => {
+    const onSubmit = vi.fn();
+    const commands: SlashCommand[] = [
+      { name: 'resume', description: 'resume a saved run', args: '<label>' },
+    ];
+    const suggestions = (value: string): InputSuggestion[] =>
+      value.startsWith('/resume ')
+        ? [
+            {
+              label: 'launch docs',
+              value: '/resume launch docs',
+              description: 'Second task',
+            },
+            {
+              label: 'launch hotfix',
+              value: '/resume launch hotfix',
+              description: 'First task',
+            },
+          ]
+        : [];
+
+    const rendered = renderInk(
+      <InputBar
+        onSubmit={onSubmit}
+        commands={commands}
+        suggestions={suggestions}
+      />
+    );
+
+    for (const char of '/resume ') {
+      await pressInkKey(rendered, char);
+    }
+
+    expect(rendered.lastFrame()).toContain('launch docs');
+    expect(rendered.lastFrame()).toContain('launch hotfix');
+    expect(rendered.lastFrame()).toContain('Second task');
+
+    await pressInkKey(rendered, '\u001B[B');
+    await pressInkKey(rendered, '\t');
+
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain('/resume launch hotfix');
+
+    await pressInkKey(rendered, '\r');
+
+    expect(onSubmit).toHaveBeenCalledWith('/resume launch hotfix');
   });
 
   it('recalls previous prompts with arrow keys and restores the current draft', async () => {

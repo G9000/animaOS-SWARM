@@ -7,6 +7,7 @@ export interface ResultViewProps {
   onBack: () => void;
   hint?: string;
   note?: string;
+  pendingDeleteNotice?: string;
 }
 
 export function ResultView({
@@ -14,6 +15,7 @@ export function ResultView({
   onBack,
   hint,
   note,
+  pendingDeleteNotice,
 }: ResultViewProps): React.ReactElement {
   void onBack; // back is triggered via /back slash command in app
 
@@ -32,6 +34,16 @@ export function ResultView({
       {note ? (
         <Box marginTop={1}>
           <Text color="gray">{note}</Text>
+        </Box>
+      ) : null}
+      {pendingDeleteNotice ? (
+        <Box marginTop={1} flexDirection="column">
+          <Text bold color="yellow">
+            Pending delete
+          </Text>
+          <Text color="gray" wrap="wrap">
+            {pendingDeleteNotice}
+          </Text>
         </Box>
       ) : null}
       {entry.label ? (

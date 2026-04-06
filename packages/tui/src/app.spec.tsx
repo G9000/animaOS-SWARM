@@ -399,10 +399,15 @@ describe('App interactions', () => {
     await submit(rendered, '/help');
 
     expect(rendered.lastFrame()).toContain('/agents  browse and edit agents');
+    expect(rendered.lastFrame()).toContain('/delete');
     expect(rendered.lastFrame()).toContain('/rename');
     expect(rendered.lastFrame()).toContain('/resume');
+    expect(rendered.lastFrame()).toContain('/undo');
+    expect(rendered.lastFrame()).toContain('/undo-drop');
+    expect(rendered.lastFrame()).toContain('/undo-status');
     expect(rendered.lastFrame()).toContain('resume by label');
-    expect(rendered.lastFrame()).toContain('/clear  clear session history');
+    expect(rendered.lastFrame()).toContain('/clear');
+    expect(rendered.lastFrame()).toContain('session history');
   });
 
   it('resumes a saved run directly by label', async () => {
@@ -472,9 +477,229 @@ describe('App interactions', () => {
     expect(rendered.lastFrame()).toContain(
       'Multiple saved runs match "launch"'
     );
+    expect(rendered.lastFrame()).toContain('Saved run matches for "launch"');
     expect(rendered.lastFrame()).toContain('"launch docs"');
     expect(rendered.lastFrame()).toContain('"launch hotfix"');
+    expect(rendered.lastFrame()).toContain('Ctrl+Y to open');
     expect(rendered.lastFrame()).toContain('SWARM');
+  });
+
+  it('shows close saved-run suggestions after a failed /resume label lookup', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+            label: 'launch hotfix',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+            label: 'docs sweep',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/resume hotfx');
+
+    expect(rendered.lastFrame()).toContain(
+      'No saved run named "hotfx". Type /resume to browse saved runs.'
+    );
+    expect(rendered.lastFrame()).toContain('Closest saved runs for "hotfx"');
+    expect(rendered.lastFrame()).toContain('launch hotfix');
+    expect(rendered.lastFrame()).toContain('First task');
+  });
+
+  it('opens a saved-run suggestion directly from the swarm assist panel', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+            label: 'launch hotfix',
+            timestamp: 1,
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+            label: 'launch docs',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/resume launch');
+
+    expect(rendered.lastFrame()).toContain('Saved run matches for "launch"');
+    expect(rendered.lastFrame()).toContain('❯ launch docs');
+
+    await pressKey(rendered, '\u0010');
+
+    expect(rendered.lastFrame()).toContain('❯ launch hotfix');
+
+    await pressKey(rendered, '\u0019');
+
+    expect(rendered.lastFrame()).toContain('Result');
+    expect(rendered.lastFrame()).toContain('launch hotfix');
+    expect(rendered.lastFrame()).toContain('First task');
+    expect(rendered.lastFrame()).toContain('Resumed saved run.');
+  });
+
+  it('shows inline /resume label completions before submitting the command', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+            label: 'launch hotfix',
+            timestamp: 1,
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+            label: 'launch docs',
+          }),
+        ]}
+      />
+    );
+
+    for (const char of '/resume ') {
+      await pressKey(rendered, char);
+    }
+
+    expect(rendered.lastFrame()).toContain('launch docs');
+    expect(rendered.lastFrame()).toContain('launch hotfix');
+    expect(rendered.lastFrame()).toContain('Second task');
+
+    await pressKey(rendered, '\u001B[B');
+    await pressKey(rendered, '\t');
+
+    expect(rendered.lastFrame()).toContain('/resume launch hotfix');
+    expect(rendered.lastFrame()).toContain('launch hotfix');
+
+    await pressKey(rendered, '\r');
+
+    expect(rendered.lastFrame()).toContain('Result');
+    expect(rendered.lastFrame()).toContain('launch hotfix');
+    expect(rendered.lastFrame()).toContain('First task');
+    expect(rendered.lastFrame()).toContain('Resumed saved run.');
+  });
+
+  it('suggests a suffixed /rename label completion when the typed label is already taken', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+            label: 'launch hotfix',
+            timestamp: 1,
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+          }),
+        ]}
+      />
+    );
+
+    for (const char of '/rename launch hotfix') {
+      await pressKey(rendered, char);
+    }
+
+    expect(rendered.lastFrame()).toContain('launch hotfix 2');
+    expect(rendered.lastFrame()).toContain('next available label');
+
+    await pressKey(rendered, '\t');
+
+    expect(rendered.lastFrame()).toContain('/rename launch hotfix 2');
+
+    await pressKey(rendered, '\r');
+
+    expect(rendered.lastFrame()).toContain('Saved run named: launch hotfix 2');
+    expect(onHistoryUpdated).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'run-2',
+          label: 'launch hotfix 2',
+        }),
+      ])
+    );
+  });
+
+  it('warns when /rename reuses an existing saved-run label', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+            label: 'launch hotfix',
+            timestamp: 1,
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/rename launch hotfix');
+
+    expect(rendered.lastFrame()).toContain(
+      'Saved run label "launch hotfix" is already used.'
+    );
+    expect(rendered.lastFrame()).toContain('Try /rename launch hotfix 2');
+    expect(onHistoryUpdated).not.toHaveBeenCalled();
   });
 
   it('renames the selected saved run and shows the label in the resume picker', async () => {
@@ -648,6 +873,757 @@ describe('App interactions', () => {
 
     expect(onTask).toHaveBeenCalledWith('First task');
     expect(rendered.lastFrame()).toContain('Retried saved run');
+  });
+
+  it('deletes the selected saved run from the resume picker and persists the history update', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Named task',
+            result: 'Named result',
+            label: 'release prep',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Latest task',
+            result: 'Latest result',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/resume');
+
+    expect(rendered.lastFrame()).toContain('Resume');
+    expect(rendered.lastFrame()).toContain('x delete');
+    expect(rendered.lastFrame()).toContain('release prep');
+
+    await pressKey(rendered, 'x');
+
+    expect(onHistoryUpdated).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain('x confirm delete');
+    expect(rendered.lastFrame()).toContain('Confirm delete');
+
+    await pressKey(rendered, 'x');
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: release prep');
+    expect(rendered.lastFrame()).toContain('Saved runs (1)');
+    expect(rendered.lastFrame()).toContain('Latest task');
+    expect(onHistoryUpdated).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: 'run-2',
+        task: 'Latest task',
+      }),
+    ]);
+
+    expect(rendered.lastFrame()).toContain('u undo delete');
+    expect(rendered.lastFrame()).toContain('Press u to restore release prep.');
+
+    await pressKey(rendered, 'u');
+
+    expect(rendered.lastFrame()).toContain('Restored saved run: release prep');
+    expect(rendered.lastFrame()).toContain('Saved runs (2)');
+    expect(rendered.lastFrame()).toContain('release prep');
+    expect(onHistoryUpdated).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'release prep',
+      }),
+      expect.objectContaining({
+        id: 'run-2',
+        task: 'Latest task',
+      }),
+    ]);
+  });
+
+  it('undoes multiple saved-run deletions in LIFO order from the resume picker', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Alpha task',
+            result: 'Alpha result',
+            label: 'alpha',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Bravo task',
+            result: 'Bravo result',
+            label: 'bravo',
+          }),
+          createResultEntry({
+            id: 'run-3',
+            timestamp: 3,
+            task: 'Charlie task',
+            result: 'Charlie result',
+            label: 'charlie',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/resume');
+
+    expect(rendered.lastFrame()).toContain('charlie');
+
+    await pressKey(rendered, 'x');
+    await pressKey(rendered, 'x');
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: charlie');
+    expect(rendered.lastFrame()).toContain('bravo');
+    expect(rendered.lastFrame()).not.toContain('charlie  Charlie task');
+
+    await pressKey(rendered, 'x');
+    await pressKey(rendered, 'x');
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: bravo');
+    expect(rendered.lastFrame()).toContain('Press u to restore bravo.');
+    expect(rendered.lastFrame()).toContain('1 more deleted saved run queued.');
+    expect(rendered.lastFrame()).toContain('Saved runs (1)');
+
+    await pressKey(rendered, 'u');
+
+    expect(rendered.lastFrame()).toContain(
+      'Restored saved run: bravo. 1 more deleted run queued for undo.'
+    );
+    expect(rendered.lastFrame()).toContain('Press u to restore charlie.');
+    expect(rendered.lastFrame()).toContain('Saved runs (2)');
+
+    await pressKey(rendered, 'u');
+
+    expect(rendered.lastFrame()).toContain('Restored saved run: charlie');
+    expect(rendered.lastFrame()).toContain('Saved runs (3)');
+    expect(onHistoryUpdated).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'alpha',
+      }),
+      expect.objectContaining({
+        id: 'run-2',
+        label: 'bravo',
+      }),
+      expect.objectContaining({
+        id: 'run-3',
+        label: 'charlie',
+      }),
+    ]);
+  });
+
+  it('drops the oldest queued undo when the delete stack exceeds its limit', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'One task',
+            result: 'One result',
+            label: 'one',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Two task',
+            result: 'Two result',
+            label: 'two',
+          }),
+          createResultEntry({
+            id: 'run-3',
+            timestamp: 3,
+            task: 'Three task',
+            result: 'Three result',
+            label: 'three',
+          }),
+          createResultEntry({
+            id: 'run-4',
+            timestamp: 4,
+            task: 'Four task',
+            result: 'Four result',
+            label: 'four',
+          }),
+          createResultEntry({
+            id: 'run-5',
+            timestamp: 5,
+            task: 'Five task',
+            result: 'Five result',
+            label: 'five',
+          }),
+          createResultEntry({
+            id: 'run-6',
+            timestamp: 6,
+            task: 'Six task',
+            result: 'Six result',
+            label: 'six',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/resume');
+
+    for (let index = 0; index < 6; index += 1) {
+      await pressKey(rendered, 'x');
+      await pressKey(rendered, 'x');
+    }
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: one');
+    expect(rendered.lastFrame()).toContain('Oldest undo dropped: six.');
+    expect(rendered.lastFrame()).toContain('Press u to restore one.');
+    expect(rendered.lastFrame()).toContain('4 more deleted saved runs queued.');
+
+    for (let index = 0; index < 5; index += 1) {
+      await pressKey(rendered, 'u');
+    }
+
+    expect(rendered.lastFrame()).toContain('Saved runs (5)');
+    expect(rendered.lastFrame()).toContain('five');
+    expect(rendered.lastFrame()).not.toContain('six  Six task');
+    expect(onHistoryUpdated).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'one',
+      }),
+      expect.objectContaining({
+        id: 'run-2',
+        label: 'two',
+      }),
+      expect.objectContaining({
+        id: 'run-3',
+        label: 'three',
+      }),
+      expect.objectContaining({
+        id: 'run-4',
+        label: 'four',
+      }),
+      expect.objectContaining({
+        id: 'run-5',
+        label: 'five',
+      }),
+    ]);
+  });
+
+  it('shows delete undo queue status without opening the resume picker', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Alpha task',
+            result: 'Alpha result',
+            label: 'alpha',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Bravo task',
+            result: 'Bravo result',
+            label: 'bravo',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/undo-status');
+
+    expect(rendered.lastFrame()).toContain(
+      'Undo queue empty. Delete a saved run first.'
+    );
+
+    await submit(rendered, '/delete bravo');
+    await submit(rendered, '/delete bravo');
+    await submit(rendered, '/delete alpha');
+    await submit(rendered, '/delete alpha');
+    await submit(rendered, '/undo-status');
+
+    expect(rendered.lastFrame()).toContain('Undo queue: 2 deleted saved runs.');
+    expect(rendered.lastFrame()).toContain('Next restore alpha.');
+    expect(rendered.lastFrame()).toContain('Oldest queued bravo.');
+    expect(rendered.lastFrame()).toContain('Limit 5.');
+    expect(rendered.lastFrame()).toContain('Open /resume');
+    expect(rendered.lastFrame()).toContain('and press u to restore.');
+  });
+
+  it('restores the latest deleted saved run with /undo from swarm view', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Alpha task',
+            result: 'Alpha result',
+            label: 'alpha',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Bravo task',
+            result: 'Bravo result',
+            label: 'bravo',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/undo');
+
+    expect(rendered.lastFrame()).toContain('No deleted saved run to restore.');
+
+    await submit(rendered, '/delete bravo');
+    await submit(rendered, '/delete bravo');
+    await submit(rendered, '/undo');
+
+    expect(rendered.lastFrame()).toContain('Restored saved run: bravo');
+    expect(onHistoryUpdated).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'alpha',
+      }),
+      expect.objectContaining({
+        id: 'run-2',
+        label: 'bravo',
+      }),
+    ]);
+  });
+
+  it('discards the oldest queued undo with /undo-drop from swarm view', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Alpha task',
+            result: 'Alpha result',
+            label: 'alpha',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Bravo task',
+            result: 'Bravo result',
+            label: 'bravo',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/undo-drop');
+
+    expect(rendered.lastFrame()).toContain('No queued undo to discard.');
+
+    await submit(rendered, '/delete bravo');
+    await submit(rendered, '/delete bravo');
+    await submit(rendered, '/delete alpha');
+    await submit(rendered, '/delete alpha');
+    await submit(rendered, '/undo-drop');
+
+    expect(rendered.lastFrame()).toContain(
+      'Confirm oldest undo discard: repeat /undo-drop to discard bravo.'
+    );
+    expect(rendered.lastFrame()).toContain('Undo discard armed.');
+    expect(rendered.lastFrame()).toContain(
+      'Repeat /undo-drop to discard bravo.'
+    );
+    expect(rendered.lastFrame()).toContain('Any other command cancels.');
+    expect(onHistoryUpdated).toHaveBeenCalledTimes(2);
+
+    await submit(rendered, '/undo-drop');
+
+    expect(rendered.lastFrame()).toContain(
+      'Dropped oldest queued undo: bravo.'
+    );
+    expect(rendered.lastFrame()).toContain('1 deleted run still queued.');
+    expect(rendered.lastFrame()).toContain('Undo queued: alpha.');
+    expect(rendered.lastFrame()).not.toContain('Undo discard armed.');
+
+    await submit(rendered, '/undo');
+
+    expect(rendered.lastFrame()).toContain('Restored saved run: alpha');
+    expect(onHistoryUpdated).toHaveBeenLastCalledWith([
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'alpha',
+      }),
+    ]);
+  });
+
+  it('discards the oldest queued undo with D from the resume picker', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Alpha task',
+            result: 'Alpha result',
+            label: 'alpha',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Bravo task',
+            result: 'Bravo result',
+            label: 'bravo',
+          }),
+          createResultEntry({
+            id: 'run-3',
+            timestamp: 3,
+            task: 'Charlie task',
+            result: 'Charlie result',
+            label: 'charlie',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/resume');
+    await pressKey(rendered, 'x');
+    await pressKey(rendered, 'x');
+    await pressKey(rendered, 'x');
+    await pressKey(rendered, 'x');
+
+    expect(rendered.lastFrame()).toContain('Press u to restore bravo.');
+    expect(rendered.lastFrame()).toContain(
+      'Press D to discard oldest queued undo: charlie.'
+    );
+
+    await pressKey(rendered, 'D');
+
+    expect(rendered.lastFrame()).toContain('D confirm');
+    expect(rendered.lastFrame()).toContain('drop oldest undo');
+    expect(rendered.lastFrame()).toContain('Confirm oldest undo discard');
+    expect(rendered.lastFrame()).toContain(
+      'Press D again to discard oldest queued undo: charlie.'
+    );
+
+    await pressKey(rendered, 'D');
+
+    expect(rendered.lastFrame()).toContain(
+      'Dropped oldest queued undo: charlie.'
+    );
+    expect(rendered.lastFrame()).toContain('1 deleted run still queued.');
+    expect(rendered.lastFrame()).toContain('Press u to restore bravo.');
+    expect(rendered.lastFrame()).not.toContain(
+      'Press D to discard oldest queued undo: charlie.'
+    );
+  });
+
+  it('shows a persistent swarm undo hint when deleted runs are queued', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Alpha task',
+            result: 'Alpha result',
+            label: 'alpha',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/delete alpha');
+    await submit(rendered, '/delete alpha');
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: alpha');
+    expect(rendered.lastFrame()).toContain(
+      'Undo queued: alpha. Use /undo or /undo-status.'
+    );
+    expect(rendered.lastFrame()).not.toContain(
+      'Press Ctrl+O to open saved runs.'
+    );
+  });
+
+  it('shows a full-queue warning in the swarm undo hint when the stack is full', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'One task',
+            result: 'One result',
+            label: 'one',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Two task',
+            result: 'Two result',
+            label: 'two',
+          }),
+          createResultEntry({
+            id: 'run-3',
+            timestamp: 3,
+            task: 'Three task',
+            result: 'Three result',
+            label: 'three',
+          }),
+          createResultEntry({
+            id: 'run-4',
+            timestamp: 4,
+            task: 'Four task',
+            result: 'Four result',
+            label: 'four',
+          }),
+          createResultEntry({
+            id: 'run-5',
+            timestamp: 5,
+            task: 'Five task',
+            result: 'Five result',
+            label: 'five',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/delete five');
+    await submit(rendered, '/delete five');
+    await submit(rendered, '/delete four');
+    await submit(rendered, '/delete four');
+    await submit(rendered, '/delete three');
+    await submit(rendered, '/delete three');
+    await submit(rendered, '/delete two');
+    await submit(rendered, '/delete two');
+    await submit(rendered, '/delete one');
+    await submit(rendered, '/delete one');
+
+    expect(rendered.lastFrame()).toContain('Undo queued: one (+4 more).');
+    expect(rendered.lastFrame()).toContain('Queue full.');
+    expect(rendered.lastFrame()).toContain('Next delete drops oldest: five.');
+    expect(rendered.lastFrame()).toContain('Use /undo or /undo-status.');
+  });
+
+  it('deletes the current result with /delete after confirmation', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        resumeLastResult
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Earlier task',
+            result: 'Earlier result',
+            label: 'release prep',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Latest task',
+            result: 'Latest result',
+            label: 'ship ready',
+          }),
+        ]}
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('ship ready');
+
+    await submit(rendered, '/delete ');
+
+    expect(onHistoryUpdated).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain('Pending delete');
+    expect(rendered.lastFrame()).toContain(
+      'Repeat /delete to remove ship ready. Any other command cancels.'
+    );
+    expect(rendered.lastFrame()).toContain(
+      'Confirm delete: repeat /delete to remove ship ready.'
+    );
+
+    await submit(rendered, '/delete ');
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: ship ready');
+    expect(rendered.lastFrame()).toContain('Earlier result');
+    expect(rendered.lastFrame()).not.toContain('Latest result');
+    expect(onHistoryUpdated).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: 'run-1',
+        label: 'release prep',
+      }),
+    ]);
+  });
+
+  it('deletes a saved run by label from the prompt after confirmation', async () => {
+    mockEventLog();
+    const onHistoryUpdated = vi.fn();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        onHistoryUpdated={onHistoryUpdated}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Named task',
+            result: 'Named result',
+            label: 'release prep',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Latest task',
+            result: 'Latest result',
+          }),
+        ]}
+      />
+    );
+
+    for (const char of '/delete ') {
+      await pressKey(rendered, char);
+    }
+
+    expect(rendered.lastFrame()).toContain('release prep');
+
+    await pressKey(rendered, '\t');
+    await pressKey(rendered, '\r');
+
+    expect(onHistoryUpdated).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain(
+      'Confirm delete: repeat /delete release prep to remove this saved run.'
+    );
+
+    await submit(rendered, '/delete release prep');
+
+    expect(rendered.lastFrame()).toContain('Deleted saved run: release prep');
+    expect(rendered.lastFrame()).toContain('Press u to undo from /resume.');
+    expect(rendered.lastFrame()).toContain('Latest task');
+    expect(rendered.lastFrame()).toContain('Past runs');
+    expect(onHistoryUpdated).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: 'run-2',
+        task: 'Latest task',
+      }),
+    ]);
+  });
+
+  it('asks for a current result or label when /delete is used from swarm view', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Named task',
+            result: 'Named result',
+            label: 'release prep',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/delete ');
+
+    expect(rendered.lastFrame()).toContain(
+      'Open a result or provide a saved run label, for example /delete release prep.'
+    );
+  });
+
+  it('shows guidance when /delete cannot find an exact saved-run label', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="round-robin"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Named task',
+            result: 'Named result',
+            label: 'release prep',
+          }),
+        ]}
+      />
+    );
+
+    await submit(rendered, '/delete release');
+
+    expect(rendered.lastFrame()).toContain(
+      'No saved run named "release". Use Tab completion or /resume to inspect saved runs.'
+    );
+    expect(rendered.lastFrame()).toContain('release prep');
   });
 
   it('opens the resume picker with ctrl+o from the swarm view', async () => {

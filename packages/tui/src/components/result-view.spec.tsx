@@ -59,6 +59,25 @@ describe('ResultView rendering', () => {
     expect(rendered.lastFrame()).not.toContain('Saved run:');
   });
 
+  it('renders a pending delete banner when provided', () => {
+    const rendered = renderInk(
+      <ResultView
+        entry={createResultEntry({
+          task: 'Ship the patch',
+          result: 'Done',
+          label: 'Release prep',
+        })}
+        onBack={() => undefined}
+        pendingDeleteNotice="Repeat /delete to remove Release prep. Any other command cancels."
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('Pending delete');
+    expect(rendered.lastFrame()).toContain(
+      'Repeat /delete to remove Release prep. Any other command cancels.'
+    );
+  });
+
   it('renders an error result without a hint', () => {
     const rendered = renderInk(
       <ResultView
