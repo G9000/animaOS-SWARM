@@ -1,11 +1,15 @@
-# memory
+# @animaOS-SWARM/memory
 
-This library was generated with [Nx](https://nx.dev).
+TypeScript memory primitives for animaOS-SWARM.
 
-## Building
+This package provides BM25 search, task history, document ingestion, memory management helpers, and the TypeScript memory plugin/provider surface used by local workflows and compatibility layers.
 
-Run `nx build memory` to build the library.
+The canonical production memory services live in `packages/animaos-rs`, but this package remains useful for shared utilities, tests, and local tooling.
 
-## Running unit tests
+## Build
 
-Run `nx test memory` to execute the unit tests via [Vitest](https://vitest.dev/).
+Run `bun x nx build @animaOS-SWARM/memory`.
+
+## Test
+
+Run `bun x nx test @animaOS-SWARM/memory`.

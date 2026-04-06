@@ -30,6 +30,27 @@ export interface AgentRuntimeOptions {
   onBroadcast?: (message: Content) => Promise<void>;
 }
 
+function toolResultText(result: TaskResult): string | undefined {
+  if (result.status === 'error') {
+    return result.error;
+  }
+
+  if (typeof result.data === 'string') {
+    return result.data;
+  }
+
+  if (
+    result.data &&
+    typeof result.data === 'object' &&
+    'text' in result.data &&
+    typeof (result.data as { text?: unknown }).text === 'string'
+  ) {
+    return (result.data as { text: string }).text;
+  }
+
+  return undefined;
+}
+
 export class AgentRuntime implements IAgentRuntime {
   readonly agentId: UUID;
   readonly config: AgentConfig;
@@ -316,6 +337,7 @@ export class AgentRuntime implements IAgentRuntime {
           toolName: toolCall.name,
           status: result.status,
           durationMs: Date.now() - startTime,
+          result: toolResultText(result),
         },
         this.agentId
       );
@@ -330,6 +352,7 @@ export class AgentRuntime implements IAgentRuntime {
           toolName: toolCall.name,
           status: 'error',
           durationMs,
+          result: err instanceof Error ? err.message : String(err),
         },
         this.agentId
       );

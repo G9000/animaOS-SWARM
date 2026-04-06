@@ -45,6 +45,55 @@ function applyValue(
   return { ...profile, [field]: value };
 }
 
+function matchesAgentProfile(profile: AgentProfile, query: string): boolean {
+  return [
+    profile.name,
+    profile.role,
+    profile.bio,
+    profile.lore,
+    profile.style,
+    profile.system,
+    profile.adjectives?.join(' '),
+    profile.topics?.join(' '),
+    profile.knowledge?.join(' '),
+  ]
+    .filter((value): value is string => Boolean(value))
+    .join('\n')
+    .toLowerCase()
+    .includes(query);
+}
+
+function nextMatchIndex(
+  matchIndexes: number[],
+  currentIdx: number,
+  direction: 1 | -1
+): number | null {
+  if (matchIndexes.length === 0) {
+    return null;
+  }
+
+  const currentMatch = matchIndexes.indexOf(currentIdx);
+  if (currentMatch >= 0) {
+    return (
+      matchIndexes[
+        (currentMatch + direction + matchIndexes.length) % matchIndexes.length
+      ] ?? null
+    );
+  }
+
+  if (direction > 0) {
+    return (
+      matchIndexes.find((idx) => idx > currentIdx) ?? matchIndexes[0] ?? null
+    );
+  }
+
+  return (
+    [...matchIndexes].reverse().find((idx) => idx < currentIdx) ??
+    matchIndexes[matchIndexes.length - 1] ??
+    null
+  );
+}
+
 export interface AgentsPanelProps {
   profiles: AgentProfile[];
   onBack: () => void;
@@ -62,8 +111,49 @@ export function AgentsPanel({
   const [editValue, setEditValue] = useState('');
   const [draft, setDraft] = useState<AgentProfile | null>(null);
   const [savedMsg, setSavedMsg] = useState(false);
+  const [searchMode, setSearchMode] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
 
   const selected = profiles[agentIdx] ?? profiles[0];
+  const normalizedQuery = searchQuery.trim().toLowerCase();
+  const matchIndexes = normalizedQuery
+    ? profiles.flatMap((profile, idx) =>
+        matchesAgentProfile(profile, normalizedQuery) ? [idx] : []
+      )
+    : [];
+  const currentMatch = matchIndexes.indexOf(agentIdx);
+
+  const updateSearch = useCallback(
+    (nextQuery: string) => {
+      setSearchQuery(nextQuery);
+
+      const normalized = nextQuery.trim().toLowerCase();
+      if (!normalized) {
+        return;
+      }
+
+      const nextMatches = profiles.flatMap((profile, idx) =>
+        matchesAgentProfile(profile, normalized) ? [idx] : []
+      );
+      const nextIdx =
+        nextMatches.find((idx) => idx >= agentIdx) ?? nextMatches[0];
+
+      if (nextIdx !== undefined) {
+        setAgentIdx(nextIdx);
+      }
+    },
+    [agentIdx, profiles]
+  );
+
+  const moveSearch = useCallback(
+    (direction: 1 | -1) => {
+      const nextIdx = nextMatchIndex(matchIndexes, agentIdx, direction);
+      if (nextIdx !== null) {
+        setAgentIdx(nextIdx);
+      }
+    },
+    [agentIdx, matchIndexes]
+  );
 
   const enterEdit = useCallback((profile: AgentProfile) => {
     const d = { ...profile };
@@ -102,6 +192,44 @@ export function AgentsPanel({
 
   useInput((input, key) => {
     if (phase === 'list') {
+      if (key.escape && (searchMode || normalizedQuery)) {
+        setSearchMode(false);
+        setSearchQuery('');
+        return;
+      }
+
+      if (searchMode) {
+        if (key.return) {
+          setSearchMode(false);
+          return;
+        }
+
+        if (key.backspace || key.delete) {
+          updateSearch(searchQuery.slice(0, -1));
+          return;
+        }
+
+        if (!key.ctrl && !key.meta && !key.tab && input.length > 0) {
+          updateSearch(searchQuery + input);
+        }
+        return;
+      }
+
+      if (!key.ctrl && !key.meta && input === '/') {
+        setSearchMode(true);
+        return;
+      }
+
+      if (normalizedQuery && input === 'n') {
+        moveSearch(1);
+        return;
+      }
+
+      if (normalizedQuery && input === 'N') {
+        moveSearch(-1);
+        return;
+      }
+
       if (key.upArrow) setAgentIdx((i) => Math.max(0, i - 1));
       else if (key.downArrow)
         setAgentIdx((i) => Math.min(profiles.length - 1, i + 1));
@@ -135,13 +263,36 @@ export function AgentsPanel({
         <Text bold color="white">
           Agents ({profiles.length})
         </Text>
+        {searchMode || normalizedQuery ? (
+          <Box marginTop={1}>
+            <Text color="magenta">/ </Text>
+            <Text color={searchQuery.length > 0 ? 'white' : 'gray'}>
+              {searchQuery.length > 0
+                ? searchQuery
+                : 'type to search names and profiles'}
+            </Text>
+            <Text color="gray">
+              {normalizedQuery
+                ? matchIndexes.length > 0
+                  ? `  ${String(currentMatch + 1)}/${String(
+                      matchIndexes.length
+                    )}`
+                  : '  no matches'
+                : '  enter close · esc clear'}
+            </Text>
+          </Box>
+        ) : null}
         <Box flexDirection="column" marginTop={1}>
           {profiles.map((p, i) => {
             const active = i === agentIdx;
+            const matched = matchIndexes.includes(i);
             const prefix = p.role === 'orchestrator' ? '★' : '•';
             return (
               <Box key={p.name}>
-                <Text color={active ? 'cyan' : 'gray'} bold={active}>
+                <Text
+                  color={active ? 'cyan' : matched ? 'yellow' : 'gray'}
+                  bold={active}
+                >
                   {active ? '❯ ' : '  '}
                   {prefix} {p.name}
                 </Text>
@@ -161,7 +312,8 @@ export function AgentsPanel({
         </Box>
         <Box marginTop={1}>
           <Text color="gray" dimColor>
-            ↑↓ navigate{'  '}enter view{'  '}e edit{'  '}q back
+            ↑↓ navigate{'  '}/ search{'  '}n next{'  '}N prev{'  '}enter view
+            {'  '}e edit{'  '}q back
           </Text>
         </Box>
       </Box>

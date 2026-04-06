@@ -4,6 +4,8 @@
 
 A swarm framework — agents with personality, built to do work.
 
+The terminal UI should be the primary operator surface. The web UI can follow after the TUI is strong enough to support daily use.
+
 ---
 
 ## Current State
@@ -34,6 +36,13 @@ A swarm framework — agents with personality, built to do work.
 - Decision trace: which agent ran, what tool, what it returned, why
 - Structured JSONL output that can be piped to external systems
 
+**1.6 TUI as the primary control surface**
+
+- Make `launch` the default operator workflow worth staying inside
+- Keyboard-first navigation between agents, tools, logs, and final output
+- Inline approvals, pending states, and failure recovery in the terminal flow
+- Session resume, recent-run browsing, and memory drill-down without leaving the terminal
+
 **1.2 Confidence scoring as output contract**
 
 - Agents return `{ text, confidence: 0–100 }` not just text
@@ -57,26 +66,26 @@ A swarm framework — agents with personality, built to do work.
 Full character definition in `anima.yaml` — not coding-centric, works for any domain (legal, medical, creative, financial, research, anything):
 
 ```yaml
-bio: string[]           # who they are — multiple facets, not a single line
-lore: string[]          # backstory and context that colors their behavior
-topics: string[]        # areas of expertise and genuine interest
-adjectives: string[]    # personality descriptors compiled into prompt
+bio: string[] # who they are — multiple facets, not a single line
+lore: string[] # backstory and context that colors their behavior
+topics: string[] # areas of expertise and genuine interest
+adjectives: string[] # personality descriptors compiled into prompt
 style:
-  all: string[]         # how they communicate in every context
-  task: string[]        # how they approach work specifically
-messageExamples:        # few-shot examples — the biggest quality lever
-  - input: "..."
-    output: "..."
-knowledge: string[]     # domain knowledge chunks injected into context
-expertise:              # any domain, not language/tool specific
+  all: string[] # how they communicate in every context
+  task: string[] # how they approach work specifically
+messageExamples: # few-shot examples — the biggest quality lever
+  - input: '...'
+    output: '...'
+knowledge: string[] # domain knowledge chunks injected into context
+expertise: # any domain, not language/tool specific
   oncology: expert
   negotiation: intermediate
-collaborationStyle:     # how they behave alongside other agents in a swarm
-  - "challenges assumptions before accepting"
-  - "defers to domain specialists"
-confidenceBands:        # how they signal certainty in their output
+collaborationStyle: # how they behave alongside other agents in a swarm
+  - 'challenges assumptions before accepting'
+  - 'defers to domain specialists'
+confidenceBands: # how they signal certainty in their output
   high: "I'm confident that..."
-  low: "This needs verification but..."
+  low: 'This needs verification but...'
 ```
 
 - All fields optional — agents without them work exactly as today
@@ -191,14 +200,15 @@ confidenceBands:        # how they signal certainty in their output
 | #   | Item                                 | Why                                 |
 | --- | ------------------------------------ | ----------------------------------- |
 | 1   | Observability (1.1)                  | Can't trust what you can't see      |
-| 2   | Confidence scoring (1.2)             | Quality gate on every result        |
-| 3   | Parallel dispatch (2.1)              | Immediate performance win           |
-| 4   | Model allocation (1.3)               | Cost control at scale               |
-| 5   | Memory confidence + categories (1.4) | Better memory, small effort         |
-| 6   | Rich agent personality (1.5)         | Agents that feel like someone       |
-| 7   | Generate → validate (2.2)            | Biggest quality differentiator      |
-| 8   | Real-time shared memory (2.4)        | Agents that actually coordinate     |
-| 9   | Knowledge graph (2.5)                | Shared discovery across agents      |
-| 10  | Stop hook loops (3.1)                | Self-healing without infrastructure |
-| 11  | Sub-swarm routing (3.3)              | The moat                            |
-| 12  | Pluggability (4.x)                   | Swappable backends                  |
+| 2   | TUI operator surface (1.6)           | Main product surface for daily use  |
+| 3   | Confidence scoring (1.2)             | Quality gate on every result        |
+| 4   | Parallel dispatch (2.1)              | Immediate performance win           |
+| 5   | Model allocation (1.3)               | Cost control at scale               |
+| 6   | Memory confidence + categories (1.4) | Better memory, small effort         |
+| 7   | Rich agent personality (1.5)         | Agents that feel like someone       |
+| 8   | Generate → validate (2.2)            | Biggest quality differentiator      |
+| 9   | Real-time shared memory (2.4)        | Agents that actually coordinate     |
+| 10  | Knowledge graph (2.5)                | Shared discovery across agents      |
+| 11  | Stop hook loops (3.1)                | Self-healing without infrastructure |
+| 12  | Sub-swarm routing (3.3)              | The moat                            |
+| 13  | Pluggability (4.x)                   | Swappable backends                  |

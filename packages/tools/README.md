@@ -1,11 +1,15 @@
-# tools
+# @animaOS-SWARM/tools
 
-This library was generated with [Nx](https://nx.dev).
+TypeScript tool execution and policy utilities for animaOS-SWARM.
 
-## Building
+This package exports the tool registry, executor, hook system, permission checks, secret handling, validation, truncation, and shell helpers used by local workflows and test harnesses.
 
-Run `nx build tools` to build the library.
+The Rust daemon owns canonical production tool execution, but this package still carries the workspace's shared tool contracts and local utilities.
 
-## Running unit tests
+## Build
 
-Run `nx test tools` to execute the unit tests via [Vitest](https://vitest.dev/).
+Run `bun x nx build @animaOS-SWARM/tools`.
+
+## Test
+
+Run `bun x nx test @animaOS-SWARM/tools`.

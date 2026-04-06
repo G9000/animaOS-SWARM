@@ -4,7 +4,7 @@ export default defineConfig(() => ({
   root: __dirname,
   cacheDir: '../../node_modules/.vite/packages/sdk',
   test: {
-    name: '@org/sdk',
+    name: '@animaOS-SWARM/sdk',
     watch: false,
     globals: true,
     environment: 'node',

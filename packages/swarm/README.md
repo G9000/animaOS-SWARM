@@ -1,11 +1,15 @@
-# swarm
+# @animaOS-SWARM/swarm
 
-This library was generated with [Nx](https://nx.dev).
+TypeScript swarm coordination primitives for animaOS-SWARM.
 
-## Building
+This package exports `SwarmCoordinator`, `MessageBus`, the built-in supervisor, dynamic, and round-robin strategies, plus the `swarm()` helper for constructing swarm configs.
 
-Run `nx build swarm` to build the library.
+The Rust workspace owns canonical production execution, but this package remains useful for shared types, local orchestration utilities, and compatibility tests.
 
-## Running unit tests
+## Build
 
-Run `nx test swarm` to execute the unit tests via [Vitest](https://vitest.dev/).
+Run `bun x nx build @animaOS-SWARM/swarm`.
+
+## Test
+
+Run `bun x nx test @animaOS-SWARM/swarm`.

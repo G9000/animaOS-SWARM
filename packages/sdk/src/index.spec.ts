@@ -253,6 +253,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
     fetchMock.mockResolvedValueOnce(
       sseResponse([
         'event: swarm:running\ndata: {"swarmId":"swarm-1","state":{"status":"running"},"result":null}\n\n',
+        'event: tool:after\ndata: {"agentId":"agent-1","agentName":"manager","toolName":"memory_search","status":"success","durationMs":12,"result":"Found prior note"}\n\n',
         'event: swarm:completed\ndata: {"swarmId":"swarm-1","state":{"status":"idle"},"result":{"status":"success"}}\n\n',
       ])
     );
@@ -262,7 +263,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
 
     for await (const event of client.swarms.subscribe('swarm-1')) {
       received.push(event);
-      if (received.length === 2) {
+      if (received.length === 3) {
         break;
       }
     }
@@ -285,6 +286,17 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             status: 'running',
           },
           result: null,
+        },
+      },
+      {
+        event: 'tool:after',
+        data: {
+          agentId: 'agent-1',
+          agentName: 'manager',
+          toolName: 'memory_search',
+          status: 'success',
+          durationMs: 12,
+          result: 'Found prior note',
         },
       },
       {

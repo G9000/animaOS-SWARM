@@ -4,9 +4,9 @@
     {
       "type": "node",
       "request": "launch",
-      "name": "Debug @org/server with Nx",
+      "name": "Debug @animaOS-SWARM/server with Nx",
       "runtimeExecutable": "bun",
-      "runtimeArgs": ["nx", "serve", "@org/server"],
+      "runtimeArgs": ["x", "nx", "serve", "@animaOS-SWARM/server"],
       "env": {
         "NODE_OPTIONS": "--inspect=9229"
       },

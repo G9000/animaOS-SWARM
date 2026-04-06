@@ -8,13 +8,19 @@ import type { SwarmConfig } from '@animaOS-SWARM/sdk';
 import { loadAgency, agencyExists } from '../agency/loader.js';
 import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
 import type { AgencyConfig, AgentDefinition } from '../agency/types.js';
-import type { AgentProfile } from '@animaOS-SWARM/tui';
+import type { AgentProfile, ResultEntry } from '@animaOS-SWARM/tui';
 import {
   emitLaunchTaskFailure,
   emitLaunchTaskStart,
   launchDisplayAgents,
   relayLaunchSwarmEvent,
 } from './launch-events.js';
+import {
+  appendLaunchHistory,
+  clearLaunchHistory,
+  loadLaunchHistory,
+  saveLaunchHistory,
+} from './launch-history.js';
 import {
   extractResultText,
   getErrorMessage,
@@ -274,6 +280,16 @@ function resultText(result: TaskResult): string {
   return extractResultText(result) ?? JSON.stringify(result.data);
 }
 
+function historyEntry(task: string, result: TaskResult): ResultEntry {
+  return {
+    id: `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    timestamp: Date.now(),
+    task,
+    result: resultText(result),
+    isError: result.status !== 'success',
+  };
+}
+
 function printLaunchResult(result: TaskResult, setExitCodeOnError = false) {
   console.log('\n--- Result ---');
   if (result.status === 'success') {
@@ -348,6 +364,10 @@ async function executeDaemonLaunchCommand(
               const execution = await client.swarms.run(swarm.id, {
                 text: trimmed,
               });
+              appendLaunchHistory(
+                opts.dir,
+                historyEntry(trimmed, execution.result)
+              );
               printLaunchResult(execution.result);
             } catch (error) {
               swarmSession.invalidate();
@@ -369,6 +389,7 @@ async function executeDaemonLaunchCommand(
       `Launching "${agency.name}" with strategy "${agency.strategy}" and model ${agency.model}...\n`
     );
     const execution = await client.swarms.run(swarm.id, { text: task });
+    appendLaunchHistory(opts.dir, historyEntry(task, execution.result));
     printLaunchResult(execution.result, true);
   } catch (error) {
     console.error('Error:', getErrorMessage(error));
@@ -406,6 +427,7 @@ async function executeDaemonTuiLaunchCommand(
       ? await deps.createDaemonTuiRuntime()
       : await loadDaemonTuiRuntime();
     const bus = tuiRuntime.eventBus;
+    const initialResults = loadLaunchHistory(opts.dir);
 
     const agentProfiles: AgentProfile[] = [
       toProfile(agency.orchestrator, 'orchestrator'),
@@ -474,6 +496,7 @@ async function executeDaemonTuiLaunchCommand(
         }
 
         const text = resultText(execution.result);
+        appendLaunchHistory(opts.dir, historyEntry(input, execution.result));
         writeFile(
           join(opts.dir, 'anima-result.md'),
           `# Task\n\n${input}\n\n# Result\n\n${text}\n`,
@@ -502,6 +525,12 @@ async function executeDaemonTuiLaunchCommand(
         onTask: runTask,
         agentProfiles,
         onSaveAgent,
+        initialResults,
+        resumeLastResult: initialResults.length > 0,
+        onResultRecorded: () => undefined,
+        onHistoryUpdated: (entries: ResultEntry[]) =>
+          saveLaunchHistory(opts.dir, entries),
+        onClearHistory: () => clearLaunchHistory(opts.dir),
       });
       tuiRuntime.render(element);
       return;
@@ -511,8 +540,14 @@ async function executeDaemonTuiLaunchCommand(
       eventBus: bus,
       strategy: agency.strategy,
       task,
+      onTask: runTask,
       agentProfiles,
       onSaveAgent,
+      initialResults,
+      onResultRecorded: () => undefined,
+      onHistoryUpdated: (entries: ResultEntry[]) =>
+        saveLaunchHistory(opts.dir, entries),
+      onClearHistory: () => clearLaunchHistory(opts.dir),
     });
     const instance = tuiRuntime.render(element);
 

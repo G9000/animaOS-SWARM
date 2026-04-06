@@ -423,6 +423,7 @@ fn runtime_event_payload(agent_id: &str, agent_name: &str, event: &EngineEvent) 
             "toolName": object_field_string(&event.data, "name").unwrap_or_default(),
             "status": object_field_string(&event.data, "status").unwrap_or("error"),
             "durationMs": object_field_u128(&event.data, "durationMs").unwrap_or(0),
+            "result": object_field_string(&event.data, "result"),
         })),
         EventType::AgentTokens => Some(json!({
             "agentId": agent_id,

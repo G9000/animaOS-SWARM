@@ -185,6 +185,7 @@ export async function relayLaunchSwarmEvent(
         toolName: data.toolName,
         status: data.status,
         durationMs: data.durationMs,
+        result: data.result,
       },
       agent.id
     );

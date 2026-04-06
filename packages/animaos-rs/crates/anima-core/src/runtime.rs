@@ -297,6 +297,7 @@ impl AgentRuntime {
                                         &tool_call.name,
                                         tool_result.status.as_str(),
                                         tool_duration,
+                                        &tool_result,
                                     ),
                                 );
                                 let tool_message = self.record_message_in_room(
@@ -525,12 +526,31 @@ fn tool_before_event_data(tool_call: &ToolCall) -> DataValue {
     DataValue::Object(value)
 }
 
-fn tool_after_event_data(name: &str, status: &str, duration_ms: u128) -> DataValue {
+fn tool_after_event_data(
+    name: &str,
+    status: &str,
+    duration_ms: u128,
+    result: &TaskResult<Content>,
+) -> DataValue {
     let mut value = BTreeMap::new();
     value.insert("name".into(), DataValue::String(name.to_string()));
     value.insert("status".into(), DataValue::String(status.to_string()));
     value.insert("durationMs".into(), DataValue::Number(duration_ms as f64));
+    value.insert("result".into(), tool_result_text_data_value(result));
     DataValue::Object(value)
+}
+
+fn tool_result_text_data_value(result: &TaskResult<Content>) -> DataValue {
+    match result.status {
+        TaskStatus::Success => match result.data.as_ref() {
+            Some(content) => DataValue::String(content.text.clone()),
+            None => DataValue::Null,
+        },
+        TaskStatus::Error => match result.error.as_ref() {
+            Some(error) => DataValue::String(error.clone()),
+            None => DataValue::Null,
+        },
+    }
 }
 
 fn task_result_data_value(result: &TaskResult<Content>) -> DataValue {

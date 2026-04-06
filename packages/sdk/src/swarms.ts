@@ -34,6 +34,7 @@ export interface SwarmToolAfterPayload extends SwarmAgentEventPayload {
   toolName: string;
   status: string;
   durationMs: number;
+  result?: string;
 }
 
 export interface SwarmAgentTokensPayload extends SwarmAgentEventPayload {

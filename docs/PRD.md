@@ -1,14 +1,16 @@
 # AnimaOS Kit — Product Requirements Document
 
-**Version:** 0.1.0
-**Date:** 2026-03-30
-**Status:** In Progress
+**Version:** 0.2.0
+**Date:** 2026-04-05
+**Status:** Active
 
 ---
 
 ## 1. Product Overview
 
-AnimaOS Kit is a lightweight TypeScript agent swarm framework for enterprise use. It is the enterprise arm of AnimaOS — task-focused, token-efficient, and horizontally scalable. Agents can talk to each other, delegate tasks, spawn new agents dynamically, and coordinate via swarm strategies.
+AnimaOS Kit is a Bun + TypeScript workspace built around a canonical Rust runtime for agent swarms. The Rust daemon owns execution, coordination, memory, and streaming. The TypeScript packages provide the CLI, SDK, TUI, UI, and shared contracts that developers use locally and integrate into other systems.
+
+The primary operator surface is the terminal UI exposed through `animaos launch`. The web UI is a secondary surface and should not lead roadmap decisions until the terminal workflow is strong.
 
 **Tagline:** Task agents that get things done.
 
@@ -22,7 +24,7 @@ AnimaOS Kit is a lightweight TypeScript agent swarm framework for enterprise use
 - Plugin system (Action / Provider / Evaluator)
 - Model agnostic (OpenAI, Anthropic, Ollama, OpenRouter)
 - BM25 search for task history + document retrieval
-- Web dashboard for agent management
+- Strong terminal operator experience for launch, tracing, approvals, and review
 - Enterprise-ready (auth, audit, permissions)
 
 ## 3. Non-Goals
@@ -39,126 +41,86 @@ AnimaOS Kit is a lightweight TypeScript agent swarm framework for enterprise use
 ```
 animaos-swarm/
 ├── packages/
-│   ├── @animaOS-SWARM/core      — Shared TS contracts, adapters, and compatibility utilities
-│   ├── @animaOS-SWARM/swarm     — Swarm coordinator, strategies, agent-to-agent messaging
-│   ├── @animaOS-SWARM/tools     — Tool registry (bash, read, write, grep, glob, etc.)
-│   ├── @animaOS-SWARM/memory    — BM25 search, task history, document ingestion
-│   ├── @animaOS-SWARM/sdk       — Public TypeScript SDK for the Rust daemon
-│   └── @animaOS-SWARM/cli       — CLI commands (run, chat, create, agents, swarm)
+│   ├── @animaOS-SWARM/core      — Shared TS contracts, plugin types, and compatibility utilities
+│   ├── @animaOS-SWARM/swarm     — TS swarm helpers, strategies, and shared types
+│   ├── @animaOS-SWARM/tools     — TS tool registry, policies, hooks, and local executors
+│   ├── @animaOS-SWARM/memory    — BM25 search, task history, and TS memory helpers
+│   ├── @animaOS-SWARM/sdk       — Public TypeScript client for the Rust daemon
+│   ├── @animaOS-SWARM/cli       — Local `animaos` CLI and agency scaffolding
+│   └── @animaOS-SWARM/tui       — Ink-based terminal UI for launch sessions
 ├── packages/animaos-rs/
 │   ├── anima-core               — Canonical runtime core
 │   ├── anima-swarm              — Canonical swarm coordination
 │   ├── anima-memory             — Canonical memory services
 │   └── anima-daemon             — Canonical HTTP/SSE execution boundary
 └── apps/
-    ├── @animaOS-SWARM/server    — REST API + WebSocket server
-    └── @animaOS-SWARM/ui        — Web dashboard (React + Vite)
+    ├── @animaOS-SWARM/server    — REST API and SSE bridge for the daemon
+  └── @animaOS-SWARM/ui        — Secondary web dashboard (React + Vite)
 ```
 
-**Tech Stack:** Rust, Bun, TypeScript, NX (monorepo), Cargo, Vitest, Biome, Drizzle ORM, pglite (default DB)
+**Tech Stack:** Rust, Bun, TypeScript, Nx, Cargo, Vite, React, Vitest, Playwright, Oxlint
 
 ---
 
 ## 5. Current Status
 
-### Done
+### Shipping Today
 
 | Component | Status | Details |
 |---|---|---|
-| Monorepo scaffold | ✅ Done | NX + Bun, all packages and apps created |
-| Rust runtime core | ✅ Done | `anima-core`, `anima-swarm`, `anima-memory`, and `anima-daemon` are the canonical execution path |
-| TypeScript shared core | ✅ Done | `@animaOS-SWARM/core` still provides shared TS contracts and utilities for client-side packages |
-| Runtime events | ✅ Done | Canonical lifecycle and SSE event flow now comes from the Rust daemon |
-| OpenAI adapter | ✅ Done | Full tool-call support |
-| Anthropic adapter | ✅ Done | Claude tool_use support + streaming |
-| Ollama adapter | ✅ Done | OpenAI-compatible API, no key required |
-| Swarm coordinator | ✅ Done | Registry, lifecycle, message routing, dynamic spawning |
-| Swarm strategies | ✅ Done | Supervisor, dynamic, round-robin |
-| Message bus | ✅ Done | Direct send + broadcast, inbox per agent |
-| Tools package | ✅ Done | bash, read, write, edit, grep, glob, multi-edit, todo, process manager |
-| Tool executor | ✅ Done | Permission checks, hooks, secrets, validation, truncation |
-| BM25 search | ✅ Done | Custom BM25 with stemming, 12 tests passing |
-| Task history | ✅ Done | Record, search, getRecent, getByAgent |
-| Document store | ✅ Done | Ingest, chunk, search via BM25 |
-| CLI (run + chat) | ✅ Done | Single task execution + interactive chat |
-| SDK | ✅ Done | TypeScript daemon client and shared type surface |
-| Server (REST API) | ✅ Done | Agents, swarms, search, documents, health endpoints |
-| Helper factories | ✅ Done | `agent()`, `plugin()`, `action()`, `swarm()` |
-| Tests | ✅ Done | 21 tests passing (core + memory) |
+| Rust runtime core | ✅ Done | `packages/animaos-rs` is the canonical execution path for runtime, swarm, memory, and daemon concerns |
+| Provider support | ✅ Done | OpenAI, Anthropic, Google/Gemini, Ollama, and several OpenAI-compatible providers run through the daemon |
+| Swarm coordination | ✅ Done | Supervisor, dynamic, and round-robin strategies are implemented |
+| CLI surface | ✅ Done | `create`, `run`, `chat`, `launch`, and `agents` are available through the local `animaos` binary |
+| SDK | ✅ Done | The TypeScript SDK provides daemon HTTP/SSE clients plus config helper factories |
+| Memory services | ✅ Done | BM25 search, task history, document storage, and recent memory retrieval are wired through the current runtime surface |
+| Server API | ✅ Done | Agents, swarms, documents, search, and health endpoints are available through the server app and daemon boundary |
+| TUI support | ✅ Done | Local launch sessions already render through the Ink-based terminal UI package |
+| Test coverage | ✅ Done | TypeScript package tests and the Rust `cargo test` suite are part of the current development flow |
 
-### Not Started
+### Active Gaps
 
-| Component | Status |
-|---|---|
-| Web UI dashboard | ❌ |
-| WebSocket real-time events | ❌ |
-| CLI: create, agents, swarm commands | ❌ |
-| Auth (API key + JWT) | ❌ |
-| Database layer (Drizzle + pglite) | ❌ |
-| Streaming responses end-to-end | ❌ |
+| Component | Status | Details |
+|---|---|---|
+| TUI operator experience | In progress | `launch` already uses the terminal UI, but it still needs stronger navigation, trace inspection, approvals, memory drill-down, and session resume |
+| Web UI dashboard | Secondary | The UI app exists but remains a placeholder and is not the primary product surface |
+| Auth and audit policy | Planned | API auth, managed permission tiers, and audit surfaces still need productization |
+| Persistent relational storage | Planned | The current runtime leans on file/BM25 flows; a DB layer remains future work |
+| Plugin packaging | Planned | Core plugin types exist, but manifests, loaders, examples, and registry conventions are not first-class yet |
+| Release and install polish | Planned | CI, package docs, install paths, and changelog/security posture still need tightening |
 
 ---
 
-## 6. Roadmap
+## 6. Near-Term Roadmap
 
-### Phase 1 — Core Agent Loop (DONE)
-- [x] Types and interfaces
-- [x] Agent runtime with tool loop
-- [x] Event bus
-- [x] OpenAI adapter
-- [x] CLI (run + chat)
-- [x] Unit tests
+### Phase 1 — TUI, Observability, and Output Quality
+- Make the `launch` TUI the default operator workflow worth staying inside
+- Keyboard-first navigation across agents, tools, logs, and final result views
+- Inline approvals, pending states, and error recovery in the terminal flow
+- Session resume, recent-run browsing, and memory drill-down without leaving the terminal
+- Per-agent token and cost breakdown, not just swarm totals
+- Structured decision traces showing which agent ran, what tool was called, and why
+- Structured JSONL output suitable for piping into external systems
+- Confidence scoring contracts for agent and swarm results
 
-### Phase 2 — Swarm Coordination
-- [ ] Swarm coordinator (registry, lifecycle, message routing)
-- [ ] Message bus (direct messaging + broadcast)
-- [ ] Supervisor strategy (manager delegates to workers)
-- [ ] Dynamic strategy (LLM decides who speaks next)
-- [ ] Round-robin strategy (agents take turns)
-- [ ] Dynamic agent spawning (spawn → task → terminate)
-- [ ] Token budget + timeout per agent
-- [ ] Swarm-level tests
+### Phase 2 — Faster and Smarter Coordination
+- Parallel dispatch for independent tasks
+- Generate-then-validate strategies with cheap validator agents
+- Smarter routing using triggers, examples, and LLM fallback
+- Better shared memory and knowledge-linking between agents mid-run
 
-### Phase 3 — Tools & Memory
-- [ ] Tools (bash, read, write, edit, grep, glob, process manager)
-- [ ] Tool executor with permission checks + hooks
-- [ ] BM25 search engine
-- [ ] Task history storage
-- [ ] Document ingestion + chunking
+### Phase 3 — Product Surface Hardening
+- Harden the TUI as the primary operator surface for runs, traces, tool calls, and memory state
+- Keep the web dashboard secondary until it adds clear value beyond the terminal workflow
+- Auth, audit, and managed permission policy surfaces
+- Storage abstractions beyond the current file-first defaults
+- Better packaging, onboarding, and install flows for teams adopting the kit
 
-### Phase 4 — Model Adapters
-- [ ] Anthropic adapter (Claude)
-- [ ] Ollama adapter (local models)
-- [ ] OpenRouter adapter
-- [ ] Streaming support for all adapters
-
-### Phase 5 — Server & API
-- [ ] REST API (agents, swarms, tasks, search)
-- [ ] WebSocket for real-time events
-- [ ] Database layer (Drizzle ORM + pglite default, Postgres adapter)
-- [ ] Auth (API key + JWT)
-- [ ] Audit logging
-
-### Phase 6 — Web Dashboard
-- [ ] Agent list view (status, token usage)
-- [ ] Swarm visualization (agent graph, message flow)
-- [ ] Real-time logs (streaming output, tool calls)
-- [ ] Task history (searchable past runs)
-- [ ] Settings (API keys, model config)
-
-### Phase 7 — SDK & Developer Experience
-- [ ] `@animaOS-SWARM/sdk` — clean public API surface
-- [ ] CLI: `animaos-swarm create` (project scaffolding)
-- [ ] CLI: `animaos-swarm agents list/spawn/terminate`
-- [ ] CLI: `animaos-swarm swarm run --strategy supervisor`
-- [ ] Plugin marketplace / registry
-
-### Phase 8 — Enterprise
-- [ ] Organization management
-- [ ] Per-agent permission scopes
-- [ ] Rate limiting + token budgets
-- [ ] Embeddings + vector search (optional plugin)
-- [ ] Postgres adapter for production
+### Phase 4 — Extension and Distribution Model
+- First-class plugin manifests and loading conventions
+- Example extensions that demonstrate actions, providers, evaluators, and policy hooks
+- A clearer settings story for managed permissions and guardrails
+- Bun-native release automation, changelog discipline, and distribution hygiene
 
 ---
 
@@ -166,83 +128,76 @@ animaos-swarm/
 
 | Decision | Choice | Why |
 |---|---|---|
-| Language | TypeScript | Larger ecosystem, enterprise-friendly |
-| Runtime | Bun | Fast, built-in TypeScript, good DX |
-| Monorepo | NX | Better than Turbo for large workspaces, dependency graph |
-| Database | pglite (default), Postgres (production) | Zero setup for dev, swappable adapter |
-| Plugin pattern | Action / Provider / Evaluator | Proven, consistent, easy to extend |
-| Swarm pattern | Supervisor / Dynamic / Round-robin | Covers all coordination needs |
-| Coordinator model | Coordinator owns all agents | Full observability, no runaway agents |
-| Memory | BM25 only (core), embeddings optional | Cheap, zero token cost for search |
-| Tools | Built-in toolkit | Stable, tested TypeScript |
+| Execution runtime | Rust daemon | Keeps the canonical execution path deterministic and gives the project a clear streaming boundary |
+| Primary operator surface | TUI via `animaos launch` | Fastest path to trust, iteration, and operator control without building a second product surface too early |
+| Client surfaces | TypeScript packages | CLI, SDK, TUI, UI, and shared contracts stay easy to compose and integrate |
+| Workspace runner | Bun | Fast installs and repo-local command execution |
+| Monorepo | Nx | Project graph, affected execution, and consistent build/test orchestration |
+| Plugin pattern | Action / Provider / Evaluator | Still the most coherent extension surface across the workspace |
+| Swarm pattern | Supervisor / Dynamic / Round-robin | Covers the current coordination needs without overfitting to one workflow |
+| Memory core | BM25 + structured persistence | Cheap search today; heavier storage remains optional |
+| Tooling model | Built-in toolkit with permission controls | Keeps execution auditable while supporting local workflows and daemon execution |
 
 ---
 
 ## 8. Developer Experience Target
 
 ```ts
-import { agent, swarm, tools } from "@animaOS-SWARM/sdk"
+import { createDaemonClient, agent, swarm } from '@animaOS-SWARM/sdk';
 
-// Define agents
-const researcher = agent({
-  name: "researcher",
-  model: "gpt-4o",
-  system: "You research topics thoroughly.",
-  tools: [tools.webSearch, tools.scrape],
-})
+const client = createDaemonClient();
 
-const writer = agent({
-  name: "writer",
-  model: "gpt-4o",
-  system: "You write clear, concise content.",
-  tools: [tools.draft],
-})
+const contentTeam = await client.swarms.create(
+  swarm({
+    name: 'content-team',
+    strategy: 'round-robin',
+    maxIterations: 6,
+    agents: [
+      agent({
+        name: 'researcher',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        apiKey: process.env.OPENAI_API_KEY,
+        systemPrompt: 'Gather the key facts and frame the problem clearly.',
+      }),
+      agent({
+        name: 'writer',
+        provider: 'openai',
+        model: 'gpt-4o',
+        apiKey: process.env.OPENAI_API_KEY,
+        systemPrompt: 'Turn the research into concise, structured output.',
+      }),
+    ],
+  })
+);
 
-// Wire into swarm
-const mySwarm = swarm({
-  strategy: "supervisor",
-  manager: researcher,
-  workers: [writer],
-})
+const result = await client.swarms.run(contentTeam.id, {
+  text: 'Write a short brief on AI agents for engineering leaders.',
+});
 
-await mySwarm.run("Write a blog post about AI agents")
+console.log(result.result.content.text);
 ```
 
-### Agent-to-agent communication
-
-```ts
-// Direct message
-await agent.send("writer", { text: "draft the intro", metadata: { context: data } })
-
-// Broadcast
-await agent.broadcast({ text: "research complete" })
-
-// Spawn child
-const analyst = await agent.spawn({
-  role: "analyst",
-  tools: [tools.queryDB],
-  task: "Analyze this dataset",
-})
-```
+Streaming consumers can subscribe with `client.swarms.subscribe(swarmId)` and render daemon events as they arrive.
 
 ### CLI
 
 ```bash
-# Single task
-animaos-swarm run "What is 42 * 17?" --model gpt-4o-mini
+# Scaffold a local agency without starting the daemon
+animaos create content-team --provider openai --model gpt-4o-mini
 
-# Interactive chat
-animaos-swarm chat --model gpt-4o
+# Start the daemon in another terminal, then launch work inside the agency directory
+animaos launch "Write a report on AI trends"
 
-# Swarm task
-animaos-swarm swarm run --strategy supervisor "Write a report on AI trends"
+# Run an interactive session against the daemon-backed runtime
+animaos chat
 ```
 
 ---
 
 ## 9. Immediate Next Steps
 
-1. **Phase 2: Swarm coordinator** — this is the key differentiator
-2. **Phase 3: Port tools from AnimaOS** — free reuse, stable code
-3. **Phase 4: Anthropic adapter** — model diversity
-4. **Test end-to-end** — run a real swarm with multiple agents coordinating
+1. Make the launch TUI the primary operator surface: navigation, trace inspection, approvals, and session resume
+2. Add structured observability and confidence scoring so swarm output is auditable
+3. Productize plugin, settings, and permission packaging for team use
+4. Tighten release discipline with Bun-native CI, clearer install flows, and accurate docs

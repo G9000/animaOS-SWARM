@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { executeLaunchCommand } from './launch.js';
+import { relayLaunchSwarmEvent } from './launch-events.js';
+import { LAUNCH_HISTORY_FILENAME } from './launch-history.js';
 
 const DEFAULT_AGENCY_YAML = [
   'name: Launch Test Agency',
@@ -83,6 +85,16 @@ function createAgencyDir(agencyYaml = DEFAULT_AGENCY_YAML): string {
   return dir;
 }
 
+function readHistory(dir: string) {
+  return JSON.parse(
+    readFileSync(join(dir, LAUNCH_HISTORY_FILENAME), 'utf-8')
+  ) as Array<{
+    task: string;
+    result: string;
+    isError: boolean;
+  }>;
+}
+
 describe('launch command daemon plain-text mode', () => {
   let agencyDir: string;
 
@@ -150,6 +162,13 @@ describe('launch command daemon plain-text mode', () => {
     expect(client.swarms.run).toHaveBeenCalledWith('swarm-1', {
       text: 'Ship the patch',
     });
+    expect(readHistory(agencyDir)).toEqual([
+      expect.objectContaining({
+        task: 'Ship the patch',
+        result: 'daemon launch result',
+        isError: false,
+      }),
+    ]);
     expect(logSpy).toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
   });
@@ -479,7 +498,365 @@ describe('launch command daemon plain-text mode', () => {
     expect(client.swarms.run).toHaveBeenNthCalledWith(2, 'swarm-1', {
       text: 'Second task',
     });
+    expect(readHistory(agencyDir)).toEqual([
+      expect.objectContaining({
+        task: 'First task',
+        result: 'interactive daemon result',
+        isError: false,
+      }),
+      expect.objectContaining({
+        task: 'Second task',
+        result: 'interactive daemon result',
+        isError: false,
+      }),
+    ]);
     expect(harness.render).toHaveBeenCalledOnce();
+  });
+
+  it('preloads persisted history and resumes the last result in TUI app props', async () => {
+    const harness = createDaemonTuiHarness();
+    writeFileSync(
+      join(agencyDir, LAUNCH_HISTORY_FILENAME),
+      JSON.stringify(
+        [
+          {
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Earlier task',
+            result: 'Earlier result',
+            isError: false,
+          },
+        ],
+        null,
+        2
+      ) + '\n'
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        subscribe: vi.fn().mockImplementation(emptySubscription),
+      }),
+    };
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: true,
+      },
+      { client, ...harness.deps }
+    );
+
+    const element = harness.getElement();
+    expect(element).toBeDefined();
+
+    const initialResults = element?.props.initialResults;
+    expect(Array.isArray(initialResults)).toBe(true);
+    expect(initialResults).toEqual([
+      expect.objectContaining({
+        task: 'Earlier task',
+        result: 'Earlier result',
+      }),
+    ]);
+    expect(element?.props.resumeLastResult).toBe(true);
+  });
+
+  it('exposes clear-history wiring alongside resumed result props', async () => {
+    const harness = createDaemonTuiHarness();
+    writeFileSync(
+      join(agencyDir, LAUNCH_HISTORY_FILENAME),
+      JSON.stringify(
+        [
+          {
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Earlier task',
+            result: 'Earlier result',
+            isError: false,
+          },
+        ],
+        null,
+        2
+      ) + '\n'
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        subscribe: vi.fn().mockImplementation(emptySubscription),
+      }),
+    };
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: true,
+      },
+      { client, ...harness.deps }
+    );
+
+    const element = harness.getElement() as unknown as {
+      props: {
+        initialResults: Array<{ task: string; result: string }>;
+        resumeLastResult: boolean;
+        onClearHistory: () => void;
+      };
+    };
+
+    expect(element.props.initialResults).toEqual([
+      expect.objectContaining({
+        task: 'Earlier task',
+        result: 'Earlier result',
+      }),
+    ]);
+    expect(element.props.resumeLastResult).toBe(true);
+
+    element.props.onClearHistory();
+
+    expect(readHistory(agencyDir)).toEqual([]);
+  });
+
+  it('persists saved-run labels through the TUI history update callback', async () => {
+    const harness = createDaemonTuiHarness();
+    writeFileSync(
+      join(agencyDir, LAUNCH_HISTORY_FILENAME),
+      JSON.stringify(
+        [
+          {
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Earlier task',
+            result: 'Earlier result',
+            isError: false,
+          },
+        ],
+        null,
+        2
+      ) + '\n'
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        subscribe: vi.fn().mockImplementation(emptySubscription),
+      }),
+    };
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: true,
+      },
+      { client, ...harness.deps }
+    );
+
+    const element = harness.getElement() as unknown as {
+      props: {
+        onHistoryUpdated: (
+          entries: Array<{
+            id: string;
+            timestamp: number;
+            task: string;
+            result: string;
+            isError: boolean;
+            label?: string;
+          }>
+        ) => void;
+      };
+    };
+
+    element.props.onHistoryUpdated([
+      {
+        id: 'run-1',
+        timestamp: 1,
+        task: 'Earlier task',
+        result: 'Earlier result',
+        isError: false,
+        label: 'launch hotfix',
+      },
+    ]);
+
+    expect(readHistory(agencyDir)).toEqual([
+      expect.objectContaining({
+        task: 'Earlier task',
+        result: 'Earlier result',
+        label: 'launch hotfix',
+      }),
+    ]);
+  });
+
+  it('clears persisted history through the TUI callback before recording new runs', async () => {
+    const harness = createDaemonTuiHarness();
+    writeFileSync(
+      join(agencyDir, LAUNCH_HISTORY_FILENAME),
+      JSON.stringify(
+        [
+          {
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Earlier task',
+            result: 'Earlier result',
+            isError: false,
+          },
+        ],
+        null,
+        2
+      ) + '\n'
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          swarm: {
+            id: 'swarm-1',
+            tokenUsage: {
+              promptTokens: 0,
+              completionTokens: 0,
+              totalTokens: 0,
+            },
+          },
+          result: {
+            status: 'success',
+            data: { text: 'Fresh result' },
+            durationMs: 5,
+          },
+        }),
+        subscribe: vi.fn().mockImplementation(emptySubscription),
+      }),
+    };
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: true,
+      },
+      { client, ...harness.deps }
+    );
+
+    const element = harness.getElement() as unknown as {
+      props: {
+        onClearHistory: () => void;
+        onTask: (input: string) => Promise<{ status: string }>;
+      };
+    };
+
+    element.props.onClearHistory();
+
+    expect(readHistory(agencyDir)).toEqual([]);
+
+    await expect(element.props.onTask('Fresh task')).resolves.toEqual(
+      expect.objectContaining({ status: 'success' })
+    );
+
+    expect(readHistory(agencyDir)).toEqual([
+      expect.objectContaining({
+        task: 'Fresh task',
+        result: 'Fresh result',
+        isError: false,
+      }),
+    ]);
+  });
+
+  it('clears preloaded history and then reuses one daemon swarm for fresh interactive runs', async () => {
+    const harness = createDaemonTuiHarness();
+    writeFileSync(
+      join(agencyDir, LAUNCH_HISTORY_FILENAME),
+      JSON.stringify(
+        [
+          {
+            id: 'run-1',
+            timestamp: 1,
+            task: 'Earlier task',
+            result: 'Earlier result',
+            isError: false,
+          },
+        ],
+        null,
+        2
+      ) + '\n'
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          swarm: {
+            id: 'swarm-1',
+            tokenUsage: {
+              promptTokens: 0,
+              completionTokens: 0,
+              totalTokens: 0,
+            },
+          },
+          result: {
+            status: 'success',
+            data: { text: 'interactive daemon result' },
+            durationMs: 8,
+          },
+        }),
+        subscribe: vi.fn().mockImplementation(emptySubscription),
+      }),
+    };
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: true,
+      },
+      { client, ...harness.deps }
+    );
+
+    const element = harness.getElement() as unknown as {
+      props: {
+        initialResults: Array<{ task: string; result: string }>;
+        resumeLastResult: boolean;
+        onClearHistory: () => void;
+        onTask: (input: string) => Promise<{ status: string }>;
+      };
+    };
+
+    expect(element.props.initialResults).toEqual([
+      expect.objectContaining({
+        task: 'Earlier task',
+        result: 'Earlier result',
+      }),
+    ]);
+    expect(element.props.resumeLastResult).toBe(true);
+
+    element.props.onClearHistory();
+
+    await expect(element.props.onTask('First task')).resolves.toEqual(
+      expect.objectContaining({ status: 'success' })
+    );
+    await expect(element.props.onTask('Second task')).resolves.toEqual(
+      expect.objectContaining({ status: 'success' })
+    );
+
+    expect(client.swarms.create).toHaveBeenCalledOnce();
+    expect(client.swarms.run).toHaveBeenNthCalledWith(1, 'swarm-1', {
+      text: 'First task',
+    });
+    expect(client.swarms.run).toHaveBeenNthCalledWith(2, 'swarm-1', {
+      text: 'Second task',
+    });
+    expect(readHistory(agencyDir)).toEqual([
+      expect.objectContaining({
+        task: 'First task',
+        result: 'interactive daemon result',
+        isError: false,
+      }),
+      expect.objectContaining({
+        task: 'Second task',
+        result: 'interactive daemon result',
+        isError: false,
+      }),
+    ]);
   });
 
   it('keeps single-shot TUI launches mounted until the user exits', async () => {
@@ -553,5 +930,46 @@ describe('launch command daemon plain-text mode', () => {
       durationMs: 0,
     });
     expect(client.swarms.run).not.toHaveBeenCalled();
+  });
+
+  it('relays tool result text into the TUI event bus', async () => {
+    const emit = vi.fn().mockResolvedValue(undefined);
+
+    await relayLaunchSwarmEvent(
+      {
+        on() {
+          return () => undefined;
+        },
+        emit,
+        clear() {},
+      },
+      [
+        {
+          id: 'launch:manager',
+          name: 'manager',
+          role: 'orchestrator',
+        },
+      ],
+      {
+        event: 'tool:after',
+        data: {
+          agentId: 'agent-1',
+          agentName: 'manager',
+          toolName: 'memory_search',
+          status: 'success',
+          durationMs: 12,
+          result: 'Found prior note',
+        },
+      }
+    );
+
+    expect(emit).toHaveBeenCalledWith(
+      'tool:after',
+      expect.objectContaining({
+        toolName: 'memory_search',
+        result: 'Found prior note',
+      }),
+      'launch:manager'
+    );
   });
 });

@@ -240,6 +240,88 @@ async fn swarm_event_stream_emits_live_agent_activity_and_lifecycle_events() {
 }
 
 #[tokio::test]
+async fn swarm_event_stream_emits_tool_results() {
+    let app = test_app();
+    let (_, create_response) = create_swarm_with_body(
+        &app,
+        r#"{
+            "strategy":"round-robin",
+            "manager":{
+                "name":"manager",
+                "model":"gpt-5.4",
+                "tools":[{
+                    "name":"memory_add",
+                    "description":"Store a memory",
+                    "parameters":{
+                        "content":{"type":"string"},
+                        "type":{"type":"string"},
+                        "importance":{"type":"number"}
+                    }
+                }]
+            },
+            "workers":[{"name":"worker-a","model":"gpt-5.4"}],
+            "maxTurns":2
+        }"#,
+    )
+    .await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/swarms/{swarm_id}/events"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("event stream responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let run_handle = {
+        let app = app.clone();
+        let swarm_id = swarm_id.clone();
+        tokio::spawn(async move {
+            run_swarm(&app, &swarm_id, r#"{"text":"remember ship the patch"}"#).await
+        })
+    };
+
+    let stream = response.into_body().into_data_stream();
+    pin_mut!(stream);
+
+    let mut chunks = String::new();
+    for _ in 0..256 {
+        match futures::poll!(stream.next()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
+                if chunks.contains("event: tool:after")
+                    && chunks.contains("event: swarm:completed")
+                {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(Some(Err(error))) => panic!("stream errored: {error}"),
+            std::task::Poll::Ready(None) => break,
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+
+    let (run_status, run_response) = run_handle.await.expect("run task should finish");
+
+    assert_eq!(run_status, StatusCode::OK);
+    assert!(run_response.contains("stored memory: ship the patch"));
+    assert!(chunks.contains("event: tool:after"));
+
+    let tool_after_data =
+        extract_sse_event_data(&chunks, "tool:after").expect("tool after event data exists");
+    assert!(tool_after_data.contains("\"toolName\":\"memory_add\""));
+    assert!(tool_after_data.contains("\"status\":\"success\""));
+    assert!(tool_after_data.contains("\"result\":\"stored memory: ship the patch\""));
+}
+
+#[tokio::test]
 async fn repeated_swarm_runs_do_not_reuse_stale_runtime_context() {
     let app = test_app();
     let (_, create_response) = create_swarm(&app).await;

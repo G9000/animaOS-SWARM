@@ -1,13 +1,13 @@
-# sdk
+# @animaOS-SWARM/sdk
 
-Public TypeScript SDK for animaOS.
+Public TypeScript client for the animaOS Rust daemon.
 
-This package builds agent and swarm configs, re-exports shared TypeScript types, and talks to the Rust daemon over HTTP and SSE. It does not embed the execution runtime.
+This package exports `createDaemonClient`, `AgentsClient`, `SwarmsClient`, and the `agent()`, `action()`, `plugin()`, and `swarm()` helpers. It talks to the daemon over HTTP and SSE and does not embed the execution runtime.
 
-## Building
+## Build
 
-Run `nx build sdk` to build the library.
+Run `bun run build:cli-sdk` to build the SDK and CLI together, or `bun x nx build @animaOS-SWARM/sdk` to build only this package.
 
-## Running unit tests
+## Test
 
-Run `nx test sdk` to execute the unit tests via [Vitest](https://vitest.dev/).
+Run `bun x nx test @animaOS-SWARM/sdk`.

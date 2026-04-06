@@ -1,13 +1,13 @@
-# core
+# @animaOS-SWARM/core
 
-Shared TypeScript contracts and utilities for the SDK, CLI, and UI.
+Shared TypeScript contracts, plugin types, and compatibility utilities for the CLI, SDK, TUI, and UI.
 
-This package is not the canonical execution runtime. Runtime execution, swarm coordination, memory services, and daemon-backed streaming live in the Rust workspace under `packages/animaos-rs`.
+This package is not the canonical execution runtime. Runtime execution, swarm coordination, memory services, and daemon-backed streaming live in `packages/animaos-rs`.
 
-## Building
+## Build
 
-Run `nx build core` to build the library.
+Run `bun x nx build @animaOS-SWARM/core`.
 
-## Running unit tests
+## Test
 
-Run `nx test core` to execute the unit tests via [Vitest](https://vitest.dev/).
+Run `bun x nx test @animaOS-SWARM/core`.

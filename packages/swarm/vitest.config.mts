@@ -4,7 +4,7 @@ export default defineConfig(() => ({
   root: __dirname,
   cacheDir: '../../node_modules/.vite/packages/swarm',
   test: {
-    name: '@org/swarm',
+    name: '@animaOS-SWARM/swarm',
     watch: false,
     globals: true,
     environment: 'node',

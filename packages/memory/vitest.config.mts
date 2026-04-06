@@ -4,7 +4,7 @@ export default defineConfig(() => ({
   root: __dirname,
   cacheDir: '../../node_modules/.vite/packages/memory',
   test: {
-    name: '@org/memory',
+    name: '@animaOS-SWARM/memory',
     watch: false,
     globals: true,
     environment: 'node',

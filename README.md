@@ -2,7 +2,7 @@
 
 Agent swarm framework. Command and control your AI agents -- spawn, coordinate, and manage swarms that get things done.
 
-## Quick Start (CLI)
+## Quick Start (CLI + TUI)
 
 Create and run an agency in 3 steps - **no code required**:
 
@@ -14,13 +14,15 @@ bun run build:cli-sdk
 export OPENAI_API_KEY="sk-..."
 bun run animaos create my-agency --provider openai --model gpt-4o-mini
 
-# 3. Start daemon & launch tasks
+# 3. Start daemon & launch tasks in the TUI
 bun run daemon          # In a new terminal
 cd my-agency
-bun run animaos launch "Write a blog post about AI" --no-tui
+bun run animaos launch "Write a blog post about AI"
 ```
 
 See [docs/SDK_USAGE.md](docs/SDK_USAGE.md) for full documentation and SDK examples.
+
+The terminal UI is the primary local operator surface. The web UI is secondary and currently less mature.
 
 ## Runtime Architecture
 
@@ -34,23 +36,26 @@ The canonical runtime lives in Rust under `packages/animaos-rs`.
 
 ```bash
 # Build all packages
-bun nx run-many -t build
+bun x nx run-many -t build
 
 # Run tests
-bun nx run-many -t test
+bun x nx run-many -t test
 
-# Start the server
-bun nx serve server
+# Start the daemon for local launch/chat workflows
+bun run daemon
 
-# Start the UI
-bun nx dev ui
+# Start the server app
+bun x nx serve @animaOS-SWARM/server
+
+# Start the web UI (secondary surface)
+bun x nx dev @animaOS-SWARM/ui
 ```
 
 ## Local CLI
 
 Prefer the repo-local CLI while developing. Bun is only the local script runner here; the actual CLI being executed is this workspace's `animaos` build. A globally linked `animaos` can work too, but only if it is linked to this workspace's CLI package; otherwise it may resolve to a different binary.
 
-`create` is a local CLI flow and does not require the Rust daemon. `launch`, `run`, and `chat` are daemon-backed.
+`create` is a local CLI flow and does not require the Rust daemon. `launch`, `run`, and `chat` are daemon-backed. `launch` is the primary TUI flow; use `--no-tui` only for automation or plain-text execution.
 
 ```bash
 # Build the local SDK/CLI runtime used by the workspace package entrypoints
@@ -69,7 +74,7 @@ node packages/cli/dist/index.js create content-team --provider openai --model gp
 bun run daemon
 
 cd content-team
-bun run animaos launch "your task" --no-tui
+bun run animaos launch "your task"
 ```
 
 ## Provider Support

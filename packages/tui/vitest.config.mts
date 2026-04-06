@@ -2,9 +2,9 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig(() => ({
   root: __dirname,
-  cacheDir: '../../node_modules/.vite/packages/core',
+  cacheDir: '../../node_modules/.vite/packages/tui',
   test: {
-    name: '@animaOS-SWARM/core',
+    name: '@animaOS-SWARM/tui',
     watch: false,
     globals: true,
     environment: 'node',

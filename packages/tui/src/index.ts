@@ -5,37 +5,53 @@ export type {
   ToolEntry,
   SwarmStats,
   AgentProfile,
-} from "./types.js"
+} from './types.js';
 
-export { AgentsPanel } from "./components/agents-panel.js"
-export type { AgentsPanelProps } from "./components/agents-panel.js"
+export { AgentsPanel } from './components/agents-panel.js';
+export type { AgentsPanelProps } from './components/agents-panel.js';
 
-export { useEventLog } from "./hooks/use-event-log.js"
-export type { UseEventLogOptions, UseEventLogResult } from "./hooks/use-event-log.js"
+export { HistoryView } from './components/history-view.js';
+export type { HistoryViewProps } from './components/history-view.js';
 
-export { App } from "./app.js"
-export type { AppProps } from "./app.js"
+export { useEventLog } from './hooks/use-event-log.js';
+export type {
+  UseEventLogOptions,
+  UseEventLogResult,
+} from './hooks/use-event-log.js';
 
-export { Header } from "./components/header.js"
-export type { HeaderProps } from "./components/header.js"
+export { App } from './app.js';
+export type { AppProps } from './app.js';
 
-export { AgentPanel } from "./components/agent-panel.js"
-export type { AgentPanelProps } from "./components/agent-panel.js"
+export { Header } from './components/header.js';
+export type { HeaderProps } from './components/header.js';
 
-export { MessageStream } from "./components/message-stream.js"
-export type { MessageStreamProps } from "./components/message-stream.js"
+export { AgentPanel } from './components/agent-panel.js';
+export type { AgentPanelProps } from './components/agent-panel.js';
 
-export { ToolPanel } from "./components/tool-panel.js"
-export type { ToolPanelProps } from "./components/tool-panel.js"
+export { MessageStream } from './components/message-stream.js';
+export type { MessageStreamProps } from './components/message-stream.js';
 
-export { StatusBar } from "./components/status-bar.js"
-export type { StatusBarProps } from "./components/status-bar.js"
+export { ToolPanel } from './components/tool-panel.js';
+export type { ToolPanelProps } from './components/tool-panel.js';
 
-export { InputBar } from "./components/input-bar.js"
-export type { InputBarProps, SlashCommand } from "./components/input-bar.js"
+export { StatusBar } from './components/status-bar.js';
+export type { StatusBarProps } from './components/status-bar.js';
 
-export { ResultLog } from "./components/result-log.js"
-export type { ResultLogProps, ResultEntry } from "./components/result-log.js"
+export { InputBar } from './components/input-bar.js';
+export type { InputBarProps, SlashCommand } from './components/input-bar.js';
 
-export { ResultView } from "./components/result-view.js"
-export type { ResultViewProps } from "./components/result-view.js"
+export { ResultLog } from './components/result-log.js';
+export type { ResultLogProps, ResultEntry } from './components/result-log.js';
+
+export { ResultView } from './components/result-view.js';
+export type { ResultViewProps } from './components/result-view.js';
+
+export { TraceView } from './components/trace-view.js';
+export type { TraceViewProps } from './components/trace-view.js';
+
+export {
+  buildTraceEntries,
+  traceEntryDetail,
+  traceEntrySummary,
+} from './trace.js';
+export type { TraceEntry } from './trace.js';
