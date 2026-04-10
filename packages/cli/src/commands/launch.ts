@@ -3,7 +3,15 @@ import { writeFile, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Interface } from 'node:readline';
 import yaml from 'js-yaml';
-import type { AgentConfig, IEventBus, TaskResult } from '@animaOS-SWARM/core';
+import {
+  DAEMON_HEALTH_UNAVAILABLE_MESSAGE,
+  DAEMON_RECOVERED_MESSAGE,
+  describeDaemonWarningTransition,
+  formatDaemonUnreachableWarning,
+  type AgentConfig,
+  type IEventBus,
+  type TaskResult,
+} from '@animaOS-SWARM/core';
 import type { SwarmConfig } from '@animaOS-SWARM/sdk';
 import { loadAgency, agencyExists } from '../agency/loader.js';
 import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
@@ -11,6 +19,7 @@ import type { AgencyConfig, AgentDefinition } from '../agency/types.js';
 import type { AgentProfile, ResultEntry } from '@animaOS-SWARM/tui';
 import {
   emitLaunchTaskFailure,
+  emitLaunchTaskQueued,
   emitLaunchTaskStart,
   launchDisplayAgents,
   relayLaunchSwarmEvent,
@@ -47,7 +56,8 @@ interface DaemonTuiRuntime {
 }
 
 interface LaunchDeps {
-  client?: Pick<CliDaemonClient, 'swarms'>;
+  client?: Pick<CliDaemonClient, 'swarms'> &
+    Partial<Pick<CliDaemonClient, 'health'>>;
   createReadline?: () => Pick<Interface, 'question' | 'close'>;
   createDaemonTuiRuntime?: () => Promise<DaemonTuiRuntime>;
 }
@@ -87,6 +97,12 @@ const DAEMON_MEMORY_PLUGIN: DaemonPluginDescriptor = {
 const DAEMON_TOOL_ALIASES = new Map<string, string>([
   ['memory_recent', 'recent_memories'],
 ]);
+
+function plainTextLaunchHelp(hasHealth: boolean): string {
+  return hasHealth
+    ? 'Commands: /help show available commands · /health recheck daemon connectivity · exit quit'
+    : 'Commands: /help show available commands · exit quit';
+}
 
 function daemonObjectToolParameters(
   properties: Record<string, unknown>,
@@ -219,6 +235,54 @@ function createDaemonSwarmSession(
   };
 }
 
+async function getDaemonPreflightWarning(
+  client: Partial<Pick<CliDaemonClient, 'health'>>
+): Promise<string | undefined> {
+  if (!client.health) {
+    return undefined;
+  }
+
+  try {
+    await client.health();
+    return undefined;
+  } catch (error) {
+    return formatDaemonUnreachableWarning(getErrorMessage(error));
+  }
+}
+
+function createDaemonWarningPoller(
+  client: Partial<Pick<CliDaemonClient, 'health'>>
+): (() => Promise<string | undefined>) | undefined {
+  if (!client.health) {
+    return undefined;
+  }
+
+  return () => getDaemonPreflightWarning(client);
+}
+
+function printPlainTextDaemonWarning(warning: string) {
+  console.error('Warning:', warning);
+}
+
+function printPlainTextDaemonRecovery() {
+  console.log(DAEMON_RECOVERED_MESSAGE);
+}
+
+function printPlainTextDaemonHealthy() {
+  const transition = describeDaemonWarningTransition(null, null, 'manual');
+  if (transition.message) {
+    console.log(transition.message);
+  }
+}
+
+function printPlainTextDaemonHealthUnavailable() {
+  console.log(DAEMON_HEALTH_UNAVAILABLE_MESSAGE);
+}
+
+function printPlainTextLaunchHelp(hasHealth: boolean) {
+  console.log(plainTextLaunchHelp(hasHealth));
+}
+
 function agentDefToDaemonConfig(
   agent: AgentDefinition,
   defaultModel: string,
@@ -333,6 +397,7 @@ async function executeDaemonLaunchCommand(
   try {
     const client = deps.client ?? createCliDaemonClient();
     const swarmSession = createDaemonSwarmSession(client, agency, opts);
+    let daemonWarning = await getDaemonPreflightWarning(client);
 
     if (!task) {
       const { createInterface } = await import('node:readline');
@@ -346,7 +411,14 @@ async function executeDaemonLaunchCommand(
       console.log(
         `${agency.name} — ${agency.strategy} strategy — ${agency.model}`
       );
-      console.log('Type "exit" to quit.\n');
+      if (daemonWarning) {
+        printPlainTextDaemonWarning(daemonWarning);
+      }
+      console.log(
+        client.health
+          ? 'Type "exit" to quit. Type "/health" to recheck daemon connectivity.\n'
+          : 'Type "exit" to quit.\n'
+      );
 
       await new Promise<void>((resolve) => {
         const prompt = () => {
@@ -359,11 +431,49 @@ async function executeDaemonLaunchCommand(
               return;
             }
 
+            if (trimmed === '/health') {
+              if (!client.health) {
+                printPlainTextDaemonHealthUnavailable();
+              } else {
+                const nextWarning = await getDaemonPreflightWarning(client);
+                const transition = describeDaemonWarningTransition(
+                  daemonWarning,
+                  nextWarning,
+                  'manual'
+                );
+                if (transition.message) {
+                  if (nextWarning) {
+                    printPlainTextDaemonWarning(nextWarning);
+                  } else if (transition.recovered) {
+                    printPlainTextDaemonRecovery();
+                  } else {
+                    printPlainTextDaemonHealthy();
+                  }
+                }
+                daemonWarning = nextWarning;
+              }
+
+              console.log();
+              prompt();
+              return;
+            }
+
+            if (trimmed === '/help') {
+              printPlainTextLaunchHelp(Boolean(client.health));
+              console.log();
+              prompt();
+              return;
+            }
+
             try {
               const swarm = await swarmSession.getSwarm();
               const execution = await client.swarms.run(swarm.id, {
                 text: trimmed,
               });
+              if (daemonWarning) {
+                printPlainTextDaemonRecovery();
+                daemonWarning = undefined;
+              }
               appendLaunchHistory(
                 opts.dir,
                 historyEntry(trimmed, execution.result)
@@ -372,6 +482,11 @@ async function executeDaemonLaunchCommand(
             } catch (error) {
               swarmSession.invalidate();
               console.error('Error:', getErrorMessage(error));
+              const nextWarning = await getDaemonPreflightWarning(client);
+              if (nextWarning && nextWarning !== daemonWarning) {
+                printPlainTextDaemonWarning(nextWarning);
+              }
+              daemonWarning = nextWarning;
             }
 
             console.log();
@@ -384,11 +499,18 @@ async function executeDaemonLaunchCommand(
       return;
     }
 
+    if (daemonWarning) {
+      printPlainTextDaemonWarning(daemonWarning);
+    }
     const swarm = await swarmSession.getSwarm();
     console.log(
       `Launching "${agency.name}" with strategy "${agency.strategy}" and model ${agency.model}...\n`
     );
     const execution = await client.swarms.run(swarm.id, { text: task });
+    if (daemonWarning) {
+      printPlainTextDaemonRecovery();
+      daemonWarning = undefined;
+    }
     appendLaunchHistory(opts.dir, historyEntry(task, execution.result));
     printLaunchResult(execution.result, true);
   } catch (error) {
@@ -428,6 +550,8 @@ async function executeDaemonTuiLaunchCommand(
       : await loadDaemonTuiRuntime();
     const bus = tuiRuntime.eventBus;
     const initialResults = loadLaunchHistory(opts.dir);
+    const preflightWarning = await getDaemonPreflightWarning(client);
+    const pollDaemonWarning = createDaemonWarningPoller(client);
 
     const agentProfiles: AgentProfile[] = [
       toProfile(agency.orchestrator, 'orchestrator'),
@@ -453,6 +577,7 @@ async function executeDaemonTuiLaunchCommand(
       let subscription: Promise<void> | undefined;
       let sawCompletion = false;
       let subscriptionError: string | undefined;
+      let launchStarted = false;
 
       try {
         const swarm = await swarmSession.getSwarm();
@@ -476,6 +601,7 @@ async function executeDaemonTuiLaunchCommand(
         })();
 
         await emitLaunchTaskStart(bus, displayAgents, input);
+        launchStarted = true;
         const execution = await client.swarms.run(swarm.id, { text: input });
         await Promise.race([subscription, sleep(2000)]);
         abortController.abort();
@@ -508,6 +634,9 @@ async function executeDaemonTuiLaunchCommand(
         abortController?.abort();
         await subscription;
         const message = getErrorMessage(error);
+        if (!launchStarted) {
+          await emitLaunchTaskQueued(bus, displayAgents, input);
+        }
         await emitLaunchTaskFailure(bus, displayAgents, message);
         return {
           status: 'error',
@@ -531,6 +660,8 @@ async function executeDaemonTuiLaunchCommand(
         onHistoryUpdated: (entries: ResultEntry[]) =>
           saveLaunchHistory(opts.dir, entries),
         onClearHistory: () => clearLaunchHistory(opts.dir),
+        preflightWarning,
+        pollDaemonWarning,
       });
       tuiRuntime.render(element);
       return;
@@ -548,6 +679,8 @@ async function executeDaemonTuiLaunchCommand(
       onHistoryUpdated: (entries: ResultEntry[]) =>
         saveLaunchHistory(opts.dir, entries),
       onClearHistory: () => clearLaunchHistory(opts.dir),
+      preflightWarning,
+      pollDaemonWarning,
     });
     const instance = tuiRuntime.render(element);
 

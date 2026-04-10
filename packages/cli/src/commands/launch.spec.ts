@@ -43,6 +43,7 @@ function createDaemonTuiHarness() {
         props: Record<string, unknown>;
       }
     | undefined;
+  const events: Array<{ type: string; data: unknown; agentId?: string }> = [];
 
   const unmount = vi.fn();
   const waitUntilExit = vi.fn().mockResolvedValue(undefined);
@@ -59,7 +60,9 @@ function createDaemonTuiHarness() {
           on() {
             return () => undefined;
           },
-          async emit() {},
+          async emit(type: string, data: unknown, agentId?: string) {
+            events.push({ type, data, agentId });
+          },
           clear() {},
         },
         render,
@@ -73,6 +76,7 @@ function createDaemonTuiHarness() {
     getElement() {
       return element;
     },
+    events,
     render,
     unmount,
     waitUntilExit,
@@ -171,6 +175,42 @@ describe('launch command daemon plain-text mode', () => {
     ]);
     expect(logSpy).toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('prints daemon warning and recovery messages for single-shot plain-text launch', async () => {
+    const client = {
+      health: vi.fn().mockRejectedValue(new Error('daemon unavailable')),
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      'Ship the patch',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Warning:',
+      'daemon unavailable. Launch tasks will fail until the daemon is reachable.'
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      'Daemon reachable again. Launch tasks can run.'
+    );
   });
 
   it('maps supported launch tools into daemon tool descriptors', async () => {
@@ -399,6 +439,247 @@ describe('launch command daemon plain-text mode', () => {
     expect(readline.close).toHaveBeenCalledOnce();
     expect(logSpy).toHaveBeenCalled();
     expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('prints daemon warning and recovery messages across interactive plain-text tasks', async () => {
+    const client = {
+      health: vi.fn().mockRejectedValue(new Error('daemon unavailable')),
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'interactive daemon result' },
+            durationMs: 8,
+          },
+        }),
+      }),
+    };
+    const inputs = ['First task', 'exit'];
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback(inputs.shift() ?? 'exit');
+      }),
+      close: vi.fn(),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      {
+        client,
+        createReadline: () => readline as any,
+      }
+    );
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Warning:',
+      'daemon unavailable. Launch tasks will fail until the daemon is reachable.'
+    );
+    expect(errorSpy.mock.calls).not.toContainEqual([
+      'Error:',
+      expect.any(String),
+    ]);
+    expect(logSpy).toHaveBeenCalledWith(
+      'Daemon reachable again. Launch tasks can run.'
+    );
+  });
+
+  it('reports daemon recovery on demand with /health in interactive plain-text launch', async () => {
+    const client = {
+      health: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('daemon unavailable'))
+        .mockResolvedValueOnce(undefined),
+      swarms: mockSwarms(),
+    };
+    const inputs = ['/health', 'exit'];
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback(inputs.shift() ?? 'exit');
+      }),
+      close: vi.fn(),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      {
+        client,
+        createReadline: () => readline as any,
+      }
+    );
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Warning:',
+      'daemon unavailable. Launch tasks will fail until the daemon is reachable.'
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      'Type "exit" to quit. Type "/health" to recheck daemon connectivity.\n'
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      'Daemon reachable again. Launch tasks can run.'
+    );
+    expect(client.swarms.create).not.toHaveBeenCalled();
+    expect(client.swarms.run).not.toHaveBeenCalled();
+  });
+
+  it('reports interactive plain-text commands on demand with /help when health is wired', async () => {
+    const client = {
+      health: vi.fn().mockResolvedValue(undefined),
+      swarms: mockSwarms(),
+    };
+    const inputs = ['/help', 'exit'];
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback(inputs.shift() ?? 'exit');
+      }),
+      close: vi.fn(),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      {
+        client,
+        createReadline: () => readline as any,
+      }
+    );
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      'Commands: /help show available commands · /health recheck daemon connectivity · exit quit'
+    );
+    expect(client.swarms.create).not.toHaveBeenCalled();
+    expect(client.swarms.run).not.toHaveBeenCalled();
+  });
+
+  it('reports healthy daemon state on demand with /health in interactive plain-text launch', async () => {
+    const client = {
+      health: vi.fn().mockResolvedValue(undefined),
+      swarms: mockSwarms(),
+    };
+    const inputs = ['/health', 'exit'];
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback(inputs.shift() ?? 'exit');
+      }),
+      close: vi.fn(),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      {
+        client,
+        createReadline: () => readline as any,
+      }
+    );
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      'Type "exit" to quit. Type "/health" to recheck daemon connectivity.\n'
+    );
+    expect(logSpy).toHaveBeenCalledWith(
+      'Daemon reachable. Launch tasks can run.'
+    );
+    expect(client.swarms.create).not.toHaveBeenCalled();
+    expect(client.swarms.run).not.toHaveBeenCalled();
+  });
+
+  it('reports interactive plain-text commands on demand with /help when health is not wired', async () => {
+    const client = {
+      swarms: mockSwarms(),
+    };
+    const inputs = ['/help', 'exit'];
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback(inputs.shift() ?? 'exit');
+      }),
+      close: vi.fn(),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      {
+        client,
+        createReadline: () => readline as any,
+      }
+    );
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      'Commands: /help show available commands · exit quit'
+    );
+    expect(client.swarms.create).not.toHaveBeenCalled();
+    expect(client.swarms.run).not.toHaveBeenCalled();
+  });
+
+  it('reports unavailable /health checks in interactive plain-text launch when health is not wired', async () => {
+    const client = {
+      swarms: mockSwarms(),
+    };
+    const inputs = ['/health', 'exit'];
+    const readline = {
+      question: vi.fn((_: string, callback: (input: string) => void) => {
+        callback(inputs.shift() ?? 'exit');
+      }),
+      close: vi.fn(),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      {
+        client,
+        createReadline: () => readline as any,
+      }
+    );
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith('Type "exit" to quit.\n');
+    expect(logSpy).toHaveBeenCalledWith(
+      'Daemon health checks unavailable in this session.'
+    );
+    expect(client.swarms.create).not.toHaveBeenCalled();
+    expect(client.swarms.run).not.toHaveBeenCalled();
   });
 
   it('forwards api-key overrides to daemon-backed plain-text launch', async () => {
@@ -929,7 +1210,74 @@ describe('launch command daemon plain-text mode', () => {
       error: 'daemon unavailable',
       durationMs: 0,
     });
+    expect(harness.events).toEqual([
+      {
+        type: 'agent:spawned',
+        data: { agentId: 'launch:manager', name: 'manager' },
+        agentId: 'launch:manager',
+      },
+      {
+        type: 'agent:spawned',
+        data: { agentId: 'launch:worker-a', name: 'worker-a' },
+        agentId: 'launch:worker-a',
+      },
+      {
+        type: 'agent:message',
+        data: {
+          from: 'user',
+          to: 'manager',
+          message: { text: 'First task' },
+        },
+        agentId: 'launch:manager',
+      },
+      {
+        type: 'task:failed',
+        data: { agentId: 'launch:manager', error: 'daemon unavailable' },
+        agentId: 'launch:manager',
+      },
+      {
+        type: 'swarm:completed',
+        data: {
+          result: {
+            status: 'error',
+            error: 'daemon unavailable',
+            durationMs: 0,
+          },
+        },
+        agentId: 'launch:manager',
+      },
+    ]);
     expect(client.swarms.run).not.toHaveBeenCalled();
+  });
+
+  it('passes a persistent daemon preflight warning into the TUI when health fails', async () => {
+    const harness = createDaemonTuiHarness();
+    const client = {
+      health: vi.fn().mockRejectedValue(new Error('daemon unavailable')),
+      swarms: mockSwarms(),
+    };
+
+    await executeLaunchCommand(
+      undefined,
+      {
+        dir: agencyDir,
+        tui: true,
+      },
+      { client, ...harness.deps }
+    );
+
+    const element = harness.getElement() as unknown as {
+      props: {
+        preflightWarning?: string;
+        pollDaemonWarning?: () => Promise<string | undefined>;
+      };
+    };
+
+    expect(element.props.preflightWarning).toContain('daemon unavailable');
+    expect(element.props.preflightWarning).toContain(
+      'Launch tasks will fail until the daemon is reachable.'
+    );
+    expect(typeof element.props.pollDaemonWarning).toBe('function');
   });
 
   it('relays tool result text into the TUI event bus', async () => {

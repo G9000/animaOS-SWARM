@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { agent, createDaemonClient, swarm } from './index.js';
+import {
+  agent,
+  createDaemonClient,
+  DaemonConnectionError,
+  DaemonHttpError,
+  swarm,
+} from './index.js';
 
 const originalFetchDescriptor = Object.getOwnPropertyDescriptor(
   globalThis,
@@ -155,6 +161,153 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
     );
   });
 
+  it('reads daemon health and manages memories through the daemon', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: 'ok',
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            id: 'memory-1',
+            agentId: 'agent-1',
+            agentName: 'researcher',
+            type: 'fact',
+            content: 'Daemon memory endpoint created',
+            importance: 0.8,
+            createdAt: 1712448000000,
+            tags: ['daemon', 'memory'],
+          },
+          { status: 201 }
+        )
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            {
+              id: 'memory-1',
+              agentId: 'agent-1',
+              agentName: 'researcher',
+              type: 'fact',
+              content: 'Daemon memory endpoint created',
+              importance: 0.8,
+              createdAt: 1712448000000,
+              tags: ['daemon', 'memory'],
+              score: 0.93,
+            },
+          ],
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          memories: [
+            {
+              id: 'memory-2',
+              agentId: 'agent-1',
+              agentName: 'researcher',
+              type: 'reflection',
+              content: 'Most recent note',
+              importance: 0.6,
+              createdAt: 1712448001000,
+              tags: ['recent'],
+            },
+          ],
+        })
+      );
+
+    const client = createDaemonClient({ baseUrl: 'http://daemon.test/' });
+
+    await expect(client.health()).resolves.toEqual({
+      status: 'ok',
+    });
+
+    await expect(
+      client.memories.create({
+        agentId: 'agent-1',
+        agentName: 'researcher',
+        type: 'fact',
+        content: 'Daemon memory endpoint created',
+        importance: 0.8,
+        tags: ['daemon', 'memory'],
+      })
+    ).resolves.toMatchObject({
+      id: 'memory-1',
+      agentId: 'agent-1',
+      type: 'fact',
+    });
+
+    await expect(
+      client.memories.search('daemon memory', {
+        agentName: 'researcher',
+        type: 'fact',
+        limit: 5,
+        minImportance: 0.5,
+      })
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: 'memory-1',
+        score: 0.93,
+      }),
+    ]);
+
+    await expect(
+      client.memories.recent({
+        agentId: 'agent-1',
+        limit: 1,
+      })
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: 'memory-2',
+        type: 'reflection',
+      }),
+    ]);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://daemon.test/health',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          accept: 'application/json',
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://daemon.test/api/memories',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          agentId: 'agent-1',
+          agentName: 'researcher',
+          type: 'fact',
+          content: 'Daemon memory endpoint created',
+          importance: 0.8,
+          tags: ['daemon', 'memory'],
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://daemon.test/api/memories/search?q=daemon+memory&agentName=researcher&type=fact&limit=5&minImportance=0.5',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          accept: 'application/json',
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      'http://daemon.test/api/memories/recent?agentId=agent-1&limit=1',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          accept: 'application/json',
+        }),
+      })
+    );
+  });
+
   it('creates and runs a swarm through the daemon', async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -247,6 +400,44 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         }),
       })
     );
+  });
+
+  it('wraps connection failures in a daemon-specific error', async () => {
+    fetchMock.mockRejectedValueOnce(new TypeError('fetch failed'));
+
+    const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
+    const healthRequest = client.health();
+
+    await expect(healthRequest).rejects.toMatchObject({
+      name: 'DaemonConnectionError',
+      message: 'Failed to reach daemon at http://daemon.test/health',
+      cause: expect.any(TypeError),
+    });
+    await expect(healthRequest).rejects.toBeInstanceOf(DaemonConnectionError);
+  });
+
+  it('surfaces daemon http errors with parsed response bodies', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          error: 'q query parameter is required',
+        },
+        { status: 400 }
+      )
+    );
+
+    const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
+    const searchRequest = client.memories.search('');
+
+    await expect(searchRequest).rejects.toMatchObject({
+      name: 'DaemonHttpError',
+      status: 400,
+      body: {
+        error: 'q query parameter is required',
+      },
+      message: 'q query parameter is required',
+    });
+    await expect(searchRequest).rejects.toBeInstanceOf(DaemonHttpError);
   });
 
   it('subscribes to swarm events over SSE', async () => {

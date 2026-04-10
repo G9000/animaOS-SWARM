@@ -43,6 +43,15 @@
     "apps/server": {
       "name": "@animaOS-SWARM/server",
       "version": "0.0.1",
+      "dependencies": {
+        "@animaOS-SWARM/core": "workspace:*",
+        "@animaOS-SWARM/memory": "workspace:*",
+        "@animaOS-SWARM/swarm": "workspace:*",
+        "ws": "^8.18.3",
+      },
+      "devDependencies": {
+        "@types/ws": "^8.18.1",
+      },
     },
     "apps/ui": {
       "name": "@animaOS-SWARM/ui",
@@ -100,6 +109,7 @@
       "version": "0.0.1",
       "dependencies": {
         "@animaOS-SWARM/core": "workspace:*",
+        "@animaOS-SWARM/memory": "workspace:*",
         "@animaOS-SWARM/swarm": "workspace:*",
         "tslib": "^2.3.0",
       },
@@ -954,6 +964,8 @@
     "@types/semver": ["@types/semver@7.5.8", "", {}, "sha512-I8EUhyrgfLrcTkzV3TSsGyl1tSuPrEDzr0yd5m90UgNxQkyDXULk3b6MlQqTCpZpNtWe1K0hzclnZkTcLBe2UQ=="],
 
     "@types/stack-utils": ["@types/stack-utils@2.0.3", "", {}, "sha512-9aEbYZ3TbYMznPdcdr3SmIrLXwC/AKZXQeCf9Pgao5CKb8CyHuEX5jzWPTkvregvhRJHcpRO6BFoGW9ycaOkYw=="],
+
+    "@types/ws": ["@types/ws@8.18.1", "", { "dependencies": { "@types/node": "*" } }, "sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg=="],
 
     "@types/yargs": ["@types/yargs@17.0.35", "", { "dependencies": { "@types/yargs-parser": "*" } }, "sha512-qUHkeCyQFxMXg79wQfTtfndEC+N9ZZg76HJftDJp+qH2tV7Gj4OJi7l+PiWwJ+pWtW8GwSmqsDj/oymhrTWXjg=="],
 

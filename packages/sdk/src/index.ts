@@ -1,8 +1,21 @@
 export { AgentsClient, action, agent, plugin } from './agents.js';
 export type { AgentMemory, AgentRunResponse, AgentSnapshot } from './agents.js';
 
-export { DaemonClient, DaemonHttpError, createDaemonClient } from './client.js';
-export type { DaemonClientOptions, DaemonEvent, FetchLike } from './client.js';
+export {
+  DaemonClient,
+  DaemonConnectionError,
+  DaemonHttpError,
+  createDaemonClient,
+} from './client.js';
+export type {
+  DaemonClientOptions,
+  DaemonEvent,
+  DaemonHealth,
+  FetchLike,
+} from './client.js';
+
+export { MemoriesClient } from './memories.js';
+export type { CreateMemoryInput, RecentMemoriesOptions } from './memories.js';
 
 export { SwarmsClient, swarm } from './swarms.js';
 export type {
@@ -29,6 +42,13 @@ export type {
   TokenUsage,
   UUID,
 } from '@animaOS-SWARM/core';
+
+export type {
+  Memory,
+  MemorySearchOptions,
+  MemorySearchResult,
+  MemoryType,
+} from '@animaOS-SWARM/memory';
 
 export type {
   AgentMessage,

@@ -21,6 +21,7 @@ import type { AgentProfile } from './types.js';
 afterEach(() => {
   cleanupInk();
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 function createEventBus(): IEventBus {
@@ -1755,6 +1756,405 @@ describe('App interactions', () => {
     expect(rendered.lastFrame()).toContain('trace ready');
   });
 
+  it('shows configured agents even before live agent events arrive', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        agentProfiles={[
+          createAgentProfile(),
+          createAgentProfile({ name: 'researcher_1', role: 'worker' }),
+        ]}
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('2 agents (0 active)');
+    expect(rendered.lastFrame()).toContain('[manager]');
+    expect(rendered.lastFrame()).toContain('[researcher_1]');
+  });
+
+  it('shows a persistent daemon preflight warning in the swarm view', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('Failed to reach daemon');
+    expect(rendered.lastFrame()).toContain('Launch tasks will fail');
+    expect(rendered.lastFrame()).toContain('daemon: down');
+    expect(rendered.lastFrame()).toContain(
+      'daemon down - tasks paused; use /health or /help'
+    );
+    expect(rendered.lastFrame()).toContain(
+      'commands only while daemon is down'
+    );
+
+    await submit(rendered, '/help');
+
+    expect(rendered.lastFrame()).toContain('/health');
+    expect(rendered.lastFrame()).toContain('daemon connectivity');
+    expect(rendered.lastFrame()).not.toContain('/retry  rerun the last task');
+  });
+
+  it('hides the past-runs retry footer while the daemon is down', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        initialResults={[createResultEntry()]}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('Past runs');
+    expect(rendered.lastFrame()).toContain('/history browse all');
+    expect(rendered.lastFrame()).not.toContain('/retry rerun last');
+  });
+
+  it('removes retry affordances from resumed result view while the daemon is down', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        initialResults={[createResultEntry()]}
+        resumeLastResult
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('Resumed last run.');
+    expect(rendered.lastFrame()).toContain(
+      'Retry unavailable while daemon is down.'
+    );
+    expect(rendered.lastFrame()).toContain('Use /health to recheck');
+
+    await submit(rendered, '/help');
+
+    expect(rendered.lastFrame()).toContain('/back  return to swarm view');
+    expect(rendered.lastFrame()).toContain('/health');
+    expect(rendered.lastFrame()).toContain('daemon connectivity');
+    expect(rendered.lastFrame()).not.toContain('/retry  rerun the last task');
+  });
+
+  it('blocks interactive task submissions while the daemon is down', async () => {
+    mockEventLog();
+    const onTask = vi
+      .fn<(task: string) => Promise<TaskResult<{ text: string }>>>()
+      .mockResolvedValue({
+        status: 'success',
+        data: { text: 'Should not run' },
+        durationMs: 5,
+      });
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        onTask={onTask}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    await submit(rendered, 'Draft release notes');
+
+    expect(onTask).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain(
+      'Task submission is blocked while the daemon is down.'
+    );
+    expect(rendered.lastFrame()).toContain('Use /health to recheck.');
+  });
+
+  it('blocks slash retries while the daemon is down', async () => {
+    mockEventLog();
+    const onTask = vi
+      .fn<(task: string) => Promise<TaskResult<{ text: string }>>>()
+      .mockResolvedValue({
+        status: 'success',
+        data: { text: 'Should not retry' },
+        durationMs: 5,
+      });
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        onTask={onTask}
+        initialResults={[createResultEntry()]}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    await submit(rendered, '/retry');
+
+    expect(onTask).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain(
+      'Task submission is blocked while the daemon is down.'
+    );
+  });
+
+  it('ignores history retry input while the daemon is down', async () => {
+    mockEventLog();
+    const onTask = vi
+      .fn<(task: string) => Promise<TaskResult<{ text: string }>>>()
+      .mockResolvedValue({
+        status: 'success',
+        data: { text: 'Should not retry from history' },
+        durationMs: 5,
+      });
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        onTask={onTask}
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+          }),
+        ]}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    await submit(rendered, '/history');
+    await pressKey(rendered, 'r');
+
+    expect(onTask).not.toHaveBeenCalled();
+    expect(rendered.lastFrame()).toContain('History');
+    expect(rendered.lastFrame()).not.toContain(
+      'Task submission is blocked while the daemon is down.'
+    );
+  });
+
+  it('hides history retry affordances while the daemon is down', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        initialResults={[
+          createResultEntry({
+            id: 'run-1',
+            task: 'First task',
+            result: 'First result',
+          }),
+          createResultEntry({
+            id: 'run-2',
+            timestamp: 2,
+            task: 'Second task',
+            result: 'Second result',
+          }),
+        ]}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    await submit(rendered, '/history');
+
+    expect(rendered.lastFrame()).toContain('History');
+    expect(rendered.lastFrame()).not.toContain('r retry');
+  });
+
+  it('updates the daemon preflight warning while the app is open', async () => {
+    mockEventLog();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-09T12:00:00Z'));
+
+    const pollDaemonWarning = vi
+      .fn<() => Promise<string | undefined>>()
+      .mockResolvedValueOnce(
+        'Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable.'
+      )
+      .mockResolvedValueOnce(undefined);
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        pollDaemonWarning={pollDaemonWarning}
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('daemon: up');
+    expect(rendered.lastFrame()).toContain('@ 12:00:00Z');
+    expect(rendered.lastFrame()).not.toContain('Failed to reach daemon');
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(rendered.lastFrame()).toContain('Failed to reach daemon');
+    expect(rendered.lastFrame()).toContain('Daemon connection lost');
+    expect(rendered.lastFrame()).toContain('daemon: down');
+    expect(rendered.lastFrame()).toContain('@ 12:00:05Z');
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(rendered.lastFrame()).not.toContain('Failed to reach daemon');
+    expect(rendered.lastFrame()).toContain('Daemon reachable again');
+    expect(rendered.lastFrame()).toContain('daemon: up');
+    expect(rendered.lastFrame()).toContain('@ 12:00:10Z');
+    expect(rendered.lastFrame()).toContain(
+      'Task entry restored. Freeform tasks are available again.'
+    );
+    expect(rendered.lastFrame()).toContain(
+      'type your task... or /help for commands'
+    );
+
+    await vi.advanceTimersByTimeAsync(4000);
+    await Promise.resolve();
+
+    expect(rendered.lastFrame()).not.toContain(
+      'Task entry restored. Freeform tasks are available again.'
+    );
+  });
+
+  it('recovers from a daemon-down launch state and then runs a task', async () => {
+    mockEventLog();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-09T12:15:00Z'));
+
+    const pollDaemonWarning = vi
+      .fn<() => Promise<string | undefined>>()
+      .mockResolvedValue(undefined);
+    const onTask = vi
+      .fn<(task: string) => Promise<TaskResult<{ text: string }>>>()
+      .mockResolvedValue({
+        status: 'success',
+        data: { text: 'Completed after reconnect' },
+        durationMs: 7,
+      });
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        onTask={onTask}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+        pollDaemonWarning={pollDaemonWarning}
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain('daemon: down');
+    expect(rendered.lastFrame()).toContain(
+      'daemon down - tasks paused; use /health or /help'
+    );
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(rendered.lastFrame()).toContain('daemon: up');
+    expect(rendered.lastFrame()).toContain(
+      'Task entry restored. Freeform tasks are available again.'
+    );
+    expect(rendered.lastFrame()).toContain(
+      'type your task... or /help for commands'
+    );
+    expect(rendered.lastFrame()).not.toContain(
+      'daemon down - tasks paused; use /health or /help'
+    );
+
+    vi.useRealTimers();
+
+    await submit(rendered, 'Ship the patch');
+    await flush();
+
+    expect(onTask).toHaveBeenCalledWith('Ship the patch');
+    expect(rendered.lastFrame()).toContain('Completed after reconnect');
+  });
+
+  it('includes the daemon check time in /status when health monitoring is wired', async () => {
+    mockEventLog();
+    vi.spyOn(Date, 'now').mockReturnValue(
+      new Date('2026-04-09T09:45:30Z').valueOf()
+    );
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        pollDaemonWarning={vi.fn().mockResolvedValue(undefined)}
+      />
+    );
+
+    await submit(rendered, '/status');
+
+    expect(rendered.lastFrame()).toContain('daemon up checked 09:45:30Z');
+  });
+
+  it('reports daemon health on demand with /health', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App
+        eventBus={createEventBus()}
+        strategy="supervisor"
+        interactive
+        pollDaemonWarning={vi.fn().mockResolvedValue(undefined)}
+        preflightWarning="Failed to reach daemon at http://127.0.0.1:8080. Launch tasks will fail until the daemon is reachable."
+      />
+    );
+
+    await submit(rendered, '/health');
+
+    expect(rendered.lastFrame()).toContain('Daemon reachable again.');
+    expect(rendered.lastFrame()).toContain('Launch tasks can run.');
+    expect(rendered.lastFrame()).toContain(
+      'Task entry restored. Freeform tasks are available again.'
+    );
+    expect(rendered.lastFrame()).toContain(
+      'type your task... or /help for commands'
+    );
+  });
+
+  it('reports unavailable health checks when /health is not wired for the session', async () => {
+    mockEventLog();
+
+    const rendered = render(
+      <App eventBus={createEventBus()} strategy="supervisor" interactive />
+    );
+
+    await submit(rendered, '/health');
+
+    expect(rendered.lastFrame()).toContain(
+      'Daemon health checks unavailable in this session.'
+    );
+  });
+
   it('shows an informative message when /agents is used without profiles', async () => {
     mockEventLog();
 
@@ -1915,7 +2315,7 @@ describe('App interactions', () => {
     expect(rendered.lastFrame()).toContain('agents 1');
     expect(rendered.lastFrame()).toContain('messages 0');
     expect(rendered.lastFrame()).toContain('tools 0');
-    expect(rendered.lastFrame()).toContain('history 0');
+    expect(rendered.lastFrame()).toContain('history');
     expect(rendered.lastFrame()).toContain('trace empty');
 
     deferred.resolve({

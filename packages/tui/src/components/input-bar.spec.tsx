@@ -242,4 +242,33 @@ describe('InputBar interactions', () => {
     expect(onSubmit).not.toHaveBeenCalled();
     expect(rendered.lastFrame()).toContain('running swarm...');
   });
+
+  it('shows a command-only prompt state while still allowing slash commands', async () => {
+    const onSubmit = vi.fn();
+
+    const rendered = renderInk(
+      <InputBar
+        onSubmit={onSubmit}
+        commandOnly
+        commandOnlyHint="daemon down - tasks paused; use /health or /help"
+        commandOnlyHelperText="commands only while daemon is down"
+        history={['Earlier task']}
+        commands={[{ name: 'health', description: 'check daemon health' }]}
+      />
+    );
+
+    expect(rendered.lastFrame()).toContain(
+      'daemon down - tasks paused; use /health or /help'
+    );
+    expect(rendered.lastFrame()).toContain(
+      'commands only while daemon is down'
+    );
+    expect(rendered.lastFrame()).not.toContain(
+      '↑↓ recall previous prompts · ctrl+r search history'
+    );
+
+    await submitInk(rendered, '/health');
+
+    expect(onSubmit).toHaveBeenCalledWith('/health');
+  });
 });

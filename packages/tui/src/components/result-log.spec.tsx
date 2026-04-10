@@ -84,4 +84,13 @@ describe('ResultLog rendering', () => {
       'task: Ship the patch and update docs'
     );
   });
+
+  it('can hide the retry hint from the footer', () => {
+    const rendered = renderInk(
+      <ResultLog results={[createResultEntry()]} showRetryHint={false} />
+    );
+
+    expect(rendered.lastFrame()).toContain('/history browse all');
+    expect(rendered.lastFrame()).not.toContain('/retry rerun last');
+  });
 });

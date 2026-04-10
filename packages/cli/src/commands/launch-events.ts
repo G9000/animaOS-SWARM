@@ -36,7 +36,7 @@ export function launchDisplayAgents(
   ];
 }
 
-export async function emitLaunchTaskStart(
+export async function emitLaunchTaskQueued(
   eventBus: IEventBus,
   agents: LaunchDisplayAgent[],
   task: string
@@ -68,6 +68,19 @@ export async function emitLaunchTaskStart(
     },
     primaryAgent.id
   );
+}
+
+export async function emitLaunchTaskStart(
+  eventBus: IEventBus,
+  agents: LaunchDisplayAgent[],
+  task: string
+): Promise<void> {
+  const primaryAgent = agents[0];
+  if (!primaryAgent) {
+    return;
+  }
+
+  await emitLaunchTaskQueued(eventBus, agents, task);
 
   await eventBus.emit(
     'task:started',

@@ -4,6 +4,7 @@ import type { IEventBus } from '@animaOS-SWARM/core';
 
 import {
   emitLaunchTaskFailure,
+  emitLaunchTaskQueued,
   emitLaunchTaskStart,
   launchDisplayAgents,
   relayLaunchSwarmEvent,
@@ -94,6 +95,35 @@ describe('launch event bridge', () => {
       {
         type: 'task:started',
         data: { agentId: 'launch:manager' },
+        agentId: 'launch:manager',
+      },
+    ]);
+  });
+
+  it('emits spawn and input context before a launch task starts', async () => {
+    const { bus, events } = createRecordingBus();
+    const agents = launchDisplayAgents(agency);
+
+    await emitLaunchTaskQueued(bus, agents, 'Ship it');
+
+    expect(events).toEqual([
+      {
+        type: 'agent:spawned',
+        data: { agentId: 'launch:manager', name: 'manager' },
+        agentId: 'launch:manager',
+      },
+      {
+        type: 'agent:spawned',
+        data: { agentId: 'launch:worker-a', name: 'worker-a' },
+        agentId: 'launch:worker-a',
+      },
+      {
+        type: 'agent:message',
+        data: {
+          from: 'user',
+          to: 'manager',
+          message: { text: 'Ship it' },
+        },
         agentId: 'launch:manager',
       },
     ]);

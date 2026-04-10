@@ -1,4 +1,5 @@
 import { AgentsClient } from './agents.js';
+import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
@@ -16,6 +17,10 @@ export interface DaemonEvent<T = unknown> {
   event: string;
   data: T;
   id?: string;
+}
+
+export interface DaemonHealth {
+  status: 'ok';
 }
 
 export class DaemonHttpError extends Error {
@@ -38,8 +43,19 @@ export class DaemonHttpError extends Error {
   }
 }
 
+export class DaemonConnectionError extends Error {
+  override readonly cause: unknown;
+
+  constructor(baseUrl: string, cause: unknown) {
+    super(`Failed to reach daemon at ${baseUrl}`);
+    this.name = 'DaemonConnectionError';
+    this.cause = cause;
+  }
+}
+
 export class DaemonClient {
   readonly agents: AgentsClient;
+  readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
 
   private readonly baseUrl: string;
@@ -55,7 +71,12 @@ export class DaemonClient {
 
     this.fetchImpl = fetchImpl;
     this.agents = new AgentsClient(this);
+    this.memories = new MemoriesClient(this);
     this.swarms = new SwarmsClient(this);
+  }
+
+  async health(): Promise<DaemonHealth> {
+    return this.requestJson<DaemonHealth>('/health');
   }
 
   async requestJson<T>(
@@ -73,7 +94,7 @@ export class DaemonClient {
       headers['content-type'] = 'application/json';
     }
 
-    const response = await this.fetchImpl(this.url(path), {
+    const response = await this.fetchWithConnectionErrors(path, {
       ...init,
       headers,
       body,
@@ -93,7 +114,7 @@ export class DaemonClient {
   ): AsyncGenerator<DaemonEvent<T>> {
     const abortController = new AbortController();
     const detachAbortRelay = relayAbort(init.signal, abortController);
-    const response = await this.fetchImpl(this.url(path), {
+    const response = await this.fetchWithConnectionErrors(path, {
       ...init,
       method: init.method ?? 'GET',
       headers: {
@@ -159,6 +180,21 @@ export class DaemonClient {
 
   private url(path: string): string {
     return `${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`;
+  }
+
+  private async fetchWithConnectionErrors(
+    path: string,
+    init: RequestInit
+  ): Promise<Response> {
+    try {
+      return await this.fetchImpl(this.url(path), init);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw error;
+      }
+
+      throw new DaemonConnectionError(this.url(path), error);
+    }
   }
 }
 

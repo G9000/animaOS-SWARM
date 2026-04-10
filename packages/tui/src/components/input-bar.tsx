@@ -17,6 +17,9 @@ export interface InputBarProps {
   onSubmit: (value: string) => void;
   disabled?: boolean;
   placeholder?: string;
+  commandOnly?: boolean;
+  commandOnlyHint?: string;
+  commandOnlyHelperText?: string;
   commands?: SlashCommand[];
   history?: string[];
   suggestions?: (value: string) => InputSuggestion[];
@@ -26,6 +29,9 @@ export function InputBar({
   onSubmit,
   disabled = false,
   placeholder = 'type your task... or /help for commands',
+  commandOnly = false,
+  commandOnlyHint = 'commands only... use /help for commands',
+  commandOnlyHelperText = 'commands only while task entry is paused',
   commands = [],
   history = [],
   suggestions,
@@ -277,17 +283,26 @@ export function InputBar({
   if (disabled) {
     body = <Text color="yellow">running swarm...</Text>;
   } else if (value) {
+    const blockedPlainTaskDraft = commandOnly && !isSlash;
     body = (
       <Text>
-        {isSlash ? <Text color="magenta">{value}</Text> : value}
-        <Text color="cyan">▌</Text>
+        {isSlash ? (
+          <Text color="magenta">{value}</Text>
+        ) : blockedPlainTaskDraft ? (
+          <Text color="yellow">{value}</Text>
+        ) : (
+          value
+        )}
+        <Text color={blockedPlainTaskDraft ? 'yellow' : 'cyan'}>▌</Text>
       </Text>
     );
   } else {
     body = (
       <Text>
-        <Text color="gray">{placeholder}</Text>
-        <Text color="cyan">▌</Text>
+        <Text color={commandOnly ? 'yellow' : 'gray'}>
+          {commandOnly ? commandOnlyHint : placeholder}
+        </Text>
+        <Text color={commandOnly ? 'yellow' : 'cyan'}>▌</Text>
       </Text>
     );
   }
@@ -373,6 +388,7 @@ export function InputBar({
       {activeMatchCount === 0 &&
         history.length > 0 &&
         !disabled &&
+        !commandOnly &&
         !historySearchMode && (
           <Box paddingX={2}>
             <Text color="gray" dimColor>
@@ -381,8 +397,16 @@ export function InputBar({
           </Box>
         )}
 
+      {commandOnly && !disabled && !historySearchMode ? (
+        <Box paddingX={2}>
+          <Text color="yellow" dimColor>
+            {commandOnlyHelperText}
+          </Text>
+        </Box>
+      ) : null}
+
       <Box borderStyle="round" paddingX={1}>
-        <Text bold color="cyan">
+        <Text bold color={commandOnly && !disabled ? 'yellow' : 'cyan'}>
           {'>'}{' '}
         </Text>
         {body}

@@ -12,10 +12,12 @@ export interface ResultEntry {
 
 export interface ResultLogProps {
   results: ResultEntry[];
+  showRetryHint?: boolean;
 }
 
 export function ResultLog({
   results,
+  showRetryHint = true,
 }: ResultLogProps): React.ReactElement | null {
   if (results.length === 0) return null;
 
@@ -34,7 +36,11 @@ export function ResultLog({
       <Text bold color="white">
         Past runs
       </Text>
-      <Text dimColor>/history browse all /retry rerun last</Text>
+      <Text dimColor>
+        {showRetryHint
+          ? '/history browse all /retry rerun last'
+          : '/history browse all'}
+      </Text>
       {recent.map((r) => {
         const label = r.label?.trim();
         const task = r.task.length > 55 ? r.task.slice(0, 52) + '...' : r.task;

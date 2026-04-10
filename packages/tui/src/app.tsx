@@ -1,6 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { Box, Text, useApp, useInput } from 'ink';
-import type { IEventBus, TaskResult } from '@animaOS-SWARM/core';
+import { type IEventBus, type TaskResult } from '@animaOS-SWARM/core';
+import { useDaemonState } from './hooks/use-daemon-state.js';
 import { useEventLog } from './hooks/use-event-log.js';
 import { Header } from './components/header.js';
 import { AgentPanel } from './components/agent-panel.js';
@@ -13,8 +14,10 @@ import { ResultView } from './components/result-view.js';
 import { AgentsPanel } from './components/agents-panel.js';
 import { TraceView } from './components/trace-view.js';
 import { HistoryView } from './components/history-view.js';
+import { buildDisplayedAgents } from './displayed-agents.js';
+import { buildAppInputCommands } from './input-commands.js';
 import type { ResultEntry } from './components/result-log.js';
-import type { InputSuggestion, SlashCommand } from './components/input-bar.js';
+import type { InputSuggestion } from './components/input-bar.js';
 import type { AgentProfile } from './types.js';
 
 export interface AppProps {
@@ -40,29 +43,11 @@ export interface AppProps {
   onHistoryUpdated?: (entries: ResultEntry[]) => void;
   /** Called when history is cleared */
   onClearHistory?: () => void;
+  /** Persistent daemon warning shown in the swarm view before tasks run */
+  preflightWarning?: string;
+  /** Poll for daemon health warnings while the TUI is open */
+  pollDaemonWarning?: () => Promise<string | undefined>;
 }
-
-const SLASH_COMMANDS: SlashCommand[] = [
-  { name: 'agents', description: 'browse and edit agents' },
-  { name: 'history', description: 'browse past runs' },
-  { name: 'resume', description: 'browse saved runs or resume by label' },
-  { name: 'rename', description: 'name the current saved run' },
-  {
-    name: 'delete',
-    description: 'delete a saved run by label',
-    args: '<label>',
-  },
-  { name: 'undo', description: 'restore the last deleted saved run' },
-  { name: 'undo-drop', description: 'discard the oldest queued undo' },
-  { name: 'undo-status', description: 'show deleted-run undo queue' },
-  { name: 'trace', description: 'inspect messages and tool activity' },
-  { name: 'result', description: 'view the full last result' },
-  { name: 'status', description: 'show current session state' },
-  { name: 'retry', description: 'rerun the last task' },
-  { name: 'help', description: 'show available commands' },
-  { name: 'clear', description: 'clear session history' },
-  { name: 'exit', description: 'exit the session' },
-];
 
 type AppView = 'swarm' | 'agents' | 'history' | 'trace' | 'result';
 type HistoryMode = 'history' | 'resume';
@@ -86,6 +71,16 @@ type DeletedSavedRunState = {
 };
 const MAX_PROMPT_HISTORY = 100;
 const MAX_DELETED_SAVED_RUN_UNDOS = 5;
+const TASK_SUBMISSION_BLOCKED_MESSAGE =
+  'Task submission is blocked while the daemon is down. Use /health to recheck.';
+const TASK_INPUT_COMMAND_ONLY_HINT =
+  'daemon down - tasks paused; use /health or /help';
+const TASK_INPUT_COMMAND_ONLY_HELPER =
+  'commands only while daemon is down · /health recheck · /help commands';
+
+function formatDaemonCheckTime(timestamp: number): string {
+  return `${new Date(timestamp).toISOString().slice(11, 19)}Z`;
+}
 
 function hasSavedRunLabel(
   entry: ResultEntry
@@ -391,6 +386,8 @@ export function App({
   onResultRecorded,
   onHistoryUpdated,
   onClearHistory,
+  preflightWarning,
+  pollDaemonWarning,
 }: AppProps): React.ReactElement {
   const { exit } = useApp();
   const { agents, messages, tools, stats, done, result, error, reset } =
@@ -453,11 +450,45 @@ export function App({
     historyMode === 'resume' ? sortResumeEntries(resultLog) : resultLog;
   const canExitOneShot =
     !interactive && view === 'swarm' && (done || Boolean(error));
-
+  const displayedAgents = buildDisplayedAgents(profiles, agents);
+  const configuredAgentCount =
+    profiles.length > 0 ? profiles.length : undefined;
+  const visibleAgentCount = configuredAgentCount ?? stats.agentCount;
   const showMsg = useCallback((msg: string) => {
     setSystemMsg(msg);
     setTimeout(() => setSystemMsg(null), 3000);
   }, []);
+
+  const {
+    daemonWarning,
+    daemonRecoveryNotice,
+    daemonStatus,
+    lastDaemonCheckAt,
+    taskEntryBlockedByDaemon,
+    syncDaemonWarning,
+  } = useDaemonState({
+    interactive,
+    phase,
+    preflightWarning,
+    pollDaemonWarning,
+    showMessage: showMsg,
+  });
+  const { swarmInputCommands, resultInputCommands, helpCommands } =
+    buildAppInputCommands({
+      interactive,
+      hasSavedRuns: resultLog.length > 0,
+      taskEntryBlockedByDaemon,
+      showResultCommands: view === 'result' && Boolean(activeResult),
+    });
+
+  const blockInteractiveTaskSubmission = useCallback(() => {
+    if (!interactive || !daemonWarning) {
+      return false;
+    }
+
+    showMsg(TASK_SUBMISSION_BLOCKED_MESSAGE);
+    return true;
+  }, [daemonWarning, interactive, showMsg]);
 
   const showStatus = useCallback(() => {
     const taskLabel = currentTask
@@ -472,7 +503,16 @@ export function App({
       [
         `Status: ${phase}`,
         `task ${taskLabel}`,
-        `agents ${stats.agentCount}`,
+        typeof configuredAgentCount === 'number'
+          ? `agents ${configuredAgentCount} configured / ${stats.agentCount} active`
+          : `agents ${stats.agentCount}`,
+        daemonStatus
+          ? `daemon ${daemonStatus}${
+              lastDaemonCheckAt
+                ? ` checked ${formatDaemonCheckTime(lastDaemonCheckAt)}`
+                : ''
+            }`
+          : null,
         `messages ${messages.length}`,
         `tools ${tools.length}`,
         `history ${resultLog.length}`,
@@ -485,6 +525,9 @@ export function App({
     messages.length,
     phase,
     resultLog.length,
+    configuredAgentCount,
+    daemonStatus,
+    lastDaemonCheckAt,
     stats.agentCount,
     tools.length,
     showMsg,
@@ -982,6 +1025,9 @@ export function App({
         case 'status':
           showStatus();
           break;
+        case 'health':
+          await syncDaemonWarning('manual');
+          break;
         case 'undo':
           undoDeleteSavedRun();
           break;
@@ -1030,6 +1076,9 @@ export function App({
             showMsg('No previous task to retry.');
             break;
           }
+          if (blockInteractiveTaskSubmission()) {
+            break;
+          }
           await runTask(retryEntry.task);
           break;
         }
@@ -1053,9 +1102,7 @@ export function App({
           break;
         case 'help':
           showMsg(
-            SLASH_COMMANDS.map((c) => `/${c.name}  ${c.description}`).join(
-              '   '
-            )
+            helpCommands.map((c) => `/${c.name}  ${c.description}`).join('   ')
           );
           break;
         default:
@@ -1068,6 +1115,7 @@ export function App({
       profiles,
       showMsg,
       showStatus,
+      syncDaemonWarning,
       resultLog,
       activeResult,
       view,
@@ -1081,8 +1129,10 @@ export function App({
       deleteSavedRun,
       undoDeleteSavedRun,
       dropOldestDeletedSavedRun,
+      helpCommands,
       oldestUndoLabel,
       openResultEntry,
+      blockInteractiveTaskSubmission,
       runTask,
       onClearHistory,
     ]
@@ -1095,9 +1145,17 @@ export function App({
         await handleSlashCommand(input);
         return;
       }
+      if (blockInteractiveTaskSubmission()) {
+        return;
+      }
       await runTask(input);
     },
-    [handleSlashCommand, rememberPrompt, runTask]
+    [
+      blockInteractiveTaskSubmission,
+      handleSlashCommand,
+      rememberPrompt,
+      runTask,
+    ]
   );
 
   const handleSaveAgent = useCallback(
@@ -1150,8 +1208,11 @@ export function App({
               : undefined
           }
           onRetry={
-            interactive
+            interactive && !taskEntryBlockedByDaemon
               ? async (entry: ResultEntry) => {
+                  if (blockInteractiveTaskSubmission()) {
+                    return;
+                  }
                   await runTask(entry.task);
                 }
               : undefined
@@ -1226,7 +1287,11 @@ export function App({
     const hint =
       interactive && resumeEntryId === activeResult.id
         ? resumeEntry?.id === activeResult.id
-          ? 'Resumed last run. Type /retry to run it again or /back to return.'
+          ? taskEntryBlockedByDaemon
+            ? 'Resumed last run. Retry unavailable while daemon is down. Use /health to recheck or /back to return.'
+            : 'Resumed last run. Type /retry to run it again or /back to return.'
+          : taskEntryBlockedByDaemon
+          ? 'Resumed saved run. Retry unavailable while daemon is down. Use /health to recheck or /back to return.'
           : 'Resumed saved run. Type /retry to run it again or /back to return.'
         : undefined;
     const note =
@@ -1254,49 +1319,20 @@ export function App({
         <InputBar
           onSubmit={handleTaskSubmit}
           disabled={false}
+          commandOnly={taskEntryBlockedByDaemon}
+          commandOnlyHint={TASK_INPUT_COMMAND_ONLY_HINT}
+          commandOnlyHelperText={TASK_INPUT_COMMAND_ONLY_HELPER}
           history={promptHistory}
           suggestions={inputSuggestions}
-          commands={[
-            { name: 'back', description: 'return to swarm view' },
-            ...(resultLog.length > 0
-              ? [
-                  {
-                    name: 'resume',
-                    description: 'browse saved runs to resume',
-                  },
-                  {
-                    name: 'rename',
-                    description: 'name the current saved run',
-                    args: '<label>',
-                  },
-                  {
-                    name: 'delete',
-                    description: 'delete the current saved run',
-                  },
-                  {
-                    name: 'undo',
-                    description: 'restore the last deleted saved run',
-                  },
-                  {
-                    name: 'undo-drop',
-                    description: 'discard the oldest queued undo',
-                  },
-                  {
-                    name: 'undo-status',
-                    description: 'show deleted-run undo queue',
-                  },
-                ]
-              : []),
-            ...(interactive
-              ? [
-                  {
-                    name: 'retry',
-                    description: 'rerun the last task',
-                  },
-                ]
-              : []),
-          ]}
+          commands={resultInputCommands}
         />
+        {daemonRecoveryNotice ? (
+          <Box paddingX={2}>
+            <Text color="green" bold>
+              {daemonRecoveryNotice}
+            </Text>
+          </Box>
+        ) : null}
       </Box>
     );
   }
@@ -1308,10 +1344,16 @@ export function App({
     <Box flexDirection="column">
       <Header
         strategy={strategy}
-        agentCount={stats.agentCount}
+        agentCount={visibleAgentCount}
+        activeAgentCount={stats.agentCount}
         task={headerTask}
       />
-      <AgentPanel agents={agents} />
+      {daemonWarning ? (
+        <Box paddingX={1}>
+          <Text color="yellow">{daemonWarning}</Text>
+        </Box>
+      ) : null}
+      <AgentPanel agents={displayedAgents} />
       <MessageStream messages={messages} />
       <ToolPanel tools={tools} />
 
@@ -1345,10 +1387,18 @@ export function App({
         </Box>
       ) : null}
 
-      {interactive ? <ResultLog results={resultLog} /> : null}
+      {interactive ? (
+        <ResultLog
+          results={resultLog}
+          showRetryHint={!taskEntryBlockedByDaemon}
+        />
+      ) : null}
 
       <StatusBar
         stats={stats}
+        configuredAgentCount={configuredAgentCount}
+        daemonStatus={daemonStatus}
+        daemonCheckedAt={lastDaemonCheckAt}
         done={interactive ? phase === 'waiting' && resultLog.length > 0 : done}
       />
 
@@ -1428,10 +1478,18 @@ export function App({
           })}
           <Box marginTop={1}>
             <Text color="gray" dimColor>
-              Retry with /resume {'<label>'}, Ctrl+N/Ctrl+P to move, Ctrl+Y to
-              open, or Ctrl+O to browse all saved runs.
+              Use /resume {'<label>'}, Ctrl+N/Ctrl+P to move, Ctrl+Y to open, or
+              Ctrl+O to browse all saved runs.
             </Text>
           </Box>
+        </Box>
+      ) : null}
+
+      {daemonRecoveryNotice ? (
+        <Box paddingX={2}>
+          <Text color="green" bold>
+            {daemonRecoveryNotice}
+          </Text>
         </Box>
       ) : null}
 
@@ -1439,9 +1497,12 @@ export function App({
         <InputBar
           onSubmit={handleTaskSubmit}
           disabled={phase === 'running'}
+          commandOnly={taskEntryBlockedByDaemon}
+          commandOnlyHint={TASK_INPUT_COMMAND_ONLY_HINT}
+          commandOnlyHelperText={TASK_INPUT_COMMAND_ONLY_HELPER}
           history={promptHistory}
           suggestions={inputSuggestions}
-          commands={SLASH_COMMANDS}
+          commands={swarmInputCommands}
         />
       ) : null}
     </Box>

@@ -1,16 +1,15 @@
-import { route, json } from './helpers.js';
-import type { SwarmConfig } from '@animaOS-SWARM/swarm';
+import { getTaskText, isSwarmConfigBody, json, route } from './helpers.js';
 
 export const swarmRoutes = [
   // Create swarm
   route('POST', '/api/swarms', async (_req, res, state, body) => {
-    const config = body as SwarmConfig;
-    if (!config.strategy || !config.manager || !config.workers) {
+    if (!isSwarmConfigBody(body)) {
       json(res, 400, { error: 'strategy, manager, and workers are required' });
       return;
     }
-    const swarm = state.createSwarm(config);
-    json(res, 201, { id: swarm.id, strategy: config.strategy });
+
+    const swarm = await state.createSwarm(body);
+    json(res, 201, { id: swarm.id, strategy: body.strategy });
   }),
 
   // List swarms
@@ -39,7 +38,7 @@ export const swarmRoutes = [
         json(res, 404, { error: 'Swarm not found' });
         return;
       }
-      const task = body.task as string;
+      const task = getTaskText(body);
       if (!task) {
         json(res, 400, { error: 'task is required' });
         return;

@@ -1,16 +1,15 @@
-import { route, json } from './helpers.js';
-import type { AgentConfig } from '@animaOS-SWARM/core';
+import { getTaskText, isAgentConfigBody, json, route } from './helpers.js';
 
 export const agentRoutes = [
   // Create agent
   route('POST', '/api/agents', async (_req, res, state, body) => {
-    const config = body as AgentConfig;
-    if (!config.name || !config.model) {
+    if (!isAgentConfigBody(body)) {
       json(res, 400, { error: 'name and model are required' });
       return;
     }
-    const agent = await state.createAgent(config);
-    json(res, 201, { id: agent.agentId, name: config.name, status: 'idle' });
+
+    const agent = await state.createAgent(body);
+    json(res, 201, { id: agent.agentId, name: body.name, status: 'idle' });
   }),
 
   // List agents
@@ -42,7 +41,7 @@ export const agentRoutes = [
     'POST',
     '/api/agents/:id/run',
     async (_req, res, state, body, params) => {
-      const task = body.task as string;
+      const task = getTaskText(body);
       if (!task) {
         json(res, 400, { error: 'task is required' });
         return;

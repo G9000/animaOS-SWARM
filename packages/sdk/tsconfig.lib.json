@@ -14,6 +14,9 @@
       "path": "../swarm/tsconfig.lib.json"
     },
     {
+      "path": "../memory/tsconfig.lib.json"
+    },
+    {
       "path": "../core/tsconfig.lib.json"
     }
   ],

@@ -1,1 +1,65 @@
-/* You can add global styles to this file, and also import other style files */
+:root {
+  --app-background: #030303;
+  --app-surface: #0a0a0a;
+  --app-surface-strong: #111111;
+  --app-border: rgba(201, 162, 39, 0.16);
+  --app-border-strong: rgba(201, 162, 39, 0.34);
+  --app-accent: #c9a227;
+  --app-text-primary: #f2d786;
+  --app-text-secondary: #c7b882;
+  --app-text-muted: #867754;
+  --app-success: #8cae6e;
+  --app-danger: #c25a42;
+  --app-font: 'IBM Plex Mono', 'Cascadia Mono', 'SFMono-Regular', 'Courier New',
+    monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--app-background);
+  color: var(--app-text-primary);
+  font-family: var(--app-font);
+  line-height: 1.45;
+  text-rendering: optimizeLegibility;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.015),
+    rgba(255, 255, 255, 0.015) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+  opacity: 0.35;
+  mix-blend-mode: screen;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  border-radius: 0;
+}
+
+a {
+  color: inherit;
+}

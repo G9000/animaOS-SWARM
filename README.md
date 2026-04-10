@@ -57,6 +57,12 @@ Prefer the repo-local CLI while developing. Bun is only the local script runner 
 
 `create` is a local CLI flow and does not require the Rust daemon. `launch`, `run`, and `chat` are daemon-backed. `launch` is the primary TUI flow; use `--no-tui` only for automation or plain-text execution.
 
+Plain-text launch (`--no-tui`) supports both single-shot and interactive use:
+
+- `bun run animaos launch --no-tui "your task"` runs one daemon-backed task with plain-text output.
+- `bun run animaos launch --no-tui` opens an interactive prompt with `exit`, `/help`, and `/health`.
+- If daemon health is unavailable at startup, launch prints a warning that tasks will fail until the daemon is reachable; once connectivity returns, it prints a one-line recovery message before continuing.
+
 ```bash
 # Build the local SDK/CLI runtime used by the workspace package entrypoints
 bun run build:cli-sdk
@@ -75,6 +81,12 @@ bun run daemon
 
 cd content-team
 bun run animaos launch "your task"
+
+# Plain-text single-shot execution
+bun run animaos launch --no-tui "your task"
+
+# Plain-text interactive prompt (/help, /health, exit)
+bun run animaos launch --no-tui
 ```
 
 ## Provider Support

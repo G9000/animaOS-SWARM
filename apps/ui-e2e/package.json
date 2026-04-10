@@ -3,6 +3,51 @@
   "version": "0.0.1",
   "private": true,
   "nx": {
+    "targets": {
+      "e2e-live": {
+        "executor": "nx:run-commands",
+        "options": {
+          "cwd": "apps/ui-e2e",
+          "env": {
+            "PLAYWRIGHT_HTML_OUTPUT_DIR": "test-output\\playwright\\live-report",
+            "PLAYWRIGHT_HTML_REPORT": "test-output\\playwright\\live-report",
+            "PLAYWRIGHT_BLOB_OUTPUT_FILE": "test-output\\playwright\\live-blob-report\\report.zip"
+          },
+          "command": "playwright test --config=playwright.live.config.ts src/live-events.spec.ts --output=test-output\\playwright\\live-output"
+        },
+        "metadata": {
+          "technologies": [
+            "playwright"
+          ],
+          "description": "Runs live websocket Playwright tests",
+          "help": {
+            "command": "bun playwright test --help",
+            "example": {
+              "options": {
+                "workers": 1
+              }
+            }
+          }
+        },
+        "parallelism": false,
+        "cache": true,
+        "inputs": [
+          "default",
+          "^{projectRoot}/tsconfig*.json",
+          "^production",
+          {
+            "externalDependencies": [
+              "@playwright/test"
+            ]
+          }
+        ],
+        "outputs": [
+          "{projectRoot}/test-output/playwright/live-output",
+          "{projectRoot}/test-output/playwright/live-report",
+          "{projectRoot}/test-output/playwright/live-blob-report"
+        ]
+      }
+    },
     "implicitDependencies": [
       "@animaOS-SWARM/ui"
     ]

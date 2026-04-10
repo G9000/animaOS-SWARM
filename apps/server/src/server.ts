@@ -9,6 +9,7 @@ import { searchRoutes } from './routes/search.js';
 import { healthRoutes } from './routes/health.js';
 import { json, type Route } from './routes/helpers.js';
 import { AppState } from './state.js';
+import { attachWebSocketServer } from './ws.js';
 
 function parseBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
@@ -64,7 +65,7 @@ export function createServer() {
     ...searchRoutes,
   ];
 
-  return createHttpServer(async (req, res) => {
+  const server = createHttpServer(async (req, res) => {
     cors(res);
 
     if (req.method === 'OPTIONS') {
@@ -92,6 +93,9 @@ export function createServer() {
       json(res, 500, { error: message });
     }
   });
+
+  attachWebSocketServer(server, state);
+  return server;
 }
 
 export { json };
