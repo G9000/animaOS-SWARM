@@ -2,13 +2,14 @@ import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { ModPlugin } from '@animaOS-SWARM/core';
 import { readModConfig } from '@animaOS-SWARM/mod-sdk';
-import { registerModTools } from '@animaOS-SWARM/tools';
+import { MOD_TOOL_MAP, registerModTools } from '@animaOS-SWARM/tools';
 
 let modsLoaded = false;
 
-/** For testing only */
+/** For testing only — also clears MOD_TOOL_MAP to fully reset state. */
 export function resetModsLoaded(): void {
   modsLoaded = false;
+  MOD_TOOL_MAP.clear();
 }
 
 interface ModManifest {
@@ -47,6 +48,15 @@ function readManifest(modDir: string): ModManifest | null {
   }
 }
 
+function isModToolHandler(value: unknown): value is import('@animaOS-SWARM/core').ModToolHandler {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as Record<string, unknown>)['name'] === 'string' &&
+    typeof (value as Record<string, unknown>)['execute'] === 'function'
+  );
+}
+
 function findPlugin(module: unknown): ModPlugin | null {
   const candidate =
     module !== null && typeof module === 'object' && 'default' in module
@@ -59,7 +69,10 @@ function findPlugin(module: unknown): ModPlugin | null {
     'tools' in candidate &&
     Array.isArray((candidate as Record<string, unknown>)['tools'])
   ) {
-    return candidate as ModPlugin;
+    const plugin = candidate as ModPlugin;
+    // Filter out malformed tool entries so one bad tool doesn't crash the whole mod
+    plugin.tools = plugin.tools.filter(isModToolHandler);
+    return plugin;
   }
   return null;
 }

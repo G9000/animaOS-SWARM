@@ -18,7 +18,8 @@ export const getTradeHistory = defineModTool({
   },
   execute: async (args) => {
     const limit = Math.min(Math.max(1, Number(args['limit'] ?? 10)), 50);
-    const trades = getTrades().slice(0, limit);
-    return { trades, total: trades.length };
+    const allTrades = getTrades();
+    const trades = allTrades.slice(0, limit);
+    return { trades, total: allTrades.length };
   },
 });

@@ -14,7 +14,10 @@ function isModConfig(value: unknown): value is ModConfig {
     typeof value === 'object' &&
     value !== null &&
     'enabled' in value &&
-    Array.isArray((value as Record<string, unknown>)['enabled'])
+    Array.isArray((value as Record<string, unknown>)['enabled']) &&
+    ((value as Record<string, unknown>)['enabled'] as unknown[]).every(
+      (item) => typeof item === 'string',
+    )
   );
 }
 

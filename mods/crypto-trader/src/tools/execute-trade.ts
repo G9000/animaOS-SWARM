@@ -45,6 +45,8 @@ export const executeTrade = defineModTool({
     }
     if (!token) throw new Error('token is required');
     if (!reason) throw new Error('reason is required');
+    if (!Number.isFinite(amount)) throw new Error('amount must be a finite number');
+    if (!Number.isFinite(price)) throw new Error('price must be a finite number');
     if (action !== 'HOLD' && amount <= 0) throw new Error('amount must be greater than 0');
     if (price <= 0) throw new Error('price must be greater than 0');
 

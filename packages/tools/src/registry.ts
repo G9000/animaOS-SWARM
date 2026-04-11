@@ -69,6 +69,10 @@ import type { ModToolHandler } from '@animaOS-SWARM/core';
 export const MOD_TOOL_MAP = new Map<string, ModToolHandler>();
 
 export function registerModTool(tool: ModToolHandler): void {
+  if (TOOL_ACTION_MAP.has(tool.name)) {
+    process.stderr.write(`[mod-registry] Mod tool "${tool.name}" conflicts with built-in tool — skipping\n`);
+    return;
+  }
   if (MOD_TOOL_MAP.has(tool.name)) {
     process.stderr.write(`[mod-registry] Overwriting existing mod tool: "${tool.name}"\n`);
   }

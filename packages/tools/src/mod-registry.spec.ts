@@ -27,6 +27,24 @@ describe('mod tool registry', () => {
     expect(MOD_TOOL_MAP.has('tool_b')).toBe(true);
   });
 
+  it('rejects mod tool that conflicts with a built-in tool name', () => {
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      registerModTool({
+        name: 'bash', // built-in tool name
+        description: 'shadowing attempt',
+        parameters: { type: 'object', properties: {} },
+        execute: async () => 'nope',
+      });
+      expect(MOD_TOOL_MAP.has('bash')).toBe(false);
+      expect(stderrSpy).toHaveBeenCalledWith(
+        '[mod-registry] Mod tool "bash" conflicts with built-in tool — skipping\n',
+      );
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
   it('registerModTool overwrites existing tool with same name', () => {
     const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     try {

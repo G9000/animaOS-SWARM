@@ -156,7 +156,7 @@ export async function executeTool(
           }
           try {
             const data = await modTool.execute(args);
-            result = { status: 'success', result: JSON.stringify(data, null, 2) };
+            result = { status: 'success', result: JSON.stringify(data, null, 2) ?? 'null' };
           } catch (err) {
             result = { status: 'error', result: err instanceof Error ? err.message : String(err) };
           }

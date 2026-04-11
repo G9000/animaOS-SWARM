@@ -28,7 +28,7 @@ describe('get_trade_history tool', () => {
     for (let i = 0; i < 15; i++) addTrade(makeTrade({ price: i }));
     const result = await getTradeHistory.execute({}) as { trades: Trade[]; total: number };
     expect(result.trades).toHaveLength(10);
-    expect(result.total).toBe(10);
+    expect(result.total).toBe(15); // total reflects all available, not just returned
   });
 
   it('respects custom limit', async () => {
