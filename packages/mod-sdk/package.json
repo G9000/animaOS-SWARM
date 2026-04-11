@@ -1,0 +1,25 @@
+{
+  "name": "@animaOS-SWARM/mod-sdk",
+  "version": "0.1.0",
+  "description": "Mod author SDK for animaOS-SWARM",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": {
+      "@animaOS-SWARM/source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@animaOS-SWARM/core": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2",
+    "vitest": "~4.0.8"
+  }
+}

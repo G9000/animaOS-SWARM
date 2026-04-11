@@ -104,6 +104,17 @@
         "tslib": "^2.3.0",
       },
     },
+    "packages/mod-sdk": {
+      "name": "@animaOS-SWARM/mod-sdk",
+      "version": "0.1.0",
+      "dependencies": {
+        "@animaOS-SWARM/core": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "~5.9.2",
+        "vitest": "~4.0.8",
+      },
+    },
     "packages/sdk": {
       "name": "@animaOS-SWARM/sdk",
       "version": "0.0.1",
@@ -154,6 +165,8 @@
     "@animaOS-SWARM/core": ["@animaOS-SWARM/core@workspace:packages/core"],
 
     "@animaOS-SWARM/memory": ["@animaOS-SWARM/memory@workspace:packages/memory"],
+
+    "@animaOS-SWARM/mod-sdk": ["@animaOS-SWARM/mod-sdk@workspace:packages/mod-sdk"],
 
     "@animaOS-SWARM/sdk": ["@animaOS-SWARM/sdk@workspace:packages/sdk"],
 
