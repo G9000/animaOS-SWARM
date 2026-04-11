@@ -26,14 +26,18 @@ function readManifest(modDir: string): ModManifest | null {
 }
 
 function findPlugin(module: unknown): ModPlugin | null {
+  const candidate =
+    module !== null && typeof module === 'object' && 'default' in module
+      ? (module as { default: unknown }).default
+      : null;
+
   if (
-    module !== null &&
-    typeof module === 'object' &&
-    'default' in module &&
-    typeof (module as { default: unknown }).default === 'object' &&
-    (module as { default: unknown }).default !== null
+    candidate !== null &&
+    typeof candidate === 'object' &&
+    'tools' in candidate &&
+    Array.isArray((candidate as Record<string, unknown>)['tools'])
   ) {
-    return (module as { default: ModPlugin }).default;
+    return candidate as ModPlugin;
   }
   return null;
 }
