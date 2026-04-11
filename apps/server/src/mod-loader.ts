@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { ModPlugin } from '@animaOS-SWARM/core';
 import { readModConfig } from '@animaOS-SWARM/mod-sdk';
 import { registerModTools } from '@animaOS-SWARM/tools';
@@ -11,6 +11,16 @@ interface ModManifest {
   main: string;
 }
 
+function isModManifest(value: unknown): value is ModManifest {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as Record<string, unknown>)['name'] === 'string' &&
+    typeof (value as Record<string, unknown>)['main'] === 'string' &&
+    (value as Record<string, unknown>)['main'] !== ''
+  );
+}
+
 function readManifest(modDir: string): ModManifest | null {
   const manifestPath = join(modDir, 'mod.json');
   if (!existsSync(manifestPath)) {
@@ -18,7 +28,12 @@ function readManifest(modDir: string): ModManifest | null {
     return null;
   }
   try {
-    return JSON.parse(readFileSync(manifestPath, 'utf-8')) as ModManifest;
+    const parsed: unknown = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+    if (!isModManifest(parsed)) {
+      process.stderr.write(`[mod-loader] Invalid mod.json at ${manifestPath}: missing or invalid "name"/"main" fields\n`);
+      return null;
+    }
+    return parsed;
   } catch (err) {
     process.stderr.write(`[mod-loader] Failed to parse mod.json at ${manifestPath}: ${String(err)}\n`);
     return null;
@@ -49,6 +64,11 @@ export async function loadEnabledMods(workspaceRoot: string): Promise<void> {
   if (config.enabled.length === 0) return;
 
   for (const name of config.enabled) {
+    // Guard against path traversal in mod names
+    if (name.includes('..') || name.includes('/') || name.includes('\\')) {
+      process.stderr.write(`[mod-loader] Skipping mod with unsafe name: "${name}"\n`);
+      continue;
+    }
     const modDir = join(workspaceRoot, 'mods', name);
 
     if (!existsSync(modDir)) {
@@ -60,6 +80,12 @@ export async function loadEnabledMods(workspaceRoot: string): Promise<void> {
     if (!manifest) continue;
 
     const mainPath = resolve(modDir, manifest.main);
+
+    const rel = relative(modDir, mainPath);
+    if (rel.startsWith('..') || isAbsolute(rel)) {
+      process.stderr.write(`[mod-loader] Mod "${name}" main path escapes mod directory, skipping\n`);
+      continue;
+    }
 
     try {
       const module = await import(mainPath);
