@@ -44,6 +44,7 @@ export const executeTrade = defineModTool({
       throw new Error(`Invalid action "${action}". Must be BUY, SELL, or HOLD`);
     }
     if (!token) throw new Error('token is required');
+    if (!reason) throw new Error('reason is required');
     if (action !== 'HOLD' && amount <= 0) throw new Error('amount must be greater than 0');
     if (price <= 0) throw new Error('price must be greater than 0');
 

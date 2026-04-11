@@ -44,4 +44,14 @@ describe('execute_trade tool', () => {
   it('throws when price is zero or negative', async () => {
     await expect(executeTrade.execute({ ...validArgs, price: -1 })).rejects.toThrow('price must be greater than 0');
   });
+
+  it('allows HOLD with amount=0', async () => {
+    const result = await executeTrade.execute({ ...validArgs, action: 'HOLD', amount: 0 }) as { success: boolean };
+    expect(result.success).toBe(true);
+    expect(getTrades()).toHaveLength(1);
+  });
+
+  it('throws when reason is empty', async () => {
+    await expect(executeTrade.execute({ ...validArgs, reason: '' })).rejects.toThrow('reason is required');
+  });
 });
