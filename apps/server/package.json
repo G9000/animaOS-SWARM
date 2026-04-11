@@ -100,10 +100,13 @@
   "dependencies": {
     "@animaOS-SWARM/core": "workspace:*",
     "@animaOS-SWARM/memory": "workspace:*",
+    "@animaOS-SWARM/mod-sdk": "workspace:*",
     "@animaOS-SWARM/swarm": "workspace:*",
+    "@animaOS-SWARM/tools": "workspace:*",
     "ws": "^8.18.3"
   },
   "devDependencies": {
-    "@types/ws": "^8.18.1"
+    "@types/ws": "^8.18.1",
+    "vitest": "~4.0.8"
   }
 }

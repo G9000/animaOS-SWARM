@@ -10,10 +10,16 @@
   "exclude": [],
   "references": [
     {
-      "path": "../../packages/memory/tsconfig.lib.json"
+      "path": "../../packages/tools/tsconfig.lib.json"
     },
     {
       "path": "../../packages/swarm/tsconfig.lib.json"
+    },
+    {
+      "path": "../../packages/mod-sdk/tsconfig.lib.json"
+    },
+    {
+      "path": "../../packages/memory/tsconfig.lib.json"
     },
     {
       "path": "../../packages/core/tsconfig.lib.json"

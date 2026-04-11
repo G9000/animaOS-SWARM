@@ -21,7 +21,7 @@ import { checkPermission, type PermissionDecision } from "./permissions.js";
 import { substituteSecretsInArgs, redactSecrets } from "./secrets.js";
 import { hooks } from "./hooks.js";
 import { validateArgs } from "./validation.js";
-import { TOOL_SCHEMA_MAP } from "./registry.js";
+import { TOOL_SCHEMA_MAP, MOD_TOOL_MAP } from "./registry.js";
 
 export interface ToolExecuteInput {
   tool_call_id: string;
@@ -146,8 +146,25 @@ export async function executeTool(
       case "bg_list":
         result = executeBgList();
         break;
-      default:
-        result = { status: "error", result: `Unknown tool: ${tool_name}` };
+      default: {
+        const modTool = MOD_TOOL_MAP.get(tool_name);
+        if (modTool) {
+          const validationError = validateArgs(tool_name, args, modTool.parameters as Record<string, unknown>);
+          if (validationError) {
+            result = { status: 'error', result: validationError };
+            break;
+          }
+          try {
+            const data = await modTool.execute(args);
+            result = { status: 'success', result: JSON.stringify(data, null, 2) ?? 'null' };
+          } catch (err) {
+            result = { status: 'error', result: err instanceof Error ? err.message : String(err) };
+          }
+        } else {
+          result = { status: 'error', result: `Unknown tool: ${tool_name}` };
+        }
+        break;
+      }
     }
 
     // Redact secrets from output of shell-like tools

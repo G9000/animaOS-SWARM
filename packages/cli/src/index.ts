@@ -8,6 +8,7 @@ import { chatCommand } from './commands/chat.js';
 import { createCommand } from './commands/create.js';
 import { launchCommand } from './commands/launch.js';
 import { agentsCommand } from './commands/agents.js';
+import { modCommand } from './commands/mod.js';
 export { createCliDaemonClient } from './client.js';
 
 export function buildProgram(): Command {
@@ -23,6 +24,7 @@ export function buildProgram(): Command {
   program.addCommand(createCommand);
   program.addCommand(launchCommand);
   program.addCommand(agentsCommand);
+  program.addCommand(modCommand);
 
   return program;
 }

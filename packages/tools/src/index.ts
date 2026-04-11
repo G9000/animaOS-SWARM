@@ -26,6 +26,9 @@ export {
   ACTION_TOOL_SCHEMAS,
   TOOL_SCHEMA_MAP,
   TOOL_ACTION_MAP,
+  MOD_TOOL_MAP,
+  registerModTool,
+  registerModTools,
 } from "./registry.js";
 export type { ToolSchema } from "./registry.js";
 

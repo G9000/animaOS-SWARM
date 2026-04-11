@@ -35,6 +35,7 @@ import {
   getErrorMessage,
   resolveDaemonModelSettings,
 } from './utils.js';
+import { MOD_TOOL_MAP } from '@animaOS-SWARM/tools';
 
 export interface LaunchOptions {
   dir: string;
@@ -163,6 +164,7 @@ function daemonToolName(toolName: string): string {
 
 function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
   const supportedToolNames = new Set<string>(DEFAULT_DAEMON_TOOL_NAMES);
+  const modToolDescriptors = new Map<string, DaemonToolDescriptor>();
   const unsupportedTools: string[] = [];
 
   for (const rawToolName of agent.tools ?? []) {
@@ -172,12 +174,22 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
     }
 
     const normalizedToolName = daemonToolName(toolName);
-    if (!DAEMON_TOOL_DESCRIPTOR_MAP.has(normalizedToolName)) {
-      unsupportedTools.push(toolName);
+    if (DAEMON_TOOL_DESCRIPTOR_MAP.has(normalizedToolName)) {
+      supportedToolNames.add(normalizedToolName);
       continue;
     }
 
-    supportedToolNames.add(normalizedToolName);
+    const modTool = MOD_TOOL_MAP.get(normalizedToolName);
+    if (modTool) {
+      modToolDescriptors.set(modTool.name, {
+        name: modTool.name,
+        description: modTool.description,
+        parameters: { ...modTool.parameters }, // shallow copy — don't mutate the live ModToolHandler
+      });
+      continue;
+    }
+
+    unsupportedTools.push(toolName);
   }
 
   if (unsupportedTools.length > 0) {
@@ -190,7 +202,7 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
     );
   }
 
-  return Array.from(supportedToolNames, (toolName) => {
+  const builtinDescriptors = Array.from(supportedToolNames, (toolName) => {
     const descriptor = DAEMON_TOOL_DESCRIPTOR_MAP.get(toolName);
     if (!descriptor) {
       throw new Error(`missing daemon tool descriptor for ${toolName}`);
@@ -202,6 +214,8 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
       parameters: descriptor.parameters,
     };
   });
+
+  return [...builtinDescriptors, ...modToolDescriptors.values()];
 }
 
 function createDaemonSwarmSession(

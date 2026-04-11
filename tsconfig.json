@@ -32,6 +32,12 @@
     },
     {
       "path": "./packages/tui"
+    },
+    {
+      "path": "./packages/mod-sdk"
+    },
+    {
+      "path": "./mods/crypto-trader"
     }
   ]
 }

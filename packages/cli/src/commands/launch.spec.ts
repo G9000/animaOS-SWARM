@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { executeLaunchCommand } from './launch.js';
 import { relayLaunchSwarmEvent } from './launch-events.js';
 import { LAUNCH_HISTORY_FILENAME } from './launch-history.js';
+import { MOD_TOOL_MAP } from '@animaOS-SWARM/tools';
 
 const DEFAULT_AGENCY_YAML = [
   'name: Launch Test Agency',
@@ -392,6 +393,90 @@ describe('launch command daemon plain-text mode', () => {
       'daemon-backed launch does not support tool(s) for agent "manager": bash. Launch now runs only through the Rust daemon; remove those tools from anima.yaml or implement them in the daemon tool registry.'
     );
     expect(process.exitCode).toBe(1);
+  });
+
+  it('resolves registered mod tools into daemon tool descriptors', async () => {
+    MOD_TOOL_MAP.set('get_price', {
+      name: 'get_price',
+      description: 'Fetch the current price of a crypto asset.',
+      parameters: {
+        type: 'object',
+        properties: {
+          symbol: { type: 'string' },
+        },
+        required: ['symbol'],
+      },
+      execute: vi.fn().mockResolvedValue({ price: 42000 }),
+    });
+
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - get_price',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-mod' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'mod tool launch result' },
+            durationMs: 10,
+          },
+        }),
+      }),
+    };
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await executeLaunchCommand(
+      'Analyze BTC',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(client.swarms.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manager: expect.objectContaining({
+          tools: expect.arrayContaining([
+            expect.objectContaining({
+              name: 'get_price',
+              description: 'Fetch the current price of a crypto asset.',
+              parameters: {
+                type: 'object',
+                properties: { symbol: { type: 'string' } },
+                required: ['symbol'],
+              },
+            }),
+          ]),
+        }),
+      })
+    );
+
+    MOD_TOOL_MAP.delete('get_price');
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
   });
 
   it('reuses one daemon swarm across plain-text interactive tasks', async () => {

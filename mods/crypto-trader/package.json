@@ -1,0 +1,19 @@
+{
+  "name": "@animaOS-SWARM/crypto-trader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "animaOS mod: AI-powered crypto market intelligence",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@animaOS-SWARM/mod-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2",
+    "vitest": "~4.0.8"
+  }
+}

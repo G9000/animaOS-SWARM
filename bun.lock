@@ -46,11 +46,14 @@
       "dependencies": {
         "@animaOS-SWARM/core": "workspace:*",
         "@animaOS-SWARM/memory": "workspace:*",
+        "@animaOS-SWARM/mod-sdk": "workspace:*",
         "@animaOS-SWARM/swarm": "workspace:*",
+        "@animaOS-SWARM/tools": "workspace:*",
         "ws": "^8.18.3",
       },
       "devDependencies": {
         "@types/ws": "^8.18.1",
+        "vitest": "~4.0.8",
       },
     },
     "apps/ui": {
@@ -61,6 +64,17 @@
       "name": "@animaOS-SWARM/ui-e2e",
       "version": "0.0.1",
     },
+    "mods/crypto-trader": {
+      "name": "@animaOS-SWARM/crypto-trader",
+      "version": "1.0.0",
+      "dependencies": {
+        "@animaOS-SWARM/mod-sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "~5.9.2",
+        "vitest": "~4.0.8",
+      },
+    },
     "packages/cli": {
       "name": "@animaOS-SWARM/cli",
       "version": "0.0.1",
@@ -70,6 +84,7 @@
       "dependencies": {
         "@animaOS-SWARM/core": "workspace:*",
         "@animaOS-SWARM/memory": "workspace:*",
+        "@animaOS-SWARM/mod-sdk": "workspace:*",
         "@animaOS-SWARM/sdk": "workspace:*",
         "@animaOS-SWARM/swarm": "workspace:*",
         "@animaOS-SWARM/tools": "workspace:*",
@@ -102,6 +117,18 @@
       "dependencies": {
         "@animaOS-SWARM/core": "workspace:*",
         "tslib": "^2.3.0",
+      },
+    },
+    "packages/mod-sdk": {
+      "name": "@animaOS-SWARM/mod-sdk",
+      "version": "0.1.0",
+      "dependencies": {
+        "@animaOS-SWARM/core": "workspace:*",
+        "tslib": "^2.3.0",
+      },
+      "devDependencies": {
+        "typescript": "~5.9.2",
+        "vitest": "~4.0.8",
       },
     },
     "packages/sdk": {
@@ -153,7 +180,11 @@
 
     "@animaOS-SWARM/core": ["@animaOS-SWARM/core@workspace:packages/core"],
 
+    "@animaOS-SWARM/crypto-trader": ["@animaOS-SWARM/crypto-trader@workspace:mods/crypto-trader"],
+
     "@animaOS-SWARM/memory": ["@animaOS-SWARM/memory@workspace:packages/memory"],
+
+    "@animaOS-SWARM/mod-sdk": ["@animaOS-SWARM/mod-sdk@workspace:packages/mod-sdk"],
 
     "@animaOS-SWARM/sdk": ["@animaOS-SWARM/sdk@workspace:packages/sdk"],
 

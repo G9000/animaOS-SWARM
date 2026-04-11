@@ -1,0 +1,34 @@
+# Crypto Analyst Agency Template
+# Deploy with: animaos agency deploy --template mods/crypto-trader/templates/crypto-analyst-agency.yaml
+
+name: crypto-analyst-agency
+description: A 3-agent swarm that analyzes crypto markets and makes BUY/SELL/HOLD decisions
+
+agents:
+  - name: orchestrator
+    role: Coordinator
+    description: |
+      Coordinates the market analysis swarm. Asks each analyst for their assessment,
+      synthesizes the responses, and calls execute_trade with a final BUY/SELL/HOLD decision.
+    tools:
+      - get_price
+      - execute_trade
+      - get_trade_history
+
+  - name: trend-analyst
+    role: Trend Analyst
+    description: |
+      Analyzes price direction and momentum. Calls get_price, reviews trade history,
+      and assesses whether the trend is bullish, bearish, or neutral.
+    tools:
+      - get_price
+      - get_trade_history
+
+  - name: risk-manager
+    role: Risk Manager
+    description: |
+      Evaluates market volatility and risk. Reviews recent price swings via get_price
+      and trade frequency via get_trade_history. Recommends position sizing and risk thresholds.
+    tools:
+      - get_price
+      - get_trade_history
