@@ -30,7 +30,8 @@ function findPlugin(module: unknown): ModPlugin | null {
     module !== null &&
     typeof module === 'object' &&
     'default' in module &&
-    typeof (module as { default: unknown }).default === 'object'
+    typeof (module as { default: unknown }).default === 'object' &&
+    (module as { default: unknown }).default !== null
   ) {
     return (module as { default: ModPlugin }).default;
   }
