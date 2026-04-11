@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MOD_TOOL_MAP, registerModTool, registerModTools } from './registry.js';
 
 afterEach(() => {
@@ -28,10 +28,16 @@ describe('mod tool registry', () => {
   });
 
   it('registerModTool overwrites existing tool with same name', () => {
-    const original = { name: 'tool_x', description: 'orig', parameters: { type: 'object' as const, properties: {} }, execute: async () => 'orig' };
-    const updated = { name: 'tool_x', description: 'updated', parameters: { type: 'object' as const, properties: {} }, execute: async () => 'updated' };
-    registerModTool(original);
-    registerModTool(updated);
-    expect(MOD_TOOL_MAP.get('tool_x')?.description).toBe('updated');
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      const original = { name: 'tool_x', description: 'orig', parameters: { type: 'object' as const, properties: {} }, execute: async () => 'orig' };
+      const updated = { name: 'tool_x', description: 'updated', parameters: { type: 'object' as const, properties: {} }, execute: async () => 'updated' };
+      registerModTool(original);
+      registerModTool(updated);
+      expect(MOD_TOOL_MAP.get('tool_x')?.description).toBe('updated');
+      expect(stderrSpy).toHaveBeenCalledWith('[mod-registry] Overwriting existing mod tool: "tool_x"\n');
+    } finally {
+      stderrSpy.mockRestore();
+    }
   });
 });

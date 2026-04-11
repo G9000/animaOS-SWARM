@@ -4,6 +4,13 @@ import type { ModPlugin } from '@animaOS-SWARM/core';
 import { readModConfig } from '@animaOS-SWARM/mod-sdk';
 import { registerModTools } from '@animaOS-SWARM/tools';
 
+let modsLoaded = false;
+
+/** For testing only */
+export function resetModsLoaded(): void {
+  modsLoaded = false;
+}
+
 interface ModManifest {
   name: string;
   version: string;
@@ -58,6 +65,12 @@ function findPlugin(module: unknown): ModPlugin | null {
 }
 
 export async function loadEnabledMods(workspaceRoot: string): Promise<void> {
+  if (modsLoaded) {
+    process.stderr.write('[mod-loader] loadEnabledMods called more than once — skipping\n');
+    return;
+  }
+  modsLoaded = true;
+
   const configPath = join(workspaceRoot, '.animaos', 'mods.json');
   const config = readModConfig(configPath);
 
