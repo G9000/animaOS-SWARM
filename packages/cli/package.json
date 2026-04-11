@@ -21,6 +21,7 @@
   "dependencies": {
     "@animaOS-SWARM/core": "workspace:*",
     "@animaOS-SWARM/memory": "workspace:*",
+    "@animaOS-SWARM/mod-sdk": "workspace:*",
     "@animaOS-SWARM/sdk": "workspace:*",
     "@animaOS-SWARM/swarm": "workspace:*",
     "@animaOS-SWARM/tools": "workspace:*",

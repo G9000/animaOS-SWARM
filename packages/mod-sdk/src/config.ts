@@ -5,7 +5,9 @@ export interface ModConfig {
   enabled: string[];
 }
 
-const DEFAULT_CONFIG: ModConfig = { enabled: [] };
+function defaultConfig(): ModConfig {
+  return { enabled: [] };
+}
 
 function isModConfig(value: unknown): value is ModConfig {
   return (
@@ -17,17 +19,17 @@ function isModConfig(value: unknown): value is ModConfig {
 }
 
 export function readModConfig(configPath: string): ModConfig {
-  if (!existsSync(configPath)) return { ...DEFAULT_CONFIG };
+  if (!existsSync(configPath)) return defaultConfig();
   try {
     const parsed: unknown = JSON.parse(readFileSync(configPath, 'utf-8'));
     if (!isModConfig(parsed)) {
       process.stderr.write(`[mod-sdk] Invalid config shape at ${configPath}, using defaults\n`);
-      return { ...DEFAULT_CONFIG };
+      return defaultConfig();
     }
     return parsed;
   } catch (err) {
     process.stderr.write(`[mod-sdk] Failed to parse config at ${configPath}: ${String(err)}\n`);
-    return { ...DEFAULT_CONFIG };
+    return defaultConfig();
   }
 }
 
