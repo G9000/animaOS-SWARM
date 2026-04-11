@@ -62,3 +62,18 @@ export const TOOL_SCHEMA_MAP = new Map(
 export const TOOL_ACTION_MAP = new Map(
   ALL_TOOL_ACTIONS.map((a) => [a.name, a]),
 );
+
+import type { ModToolHandler } from '@animaOS-SWARM/core';
+
+/** Runtime registry for mod-contributed tools. Keyed by tool name. */
+export const MOD_TOOL_MAP = new Map<string, ModToolHandler>();
+
+export function registerModTool(tool: ModToolHandler): void {
+  MOD_TOOL_MAP.set(tool.name, tool);
+}
+
+export function registerModTools(tools: ModToolHandler[]): void {
+  for (const tool of tools) {
+    registerModTool(tool);
+  }
+}
