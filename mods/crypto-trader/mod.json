@@ -1,0 +1,10 @@
+{
+  "name": "crypto-trader",
+  "version": "1.0.0",
+  "description": "AI-powered crypto market intelligence",
+  "main": "src/index.ts",
+  "contributes": {
+    "tools": ["get_price", "execute_trade", "get_trade_history"],
+    "templates": ["templates/crypto-analyst-agency.yaml"]
+  }
+}

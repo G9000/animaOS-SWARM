@@ -61,6 +61,16 @@
       "name": "@animaOS-SWARM/ui-e2e",
       "version": "0.0.1",
     },
+    "mods/crypto-trader": {
+      "name": "@animaOS-SWARM/crypto-trader",
+      "version": "1.0.0",
+      "dependencies": {
+        "@animaOS-SWARM/mod-sdk": "workspace:*",
+      },
+      "devDependencies": {
+        "typescript": "~5.9.2",
+      },
+    },
     "packages/cli": {
       "name": "@animaOS-SWARM/cli",
       "version": "0.0.1",
@@ -164,6 +174,8 @@
     "@animaOS-SWARM/cli": ["@animaOS-SWARM/cli@workspace:packages/cli"],
 
     "@animaOS-SWARM/core": ["@animaOS-SWARM/core@workspace:packages/core"],
+
+    "@animaOS-SWARM/crypto-trader": ["@animaOS-SWARM/crypto-trader@workspace:mods/crypto-trader"],
 
     "@animaOS-SWARM/memory": ["@animaOS-SWARM/memory@workspace:packages/memory"],
 
