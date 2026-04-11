@@ -149,6 +149,11 @@ export async function executeTool(
       default: {
         const modTool = MOD_TOOL_MAP.get(tool_name);
         if (modTool) {
+          const validationError = validateArgs(tool_name, args, modTool.parameters as Record<string, unknown>);
+          if (validationError) {
+            result = { status: 'error', result: validationError };
+            break;
+          }
           try {
             const data = await modTool.execute(args);
             result = { status: 'success', result: JSON.stringify(data, null, 2) };

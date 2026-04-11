@@ -62,6 +62,29 @@ describe('executor mod tool dispatch', () => {
     expect(result.result).toContain('hello from mod');
   });
 
+  it('returns an error when a required mod tool parameter is missing', async () => {
+    registerModTool({
+      name: 'mod_greet',
+      description: 'Greet by name',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+      },
+      execute: async (args) => ({ greeting: `hello ${(args as { name: string }).name}` }),
+    });
+
+    const result = await executeTool({
+      tool_call_id: 'call-3',
+      tool_name: 'mod_greet',
+      args: {},
+    });
+
+    expect(result.tool_call_id).toBe('call-3');
+    expect(result.status).toBe('error');
+    expect(result.result).toContain("missing required parameter 'name'");
+  });
+
   it('returns an error result when the tool name is not in TOOL_ACTION_MAP or MOD_TOOL_MAP', async () => {
     const result = await executeTool({
       tool_call_id: 'call-2',
