@@ -184,7 +184,7 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
       modToolDescriptors.set(modTool.name, {
         name: modTool.name,
         description: modTool.description,
-        parameters: modTool.parameters,
+        parameters: { ...modTool.parameters }, // shallow copy — don't mutate the live ModToolHandler
       });
       continue;
     }
