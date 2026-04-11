@@ -1,4 +1,4 @@
-import type { ModToolHandler } from './types.js';
+import type { ModToolHandler } from '@animaOS-SWARM/core';
 
 /**
  * Define a mod tool with full TypeScript type inference.

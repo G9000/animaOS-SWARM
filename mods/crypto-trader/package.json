@@ -4,8 +4,9 @@
   "private": true,
   "type": "module",
   "description": "animaOS mod: AI-powered crypto market intelligence",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "scripts": {
+    "build": "tsc -p tsconfig.json",
     "test": "vitest run"
   },
   "dependencies": {
