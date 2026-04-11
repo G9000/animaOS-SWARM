@@ -7,11 +7,26 @@ export interface ModConfig {
 
 const DEFAULT_CONFIG: ModConfig = { enabled: [] };
 
+function isModConfig(value: unknown): value is ModConfig {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'enabled' in value &&
+    Array.isArray((value as Record<string, unknown>)['enabled'])
+  );
+}
+
 export function readModConfig(configPath: string): ModConfig {
   if (!existsSync(configPath)) return { ...DEFAULT_CONFIG };
   try {
-    return JSON.parse(readFileSync(configPath, 'utf-8')) as ModConfig;
-  } catch {
+    const parsed: unknown = JSON.parse(readFileSync(configPath, 'utf-8'));
+    if (!isModConfig(parsed)) {
+      process.stderr.write(`[mod-sdk] Invalid config shape at ${configPath}, using defaults\n`);
+      return { ...DEFAULT_CONFIG };
+    }
+    return parsed;
+  } catch (err) {
+    process.stderr.write(`[mod-sdk] Failed to parse config at ${configPath}: ${String(err)}\n`);
     return { ...DEFAULT_CONFIG };
   }
 }
