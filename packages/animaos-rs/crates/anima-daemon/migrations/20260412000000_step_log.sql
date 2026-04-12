@@ -11,5 +11,3 @@ CREATE TABLE IF NOT EXISTS step_log (
     UNIQUE (agent_id, step_index),
     UNIQUE (agent_id, idempotency_key)
 );
-
-CREATE INDEX IF NOT EXISTS step_log_agent_idx ON step_log (agent_id);

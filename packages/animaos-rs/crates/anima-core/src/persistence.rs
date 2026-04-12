@@ -110,12 +110,21 @@ pub mod in_memory {
                 PersistenceError::Write(format!("Mutex poisoned: {}", e))
             })?;
 
-            // Upsert by (agent_id, step_index)
+            // Upsert by (agent_id, step_index) — match Postgres semantics:
+            // preserve input, freeze terminal status+output
             if let Some(existing) = steps
                 .iter_mut()
                 .find(|s| s.agent_id == step.agent_id && s.step_index == step.step_index)
             {
-                *existing = step.clone();
+                if !matches!(existing.status, StepStatus::Done | StepStatus::Failed) {
+                    existing.status = step.status.clone();
+                    if step.output.is_some() {
+                        existing.output = step.output.clone();
+                    }
+                }
+                if step.input.is_some() {
+                    existing.input = step.input.clone();
+                }
             } else {
                 steps.push(step.clone());
             }

@@ -28,7 +28,10 @@ impl DatabaseAdapter for SqlxPostgresAdapter {
                     WHEN step_log.status IN ('done', 'failed') THEN step_log.status
                     ELSE EXCLUDED.status
                 END,
-                output = COALESCE(EXCLUDED.output, step_log.output)
+                output = CASE
+                    WHEN step_log.status IN ('done', 'failed') THEN step_log.output
+                    ELSE COALESCE(EXCLUDED.output, step_log.output)
+                END
             "#,
         )
         .bind(&step.id)

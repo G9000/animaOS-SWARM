@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -277,13 +277,16 @@ impl AgentRuntime {
                             );
                             conversation.push(assistant_message);
 
-                            // Assign step indices for each tool call
-                            let mut step_map = HashMap::new();
-                            for tool_call in &tool_calls {
-                                let idx = self.step_counter as i32;
-                                step_map.insert(tool_call.id.clone(), idx);
-                                self.step_counter += 1;
-                            }
+                            // Assign step indices by position (not by tool_call.id which may not be unique)
+                            let step_indices: Vec<i32> = tool_calls
+                                .iter()
+                                .enumerate()
+                                .map(|(i, _)| {
+                                    let idx = (self.step_counter + i as u64) as i32;
+                                    idx
+                                })
+                                .collect();
+                            self.step_counter += tool_calls.len() as u64;
 
                             for tool_call in &tool_calls {
                                 self.record_event(
@@ -294,8 +297,8 @@ impl AgentRuntime {
 
                             // Write pending steps to database
                             if let Some(db) = self.db.clone() {
-                                for tool_call in &tool_calls {
-                                    let step_index = *step_map.get(&tool_call.id).expect("assigned above");
+                                for (i, tool_call) in tool_calls.iter().enumerate() {
+                                    let step_index = step_indices[i];
                                     let step = Step {
                                         id: Uuid::new_v4().to_string(),
                                         agent_id: self.state.id.clone(),
@@ -336,8 +339,8 @@ impl AgentRuntime {
 
                             // Write done/failed steps to database
                             if let Some(db) = self.db.clone() {
-                                for (tool_call, tool_result, _) in &tool_results {
-                                    let step_index = *step_map.get(&tool_call.id).expect("assigned above");
+                                for (i, (tool_call, tool_result, _)) in tool_results.iter().enumerate() {
+                                    let step_index = step_indices[i];
                                     let status = if tool_result.error.is_none() {
                                         StepStatus::Done
                                     } else {
