@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anima_core::{
-    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, DataValue, EngineEvent,
-    EventType, Message, ModelAdapter, TaskResult, TokenUsage, ToolCall,
+    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, DataValue, DatabaseAdapter,
+    EngineEvent, EventType, Message, ModelAdapter, TaskResult, TokenUsage, ToolCall,
 };
 use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
 use anima_swarm::coordinator::{
@@ -29,6 +29,7 @@ pub(crate) struct DaemonState {
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) event_fanout: EventFanout,
+    pub(crate) db: Option<Arc<dyn DatabaseAdapter>>,
 }
 
 impl DaemonState {
@@ -63,12 +64,20 @@ impl DaemonState {
             model_adapter,
             tool_registry: ToolRegistry::new(),
             event_fanout,
+            db: None,
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn event_fanout(&self) -> EventFanout {
         self.event_fanout.clone()
+    }
+
+    pub(crate) fn set_database(&mut self, db: Arc<dyn DatabaseAdapter>) {
+        for runtime in self.agents.values_mut() {
+            runtime.set_database(Arc::clone(&db));
+        }
+        self.db = Some(db);
     }
 
     pub(crate) fn build_swarm(
@@ -140,6 +149,9 @@ impl DaemonState {
         let mut runtime = AgentRuntime::new(config, Arc::clone(&self.model_adapter));
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
         runtime.set_evaluators(default_evaluators(Arc::clone(&self.memory)));
+        if let Some(db) = &self.db {
+            runtime.set_database(Arc::clone(db));
+        }
         runtime.init();
         let agent_id = runtime.id().to_string();
         let snapshot = runtime.snapshot();
@@ -233,12 +245,14 @@ impl DaemonState {
         let memory = Arc::clone(&self.memory);
         let model_adapter = Arc::clone(&self.model_adapter);
         let tool_registry = self.tool_registry.clone();
+        let db = self.db.clone();
 
         Arc::new(move |context: CoordinatorAgentFactoryContext| {
             let memory = Arc::clone(&memory);
             let model_adapter = Arc::clone(&model_adapter);
             let tool_registry = tool_registry.clone();
             let event_stream = event_stream.clone();
+            let db = db.clone();
 
             Box::pin(async move {
                 let tool_context = ToolExecutionContext::new(Arc::clone(&memory), tool_registry);
@@ -249,12 +263,16 @@ impl DaemonState {
                         publish_runtime_event(&event_stream, &agent_name, event);
                     }
                 });
-                let runtime = Arc::new(AsyncMutex::new(build_swarm_runtime(
+                let mut initial_runtime = build_swarm_runtime(
                     context.config.clone(),
                     Arc::clone(&model_adapter),
                     Arc::clone(&memory),
                     Arc::clone(&runtime_events),
-                )));
+                );
+                if let Some(db) = &db {
+                    initial_runtime.set_database(Arc::clone(db));
+                }
+                let runtime = Arc::new(AsyncMutex::new(initial_runtime));
                 let config = context.config.clone();
                 let token_usage = Arc::new(Mutex::new(TokenUsage::default()));
                 let needs_reset = Arc::new(AtomicBool::new(false));
@@ -271,6 +289,7 @@ impl DaemonState {
                         let delegate_tasks = context.delegate_tasks.clone();
                         let tool_context = tool_context.clone();
                         let runtime_events = Arc::clone(&runtime_events);
+                        let db = db.clone();
                         move |input: String| {
                             let runtime = Arc::clone(&runtime);
                             let config = config.clone();
@@ -282,15 +301,20 @@ impl DaemonState {
                             let delegate_tasks = delegate_tasks.clone();
                             let tool_context = tool_context.clone();
                             let runtime_events = Arc::clone(&runtime_events);
+                            let db = db.clone();
                             Box::pin(async move {
                                 let mut runtime = runtime.lock().await;
                                 if needs_reset.swap(false, Ordering::AcqRel) {
-                                    *runtime = build_swarm_runtime(
+                                    let mut new_runtime = build_swarm_runtime(
                                         config,
                                         Arc::clone(&model_adapter),
                                         Arc::clone(&memory),
                                         Arc::clone(&runtime_events),
                                     );
+                                    if let Some(db) = &db {
+                                        new_runtime.set_database(Arc::clone(db));
+                                    }
+                                    *runtime = new_runtime;
                                 }
                                 let result = runtime
                                     .run_with_tools(

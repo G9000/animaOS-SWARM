@@ -8,6 +8,8 @@ mod runtime_model;
 mod state;
 mod tools;
 
+pub mod postgres;
+
 pub(crate) mod http {
     pub(crate) use crate::routes::Response;
 }
