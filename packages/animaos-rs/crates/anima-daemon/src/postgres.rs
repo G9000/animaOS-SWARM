@@ -23,7 +23,12 @@ impl DatabaseAdapter for SqlxPostgresAdapter {
             INSERT INTO step_log (id, agent_id, step_index, idempotency_key, type, status, input, output)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (agent_id, step_index)
-            DO UPDATE SET status = EXCLUDED.status, output = EXCLUDED.output
+            DO UPDATE SET
+                status = CASE
+                    WHEN step_log.status IN ('done', 'failed') THEN step_log.status
+                    ELSE EXCLUDED.status
+                END,
+                output = COALESCE(EXCLUDED.output, step_log.output)
             "#,
         )
         .bind(&step.id)

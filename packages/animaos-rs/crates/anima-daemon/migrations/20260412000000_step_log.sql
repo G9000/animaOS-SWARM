@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS step_log (
     input           JSONB,
     output          JSONB,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    UNIQUE (agent_id, step_index)
+    UNIQUE (agent_id, step_index),
+    UNIQUE (agent_id, idempotency_key)
 );
 
 CREATE INDEX IF NOT EXISTS step_log_agent_idx ON step_log (agent_id);
-CREATE INDEX IF NOT EXISTS step_log_idem_idx  ON step_log (agent_id, idempotency_key);
