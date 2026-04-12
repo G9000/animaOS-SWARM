@@ -118,12 +118,12 @@ pub mod in_memory {
             {
                 if !matches!(existing.status, StepStatus::Done | StepStatus::Failed) {
                     existing.status = step.status.clone();
+                    if step.input.is_some() {
+                        existing.input = step.input.clone();
+                    }
                     if step.output.is_some() {
                         existing.output = step.output.clone();
                     }
-                }
-                if step.input.is_some() {
-                    existing.input = step.input.clone();
                 }
             } else {
                 steps.push(step.clone());
