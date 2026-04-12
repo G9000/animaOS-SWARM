@@ -300,7 +300,7 @@ impl AgentRuntime {
                                         id: Uuid::new_v4().to_string(),
                                         agent_id: self.state.id.clone(),
                                         step_index,
-                                        idempotency_key: format!("{}:{}", self.state.id, tool_call.id),
+                                        idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
                                         step_type: "tool".to_string(),
                                         status: StepStatus::Pending,
                                         input: Some(serde_json::json!({
@@ -309,7 +309,12 @@ impl AgentRuntime {
                                         })),
                                         output: None,
                                     };
-                                    let _ = db.write_step(&step).await;
+                                    if let Err(err) = db.write_step(&step).await {
+                                        eprintln!(
+                                            "warn: failed to persist pending step: agent_id={}, step_index={}, error={}",
+                                            self.state.id, step_index, err
+                                        );
+                                    }
                                 }
                             }
 
@@ -342,7 +347,7 @@ impl AgentRuntime {
                                         id: Uuid::new_v4().to_string(),
                                         agent_id: self.state.id.clone(),
                                         step_index,
-                                        idempotency_key: format!("{}:{}", self.state.id, tool_call.id),
+                                        idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
                                         step_type: "tool".to_string(),
                                         status,
                                         input: None,
@@ -352,7 +357,12 @@ impl AgentRuntime {
                                             "error": &tool_result.error,
                                         })),
                                     };
-                                    let _ = db.write_step(&step).await;
+                                    if let Err(err) = db.write_step(&step).await {
+                                        eprintln!(
+                                            "warn: failed to persist done/failed step: agent_id={}, step_index={}, error={}",
+                                            self.state.id, step_index, err
+                                        );
+                                    }
                                 }
                             }
 
