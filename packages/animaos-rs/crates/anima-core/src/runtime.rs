@@ -314,7 +314,7 @@ impl AgentRuntime {
                                     };
                                     if let Err(err) = db.write_step(&step).await {
                                         self.record_event(
-                                            EventType::AgentFailed,
+                                            EventType::AgentMessage,
                                             DataValue::String(format!(
                                                 "failed to persist pending step: step_index={}, error={}",
                                                 step_index, err
@@ -365,7 +365,7 @@ impl AgentRuntime {
                                     };
                                     if let Err(err) = db.write_step(&step).await {
                                         self.record_event(
-                                            EventType::AgentFailed,
+                                            EventType::AgentMessage,
                                             DataValue::String(format!(
                                                 "failed to persist done/failed step: step_index={}, error={}",
                                                 step_index, err
