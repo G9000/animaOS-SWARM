@@ -356,7 +356,10 @@ impl AgentRuntime {
                                         idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
                                         step_type: "tool".to_string(),
                                         status,
-                                        input: None,
+                                        input: Some(serde_json::json!({
+                                            "name": tool_call.name,
+                                            "args": data_value_to_json(&DataValue::Object(tool_call.args.clone())),
+                                        })),
                                         output: Some(serde_json::json!({
                                             "status": tool_result.status.as_str(),
                                             "data": tool_result.data.as_ref().map(|c| &c.text),
