@@ -313,9 +313,12 @@ impl AgentRuntime {
                                         output: None,
                                     };
                                     if let Err(err) = db.write_step(&step).await {
-                                        eprintln!(
-                                            "warn: failed to persist pending step: agent_id={}, step_index={}, error={}",
-                                            self.state.id, step_index, err
+                                        self.record_event(
+                                            EventType::AgentFailed,
+                                            DataValue::String(format!(
+                                                "failed to persist pending step: step_index={}, error={}",
+                                                step_index, err
+                                            )),
                                         );
                                     }
                                 }
@@ -361,9 +364,12 @@ impl AgentRuntime {
                                         })),
                                     };
                                     if let Err(err) = db.write_step(&step).await {
-                                        eprintln!(
-                                            "warn: failed to persist done/failed step: agent_id={}, step_index={}, error={}",
-                                            self.state.id, step_index, err
+                                        self.record_event(
+                                            EventType::AgentFailed,
+                                            DataValue::String(format!(
+                                                "failed to persist done/failed step: step_index={}, error={}",
+                                                step_index, err
+                                            )),
                                         );
                                     }
                                 }
