@@ -56,18 +56,20 @@ pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()
             .await
         {
             Ok(pool) => {
-                sqlx::migrate!("./migrations")
-                    .run(&pool)
-                    .await
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                match sqlx::migrate!("./migrations").run(&pool).await {
+                    Ok(_) => {
+                        let adapter = Arc::new(SqlxPostgresAdapter::new(pool));
+                        state
+                            .lock()
+                            .expect("state mutex should not be poisoned")
+                            .set_database(adapter);
 
-                let adapter = Arc::new(SqlxPostgresAdapter::new(pool));
-                state
-                    .lock()
-                    .expect("state mutex should not be poisoned")
-                    .set_database(adapter);
-
-                println!("anima-daemon: Postgres connected, migrations applied");
+                        println!("anima-daemon: Postgres connected, migrations applied");
+                    }
+                    Err(e) => {
+                        eprintln!("anima-daemon: migration failed: {e} — running without persistence");
+                    }
+                }
             }
             Err(e) => {
                 eprintln!("anima-daemon: Postgres connection failed: {e} — running without persistence");
