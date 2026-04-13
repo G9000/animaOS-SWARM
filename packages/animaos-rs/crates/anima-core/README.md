@@ -19,17 +19,43 @@ The execution engine for AnimaOS agents. A pure Rust library with no HTTP server
 
 `anima-core` owns the agent runtime and nothing else. It defines the shapes of things — traits for model providers, databases, context providers, and evaluators — and the `AgentRuntime` struct that drives agent execution.
 
-```
-anima-core (this crate)
-│
-├── AgentRuntime          ← drives the execution loop
-├── ModelAdapter          ← trait: generate text / tool calls
-├── DatabaseAdapter       ← trait: checkpoint step state
-├── Provider              ← trait: inject context before each turn
-└── Evaluator             ← trait: validate/score each response
+Hosts (anima-daemon, WASM, BEAM NIF, test harnesses) implement these traits and wire them in. The core never reaches out to anything on its own.
+
+```mermaid
+graph TD
+    subgraph core["anima-core (this crate)"]
+        AR[AgentRuntime]
+        MA([ModelAdapter])
+        DA([DatabaseAdapter])
+        PR([Provider])
+        EV([Evaluator])
+        AR -- calls --> MA
+        AR -- calls --> DA
+        AR -- calls --> PR
+        AR -- calls --> EV
+    end
+
+    subgraph daemon["anima-daemon"]
+        SA[SqlxPostgresAdapter]
+        CA[ClaudeAdapter]
+        SA -- implements --> DA
+        CA -- implements --> MA
+    end
+
+    subgraph wasm["WASM host (future)"]
+        WM[BrowserModelAdapter]
+        WM -- implements --> MA
+    end
+
+    subgraph beam["BEAM NIF host (future)"]
+        BM[BeamModelAdapter]
+        BD[BeamPersistenceAdapter]
+        BM -- implements --> MA
+        BD -- implements --> DA
+    end
 ```
 
-Hosts (anima-daemon, WASM, BEAM NIF, test harnesses) implement these traits and wire them in. The core never reaches out to anything on its own.
+The arrow direction reads as dependency: the core defines the trait, the host provides the implementation. `anima-core` has zero knowledge of any host.
 
 ---
 
@@ -108,34 +134,47 @@ Runs after the model returns a final answer (not after tool calls). Can score, f
 
 ## Agent Execution Loop
 
-The loop lives in `AgentRuntime::run_with_tools`. A simplified view:
+The loop lives in `AgentRuntime::run_with_tools`.
 
+```mermaid
+sequenceDiagram
+    participant Host
+    participant Runtime as AgentRuntime
+    participant Providers
+    participant Model as ModelAdapter
+    participant DB as DatabaseAdapter
+    participant Tools as execute_tool (host)
+
+    Host->>Runtime: run_with_tools(input, execute_tool)
+    Runtime->>Runtime: mark_running()
+    Runtime->>Providers: get() — build context
+    Providers-->>Runtime: context parts
+
+    loop up to MAX_TOOL_ITERATIONS (8)
+        Runtime->>Model: generate(system + context, messages)
+        Model-->>Runtime: ModelGenerateResponse
+
+        alt stop_reason = End | MaxTokens
+            Runtime->>Runtime: run_evaluators()
+            Runtime->>Runtime: mark_completed()
+            Runtime-->>Host: TaskResult ✓
+        else stop_reason = ToolCall
+            Runtime->>DB: write_step(Pending) × N
+            par parallel dispatch
+                Runtime->>Tools: execute_tool(call_1)
+            and
+                Runtime->>Tools: execute_tool(call_2)
+            end
+            Tools-->>Runtime: results
+            Runtime->>DB: write_step(Done | Failed) × N
+            Note over Runtime: append tool results to conversation
+        end
+    end
+
+    Note over Runtime,Host: iteration cap exceeded → TaskResult ✗
 ```
-run_with_tools(input, execute_tool)
-│
-├── mark_running()
-├── build_provider_context()      ← call all Providers
-│
-└── loop (up to MAX_TOOL_ITERATIONS = 8)
-    │
-    ├── model_adapter.generate()
-    │
-    ├── ModelStopReason::End / MaxTokens
-    │   ├── run_evaluators()
-    │   ├── mark_completed()
-    │   └── return TaskResult
-    │
-    └── ModelStopReason::ToolCall
-        ├── assign step_indices by position
-        ├── write_step(Pending) for each tool call
-        ├── join_all(execute_tool(...))     ← parallel execution
-        ├── write_step(Done | Failed) for each result
-        └── continue loop with tool results appended
-```
 
-Tool calls within a single model response are executed in parallel via `join_all`. The model sees all results before generating the next response.
-
-The iteration cap (`MAX_TOOL_ITERATIONS`) is a hard guard against runaway loops. A task that hits it fails with `"tool iteration limit exceeded"`.
+Tool calls within a single model response are dispatched in parallel. The model sees all results before generating its next response. The `DatabaseAdapter` steps are skipped when no database is injected.
 
 ---
 
@@ -160,13 +199,14 @@ pub struct Step {
 
 ### State machine
 
-```
-  write before execution
-        │
-        ▼
-    Pending ──── execution succeeds ──► Done
-        │
-        └────── execution fails ──────► Failed
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Pending : write_step (before execution)
+    Pending --> Done : execution succeeds
+    Pending --> Failed : execution fails
+    Done --> Done : write_step (no-op)
+    Failed --> Failed : write_step (no-op)
 ```
 
 `Done` and `Failed` are terminal. A `write_step` call against a terminal step must be a no-op — both the `InMemoryAdapter` (tests) and `SqlxPostgresAdapter` (daemon) enforce this with conditional logic.
