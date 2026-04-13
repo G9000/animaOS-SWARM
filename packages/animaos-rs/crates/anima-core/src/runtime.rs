@@ -5,11 +5,13 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
+use uuid::Uuid;
 
 use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage};
 use crate::components::{Evaluator, Provider};
 use crate::events::{EngineEvent, EventType};
 use crate::model::{ModelAdapter, ModelGenerateRequest, ModelStopReason, ToolCall};
+use crate::persistence::{DatabaseAdapter, Step, StepStatus};
 use crate::primitives::{Content, DataValue, Message, MessageRole, TaskResult, TaskStatus};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +36,8 @@ pub struct AgentRuntime {
     providers: Vec<Arc<dyn Provider>>,
     evaluators: Vec<Arc<dyn Evaluator>>,
     model_adapter: Arc<dyn ModelAdapter>,
+    db: Option<Arc<dyn DatabaseAdapter>>,
+    step_counter: u64,
 }
 
 impl AgentRuntime {
@@ -57,11 +61,17 @@ impl AgentRuntime {
             providers: Vec::new(),
             evaluators: Vec::new(),
             model_adapter,
+            db: None,
+            step_counter: 0,
         }
     }
 
     pub fn set_event_listener(&mut self, listener: Arc<dyn Fn(EngineEvent) + Send + Sync>) {
         self.event_listener = Some(listener);
+    }
+
+    pub fn set_database(&mut self, db: Arc<dyn DatabaseAdapter>) {
+        self.db = Some(db);
     }
 
     pub fn init(&mut self) {
@@ -267,11 +277,51 @@ impl AgentRuntime {
                             );
                             conversation.push(assistant_message);
 
+                            // Assign step indices by position (not by tool_call.id which may not be unique)
+                            let step_indices: Vec<i32> = tool_calls
+                                .iter()
+                                .enumerate()
+                                .map(|(i, _)| {
+                                    let idx = (self.step_counter + i as u64) as i32;
+                                    idx
+                                })
+                                .collect();
+                            self.step_counter += tool_calls.len() as u64;
+
                             for tool_call in &tool_calls {
                                 self.record_event(
                                     EventType::ToolBefore,
                                     tool_before_event_data(tool_call),
                                 );
+                            }
+
+                            // Write pending steps to database
+                            if let Some(db) = self.db.clone() {
+                                for (i, tool_call) in tool_calls.iter().enumerate() {
+                                    let step_index = step_indices[i];
+                                    let step = Step {
+                                        id: Uuid::new_v4().to_string(),
+                                        agent_id: self.state.id.clone(),
+                                        step_index,
+                                        idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
+                                        step_type: "tool".to_string(),
+                                        status: StepStatus::Pending,
+                                        input: Some(serde_json::json!({
+                                            "name": tool_call.name,
+                                            "args": data_value_to_json(&DataValue::Object(tool_call.args.clone())),
+                                        })),
+                                        output: None,
+                                    };
+                                    if let Err(err) = db.write_step(&step).await {
+                                        self.record_event(
+                                            EventType::AgentMessage,
+                                            DataValue::String(format!(
+                                                "failed to persist pending step: step_index={}, error={}",
+                                                step_index, err
+                                            )),
+                                        );
+                                    }
+                                }
                             }
 
                             let tool_results =
@@ -289,6 +339,44 @@ impl AgentRuntime {
                                     }
                                 }))
                                 .await;
+
+                            // Write done/failed steps to database
+                            if let Some(db) = self.db.clone() {
+                                for (i, (tool_call, tool_result, _)) in tool_results.iter().enumerate() {
+                                    let step_index = step_indices[i];
+                                    let status = if tool_result.error.is_none() {
+                                        StepStatus::Done
+                                    } else {
+                                        StepStatus::Failed
+                                    };
+                                    let step = Step {
+                                        id: Uuid::new_v4().to_string(),
+                                        agent_id: self.state.id.clone(),
+                                        step_index,
+                                        idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
+                                        step_type: "tool".to_string(),
+                                        status,
+                                        input: Some(serde_json::json!({
+                                            "name": tool_call.name,
+                                            "args": data_value_to_json(&DataValue::Object(tool_call.args.clone())),
+                                        })),
+                                        output: Some(serde_json::json!({
+                                            "status": tool_result.status.as_str(),
+                                            "data": tool_result.data.as_ref().map(|c| &c.text),
+                                            "error": &tool_result.error,
+                                        })),
+                                    };
+                                    if let Err(err) = db.write_step(&step).await {
+                                        self.record_event(
+                                            EventType::AgentMessage,
+                                            DataValue::String(format!(
+                                                "failed to persist done/failed step: step_index={}, error={}",
+                                                step_index, err
+                                            )),
+                                        );
+                                    }
+                                }
+                            }
 
                             for (tool_call, tool_result, tool_duration) in tool_results {
                                 self.record_event(
@@ -673,6 +761,23 @@ fn now_millis() -> u128 {
 fn next_id(prefix: &str, counter: &AtomicU64) -> String {
     let next = counter.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{}-{next}", now_millis())
+}
+
+fn data_value_to_json(value: &DataValue) -> serde_json::Value {
+    match value {
+        DataValue::Null => serde_json::Value::Null,
+        DataValue::Bool(v) => serde_json::json!(v),
+        DataValue::Number(v) => serde_json::json!(v),
+        DataValue::String(v) => serde_json::json!(v),
+        DataValue::Array(vs) => {
+            serde_json::Value::Array(vs.iter().map(data_value_to_json).collect())
+        }
+        DataValue::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), data_value_to_json(v)))
+                .collect(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1666,5 +1771,41 @@ mod tests {
                 .as_slice(),
             ["start:tool-1", "start:tool-2", "end:tool-1", "end:tool-2"]
         );
+    }
+
+    #[test]
+    fn runtime_writes_steps_to_database_adapter() {
+        use crate::persistence::in_memory::InMemoryAdapter;
+        use crate::persistence::StepStatus;
+
+        let db = Arc::new(InMemoryAdapter::new());
+        let mut runtime = AgentRuntime::new(tool_config(), Arc::new(ToolCallingModelAdapter));
+        runtime.init();
+        runtime.set_database(db.clone());
+
+        let result = block_on(runtime.run_with_tools(
+            Content {
+                text: "search memory".into(),
+                ..Content::default()
+            },
+            |_state, _msg, tool_call| async move {
+                TaskResult::success(
+                    Content {
+                        text: format!("result for {}", tool_call.name),
+                        ..Content::default()
+                    },
+                    1,
+                )
+            },
+        ));
+
+        assert_eq!(result.status, TaskStatus::Success);
+
+        let steps = db.recorded_steps();
+        // InMemoryAdapter upserts by (agent_id, step_index), so pending is overwritten by done
+        assert!(!steps.is_empty(), "at least one step should be recorded");
+        let last = steps.last().unwrap();
+        assert_eq!(last.status, StepStatus::Done);
+        assert_eq!(last.step_type, "tool");
     }
 }
