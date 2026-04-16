@@ -37,6 +37,9 @@
       "path": "./packages/mod-sdk"
     },
     {
+      "path": "./tools/workspace-dev"
+    },
+    {
       "path": "./mods/crypto-trader"
     }
   ]

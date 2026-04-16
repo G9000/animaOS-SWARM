@@ -30,7 +30,7 @@ The daemon must be running for SDK operations and most CLI commands:
 bun run daemon
 
 # Or directly with cargo
-cargo run --manifest-path packages/animaos-rs/Cargo.toml -p anima-daemon
+cargo run --manifest-path hosts/rust-daemon/Cargo.toml -p anima-daemon
 ```
 
 The daemon listens on `http://127.0.0.1:8080` by default.
@@ -83,7 +83,7 @@ That's it! The `create` command sets up everything you need.
 
 Runtime ownership in the current repo:
 
-- The canonical runtime core lives in `packages/animaos-rs`.
+- The canonical runtime core lives in `hosts/rust-daemon`.
 - `@animaOS-SWARM/sdk` is a TypeScript client over the daemon's HTTP and SSE APIs.
 - `@animaOS-SWARM/core` provides shared TypeScript contracts and utilities, but it is not the source of truth for runtime behavior.
 
@@ -605,6 +605,6 @@ console.log(agents.map(a => a.state.id));
 
 - [Project README](../README.md) - Overview and quick start
 - [Design Docs](./design/) - Architecture and design decisions
-- [Rust Workspace](../packages/animaos-rs/) - Canonical runtime core and daemon crates
+- [Rust Workspace](../hosts/rust-daemon/) - Canonical runtime core and daemon crates
 - [Core Package](../packages/core/) - Shared TypeScript contracts and utilities
 - [SDK Source](../packages/sdk/src/) - TypeScript daemon client implementation

@@ -116,6 +116,17 @@ impl DaemonState {
             .or_else(|| self.swarm_snapshots.get(swarm_id).cloned())
     }
 
+    pub(crate) fn list_swarms(&self) -> Vec<SwarmState> {
+        let mut snapshots = self.swarm_snapshots.clone();
+        for (swarm_id, coordinator) in &self.swarms {
+            snapshots.insert(swarm_id.clone(), coordinator.get_state());
+        }
+
+        let mut snapshots: Vec<_> = snapshots.into_values().collect();
+        snapshots.sort_by(|left, right| left.id.cmp(&right.id));
+        snapshots
+    }
+
     pub(crate) fn get_swarm_coordinator(&self, swarm_id: &str) -> Option<SwarmCoordinator> {
         self.swarms.get(swarm_id).cloned()
     }
@@ -172,6 +183,12 @@ impl DaemonState {
 
     pub(crate) fn get_agent(&self, agent_id: &str) -> Option<AgentRuntimeSnapshot> {
         self.agents.get(agent_id).map(AgentRuntime::snapshot)
+    }
+
+    pub(crate) fn remove_agent(&mut self, agent_id: &str) {
+        if let Some(mut runtime) = self.agents.remove(agent_id) {
+            runtime.stop();
+        }
     }
 
     pub(crate) fn recent_memories_for_agent(

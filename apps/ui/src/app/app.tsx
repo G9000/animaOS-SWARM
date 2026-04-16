@@ -7,6 +7,16 @@ import {
 } from 'react';
 import styles from './app.module.css';
 import {
+  normalizeAgentCreateResponse,
+  normalizeAgentListResponse,
+  normalizeAgentRunResponse,
+  normalizeSwarmCreateResponse,
+  normalizeSwarmListResponse,
+  normalizeSwarmRunResponse,
+  type TaskOutcome,
+} from './api-contract';
+import { getBackendProfile } from './backend-profile';
+import {
   applyLiveEvent,
   buildLiveActivity,
   buildLiveOutputDelta,
@@ -26,13 +36,6 @@ import {
 
 type ConnectionState = 'connecting' | 'ready' | 'refreshing' | 'offline';
 
-interface TaskOutcome {
-  status: string;
-  data?: unknown;
-  error?: string;
-  durationMs?: number;
-}
-
 interface ActivityEntry {
   id: string;
   scope: SectionId | 'system';
@@ -40,14 +43,6 @@ interface ActivityEntry {
   body: string;
   tone: Tone;
   timestamp: number;
-}
-
-interface AgentListResponse {
-  agents: AgentEntry[];
-}
-
-interface SwarmListResponse {
-  swarms: SwarmEntry[];
 }
 
 interface SearchResponse {
@@ -89,6 +84,7 @@ const NAV_ITEMS: Array<{
 const DEFAULT_AGENT_MODEL = 'gpt-5.4';
 const DASHBOARD_POLL_MS = 30_000;
 const LIVE_RECONNECT_MS = 1_500;
+const BACKEND_PROFILE = getBackendProfile(import.meta.env.VITE_HOST_KEY);
 
 function formatUptime(totalSeconds: number | undefined): string {
   const safeSeconds = Math.max(0, Math.floor(totalSeconds ?? 0));
@@ -201,16 +197,16 @@ async function requestJson<T>(
 }
 
 async function fetchDashboardSnapshot(): Promise<DashboardSnapshot> {
-  const [health, agents, swarms] = await Promise.all([
+  const [health, agentsPayload, swarmsPayload] = await Promise.all([
     requestJson<HealthSnapshot>('/api/health'),
-    requestJson<AgentListResponse>('/api/agents'),
-    requestJson<SwarmListResponse>('/api/swarms'),
+    requestJson<unknown>('/api/agents'),
+    requestJson<unknown>('/api/swarms'),
   ]);
 
   return {
     health,
-    agents: agents.agents,
-    swarms: swarms.swarms,
+    agents: normalizeAgentListResponse(agentsPayload),
+    swarms: normalizeSwarmListResponse(swarmsPayload),
   };
 }
 
@@ -317,7 +313,10 @@ export function App() {
   const relevantActivity = activity.filter(
     (entry) => entry.scope === 'system' || entry.scope === section
   );
-  const canStreamLiveEvents = connectionState !== 'offline' && health !== null;
+  const canStreamLiveEvents =
+    BACKEND_PROFILE.supportsLiveEvents &&
+    connectionState !== 'offline' &&
+    health !== null;
 
   function addActivity(
     scope: SectionId | 'system',
@@ -565,15 +564,14 @@ export function App() {
     setBusyAction('create-agent');
 
     try {
-      const created = await requestJson<{ id: string; name: string }>(
-        '/api/agents',
-        {
+      const created = normalizeAgentCreateResponse(
+        await requestJson<unknown>('/api/agents', {
           method: 'POST',
           body: {
             name: agentDraft.name.trim(),
             model: agentDraft.model.trim(),
           },
-        }
+        })
       );
 
       startTransition(() => {
@@ -610,12 +608,11 @@ export function App() {
     setBusyAction('run-agent');
 
     try {
-      const result = await requestJson<TaskOutcome>(
-        `/api/agents/${selectedAgentId}/run`,
-        {
+      const result = normalizeAgentRunResponse(
+        await requestJson<unknown>(`/api/agents/${selectedAgentId}/run`, {
           method: 'POST',
           body: { task: agentTask.trim() },
-        }
+        })
       );
       const body =
         result.status === 'success'
@@ -705,9 +702,8 @@ export function App() {
     setBusyAction('create-swarm');
 
     try {
-      const created = await requestJson<{ id: string; strategy: string }>(
-        '/api/swarms',
-        {
+      const created = normalizeSwarmCreateResponse(
+        await requestJson<unknown>('/api/swarms', {
           method: 'POST',
           body: {
             strategy: swarmDraft.strategy,
@@ -717,7 +713,7 @@ export function App() {
             },
             workers,
           },
-        }
+        })
       );
 
       startTransition(() => {
@@ -727,7 +723,7 @@ export function App() {
       if (!liveEventsConnected) {
         addActivity(
           'swarms',
-          `Swarm created: ${created.strategy}`,
+          `Swarm created: ${created.strategy ?? swarmDraft.strategy}`,
           `Coordinator ${created.id} is ready with ${String(
             workers.length
           )} workers.`,
@@ -752,12 +748,11 @@ export function App() {
     setBusyAction('run-swarm');
 
     try {
-      const result = await requestJson<TaskOutcome>(
-        `/api/swarms/${selectedSwarmId}/run`,
-        {
+      const result = normalizeSwarmRunResponse(
+        await requestJson<unknown>(`/api/swarms/${selectedSwarmId}/run`, {
           method: 'POST',
           body: { task: swarmTask.trim() },
-        }
+        })
       );
       const body =
         result.status === 'success'
@@ -1434,102 +1429,117 @@ export function App() {
               ),
             })}
 
-            {Panel({
-              eyebrow: 'Documents',
-              title: 'Ingest and query local knowledge',
-              children: (
-                <>
-                  <div className={styles.formGrid}>
-                    <label className={styles.field}>
-                      <span>Document id</span>
-                      <input
-                        value={documentDraft.id}
-                        onChange={(event) =>
-                          setDocumentDraft((current) => ({
-                            ...current,
-                            id: event.target.value,
-                          }))
-                        }
-                        placeholder="ops-playbook"
-                      />
-                    </label>
-                    <label className={styles.field}>
-                      <span>Document query</span>
-                      <input
-                        value={documentQuery}
-                        onChange={(event) =>
-                          setDocumentQuery(event.target.value)
-                        }
-                        placeholder="operator"
-                      />
-                    </label>
-                  </div>
-
-                  <label className={styles.field}>
-                    <span>Document text</span>
-                    <textarea
-                      value={documentDraft.text}
-                      onChange={(event) =>
-                        setDocumentDraft((current) => ({
-                          ...current,
-                          text: event.target.value,
-                        }))
-                      }
-                      placeholder="Paste operating guidance, runbooks, or policy notes here."
-                    />
-                  </label>
-
-                  <div className={styles.buttonRow}>
-                    <button
-                      type="button"
-                      className={styles.primaryButton}
-                      disabled={busyAction === 'ingest-document'}
-                      onClick={() => void handleIngestDocument()}
-                    >
-                      ingest document
-                    </button>
-                    <button
-                      type="button"
-                      className={styles.secondaryButton}
-                      disabled={busyAction === 'search-documents'}
-                      onClick={() => void handleSearchDocuments()}
-                    >
-                      search documents
-                    </button>
-                  </div>
-
-                  <div className={styles.resultList}>
-                    {documentResults.length === 0 ? (
-                      <div className={styles.emptyState}>
-                        Search indexed documents to inspect local knowledge.
+            {BACKEND_PROFILE.supportsDocuments
+              ? Panel({
+                  eyebrow: 'Documents',
+                  title: 'Ingest and query local knowledge',
+                  children: (
+                    <>
+                      <div className={styles.formGrid}>
+                        <label className={styles.field}>
+                          <span>Document id</span>
+                          <input
+                            value={documentDraft.id}
+                            onChange={(event) =>
+                              setDocumentDraft((current) => ({
+                                ...current,
+                                id: event.target.value,
+                              }))
+                            }
+                            placeholder="ops-playbook"
+                          />
+                        </label>
+                        <label className={styles.field}>
+                          <span>Document query</span>
+                          <input
+                            value={documentQuery}
+                            onChange={(event) =>
+                              setDocumentQuery(event.target.value)
+                            }
+                            placeholder="operator"
+                          />
+                        </label>
                       </div>
-                    ) : (
-                      documentResults.map((result, index) => {
-                        const card = formatDocumentResult(result, index);
 
-                        return (
-                          <article
-                            key={`${card.key}-${String(index)}`}
-                            className={styles.resultCard}
-                          >
-                            <div className={styles.resultMeta}>
-                              <strong>{card.label}</strong>
-                              {typeof result.score === 'number' ? (
-                                <span>score {result.score.toFixed(2)}</span>
-                              ) : null}
-                            </div>
-                            <div className={styles.resultTitle}>
-                              {card.title}
-                            </div>
-                            <p className={styles.resultCopy}>{card.preview}</p>
-                          </article>
-                        );
-                      })
-                    )}
-                  </div>
-                </>
-              ),
-            })}
+                      <label className={styles.field}>
+                        <span>Document text</span>
+                        <textarea
+                          value={documentDraft.text}
+                          onChange={(event) =>
+                            setDocumentDraft((current) => ({
+                              ...current,
+                              text: event.target.value,
+                            }))
+                          }
+                          placeholder="Paste operating guidance, runbooks, or policy notes here."
+                        />
+                      </label>
+
+                      <div className={styles.buttonRow}>
+                        <button
+                          type="button"
+                          className={styles.primaryButton}
+                          disabled={busyAction === 'ingest-document'}
+                          onClick={() => void handleIngestDocument()}
+                        >
+                          ingest document
+                        </button>
+                        <button
+                          type="button"
+                          className={styles.secondaryButton}
+                          disabled={busyAction === 'search-documents'}
+                          onClick={() => void handleSearchDocuments()}
+                        >
+                          search documents
+                        </button>
+                      </div>
+
+                      <div className={styles.resultList}>
+                        {documentResults.length === 0 ? (
+                          <div className={styles.emptyState}>
+                            Search indexed documents to inspect local
+                            knowledge.
+                          </div>
+                        ) : (
+                          documentResults.map((result, index) => {
+                            const card = formatDocumentResult(result, index);
+
+                            return (
+                              <article
+                                key={`${card.key}-${String(index)}`}
+                                className={styles.resultCard}
+                              >
+                                <div className={styles.resultMeta}>
+                                  <strong>{card.label}</strong>
+                                  {typeof result.score === 'number' ? (
+                                    <span>score {result.score.toFixed(2)}</span>
+                                  ) : null}
+                                </div>
+                                <div className={styles.resultTitle}>
+                                  {card.title}
+                                </div>
+                                <p className={styles.resultCopy}>
+                                  {card.preview}
+                                </p>
+                              </article>
+                            );
+                          })
+                        )}
+                      </div>
+                    </>
+                  ),
+                })
+              : Panel({
+                  eyebrow: 'Documents',
+                  title: 'Local knowledge is unavailable on this host',
+                  children: (
+                    <div className={styles.emptyState}>
+                      The {BACKEND_PROFILE.hostKey} host currently exposes
+                      task-memory search only. Document ingest and document
+                      search still require the server host.
+                    </div>
+                  ),
+                })}
           </section>
         ) : null}
 
@@ -1573,15 +1583,33 @@ export function App() {
                       <span>coordination roster, create, execute</span>
                     </article>
                     <article className={styles.endpointCard}>
-                      <strong>/api/search + /api/documents</strong>
-                      <span>task-memory and document knowledge search</span>
-                    </article>
-                    <article className={styles.endpointCard}>
-                      <strong>/ws</strong>
+                      <strong>
+                        {BACKEND_PROFILE.supportsDocuments
+                          ? '/api/search + /api/documents'
+                          : '/api/search'}
+                      </strong>
                       <span>
-                        live runtime event stream for browser operators
+                        {BACKEND_PROFILE.supportsDocuments
+                          ? 'task-memory and document knowledge search'
+                          : 'task-memory search for local runtime output'}
                       </span>
                     </article>
+                    {BACKEND_PROFILE.supportsLiveEvents ? (
+                      <article className={styles.endpointCard}>
+                        <strong>/ws</strong>
+                        <span>
+                          live runtime event stream for browser operators
+                        </span>
+                      </article>
+                    ) : (
+                      <article className={styles.endpointCard}>
+                        <strong>live updates</strong>
+                        <span>
+                          This host currently runs without the browser websocket
+                          stream.
+                        </span>
+                      </article>
+                    )}
                   </div>
                 </div>
               ),

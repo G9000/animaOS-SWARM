@@ -2,6 +2,7 @@ use anima_core::persistence::{DatabaseAdapter, Step, StepStatus};
 use anima_daemon::postgres::SqlxPostgresAdapter;
 use sqlx::PgPool;
 
+#[ignore = "requires DATABASE_URL-backed Postgres"]
 #[sqlx::test(migrations = "./migrations")]
 async fn write_and_retrieve_step(pool: PgPool) {
     let adapter = SqlxPostgresAdapter::new(pool);
@@ -25,6 +26,7 @@ async fn write_and_retrieve_step(pool: PgPool) {
     assert_eq!(found.unwrap().status, StepStatus::Pending);
 }
 
+#[ignore = "requires DATABASE_URL-backed Postgres"]
 #[sqlx::test(migrations = "./migrations")]
 async fn write_step_upserts_to_done(pool: PgPool) {
     let adapter = SqlxPostgresAdapter::new(pool);
@@ -59,6 +61,7 @@ async fn write_step_upserts_to_done(pool: PgPool) {
     assert!(steps[0].output.is_some());
 }
 
+#[ignore = "requires DATABASE_URL-backed Postgres"]
 #[sqlx::test(migrations = "./migrations")]
 async fn list_steps_ordered_by_index(pool: PgPool) {
     let adapter = SqlxPostgresAdapter::new(pool);

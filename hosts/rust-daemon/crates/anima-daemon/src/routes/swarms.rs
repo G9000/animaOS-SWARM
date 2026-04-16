@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use futures::stream;
 
 use super::api::{
-    optional_u64, optional_usize, parse_agent_config, required_string, string_array_json,
+    optional_u64, optional_usize, parse_agent_config, required_text_or_task, string_array_json,
     task_result_json, token_usage_json,
 };
 use super::Response;
@@ -82,6 +82,27 @@ pub(crate) async fn handle_create_swarm(
     )
 }
 
+pub(crate) fn handle_list_swarms(state: &Arc<Mutex<DaemonState>>) -> Response {
+    let snapshots = {
+        let guard = state
+            .lock()
+            .expect("daemon state mutex should not be poisoned");
+        guard.list_swarms()
+    };
+
+    Response::json(
+        "HTTP/1.1 200 OK",
+        format!(
+            "{{\"swarms\":[{}]}}",
+            snapshots
+                .iter()
+                .map(swarm_state_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    )
+}
+
 pub(crate) fn handle_get_swarm(swarm_id: &str, state: &Arc<Mutex<DaemonState>>) -> Response {
     let snapshot = {
         let guard = state
@@ -124,7 +145,7 @@ pub(crate) async fn handle_run_swarm(
         }
     };
 
-    let task = match required_string(&object, "text") {
+    let task = match required_text_or_task(&object) {
         Ok(task) => task,
         Err(message) => return Response::error("HTTP/1.1 400 Bad Request", message),
     };

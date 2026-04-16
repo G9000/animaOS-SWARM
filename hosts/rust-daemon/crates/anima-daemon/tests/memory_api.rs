@@ -92,6 +92,21 @@ async fn search_memories_returns_created_memory() {
 }
 
 #[tokio::test]
+async fn search_alias_matches_memory_search_endpoint() {
+    let app = test_app();
+    let create_body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":"search alias should find this memory","importance":0.9,"tags":["search"]}"#;
+
+    let (create_status, _) = send_json_request(&app, "POST", "/api/memories", create_body).await;
+    let (search_status, search_response) =
+        send_empty_request(&app, "GET", "/api/search?q=search%20alias").await;
+
+    assert_eq!(create_status, StatusCode::CREATED);
+    assert_eq!(search_status, StatusCode::OK);
+    assert!(search_response.contains("\"results\":"));
+    assert!(search_response.contains("\"content\":\"search alias should find this memory\""));
+}
+
+#[tokio::test]
 async fn search_memories_rejects_missing_query() {
     let app = test_app();
     let (status, response) = send_empty_request(&app, "GET", "/api/memories/search").await;

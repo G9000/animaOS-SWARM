@@ -53,6 +53,7 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         .route("/api/health", any(health_entry))
         .route("/api/memories", any(memories_collection_entry))
         .route("/api/memories/search", any(memories_search_entry))
+        .route("/api/search", any(memories_search_entry))
         .route("/api/memories/recent", any(memories_recent_entry))
         .route("/api/agents", any(agents_collection_entry))
         .route("/api/agents/:agent_id", any(agent_detail_entry))
@@ -140,6 +141,7 @@ async fn agent_detail_entry(
 ) -> AxumResponse {
     match method {
         Method::GET => json_response(agents::handle_get_agent(&agent_id, &state.daemon)),
+        Method::DELETE => json_response(agents::handle_delete_agent(&agent_id, &state.daemon)),
         _ => not_found().await,
     }
 }
@@ -186,6 +188,7 @@ async fn swarms_collection_entry(
     request: Request,
 ) -> AxumResponse {
     match method {
+        Method::GET => json_response(swarms::handle_list_swarms(&state.daemon)),
         Method::POST => match read_limited_body(request, state.config.max_request_bytes).await {
             Ok(body) => json_response(swarms::handle_create_swarm(body, &state.daemon).await),
             Err(response) => response,

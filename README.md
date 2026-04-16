@@ -26,7 +26,7 @@ The terminal UI is the primary local operator surface. The web UI is secondary a
 
 ## Runtime Architecture
 
-The canonical runtime lives in Rust under `packages/animaos-rs`.
+The canonical runtime lives in Rust under `hosts/rust-daemon`.
 
 - `anima-core`, `anima-swarm`, `anima-memory`, and `anima-daemon` own execution, coordination, memory, and the HTTP/SSE boundary.
 - `packages/sdk` is the public TypeScript client for that runtime.
@@ -36,19 +36,29 @@ The canonical runtime lives in Rust under `packages/animaos-rs`.
 
 ```bash
 # Build all packages
-bun x nx run-many -t build
+bun run build
 
 # Run tests
-bun x nx run-many -t test
+bun run test
 
-# Start the daemon for local launch/chat workflows
+# Run only what changed on the current branch
+bun run affected:build
+bun run affected:test
+
+# Open the project graph
+bun run graph
+
+# Start the selected host and UI together
+bun dev --host rust
+
+# Start the daemon only for local launch/chat workflows
 bun run daemon
 
 # Start the server app
-bun x nx serve @animaOS-SWARM/server
+bun run server
 
 # Start the web UI (secondary surface)
-bun x nx dev @animaOS-SWARM/ui
+bun run ui
 ```
 
 ## Local CLI

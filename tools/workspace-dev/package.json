@@ -1,0 +1,17 @@
+{
+  "name": "workspace-dev",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "nx": {
+    "targets": {
+      "dev": {
+        "executor": "nx:run-commands",
+        "options": {
+          "command": "bun run tools/workspace-dev/src/main.ts",
+          "forwardAllArgs": true
+        }
+      }
+    }
+  }
+}

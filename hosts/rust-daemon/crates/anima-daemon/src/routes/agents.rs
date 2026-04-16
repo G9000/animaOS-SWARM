@@ -97,6 +97,15 @@ pub(crate) fn handle_get_agent(agent_id: &str, state: &Arc<Mutex<DaemonState>>) 
     }
 }
 
+pub(crate) fn handle_delete_agent(agent_id: &str, state: &Arc<Mutex<DaemonState>>) -> Response {
+    state
+        .lock()
+        .expect("daemon state mutex should not be poisoned")
+        .remove_agent(agent_id);
+
+    Response::json("HTTP/1.1 200 OK", "{\"deleted\":true}".to_string())
+}
+
 pub(crate) fn handle_recent_agent_memories(
     agent_id: &str,
     query: std::collections::HashMap<String, String>,

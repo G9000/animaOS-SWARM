@@ -14,7 +14,7 @@ This scorecard tracks parity between the main TypeScript-facing packages and the
 - `@animaOS-SWARM/server`
 - `@animaOS-SWARM/ui`
 - `@animaOS-SWARM/ui-e2e`
-- `packages/animaos-rs`
+- `hosts/rust-daemon`
 
 The goal is not to make every surface identical. The goal is to hold each one to the same quality bar for its role.
 
@@ -199,4 +199,4 @@ Remaining gap:
 
 1. Keep the scorecard updated whenever a package or active app surface gains or loses a boundary, example, dedicated seam test, or build/static-validation target.
 2. Expand README examples if a surface adds new major exported or operator-facing capabilities.
-3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, and canonical execution/runtime depth belongs in `packages/animaos-rs`.
+3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, and canonical execution/runtime depth belongs in `hosts/rust-daemon`.

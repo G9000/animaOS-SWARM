@@ -259,6 +259,20 @@ async fn run_agent_returns_task_result_and_completed_runtime_state() {
 }
 
 #[tokio::test]
+async fn run_agent_accepts_task_field_alias() {
+    let app = test_app();
+    let (_, create_response) = create_agent(&app, r#"{"name":"operator","model":"gpt-5.4"}"#).await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (status, response) =
+        run_agent(&app, &agent_id, r#"{"task":"Summarize the latest task"}"#).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.contains("\"status\":\"success\""));
+    assert!(response.contains("\"text\":\"operator handled task: Summarize the latest task\""));
+}
+
+#[tokio::test]
 async fn run_agent_uses_recent_memory_provider_context() {
     let app = test_app();
     let (_, create_response) = create_agent(&app, r#"{"name":"operator","model":"gpt-5.4"}"#).await;
@@ -381,6 +395,23 @@ async fn run_agent_persists_task_result_memory() {
     assert_eq!(recent_status, StatusCode::OK);
     assert!(recent_response.contains("\"type\":\"task_result\""));
     assert!(recent_response.contains("\"content\":\"operator handled task: Produce final answer\""));
+}
+
+#[tokio::test]
+async fn delete_agent_removes_runtime_and_returns_deleted_flag() {
+    let app = test_app();
+    let (_, create_response) = create_agent(&app, r#"{"name":"operator","model":"gpt-5.4"}"#).await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (delete_status, delete_response) =
+        send_empty_request(&app, "DELETE", &format!("/api/agents/{agent_id}")).await;
+    let (get_status, get_response) =
+        send_empty_request(&app, "GET", &format!("/api/agents/{agent_id}")).await;
+
+    assert_eq!(delete_status, StatusCode::OK);
+    assert!(delete_response.contains("\"deleted\":true"));
+    assert_eq!(get_status, StatusCode::NOT_FOUND);
+    assert!(get_response.contains("\"error\":\"not found\""));
 }
 
 #[tokio::test]

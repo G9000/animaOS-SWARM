@@ -4,11 +4,21 @@
   "packageManager": "bun@1.3.8",
   "license": "MIT",
   "scripts": {
+    "affected:build": "bun x nx affected -t build",
+    "affected:test": "bun x nx affected -t test",
+    "build": "bun x nx run-many -t build",
     "build:cli-sdk": "tsc -b packages/sdk/tsconfig.lib.json packages/cli/tsconfig.lib.json",
-    "daemon": "cargo run --manifest-path packages/animaos-rs/Cargo.toml -p anima-daemon",
+    "daemon": "cargo run --manifest-path hosts/rust-daemon/Cargo.toml -p anima-daemon",
+    "dev": "bun x nx run workspace-dev:dev --",
     "animaos": "node packages/cli/dist/index.js",
+    "graph": "bun x nx graph",
     "lint": "oxlint --config .oxlintrc.json packages/*/src apps/*/src",
-    "lint:fix": "oxlint --fix --config .oxlintrc.json packages/*/src apps/*/src"
+    "lint:fix": "oxlint --fix --config .oxlintrc.json packages/*/src apps/*/src",
+    "projects": "bun x nx show projects",
+    "server": "bun x nx serve @animaOS-SWARM/server",
+    "test": "bun x nx run-many -t test",
+    "typecheck": "bun x nx run-many -t typecheck",
+    "ui": "bun x nx dev @animaOS-SWARM/ui"
   },
   "private": true,
   "dependencies": {

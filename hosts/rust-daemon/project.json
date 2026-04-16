@@ -1,0 +1,36 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "rust-daemon",
+  "root": "hosts/rust-daemon",
+  "projectType": "application",
+  "targets": {
+    "dev": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "hosts/rust-daemon",
+        "command": "cargo run --target-dir target/dev -p anima-daemon"
+      }
+    },
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "hosts/rust-daemon",
+        "command": "cargo build --target-dir target/build --workspace"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "hosts/rust-daemon",
+        "command": "cargo test --target-dir target/test --workspace"
+      }
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "hosts/rust-daemon",
+        "command": "cargo fmt --all --check"
+      }
+    }
+  }
+}

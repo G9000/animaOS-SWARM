@@ -48,7 +48,7 @@ animaos-swarm/
 │   ├── @animaOS-SWARM/sdk       — Public TypeScript client for the Rust daemon
 │   ├── @animaOS-SWARM/cli       — Local `animaos` CLI and agency scaffolding
 │   └── @animaOS-SWARM/tui       — Ink-based terminal UI for launch sessions
-├── packages/animaos-rs/
+├── hosts/rust-daemon/
 │   ├── anima-core               — Canonical runtime core
 │   ├── anima-swarm              — Canonical swarm coordination
 │   ├── anima-memory             — Canonical memory services
@@ -68,7 +68,7 @@ animaos-swarm/
 
 | Component | Status | Details |
 |---|---|---|
-| Rust runtime core | ✅ Done | `packages/animaos-rs` is the canonical execution path for runtime, swarm, memory, and daemon concerns |
+| Rust runtime core | ✅ Done | `hosts/rust-daemon` is the canonical execution path for runtime, swarm, memory, and daemon concerns |
 | Provider support | ✅ Done | OpenAI, Anthropic, Google/Gemini, Ollama, and several OpenAI-compatible providers run through the daemon |
 | Swarm coordination | ✅ Done | Supervisor, dynamic, and round-robin strategies are implemented |
 | CLI surface | ✅ Done | `create`, `run`, `chat`, `launch`, and `agents` are available through the local `animaos` binary |

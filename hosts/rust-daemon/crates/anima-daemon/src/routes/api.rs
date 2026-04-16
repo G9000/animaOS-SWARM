@@ -29,10 +29,30 @@ pub(crate) fn parse_agent_config(
 
 pub(crate) fn parse_content(object: &BTreeMap<String, JsonValue>) -> Result<Content, &'static str> {
     Ok(Content {
-        text: required_string(object, "text")?,
+        text: required_text_or_task(object)?,
         attachments: optional_attachments(object.get("attachments"))?,
         metadata: optional_metadata(object.get("metadata"))?,
     })
+}
+
+pub(crate) fn required_text_or_task(
+    object: &BTreeMap<String, JsonValue>,
+) -> Result<String, &'static str> {
+    if let Some(JsonValue::String(value)) = object.get("text").filter(|value| match value {
+        JsonValue::String(value) => !value.is_empty(),
+        _ => false,
+    }) {
+        return Ok(value.clone());
+    }
+
+    if let Some(JsonValue::String(value)) = object.get("task").filter(|value| match value {
+        JsonValue::String(value) => !value.is_empty(),
+        _ => false,
+    }) {
+        return Ok(value.clone());
+    }
+
+    Err("text is required")
 }
 
 pub(crate) fn required_string(

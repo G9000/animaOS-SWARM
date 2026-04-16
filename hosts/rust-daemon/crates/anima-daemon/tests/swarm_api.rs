@@ -124,6 +124,20 @@ async fn create_swarm_returns_created_idle_snapshot() {
 }
 
 #[tokio::test]
+async fn list_swarms_returns_registered_snapshots() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let (status, response) = send_empty_request(&app, "GET", "/api/swarms").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.contains("\"swarms\":["));
+    assert!(response.contains(&format!("\"id\":\"{swarm_id}\"")));
+    assert!(response.contains("\"status\":\"idle\""));
+}
+
+#[tokio::test]
 async fn run_swarm_returns_result_and_updates_swarm_state() {
     let app = test_app();
     let (_, create_response) = create_swarm(&app).await;
@@ -139,6 +153,19 @@ async fn run_swarm_returns_result_and_updates_swarm_state() {
     assert!(response.contains(
         "[worker-a]: worker-a handled task: Continue working on this task: Coordinate the patch"
     ));
+}
+
+#[tokio::test]
+async fn run_swarm_accepts_task_field_alias() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let (status, response) = run_swarm(&app, &swarm_id, r#"{"task":"Coordinate the patch"}"#).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.contains("\"status\":\"success\""));
+    assert!(response.contains("[manager]: manager handled task: Coordinate the patch"));
 }
 
 #[tokio::test]

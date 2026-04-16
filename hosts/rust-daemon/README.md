@@ -29,7 +29,7 @@ graph BT
 
 ```bash
 # from the repo root
-cd packages/animaos-rs
+cd hosts/rust-daemon
 
 ANTHROPIC_API_KEY=sk-... cargo run -p anima-daemon
 curl http://127.0.0.1:8080/health
