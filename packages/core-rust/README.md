@@ -1,64 +1,33 @@
-# animaOS Rust Workspace
+# animaOS Rust Core
 
-The runtime core for AnimaOS. This workspace owns agent execution, swarm coordination, memory services, and the HTTP daemon that bridges everything to TypeScript clients.
+Reusable Rust runtime crates for animaOS. This package owns the core execution, memory, and swarm libraries.
 
-```mermaid
-graph BT
-    anima-core["anima-core\n(execution engine, traits)"]
-    anima-memory["anima-memory\n(BM25 search, storage)"]
-    anima-swarm["anima-swarm\n(multi-agent coordination)"]
-    anima-daemon["anima-daemon\n(HTTP API, Postgres, SSE)"]
-
-    anima-memory --> anima-core
-    anima-swarm --> anima-core
-    anima-daemon --> anima-core
-    anima-daemon --> anima-memory
-    anima-daemon --> anima-swarm
-```
+It does not own the runnable HTTP daemon. The current Rust host remains at [`hosts/rust-daemon/crates/anima-daemon`](../../hosts/rust-daemon/crates/anima-daemon).
 
 ## Crates
 
 | Crate | What it does |
 |---|---|
-| [`anima-core`](crates/anima-core) | Agent execution loop, trait interfaces (ModelAdapter, DatabaseAdapter, Provider, Evaluator). No HTTP, no DB, no runtime dep. |
-| [`anima-memory`](crates/anima-memory) | BM25 full-text memory store with optional JSON file persistence. Synchronous, no external dependencies. |
-| [`anima-swarm`](crates/anima-swarm) | Multi-agent coordinator with Supervisor, RoundRobin, and Dynamic strategies. Built on top of anima-core agents. |
-| [`anima-daemon`](crates/anima-daemon) | Axum HTTP server. Implements ModelAdapter + DatabaseAdapter from anima-core, exposes the REST API, emits SSE events. |
-
-## Quick start
-
-```bash
-# from the repo root
-cd hosts/rust-daemon
-
-ANTHROPIC_API_KEY=sk-... cargo run -p anima-daemon
-curl http://127.0.0.1:8080/health
-```
-
-With Postgres step persistence:
-
-```bash
-DATABASE_URL=postgres://user:pass@localhost/animaos \
-ANTHROPIC_API_KEY=sk-... \
-cargo run -p anima-daemon
-```
+| [`anima-core`](crates/anima-core) | Agent execution loop, trait interfaces, and runtime primitives. No HTTP or database implementation details. |
+| [`anima-memory`](crates/anima-memory) | BM25-backed memory storage and retrieval helpers. |
+| [`anima-swarm`](crates/anima-swarm) | Multi-agent coordination strategies built on top of `anima-core`. |
 
 ## Build
 
+From the repo root:
+
 ```bash
-cargo build --workspace
+cargo build -p anima-core
+cargo build -p anima-memory
+cargo build -p anima-swarm
 ```
 
 ## Test
 
+From the repo root:
+
 ```bash
-# unit + integration (requires no external services)
-cargo test --workspace
-
-# integration tests that need Postgres
-DATABASE_URL=postgres://user:pass@localhost/animaos cargo test --workspace
+cargo test -p anima-core
+cargo test -p anima-memory
+cargo test -p anima-swarm
 ```
-
-## How it fits together
-
-TypeScript clients (SDK, CLI, UI) talk exclusively to `anima-daemon` over HTTP. The daemon wires the pure `anima-core` runtime to real infrastructure — Anthropic's API for the model and Postgres for durable step logging. `anima-memory` and `anima-swarm` are used by the daemon but are independently testable without it.

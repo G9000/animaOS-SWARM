@@ -17,7 +17,7 @@ const workspaceRoot = resolve(
 );
 const daemonManifestPath = resolve(
   workspaceRoot,
-  'hosts/rust-daemon/Cargo.toml'
+  'Cargo.toml'
 );
 
 describe.sequential('@animaOS-SWARM/sdk real daemon integration', () => {
