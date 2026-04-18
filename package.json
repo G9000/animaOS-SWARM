@@ -59,6 +59,7 @@
   "workspaces": [
     "packages/*",
     "apps/*",
-    "mods/*"
+    "mods/*",
+    "tools/*"
   ]
 }

@@ -35,6 +35,8 @@ for load-balancer probes.
 |---|---|---|
 | `GET` | `/health` | Liveness check. Always returns `200 OK` with `{"status":"ok"}`. |
 | `GET` | `/api/health` | Same as above. |
+| `GET` | `/openapi.json` | OpenAPI spec for the daemon routes. |
+| `GET` | `/docs` | Swagger UI for exploring the daemon API in a browser. |
 
 ### Agents
 

@@ -19,9 +19,7 @@ export function parseHostArg(argv: string[]): HostKey {
     hostFlagIndex >= 0 ? argv[hostFlagIndex + 1] : undefined;
 
   if (!nextValue) {
-    throw new Error(
-      "Missing required '--host <name>' argument. Expected one of: rust, elixir, python."
-    );
+    return 'rust';
   }
 
   return nextValue as HostKey;

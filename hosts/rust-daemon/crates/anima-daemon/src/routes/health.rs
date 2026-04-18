@@ -1,7 +1,7 @@
-use anima_core::HealthStatus;
+use crate::routes::contracts::HealthResponse;
 
-use crate::http::Response;
-
-pub(crate) fn handle_health() -> Response {
-    Response::json("HTTP/1.1 200 OK", HealthStatus::ok().as_json().to_string())
+pub(crate) fn handle_health() -> HealthResponse {
+    HealthResponse {
+        status: "ok".to_string(),
+    }
 }
