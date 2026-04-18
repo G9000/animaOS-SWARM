@@ -17,6 +17,7 @@ describe('repo layout', () => {
   });
 
   it('stores reusable Rust crates under packages/core-rust', () => {
+    expect(existsSync(repoPath('Cargo.toml'))).toBe(true);
     expect(
       existsSync(
         repoPath('packages', 'core-rust', 'crates', 'anima-core', 'Cargo.toml')
@@ -45,6 +46,9 @@ describe('repo layout', () => {
       )
     ).toBe(true);
 
+    expect(
+      existsSync(repoPath('hosts', 'rust-daemon', 'Cargo.toml'))
+    ).toBe(false);
     expect(
       existsSync(
         repoPath('hosts', 'rust-daemon', 'crates', 'anima-core', 'Cargo.toml')
