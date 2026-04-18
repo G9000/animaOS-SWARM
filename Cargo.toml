@@ -1,9 +1,9 @@
 [workspace]
 members = [
-    "crates/anima-core",
-    "crates/anima-memory",
-    "crates/anima-swarm",
-    "crates/anima-daemon",
+    "packages/core-rust/crates/anima-core",
+    "packages/core-rust/crates/anima-memory",
+    "packages/core-rust/crates/anima-swarm",
+    "hosts/rust-daemon/crates/anima-daemon",
 ]
 resolver = "2"
 

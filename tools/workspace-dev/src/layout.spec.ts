@@ -15,4 +15,62 @@ describe('repo layout', () => {
       false
     );
   });
+
+  it('stores reusable Rust crates under packages/core-rust', () => {
+    expect(
+      existsSync(
+        repoPath('packages', 'core-rust', 'crates', 'anima-core', 'Cargo.toml')
+      )
+    ).toBe(true);
+    expect(
+      existsSync(
+        repoPath(
+          'packages',
+          'core-rust',
+          'crates',
+          'anima-memory',
+          'Cargo.toml'
+        )
+      )
+    ).toBe(true);
+    expect(
+      existsSync(
+        repoPath(
+          'packages',
+          'core-rust',
+          'crates',
+          'anima-swarm',
+          'Cargo.toml'
+        )
+      )
+    ).toBe(true);
+
+    expect(
+      existsSync(
+        repoPath('hosts', 'rust-daemon', 'crates', 'anima-core', 'Cargo.toml')
+      )
+    ).toBe(false);
+    expect(
+      existsSync(
+        repoPath(
+          'hosts',
+          'rust-daemon',
+          'crates',
+          'anima-memory',
+          'Cargo.toml'
+        )
+      )
+    ).toBe(false);
+    expect(
+      existsSync(
+        repoPath(
+          'hosts',
+          'rust-daemon',
+          'crates',
+          'anima-swarm',
+          'Cargo.toml'
+        )
+      )
+    ).toBe(false);
+  });
 });

@@ -7,29 +7,29 @@
     "dev": {
       "executor": "nx:run-commands",
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo run --target-dir target/dev -p anima-daemon"
+        "cwd": ".",
+        "command": "cargo run --manifest-path Cargo.toml --target-dir target/dev -p anima-daemon"
       }
     },
     "build": {
       "executor": "nx:run-commands",
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo build --target-dir target/build --workspace"
+        "cwd": ".",
+        "command": "cargo build --manifest-path Cargo.toml --target-dir target/build -p anima-daemon"
       }
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo test --target-dir target/test --workspace"
+        "cwd": ".",
+        "command": "cargo test --manifest-path Cargo.toml --target-dir target/test -p anima-daemon"
       }
     },
     "lint": {
       "executor": "nx:run-commands",
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo fmt --all --check"
+        "cwd": ".",
+        "command": "cargo fmt --manifest-path Cargo.toml --all --check"
       }
     }
   }
