@@ -30,7 +30,7 @@ The canonical runtime lives in Rust under `hosts/rust-daemon`.
 
 - `anima-core`, `anima-swarm`, `anima-memory`, and `anima-daemon` own execution, coordination, memory, and the HTTP/SSE boundary.
 - `packages/sdk` is the public TypeScript client for that runtime.
-- `packages/core` is shared TypeScript support used by the SDK, CLI, and UI. It is not the source of truth for execution behavior.
+- `packages/core-ts` is shared TypeScript support used by the SDK, CLI, and UI. It is not the source of truth for execution behavior.
 
 ## Development
 

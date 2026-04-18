@@ -606,5 +606,5 @@ console.log(agents.map(a => a.state.id));
 - [Project README](../README.md) - Overview and quick start
 - [Design Docs](./design/) - Architecture and design decisions
 - [Rust Workspace](../hosts/rust-daemon/) - Canonical runtime core and daemon crates
-- [Core Package](../packages/core/) - Shared TypeScript contracts and utilities
+- [Core Package](../packages/core-ts/) - Shared TypeScript contracts and utilities
 - [SDK Source](../packages/sdk/src/) - TypeScript daemon client implementation
