@@ -1,15 +1,18 @@
-# Hosts Workspace And Unified Dev Design
+# Core Ports, Hosts, And Unified Dev Design
 
-**Date:** 2026-04-15
+**Date:** 2026-04-18
 **Status:** Approved
 
 ---
 
 ## Goal
 
-Restructure the repository so backend implementations live under `hosts/` and become first-class Nx projects, with one consistent local development entrypoint that starts the selected host plus the web UI.
+Restructure the repository so the host-agnostic engine ports live under `packages/`, runnable backend implementations live under `hosts/`, and local development starts the selected host plus the web UI through one consistent command.
 
-This design is about repository boundaries and developer workflow. It does not change the ADR decision that `anima-core` is host-agnostic. It changes how host implementations are organized and run inside this repo.
+This revision replaces the earlier incorrect assumption that the full Rust workspace should move under `hosts/`. That would have mixed reusable engine code with runnable backend processes. The correct boundary is:
+
+- reusable core ports in `packages/`
+- runnable hosts in `hosts/`
 
 ---
 
@@ -17,33 +20,40 @@ This design is about repository boundaries and developer workflow. It does not c
 
 The repository will adopt this ownership model:
 
-- `hosts/*` contains backend host implementations
-- `apps/*` contains user-facing application surfaces
-- `packages/*` contains reusable libraries, SDKs, and shared contracts
+- `packages/core-rust` contains the Rust core port and its reusable engine crates
+- `packages/core-ts` contains the TypeScript core port
+- `hosts/*` contains runnable backend implementations only
+- `apps/*` contains operator-facing or end-user-facing application surfaces
+- `packages/*` continues to contain reusable SDKs, libraries, and shared code
 
-The first concrete migration is:
+The first restructuring pass will:
 
-- move `packages/animaos-rs` to `hosts/rust-daemon`
-- make `hosts/rust-daemon` a first-class Nx project
-- add placeholder host projects for future Elixir and Python implementations
-- add a workspace-level Nx orchestration project that starts the selected host plus `apps/ui`
-- expose one human-friendly entrypoint: `bun dev --host <name>`
+- rehome the reusable Rust crates into `packages/core-rust`
+- rehome the Rust daemon into `hosts/rust-daemon`
+- rename or reframe the current TypeScript core package as `packages/core-ts`
+- add placeholder host directories for Elixir and Python
+- add one host-selecting dev entrypoint: `bun dev --host <name>`
+- add an Nx-native orchestration target for the same flow
 
-The target backend choices are:
-
-- `rust`
-- `elixir`
-- `python`
-
-Only Rust is expected to be fully implemented in phase 1. Elixir and Python are explicit repo-level citizens from the beginning so the structure does not need to be rethought later.
+The old TypeScript server is not removed in this pass. It stays in place while the repo boundaries are cleaned up.
 
 ---
 
 ## Repository Shape
 
-The repo should converge on this structure:
+The repo should converge on this shape:
 
 ```text
+packages/
+  core-rust/
+  core-ts/
+  sdk/
+  cli/
+  memory/
+  swarm/
+  tools/
+  ...
+
 hosts/
   rust-daemon/
   elixir-phoenix/
@@ -52,83 +62,151 @@ hosts/
 apps/
   ui/
   tui/
-
-packages/
-  sdk/
-  cli/
-  core/
-  swarm/
-  memory/
-  tools/
-  ...
+  server/        # kept for now, follow-up decision later
 ```
 
 Interpretation:
 
-- `hosts/*` are backend process boundaries that expose runtime capabilities to clients
-- `apps/*` are operator-facing or end-user-facing surfaces
-- `packages/*` are imported and reused; they are not deployment boundaries
+- `packages/core-rust` and `packages/core-ts` are sibling engine ports
+- `hosts/*` are runnable wrappers around a core port
+- `apps/*` are user-facing surfaces, not backend ownership boundaries
+- `packages/*` are reusable and importable, not deployment units
 
-This gives the repository one honest place for Rust, Elixir, and Python backends without overloading `apps/` or hiding production backends inside `packages/`.
+This matches the architectural intent: the core is host-agnostic, while hosts are deployment-specific wrappers around it.
+
+---
+
+## Boundary Rules
+
+### `packages/core-rust`
+
+`packages/core-rust` owns reusable Rust engine code only.
+
+Examples:
+
+- `anima-core`
+- `anima-memory`
+- `anima-swarm`
+- shared Rust traits, primitives, and runtime libraries
+
+It must not be treated as a backend process boundary.
+
+### `packages/core-ts`
+
+`packages/core-ts` is the TypeScript port of the core.
+
+It remains a reusable package boundary, not a host. It can contain TypeScript-side core/runtime concepts, contracts, and library code. It does not need to imply a TypeScript backend host exists.
+
+### `hosts/*`
+
+`hosts/*` are runnable backend implementations.
+
+Examples:
+
+- `hosts/rust-daemon`
+- `hosts/elixir-phoenix`
+- `hosts/python-service`
+
+Each host wraps one core port and exposes runtime capabilities over whatever transport it chooses. The host is the backend process boundary.
+
+That means:
+
+- reusable engine code does not belong in `hosts/*`
+- deployment-specific code does not belong in `packages/core-*`
+
+---
+
+## Rust Layout
+
+The Rust side should be split between reusable crates and the runnable daemon.
+
+Target shape:
+
+```text
+packages/core-rust/
+  crates/
+    anima-core/
+    anima-memory/
+    anima-swarm/
+
+hosts/rust-daemon/
+  Cargo.toml
+  src/
+  tests/
+```
+
+To support this cleanly, the repository should adopt a repo-root Cargo workspace so Rust packages and Rust hosts can be siblings without awkward cross-directory ownership.
+
+Expected Rust workspace membership:
+
+- `packages/core-rust/crates/anima-core`
+- `packages/core-rust/crates/anima-memory`
+- `packages/core-rust/crates/anima-swarm`
+- `hosts/rust-daemon`
+
+This is the cleanest way to express:
+
+- reusable Rust engine crates in `packages/`
+- runnable Rust backend in `hosts/`
+
+without pretending one owns the other.
 
 ---
 
 ## Host Model
 
-Each host is a backend implementation of the same broad role: expose runtime capabilities to the rest of the system.
+The host model is simple:
+
+- core is agnostic
+- host is specific
+
+Each host is a runnable wrapper around a core port.
 
 Examples:
 
-- `hosts/rust-daemon` -> Axum/Tokio host
-- `hosts/elixir-phoenix` -> Phoenix/BEAM host
-- `hosts/python-service` -> Python host
+- `hosts/rust-daemon` wraps `packages/core-rust`
+- a future TypeScript host, if ever needed, would still live under `hosts/`, not under `packages/core-ts`
+- `hosts/elixir-phoenix` and `hosts/python-service` are peer host implementations, not alternate homes for the core itself
 
-`hosts` is intentionally broader than "HTTP server" in the abstract, but in this repository it should be treated as the home for backend server/process implementations.
+This keeps the architecture honest:
 
-The host is the backend boundary. UI, TUI, SDK, and CLI should talk directly to the selected host. A second server above the host is not required by default.
-
-An extra server or gateway is only justified later for specific concerns like:
-
-- browser auth/session handling
-- edge routing or caching
-- multi-service aggregation
-- public/private topology separation
-
-Until one of those problems is concrete, the selected host is the backend.
+- the core is portable
+- the host is replaceable
+- the repo structure reflects that separation
 
 ---
 
 ## Nx Project Contract
 
-Every host must be represented as an Nx project and should expose a consistent target contract where possible:
+Every runnable host must be a first-class Nx project and should expose a consistent target contract where practical:
 
 - `dev`
 - `build`
 - `test`
 - `lint`
 
-Not every language ecosystem will implement every target in exactly the same way, but the names should stay consistent so the workspace tooling stays predictable.
+The internals will differ by ecosystem, but the target names should stay aligned so workspace tooling remains predictable.
 
-### Rust Host
+### `hosts/rust-daemon`
 
-`hosts/rust-daemon` becomes an Nx project even though it is built with Cargo.
+`hosts/rust-daemon` becomes an Nx project with targets that wrap Cargo commands.
 
-Its Nx targets should be thin wrappers around Cargo commands, likely using `nx:run-commands`:
+Expected shape:
 
-- `dev` -> `cargo run`
-- `build` -> `cargo build`
-- `test` -> `cargo test`
-- `lint` -> `cargo fmt --check` and/or `cargo clippy` in a follow-up if desired
+- `dev` -> `cargo run -p anima-daemon`
+- `build` -> `cargo build -p anima-daemon`
+- `test` -> `cargo test -p anima-daemon`
+- `lint` -> `cargo fmt --check` and/or `cargo clippy` in a follow-up
 
-### Elixir Host
+### `hosts/elixir-phoenix`
 
-`hosts/elixir-phoenix` will eventually expose the same target names through Phoenix/Mix commands.
+Future Nx targets should wrap Mix/Phoenix commands.
 
-### Python Host
+### `hosts/python-service`
 
-`hosts/python-service` will eventually expose the same target names through Python tooling.
+Future Nx targets should wrap Python tooling.
 
-The point is not identical internals. The point is one workspace-level interface.
+The goal is one workspace-facing contract for runnable backends.
 
 ---
 
@@ -150,42 +228,42 @@ nx run workspace-dev:dev -- --host elixir
 nx run workspace-dev:dev -- --host python
 ```
 
-`workspace-dev` is the proposed workspace orchestration project name. The exact project name can change during implementation, but the orchestration responsibility should exist as a dedicated Nx project rather than as ad hoc shell glue.
+`workspace-dev` is the proposed workspace orchestration project name. The exact name can change during implementation, but the orchestration role should exist as a dedicated Nx project.
 
-### What The Dev Command Starts
+### What `dev` Starts
 
-For phase 1, the unified dev command starts:
+For this restructuring track, the unified dev command starts:
 
 - the selected host
 - `apps/ui`
-- any env wiring required for `apps/ui` to target the selected host
+- any env wiring needed for `apps/ui` to target that host
 
 It does not auto-launch the TUI. `apps/tui` remains a manual client.
 
 ### UI Wiring Rule
 
-`apps/ui` must stop assuming a fixed backend like `localhost:3000` when launched through the workspace dev flow.
+`apps/ui` must not hardcode a backend assumption like `localhost:3000` in the normal workspace dev flow.
 
-Instead, the dev orchestrator must supply the backend origin explicitly through environment variables such as:
+Instead, the orchestrator supplies:
 
 - `UI_BACKEND_ORIGIN`
-- any future event-stream or websocket origin variables if needed
+- any future host-specific event origin vars if needed
 
-The orchestrator owns the host-specific port map.
+The workspace dev layer owns host selection and host-to-UI wiring.
 
 ---
 
 ## Host Registry
 
-The workspace dev orchestration must read from one central host registry rather than hardcoding conditional logic in multiple files.
+Host selection must come from one central registry rather than from scattered script logic.
 
-That registry should define, at minimum:
+That registry should define:
 
 - host key: `rust`, `elixir`, `python`
-- Nx project name for that host
+- Nx project name
 - backend base URL/port
-- any host-specific env required for development
 - implementation status
+- optional host-specific env
 
 Example shape:
 
@@ -200,51 +278,61 @@ interface HostDefinition {
 }
 ```
 
-This makes host selection a data problem instead of spreading backend assumptions through scripts, UI config, docs, and tests.
+This keeps host orchestration data-driven and prevents backend assumptions from leaking into UI config, docs, tests, and scripts.
 
 ---
 
 ## Migration Plan
 
-### Phase 1: Introduce `hosts/` and Rust Host Parity
+### Phase 1: Correct The Repo Boundaries
 
-- move `packages/animaos-rs` to `hosts/rust-daemon`
-- update Cargo manifest-path references, docs, scripts, and tests
+- move reusable Rust engine crates from the current Rust workspace into `packages/core-rust`
+- move the Rust daemon into `hosts/rust-daemon`
+- create a repo-root Cargo workspace covering both `packages/core-rust` and `hosts/rust-daemon`
+- rename or reframe the current TypeScript core package as `packages/core-ts`
+- update scripts, docs, tests, and path references
+
+Exit criteria:
+
+- reusable Rust code lives only in `packages/core-rust`
+- the runnable Rust backend lives only in `hosts/rust-daemon`
+- `packages/core-ts` exists as the TypeScript core port
+
+### Phase 2: Add First-Class Host Projects
+
 - define `hosts/rust-daemon` as an Nx project
-- add `dev`, `build`, and `test` targets for Rust
-- add the workspace orchestration project
-- add `bun dev --host rust`
-- update `apps/ui` to read backend origin from orchestrated env
+- create placeholder Nx host projects for `hosts/elixir-phoenix` and `hosts/python-service`
+- register all hosts in the host registry
 
 Exit criteria:
 
-- `bun dev --host rust` starts the Rust host and UI together
+- all hosts are discoverable through one host registry
+- Rust host is runnable through Nx
+- Elixir and Python hosts have intentional placeholders rather than missing-path failures
+
+### Phase 3: Add Unified Dev Orchestration
+
+- create the `workspace-dev` orchestration project
+- add `bun dev --host <name>`
+- wire `apps/ui` to the selected host through env
+
+Exit criteria:
+
+- `bun dev --host rust` starts the selected host plus UI
 - `nx run workspace-dev:dev -- --host rust` does the same
-- Rust build/test commands still work directly in the moved host directory
+- host selection is controlled by the workspace dev layer rather than hardcoded backend assumptions
 
-### Phase 2: Add Future Host Stubs
+### Phase 4: Leave `apps/server` Alone For Now
 
-- create `hosts/elixir-phoenix`
-- create `hosts/python-service`
-- register them in the host registry
-- expose Nx `dev` targets even if initially placeholder-only
+The existing TypeScript server is not part of this restructuring decision.
 
-Exit criteria:
+For this pass:
 
-- the workspace accepts `--host elixir` and `--host python`
-- unsupported hosts fail clearly and intentionally rather than through missing-path errors
+- do not remove it
+- do not move it
+- do not use it to define the core-vs-host boundary
 
-### Phase 3: Resolve Existing TypeScript Server Boundary
-
-`apps/server` should be handled as an explicit follow-up decision, not implicitly kept forever.
-
-Possible outcomes:
-
-- remove it once UI parity exists against the selected host API
-- keep it only as a dev sandbox and rename it accordingly
-- replace it with a narrower proxy/BFF only if a real browser-facing need appears
-
-This prevents the repository from continuing to carry two overlapping backend stories by accident.
+It can be evaluated later once the repo layout is corrected.
 
 ---
 
@@ -252,43 +340,47 @@ This prevents the repository from continuing to carry two overlapping backend st
 
 Main risks:
 
-- large path churn from moving `packages/animaos-rs`
-- broken Cargo manifest references
-- broken test fixtures and docs that mention old paths
-- UI/backend assumptions remaining split across config and tests
-- false Nx consistency if host projects are added without a real contract
+- path churn from splitting the current Rust workspace into `packages/core-rust` and `hosts/rust-daemon`
+- broken Cargo path references during the workspace transition
+- broken docs and tests that still point at `packages/animaos-rs`
+- accidental mixing of `core-ts` with host responsibilities
+- workspace dev flow staying coupled to old server assumptions
 
 Mitigations:
 
-- do the path move and dev orchestration in one coordinated change
-- centralize host metadata in one registry
-- sweep hardcoded path and port references immediately after the move
-- keep the target contract intentionally small: `dev`, `build`, `test`, `lint`
+- move paths and workspace wiring in one coordinated change
+- adopt one Cargo workspace at the repo root
+- add one host registry instead of hardcoded conditionals
+- keep `apps/server` out of scope for this pass to avoid mixing structural cleanup with backend removal
 
 ---
 
 ## Success Criteria
 
-This design is successful when:
+This restructuring is successful when:
 
-- `hosts/` is the clear home for backend implementations
-- `apps/` remains the clear home for UI/TUI surfaces
-- `packages/` remains the clear home for reusable libraries
+- `packages/core-rust` is the clear home for reusable Rust engine code
+- `packages/core-ts` is the clear home for the TypeScript core port
+- `hosts/*` is the clear home for runnable backend implementations
 - `hosts/rust-daemon` is a first-class Nx project
-- the workspace has one stable development entrypoint: `bun dev --host <name>`
-- the workspace has one Nx-native orchestration entrypoint for the same flow
-- `apps/ui` can target whichever host is selected without hardcoded local backend assumptions
-- adding an Elixir host no longer requires repo-level reorganization
+- the workspace has one stable dev entrypoint: `bun dev --host <name>`
+- the workspace has one Nx-native orchestration target for the same flow
+- the old TypeScript server is no longer distorting the core-vs-host boundary
+- adding Elixir or Python hosts later does not require another repo-level reorganization
 
 ---
 
 ## Explicit Non-Goals
 
-This design does not require:
+This restructuring does not require:
 
-- changing the ADR boundary of `anima-core`
-- automatically launching the TUI during `dev`
-- introducing a gateway or proxy above the selected host
-- making Elixir or Python fully implemented in the same change as the repo restructure
+- removing `apps/server`
+- deciding the final fate of the old TypeScript backend
+- changing the ADR boundary of the core
+- auto-launching the TUI during `dev`
+- adding a gateway above the selected host
 
-It only requires that the repository stop hiding backend implementations in misleading locations and expose one clean development flow for the chosen host.
+It only requires that the repository reflect the architectural truth:
+
+- core ports are reusable packages
+- hosts are runnable backends
