@@ -1,4 +1,4 @@
-import { AgentRuntime, EventBus, OpenAIAdapter, agent, action } from "../packages/core-ts/src/index.js"
+import { AgentRuntime, EventBus, OpenAIAdapter, agent, action } from "@animaOS-SWARM/core"
 
 // Define a simple tool
 const getCurrentTime = action({
