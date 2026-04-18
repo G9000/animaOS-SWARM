@@ -22,7 +22,7 @@
       "path": "../../packages/memory/tsconfig.lib.json"
     },
     {
-      "path": "../../packages/core/tsconfig.lib.json"
+      "path": "../../packages/core-ts/tsconfig.lib.json"
     }
   ]
 }

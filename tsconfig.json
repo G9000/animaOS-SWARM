@@ -4,7 +4,7 @@
   "files": [],
   "references": [
     {
-      "path": "./packages/core"
+      "path": "./packages/core-ts"
     },
     {
       "path": "./packages/swarm"

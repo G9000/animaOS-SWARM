@@ -2,7 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig(() => ({
   root: __dirname,
-  cacheDir: '../../node_modules/.vite/packages/core',
+  cacheDir: '../../node_modules/.vite/packages/core-ts',
   test: {
     name: '@animaOS-SWARM/core',
     watch: false,
