@@ -4,7 +4,7 @@ TypeScript memory primitives for animaOS-SWARM.
 
 This package provides BM25 search, task history, document ingestion, memory management helpers, and the TypeScript memory plugin/provider surface used by local workflows and compatibility layers.
 
-The canonical production memory services live in `hosts/rust-daemon`, but this package remains useful for shared utilities, tests, and local tooling.
+The reusable Rust memory implementation now lives in `packages/core-rust/crates/anima-memory`, while the current runnable daemon host lives in `hosts/rust-daemon/crates/anima-daemon`. This package remains useful for shared utilities, tests, and local tooling.
 
 Current memory coverage includes:
 

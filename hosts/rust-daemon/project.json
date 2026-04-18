@@ -9,28 +9,52 @@
       "options": {
         "cwd": ".",
         "command": "cargo run --manifest-path Cargo.toml --target-dir target/dev -p anima-daemon"
-      }
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     },
     "build": {
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
         "command": "cargo build --manifest-path Cargo.toml --target-dir target/build -p anima-daemon"
-      }
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
         "command": "cargo test --manifest-path Cargo.toml --target-dir target/test -p anima-daemon"
-      }
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     },
     "lint": {
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
         "command": "cargo fmt --manifest-path Cargo.toml --all --check"
-      }
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     }
   }
 }

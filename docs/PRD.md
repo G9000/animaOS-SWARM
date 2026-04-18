@@ -68,7 +68,7 @@ animaos-swarm/
 
 | Component | Status | Details |
 |---|---|---|
-| Rust runtime core | ✅ Done | `hosts/rust-daemon` is the canonical execution path for runtime, swarm, memory, and daemon concerns |
+| Rust runtime core | ✅ Done | Reusable Rust runtime crates now live in `packages/core-rust`, while the current runnable daemon host remains under `hosts/rust-daemon/crates/anima-daemon` |
 | Provider support | ✅ Done | OpenAI, Anthropic, Google/Gemini, Ollama, and several OpenAI-compatible providers run through the daemon |
 | Swarm coordination | ✅ Done | Supervisor, dynamic, and round-robin strategies are implemented |
 | CLI surface | ✅ Done | `create`, `run`, `chat`, `launch`, and `agents` are available through the local `animaos` binary |

@@ -187,7 +187,7 @@ Remaining gap:
 
 Strengths:
 
-- Clear role as the canonical runtime workspace.
+- Clear role as the reusable Rust runtime core package.
 - Existing crate and integration tests already cover runtime, memory, swarm, and daemon behavior directly.
 - README now documents workspace layout plus build, test, and quick daemon run commands.
 
@@ -199,4 +199,4 @@ Remaining gap:
 
 1. Keep the scorecard updated whenever a package or active app surface gains or loses a boundary, example, dedicated seam test, or build/static-validation target.
 2. Expand README examples if a surface adds new major exported or operator-facing capabilities.
-3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, and canonical execution/runtime depth belongs in `hosts/rust-daemon`.
+3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, reusable Rust runtime depth belongs in `packages/core-rust`, and runnable host concerns belong in `hosts/rust-daemon/crates/anima-daemon`.

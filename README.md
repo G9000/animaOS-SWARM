@@ -26,9 +26,9 @@ The terminal UI is the primary local operator surface. The web UI is secondary a
 
 ## Runtime Architecture
 
-The canonical runtime lives in Rust under `hosts/rust-daemon`.
+The reusable Rust runtime core lives under `packages/core-rust`, and the current runnable Rust daemon lives under `hosts/rust-daemon/crates/anima-daemon`.
 
-- `anima-core`, `anima-swarm`, `anima-memory`, and `anima-daemon` own execution, coordination, memory, and the HTTP/SSE boundary.
+- `anima-core`, `anima-swarm`, and `anima-memory` live under `packages/core-rust`; `anima-daemon` is the current Axum host that exposes the HTTP/SSE boundary.
 - `packages/sdk` is the public TypeScript client for that runtime.
 - `packages/core-ts` is shared TypeScript support used by the SDK, CLI, and UI. It is not the source of truth for execution behavior.
 

@@ -2,7 +2,7 @@
 
 Shared TypeScript contracts, plugin types, and compatibility utilities for the CLI, SDK, TUI, and UI.
 
-This package is not the canonical execution runtime. Runtime execution, swarm coordination, memory services, and daemon-backed streaming live in `hosts/rust-daemon`.
+This package is not the source of truth for runtime execution. The reusable Rust runtime core lives in `packages/core-rust`, and the current runnable Rust daemon lives in `hosts/rust-daemon/crates/anima-daemon`.
 
 Current core coverage includes:
 
