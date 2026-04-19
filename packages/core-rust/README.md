@@ -1,8 +1,8 @@
 # animaOS Rust Core
 
-Reusable Rust runtime crates for animaOS. This package owns the core execution, memory, and swarm libraries.
+Reusable Rust runtime crates for animaOS. This package owns the reusable execution, memory, and swarm libraries that runnable hosts build on top of.
 
-It does not own the runnable HTTP daemon. The current Rust host remains at [`hosts/rust-daemon/crates/anima-daemon`](../../hosts/rust-daemon/crates/anima-daemon).
+It does not own the runnable HTTP daemon. The current Rust host remains at [`hosts/rust-daemon`](../../hosts/rust-daemon).
 
 ## Crates
 

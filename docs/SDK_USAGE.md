@@ -84,9 +84,9 @@ That's it! The `create` command sets up everything you need.
 Runtime ownership in the current repo:
 
 - The reusable Rust runtime core lives in `packages/core-rust`.
-- The runnable Rust daemon currently lives in `hosts/rust-daemon/crates/anima-daemon`.
+- The runnable Rust daemon host lives in `hosts/rust-daemon`.
 - `@animaOS-SWARM/sdk` is a TypeScript client over the daemon's HTTP and SSE APIs.
-- `@animaOS-SWARM/core` provides shared TypeScript contracts and utilities, but it is not the source of truth for runtime behavior.
+- `@animaOS-SWARM/core` is the TypeScript core port in `packages/core-ts`; it provides shared contracts and utilities, but it is not the source of truth for runtime behavior.
 
 ---
 
@@ -607,5 +607,6 @@ console.log(agents.map(a => a.state.id));
 - [Project README](../README.md) - Overview and quick start
 - [Design Docs](./design/) - Architecture and design decisions
 - [Rust Core](../packages/core-rust/) - Reusable Rust runtime crates
-- [Core Package](../packages/core-ts/) - Shared TypeScript contracts and utilities
+- [Rust Daemon Host](../hosts/rust-daemon/) - Runnable Rust host, API surface, and operational commands
+- [Core Package](../packages/core-ts/) - TypeScript core port with shared contracts and utilities
 - [SDK Source](../packages/sdk/src/) - TypeScript daemon client implementation

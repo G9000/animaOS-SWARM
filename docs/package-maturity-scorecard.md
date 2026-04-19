@@ -52,7 +52,8 @@ For thin apps or harnesses, the direct seam can be a smoke test around the prima
 | `server`     | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 8 tests / 2 files       | Parity bar met |
 | `ui`         | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 7 tests / 3 files       | Parity bar met |
 | `ui-e2e`     | Yes          | Yes            | Role-specific     | Yes                          | N/A         | Pass                    | 24 tests / 2 specs      | Parity bar met |
-| `core-rust + rust-daemon` | Yes | Yes | Yes | Yes | Pass | Pass | 166 tests / workspace | Parity bar met |
+| `core-rust`  | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | Rust crate tests        | Parity bar met |
+| `rust-daemon` | Yes         | Yes            | Yes               | Yes                          | Pass        | Pass                    | Host package + integration tests | Parity bar met |
 
 ## Notes By Package
 
@@ -184,20 +185,32 @@ Remaining gap:
 
 - This surface is intentionally thin. Its job is boundary validation, not internal seam depth.
 
-### `core-rust + rust-daemon`
+### `core-rust`
 
 Strengths:
 
-- Clear split between reusable Rust runtime crates in `packages/core-rust` and the current daemon host in `hosts/rust-daemon`.
-- Existing crate and integration tests already cover runtime, memory, swarm, and daemon behavior directly.
-- README now documents workspace layout plus build, test, and quick daemon run commands.
+- Clear role as the reusable Rust runtime core in `packages/core-rust`.
+- Existing crate tests already cover runtime, memory, and swarm behavior directly.
+- README now documents the reusable crate layout plus focused build and test commands.
 
 Remaining gap:
 
 - The remaining work here is roadmap depth and crate-level docs, not basic maturity posture.
 
+### `rust-daemon`
+
+Strengths:
+
+- Clear role as the runnable Rust host in `hosts/rust-daemon`.
+- Host package and integration tests already cover the HTTP/SSE boundary, provider wiring, persistence integration, and daemon behavior directly.
+- README now documents daemon-specific API, environment, startup, and operational commands without conflating host ownership with reusable runtime ownership.
+
+Remaining gap:
+
+- The remaining work here is roadmap depth and host-level docs, not basic maturity posture.
+
 ## Recommended Next Parity Work
 
 1. Keep the scorecard updated whenever a package or active app surface gains or loses a boundary, example, dedicated seam test, or build/static-validation target.
 2. Expand README examples if a surface adds new major exported or operator-facing capabilities.
-3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, reusable Rust runtime depth belongs in `packages/core-rust`, and runnable host concerns belong in `hosts/rust-daemon/crates/anima-daemon`.
+3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, reusable Rust runtime depth belongs in `packages/core-rust`, and runnable host concerns belong in `hosts/rust-daemon`.

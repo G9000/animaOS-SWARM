@@ -1,9 +1,9 @@
 # anima-daemon
 
-`anima-daemon` is the Axum HTTP server that hosts `anima-core`. It wires the
-pure-Rust agent engine to real infrastructure: an Anthropic (or other provider)
-model API, an optional Postgres database for step persistence, and an SSE event
-bus for streaming agent and swarm events to connected clients.
+`anima-daemon` is the runnable Rust host in `hosts/rust-daemon`. It is the
+current Axum HTTP/SSE boundary for animaOS, wiring the reusable crates in
+`packages/core-rust` to real infrastructure such as model providers, optional
+Postgres persistence, and streaming clients.
 
 ---
 
@@ -101,7 +101,7 @@ curl http://127.0.0.1:8080/health
 
 ## Architecture note
 
-This crate implements `ModelAdapter` (via `RuntimeModelAdapter`) and
-`DatabaseAdapter` (via `SqlxPostgresAdapter`) from `anima-core`, wiring the
-pure, infrastructure-free core to real provider APIs and Postgres at the
-process boundary.
+This host implements `ModelAdapter` (via `RuntimeModelAdapter`) and
+`DatabaseAdapter` (via `SqlxPostgresAdapter`) from the reusable Rust core,
+wiring those infrastructure-free crates to real provider APIs and Postgres at
+the process boundary.
