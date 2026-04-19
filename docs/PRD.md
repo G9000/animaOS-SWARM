@@ -150,26 +150,35 @@ animaos-swarm/
 import { createDaemonClient, agent, swarm } from '@animaOS-SWARM/sdk';
 
 const client = createDaemonClient();
+const modelSettings = {
+  apiKey: process.env.OPENAI_API_KEY,
+};
 
 const contentTeam = await client.swarms.create(
   swarm({
-    name: 'content-team',
     strategy: 'round-robin',
-    maxIterations: 6,
-    agents: [
+    maxTurns: 6,
+    manager: agent({
+      name: 'manager',
+      provider: 'openai',
+      model: 'gpt-4o',
+      system: 'Plan the work, delegate to workers, and synthesize the final answer.',
+      settings: modelSettings,
+    }),
+    workers: [
       agent({
         name: 'researcher',
         provider: 'openai',
         model: 'gpt-4o-mini',
-        apiKey: process.env.OPENAI_API_KEY,
-        systemPrompt: 'Gather the key facts and frame the problem clearly.',
+        system: 'Gather the key facts and frame the problem clearly.',
+        settings: modelSettings,
       }),
       agent({
         name: 'writer',
         provider: 'openai',
         model: 'gpt-4o',
-        apiKey: process.env.OPENAI_API_KEY,
-        systemPrompt: 'Turn the research into concise, structured output.',
+        system: 'Turn the research into concise, structured output.',
+        settings: modelSettings,
       }),
     ],
   })
@@ -179,7 +188,14 @@ const result = await client.swarms.run(contentTeam.id, {
   text: 'Write a short brief on AI agents for engineering leaders.',
 });
 
-console.log(result.result.content.text);
+if (
+  result.result.status === 'success' &&
+  typeof result.result.data === 'object' &&
+  result.result.data !== null &&
+  'text' in result.result.data
+) {
+  console.log(result.result.data.text);
+}
 ```
 
 Streaming consumers can subscribe with `client.swarms.subscribe(swarmId)` and render daemon events as they arrive.

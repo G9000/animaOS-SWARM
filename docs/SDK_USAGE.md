@@ -1,6 +1,6 @@
 # animaOS SDK Usage Guide
 
-This guide covers how to interact with the animaOS SDK and daemon for building agent swarms.
+This guide covers the current public TypeScript SDK surface for talking to the Rust daemon host and building agent or swarm workflows against it.
 
 ## Table of Contents
 
@@ -35,7 +35,7 @@ cargo run --manifest-path Cargo.toml -p anima-daemon
 
 The daemon listens on `http://127.0.0.1:8080` by default.
 
-### 3. Set API Keys
+### 3. Set Provider Credentials
 
 ```bash
 export OPENAI_API_KEY="sk-..."
@@ -63,22 +63,26 @@ cd my-agency
 bun run animaos launch "Write a blog post about AI" --no-tui
 ```
 
-That's it! The `create` command sets up everything you need.
+That's it. The `create` command sets up the local files, and the daemon-backed commands talk to the runnable host in `hosts/rust-daemon`.
 
 ---
 
 ## Architecture Overview
 
-```
-┌─────────────────┐     HTTP      ┌─────────────┐
-│   Your Code     │ ◄───────────► │ Rust Runtime│
-│   (SDK/CLI)     │   (Port 8080) │ + Daemon    │
-└─────────────────┘               └──────┬──────┘
-                                         │
-                                    ┌────┴────┐
-                                    │  LLM    │
-                                    │ Providers
-                                    └─────────┘
+```text
+┌─────────────────┐     HTTP/SSE     ┌────────────────────┐
+│    Your Code    │ ───────────────► │   rust-daemon host │
+│   (SDK / CLI)   │                  │    on port 8080    │
+└─────────────────┘                  └─────────┬──────────┘
+                                               │
+                                      ┌────────┴─────────┐
+                                      │ packages/core-rust│
+                                      │ reusable runtime  │
+                                      └────────┬─────────┘
+                                               │
+                                      ┌────────┴─────────┐
+                                      │  LLM providers   │
+                                      └──────────────────┘
 ```
 
 Runtime ownership in the current repo:
@@ -86,7 +90,7 @@ Runtime ownership in the current repo:
 - The reusable Rust runtime core lives in `packages/core-rust`.
 - The runnable Rust daemon host lives in `hosts/rust-daemon`.
 - `@animaOS-SWARM/sdk` is a TypeScript client over the daemon's HTTP and SSE APIs.
-- `@animaOS-SWARM/core` is the TypeScript core port in `packages/core-ts`; it provides shared contracts and utilities, but it is not the source of truth for runtime behavior.
+- `@animaOS-SWARM/core` is the TypeScript core port in `packages/core-ts`; it provides shared contracts and typed helpers such as `agent()`, `action()`, and `plugin()`.
 
 ---
 
@@ -96,10 +100,10 @@ Runtime ownership in the current repo:
 
 | Command | Needs Daemon | Description |
 |---------|-------------|-------------|
-| `create` | ❌ | Create a new agency (local files only) |
-| `launch` | ✅ | Launch a task in an agency directory |
-| `run` | ✅ | Run a one-off agent task |
-| `chat` | ✅ | Start interactive chat session |
+| `create` | No | Create a new agency (local files only) |
+| `launch` | Yes | Launch a task in an agency directory |
+| `run` | Yes | Run a one-off agent or swarm task |
+| `chat` | Yes | Start an interactive chat session |
 
 ### Creating an Agency
 
@@ -109,23 +113,17 @@ bun run animaos create my-agency \
   --provider openai \
   --model gpt-4o-mini \
   --api-key "$OPENAI_API_KEY"
-
-# Or use environment variable (no --api-key needed)
-export OPENAI_API_KEY="sk-..."
-bun run animaos create my-agency --provider openai --model gpt-4o-mini
 ```
-
-This creates a `my-agency/` directory with configuration files.
 
 ### Launching Tasks
 
 ```bash
 cd my-agency
 
-# Launch with TUI (interactive)
+# Launch with TUI
 bun run animaos launch "Write a blog post about AI"
 
-# Launch without TUI (headless)
+# Launch without TUI
 bun run animaos launch "Write a blog post about AI" --no-tui
 ```
 
@@ -133,8 +131,6 @@ bun run animaos launch "Write a blog post about AI" --no-tui
 
 ```bash
 cd my-agency
-
-# Quick task without saving state
 bun run animaos run "Summarize this document" --no-tui
 ```
 
@@ -142,8 +138,6 @@ bun run animaos run "Summarize this document" --no-tui
 
 ```bash
 cd my-agency
-
-# Start chat session
 bun run animaos chat
 ```
 
@@ -154,54 +148,69 @@ bun run animaos chat
 ### Import the SDK
 
 ```typescript
-import { 
-  createDaemonClient,
-  agent,
-  swarm,
+import {
   action,
+  agent,
+  createDaemonClient,
+  DaemonHttpError,
   plugin,
-  DaemonHttpError 
+  swarm,
 } from '@animaOS-SWARM/sdk';
 ```
 
 ### Create a Client
 
 ```typescript
-// Default client (connects to localhost:8080)
 const client = createDaemonClient();
 
-// Custom configuration
-const client = createDaemonClient({
+const customClient = createDaemonClient({
   baseUrl: 'http://127.0.0.1:8080',
-  // Optional: custom fetch implementation
-  fetch: customFetch
+  fetch: customFetch,
 });
 ```
 
 ### Working with Agents
 
+`agent()` is a typed helper over the live `AgentConfig` surface. The current public agent shape uses `system`, `tools`, and `settings`.
+
 #### Create an Agent
 
 ```typescript
-import { agent } from '@animaOS-SWARM/sdk';
+import { action, agent } from '@animaOS-SWARM/sdk';
 
-// Define agent configuration
+const memorySearch = action({
+  name: 'memory_search',
+  description: 'Search stored memories by keyword',
+  parameters: {
+    query: { type: 'string', description: 'Search query' },
+    limit: { type: 'number', description: 'Maximum matches to return' },
+  },
+  handler: async (_runtime, _message, args) => {
+    const query = typeof args.query === 'string' ? args.query : '';
+    return {
+      status: 'success',
+      data: { text: `Search requested for: ${query}` },
+      durationMs: 0,
+    };
+  },
+});
+
 const myAgent = agent({
   name: 'researcher',
   provider: 'openai',
   model: 'gpt-4o-mini',
-  apiKey: process.env.OPENAI_API_KEY,
-  systemPrompt: 'You are a research assistant specializing in technology.',
+  system: 'You are a research assistant specializing in technology.',
+  tools: [memorySearch],
   settings: {
     temperature: 0.7,
-    maxTokens: 2000
+    maxTokens: 2000,
+    apiKey: process.env.OPENAI_API_KEY,
   },
-  actions: []
 });
 
-// Create on daemon
 const created = await client.agents.create(myAgent);
 console.log('Agent ID:', created.state.id);
+console.log('Status:', created.state.status);
 ```
 
 #### List All Agents
@@ -216,97 +225,124 @@ for (const agent of agents) {
 #### Get Agent Details
 
 ```typescript
-const agent = await client.agents.get('agent-uuid-here');
-console.log('Status:', agent.state.status);
-console.log('Messages:', agent.messageCount);
-console.log('Events:', agent.eventCount);
+const snapshot = await client.agents.get('agent-uuid-here');
+console.log('Status:', snapshot.state.status);
+console.log('Messages:', snapshot.messageCount);
+console.log('Events:', snapshot.eventCount);
+console.log('Last task:', snapshot.lastTask?.status);
 ```
 
 #### Run an Agent
 
 ```typescript
-const result = await client.agents.run('agent-uuid-here', {
-  text: 'Research the latest advances in quantum computing'
+const run = await client.agents.run('agent-uuid-here', {
+  text: 'Research the latest advances in quantum computing',
 });
 
-console.log('Result:', result.result.content.text);
-console.log('Usage:', result.result.usage);
+if (
+  run.result.status === 'success' &&
+  typeof run.result.data === 'object' &&
+  run.result.data !== null &&
+  'text' in run.result.data
+) {
+  console.log('Result:', run.result.data.text);
+} else {
+  console.error('Run failed:', run.result.error);
+}
+
+console.log('Duration:', run.result.durationMs);
+console.log('Tokens:', run.agent.state.tokenUsage.totalTokens);
 ```
 
 #### Get Agent Memories
 
 ```typescript
-// Get recent memories
 const memories = await client.agents.recentMemories('agent-uuid-here', {
-  limit: 10
+  limit: 10,
 });
 
 for (const memory of memories) {
-  console.log(`[${memory.importance}] ${memory.type}: ${memory.content.slice(0, 100)}...`);
+  console.log(`[${memory.importance}] ${memory.type}: ${memory.content}`);
 }
 ```
 
 ### Working with Swarms
 
+`swarm()` is a typed helper over the live `SwarmConfig` surface. The current public swarm shape uses `manager`, `workers`, and optional limits such as `maxTurns`.
+
 #### Create a Swarm
 
 ```typescript
-import { swarm, agent } from '@animaOS-SWARM/sdk';
+import { agent, swarm } from '@animaOS-SWARM/sdk';
 
-// Define multiple agents
-const researcher = agent({
-  name: 'researcher',
-  provider: 'openai',
-  model: 'gpt-4o-mini',
+const modelSettings = {
   apiKey: process.env.OPENAI_API_KEY,
-  systemPrompt: 'You are a research specialist.'
-});
+};
 
-const writer = agent({
-  name: 'writer',
-  provider: 'openai',
-  model: 'gpt-4o',
-  apiKey: process.env.OPENAI_API_KEY,
-  systemPrompt: 'You are a content writer.'
-});
-
-// Create swarm
 const contentTeam = swarm({
-  name: 'content-team',
-  agents: [researcher, writer],
   strategy: 'round-robin',
-  maxIterations: 10
+  maxTurns: 10,
+  manager: agent({
+    name: 'manager',
+    provider: 'openai',
+    model: 'gpt-4o',
+    system: 'Break complex tasks into subtasks and synthesize the final answer.',
+    settings: modelSettings,
+  }),
+  workers: [
+    agent({
+      name: 'researcher',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      system: 'Research the assigned topic and return concise findings.',
+      settings: modelSettings,
+    }),
+    agent({
+      name: 'writer',
+      provider: 'openai',
+      model: 'gpt-4o',
+      system: 'Turn approved findings into polished written output.',
+      settings: modelSettings,
+    }),
+  ],
 });
 
 const created = await client.swarms.create(contentTeam);
 console.log('Swarm ID:', created.id);
+console.log('Status:', created.status);
 ```
 
 #### Run a Swarm
 
 ```typescript
-const result = await client.swarms.run('swarm-uuid-here', {
-  text: 'Write a comprehensive article about renewable energy'
+const run = await client.swarms.run('swarm-uuid-here', {
+  text: 'Write a comprehensive article about renewable energy',
 });
 
-console.log('Result:', result.result.content.text);
-console.log('Iterations:', result.swarm.iteration);
+if (
+  run.result.status === 'success' &&
+  typeof run.result.data === 'object' &&
+  run.result.data !== null &&
+  'text' in run.result.data
+) {
+  console.log('Result:', run.result.data.text);
+} else {
+  console.error('Run failed:', run.result.error);
+}
+
+console.log('Status:', run.swarm.status);
+console.log('Agents involved:', run.swarm.agentIds);
+console.log('Total tokens:', run.swarm.tokenUsage.totalTokens);
 ```
 
 #### Subscribe to Swarm Events (Streaming)
 
 ```typescript
-// Subscribe to real-time events
-const eventStream = client.swarms.subscribe('swarm-uuid-here');
+const stream = client.swarms.subscribe('swarm-uuid-here');
 
-for await (const event of eventStream) {
+for await (const event of stream) {
   console.log('Event:', event.event);
   console.log('Data:', event.data);
-  
-  // Event data includes:
-  // - swarmId: string
-  // - state: SwarmState
-  // - result: TaskResult | null
 }
 ```
 
@@ -314,9 +350,36 @@ for await (const event of eventStream) {
 
 ```typescript
 const swarmState = await client.swarms.get('swarm-uuid-here');
-console.log('Active:', swarmState.active);
-console.log('Iteration:', swarmState.iteration);
-console.log('Agents:', swarmState.agents);
+console.log('Status:', swarmState.status);
+console.log('Agents:', swarmState.agentIds);
+console.log('Total tokens:', swarmState.tokenUsage.totalTokens);
+console.log('Started at:', swarmState.startedAt);
+console.log('Completed at:', swarmState.completedAt);
+```
+
+### Working with Memories
+
+```typescript
+await client.memories.create({
+  agentId: 'agent-uuid-here',
+  agentName: 'researcher',
+  type: 'fact',
+  content: 'Rust daemon memory endpoint created',
+  importance: 0.8,
+  tags: ['sdk', 'memory'],
+});
+
+const searchResults = await client.memories.search('daemon memory', {
+  agentName: 'researcher',
+  type: 'fact',
+  limit: 5,
+  minImportance: 0.5,
+});
+
+const recent = await client.memories.recent({
+  agentId: 'agent-uuid-here',
+  limit: 3,
+});
 ```
 
 ### Defining Actions
@@ -328,25 +391,16 @@ const searchAction = action({
   name: 'web_search',
   description: 'Search the web for information',
   parameters: {
-    type: 'object',
-    properties: {
-      query: { type: 'string', description: 'Search query' }
-    },
-    required: ['query']
+    query: { type: 'string', description: 'Search query' },
   },
-  handler: async ({ query }) => {
-    // Implementation here
-    return { results: [...] };
-  }
-});
-
-// Add to agent
-const myAgent = agent({
-  name: 'researcher',
-  provider: 'openai',
-  model: 'gpt-4o-mini',
-  apiKey: process.env.OPENAI_API_KEY,
-  actions: [searchAction]
+  handler: async (_runtime, _message, args) => {
+    const query = typeof args.query === 'string' ? args.query : '';
+    return {
+      status: 'success',
+      data: { text: `Results for ${query}` },
+      durationMs: 0,
+    };
+  },
 });
 ```
 
@@ -355,20 +409,15 @@ const myAgent = agent({
 ```typescript
 import { plugin } from '@animaOS-SWARM/sdk';
 
-const memoryPlugin = plugin({
-  name: 'memory',
-  version: '1.0.0',
-  install: (context) => {
-    // Plugin setup
-    return {
-      onAgentStart: async (agent) => {
-        console.log(`Agent ${agent.name} started`);
-      },
-      onAgentComplete: async (agent, result) => {
-        console.log(`Agent ${agent.name} completed`);
-      }
-    };
-  }
+const notesPlugin = plugin({
+  name: 'notes',
+  description: 'Registers startup and cleanup hooks for note-oriented agents',
+  init: async (runtime) => {
+    console.log(`Plugin initialized for ${runtime.agentId}`);
+  },
+  cleanup: async (runtime) => {
+    console.log(`Plugin cleaned up for ${runtime.agentId}`);
+  },
 });
 ```
 
@@ -378,7 +427,7 @@ const memoryPlugin = plugin({
 import { DaemonHttpError } from '@animaOS-SWARM/sdk';
 
 try {
-  const result = await client.agents.run('invalid-uuid', { text: 'Hello' });
+  await client.agents.run('invalid-uuid', { text: 'Hello' });
 } catch (error) {
   if (error instanceof DaemonHttpError) {
     console.error('HTTP Status:', error.status);
@@ -413,35 +462,38 @@ try {
 
 ### Configuration Priority
 
-1. **Inline API key** (highest priority): Passed directly in config
-2. **Environment variable**: Standard env vars per provider
-3. **Base URL override**: `*_BASE_URL` env vars for custom endpoints
+1. Per-agent or per-swarm `settings` for model-specific overrides such as `apiKey`, `baseUrl`, `temperature`, or `maxTokens`
+2. Daemon environment variables such as `OPENAI_API_KEY` or `OPENAI_BASE_URL`
+3. SDK transport settings such as `createDaemonClient({ baseUrl })`, which control where HTTP and SSE requests are sent
 
 ### Example Configurations
 
 ```typescript
-// OpenAI
 const openaiAgent = agent({
   name: 'gpt4',
   provider: 'openai',
   model: 'gpt-4o',
-  apiKey: process.env.OPENAI_API_KEY
+  settings: {
+    apiKey: process.env.OPENAI_API_KEY,
+  },
 });
 
-// Ollama (local)
 const ollamaAgent = agent({
   name: 'local',
   provider: 'ollama',
   model: 'llama3.2',
-  baseUrl: 'http://localhost:11434'
+  settings: {
+    baseUrl: 'http://localhost:11434',
+  },
 });
 
-// OpenRouter
 const openrouterAgent = agent({
   name: 'multi',
   provider: 'openrouter',
   model: 'anthropic/claude-3-opus',
-  apiKey: process.env.OPENROUTER_API_KEY
+  settings: {
+    apiKey: process.env.OPENROUTER_API_KEY,
+  },
 });
 ```
 
@@ -452,27 +504,39 @@ const openrouterAgent = agent({
 ### Example 1: Simple Research Agent
 
 ```typescript
-import { createDaemonClient, agent } from '@animaOS-SWARM/sdk';
+import { agent, createDaemonClient } from '@animaOS-SWARM/sdk';
 
 const client = createDaemonClient();
 
 async function main() {
-  // Create agent
-  const researcher = await client.agents.create(agent({
-    name: 'researcher',
-    provider: 'openai',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
-    systemPrompt: 'You are a research assistant. Provide concise, factual answers.'
-  }));
+  const researcher = await client.agents.create(
+    agent({
+      name: 'researcher',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      system: 'You are a research assistant. Provide concise, factual answers.',
+      settings: {
+        apiKey: process.env.OPENAI_API_KEY,
+      },
+    })
+  );
 
-  // Run task
-  const result = await client.agents.run(researcher.state.id, {
-    text: 'What are the main types of neural networks?'
+  const run = await client.agents.run(researcher.state.id, {
+    text: 'What are the main types of neural networks?',
   });
 
-  console.log('Answer:', result.result.content.text);
-  console.log('Tokens used:', result.result.usage?.total);
+  if (
+    run.result.status === 'success' &&
+    typeof run.result.data === 'object' &&
+    run.result.data !== null &&
+    'text' in run.result.data
+  ) {
+    console.log('Answer:', run.result.data.text);
+  } else {
+    console.error('Run failed:', run.result.error);
+  }
+
+  console.log('Tokens used:', run.agent.state.tokenUsage.totalTokens);
 }
 
 main().catch(console.error);
@@ -481,57 +545,78 @@ main().catch(console.error);
 ### Example 2: Multi-Agent Content Team
 
 ```typescript
-import { createDaemonClient, agent, swarm } from '@animaOS-SWARM/sdk';
+import { agent, createDaemonClient, swarm } from '@animaOS-SWARM/sdk';
 
 const client = createDaemonClient();
 
 async function createContentTeam() {
-  // Create swarm with multiple agents
-  const contentSwarm = await client.swarms.create(swarm({
-    name: 'blog-team',
-    strategy: 'round-robin',
-    agents: [
-      agent({
-        name: 'researcher',
-        provider: 'openai',
-        model: 'gpt-4o-mini',
-        apiKey: process.env.OPENAI_API_KEY,
-        systemPrompt: 'Research topics and provide key points. Be thorough.'
-      }),
-      agent({
-        name: 'writer',
+  const modelSettings = {
+    apiKey: process.env.OPENAI_API_KEY,
+  };
+
+  const contentSwarm = await client.swarms.create(
+    swarm({
+      strategy: 'round-robin',
+      maxTurns: 6,
+      manager: agent({
+        name: 'manager',
         provider: 'openai',
         model: 'gpt-4o',
-        apiKey: process.env.OPENAI_API_KEY,
-        systemPrompt: 'Write engaging content based on research. Use markdown.'
+        system: 'Delegate work to specialists and synthesize the final answer.',
+        settings: modelSettings,
       }),
-      agent({
-        name: 'editor',
-        provider: 'openai',
-        model: 'gpt-4o-mini',
-        apiKey: process.env.OPENAI_API_KEY,
-        systemPrompt: 'Review and polish content. Fix grammar and improve flow.'
-      })
-    ]
-  }));
+      workers: [
+        agent({
+          name: 'researcher',
+          provider: 'openai',
+          model: 'gpt-4o-mini',
+          system: 'Research topics and provide key points. Be thorough.',
+          settings: modelSettings,
+        }),
+        agent({
+          name: 'writer',
+          provider: 'openai',
+          model: 'gpt-4o',
+          system: 'Write engaging content based on research. Use markdown.',
+          settings: modelSettings,
+        }),
+      ],
+    })
+  );
 
-  // Run with streaming
   const stream = client.swarms.subscribe(contentSwarm.id);
-  
-  // Run task
   const runPromise = client.swarms.run(contentSwarm.id, {
-    text: 'Create a blog post about the future of AI agents'
+    text: 'Create a blog post about the future of AI agents',
   });
 
-  // Process events
   for await (const event of stream) {
-    if (event.data.result) {
-      console.log(`[${event.data.swarmId}] Progress:`, event.data.state.iteration);
+    if (event.event === 'swarm:completed') {
+      break;
+    }
+
+    if (
+      typeof event.data === 'object' &&
+      event.data !== null &&
+      'state' in event.data &&
+      typeof event.data.state === 'object' &&
+      event.data.state !== null &&
+      'status' in event.data.state
+    ) {
+      console.log('Swarm status:', event.data.state.status);
     }
   }
 
-  const result = await runPromise;
-  console.log('Final content:', result.result.content.text);
+  const run = await runPromise;
+  if (
+    run.result.status === 'success' &&
+    typeof run.result.data === 'object' &&
+    run.result.data !== null &&
+    'text' in run.result.data
+  ) {
+    console.log('Final content:', run.result.data.text);
+  } else {
+    console.error('Run failed:', run.result.error);
+  }
 }
 
 createContentTeam().catch(console.error);
@@ -540,34 +625,43 @@ createContentTeam().catch(console.error);
 ### Example 3: Agent with Memory
 
 ```typescript
-import { createDaemonClient, agent } from '@animaOS-SWARM/sdk';
+import { agent, createDaemonClient } from '@animaOS-SWARM/sdk';
 
 const client = createDaemonClient();
 
 async function conversationalAgent() {
-  const assistant = await client.agents.create(agent({
-    name: 'assistant',
-    provider: 'openai',
-    model: 'gpt-4o-mini',
-    apiKey: process.env.OPENAI_API_KEY,
-    systemPrompt: 'You are a helpful assistant with memory of past conversations.'
-  }));
+  const assistant = await client.agents.create(
+    agent({
+      name: 'assistant',
+      provider: 'openai',
+      model: 'gpt-4o-mini',
+      system: 'You are a helpful assistant with memory of past conversations.',
+      settings: {
+        apiKey: process.env.OPENAI_API_KEY,
+      },
+    })
+  );
 
-  // First interaction
   await client.agents.run(assistant.state.id, {
-    text: 'My name is Alice and I love Python programming.'
+    text: 'My name is Alice and I love Python programming.',
   });
 
-  // Second interaction - should remember
-  const result = await client.agents.run(assistant.state.id, {
-    text: 'What programming language do I like?'
+  const run = await client.agents.run(assistant.state.id, {
+    text: 'What programming language do I like?',
   });
 
-  console.log('Response:', result.result.content.text);
-  // Should mention Python based on memory
+  if (
+    run.result.status === 'success' &&
+    typeof run.result.data === 'object' &&
+    run.result.data !== null &&
+    'text' in run.result.data
+  ) {
+    console.log('Response:', run.result.data.text);
+  }
 
-  // Check memories
-  const memories = await client.agents.recentMemories(assistant.state.id, { limit: 5 });
+  const memories = await client.agents.recentMemories(assistant.state.id, {
+    limit: 5,
+  });
   console.log('Stored memories:', memories.length);
 }
 
@@ -581,23 +675,22 @@ conversationalAgent().catch(console.error);
 ### "Connection refused" Error
 
 The daemon is not running. Start it with:
+
 ```bash
 bun run daemon
 ```
 
 ### "Invalid API key" Error
 
-Check that your API key is set correctly:
-```bash
-echo $OPENAI_API_KEY  # Should show your key
-```
+Check that your provider key is available to the daemon process or passed through the config `settings` you send.
 
 ### "Agent not found" Error
 
 Verify the agent ID exists:
+
 ```typescript
 const agents = await client.agents.list();
-console.log(agents.map(a => a.state.id));
+console.log(agents.map((agent) => agent.state.id));
 ```
 
 ---
@@ -605,7 +698,6 @@ console.log(agents.map(a => a.state.id));
 ## Additional Resources
 
 - [Project README](../README.md) - Overview and quick start
-- [Design Docs](./design/) - Architecture and design decisions
 - [Rust Core](../packages/core-rust/) - Reusable Rust runtime crates
 - [Rust Daemon Host](../hosts/rust-daemon/) - Runnable Rust host, API surface, and operational commands
 - [Core Package](../packages/core-ts/) - TypeScript core port with shared contracts and utilities
