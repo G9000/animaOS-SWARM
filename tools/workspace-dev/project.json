@@ -1,0 +1,71 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "workspace-dev",
+  "root": "tools/workspace-dev",
+  "sourceRoot": "tools/workspace-dev/src",
+  "projectType": "library",
+  "targets": {
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "dependsOn": ["build", "^typecheck"],
+      "options": {
+        "cwd": "tools/workspace-dev",
+        "command": "tsc --build tsconfig.json --emitDeclarationOnly"
+      },
+      "cache": true,
+      "inputs": [
+        "{projectRoot}/package.json",
+        "{workspaceRoot}/tsconfig.base.json",
+        "{projectRoot}/tsconfig.json",
+        "{projectRoot}/tsconfig.lib.json",
+        "{projectRoot}/tsconfig.spec.json",
+        "{projectRoot}/src/**/*.ts",
+        "{projectRoot}/scripts/**/*.ts",
+        "{projectRoot}/vite.config.ts",
+        "{projectRoot}/vite.config.mts",
+        "{projectRoot}/vitest.config.ts",
+        "{projectRoot}/vitest.config.mts",
+        "{projectRoot}/src/**/*.test.ts",
+        "{projectRoot}/src/**/*.spec.ts",
+        "{projectRoot}/src/**/*.d.ts",
+        {
+          "dependentTasksOutputFiles": "**/*.{d.ts,tsbuildinfo}",
+          "transitive": true
+        },
+        {
+          "fileset": "{projectRoot}/**/*.d.ts",
+          "dependencies": true
+        }
+      ],
+      "outputs": [
+        "{projectRoot}/dist/**/*.d.ts",
+        "{projectRoot}/dist/**/*.d.ts.map",
+        "{projectRoot}/dist/tsconfig.lib.tsbuildinfo",
+        "{projectRoot}/out-tsc/vitest/**/*.d.ts",
+        "{projectRoot}/out-tsc/vitest/**/*.d.ts.map",
+        "{projectRoot}/out-tsc/vitest/tsconfig.spec.tsbuildinfo"
+      ],
+      "syncGenerators": ["@nx/js:typescript-sync"]
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "tools/workspace-dev",
+        "command": "bun run ./scripts/run-vitest.ts",
+        "forwardAllArgs": true
+      },
+      "cache": true,
+      "inputs": [
+        "default",
+        "^production",
+        {
+          "externalDependencies": ["vitest"]
+        },
+        {
+          "env": "CI"
+        }
+      ],
+      "outputs": ["{projectRoot}/test-output/vitest/coverage"]
+    }
+  }
+}

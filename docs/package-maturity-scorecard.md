@@ -2,7 +2,7 @@
 
 Last updated: 2026-04-10
 
-This scorecard tracks parity between the main TypeScript-facing packages and the currently active application/runtime surfaces:
+This scorecard tracks parity between the main workspace packages and the currently active application/runtime surfaces:
 
 - `@animaOS-SWARM/cli`
 - `@animaOS-SWARM/core`
@@ -14,6 +14,7 @@ This scorecard tracks parity between the main TypeScript-facing packages and the
 - `@animaOS-SWARM/server`
 - `@animaOS-SWARM/ui`
 - `@animaOS-SWARM/ui-e2e`
+- `packages/core-rust`
 - `hosts/rust-daemon`
 
 The goal is not to make every surface identical. The goal is to hold each one to the same quality bar for its role.
@@ -51,7 +52,8 @@ For thin apps or harnesses, the direct seam can be a smoke test around the prima
 | `server`     | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 8 tests / 2 files       | Parity bar met |
 | `ui`         | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 7 tests / 3 files       | Parity bar met |
 | `ui-e2e`     | Yes          | Yes            | Role-specific     | Yes                          | N/A         | Pass                    | 24 tests / 2 specs      | Parity bar met |
-| `animaos-rs` | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 166 tests / workspace   | Parity bar met |
+| `core-rust`  | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | Rust crate tests        | Parity bar met |
+| `rust-daemon` | Yes         | Yes            | Yes               | Yes                          | Pass        | Pass                    | Host package + integration tests | Parity bar met |
 
 ## Notes By Package
 
@@ -113,7 +115,7 @@ Strengths:
 
 Remaining gap:
 
-- Its remaining difference from `sdk` is role, not maturity bar. Canonical production execution still belongs to Rust.
+- Its remaining difference from `sdk` is role, not maturity bar. Current production execution still runs through the Rust host.
 
 ### `tools`
 
@@ -125,7 +127,7 @@ Strengths:
 
 Remaining gap:
 
-- Its remaining difference from other packages is role, not maturity bar. Canonical production tool execution still belongs to Rust.
+- Its remaining difference from other packages is role, not maturity bar. Current production tool execution still runs through the Rust host.
 
 ### `tui`
 
@@ -154,7 +156,7 @@ Strengths:
 
 Remaining gap:
 
-- This remains a thin development-facing surface, not the canonical daemon boundary.
+- This remains a thin development-facing surface, not the primary daemon boundary.
 
 ### `ui`
 
@@ -183,20 +185,32 @@ Remaining gap:
 
 - This surface is intentionally thin. Its job is boundary validation, not internal seam depth.
 
-### `animaos-rs`
+### `core-rust`
 
 Strengths:
 
-- Clear role as the canonical runtime workspace.
-- Existing crate and integration tests already cover runtime, memory, swarm, and daemon behavior directly.
-- README now documents workspace layout plus build, test, and quick daemon run commands.
+- Clear role as the reusable Rust runtime core in `packages/core-rust`.
+- Existing crate tests already cover runtime, memory, and swarm behavior directly.
+- README now documents the reusable crate layout plus focused build and test commands.
 
 Remaining gap:
 
 - The remaining work here is roadmap depth and crate-level docs, not basic maturity posture.
 
+### `rust-daemon`
+
+Strengths:
+
+- Clear role as the runnable Rust host in `hosts/rust-daemon`.
+- Host package and integration tests already cover the HTTP/SSE boundary, provider wiring, persistence integration, and daemon behavior directly.
+- README now documents daemon-specific API, environment, startup, and operational commands without conflating host ownership with reusable runtime ownership.
+
+Remaining gap:
+
+- The remaining work here is roadmap depth and host-level docs, not basic maturity posture.
+
 ## Recommended Next Parity Work
 
 1. Keep the scorecard updated whenever a package or active app surface gains or loses a boundary, example, dedicated seam test, or build/static-validation target.
 2. Expand README examples if a surface adds new major exported or operator-facing capabilities.
-3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, and canonical execution/runtime depth belongs in `hosts/rust-daemon`.
+3. Treat future gaps as role-specific: daemon protocol depth belongs in `sdk`, operator workflow depth belongs in `tui`, browser workflow depth belongs in `ui` and `ui-e2e`, thin local HTTP app behavior belongs in `server`, reusable Rust runtime depth belongs in `packages/core-rust`, and runnable host concerns belong in `hosts/rust-daemon`.

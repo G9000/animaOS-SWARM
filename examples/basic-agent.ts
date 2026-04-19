@@ -1,4 +1,4 @@
-import { AgentRuntime, EventBus, OpenAIAdapter, agent, action } from "../packages/core/src/index.js"
+import { AgentRuntime, EventBus, OpenAIAdapter, agent, action } from "../packages/core-ts/src/index.js"
 
 // Define a simple tool
 const getCurrentTime = action({

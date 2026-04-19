@@ -8,7 +8,7 @@
     "affected:test": "bun x nx affected -t test",
     "build": "bun x nx run-many -t build",
     "build:cli-sdk": "tsc -b packages/sdk/tsconfig.lib.json packages/cli/tsconfig.lib.json",
-    "daemon": "cargo run --manifest-path hosts/rust-daemon/Cargo.toml -p anima-daemon",
+    "daemon": "cargo run --manifest-path Cargo.toml -p anima-daemon",
     "dev": "bun x nx run workspace-dev:dev --",
     "animaos": "node packages/cli/dist/index.js",
     "graph": "bun x nx graph",

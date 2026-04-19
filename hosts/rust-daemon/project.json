@@ -7,30 +7,68 @@
     "dev": {
       "executor": "nx:run-commands",
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo run --target-dir target/dev -p anima-daemon"
-      }
+        "cwd": ".",
+        "command": "cargo run -p anima-daemon"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     },
     "build": {
       "executor": "nx:run-commands",
+      "dependsOn": [
+        {
+          "projects": ["core-rust"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ],
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo build --target-dir target/build --workspace"
-      }
+        "cwd": ".",
+        "command": "cargo build -p anima-daemon"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     },
     "test": {
       "executor": "nx:run-commands",
+      "dependsOn": [
+        {
+          "projects": ["core-rust"],
+          "target": "test",
+          "params": "ignore"
+        }
+      ],
       "options": {
-        "cwd": "hosts/rust-daemon",
-        "command": "cargo test --target-dir target/test --workspace"
-      }
+        "cwd": ".",
+        "command": "cargo test -p anima-daemon"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     },
     "lint": {
       "executor": "nx:run-commands",
       "options": {
-        "cwd": "hosts/rust-daemon",
+        "cwd": ".",
         "command": "cargo fmt --all --check"
-      }
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
     }
   }
 }

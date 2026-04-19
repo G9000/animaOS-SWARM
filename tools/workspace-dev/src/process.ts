@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 
 export interface ManagedProcessDefinition {
   name: string;
@@ -6,6 +7,8 @@ export interface ManagedProcessDefinition {
   args: string[];
   env?: Record<string, string>;
 }
+
+const execFileAsync = promisify(execFile);
 
 export function spawnManagedProcess(
   definition: ManagedProcessDefinition
@@ -17,7 +20,35 @@ export function spawnManagedProcess(
       ...definition.env,
     },
     stdio: 'inherit',
+    detached: process.platform !== 'win32',
   });
+}
+
+async function stopManagedProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.pid === undefined) {
+    return;
+  }
+
+  if (process.platform === 'win32') {
+    try {
+      await execFileAsync('taskkill', [
+        '/PID',
+        String(child.pid),
+        '/T',
+        '/F',
+      ]);
+    } catch {
+      // A concurrent exit is fine during shutdown cleanup.
+    }
+
+    return;
+  }
+
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    // A concurrent exit is fine during shutdown cleanup.
+  }
 }
 
 export async function runManagedProcesses(
@@ -26,17 +57,13 @@ export async function runManagedProcesses(
   const children = definitions.map(spawnManagedProcess);
   let shuttingDown = false;
 
-  const stopChildren = () => {
-    for (const child of children) {
-      if (child.exitCode === null) {
-        child.kill();
-      }
-    }
+  const stopChildren = async () => {
+    await Promise.all(children.map((child) => stopManagedProcess(child)));
   };
 
   const onSignal = () => {
     shuttingDown = true;
-    stopChildren();
+    void stopChildren();
   };
 
   process.once('SIGINT', onSignal);
@@ -70,6 +97,7 @@ export async function runManagedProcesses(
     ]);
 
     if (shuttingDown) {
+      await stopChildren();
       await Promise.all(
         children.map(
           (child) =>
@@ -87,6 +115,6 @@ export async function runManagedProcesses(
   } finally {
     process.removeListener('SIGINT', onSignal);
     process.removeListener('SIGTERM', onSignal);
-    stopChildren();
+    await stopChildren();
   }
 }

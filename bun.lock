@@ -102,7 +102,7 @@
         "@types/react": "^19.0.0",
       },
     },
-    "packages/core": {
+    "packages/core-ts": {
       "name": "@animaOS-SWARM/core",
       "version": "0.0.1",
       "dependencies": {
@@ -182,7 +182,7 @@
 
     "@animaOS-SWARM/cli": ["@animaOS-SWARM/cli@workspace:packages/cli"],
 
-    "@animaOS-SWARM/core": ["@animaOS-SWARM/core@workspace:packages/core"],
+    "@animaOS-SWARM/core": ["@animaOS-SWARM/core@workspace:packages/core-ts"],
 
     "@animaOS-SWARM/crypto-trader": ["@animaOS-SWARM/crypto-trader@workspace:mods/crypto-trader"],
 

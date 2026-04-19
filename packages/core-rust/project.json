@@ -1,0 +1,47 @@
+{
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "name": "core-rust",
+  "root": "packages/core-rust",
+  "projectType": "library",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": ".",
+        "command": "cargo build --manifest-path Cargo.toml --target-dir target/core-rust/build -p anima-core -p anima-memory -p anima-swarm"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": ".",
+        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/test -p anima-core -p anima-memory -p anima-swarm"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": ".",
+        "command": "cargo fmt --manifest-path Cargo.toml --package anima-core --package anima-memory --package anima-swarm --check"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/**/*"
+      ]
+    }
+  }
+}
