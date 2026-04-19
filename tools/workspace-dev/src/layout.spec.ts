@@ -47,9 +47,6 @@ describe('repo layout', () => {
     ).toBe(true);
 
     expect(
-      existsSync(repoPath('hosts', 'rust-daemon', 'Cargo.toml'))
-    ).toBe(false);
-    expect(
       existsSync(
         repoPath('hosts', 'rust-daemon', 'crates', 'anima-core', 'Cargo.toml')
       )
@@ -75,6 +72,21 @@ describe('repo layout', () => {
           'Cargo.toml'
         )
       )
+    ).toBe(false);
+  });
+
+  it('stores the daemon package at hosts/rust-daemon', () => {
+    expect(existsSync(repoPath('hosts', 'rust-daemon', 'Cargo.toml'))).toBe(
+      true
+    );
+    expect(
+      existsSync(repoPath('hosts', 'rust-daemon', 'src', 'main.rs'))
+    ).toBe(true);
+    expect(
+      existsSync(repoPath('hosts', 'rust-daemon', 'tests', 'health.rs'))
+    ).toBe(true);
+    expect(
+      existsSync(repoPath('hosts', 'rust-daemon', 'crates', 'anima-daemon'))
     ).toBe(false);
   });
 });

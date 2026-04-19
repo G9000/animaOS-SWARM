@@ -6,9 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-anima-core = { path = "../../../../packages/core-rust/crates/anima-core" }
-anima-memory = { path = "../../../../packages/core-rust/crates/anima-memory" }
-anima-swarm = { path = "../../../../packages/core-rust/crates/anima-swarm" }
+anima-core = { path = "../../packages/core-rust/crates/anima-core" }
+anima-memory = { path = "../../packages/core-rust/crates/anima-memory" }
+anima-swarm = { path = "../../packages/core-rust/crates/anima-swarm" }
 async-trait = "0.1"
 axum = "0.8"
 futures = "0.3"

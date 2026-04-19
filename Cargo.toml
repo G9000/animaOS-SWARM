@@ -3,7 +3,7 @@ members = [
     "packages/core-rust/crates/anima-core",
     "packages/core-rust/crates/anima-memory",
     "packages/core-rust/crates/anima-swarm",
-    "hosts/rust-daemon/crates/anima-daemon",
+    "hosts/rust-daemon",
 ]
 resolver = "2"
 
