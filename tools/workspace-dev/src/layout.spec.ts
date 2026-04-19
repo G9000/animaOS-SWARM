@@ -89,4 +89,13 @@ describe('repo layout', () => {
       existsSync(repoPath('hosts', 'rust-daemon', 'crates', 'anima-daemon'))
     ).toBe(false);
   });
+
+  it('stores placeholder host projects for elixir and python', () => {
+    expect(
+      existsSync(repoPath('hosts', 'elixir-phoenix', 'project.json'))
+    ).toBe(true);
+    expect(
+      existsSync(repoPath('hosts', 'python-service', 'project.json'))
+    ).toBe(true);
+  });
 });
