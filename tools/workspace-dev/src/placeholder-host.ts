@@ -60,6 +60,12 @@ export function runPlaceholderHost(argv: string[]): void {
   );
 }
 
-if (import.meta.main) {
+const isEntrypoint = (
+  import.meta as ImportMeta & {
+    main?: boolean;
+  }
+).main === true;
+
+if (isEntrypoint) {
   runPlaceholderHost(process.argv.slice(2));
 }
