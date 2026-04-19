@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use anima_memory::{MemorySearchOptions, RecentMemoryOptions};
 
 use super::contracts::{
-    MemoriesEnvelope, MemoryCreateRequest, MemoryResponse, MemorySearchEnvelope,
-    MemorySearchQuery, MemorySearchResultResponse, RecentMemoriesQuery,
+    MemoriesEnvelope, MemoryCreateRequest, MemoryResponse, MemorySearchEnvelope, MemorySearchQuery,
+    MemorySearchResultResponse, RecentMemoriesQuery,
 };
 use super::ApiError;
 use crate::state::DaemonState;
@@ -14,7 +14,9 @@ pub(crate) fn handle_create_memory(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<MemoryResponse, ApiError> {
     let request: MemoryCreateRequest = super::parse_json_body(body)?;
-    let new_memory = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let new_memory = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let memory = {
         let memory = {

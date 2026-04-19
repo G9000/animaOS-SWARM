@@ -22,11 +22,10 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::app::{DaemonConfig, SharedDaemonState};
 
 use self::contracts::{
-    AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
-    AgentsEnvelope, DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope,
-    MemoryCreateRequest, MemoryResponse, MemorySearchEnvelope, MemorySearchQuery,
-    RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope,
-    TaskRequest,
+    AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope, AgentsEnvelope,
+    DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope, MemoryCreateRequest,
+    MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, RecentMemoriesQuery,
+    SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
 };
 
 #[derive(OpenApi)]
@@ -128,7 +127,10 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             "/api/agents/{agent_id}",
             get(get_agent_entry).delete(delete_agent_entry),
         )
-        .route("/api/agents/{agent_id}/run", axum::routing::post(run_agent_entry))
+        .route(
+            "/api/agents/{agent_id}/run",
+            axum::routing::post(run_agent_entry),
+        )
         .route(
             "/api/agents/{agent_id}/memories/recent",
             get(agent_recent_memories_entry),
@@ -138,7 +140,10 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             get(list_swarms_entry).post(create_swarm_entry),
         )
         .route("/api/swarms/{swarm_id}", get(get_swarm_entry))
-        .route("/api/swarms/{swarm_id}/run", axum::routing::post(run_swarm_entry))
+        .route(
+            "/api/swarms/{swarm_id}/run",
+            axum::routing::post(run_swarm_entry),
+        )
         .route("/api/swarms/{swarm_id}/events", get(swarm_events_entry))
         .fallback(not_found_entry)
         .with_state(app_state)

@@ -194,7 +194,9 @@ pub(in crate::routes::contracts) fn required_string(
 }
 
 pub(in crate::routes::contracts) fn parse_usize(value: &str) -> Result<usize, &'static str> {
-    value.parse::<usize>().map_err(|_| "limit must be an integer")
+    value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer")
 }
 
 pub(in crate::routes::contracts) fn parse_importance(value: &str) -> Result<f64, &'static str> {

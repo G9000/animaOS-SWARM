@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use super::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
-    AgentRuntimeSnapshotResponse, AgentsEnvelope, DeleteResponse, MemoriesEnvelope,
-    MemoryResponse, TaskRequest, TaskResultResponse,
+    AgentRuntimeSnapshotResponse, AgentsEnvelope, DeleteResponse, MemoriesEnvelope, MemoryResponse,
+    TaskRequest, TaskResultResponse,
 };
 use super::ApiError;
 use crate::state::DaemonState;
@@ -14,7 +14,9 @@ pub(crate) fn handle_create_agent(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<AgentEnvelope, ApiError> {
     let request: AgentConfigRequest = super::parse_json_body(body)?;
-    let config = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let config = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let snapshot = {
         let mut guard = state
@@ -105,7 +107,9 @@ pub(crate) async fn handle_run_agent(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
-    let content = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let content = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let Some((mut runtime, tool_context)) = ({
         let mut guard = state

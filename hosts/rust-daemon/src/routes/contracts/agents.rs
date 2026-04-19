@@ -9,8 +9,8 @@ use serde_json::Value;
 use utoipa::{IntoParams, ToSchema};
 
 use super::shared::{
-    data_value_to_json, json_to_data_value, number_value, parse_usize, required_string,
-    u32_value, u64_value, TaskResultResponse, TokenUsageResponse,
+    data_value_to_json, json_to_data_value, number_value, parse_usize, required_string, u32_value,
+    u64_value, TaskResultResponse, TokenUsageResponse,
 };
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -214,7 +214,10 @@ impl AgentConfigRequest {
                         .collect::<Result<Vec<_>, _>>()
                 })
                 .transpose()?,
-            settings: self.settings.map(AgentSettingsRequest::into_domain).transpose()?,
+            settings: self
+                .settings
+                .map(AgentSettingsRequest::into_domain)
+                .transpose()?,
         })
     }
 }

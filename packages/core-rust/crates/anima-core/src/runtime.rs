@@ -303,7 +303,10 @@ impl AgentRuntime {
                                         id: Uuid::new_v4().to_string(),
                                         agent_id: self.state.id.clone(),
                                         step_index,
-                                        idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
+                                        idempotency_key: format!(
+                                            "{}:{}:{}",
+                                            self.state.id, step_index, tool_call.id
+                                        ),
                                         step_type: "tool".to_string(),
                                         status: StepStatus::Pending,
                                         input: Some(serde_json::json!({
@@ -342,7 +345,9 @@ impl AgentRuntime {
 
                             // Write done/failed steps to database
                             if let Some(db) = self.db.clone() {
-                                for (i, (tool_call, tool_result, _)) in tool_results.iter().enumerate() {
+                                for (i, (tool_call, tool_result, _)) in
+                                    tool_results.iter().enumerate()
+                                {
                                     let step_index = step_indices[i];
                                     let status = if tool_result.error.is_none() {
                                         StepStatus::Done
@@ -353,7 +358,10 @@ impl AgentRuntime {
                                         id: Uuid::new_v4().to_string(),
                                         agent_id: self.state.id.clone(),
                                         step_index,
-                                        idempotency_key: format!("{}:{}:{}", self.state.id, step_index, tool_call.id),
+                                        idempotency_key: format!(
+                                            "{}:{}:{}",
+                                            self.state.id, step_index, tool_call.id
+                                        ),
                                         step_type: "tool".to_string(),
                                         status,
                                         input: Some(serde_json::json!({

@@ -323,8 +323,7 @@ async fn swarm_event_stream_emits_tool_results() {
         match futures::poll!(stream.next()) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
-                if chunks.contains("event: tool:after")
-                    && chunks.contains("event: swarm:completed")
+                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed")
                 {
                     break;
                 }

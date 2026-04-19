@@ -106,9 +106,10 @@ pub mod in_memory {
     #[async_trait]
     impl DatabaseAdapter for InMemoryAdapter {
         async fn write_step(&self, step: &Step) -> PersistenceResult<()> {
-            let mut steps = self.steps.lock().map_err(|e| {
-                PersistenceError::Write(format!("Mutex poisoned: {}", e))
-            })?;
+            let mut steps = self
+                .steps
+                .lock()
+                .map_err(|e| PersistenceError::Write(format!("Mutex poisoned: {}", e)))?;
 
             // Upsert by (agent_id, step_index) — match Postgres semantics:
             // preserve input, freeze terminal status+output
@@ -137,9 +138,10 @@ pub mod in_memory {
             agent_id: &str,
             key: &str,
         ) -> PersistenceResult<Option<Step>> {
-            let steps = self.steps.lock().map_err(|e| {
-                PersistenceError::Query(format!("Mutex poisoned: {}", e))
-            })?;
+            let steps = self
+                .steps
+                .lock()
+                .map_err(|e| PersistenceError::Query(format!("Mutex poisoned: {}", e)))?;
 
             let found = steps
                 .iter()
@@ -150,9 +152,10 @@ pub mod in_memory {
         }
 
         async fn list_agent_steps(&self, agent_id: &str) -> PersistenceResult<Vec<Step>> {
-            let steps = self.steps.lock().map_err(|e| {
-                PersistenceError::Query(format!("Mutex poisoned: {}", e))
-            })?;
+            let steps = self
+                .steps
+                .lock()
+                .map_err(|e| PersistenceError::Query(format!("Mutex poisoned: {}", e)))?;
 
             let mut result: Vec<Step> = steps
                 .iter()
@@ -175,7 +178,12 @@ mod tests {
     use super::in_memory::InMemoryAdapter;
     use super::*;
 
-    fn make_step(agent_id: &str, step_index: i32, idempotency_key: &str, status: StepStatus) -> Step {
+    fn make_step(
+        agent_id: &str,
+        step_index: i32,
+        idempotency_key: &str,
+        status: StepStatus,
+    ) -> Step {
         Step {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: agent_id.to_string(),
@@ -213,7 +221,10 @@ mod tests {
 
         // Write initial step as Pending
         let step_pending = make_step("agent-2", 0, "key-xyz", StepStatus::Pending);
-        adapter.write_step(&step_pending).await.expect("initial write failed");
+        adapter
+            .write_step(&step_pending)
+            .await
+            .expect("initial write failed");
 
         // Upsert with Done status — same (agent_id, step_index)
         let step_done = Step {
@@ -226,7 +237,10 @@ mod tests {
             input: step_pending.input.clone(),
             output: Some(serde_json::json!({ "result": "ok" })),
         };
-        adapter.write_step(&step_done).await.expect("upsert write failed");
+        adapter
+            .write_step(&step_done)
+            .await
+            .expect("upsert write failed");
 
         // List steps and confirm only one entry exists, with Done status
         let steps = adapter

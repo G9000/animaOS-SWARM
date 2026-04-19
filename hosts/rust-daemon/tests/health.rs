@@ -75,7 +75,10 @@ async fn openapi_endpoint_returns_spec_json() {
         .expect("content-type header exists")
         .to_str()
         .expect("content-type header is utf-8");
-    assert!(content_type.starts_with("application/json"), "{content_type}");
+    assert!(
+        content_type.starts_with("application/json"),
+        "{content_type}"
+    );
 
     let body = to_bytes(response.into_body(), usize::MAX)
         .await
@@ -111,7 +114,10 @@ async fn swagger_ui_endpoint_returns_html() {
         .await
         .expect("body reads");
     let body = std::str::from_utf8(&body).expect("body is utf-8");
-    assert!(body.contains("SwaggerUI") || body.contains("swagger-ui"), "{body}");
+    assert!(
+        body.contains("SwaggerUI") || body.contains("swagger-ui"),
+        "{body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -3,8 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anima_core::{
-    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, DataValue, DatabaseAdapter,
-    EngineEvent, EventType, Message, ModelAdapter, TaskResult, TokenUsage, ToolCall,
+    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, DataValue,
+    DatabaseAdapter, EngineEvent, EventType, Message, ModelAdapter, TaskResult, TokenUsage,
+    ToolCall,
 };
 use anima_memory::{Memory, MemoryManager, MemoryType, NewMemory, RecentMemoryOptions};
 use anima_swarm::coordinator::{

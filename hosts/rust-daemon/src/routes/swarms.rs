@@ -9,8 +9,8 @@ use axum::response::IntoResponse;
 use futures::stream;
 
 use super::contracts::{
-    SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope,
-    SwarmStateResponse, SwarmsEnvelope, TaskRequest, TaskResultResponse,
+    SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
+    SwarmsEnvelope, TaskRequest, TaskResultResponse,
 };
 use super::ApiError;
 use crate::state::DaemonState;
@@ -20,15 +20,15 @@ pub(crate) async fn handle_create_swarm(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<SwarmEnvelope, ApiError> {
     let request: SwarmCreateRequest = super::parse_json_body(body)?;
-    let config = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let config = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let (coordinator, event_stream) = {
         let guard = state
             .lock()
             .expect("daemon state mutex should not be poisoned");
-        guard
-            .build_swarm(config)
-            .map_err(ApiError::bad_request)?
+        guard.build_swarm(config).map_err(ApiError::bad_request)?
     };
 
     if let Err(message) = coordinator.start().await {
@@ -88,7 +88,9 @@ pub(crate) async fn handle_run_swarm(
     state: &Arc<Mutex<DaemonState>>,
 ) -> Result<SwarmRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
-    let content = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let content = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let coordinator = {
         let guard = state
@@ -150,8 +152,7 @@ pub(crate) fn handle_subscribe_swarm_events(
             )],
             super::serialize_json(&super::contracts::ErrorBody {
                 error: "not found".to_string(),
-            })
-            ,
+            }),
         )
             .into_response();
     };

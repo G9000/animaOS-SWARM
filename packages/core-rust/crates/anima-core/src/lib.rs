@@ -15,9 +15,9 @@ pub use events::{EngineEvent, EventType};
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
 };
+pub use persistence::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
 pub use primitives::{
     AgentId, Attachment, AttachmentType, Content, DataValue, HealthStatus, Message, MessageId,
     MessageRole, RoomId, TaskResult, TaskStatus, UuidString, HEALTH_OK_JSON,
 };
-pub use persistence::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
 pub use runtime::{AgentRuntime, AgentRuntimeSnapshot};
