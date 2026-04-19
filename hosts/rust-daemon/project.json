@@ -19,6 +19,13 @@
     },
     "build": {
       "executor": "nx:run-commands",
+      "dependsOn": [
+        {
+          "projects": ["core-rust"],
+          "target": "build",
+          "params": "ignore"
+        }
+      ],
       "options": {
         "cwd": ".",
         "command": "cargo build --manifest-path Cargo.toml --target-dir target/build -p anima-daemon"
@@ -32,6 +39,13 @@
     },
     "test": {
       "executor": "nx:run-commands",
+      "dependsOn": [
+        {
+          "projects": ["core-rust"],
+          "target": "test",
+          "params": "ignore"
+        }
+      ],
       "options": {
         "cwd": ".",
         "command": "cargo test --manifest-path Cargo.toml --target-dir target/test -p anima-daemon"

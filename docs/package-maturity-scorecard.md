@@ -2,7 +2,7 @@
 
 Last updated: 2026-04-10
 
-This scorecard tracks parity between the main TypeScript-facing packages and the currently active application/runtime surfaces:
+This scorecard tracks parity between the main workspace packages and the currently active application/runtime surfaces:
 
 - `@animaOS-SWARM/cli`
 - `@animaOS-SWARM/core`
@@ -14,6 +14,7 @@ This scorecard tracks parity between the main TypeScript-facing packages and the
 - `@animaOS-SWARM/server`
 - `@animaOS-SWARM/ui`
 - `@animaOS-SWARM/ui-e2e`
+- `packages/core-rust`
 - `hosts/rust-daemon`
 
 The goal is not to make every surface identical. The goal is to hold each one to the same quality bar for its role.
@@ -51,7 +52,7 @@ For thin apps or harnesses, the direct seam can be a smoke test around the prima
 | `server`     | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 8 tests / 2 files       | Parity bar met |
 | `ui`         | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 7 tests / 3 files       | Parity bar met |
 | `ui-e2e`     | Yes          | Yes            | Role-specific     | Yes                          | N/A         | Pass                    | 24 tests / 2 specs      | Parity bar met |
-| `animaos-rs` | Yes          | Yes            | Yes               | Yes                          | Pass        | Pass                    | 166 tests / workspace   | Parity bar met |
+| `core-rust + rust-daemon` | Yes | Yes | Yes | Yes | Pass | Pass | 166 tests / workspace | Parity bar met |
 
 ## Notes By Package
 
@@ -113,7 +114,7 @@ Strengths:
 
 Remaining gap:
 
-- Its remaining difference from `sdk` is role, not maturity bar. Canonical production execution still belongs to Rust.
+- Its remaining difference from `sdk` is role, not maturity bar. Current production execution still runs through the Rust host.
 
 ### `tools`
 
@@ -125,7 +126,7 @@ Strengths:
 
 Remaining gap:
 
-- Its remaining difference from other packages is role, not maturity bar. Canonical production tool execution still belongs to Rust.
+- Its remaining difference from other packages is role, not maturity bar. Current production tool execution still runs through the Rust host.
 
 ### `tui`
 
@@ -154,7 +155,7 @@ Strengths:
 
 Remaining gap:
 
-- This remains a thin development-facing surface, not the canonical daemon boundary.
+- This remains a thin development-facing surface, not the primary daemon boundary.
 
 ### `ui`
 
@@ -183,11 +184,11 @@ Remaining gap:
 
 - This surface is intentionally thin. Its job is boundary validation, not internal seam depth.
 
-### `animaos-rs`
+### `core-rust + rust-daemon`
 
 Strengths:
 
-- Clear role as the reusable Rust runtime core package.
+- Clear split between reusable Rust runtime crates in `packages/core-rust` and the current daemon host in `hosts/rust-daemon`.
 - Existing crate and integration tests already cover runtime, memory, swarm, and daemon behavior directly.
 - README now documents workspace layout plus build, test, and quick daemon run commands.
 

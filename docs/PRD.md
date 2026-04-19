@@ -1,4 +1,4 @@
-# AnimaOS Kit — Product Requirements Document
+# AnimaOS Kit - Product Requirements Document
 
 **Version:** 0.2.0
 **Date:** 2026-04-05
@@ -8,7 +8,7 @@
 
 ## 1. Product Overview
 
-AnimaOS Kit is a Bun + TypeScript workspace built around a canonical Rust runtime for agent swarms. The Rust daemon owns execution, coordination, memory, and streaming. The TypeScript packages provide the CLI, SDK, TUI, UI, and shared contracts that developers use locally and integrate into other systems.
+AnimaOS Kit is a Bun + TypeScript workspace built around host-agnostic runtime ports and a current Rust execution host for agent swarms. The Rust daemon currently owns execution, coordination, memory, and streaming. The TypeScript packages provide the CLI, SDK, TUI, UI, and shared contracts that developers use locally and integrate into other systems.
 
 The primary operator surface is the terminal UI exposed through `animaos launch`. The web UI is a secondary surface and should not lead roadmap decisions until the terminal workflow is strong.
 
@@ -38,24 +38,30 @@ The primary operator surface is the terminal UI exposed through `animaos launch`
 
 ## 4. Architecture
 
-```
+```text
 animaos-swarm/
-├── packages/
-│   ├── @animaOS-SWARM/core      — Shared TS contracts, plugin types, and compatibility utilities
-│   ├── @animaOS-SWARM/swarm     — TS swarm helpers, strategies, and shared types
-│   ├── @animaOS-SWARM/tools     — TS tool registry, policies, hooks, and local executors
-│   ├── @animaOS-SWARM/memory    — BM25 search, task history, and TS memory helpers
-│   ├── @animaOS-SWARM/sdk       — Public TypeScript client for the Rust daemon
-│   ├── @animaOS-SWARM/cli       — Local `animaos` CLI and agency scaffolding
-│   └── @animaOS-SWARM/tui       — Ink-based terminal UI for launch sessions
-├── hosts/rust-daemon/
-│   ├── anima-core               — Canonical runtime core
-│   ├── anima-swarm              — Canonical swarm coordination
-│   ├── anima-memory             — Canonical memory services
-│   └── anima-daemon             — Canonical HTTP/SSE execution boundary
-└── apps/
-    ├── @animaOS-SWARM/server    — REST API and SSE bridge for the daemon
-  └── @animaOS-SWARM/ui        — Secondary web dashboard (React + Vite)
+|-- packages/
+|   |-- core-ts/                    Shared TS contracts, plugin types, and compatibility utilities
+|   |-- core-rust/
+|   |   `-- crates/
+|   |       |-- anima-core          Reusable Rust runtime core
+|   |       |-- anima-swarm         Reusable Rust swarm coordination
+|   |       `-- anima-memory        Reusable Rust memory services
+|   |-- swarm/                      TS swarm helpers, strategies, and shared types
+|   |-- tools/                      TS tool registry, policies, hooks, and local executors
+|   |-- memory/                     BM25 search, task history, and TS memory helpers
+|   |-- sdk/                        Public TypeScript client for the Rust daemon
+|   |-- cli/                        Local `animaos` CLI and agency scaffolding
+|   `-- tui/                        Ink-based terminal UI for launch sessions
+|-- hosts/
+|   |-- rust-daemon/
+|   |   `-- crates/
+|   |       `-- anima-daemon        Current HTTP/SSE execution host
+|   |-- elixir-phoenix/             Placeholder for a future Elixir host
+|   `-- python-service/             Placeholder for a future Python host
+`-- apps/
+    |-- server/                     Existing TS server kept during restructuring
+    `-- ui/                         Secondary web dashboard (React + Vite)
 ```
 
 **Tech Stack:** Rust, Bun, TypeScript, Nx, Cargo, Vite, React, Vitest, Playwright, Oxlint
@@ -68,15 +74,15 @@ animaos-swarm/
 
 | Component | Status | Details |
 |---|---|---|
-| Rust runtime core | ✅ Done | Reusable Rust runtime crates now live in `packages/core-rust`, while the current runnable daemon host remains under `hosts/rust-daemon/crates/anima-daemon` |
-| Provider support | ✅ Done | OpenAI, Anthropic, Google/Gemini, Ollama, and several OpenAI-compatible providers run through the daemon |
-| Swarm coordination | ✅ Done | Supervisor, dynamic, and round-robin strategies are implemented |
-| CLI surface | ✅ Done | `create`, `run`, `chat`, `launch`, and `agents` are available through the local `animaos` binary |
-| SDK | ✅ Done | The TypeScript SDK provides daemon HTTP/SSE clients plus config helper factories |
-| Memory services | ✅ Done | BM25 search, task history, document storage, and recent memory retrieval are wired through the current runtime surface |
-| Server API | ✅ Done | Agents, swarms, documents, search, and health endpoints are available through the server app and daemon boundary |
-| TUI support | ✅ Done | Local launch sessions already render through the Ink-based terminal UI package |
-| Test coverage | ✅ Done | TypeScript package tests and the Rust `cargo test` suite are part of the current development flow |
+| Rust runtime ports | Done | Reusable Rust runtime crates now live in `packages/core-rust`, while the current runnable daemon host remains under `hosts/rust-daemon/crates/anima-daemon` |
+| Provider support | Done | OpenAI, Anthropic, Google/Gemini, Ollama, and several OpenAI-compatible providers run through the daemon |
+| Swarm coordination | Done | Supervisor, dynamic, and round-robin strategies are implemented |
+| CLI surface | Done | `create`, `run`, `chat`, `launch`, and `agents` are available through the local `animaos` binary |
+| SDK | Done | The TypeScript SDK provides daemon HTTP/SSE clients plus config helper factories |
+| Memory services | Done | BM25 search, task history, document storage, and recent memory retrieval are wired through the current runtime surface |
+| Server API | Done | Agents, swarms, documents, search, and health endpoints are available through the server app and daemon boundary |
+| TUI support | Done | Local launch sessions already render through the Ink-based terminal UI package |
+| Test coverage | Done | TypeScript package tests and the Rust `cargo test` suite are part of the current development flow |
 
 ### Active Gaps
 
@@ -93,7 +99,7 @@ animaos-swarm/
 
 ## 6. Near-Term Roadmap
 
-### Phase 1 — TUI, Observability, and Output Quality
+### Phase 1 - TUI, Observability, and Output Quality
 - Make the `launch` TUI the default operator workflow worth staying inside
 - Keyboard-first navigation across agents, tools, logs, and final result views
 - Inline approvals, pending states, and error recovery in the terminal flow
@@ -103,20 +109,20 @@ animaos-swarm/
 - Structured JSONL output suitable for piping into external systems
 - Confidence scoring contracts for agent and swarm results
 
-### Phase 2 — Faster and Smarter Coordination
+### Phase 2 - Faster and Smarter Coordination
 - Parallel dispatch for independent tasks
 - Generate-then-validate strategies with cheap validator agents
 - Smarter routing using triggers, examples, and LLM fallback
 - Better shared memory and knowledge-linking between agents mid-run
 
-### Phase 3 — Product Surface Hardening
+### Phase 3 - Product Surface Hardening
 - Harden the TUI as the primary operator surface for runs, traces, tool calls, and memory state
 - Keep the web dashboard secondary until it adds clear value beyond the terminal workflow
 - Auth, audit, and managed permission policy surfaces
 - Storage abstractions beyond the current file-first defaults
 - Better packaging, onboarding, and install flows for teams adopting the kit
 
-### Phase 4 — Extension and Distribution Model
+### Phase 4 - Extension and Distribution Model
 - First-class plugin manifests and loading conventions
 - Example extensions that demonstrate actions, providers, evaluators, and policy hooks
 - A clearer settings story for managed permissions and guardrails
@@ -128,7 +134,7 @@ animaos-swarm/
 
 | Decision | Choice | Why |
 |---|---|---|
-| Execution runtime | Rust daemon | Keeps the canonical execution path deterministic and gives the project a clear streaming boundary |
+| Execution runtime | Rust daemon host | Keeps the current execution path deterministic and gives the project a clear streaming boundary |
 | Primary operator surface | TUI via `animaos launch` | Fastest path to trust, iteration, and operator control without building a second product surface too early |
 | Client surfaces | TypeScript packages | CLI, SDK, TUI, UI, and shared contracts stay easy to compose and integrate |
 | Workspace runner | Bun | Fast installs and repo-local command execution |
