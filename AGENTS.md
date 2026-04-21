@@ -1,3 +1,41 @@
+# AnimaOS Kit Agent Guide
+
+This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime packages separate from runnable backend hosts.
+
+# Repo Boundaries
+
+- `packages/core-rust` is the Rust host-agnostic core workspace. It contains reusable Rust engine crates such as `anima-core`, `anima-memory`, and `anima-swarm`.
+- `packages/core-ts` is the TypeScript host-agnostic core package. Its npm package name is still `@animaOS-SWARM/core`.
+- `packages/*` is for reusable libraries, SDKs, runtime ports, and shared tooling.
+- `hosts/*` is for runnable backend host processes only. Hosts wrap a core implementation and expose it over a runtime boundary such as HTTP, WebSocket, SSE, jobs, or another process interface.
+- `hosts/rust-daemon` is the ready Rust host. `hosts/elixir-phoenix` and `hosts/python-service` are placeholder host projects until implemented.
+- `apps/*` is for user-facing app surfaces such as the UI, UI e2e app, and the legacy local TypeScript server.
+- `tools/*` is for workspace tooling such as the `workspace-dev` launcher.
+
+# Architecture Rules
+
+- Do not move reusable engine/runtime library code into `hosts/*`.
+- If code is intended to be reused by multiple hosts, put it under `packages/*`.
+- Do not make `anima-core` depend on an HTTP framework, DB driver, or host-specific runtime.
+- Do not remove or retarget `apps/server` unless explicitly asked. It is retained during the restructuring even though the long-term backend host boundary is `hosts/*`.
+- Keep host selection centralized in `tools/workspace-dev` rather than hardcoding host ports or project names in UI/client packages.
+
+# Dev Workflow
+
+- Use `bun dev --host rust` for the normal local workflow. It runs the selected host plus the web UI through `workspace-dev`.
+- The current supported host keys are `rust`, `elixir`, and `python`; only `rust` is production-ready today.
+- Use Nx project targets for host work: `bun x nx run rust-daemon:dev`, `bun x nx run rust-daemon:build`, `bun x nx run rust-daemon:test`, and `bun x nx run rust-daemon:lint`.
+- Use `bun x nx test workspace-dev` when changing host selection, process orchestration, or dev launcher behavior.
+- Use `bun x nx show projects --json` to confirm project names before assuming target names or paths.
+- Prefer `bun x nx ...` over direct tool commands for build/test/lint tasks when an Nx target exists.
+
+# Verification
+
+- For Rust host/core changes, run `bun x nx run rust-daemon:test --skipNxCache`.
+- For dev launcher changes, run `bun x nx test workspace-dev --runInBand --skipNxCache`.
+- For TypeScript package changes, use the relevant Nx `test`, `build`, or `typecheck` target.
+- Do not claim completion unless the relevant verification commands have passed in the current tree.
+
 <!-- nx configuration start-->
 <!-- Leave the start & end comments to automatically receive updates. -->
 
