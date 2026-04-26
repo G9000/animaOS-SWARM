@@ -22,6 +22,7 @@ const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
 const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
 const DEFAULT_PERPLEXITY_BASE_URL: &str = "https://api.perplexity.ai";
+const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
@@ -140,6 +141,19 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
             default_base_url: DEFAULT_PERPLEXITY_BASE_URL,
         },
     ),
+    (
+        "moonshot",
+        ProviderDef {
+            api_key_envs: &[
+                "MOONSHOT_API_KEY",
+                "MOONSHOT_KEY",
+                "MOONSHOT_TOKEN",
+                "KIMI_API_KEY",
+            ],
+            base_url_envs: &["MOONSHOT_BASE_URL", "KIMI_BASE_URL"],
+            default_base_url: DEFAULT_MOONSHOT_BASE_URL,
+        },
+    ),
 ];
 
 fn provider_def(name: &str) -> Option<&'static ProviderDef> {
@@ -233,7 +247,8 @@ impl RuntimeModelAdapter {
     }
 
     /// Generate via an OpenAI-compatible provider (OpenAI, Ollama, Groq, xAI,
-    /// OpenRouter, Mistral, Together, DeepSeek, Fireworks, Perplexity, …).
+    /// OpenRouter, Mistral, Together, DeepSeek, Fireworks, Perplexity,
+    /// Moonshot/Kimi, …).
     async fn generate_openai_compat_provider(
         &self,
         provider_name: &str,
@@ -460,6 +475,10 @@ impl ModelAdapter for RuntimeModelAdapter {
             }
             "perplexity" => {
                 self.generate_openai_compat_provider("perplexity", true, config, request)
+                    .await
+            }
+            "moonshot" | "kimi" => {
+                self.generate_openai_compat_provider("moonshot", true, config, request)
                     .await
             }
             other => Err(format!(
@@ -1751,6 +1770,78 @@ mod tests {
             .expect("groq adapter should generate");
 
         assert_eq!(response.content.text, "groq response");
+    }
+
+    #[tokio::test]
+    async fn runtime_adapter_routes_moonshot_through_openai_compatible() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                assert_eq!(auth, "Bearer moonshot-key");
+                assert_eq!(body.get("model"), Some(&json!("kimi-k2.5")));
+                Json(json!({
+                    "choices": [{
+                        "message": { "content": "moonshot response" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 6, "completion_tokens": 4, "total_tokens": 10 }
+                }))
+            }),
+        );
+
+        let base_url = spawn_server(app).await;
+        let adapter = RuntimeModelAdapter::with_config(test_config(&[(
+            "moonshot",
+            Some("moonshot-key"),
+            &format!("{base_url}/v1"),
+        )]));
+
+        let mut config = agent_config("moonshot");
+        config.model = "kimi-k2.5".into();
+        let response = adapter
+            .generate(&config, &request())
+            .await
+            .expect("moonshot adapter should generate");
+
+        assert_eq!(response.content.text, "moonshot response");
+        assert_eq!(response.usage.total_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn runtime_adapter_accepts_kimi_as_moonshot_alias() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|Json(_body): Json<Value>| async move {
+                Json(json!({
+                    "choices": [{
+                        "message": { "content": "kimi alias response" },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": { "prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5 }
+                }))
+            }),
+        );
+
+        let base_url = spawn_server(app).await;
+        let adapter = RuntimeModelAdapter::with_config(test_config(&[(
+            "moonshot",
+            Some("moonshot-key"),
+            &format!("{base_url}/v1"),
+        )]));
+
+        let mut config = agent_config("kimi");
+        config.model = "kimi-k2.5".into();
+        let response = adapter
+            .generate(&config, &request())
+            .await
+            .expect("kimi alias should generate through moonshot");
+
+        assert_eq!(response.content.text, "kimi alias response");
     }
 
     #[test]

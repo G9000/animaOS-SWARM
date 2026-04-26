@@ -10,6 +10,7 @@ import {
   type UUID,
 } from '@animaOS-SWARM/core';
 import type { AgentDefinition } from './types.js';
+import type { AgentSeedMemories, SeedMemoryEntry, SeedMemoryType } from './seed-memory.js';
 import { resolveProviderConfig } from '../provider-config.js';
 
 class DelegatingModelAdapter implements IModelAdapter {
@@ -203,6 +204,8 @@ export function createAdapter(
     case 'deepseek':
     case 'fireworks':
     case 'perplexity':
+    case 'moonshot':
+    case 'kimi':
       return new DelegatingModelAdapter(
         normalizedProvider,
         new OpenAIAdapter(resolved?.apiKey, baseUrl)
@@ -217,15 +220,22 @@ export interface GenerateAgentTeamOptions {
   model: string;
   agencyName: string;
   agencyDescription: string;
+  /** Total team size including the orchestrator. Defaults to 4. Clamped to [2, 10]. */
+  teamSize?: number;
+}
+
+export interface GeneratedAgency {
+  mission?: string;
+  values?: string[];
+  agents: AgentDefinition[];
 }
 
 /**
- * Use an LLM to generate 2-4 worker agent suggestions for an agency
- * based on its name, description, and orchestrator bio.
+ * Use an LLM to generate a full agency: mission, values, and the agent roster.
  */
 export async function generateAgentTeam(
   opts: GenerateAgentTeamOptions
-): Promise<AgentDefinition[]> {
+): Promise<GeneratedAgency> {
   const dummyId = '00000000-0000-0000-0000-000000000000' as UUID;
 
   const config: ModelConfig = {
@@ -233,25 +243,51 @@ export async function generateAgentTeam(
     model: opts.model,
   };
 
+  const requestedSize = Math.max(2, Math.min(10, opts.teamSize ?? 4));
+  const workerCount = requestedSize - 1;
+
   const prompt = [
     `You are designing a team of AI agents for an agency called "${opts.agencyName}".`,
     `Agency purpose: ${opts.agencyDescription}`,
     '',
-    'Suggest 3-5 agents (including an orchestrator) that would form this agency.',
-    'The first agent should be the orchestrator — the one who coordinates the team.',
-    'The rest are workers with distinct roles.',
+    `Generate EXACTLY ${requestedSize} agents in total: 1 orchestrator + ${workerCount} workers.`,
+    'The first agent must be the orchestrator — the one who coordinates the team.',
+    'Workers should have focused, distinct mandates.',
     '',
-    'Respond with ONLY valid JSON — an array of agent objects. No markdown, no explanation.',
-    'Each object must have these fields:',
-    '  - "name": a short snake_case identifier',
+    'OVERLAP RULE: when cross-validation, multiple perspectives, or parallel exploration adds clear value,',
+    'you may include 2-3 agents in similar roles but with DIFFERENT angles or methodologies',
+    '(e.g. researcher_quantitative + researcher_qualitative, or writer_long_form + writer_punchy).',
+    'Never duplicate an agent verbatim — each must contribute something distinct.',
+    '',
+    'Respond with ONLY valid JSON — a single object. No markdown, no explanation.',
+    'The object MUST have this shape:',
+    '{',
+    '  "mission": string  — one-sentence north star the whole team shares',
+    '  "values": string[] — 3-5 cultural principles the team operates under (short phrases)',
+    '  "agents": AgentObject[]  — exactly the requested size',
+    '}',
+    '',
+    'Each AgentObject must have:',
+    '  - "name": a real human name. First name only when distinct (e.g. "Sarah", "Marcus", "Aiko"),',
+    '             OR full first + last name when richer characterization fits (e.g. "Sarah Chen",',
+    '             "Marcus Rivera", "Aiko Tanaka"). Pick culturally diverse names that fit each',
+    '             personality. NEVER use single-letter suffixes or initials like "Sarah_C" — if two',
+    '             agents would share a first name, give them different first names entirely or use',
+    '             full last names. Treat each agent as a real teammate, not a serial number.',
+    '  - "position": real-world job title (e.g. "Head of Growth", "Chief Brand Officer")',
     '  - "role": either "orchestrator" or "worker"',
-    '  - "bio": 1-2 sentences describing who this agent is — personality and expertise',
-    '  - "lore": 1-2 sentences of backstory — what shaped them, their origin',
-    '  - "adjectives": array of 3-5 personality trait words (e.g. ["analytical", "thorough", "methodical"])',
-    '  - "topics": array of 3-6 short expertise tags (e.g. ["web research", "data analysis", "fact checking"])',
+    '  - "bio": 1-2 sentences — personality and expertise',
+    '  - "lore": 1-2 sentences of backstory',
+    '  - "adjectives": array of 3-5 personality trait words',
+    '  - "topics": array of 3-6 short expertise tags',
     '  - "knowledge": array of 2-4 specific things this agent knows deeply',
     '  - "style": 1-2 sentences describing how this agent communicates',
-    '  - "system": core instruction — what they do and how (2-3 sentences)',
+    '  - "system": core instruction — what they do, decide, and own (2-3 sentences)',
+    '  - "tools": array of 2-5 skill slugs in snake_case (e.g. ["web_search", "trend_forecast"])',
+    '  - "collaborates_with": array of agent names (snake_case) this agent frequently pairs with.',
+    '             Use this to express working relationships — which workers naturally hand off to,',
+    '             review, or build on each other. Reference names that exist in this same array.',
+    '             The orchestrator may leave this empty (it implicitly delegates to all workers).',
   ].join('\n');
 
   const result = await opts.adapter.generate(config, {
@@ -285,23 +321,189 @@ export async function generateAgentTeam(
     );
   }
 
-  if (!Array.isArray(parsed)) {
-    throw new Error(`Expected JSON array from LLM, got ${typeof parsed}`);
+  // Tolerate both shapes: a bare array (legacy) or a structured object (new).
+  let mission: string | undefined;
+  let values: string[] | undefined;
+  let rawAgents: unknown[];
+
+  if (Array.isArray(parsed)) {
+    rawAgents = parsed;
+  } else if (parsed && typeof parsed === 'object') {
+    const obj = parsed as Record<string, unknown>;
+    mission = typeof obj.mission === 'string' ? obj.mission : undefined;
+    values = Array.isArray(obj.values) ? (obj.values as string[]) : undefined;
+    if (!Array.isArray(obj.agents)) {
+      throw new Error(
+        `Expected "agents" array in LLM response, got ${typeof obj.agents}`
+      );
+    }
+    rawAgents = obj.agents;
+  } else {
+    throw new Error(`Expected JSON object or array from LLM, got ${typeof parsed}`);
   }
 
-  return parsed.map((item: Record<string, unknown>) => ({
-    name: (item.name as string) ?? 'unnamed',
-    role: ((item.role as string) ?? 'worker') as 'orchestrator' | 'worker',
-    bio: (item.bio as string) ?? '',
-    lore: item.lore as string | undefined,
-    adjectives: Array.isArray(item.adjectives)
-      ? (item.adjectives as string[])
-      : undefined,
-    topics: Array.isArray(item.topics) ? (item.topics as string[]) : undefined,
-    knowledge: Array.isArray(item.knowledge)
-      ? (item.knowledge as string[])
-      : undefined,
-    style: item.style as string | undefined,
-    system: (item.system as string) ?? '',
-  }));
+  const agents = rawAgents.map((raw): AgentDefinition => {
+    const item = raw as Record<string, unknown>;
+    return {
+      name: (item.name as string) ?? 'unnamed',
+      position: item.position as string | undefined,
+      role: ((item.role as string) ?? 'worker') as 'orchestrator' | 'worker',
+      bio: (item.bio as string) ?? '',
+      lore: item.lore as string | undefined,
+      adjectives: Array.isArray(item.adjectives)
+        ? (item.adjectives as string[])
+        : undefined,
+      topics: Array.isArray(item.topics) ? (item.topics as string[]) : undefined,
+      knowledge: Array.isArray(item.knowledge)
+        ? (item.knowledge as string[])
+        : undefined,
+      style: item.style as string | undefined,
+      system: (item.system as string) ?? '',
+      tools: Array.isArray(item.tools) ? (item.tools as string[]) : undefined,
+      collaboratesWith: Array.isArray(item.collaborates_with)
+        ? (item.collaborates_with as string[])
+        : Array.isArray(item.collaboratesWith)
+        ? (item.collaboratesWith as string[])
+        : undefined,
+    };
+  });
+
+  return { mission, values, agents };
+}
+
+export interface GenerateSeedMemoriesOptions {
+  adapter: IModelAdapter;
+  model: string;
+  agencyName: string;
+  agencyDescription: string;
+  mission?: string;
+  agents: AgentDefinition[];
+}
+
+const VALID_SEED_TYPES = new Set<SeedMemoryType>([
+  'fact',
+  'observation',
+  'task_result',
+  'reflection',
+]);
+
+/**
+ * Use an LLM to generate realistic seed memories for every agent in the
+ * agency. Returns one AgentSeedMemories per agent (3-5 entries each).
+ */
+export async function generateAgentSeeds(
+  opts: GenerateSeedMemoriesOptions
+): Promise<AgentSeedMemories[]> {
+  const dummyId = '00000000-0000-0000-0000-000000000000' as UUID;
+
+  const config: ModelConfig = {
+    provider: opts.adapter.provider,
+    model: opts.model,
+  };
+
+  const agentSummaries = opts.agents.map((a) => {
+    const lines = [`Name: ${a.name}`, `Position: ${a.position ?? 'unspecified'}`];
+    if (a.bio) lines.push(`Bio: ${a.bio}`);
+    if (a.topics?.length) lines.push(`Expertise: ${a.topics.join(', ')}`);
+    if (a.knowledge?.length) lines.push(`Knows: ${a.knowledge.join('; ')}`);
+    return lines.join('\n');
+  });
+
+  const prompt = [
+    `Agency: "${opts.agencyName}"`,
+    `Purpose: ${opts.agencyDescription}`,
+    ...(opts.mission ? [`Mission: ${opts.mission}`] : []),
+    '',
+    'For each agent below, generate 3-5 seed memories — concrete facts, observations,',
+    'or prior knowledge this person would realistically hold given their role and the agency context.',
+    'Make them specific and useful, not generic platitudes.',
+    '',
+    'Agents:',
+    ...agentSummaries.map((s, i) => `\n[${i + 1}]\n${s}`),
+    '',
+    'Respond with ONLY valid JSON — a single object, no markdown.',
+    '{',
+    '  "seeds": [',
+    '    {',
+    '      "agentName": string  — exactly as given above',
+    '      "memories": [',
+    '        {',
+    '          "type": "fact" | "observation" | "task_result" | "reflection"',
+    '          "content": string  — the memory (1-2 sentences)',
+    '          "importance": number  — 0.0 to 1.0, how relevant this is to day-to-day work',
+    '          "tags": string[]  — 1-3 short labels (optional)',
+    '        }',
+    '      ]',
+    '    }',
+    '  ]',
+    '}',
+  ].join('\n');
+
+  const result = await opts.adapter.generate(config, {
+    system: 'You are a helpful assistant that outputs only valid JSON.',
+    messages: [
+      {
+        id: dummyId,
+        agentId: dummyId,
+        roomId: dummyId,
+        content: { text: prompt },
+        role: 'user',
+        createdAt: Date.now(),
+      },
+    ],
+  });
+
+  const text = result.content.text.trim();
+  const cleaned = text
+    .replace(/^```(?:json)?\s*\n?/i, '')
+    .replace(/\n?```\s*$/i, '')
+    .trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    throw new Error(`Failed to parse seed LLM response as JSON. Raw:\n${text}`);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray((parsed as Record<string, unknown>).seeds)) {
+    throw new Error('Expected { seeds: [...] } from seed generator');
+  }
+
+  const rawSeeds = (parsed as Record<string, unknown>).seeds as unknown[];
+
+  return rawSeeds.map((raw): AgentSeedMemories => {
+    const item = raw as Record<string, unknown>;
+    const agentName = typeof item.agentName === 'string' ? item.agentName : 'unknown';
+    const rawMemories = Array.isArray(item.memories) ? item.memories : [];
+
+    const entries = rawMemories
+      .map((m): SeedMemoryEntry | null => {
+        const mem = m as Record<string, unknown>;
+        const type = mem.type as string;
+        const content = typeof mem.content === 'string' ? mem.content.trim() : '';
+        if (!content || !VALID_SEED_TYPES.has(type as SeedMemoryType)) return null;
+
+        const importance =
+          typeof mem.importance === 'number' &&
+          mem.importance >= 0 &&
+          mem.importance <= 1
+            ? mem.importance
+            : 0.5;
+
+        const tags = Array.isArray(mem.tags)
+          ? (mem.tags as unknown[]).filter((t): t is string => typeof t === 'string')
+          : undefined;
+
+        return {
+          type: type as SeedMemoryType,
+          content,
+          importance,
+          ...(tags && tags.length > 0 ? { tags } : {}),
+        };
+      })
+      .filter((e): e is SeedMemoryEntry => e !== null);
+
+    return { agentName, entries };
+  });
 }

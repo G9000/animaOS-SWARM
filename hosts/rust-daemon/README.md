@@ -21,8 +21,10 @@ Postgres persistence, and streaming clients.
 | `ANIMAOS_RS_PERSISTENCE_MODE` | No | Persistence mode: `memory` (default) or `postgres`. `postgres` requires `DATABASE_URL` and fails startup if Postgres is unavailable or migrations fail. |
 
 Other provider keys follow the same pattern: `GOOGLE_API_KEY`, `GROQ_API_KEY`,
-`OLLAMA_API_KEY`, and so on. The model to use is specified per-agent in the
-request body (`model`), not via a single global env var.
+`MOONSHOT_API_KEY`, `OLLAMA_API_KEY`, and so on. Moonshot/Kimi uses the
+OpenAI-compatible endpoint at `https://api.moonshot.ai/v1`. The model to use is
+specified per-agent in the request body (`model`), not via a single global env
+var.
 
 The daemon emits structured logs through `tracing` and adds `x-request-id` to
 HTTP responses so request logs and client-visible responses can be correlated.

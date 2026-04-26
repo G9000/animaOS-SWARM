@@ -7,6 +7,10 @@ const ENV_KEYS = [
   'GROK_API_KEY',
   'XAI_BASE_URL',
   'OPENROUTER_API_KEY',
+  'MOONSHOT_API_KEY',
+  'MOONSHOT_BASE_URL',
+  'KIMI_API_KEY',
+  'KIMI_BASE_URL',
 ] as const;
 
 afterEach(() => {
@@ -37,6 +41,26 @@ describe('resolveDaemonModelSettings', () => {
 
     expect(resolveDaemonModelSettings('openrouter', 'flag-key')).toEqual({
       apiKey: 'flag-key',
+    });
+  });
+
+  it('resolves moonshot api key and base url for Kimi models', () => {
+    process.env.MOONSHOT_API_KEY = 'moonshot-key';
+    process.env.MOONSHOT_BASE_URL = 'https://moonshot.example/v1';
+
+    expect(resolveDaemonModelSettings('moonshot')).toEqual({
+      apiKey: 'moonshot-key',
+      baseUrl: 'https://moonshot.example/v1',
+    });
+  });
+
+  it('resolves kimi as a moonshot provider alias', () => {
+    process.env.KIMI_API_KEY = 'kimi-key';
+    process.env.KIMI_BASE_URL = 'https://kimi.example/v1';
+
+    expect(resolveDaemonModelSettings('kimi')).toEqual({
+      apiKey: 'kimi-key',
+      baseUrl: 'https://kimi.example/v1',
     });
   });
 });

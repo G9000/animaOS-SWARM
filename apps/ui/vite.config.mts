@@ -54,17 +54,12 @@ function configureWebSocketProxy(proxy: ViteProxy) {
 
 export default defineConfig(() => {
   const backendOrigin =
-    process.env.UI_BACKEND_ORIGIN ?? 'http://localhost:3000';
-  const backendWebSocketOrigin = backendOrigin.replace(/^http/i, 'ws');
+    process.env.UI_BACKEND_ORIGIN ?? 'http://localhost:8080';
   const proxy = process.env.CI
     ? undefined
     : {
         '/api': backendOrigin,
-        '/ws': {
-          target: backendWebSocketOrigin,
-          ws: true,
-          configure: configureWebSocketProxy,
-        },
+        '/health': backendOrigin,
       };
 
   return {

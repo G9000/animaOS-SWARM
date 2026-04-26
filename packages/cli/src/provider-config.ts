@@ -23,6 +23,7 @@ const DEFAULT_TOGETHER_BASE_URL = 'https://api.together.xyz/v1';
 const DEFAULT_DEEPSEEK_BASE_URL = 'https://api.deepseek.com/v1';
 const DEFAULT_FIREWORKS_BASE_URL = 'https://api.fireworks.ai/inference/v1';
 const DEFAULT_PERPLEXITY_BASE_URL = 'https://api.perplexity.ai';
+const DEFAULT_MOONSHOT_BASE_URL = 'https://api.moonshot.ai/v1';
 
 const PROVIDER_ENV: Record<string, ProviderEnvConfig> = {
   openai: {
@@ -112,10 +113,20 @@ const PROVIDER_ENV: Record<string, ProviderEnvConfig> = {
     urlEnv: ['PERPLEXITY_BASE_URL'],
     defaultBaseUrl: DEFAULT_PERPLEXITY_BASE_URL,
   },
+  moonshot: {
+    keyEnv: ['MOONSHOT_API_KEY', 'MOONSHOT_KEY', 'MOONSHOT_TOKEN', 'KIMI_API_KEY'],
+    urlEnv: ['MOONSHOT_BASE_URL', 'KIMI_BASE_URL'],
+    defaultBaseUrl: DEFAULT_MOONSHOT_BASE_URL,
+  },
+  kimi: {
+    keyEnv: ['KIMI_API_KEY', 'MOONSHOT_API_KEY', 'MOONSHOT_KEY', 'MOONSHOT_TOKEN'],
+    urlEnv: ['KIMI_BASE_URL', 'MOONSHOT_BASE_URL'],
+    defaultBaseUrl: DEFAULT_MOONSHOT_BASE_URL,
+  },
 };
 
 export const PROVIDER_HELP_TEXT =
-  'Provider: openai, anthropic, google/gemini, ollama, groq, xai/grok, openrouter, mistral, together, deepseek, fireworks, perplexity';
+  'Provider: openai, anthropic, google/gemini, ollama, groq, xai/grok, openrouter, mistral, together, deepseek, fireworks, perplexity, moonshot/kimi';
 
 export function normalizeProvider(
   provider: string | undefined

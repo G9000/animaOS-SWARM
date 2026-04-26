@@ -16,6 +16,8 @@ const SUPPORTED_CREATE_PROVIDERS = [
   'deepseek',
   'fireworks',
   'perplexity',
+  'moonshot',
+  'kimi',
 ] as const;
 
 describe('createAdapter', () => {

@@ -459,6 +459,7 @@ try {
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL` |
 | Fireworks | `fireworks` | `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL` |
 | Perplexity | `perplexity` | `PERPLEXITY_API_KEY`, `PERPLEXITY_BASE_URL` |
+| Moonshot Kimi | `moonshot` / `kimi` | `MOONSHOT_API_KEY`, `MOONSHOT_BASE_URL` |
 
 ### Configuration Priority
 

@@ -1,0 +1,38 @@
+[
+  {
+    "type": "fact",
+    "content": "LinkedIn remains the highest CPL channel, but provides the highest Lead-to-SQL conversion rate for the AnimaOS target profile.",
+    "importance": 0.9,
+    "tags": [
+      "Paid Acquisition",
+      "Channels"
+    ]
+  },
+  {
+    "type": "observation",
+    "content": "Current lead scoring is over-weighting whitepaper downloads, which is flooding the pipeline with low-intent researchers.",
+    "importance": 0.8,
+    "tags": [
+      "Lead Scoring",
+      "Funnel"
+    ]
+  },
+  {
+    "type": "task_result",
+    "content": "Architected a multi-channel nurture sequence that increased the MQL-to-SQL velocity by 18% over the last quarter.",
+    "importance": 0.7,
+    "tags": [
+      "Automation",
+      "Lead Nurture"
+    ]
+  },
+  {
+    "type": "fact",
+    "content": "The current CRM is leaking leads at the 'Hand-off to Sales' stage due to a lack of standardized qualification data.",
+    "importance": 0.9,
+    "tags": [
+      "CRM",
+      "Pipeline"
+    ]
+  }
+]

@@ -23,7 +23,7 @@ use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
 use tracing::{info_span, Level};
 use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use utoipa_scalar::{Scalar, Servable};
 
 use crate::app::{DaemonConfig, SharedDaemonState};
 
@@ -37,7 +37,6 @@ use self::contracts::{
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        health_entry,
         api_health_entry,
         create_memory_entry,
         memories_search_entry,
@@ -129,7 +128,7 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
                 ),
         );
     let standard_routes = Router::new()
-        .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
+        .merge(Scalar::with_url("/docs", ApiDoc::openapi()))
         .route("/health", get(health_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/memories", axum::routing::post(create_memory_entry))
@@ -186,12 +185,6 @@ fn make_http_span<B>(request: &HttpRequest<B>) -> tracing::Span {
     )
 }
 
-#[utoipa::path(
-    get,
-    path = "/health",
-    tag = "health",
-    responses((status = 200, description = "Daemon is alive", body = HealthResponse))
-)]
 async fn health_entry() -> AxumResponse {
     json_response(StatusCode::OK, &health::handle_health())
 }

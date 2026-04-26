@@ -14,6 +14,12 @@ import {
 } from '@animaOS-SWARM/core';
 import type { SwarmConfig } from '@animaOS-SWARM/sdk';
 import { loadAgency, agencyExists } from '../agency/loader.js';
+import {
+  loadSeedMemories,
+  resolveAgentIds,
+  seedDaemonMemories,
+  type AgentSeedMemories,
+} from '../agency/seed-memory.js';
 import { createCliDaemonClient, type CliDaemonClient } from '../client.js';
 import type { AgencyConfig, AgentDefinition } from '../agency/types.js';
 import type { AgentProfile, ResultEntry } from '@animaOS-SWARM/tui';
@@ -58,7 +64,7 @@ interface DaemonTuiRuntime {
 
 interface LaunchDeps {
   client?: Pick<CliDaemonClient, 'swarms'> &
-    Partial<Pick<CliDaemonClient, 'health'>>;
+    Partial<Pick<CliDaemonClient, 'health' | 'agents' | 'memories'>>;
   createReadline?: () => Pick<Interface, 'question' | 'close'>;
   createDaemonTuiRuntime?: () => Promise<DaemonTuiRuntime>;
 }
@@ -219,9 +225,11 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
 }
 
 function createDaemonSwarmSession(
-  client: Pick<CliDaemonClient, 'swarms'>,
+  client: Pick<CliDaemonClient, 'swarms'> &
+    Partial<Pick<CliDaemonClient, 'agents' | 'memories'>>,
   agency: AgencyConfig,
-  opts: Pick<LaunchOptions, 'apiKey'>
+  opts: Pick<LaunchOptions, 'apiKey'>,
+  onAfterCreate?: (swarm: DaemonSwarmSnapshot) => Promise<void>
 ): {
   getSwarm: () => Promise<DaemonSwarmSnapshot>;
   invalidate: () => void;
@@ -234,6 +242,12 @@ function createDaemonSwarmSession(
       if (!swarmPromise) {
         swarmPromise = client.swarms
           .create(swarmConfig as unknown as SwarmConfig)
+          .then(async (swarm) => {
+            if (onAfterCreate) {
+              await onAfterCreate(swarm);
+            }
+            return swarm;
+          })
           .catch((error: unknown) => {
             swarmPromise = undefined;
             throw error;
@@ -247,6 +261,37 @@ function createDaemonSwarmSession(
       swarmPromise = undefined;
     },
   };
+}
+
+async function applySeedMemories(
+  client: Pick<CliDaemonClient, 'swarms'> &
+    Partial<Pick<CliDaemonClient, 'agents' | 'memories'>>,
+  swarm: DaemonSwarmSnapshot,
+  seeds: AgentSeedMemories[]
+): Promise<{ created: number; errors: string[] } | undefined> {
+  if (seeds.length === 0) return undefined;
+  if (!client.agents || !client.memories) return undefined;
+
+  const agentIds = swarm.agentIds ?? [];
+  const idsByName = await resolveAgentIds(agentIds, (id) =>
+    client.agents!.get(id)
+  );
+
+  return seedDaemonMemories(seeds, idsByName, (body) =>
+    client.memories!.create(body)
+  );
+}
+
+function reportSeedResult(
+  result: { created: number; errors: string[] } | undefined
+): void {
+  if (!result) return;
+  if (result.created > 0) {
+    console.log(`Seeded ${result.created} memories from agents/<slug>/memory/seed.json`);
+  }
+  for (const err of result.errors) {
+    console.error('Warning:', err);
+  }
 }
 
 async function getDaemonPreflightWarning(
@@ -410,7 +455,16 @@ async function executeDaemonLaunchCommand(
 ): Promise<void> {
   try {
     const client = deps.client ?? createCliDaemonClient();
-    const swarmSession = createDaemonSwarmSession(client, agency, opts);
+    const seeds = loadSeedMemories(opts.dir, agency);
+    const swarmSession = createDaemonSwarmSession(
+      client,
+      agency,
+      opts,
+      async (swarm) => {
+        const result = await applySeedMemories(client, swarm, seeds);
+        reportSeedResult(result);
+      }
+    );
     let daemonWarning = await getDaemonPreflightWarning(client);
 
     if (!task) {
@@ -558,7 +612,16 @@ async function executeDaemonTuiLaunchCommand(
 ): Promise<void> {
   try {
     const client = deps.client ?? createCliDaemonClient();
-    const swarmSession = createDaemonSwarmSession(client, agency, opts);
+    const seeds = loadSeedMemories(opts.dir, agency);
+    const swarmSession = createDaemonSwarmSession(
+      client,
+      agency,
+      opts,
+      async (swarm) => {
+        const result = await applySeedMemories(client, swarm, seeds);
+        reportSeedResult(result);
+      }
+    );
     const tuiRuntime = deps.createDaemonTuiRuntime
       ? await deps.createDaemonTuiRuntime()
       : await loadDaemonTuiRuntime();
