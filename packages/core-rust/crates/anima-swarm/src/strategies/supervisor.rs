@@ -281,7 +281,15 @@ fn supervisor_system_prompt(
             .join(", "),
     );
     prompt.push_str(&format!(
-        ".\nUse the delegate_task tool for one subtask and delegate_tasks for multiple independent subtasks that should run concurrently. Keep total concurrent delegations at or below {max_parallel_delegations}. Synthesize the results into a final answer."
+        ".\nUse the delegate_task tool for one subtask and delegate_tasks for multiple independent subtasks that should run concurrently. Keep total concurrent delegations at or below {max_parallel_delegations}.\n\
+        \n\
+        SYNTHESIS GUIDELINES:\n\
+        When you synthesize worker results, your job is NOT to force consensus. Workers were chosen for distinct perspectives — preserve that.\n\
+        - Surface disagreements explicitly. If two workers reach different conclusions, name both and explain the tension. Do not paper over conflicts.\n\
+        - Quote or attribute strong, specific claims to the worker who made them, especially when their angle differs from peers.\n\
+        - When the question genuinely has multiple defensible answers, present them as alternatives rather than averaging into a single blurred answer.\n\
+        - Only converge on one answer when the workers themselves clearly agree, or when the task demands a single decision and you can justify the choice over the rejected alternatives.\n\
+        - Treat dissent from a worker (especially a designated skeptic) as a signal worth keeping, not noise to smooth over."
     ));
     prompt
 }
