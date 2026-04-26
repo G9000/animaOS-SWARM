@@ -222,6 +222,12 @@ export interface GenerateAgentTeamOptions {
   agencyDescription: string;
   /** Total team size including the orchestrator. Defaults to 4. Clamped to [2, 10]. */
   teamSize?: number;
+  /**
+   * Optional pool of model identifiers to distribute across agents.
+   * When provided, the LLM assigns each agent a model from this list.
+   * Heterogeneous models significantly reduce consensus collapse (see arXiv:2604.18005).
+   */
+  modelPool?: string[];
 }
 
 export interface GeneratedAgency {
@@ -245,6 +251,27 @@ export async function generateAgentTeam(
 
   const requestedSize = Math.max(2, Math.min(10, opts.teamSize ?? 4));
   const workerCount = requestedSize - 1;
+  const needsSkeptic = workerCount >= 3;
+  const modelPool = opts.modelPool && opts.modelPool.length > 0 ? opts.modelPool : null;
+
+  const modelInstruction = modelPool
+    ? [
+        '',
+        `MODEL POOL — assign each agent one model from this list: [${modelPool.map((m) => `"${m}"`).join(', ')}].`,
+        'Distribute them so no two adjacent collaborators share the same model.',
+        'Each AgentObject must include a "model" field set to one of the listed values.',
+      ]
+    : [];
+
+  const skepticInstruction = needsSkeptic
+    ? [
+        '',
+        'SKEPTIC RULE: one worker must be a dedicated contrarian — their explicit job is to challenge',
+        'assumptions, poke holes in plans, and surface risks others miss. Their "system" must include',
+        'an instruction to actively disagree when they see flaws, not to reach consensus.',
+        'Give this agent adjectives like "skeptical", "rigorous", "contrarian".',
+      ]
+    : [];
 
   const prompt = [
     `You are designing a team of AI agents for an agency called "${opts.agencyName}".`,
@@ -258,6 +285,12 @@ export async function generateAgentTeam(
     'you may include 2-3 agents in similar roles but with DIFFERENT angles or methodologies',
     '(e.g. researcher_quantitative + researcher_qualitative, or writer_long_form + writer_punchy).',
     'Never duplicate an agent verbatim — each must contribute something distinct.',
+    ...skepticInstruction,
+    '',
+    'ANTI-SYCOPHANCY: every worker\'s "system" field MUST include a sentence instructing them to',
+    'challenge assumptions and disagree with the orchestrator whenever they have a different view.',
+    'Workers should surface dissent, not defer.',
+    ...modelInstruction,
     '',
     'Respond with ONLY valid JSON — a single object. No markdown, no explanation.',
     'The object MUST have this shape:',
@@ -282,8 +315,10 @@ export async function generateAgentTeam(
     '  - "topics": array of 3-6 short expertise tags',
     '  - "knowledge": array of 2-4 specific things this agent knows deeply',
     '  - "style": 1-2 sentences describing how this agent communicates',
-    '  - "system": core instruction — what they do, decide, and own (2-3 sentences)',
+    '  - "system": core instruction — what they do, decide, and own (2-3 sentences). Must include',
+    '              a line instructing the agent to voice disagreement when they see a better path.',
     '  - "tools": array of 2-5 skill slugs in snake_case (e.g. ["web_search", "trend_forecast"])',
+    ...(modelPool ? ['  - "model": one model from the provided pool'] : []),
     '  - "collaborates_with": array of agent names (snake_case) this agent frequently pairs with.',
     '             Use this to express working relationships — which workers naturally hand off to,',
     '             review, or build on each other. Reference names that exist in this same array.',
@@ -359,6 +394,7 @@ export async function generateAgentTeam(
         : undefined,
       style: item.style as string | undefined,
       system: (item.system as string) ?? '',
+      model: typeof item.model === 'string' ? item.model : undefined,
       tools: Array.isArray(item.tools) ? (item.tools as string[]) : undefined,
       collaboratesWith: Array.isArray(item.collaborates_with)
         ? (item.collaborates_with as string[])

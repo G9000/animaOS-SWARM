@@ -19,6 +19,7 @@ export const createCommand = new Command('create')
   .argument('[name]', 'Agency name')
   .option('-p, --provider <provider>', PROVIDER_HELP_TEXT, 'openai')
   .option('-m, --model <model>', 'Model to use', 'gpt-4o-mini')
+  .option('--models <list>', 'Comma-separated model pool to distribute across agents (e.g. "gemma4:31b,llama3.1:70b")')
   .option('-d, --description <description>', 'Agency description')
   .option('-s, --size <number>', 'Team size including orchestrator (2-10)', '4')
   .option('--api-key <key>', 'API key')
@@ -33,6 +34,7 @@ export const createCommand = new Command('create')
         description?: string;
         size?: string;
         apiKey?: string;
+        models?: string;
         seed?: boolean;
         yes?: boolean;
       }
@@ -110,12 +112,16 @@ export const createCommand = new Command('create')
       let values: string[] | undefined;
       try {
         const adapter = createAdapter(opts.provider, opts.apiKey);
+        const modelPool = opts.models
+          ? opts.models.split(',').map((m) => m.trim()).filter(Boolean)
+          : undefined;
         const generated = await generateAgentTeam({
           adapter,
           model: opts.model,
           agencyName: name as string,
           agencyDescription: description as string,
           teamSize,
+          modelPool,
         });
         agents = generated.agents;
         mission = generated.mission;
@@ -222,6 +228,7 @@ export const createCommand = new Command('create')
         knowledge: a.knowledge,
         style: a.style,
         system: a.system,
+        model: a.model,
         tools: a.tools,
         collaboratesWith: a.collaboratesWith,
       });
