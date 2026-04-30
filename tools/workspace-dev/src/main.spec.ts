@@ -30,9 +30,9 @@ describe('workspace-dev orchestration', () => {
           },
         },
         {
-          name: '@animaOS-SWARM/ui',
+          name: '@animaOS-SWARM/web',
           command: 'bun',
-          args: ['x', 'nx', 'run', '@animaOS-SWARM/ui:serve'],
+          args: ['x', 'nx', 'run', '@animaOS-SWARM/web:serve'],
           env: {
             UI_BACKEND_ORIGIN: 'http://127.0.0.1:8080',
             VITE_HOST_KEY: 'rust',
@@ -58,9 +58,9 @@ describe('workspace-dev orchestration', () => {
       },
       processes: [
         {
-          name: '@animaOS-SWARM/ui',
+          name: '@animaOS-SWARM/web',
           command: 'bun',
-          args: ['x', 'nx', 'run', '@animaOS-SWARM/ui:serve'],
+          args: ['x', 'nx', 'run', '@animaOS-SWARM/web:serve'],
           env: {
             UI_BACKEND_ORIGIN: 'http://127.0.0.1:8080',
             VITE_HOST_KEY: 'rust',

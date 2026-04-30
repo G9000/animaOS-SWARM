@@ -10,6 +10,7 @@ use super::super::workspace::{canonical_workspace_root, resolve_workspace_search
 use super::shell::{resolve_shell_launcher, truncate_shell_output};
 
 const MAX_PROCESS_OUTPUT_LINES: usize = 2_000;
+pub(crate) const DEFAULT_MAX_BACKGROUND_PROCESSES: usize = 8;
 
 pub(crate) type SharedProcessManager = Arc<Mutex<ProcessManager>>;
 
@@ -17,6 +18,7 @@ pub(crate) type SharedProcessManager = Arc<Mutex<ProcessManager>>;
 pub(crate) struct ProcessManager {
     processes: HashMap<String, ManagedProcess>,
     next_id: u64,
+    max_running_processes: usize,
 }
 
 struct ManagedProcess {
@@ -34,15 +36,44 @@ struct ManagedProcessOutput {
     exit_code: Option<i32>,
 }
 
+#[cfg(test)]
 pub(crate) fn new_shared_process_manager() -> SharedProcessManager {
-    Arc::new(Mutex::new(ProcessManager::new()))
+    new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES)
+}
+
+pub(crate) fn new_shared_process_manager_with_limit(
+    max_running_processes: usize,
+) -> SharedProcessManager {
+    Arc::new(Mutex::new(ProcessManager::new(max_running_processes)))
+}
+
+#[cfg(test)]
+pub(crate) fn set_background_process_limit(
+    process_manager: &SharedProcessManager,
+    max_running_processes: usize,
+) -> Result<(), String> {
+    let mut manager = process_manager
+        .lock()
+        .map_err(|_| "background process manager lock poisoned".to_string())?;
+    manager.max_running_processes = max_running_processes;
+    Ok(())
+}
+
+pub(crate) fn background_process_count(
+    process_manager: &SharedProcessManager,
+) -> Result<usize, String> {
+    let mut manager = process_manager
+        .lock()
+        .map_err(|_| "background process manager lock poisoned".to_string())?;
+    running_process_count(&mut manager)
 }
 
 impl ProcessManager {
-    fn new() -> Self {
+    fn new(max_running_processes: usize) -> Self {
         Self {
             processes: HashMap::new(),
             next_id: 1,
+            max_running_processes,
         }
     }
 }
@@ -73,6 +104,18 @@ pub(in super::super) fn start_background_process_from_root(
 ) -> Result<String, String> {
     let cwd_path =
         resolve_workspace_search_root(&canonical_workspace_root(workspace_root, "bg_start")?, cwd, "bg_start")?;
+
+    let mut manager = process_manager
+        .lock()
+        .map_err(|_| "background process manager lock poisoned".to_string())?;
+    let running_processes = running_process_count(&mut manager)?;
+    if running_processes >= manager.max_running_processes {
+        return Err(format!(
+            "bg_start limit reached: {} running background processes (max {}).",
+            running_processes, manager.max_running_processes
+        ));
+    }
+
     let (executable, flags) = resolve_shell_launcher()?;
 
     let mut child = Command::new(&executable)
@@ -98,9 +141,6 @@ pub(in super::super) fn start_background_process_from_root(
     spawn_process_output_reader(stdout, Arc::clone(&output_state), false);
     spawn_process_output_reader(stderr, Arc::clone(&output_state), true);
 
-    let mut manager = process_manager
-        .lock()
-        .map_err(|_| "background process manager lock poisoned".to_string())?;
     let id = format!("bg-{}", manager.next_id);
     manager.next_id += 1;
     manager.processes.insert(
@@ -240,6 +280,23 @@ pub(in super::super) fn list_background_processes(
     lines.sort();
 
     Ok(lines.join("\n"))
+}
+
+fn running_process_count(manager: &mut ProcessManager) -> Result<usize, String> {
+    let mut running_processes = 0;
+    for managed in manager.processes.values_mut() {
+        sync_managed_process_exit(managed)?;
+        let exit_code = managed
+            .output_state
+            .lock()
+            .map_err(|_| "background process output lock poisoned".to_string())?
+            .exit_code;
+        if exit_code.is_none() {
+            running_processes += 1;
+        }
+    }
+
+    Ok(running_processes)
 }
 
 fn sync_managed_process_exit(managed: &mut ManagedProcess) -> Result<(), String> {

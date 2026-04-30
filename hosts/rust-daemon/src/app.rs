@@ -14,8 +14,11 @@ use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::routes;
 use crate::runtime_model::RuntimeModelAdapter;
 use crate::state::DaemonState;
+use crate::tools::DEFAULT_MAX_BACKGROUND_PROCESSES;
 
 pub(crate) type SharedDaemonState = Arc<RwLock<DaemonState>>;
+
+const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceMode {
@@ -23,11 +26,22 @@ pub enum PersistenceMode {
     Postgres,
 }
 
+impl PersistenceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DaemonConfig {
     pub max_request_bytes: usize,
     pub request_timeout: Duration,
     pub persistence_mode: PersistenceMode,
+    pub max_concurrent_runs: usize,
+    pub max_background_processes: usize,
 }
 
 impl Default for DaemonConfig {
@@ -36,6 +50,8 @@ impl Default for DaemonConfig {
             max_request_bytes: 64 * 1024,
             request_timeout: Duration::from_secs(30),
             persistence_mode: PersistenceMode::Memory,
+            max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
+            max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
         }
     }
 }
@@ -46,10 +62,11 @@ pub fn app() -> Router {
 
 pub fn app_with_config(config: DaemonConfig) -> Router {
     let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
-    app_with_state(
-        Arc::new(RwLock::new(DaemonState::with_events(event_fanout))),
-        config,
-    )
+    let state = Arc::new(RwLock::new(DaemonState::with_events_and_limits(
+        event_fanout,
+        config.max_background_processes,
+    )));
+    app_with_state(state, config)
 }
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
@@ -58,9 +75,10 @@ pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> 
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
     let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
-    let state = Arc::new(RwLock::new(DaemonState::with_model_adapter_and_events(
+    let state = Arc::new(RwLock::new(DaemonState::with_model_adapter_and_events_and_limits(
         Arc::new(RuntimeModelAdapter::from_env()),
         event_fanout,
+        config.max_background_processes,
     )));
 
     configure_persistence(&state, config.persistence_mode).await?;

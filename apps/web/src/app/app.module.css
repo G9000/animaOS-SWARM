@@ -1,0 +1,148 @@
+.shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem;
+}
+
+.header {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--app-border-strong);
+}
+
+.headerRight {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+}
+
+.kicker {
+  font-size: 0.72rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--app-text-muted);
+}
+
+.title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: var(--app-text-primary);
+}
+
+.main {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+  padding-top: 2rem;
+}
+
+.muted {
+  color: var(--app-text-muted);
+  font-size: 0.82rem;
+  margin: 0;
+}
+
+.err {
+  color: var(--app-danger);
+  font-size: 0.82rem;
+  margin: 0;
+}
+
+/* ── Badge ────────────────────────────────────────────────────────────────── */
+
+.badge {
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  color: var(--app-text-muted);
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.badge[data-status='ok'] {
+  color: var(--app-success);
+}
+
+.badge[data-status='err'] {
+  color: var(--app-danger);
+}
+
+/* ── Status dots ──────────────────────────────────────────────────────────── */
+
+.dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+.dotGreen {
+  background: var(--app-success);
+}
+
+.dotYellow {
+  background: var(--app-accent);
+}
+
+.dotRed {
+  background: var(--app-danger);
+}
+
+/* ── Panel ────────────────────────────────────────────────────────────────── */
+
+.panel {
+  border: 1px solid var(--app-border);
+  background: var(--app-surface);
+  padding: 1.25rem 1.5rem;
+}
+
+.panelTitle {
+  margin: 0 0 1rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--app-text-muted);
+  font-weight: 400;
+}
+
+/* ── Table ────────────────────────────────────────────────────────────────── */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+
+.table th {
+  text-align: left;
+  color: var(--app-text-muted);
+  font-weight: 400;
+  letter-spacing: 0.1em;
+  font-size: 0.72rem;
+  padding: 0 0.75rem 0.6rem 0;
+  border-bottom: 1px solid var(--app-border);
+}
+
+.table td {
+  padding: 0.55rem 0.75rem 0.55rem 0;
+  border-bottom: 1px solid var(--app-border);
+  color: var(--app-text-secondary);
+  vertical-align: middle;
+}
+
+.table tr:last-child td {
+  border-bottom: none;
+}
+
+.mono {
+  color: var(--app-text-muted);
+  font-size: 0.78rem;
+}

@@ -3,10 +3,10 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(() => ({
   root: __dirname,
-  cacheDir: '../../node_modules/.vite/apps/ui-vitest',
+  cacheDir: '../../node_modules/.vite/apps/web-vitest',
   plugins: [react()],
   test: {
-    name: '@animaOS-SWARM/ui',
+    name: '@animaOS-SWARM/web',
     watch: false,
     globals: true,
     environment: 'node',

@@ -12,7 +12,8 @@ pub(crate) use memories::{
     MemorySearchResultResponse, RecentMemoriesQuery,
 };
 pub(crate) use shared::{
-    DeleteResponse, ErrorBody, HealthResponse, TaskRequest, TaskResultResponse,
+    DeleteResponse, ErrorBody, HealthResponse, ReadinessResponse, TaskRequest,
+    TaskResultResponse,
 };
 pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,

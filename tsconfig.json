@@ -25,10 +25,10 @@
       "path": "./apps/server"
     },
     {
-      "path": "./apps/ui-e2e"
+      "path": "./apps/web-e2e"
     },
     {
-      "path": "./apps/ui"
+      "path": "./apps/web"
     },
     {
       "path": "./packages/tui"

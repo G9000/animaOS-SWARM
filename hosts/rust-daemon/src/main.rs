@@ -24,6 +24,14 @@ async fn main() -> io::Result<()> {
             default_config.request_timeout.as_secs(),
         )?),
         persistence_mode: parse_persistence_mode(default_config.persistence_mode)?,
+        max_concurrent_runs: parse_env_usize(
+            "ANIMAOS_RS_MAX_CONCURRENT_RUNS",
+            default_config.max_concurrent_runs,
+        )?,
+        max_background_processes: parse_env_usize(
+            "ANIMAOS_RS_MAX_BACKGROUND_PROCESSES",
+            default_config.max_background_processes,
+        )?,
     };
 
     let listener = TcpListener::bind(bind_addr.as_str()).await?;
@@ -31,7 +39,10 @@ async fn main() -> io::Result<()> {
     info!(
         address = %local_addr,
         timeout_secs = config.request_timeout.as_secs(),
-        persistence_mode = ?config.persistence_mode,
+        persistence_mode = config.persistence_mode.as_str(),
+        max_concurrent_runs = config.max_concurrent_runs,
+        max_background_processes = config.max_background_processes,
+        control_plane_durability = "ephemeral",
         "anima-daemon listening"
     );
 
@@ -40,12 +51,21 @@ async fn main() -> io::Result<()> {
 
 fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
     match std::env::var(name) {
-        Ok(value) => value.parse::<usize>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be a positive integer"),
-            )
-        }),
+        Ok(value) => {
+            let parsed = value.parse::<usize>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer"),
+                )
+            })?;
+            if parsed == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer"),
+                ));
+            }
+            Ok(parsed)
+        }
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -56,12 +76,21 @@ fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
 
 fn parse_env_u64(name: &str, default: u64) -> io::Result<u64> {
     match std::env::var(name) {
-        Ok(value) => value.parse::<u64>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} must be a positive integer"),
-            )
-        }),
+        Ok(value) => {
+            let parsed = value.parse::<u64>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer"),
+                )
+            })?;
+            if parsed == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer"),
+                ));
+            }
+            Ok(parsed)
+        }
         Err(std::env::VarError::NotPresent) => Ok(default),
         Err(error) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,

@@ -1,5 +1,5 @@
 {
-  "name": "@animaOS-SWARM/ui-e2e",
+  "name": "@animaOS-SWARM/web-e2e",
   "version": "0.0.1",
   "private": true,
   "nx": {
@@ -7,7 +7,7 @@
       "e2e-live": {
         "executor": "nx:run-commands",
         "options": {
-          "cwd": "apps/ui-e2e",
+          "cwd": "apps/web-e2e",
           "env": {
             "PLAYWRIGHT_HTML_OUTPUT_DIR": "test-output\\playwright\\live-report",
             "PLAYWRIGHT_HTML_REPORT": "test-output\\playwright\\live-report",
@@ -49,7 +49,7 @@
       }
     },
     "implicitDependencies": [
-      "@animaOS-SWARM/ui"
+      "@animaOS-SWARM/web"
     ]
   }
 }

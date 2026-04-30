@@ -40,6 +40,75 @@ async fn health_endpoint_returns_ok_json() {
 }
 
 #[tokio::test]
+async fn readiness_endpoint_returns_ready_json() {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/ready")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("app responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .expect("content-type header exists"),
+        "application/json"
+    );
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    let body = std::str::from_utf8(&body).expect("body is utf-8");
+    assert!(body.contains("\"status\":\"ready\""), "{body}");
+    assert!(
+        body.contains("\"controlPlaneDurability\":\"ephemeral\""),
+        "{body}"
+    );
+    assert!(body.contains("\"persistenceMode\":\"memory\""), "{body}");
+}
+
+#[tokio::test]
+async fn metrics_endpoint_returns_prometheus_text() {
+    let response = app()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("app responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .expect("content-type header exists")
+        .to_str()
+        .expect("content-type header is utf-8");
+    assert!(content_type.starts_with("text/plain"), "{content_type}");
+
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    let body = std::str::from_utf8(&body).expect("body is utf-8");
+    assert!(body.contains("anima_daemon_ready 1"), "{body}");
+    assert!(body.contains("anima_daemon_agents"), "{body}");
+    assert!(body.contains("anima_daemon_memories"), "{body}");
+    assert!(
+        body.contains("anima_daemon_control_plane_durability_info{mode=\"ephemeral\"} 1"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn health_endpoint_propagates_request_id_header() {
     let response = app()
         .oneshot(

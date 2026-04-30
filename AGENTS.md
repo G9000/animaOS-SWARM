@@ -32,6 +32,7 @@ This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime pa
 # Verification
 
 - For Rust host/core changes, run `bun x nx run rust-daemon:test --skipNxCache`.
+- On Windows, if a running daemon locks `target/debug/anima-daemon.exe`, rerun Rust host validation with `CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache`.
 - For dev launcher changes, run `bun x nx test workspace-dev --runInBand --skipNxCache`.
 - For TypeScript package changes, use the relevant Nx `test`, `build`, or `typecheck` target.
 - Do not claim completion unless the relevant verification commands have passed in the current tree.

@@ -27,7 +27,7 @@ export default defineConfig({
       },
     },
     {
-      command: `bun x nx run @animaOS-SWARM/ui:serve -- --host 127.0.0.1 --port ${String(
+      command: `bun x nx run @animaOS-SWARM/web:serve -- --host 127.0.0.1 --port ${String(
         uiPort
       )}`,
       url: baseURL,

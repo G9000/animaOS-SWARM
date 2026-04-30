@@ -12,10 +12,10 @@ use super::{
     },
     process::{
         background::{
-            list_background_processes, read_background_process_output,
+            list_background_processes, new_shared_process_manager,
+            read_background_process_output, set_background_process_limit,
             start_background_process_from_root, stop_background_process,
         },
-        new_shared_process_manager,
         shell::execute_bash_command_from_root,
     },
     todo::{
@@ -457,6 +457,26 @@ fn background_process_manager_tracks_process_lifecycle() {
     let output =
         read_background_process_output(&manager, "bg-1", true).expect("read background output");
     assert!(output.to_ascii_lowercase().contains("hello"));
+
+    let stopped = stop_background_process(&manager, "bg-1").expect("stop process");
+    assert_eq!(stopped, "Stopped and removed bg-1.");
+
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
+fn background_process_manager_enforces_running_process_limit() {
+    let workspace = create_temp_workspace("bg-process-limit");
+    let manager = new_shared_process_manager();
+    set_background_process_limit(&manager, 1).expect("set background process limit");
+
+    let started = start_background_process_from_root(&manager, &workspace, "sleep 1", ".")
+        .expect("start background process");
+    assert!(started.contains("bg-1"));
+
+    let error = start_background_process_from_root(&manager, &workspace, "sleep 1", ".")
+        .expect_err("second process should be rejected");
+    assert!(error.contains("bg_start limit reached"), "{error}");
 
     let stopped = stop_background_process(&manager, "bg-1").expect("stop process");
     assert_eq!(stopped, "Stopped and removed bg-1.");

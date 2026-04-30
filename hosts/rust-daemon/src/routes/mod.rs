@@ -5,11 +5,14 @@ mod http;
 mod memories;
 mod swarms;
 
+use std::sync::Arc;
+
 use axum::extract::{Path, Request as AxumRequest, State};
-use axum::http::{StatusCode, Uri};
+use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response as AxumResponse};
 use axum::routing::get;
 use axum::Router;
+use tokio::sync::Semaphore;
 use tower::ServiceBuilder;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
@@ -24,8 +27,9 @@ use crate::app::{DaemonConfig, SharedDaemonState};
 use self::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope, AgentsEnvelope,
     DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope, MemoryCreateRequest,
-    MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, RecentMemoriesQuery,
-    SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
+    MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, ReadinessResponse,
+    RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope,
+    TaskRequest,
 };
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
 pub(super) use self::http::{parse_json_body, serialize_json};
@@ -34,6 +38,7 @@ pub(super) use self::http::{parse_json_body, serialize_json};
 #[openapi(
     paths(
         api_health_entry,
+        ready_entry,
         create_memory_entry,
         memories_search_entry,
         search_alias_entry,
@@ -63,6 +68,7 @@ struct ApiDoc;
 struct AppState {
     daemon: SharedDaemonState,
     config: DaemonConfig,
+    run_limiter: Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -93,6 +99,13 @@ impl ApiError {
             message: "not found".to_string(),
         }
     }
+
+    pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -110,6 +123,7 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
     let app_state = AppState {
         daemon: state,
         config,
+        run_limiter: Arc::new(Semaphore::new(config.max_concurrent_runs)),
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -128,7 +142,10 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         .route("/docs", get(docs_entry))
         .route("/docs/", get(docs_entry))
         .route("/health", get(health_entry))
+        .route("/ready", get(ready_entry))
+        .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
+        .route("/api/ready", get(ready_entry))
         .route("/api/memories", axum::routing::post(create_memory_entry))
         .route("/api/memories/search", get(memories_search_entry))
         .route("/api/search", get(search_alias_entry))
@@ -159,7 +176,11 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             "/api/agents/{agent_id}/run",
             axum::routing::post(run_agent_entry),
         )
-        .route("/api/swarms/{swarm_id}/run", axum::routing::post(run_swarm_entry));
+        .route("/api/swarms/{swarm_id}/run", axum::routing::post(run_swarm_entry))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            config.request_timeout,
+        ));
 
     Router::new()
         .merge(timed_routes)
@@ -190,6 +211,39 @@ async fn docs_entry() -> Html<String> {
 )]
 async fn api_health_entry() -> AxumResponse {
     json_response(StatusCode::OK, &health::handle_health())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/ready",
+    tag = "health",
+    responses(
+        (status = 200, description = "Daemon is ready", body = ReadinessResponse),
+        (status = 503, description = "Daemon is not ready", body = ReadinessResponse)
+    )
+)]
+async fn ready_entry(State(state): State<AppState>) -> AxumResponse {
+    let response = health::handle_readiness(&state.daemon, &state.config).await;
+    let status = if response.status == "ready" {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    json_response(status, &response)
+}
+
+async fn metrics_entry(State(state): State<AppState>) -> AxumResponse {
+    let body = health::handle_metrics(&state.daemon, &state.config).await;
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 #[utoipa::path(
@@ -358,6 +412,14 @@ async fn run_agent_entry(
     Path(agent_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
+    let _permit = match state.run_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::service_unavailable("too many concurrent run requests")
+                .into_response();
+        }
+    };
+
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => match agents::handle_run_agent(&agent_id, body, &state.daemon).await {
             Ok(response) => json_response(StatusCode::OK, &response),
@@ -473,6 +535,14 @@ async fn run_swarm_entry(
     Path(swarm_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
+    let _permit = match state.run_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ApiError::service_unavailable("too many concurrent run requests")
+                .into_response();
+        }
+    };
+
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => match swarms::handle_run_swarm(&swarm_id, body, &state.daemon).await {
             Ok(response) => json_response(StatusCode::OK, &response),
@@ -515,5 +585,185 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
     match memories::handle_search_memories(query, state).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use crate::app::DaemonConfig;
+    use crate::state::DaemonState;
+    use anima_core::{
+        AgentConfig, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
+        ModelGenerateResponse, ModelStopReason, TokenUsage,
+    };
+    use async_trait::async_trait;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+    use tower::util::ServiceExt;
+
+    struct SlowModelAdapter {
+        delay: Duration,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for SlowModelAdapter {
+        fn provider(&self) -> &str {
+            "slow"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            tokio::time::sleep(self.delay).await;
+
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: format!("{} completed", config.name),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                stop_reason: ModelStopReason::End,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_routes_respect_request_timeout() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            SlowModelAdapter {
+                delay: Duration::from_millis(50),
+            },
+        ))));
+        let agent_id = {
+            let mut guard = state.write().await;
+            guard
+                .create_agent(test_config("operator"))
+                .expect("agent should be created")
+                .state
+                .id
+        };
+        let app = router(
+            state,
+            DaemonConfig {
+                request_timeout: Duration::from_millis(10),
+                ..DaemonConfig::default()
+            },
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"run pending task"}"#))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("app responds");
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_routes_reject_when_concurrency_limit_is_exhausted() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            SlowModelAdapter {
+                delay: Duration::from_millis(75),
+            },
+        ))));
+        let (first_agent_id, second_agent_id) = {
+            let mut guard = state.write().await;
+            let first = guard
+                .create_agent(test_config("operator-one"))
+                .expect("first agent should be created")
+                .state
+                .id;
+            let second = guard
+                .create_agent(test_config("operator-two"))
+                .expect("second agent should be created")
+                .state
+                .id;
+            (first, second)
+        };
+        let app = router(
+            state,
+            DaemonConfig {
+                max_concurrent_runs: 1,
+                request_timeout: Duration::from_secs(1),
+                ..DaemonConfig::default()
+            },
+        );
+
+        let first_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/agents/{first_agent_id}/run"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"first task"}"#))
+            .expect("first request builds");
+        let second_request = Request::builder()
+            .method("POST")
+            .uri(format!("/api/agents/{second_agent_id}/run"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"text":"second task"}"#))
+            .expect("second request builds");
+
+        let first_app = app.clone();
+        let first = tokio::spawn(async move {
+            first_app
+                .oneshot(first_request)
+                .await
+                .expect("first response should be returned")
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let second = app
+            .oneshot(second_request)
+            .await
+            .expect("second response should be returned");
+
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(second.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("body is utf-8")
+                .contains("too many concurrent run requests")
+        );
+
+        let first = first.await.expect("first join succeeds");
+        assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    fn test_config(name: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.into(),
+            model: "gpt-5.4".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: Some("openai".into()),
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: Some(AgentSettings::default()),
+        }
     }
 }

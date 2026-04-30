@@ -64,7 +64,7 @@ export default defineConfig(() => {
 
   return {
     root: import.meta.dirname,
-    cacheDir: '../../node_modules/.vite/apps/ui',
+    cacheDir: '../../node_modules/.vite/apps/web',
     server: {
       port: 4200,
       host: 'localhost',

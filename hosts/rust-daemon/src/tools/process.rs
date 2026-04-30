@@ -13,7 +13,10 @@ use self::{
 };
 use super::ToolExecutionContext;
 
-pub(crate) use self::background::{new_shared_process_manager, SharedProcessManager};
+pub(crate) use self::background::{
+    background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
+    DEFAULT_MAX_BACKGROUND_PROCESSES,
+};
 
 pub(super) fn execute_bash(
     _context: ToolExecutionContext,

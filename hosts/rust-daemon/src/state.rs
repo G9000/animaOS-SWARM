@@ -16,7 +16,10 @@ use tokio::sync::RwLock as AsyncRwLock;
 use crate::components::{default_evaluators, default_providers};
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::model::DeterministicModelAdapter;
-use crate::tools::{new_shared_process_manager, SharedProcessManager, ToolExecutionContext, ToolRegistry};
+use crate::tools::{
+    background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
+    ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
+};
 
 pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
 
@@ -36,24 +39,54 @@ pub(crate) struct DaemonState {
 impl DaemonState {
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
-        Self::with_model_adapter_and_events(
+        Self::with_model_adapter_and_events_and_limits(
             Arc::new(DeterministicModelAdapter),
             EventFanout::new(DEFAULT_EVENT_BUFFER),
+            DEFAULT_MAX_BACKGROUND_PROCESSES,
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_events(event_fanout: EventFanout) -> Self {
-        Self::with_model_adapter_and_events(Arc::new(DeterministicModelAdapter), event_fanout)
+        Self::with_events_and_limits(event_fanout, DEFAULT_MAX_BACKGROUND_PROCESSES)
+    }
+
+    pub(crate) fn with_events_and_limits(
+        event_fanout: EventFanout,
+        max_background_processes: usize,
+    ) -> Self {
+        Self::with_model_adapter_and_events_and_limits(
+            Arc::new(DeterministicModelAdapter),
+            event_fanout,
+            max_background_processes,
+        )
     }
 
     #[allow(dead_code)]
     pub(crate) fn with_model_adapter(model_adapter: Arc<dyn ModelAdapter>) -> Self {
-        Self::with_model_adapter_and_events(model_adapter, EventFanout::new(DEFAULT_EVENT_BUFFER))
+        Self::with_model_adapter_and_events_and_limits(
+            model_adapter,
+            EventFanout::new(DEFAULT_EVENT_BUFFER),
+            DEFAULT_MAX_BACKGROUND_PROCESSES,
+        )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn with_model_adapter_and_events(
         model_adapter: Arc<dyn ModelAdapter>,
         event_fanout: EventFanout,
+    ) -> Self {
+        Self::with_model_adapter_and_events_and_limits(
+            model_adapter,
+            event_fanout,
+            DEFAULT_MAX_BACKGROUND_PROCESSES,
+        )
+    }
+
+    pub(crate) fn with_model_adapter_and_events_and_limits(
+        model_adapter: Arc<dyn ModelAdapter>,
+        event_fanout: EventFanout,
+        max_background_processes: usize,
     ) -> Self {
         let memory = Arc::new(AsyncRwLock::new(MemoryManager::new()));
         Self {
@@ -64,7 +97,7 @@ impl DaemonState {
             swarm_snapshots: HashMap::new(),
             model_adapter,
             tool_registry: ToolRegistry::new(),
-            process_manager: new_shared_process_manager(),
+            process_manager: new_shared_process_manager_with_limit(max_background_processes),
             event_fanout,
             db: None,
         }
@@ -77,6 +110,26 @@ impl DaemonState {
 
     pub(crate) fn memory_handle(&self) -> SharedMemoryStore {
         Arc::clone(&self.memory)
+    }
+
+    pub(crate) fn agent_count(&self) -> usize {
+        self.agents.len()
+    }
+
+    pub(crate) fn swarm_count(&self) -> usize {
+        self.swarms.len()
+    }
+
+    pub(crate) fn swarm_snapshot_count(&self) -> usize {
+        self.swarm_snapshots.len()
+    }
+
+    pub(crate) fn database_configured(&self) -> bool {
+        self.db.is_some()
+    }
+
+    pub(crate) fn background_process_count(&self) -> Result<usize, String> {
+        background_process_count(&self.process_manager)
     }
 
     pub(crate) fn set_database(&mut self, db: Arc<dyn DatabaseAdapter>) {

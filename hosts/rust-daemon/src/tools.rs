@@ -15,7 +15,10 @@ use futures::future::BoxFuture;
 
 use crate::state::SharedMemoryStore;
 
-pub(crate) use process::{new_shared_process_manager, SharedProcessManager};
+pub(crate) use process::{
+    background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
+    DEFAULT_MAX_BACKGROUND_PROCESSES,
+};
 
 type ToolHandler =
     fn(ToolExecutionContext, AgentState, Message, ToolCall) -> BoxFuture<'static, TaskResult<Content>>;

@@ -49,9 +49,9 @@ export function buildWorkspaceDevPlan(
   }
 
   processes.push({
-    name: '@animaOS-SWARM/ui',
+    name: '@animaOS-SWARM/web',
     command: 'bun',
-    args: ['x', 'nx', 'run', '@animaOS-SWARM/ui:serve'],
+    args: ['x', 'nx', 'run', '@animaOS-SWARM/web:serve'],
     env: {
       UI_BACKEND_ORIGIN: host.baseUrl,
       VITE_HOST_KEY: host.key,

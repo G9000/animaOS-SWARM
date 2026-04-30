@@ -1,4 +1,5 @@
 use anima_memory::{MemoryType, NewMemory, RecentMemoryOptions};
+use tracing::warn;
 
 use super::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
@@ -123,18 +124,24 @@ pub(crate) async fn handle_run_agent(
     };
 
     if let Some(content) = result.data.as_ref() {
-        memory
+        if let Err(error) = memory
             .write()
             .await
             .add(NewMemory {
-                agent_id: runtime_id,
-                agent_name: runtime_name,
+                agent_id: runtime_id.clone(),
+                agent_name: runtime_name.clone(),
                 memory_type: MemoryType::TaskResult,
                 content: content.text.clone(),
                 importance: 0.8,
                 tags: Some(vec!["runtime".into(), "task-result".into()]),
             })
-            .expect("runtime task_result memory should be valid");
+        {
+            warn!(
+                agent_id = %runtime_id,
+                error = %error.message(),
+                "failed to persist runtime task result memory"
+            );
+        }
     }
 
     Ok(AgentRunEnvelope {

@@ -8,9 +8,12 @@ use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
+use tracing::error;
 use tracing::info_span;
 
 use super::ApiError;
+
+const INTERNAL_SERVER_ERROR_JSON: &str = "{\"error\":\"internal server error\"}";
 
 pub(super) fn make_http_span<B>(request: &HttpRequest<B>) -> tracing::Span {
     let request_id = request
@@ -45,17 +48,39 @@ pub(super) async fn read_limited_body(
 }
 
 pub(in super::super) fn serialize_json<T: Serialize>(value: &T) -> String {
+    match try_serialize_json(value) {
+        Ok(body) => body,
+        Err(error) => {
+            error!(error = %error, "failed to serialize JSON payload");
+            INTERNAL_SERVER_ERROR_JSON.to_string()
+        }
+    }
+}
+
+pub(super) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> AxumResponse {
+    match try_serialize_json(value) {
+        Ok(body) => json_response_with_body(status, body),
+        Err(error) => {
+            error!(error = %error, "failed to serialize JSON response body");
+            json_response_with_body(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                INTERNAL_SERVER_ERROR_JSON.to_string(),
+            )
+        }
+    }
+}
+
+fn try_serialize_json<T: Serialize>(value: &T) -> Result<String, String> {
     let mut body = Vec::new();
     let mut serializer =
         serde_json::Serializer::with_formatter(&mut body, ContractJsonFormatter::default());
     value
         .serialize(&mut serializer)
-        .expect("response body should serialize");
-    String::from_utf8(body).expect("serialized response should be utf-8")
+        .map_err(|error| error.to_string())?;
+    String::from_utf8(body).map_err(|error| error.to_string())
 }
 
-pub(super) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> AxumResponse {
-    let body = serialize_json(value);
+fn json_response_with_body(status: StatusCode, body: String) -> AxumResponse {
     (
         status,
         [(

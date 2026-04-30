@@ -22,6 +22,16 @@ pub(crate) struct HealthResponse {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ReadinessResponse {
+    pub(crate) status: String,
+    pub(crate) control_plane_durability: String,
+    pub(crate) persistence_mode: String,
+    pub(crate) database: String,
+    pub(crate) issues: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct TokenUsageResponse {
     pub(crate) prompt_tokens: u64,
     pub(crate) completion_tokens: u64,

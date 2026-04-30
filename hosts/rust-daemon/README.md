@@ -5,6 +5,8 @@ current Axum HTTP/SSE boundary for animaOS, wiring the reusable crates in
 `packages/core-rust` to real infrastructure such as model providers, optional
 Postgres persistence, and streaming clients.
 
+For an implementation walkthrough, see [Rust Daemon Architecture](../../docs/rust-daemon-architecture.md).
+
 ---
 
 ## Environment variables
@@ -17,8 +19,10 @@ Postgres persistence, and streaming clients.
 | `ANIMAOS_RS_HOST` | No | Bind host (default `127.0.0.1`). |
 | `ANIMAOS_RS_PORT` | No | Bind port (default `8080`). |
 | `ANIMAOS_RS_MAX_REQUEST_BYTES` | No | Request body size limit in bytes (default `65536` / 64 KB). |
-| `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` | No | Per-request timeout for standard non-streaming HTTP routes; blocking `/run` endpoints are exempt (default `30`). |
+| `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` | No | Per-request timeout in seconds for standard routes and blocking `/run` endpoints (default `30`). |
 | `ANIMAOS_RS_PERSISTENCE_MODE` | No | Persistence mode: `memory` (default) or `postgres`. `postgres` requires `DATABASE_URL` and fails startup if Postgres is unavailable or migrations fail. |
+| `ANIMAOS_RS_MAX_CONCURRENT_RUNS` | No | Max number of concurrent `/api/agents/{id}/run` and `/api/swarms/{id}/run` requests before the daemon returns `503 Service Unavailable` (default `8`). |
+| `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES` | No | Max number of concurrently running `bg_start` processes allowed by the daemon tool surface (default `8`). |
 
 Other provider keys follow the same pattern: `GOOGLE_API_KEY`, `GROQ_API_KEY`,
 `MOONSHOT_API_KEY`, `OLLAMA_API_KEY`, and so on. Moonshot/Kimi uses the
@@ -42,8 +46,12 @@ application endpoints. The summary below matches the live router in
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/health` | Liveness check. Always returns `200 OK` with `{"status":"ok"}`. |
+| `GET` | `/ready` | Readiness check. Returns `200 OK` with `{"status":"ready",...}` when the daemon can serve traffic, otherwise `503` with issues. |
+| `GET` | `/metrics` | Prometheus-style metrics for readiness, memory/runtime counts, persistence mode, configured limits, and background-process health. |
 | `GET` | `/api/health` | Same health payload as `/health`. |
+| `GET` | `/api/ready` | Same readiness payload as `/ready`. |
 | `GET` | `/openapi.json` | OpenAPI document for the live daemon routes. |
+| `GET` | `/docs` | Scalar API reference for exploring the daemon API in a browser. |
 | `GET` | `/docs/` | Scalar API reference for exploring the daemon API in a browser. |
 
 ### Agents
@@ -96,19 +104,33 @@ Verify it is up:
 ```bash
 curl http://127.0.0.1:8080/health
 # {"status":"ok"}
+
+curl http://127.0.0.1:8080/ready
+# {"status":"ready","controlPlaneDurability":"ephemeral",...}
 ```
+
+Browse the Scalar UI at `http://127.0.0.1:8080/docs`.
 
 ---
 
 ## Startup sequence
 
-1. Read `ANIMAOS_RS_HOST`, `ANIMAOS_RS_PORT`, `ANIMAOS_RS_MAX_REQUEST_BYTES`, `ANIMAOS_RS_REQUEST_TIMEOUT_SECS`, and `ANIMAOS_RS_PERSISTENCE_MODE`, then bind the TCP listener.
+1. Read `ANIMAOS_RS_HOST`, `ANIMAOS_RS_PORT`, `ANIMAOS_RS_MAX_REQUEST_BYTES`, `ANIMAOS_RS_REQUEST_TIMEOUT_SECS`, `ANIMAOS_RS_PERSISTENCE_MODE`, `ANIMAOS_RS_MAX_CONCURRENT_RUNS`, and `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES`, then bind the TCP listener.
 2. Build `RuntimeModelAdapter::from_env()` to load provider API keys and base URLs.
-3. Initialize `tracing` so every HTTP request is logged with method, URI, latency, and `x-request-id`.
+3. Initialize `tracing` so every HTTP request is logged with method, URI, latency, and `x-request-id`, and log the daemon as an `ephemeral` control plane at startup.
 4. If persistence mode is `memory`, start without Postgres and log that choice explicitly.
 5. If persistence mode is `postgres`, require `DATABASE_URL`, connect, run embedded migrations from `./migrations`, and fail startup immediately if any step fails.
 6. Inject `SqlxPostgresAdapter` into shared daemon state so all new agents get step persistence automatically.
-7. Start Axum with request-id propagation, tracing middleware, request timeouts for standard routes, long-running `/run` routes left unbounded at the HTTP layer, and graceful shutdown on `Ctrl+C`.
+7. Start Axum with request-id propagation, tracing middleware, request timeouts for both standard and blocking `/run` routes, a semaphore-backed concurrent-run admission limit, readiness and metrics endpoints, and graceful shutdown on `Ctrl+C`.
+
+---
+
+## Operational notes
+
+- The daemon currently acts as an explicit `ephemeral` control plane. Agent and swarm runtime state lives in memory.
+- Postgres persistence adds step-log durability, but it does not make the daemon itself stateful across process restarts.
+- Readiness reports `database: "missing"` and returns `503` when `ANIMAOS_RS_PERSISTENCE_MODE=postgres` is set without a working database adapter.
+- Metrics include configured limits such as `anima_daemon_max_concurrent_runs` and `anima_daemon_max_background_processes`, plus current counts like `anima_daemon_agents`, `anima_daemon_swarms`, and `anima_daemon_background_processes`.
 
 ---
 
