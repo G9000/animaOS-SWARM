@@ -1,15 +1,16 @@
+pub(crate) mod lifecycle;
+pub(crate) mod persistence;
+
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
 
+use self::{lifecycle::shutdown_signal, persistence::configure_persistence};
 use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
-use crate::postgres::SqlxPostgresAdapter;
 use crate::routes;
 use crate::runtime_model::RuntimeModelAdapter;
 use crate::state::DaemonState;
@@ -75,62 +76,4 @@ pub(crate) async fn serve_with_state(
     axum::serve(listener, app_with_state(state, config))
         .with_graceful_shutdown(shutdown_signal())
         .await
-}
-
-async fn configure_persistence(
-    state: &SharedDaemonState,
-    persistence_mode: PersistenceMode,
-) -> io::Result<()> {
-    match persistence_mode {
-        PersistenceMode::Memory => {
-            if std::env::var_os("DATABASE_URL").is_some() {
-                warn!(
-                    "DATABASE_URL is set but ANIMAOS_RS_PERSISTENCE_MODE=memory; starting without Postgres persistence"
-                );
-            } else {
-                info!("starting in memory persistence mode");
-            }
-            Ok(())
-        }
-        PersistenceMode::Postgres => {
-            let database_url = std::env::var("DATABASE_URL").map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "DATABASE_URL must be set when ANIMAOS_RS_PERSISTENCE_MODE=postgres",
-                )
-            })?;
-            let pool = PgPoolOptions::new()
-                .max_connections(10)
-                .connect(&database_url)
-                .await
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to connect to Postgres: {error}"),
-                    )
-                })?;
-
-            sqlx::migrate!("./migrations")
-                .run(&pool)
-                .await
-                .map_err(|error| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("failed to run Postgres migrations: {error}"),
-                    )
-                })?;
-
-            let adapter = Arc::new(SqlxPostgresAdapter::new(pool));
-            state.write().await.set_database(adapter);
-            info!("Postgres connected, migrations applied");
-            Ok(())
-        }
-    }
-}
-
-async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => info!("shutdown signal received"),
-        Err(error) => warn!("failed to install shutdown signal handler: {error}"),
-    }
 }

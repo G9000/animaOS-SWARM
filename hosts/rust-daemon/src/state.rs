@@ -1,25 +1,22 @@
+mod runtime_events;
+mod swarm_runtime;
+mod swarm_tools;
+
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anima_core::{
-    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentState, Content, DataValue,
-    DatabaseAdapter, EngineEvent, EventType, Message, ModelAdapter, TaskResult, TokenUsage,
-    ToolCall,
+    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, DatabaseAdapter, ModelAdapter,
 };
 use anima_memory::MemoryManager;
-use anima_swarm::coordinator::{
-    CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentShell,
-};
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
-use serde_json::{json, Value};
-use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::RwLock as AsyncRwLock;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::model::DeterministicModelAdapter;
-use crate::tools::{ToolExecutionContext, ToolRegistry};
+use crate::tools::{new_shared_process_manager, SharedProcessManager, ToolExecutionContext, ToolRegistry};
 
 pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
 
@@ -31,6 +28,7 @@ pub(crate) struct DaemonState {
     pub(crate) swarm_snapshots: HashMap<String, SwarmState>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
+    pub(crate) process_manager: SharedProcessManager,
     pub(crate) event_fanout: EventFanout,
     pub(crate) db: Option<Arc<dyn DatabaseAdapter>>,
 }
@@ -66,6 +64,7 @@ impl DaemonState {
             swarm_snapshots: HashMap::new(),
             model_adapter,
             tool_registry: ToolRegistry::new(),
+            process_manager: new_shared_process_manager(),
             event_fanout,
             db: None,
         }
@@ -198,8 +197,11 @@ impl DaemonState {
         agent_id: &str,
     ) -> Option<(AgentRuntime, ToolExecutionContext)> {
         let runtime = self.agents.remove(agent_id)?;
-        let tool_context =
-            ToolExecutionContext::new(Arc::clone(&self.memory), self.tool_registry.clone());
+        let tool_context = ToolExecutionContext::new(
+            Arc::clone(&self.memory),
+            self.tool_registry.clone(),
+            Arc::clone(&self.process_manager),
+        );
         Some((runtime, tool_context))
     }
 
@@ -226,365 +228,4 @@ impl DaemonState {
         Ok(())
     }
 
-    fn swarm_agent_factory(&self, event_stream: EventFanout) -> Arc<CoordinatorAgentFactoryFn> {
-        let memory = Arc::clone(&self.memory);
-        let model_adapter = Arc::clone(&self.model_adapter);
-        let tool_registry = self.tool_registry.clone();
-        let db = self.db.clone();
-
-        Arc::new(move |context: CoordinatorAgentFactoryContext| {
-            let memory = Arc::clone(&memory);
-            let model_adapter = Arc::clone(&model_adapter);
-            let tool_registry = tool_registry.clone();
-            let event_stream = event_stream.clone();
-            let db = db.clone();
-
-            Box::pin(async move {
-                let tool_context = ToolExecutionContext::new(Arc::clone(&memory), tool_registry);
-                let runtime_events: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new({
-                    let event_stream = event_stream.clone();
-                    let agent_name = context.config.name.clone();
-                    move |event: EngineEvent| {
-                        publish_runtime_event(&event_stream, &agent_name, event);
-                    }
-                });
-                let mut initial_runtime = build_swarm_runtime(
-                    context.config.clone(),
-                    Arc::clone(&model_adapter),
-                    Arc::clone(&memory),
-                    Arc::clone(&runtime_events),
-                );
-                if let Some(db) = &db {
-                    initial_runtime.set_database(Arc::clone(db));
-                }
-                let runtime = Arc::new(AsyncMutex::new(initial_runtime));
-                let config = context.config.clone();
-                let token_usage = Arc::new(Mutex::new(TokenUsage::default()));
-                let needs_reset = Arc::new(AtomicBool::new(false));
-
-                Ok(CoordinatorAgentShell {
-                    run: Arc::new({
-                        let runtime = Arc::clone(&runtime);
-                        let config = config.clone();
-                        let memory = Arc::clone(&memory);
-                        let model_adapter = Arc::clone(&model_adapter);
-                        let token_usage = Arc::clone(&token_usage);
-                        let needs_reset = Arc::clone(&needs_reset);
-                        let delegate_task = context.delegate_task.clone();
-                        let delegate_tasks = context.delegate_tasks.clone();
-                        let tool_context = tool_context.clone();
-                        let runtime_events = Arc::clone(&runtime_events);
-                        let db = db.clone();
-                        move |input: String| {
-                            let runtime = Arc::clone(&runtime);
-                            let config = config.clone();
-                            let memory = Arc::clone(&memory);
-                            let model_adapter = Arc::clone(&model_adapter);
-                            let token_usage = Arc::clone(&token_usage);
-                            let needs_reset = Arc::clone(&needs_reset);
-                            let delegate_task = delegate_task.clone();
-                            let delegate_tasks = delegate_tasks.clone();
-                            let tool_context = tool_context.clone();
-                            let runtime_events = Arc::clone(&runtime_events);
-                            let db = db.clone();
-                            Box::pin(async move {
-                                let mut runtime = runtime.lock().await;
-                                if needs_reset.swap(false, Ordering::AcqRel) {
-                                    let mut new_runtime = build_swarm_runtime(
-                                        config,
-                                        Arc::clone(&model_adapter),
-                                        Arc::clone(&memory),
-                                        Arc::clone(&runtime_events),
-                                    );
-                                    if let Some(db) = &db {
-                                        new_runtime.set_database(Arc::clone(db));
-                                    }
-                                    *runtime = new_runtime;
-                                }
-                                let result = runtime
-                                    .run_with_tools(
-                                        Content {
-                                            text: input,
-                                            attachments: None,
-                                            metadata: None,
-                                        },
-                                        |agent, user_message, tool_call| {
-                                            let delegate_task = delegate_task.clone();
-                                            let delegate_tasks = delegate_tasks.clone();
-                                            let tool_context = tool_context.clone();
-                                            async move {
-                                                execute_swarm_tool(
-                                                    delegate_task,
-                                                    delegate_tasks,
-                                                    tool_context,
-                                                    agent,
-                                                    user_message,
-                                                    tool_call,
-                                                )
-                                                .await
-                                            }
-                                        },
-                                    )
-                                    .await;
-
-                                *token_usage
-                                    .lock()
-                                    .expect("swarm token mutex should not be poisoned") =
-                                    runtime.snapshot().state.token_usage.clone();
-
-                                result
-                            })
-                        }
-                    }),
-                    token_usage: Arc::new({
-                        let token_usage = Arc::clone(&token_usage);
-                        move || {
-                            token_usage
-                                .lock()
-                                .expect("swarm token mutex should not be poisoned")
-                                .clone()
-                        }
-                    }),
-                    clear_task_state: Arc::new({
-                        let needs_reset = Arc::clone(&needs_reset);
-                        let token_usage = Arc::clone(&token_usage);
-                        move || {
-                            needs_reset.store(true, Ordering::Release);
-                            *token_usage
-                                .lock()
-                                .expect("swarm token mutex should not be poisoned") =
-                                TokenUsage::default();
-                        }
-                    }),
-                    stop: Arc::new({
-                        let runtime = Arc::clone(&runtime);
-                        let token_usage = Arc::clone(&token_usage);
-                        move || {
-                            let runtime = Arc::clone(&runtime);
-                            let token_usage = Arc::clone(&token_usage);
-                            Box::pin(async move {
-                                let mut runtime = runtime.lock().await;
-                                runtime.stop();
-                                *token_usage
-                                    .lock()
-                                    .expect("swarm token mutex should not be poisoned") =
-                                    runtime.snapshot().state.token_usage.clone();
-                            })
-                        }
-                    }),
-                })
-            })
-        })
-    }
-}
-
-fn build_swarm_runtime(
-    config: AgentConfig,
-    model_adapter: Arc<dyn ModelAdapter>,
-    memory: SharedMemoryStore,
-    event_listener: Arc<dyn Fn(EngineEvent) + Send + Sync>,
-) -> AgentRuntime {
-    let mut runtime = AgentRuntime::new(config, model_adapter);
-    runtime.set_event_listener(event_listener);
-    runtime.set_providers(default_providers(Arc::clone(&memory)));
-    runtime.set_evaluators(default_evaluators(memory));
-    runtime.init();
-    runtime
-}
-
-fn publish_runtime_event(event_stream: &EventFanout, agent_name: &str, event: EngineEvent) {
-    let Some(agent_id) = event.agent_id.as_deref() else {
-        return;
-    };
-
-    let payload = match runtime_event_payload(agent_id, agent_name, &event) {
-        Some(payload) => payload,
-        None => return,
-    };
-
-    event_stream.publish(event.event_type.as_str(), payload.to_string());
-}
-
-fn runtime_event_payload(agent_id: &str, agent_name: &str, event: &EngineEvent) -> Option<Value> {
-    match event.event_type {
-        EventType::TaskStarted => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-        })),
-        EventType::TaskCompleted => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-        })),
-        EventType::TaskFailed => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-            "error": data_value_as_string(&event.data).unwrap_or("task failed"),
-        })),
-        EventType::ToolBefore => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-            "toolName": object_field_string(&event.data, "name").unwrap_or_default(),
-            "args": object_field_json(&event.data, "args").unwrap_or_else(|| json!({})),
-        })),
-        EventType::ToolAfter => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-            "toolName": object_field_string(&event.data, "name").unwrap_or_default(),
-            "status": object_field_string(&event.data, "status").unwrap_or("error"),
-            "durationMs": object_field_u128(&event.data, "durationMs").unwrap_or(0),
-            "result": object_field_string(&event.data, "result"),
-        })),
-        EventType::AgentTokens => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-            "usage": data_value_to_json(&event.data),
-        })),
-        EventType::AgentTerminated => Some(json!({
-            "agentId": agent_id,
-            "agentName": agent_name,
-        })),
-        _ => None,
-    }
-}
-
-fn data_value_as_string(value: &DataValue) -> Option<&str> {
-    match value {
-        DataValue::String(value) => Some(value.as_str()),
-        _ => None,
-    }
-}
-
-fn object_field_string<'a>(value: &'a DataValue, key: &str) -> Option<&'a str> {
-    match value {
-        DataValue::Object(object) => object.get(key).and_then(data_value_as_string),
-        _ => None,
-    }
-}
-
-fn object_field_u128(value: &DataValue, key: &str) -> Option<u128> {
-    match value {
-        DataValue::Object(object) => match object.get(key) {
-            Some(DataValue::Number(value)) if *value >= 0.0 => Some(*value as u128),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn object_field_json(value: &DataValue, key: &str) -> Option<Value> {
-    match value {
-        DataValue::Object(object) => object.get(key).map(data_value_to_json),
-        _ => None,
-    }
-}
-
-fn data_value_to_json(value: &DataValue) -> Value {
-    match value {
-        DataValue::Null => Value::Null,
-        DataValue::Bool(value) => json!(value),
-        DataValue::Number(value) => json!(value),
-        DataValue::String(value) => json!(value),
-        DataValue::Array(values) => {
-            Value::Array(values.iter().map(data_value_to_json).collect::<Vec<_>>())
-        }
-        DataValue::Object(values) => Value::Object(
-            values
-                .iter()
-                .map(|(key, value)| (key.clone(), data_value_to_json(value)))
-                .collect(),
-        ),
-    }
-}
-
-async fn execute_swarm_tool(
-    delegate_task: Option<Arc<anima_swarm::coordinator::CoordinatorDelegateFn>>,
-    delegate_tasks: Option<Arc<anima_swarm::coordinator::CoordinatorBatchDelegateFn>>,
-    tool_context: ToolExecutionContext,
-    agent: AgentState,
-    user_message: Message,
-    tool_call: ToolCall,
-) -> TaskResult<Content> {
-    match tool_call.name.as_str() {
-        "delegate_task" => {
-            let Some(delegate_task) = delegate_task else {
-                return TaskResult::error("delegate_task is unavailable", 0);
-            };
-
-            let Some(worker_name) = string_arg(&tool_call, "worker_name") else {
-                return TaskResult::error("delegate_task worker_name must be a string", 0);
-            };
-            let Some(task) = string_arg(&tool_call, "task") else {
-                return TaskResult::error("delegate_task task must be a string", 0);
-            };
-
-            delegate_task(worker_name, task).await
-        }
-        "delegate_tasks" => {
-            let Some(delegate_tasks) = delegate_tasks else {
-                return TaskResult::error("delegate_tasks is unavailable", 0);
-            };
-
-            let Some(delegations) = delegation_args(&tool_call, "delegations") else {
-                return TaskResult::error(
-                    "delegate_tasks delegations must be a non-empty array of objects",
-                    0,
-                );
-            };
-
-            delegate_tasks(delegations).await
-        }
-        "choose_speaker" => {
-            let Some(delegate_task) = delegate_task else {
-                return TaskResult::error("choose_speaker is unavailable", 0);
-            };
-
-            let Some(agent_name) = string_arg(&tool_call, "agent_name") else {
-                return TaskResult::error("choose_speaker agent_name must be a string", 0);
-            };
-            let instruction = string_arg(&tool_call, "instruction").unwrap_or_default();
-
-            delegate_task(agent_name, instruction).await
-        }
-        _ => tool_context.execute_tool(agent, user_message, tool_call).await,
-    }
-}
-
-fn string_arg(tool_call: &ToolCall, key: &str) -> Option<String> {
-    match tool_call.args.get(key) {
-        Some(DataValue::String(value)) if !value.is_empty() => Some(value.clone()),
-        _ => None,
-    }
-}
-
-fn delegation_args(tool_call: &ToolCall, key: &str) -> Option<Vec<anima_swarm::SwarmDelegation>> {
-    let DataValue::Array(values) = tool_call.args.get(key)? else {
-        return None;
-    };
-
-    let mut delegations = Vec::with_capacity(values.len());
-    for value in values {
-        let DataValue::Object(entry) = value else {
-            return None;
-        };
-        let Some(DataValue::String(worker_name)) = entry.get("worker_name") else {
-            return None;
-        };
-        let Some(DataValue::String(task)) = entry.get("task") else {
-            return None;
-        };
-        if worker_name.is_empty() || task.is_empty() {
-            return None;
-        }
-
-        delegations.push(anima_swarm::SwarmDelegation {
-            worker_name: worker_name.clone(),
-            task: task.clone(),
-        });
-    }
-
-    if delegations.is_empty() {
-        return None;
-    }
-
-    Some(delegations)
 }

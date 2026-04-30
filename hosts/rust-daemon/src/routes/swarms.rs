@@ -1,19 +1,15 @@
-use std::convert::Infallible;
+pub(super) mod events;
 
-use anima_core::{Content, TaskResult};
-use anima_swarm::SwarmState;
 use axum::http::{header, HeaderValue, StatusCode};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
-use futures::stream;
 
 use super::contracts::{
-    SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope,
-    SwarmStateResponse, SwarmsEnvelope, TaskRequest, TaskResultResponse,
+    SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmStateResponse,
+    SwarmsEnvelope, TaskRequest, TaskResultResponse,
 };
 use super::ApiError;
 use crate::app::SharedDaemonState;
-use crate::events::EventFanout;
+use self::events::{publish_swarm_event, subscribe_swarm_events_response};
 
 pub(crate) async fn handle_create_swarm(
     body: Vec<u8>,
@@ -162,40 +158,5 @@ pub(crate) async fn handle_subscribe_swarm_events(
             .into_response();
     };
 
-    let stream = stream::unfold(subscriber, |mut subscriber| async move {
-        loop {
-            match subscriber.recv().await {
-                Ok(message) => {
-                    let event = Event::default().event(message.event).data(message.data);
-                    return Some((Ok::<Event, Infallible>(event), subscriber));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
-            }
-        }
-    });
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
-}
-
-fn publish_swarm_event(
-    global_event_fanout: &EventFanout,
-    swarm_event_fanout: Option<&EventFanout>,
-    swarm_id: &str,
-    event: &str,
-    snapshot: &SwarmState,
-    result: Option<&TaskResult<Content>>,
-) {
-    let payload = super::serialize_json(&SwarmEventResponse {
-        swarm_id: swarm_id.to_string(),
-        state: SwarmStateResponse::from(snapshot),
-        result: result.map(TaskResultResponse::from),
-    });
-
-    global_event_fanout.publish(event.to_string(), payload.clone());
-    if let Some(fanout) = swarm_event_fanout {
-        fanout.publish(event.to_string(), payload);
-    }
+    subscribe_swarm_events_response(subscriber)
 }

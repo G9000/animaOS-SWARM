@@ -1,57 +1,10 @@
-use anima_daemon::app as daemon_app;
-use axum::body::{to_bytes, Body};
+mod support;
+
+use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use futures::{pin_mut, StreamExt};
 use tower::util::ServiceExt;
-
-fn test_app() -> Router {
-    daemon_app()
-}
-
-async fn send_request(app: &Router, request: Request<Body>) -> (StatusCode, String) {
-    let response = app.clone().oneshot(request).await.expect("app responds");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body reads");
-    (
-        status,
-        std::str::from_utf8(&body)
-            .expect("body is utf-8")
-            .to_string(),
-    )
-}
-
-async fn send_json_request(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    body: &str,
-) -> (StatusCode, String) {
-    send_request(
-        app,
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_owned()))
-            .expect("request builds"),
-    )
-    .await
-}
-
-async fn send_empty_request(app: &Router, method: &str, uri: &str) -> (StatusCode, String) {
-    send_request(
-        app,
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .body(Body::empty())
-            .expect("request builds"),
-    )
-    .await
-}
 
 async fn create_swarm(app: &Router) -> (StatusCode, String) {
     create_swarm_with_body(
@@ -74,42 +27,10 @@ async fn run_swarm(app: &Router, swarm_id: &str, body: &str) -> (StatusCode, Str
     send_json_request(app, "POST", &format!("/api/swarms/{swarm_id}/run"), body).await
 }
 
-fn extract_json_string_field(response: &str, field: &str) -> String {
-    let needle = format!("\"{field}\":\"");
-    let start = response
-        .find(&needle)
-        .map(|index| index + needle.len())
-        .expect("field should exist");
-    let rest = &response[start..];
-    let end = rest.find('"').expect("field should terminate");
-    rest[..end].to_string()
-}
-
-fn extract_json_u64_field(response: &str, field: &str) -> u64 {
-    let needle = format!("\"{field}\":");
-    let start = response
-        .find(&needle)
-        .map(|index| index + needle.len())
-        .expect("field should exist");
-    let rest = &response[start..];
-    let end = rest
-        .find(|character: char| !character.is_ascii_digit())
-        .unwrap_or(rest.len());
-    rest[..end]
-        .parse::<u64>()
-        .expect("field should be an unsigned integer")
-}
-
-fn extract_sse_event_data<'a>(stream: &'a str, event_name: &str) -> Option<&'a str> {
-    let marker = format!("event: {event_name}\n");
-    let start = stream.find(&marker)? + marker.len();
-    let rest = &stream[start..];
-    let data_marker = "data: ";
-    let data_start = rest.find(data_marker)? + data_marker.len();
-    let data = &rest[data_start..];
-    let end = data.find("\n\n").unwrap_or(data.len());
-    Some(&data[..end])
-}
+use support::{
+    extract_json_string_field, extract_json_u64_field, extract_sse_event_data,
+    send_empty_request, send_json_request, test_app, use_temp_workspace_root,
+};
 
 #[tokio::test]
 async fn create_swarm_returns_created_idle_snapshot() {
@@ -345,6 +266,177 @@ async fn swarm_event_stream_emits_tool_results() {
     assert!(tool_after_data.contains("\"toolName\":\"memory_add\""));
     assert!(tool_after_data.contains("\"status\":\"success\""));
     assert!(tool_after_data.contains("\"result\":\"stored memory: ship the patch\""));
+}
+
+#[tokio::test]
+async fn swarm_event_stream_emits_todo_tool_results() {
+    let workspace_root = use_temp_workspace_root("swarm-todo");
+    let app = test_app();
+    let (_, create_response) = create_swarm_with_body(
+        &app,
+        r#"{
+            "strategy":"round-robin",
+            "manager":{
+                "name":"manager",
+                "model":"gpt-5.4",
+                "tools":[{
+                    "name":"todo_write",
+                    "description":"Write todos",
+                    "parameters":{
+                        "todos":{"type":"array"}
+                    }
+                }]
+            },
+            "workers":[{"name":"worker-a","model":"gpt-5.4"}],
+            "maxTurns":2
+        }"#,
+    )
+    .await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/swarms/{swarm_id}/events"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("event stream responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let run_handle = {
+        let app = app.clone();
+        let swarm_id = swarm_id.clone();
+        tokio::spawn(async move { run_swarm(&app, &swarm_id, r#"{"text":"plan release patch"}"#).await })
+    };
+
+    let stream = response.into_body().into_data_stream();
+    pin_mut!(stream);
+
+    let mut chunks = String::new();
+    for _ in 0..256 {
+        match futures::poll!(stream.next()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
+                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed") {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(Some(Err(error))) => panic!("stream errored: {error}"),
+            std::task::Poll::Ready(None) => break,
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+
+    let (run_status, run_response) = run_handle.await.expect("run task should finish");
+
+    assert_eq!(run_status, StatusCode::OK);
+    assert!(run_response.contains("Todos updated (1 completed, 1 in progress, 1 pending)."));
+    assert!(chunks.contains("event: tool:after"));
+
+    let tool_after_data =
+        extract_sse_event_data(&chunks, "tool:after").expect("tool after event data exists");
+    assert!(tool_after_data.contains("\"toolName\":\"todo_write\""));
+    assert!(tool_after_data.contains("\"status\":\"success\""));
+    assert!(tool_after_data.contains("Todos updated (1 completed, 1 in progress, 1 pending)."));
+    assert!(
+        workspace_root
+            .path()
+            .join(".animaos-swarm")
+            .join("todos.json")
+            .exists(),
+        "todo_write should persist the todo list inside the temp workspace"
+    );
+}
+
+#[tokio::test]
+async fn swarm_event_stream_emits_write_file_tool_results() {
+    let workspace_root = use_temp_workspace_root("swarm-files");
+    let app = test_app();
+    let (_, create_response) = create_swarm_with_body(
+        &app,
+        r#"{
+            "strategy":"round-robin",
+            "manager":{
+                "name":"manager",
+                "model":"gpt-5.4",
+                "tools":[{
+                    "name":"write_file",
+                    "description":"Write file",
+                    "parameters":{
+                        "file_path":{"type":"string"},
+                        "content":{"type":"string"}
+                    }
+                }]
+            },
+            "workers":[{"name":"worker-a","model":"gpt-5.4"}],
+            "maxTurns":2
+        }"#,
+    )
+    .await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/swarms/{swarm_id}/events"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("event stream responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let run_handle = {
+        let app = app.clone();
+        let swarm_id = swarm_id.clone();
+        tokio::spawn(async move { run_swarm(&app, &swarm_id, r#"{"text":"write file release patch"}"#).await })
+    };
+
+    let stream = response.into_body().into_data_stream();
+    pin_mut!(stream);
+
+    let mut chunks = String::new();
+    for _ in 0..256 {
+        match futures::poll!(stream.next()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
+                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed") {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(Some(Err(error))) => panic!("stream errored: {error}"),
+            std::task::Poll::Ready(None) => break,
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+
+    let (run_status, run_response) = run_handle.await.expect("run task should finish");
+
+    assert_eq!(run_status, StatusCode::OK);
+    assert!(run_response.contains("Wrote 23 chars to notes/release-patch.txt"));
+    assert!(chunks.contains("event: tool:after"));
+
+    let tool_after_data =
+        extract_sse_event_data(&chunks, "tool:after").expect("tool after event data exists");
+    assert!(tool_after_data.contains("\"toolName\":\"write_file\""));
+    assert!(tool_after_data.contains("\"status\":\"success\""));
+    assert!(tool_after_data.contains("Wrote 23 chars to notes/release-patch.txt"));
+    assert!(
+        workspace_root
+            .path()
+            .join("notes")
+            .join("release-patch.txt")
+            .exists(),
+        "write_file should persist the release patch file inside the temp workspace"
+    );
 }
 
 #[tokio::test]

@@ -17,7 +17,7 @@ Postgres persistence, and streaming clients.
 | `ANIMAOS_RS_HOST` | No | Bind host (default `127.0.0.1`). |
 | `ANIMAOS_RS_PORT` | No | Bind port (default `8080`). |
 | `ANIMAOS_RS_MAX_REQUEST_BYTES` | No | Request body size limit in bytes (default `65536` / 64 KB). |
-| `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` | No | Per-request timeout for non-streaming HTTP routes (default `30`). |
+| `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` | No | Per-request timeout for standard non-streaming HTTP routes; blocking `/run` endpoints are exempt (default `30`). |
 | `ANIMAOS_RS_PERSISTENCE_MODE` | No | Persistence mode: `memory` (default) or `postgres`. `postgres` requires `DATABASE_URL` and fails startup if Postgres is unavailable or migrations fail. |
 
 Other provider keys follow the same pattern: `GOOGLE_API_KEY`, `GROQ_API_KEY`,
@@ -44,7 +44,7 @@ application endpoints. The summary below matches the live router in
 | `GET` | `/health` | Liveness check. Always returns `200 OK` with `{"status":"ok"}`. |
 | `GET` | `/api/health` | Same health payload as `/health`. |
 | `GET` | `/openapi.json` | OpenAPI document for the live daemon routes. |
-| `GET` | `/docs/` | Swagger UI for exploring the daemon API in a browser. |
+| `GET` | `/docs/` | Scalar API reference for exploring the daemon API in a browser. |
 
 ### Agents
 
@@ -108,7 +108,7 @@ curl http://127.0.0.1:8080/health
 4. If persistence mode is `memory`, start without Postgres and log that choice explicitly.
 5. If persistence mode is `postgres`, require `DATABASE_URL`, connect, run embedded migrations from `./migrations`, and fail startup immediately if any step fails.
 6. Inject `SqlxPostgresAdapter` into shared daemon state so all new agents get step persistence automatically.
-7. Start Axum with request-id propagation, tracing middleware, request timeouts for non-streaming routes, and graceful shutdown on `Ctrl+C`.
+7. Start Axum with request-id propagation, tracing middleware, request timeouts for standard routes, long-running `/run` routes left unbounded at the HTTP layer, and graceful shutdown on `Ctrl+C`.
 
 ---
 

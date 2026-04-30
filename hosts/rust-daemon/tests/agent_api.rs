@@ -1,56 +1,11 @@
-use anima_daemon::app as daemon_app;
-use axum::body::{to_bytes, Body};
-use axum::http::{Request, StatusCode};
+mod support;
+
+use axum::http::StatusCode;
 use axum::Router;
-use tower::util::ServiceExt;
-
-fn test_app() -> Router {
-    daemon_app()
-}
-
-async fn send_request(app: &Router, request: Request<Body>) -> (StatusCode, String) {
-    let response = app.clone().oneshot(request).await.expect("app responds");
-    let status = response.status();
-    let body = to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("body reads");
-    (
-        status,
-        std::str::from_utf8(&body)
-            .expect("body is utf-8")
-            .to_string(),
-    )
-}
-
-async fn send_json_request(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    body: &str,
-) -> (StatusCode, String) {
-    send_request(
-        app,
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_owned()))
-            .expect("request builds"),
-    )
-    .await
-}
-
-async fn send_empty_request(app: &Router, method: &str, uri: &str) -> (StatusCode, String) {
-    send_request(
-        app,
-        Request::builder()
-            .method(method)
-            .uri(uri)
-            .body(Body::empty())
-            .expect("request builds"),
-    )
-    .await
-}
+use support::{
+    extract_json_string_field, send_empty_request, send_json_request, test_app,
+    use_temp_workspace_root,
+};
 
 async fn create_agent(app: &Router, body: &str) -> (StatusCode, String) {
     send_json_request(app, "POST", "/api/agents", body).await
@@ -58,17 +13,6 @@ async fn create_agent(app: &Router, body: &str) -> (StatusCode, String) {
 
 async fn run_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, String) {
     send_json_request(app, "POST", &format!("/api/agents/{agent_id}/run"), body).await
-}
-
-fn extract_json_string_field(response: &str, field: &str) -> String {
-    let needle = format!("\"{field}\":\"");
-    let start = response
-        .find(&needle)
-        .map(|index| index + needle.len())
-        .expect("field should exist");
-    let rest = &response[start..];
-    let end = rest.find('"').expect("field should terminate");
-    rest[..end].to_string()
 }
 
 #[tokio::test]
@@ -461,4 +405,71 @@ async fn run_agent_does_not_reuse_previous_tool_result_between_runs() {
     assert!(first_run.contains("alpha prior answer"));
     assert!(second_run.contains("beta prior answer"));
     assert!(!second_run.contains("alpha prior answer"));
+}
+
+#[tokio::test]
+async fn run_agent_executes_todo_write_and_read_round_trip() {
+    let workspace_root = use_temp_workspace_root("agent-todo");
+    let app = test_app();
+    let (_, create_response) = create_agent(
+        &app,
+        r#"{"name":"reviewer","model":"gpt-5.4","tools":[{"name":"todo_write","description":"Write todos","parameters":{"todos":{"type":"array"}}},{"name":"todo_read","description":"Read todos","parameters":{}}]}"#,
+    )
+    .await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (write_status, write_response) =
+        run_agent(&app, &agent_id, r#"{"text":"plan release patch"}"#).await;
+    let (read_status, read_response) =
+        run_agent(&app, &agent_id, r#"{"text":"read todos"}"#).await;
+
+    assert_eq!(write_status, StatusCode::OK);
+    assert!(write_response.contains("Todos updated (1 completed, 1 in progress, 1 pending)."));
+    assert_eq!(read_status, StatusCode::OK);
+    assert!(read_response.contains("[x] 1. [completed] Inspect release patch"));
+    assert!(read_response.contains("[>] 2. [in_progress] Implement release patch"));
+    assert!(read_response.contains("[ ] 3. [pending] Validate release patch"));
+    assert!(
+        workspace_root
+            .path()
+            .join(".animaos-swarm")
+            .join("todos.json")
+            .exists(),
+        "todo_write should persist the todo list inside the temp workspace"
+    );
+}
+
+#[tokio::test]
+async fn run_agent_executes_filesystem_tools_round_trip() {
+    let workspace_root = use_temp_workspace_root("agent-files");
+    let app = test_app();
+    let (_, create_response) = create_agent(
+        &app,
+        r#"{"name":"reviewer","model":"gpt-5.4","tools":[{"name":"write_file","description":"Write file","parameters":{"file_path":{"type":"string"},"content":{"type":"string"}}},{"name":"read_file","description":"Read file","parameters":{"file_path":{"type":"string"}}},{"name":"list_dir","description":"List directory","parameters":{"path":{"type":"string"}}}]}"#,
+    )
+    .await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (write_status, write_response) =
+        run_agent(&app, &agent_id, r#"{"text":"write file release patch"}"#).await;
+    let (read_status, read_response) =
+        run_agent(&app, &agent_id, r#"{"text":"read file release patch"}"#).await;
+    let (list_status, list_response) =
+        run_agent(&app, &agent_id, r#"{"text":"list notes"}"#).await;
+
+    assert_eq!(write_status, StatusCode::OK);
+    assert!(write_response.contains("Wrote 23 chars to notes/release-patch.txt"));
+    assert_eq!(read_status, StatusCode::OK);
+    assert!(read_response.contains("notes for release patch"));
+    assert!(read_response.contains("1| notes for release patch"));
+    assert_eq!(list_status, StatusCode::OK);
+    assert!(list_response.contains("[file] release-patch.txt"));
+    assert!(
+        workspace_root
+            .path()
+            .join("notes")
+            .join("release-patch.txt")
+            .exists(),
+        "write_file should persist the release patch file inside the temp workspace"
+    );
 }

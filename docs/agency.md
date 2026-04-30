@@ -116,7 +116,7 @@ Each agent declares a `tools` array of snake_case slugs — capabilities the LLM
     - trend_forecast
 ```
 
-> **Current state:** skills are *declarative*. They appear in the YAML and the agent's system prompt, but the launch flow does not yet bind them to executable `Action` handlers. To make a skill *actually invocable*, you need to register a handler with the daemon's tool registry. (Coming next.)
+> **Current state:** skills are *declarative* unless the slug is registered in the daemon tool registry. Launch binds registered tool slugs into executable handlers and ignores unregistered slugs with a warning, so generated agencies can still run while custom skills remain metadata.
 
 When skills are wired, the runtime will:
 1. Look up each slug in the registered tool set.

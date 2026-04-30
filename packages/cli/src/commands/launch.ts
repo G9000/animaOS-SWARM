@@ -80,6 +80,11 @@ interface DaemonPluginDescriptor {
   description: string;
 }
 
+interface ResolvedDaemonTools {
+  descriptors: DaemonToolDescriptor[];
+  unsupportedToolNames: string[];
+}
+
 type DaemonAgentConfig = Omit<AgentConfig, 'tools' | 'plugins'> & {
   tools?: DaemonToolDescriptor[];
   plugins?: DaemonPluginDescriptor[];
@@ -162,13 +167,287 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
       }),
     },
   ],
+  [
+    'web_fetch',
+    {
+      name: 'web_fetch',
+      description:
+        'Fetch the content of a URL and return text or JSON with HTML stripped for readability.',
+      parameters: daemonObjectToolParameters(
+        {
+          url: { type: 'string' },
+          max_length: { type: 'number' },
+        },
+        ['url']
+      ),
+    },
+  ],
+  [
+    'exa_search',
+    {
+      name: 'exa_search',
+      description:
+        'Search Exa for relevant pages and return cited excerpts from the result set.',
+      parameters: daemonObjectToolParameters(
+        {
+          query: { type: 'string' },
+          num_results: { type: 'number' },
+          include_text: { type: 'boolean' },
+          max_characters: { type: 'number' },
+        },
+        ['query']
+      ),
+    },
+  ],
+  [
+    'get_current_time',
+    {
+      name: 'get_current_time',
+      description: 'Get the current UTC date and time.',
+      parameters: daemonObjectToolParameters({}),
+    },
+  ],
+  [
+    'calculate',
+    {
+      name: 'calculate',
+      description: 'Evaluate a math expression and return the numeric result.',
+      parameters: daemonObjectToolParameters(
+        {
+          expression: { type: 'string' },
+        },
+        ['expression']
+      ),
+    },
+  ],
+  [
+    'read_file',
+    {
+      name: 'read_file',
+      description: 'Read a file from the workspace and return numbered lines.',
+      parameters: daemonObjectToolParameters(
+        {
+          file_path: { type: 'string' },
+          offset: { type: 'number' },
+          limit: { type: 'number' },
+        },
+        ['file_path']
+      ),
+    },
+  ],
+  [
+    'list_dir',
+    {
+      name: 'list_dir',
+      description: 'List the files and directories inside a workspace path.',
+      parameters: daemonObjectToolParameters(
+        {
+          path: { type: 'string' },
+        },
+        ['path']
+      ),
+    },
+  ],
+  [
+    'glob',
+    {
+      name: 'glob',
+      description: 'Find workspace files matching a glob pattern.',
+      parameters: daemonObjectToolParameters(
+        {
+          pattern: { type: 'string' },
+          path: { type: 'string' },
+        },
+        ['pattern']
+      ),
+    },
+  ],
+  [
+    'grep',
+    {
+      name: 'grep',
+      description: 'Search workspace files for a regex pattern.',
+      parameters: daemonObjectToolParameters(
+        {
+          pattern: { type: 'string' },
+          path: { type: 'string' },
+          include: { type: 'string' },
+        },
+        ['pattern']
+      ),
+    },
+  ],
+  [
+    'write_file',
+    {
+      name: 'write_file',
+      description: 'Write content to a workspace file, creating directories as needed.',
+      parameters: daemonObjectToolParameters(
+        {
+          file_path: { type: 'string' },
+          content: { type: 'string' },
+        },
+        ['file_path', 'content']
+      ),
+    },
+  ],
+  [
+    'edit_file',
+    {
+      name: 'edit_file',
+      description: 'Edit a workspace file by replacing an exact string match.',
+      parameters: daemonObjectToolParameters(
+        {
+          file_path: { type: 'string' },
+          old_string: { type: 'string' },
+          new_string: { type: 'string' },
+        },
+        ['file_path', 'old_string', 'new_string']
+      ),
+    },
+  ],
+  [
+    'multi_edit',
+    {
+      name: 'multi_edit',
+      description: 'Apply multiple exact string edits to a workspace file atomically.',
+      parameters: daemonObjectToolParameters(
+        {
+          file_path: { type: 'string' },
+          edits: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                old_string: { type: 'string' },
+                new_string: { type: 'string' },
+              },
+              required: ['old_string', 'new_string'],
+            },
+          },
+        },
+        ['file_path', 'edits']
+      ),
+    },
+  ],
+  [
+    'todo_write',
+    {
+      name: 'todo_write',
+      description:
+        'Create or update a structured task list for tracking multi-step work.',
+      parameters: daemonObjectToolParameters(
+        {
+          todos: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                content: { type: 'string' },
+                status: {
+                  type: 'string',
+                  enum: ['pending', 'in_progress', 'completed'],
+                },
+                activeForm: { type: 'string' },
+              },
+              required: ['content', 'status', 'activeForm'],
+            },
+          },
+        },
+        ['todos']
+      ),
+    },
+  ],
+  [
+    'todo_read',
+    {
+      name: 'todo_read',
+      description: 'Read the current todo list to check progress.',
+      parameters: daemonObjectToolParameters({}),
+    },
+  ],
+  [
+    'bash',
+    {
+      name: 'bash',
+      description: 'Execute a shell command inside the workspace and return its output.',
+      parameters: daemonObjectToolParameters(
+        {
+          command: { type: 'string' },
+          timeout: { type: 'number' },
+          cwd: { type: 'string' },
+        },
+        ['command']
+      ),
+    },
+  ],
+  [
+    'bg_start',
+    {
+      name: 'bg_start',
+      description: 'Start a long-running shell command in the background.',
+      parameters: daemonObjectToolParameters(
+        {
+          command: { type: 'string' },
+          cwd: { type: 'string' },
+        },
+        ['command']
+      ),
+    },
+  ],
+  [
+    'bg_output',
+    {
+      name: 'bg_output',
+      description: 'Read incremental or full output from a background process.',
+      parameters: daemonObjectToolParameters(
+        {
+          id: { type: 'string' },
+          all: { type: 'boolean' },
+        },
+        ['id']
+      ),
+    },
+  ],
+  [
+    'bg_stop',
+    {
+      name: 'bg_stop',
+      description: 'Stop a background process and remove it from the process list.',
+      parameters: daemonObjectToolParameters(
+        {
+          id: { type: 'string' },
+        },
+        ['id']
+      ),
+    },
+  ],
+  [
+    'bg_list',
+    {
+      name: 'bg_list',
+      description: 'List the known background processes and their status.',
+      parameters: daemonObjectToolParameters({}),
+    },
+  ],
 ]);
 
 function daemonToolName(toolName: string): string {
   return DAEMON_TOOL_ALIASES.get(toolName) ?? toolName;
 }
 
-function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
+function formatUnsupportedDaemonToolWarning(
+  agentName: string,
+  unsupportedToolNames: string[]
+): string {
+  return (
+    `Ignoring unregistered tool slug(s) for agent "${agentName}": ` +
+    `${unsupportedToolNames.join(', ')}. ` +
+    'Launch binds only daemon-registered tools; other anima.yaml tool entries remain declarative.'
+  );
+}
+
+function daemonToolsForAgent(agent: AgentDefinition): ResolvedDaemonTools {
   const supportedToolNames = new Set<string>(DEFAULT_DAEMON_TOOL_NAMES);
   const modToolDescriptors = new Map<string, DaemonToolDescriptor>();
   const unsupportedTools: string[] = [];
@@ -198,16 +477,6 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
     unsupportedTools.push(toolName);
   }
 
-  if (unsupportedTools.length > 0) {
-    throw new Error(
-      `daemon-backed launch does not support tool(s) for agent "${
-        agent.name
-      }": ${unsupportedTools.join(
-        ', '
-      )}. Launch now runs only through the Rust daemon; remove those tools from anima.yaml or implement them in the daemon tool registry.`
-    );
-  }
-
   const builtinDescriptors = Array.from(supportedToolNames, (toolName) => {
     const descriptor = DAEMON_TOOL_DESCRIPTOR_MAP.get(toolName);
     if (!descriptor) {
@@ -221,7 +490,10 @@ function daemonToolsForAgent(agent: AgentDefinition): DaemonToolDescriptor[] {
     };
   });
 
-  return [...builtinDescriptors, ...modToolDescriptors.values()];
+  return {
+    descriptors: [...builtinDescriptors, ...modToolDescriptors.values()],
+    unsupportedToolNames: unsupportedTools,
+  };
 }
 
 function createDaemonSwarmSession(
@@ -234,7 +506,8 @@ function createDaemonSwarmSession(
   getSwarm: () => Promise<DaemonSwarmSnapshot>;
   invalidate: () => void;
 } {
-  let swarmConfig = buildDaemonSwarmConfig(agency, opts);
+  let { swarmConfig, warnings } = buildDaemonSwarmConfig(agency, opts);
+  reportDaemonToolWarnings(warnings);
   let swarmPromise: Promise<DaemonSwarmSnapshot> | undefined;
 
   return {
@@ -257,7 +530,8 @@ function createDaemonSwarmSession(
       return swarmPromise;
     },
     invalidate() {
-      swarmConfig = buildDaemonSwarmConfig(agency, opts);
+      ({ swarmConfig, warnings } = buildDaemonSwarmConfig(agency, opts));
+      reportDaemonToolWarnings(warnings);
       swarmPromise = undefined;
     },
   };
@@ -291,6 +565,12 @@ function reportSeedResult(
   }
   for (const err of result.errors) {
     console.error('Warning:', err);
+  }
+}
+
+function reportDaemonToolWarnings(warnings: string[]): void {
+  for (const warning of warnings) {
+    console.error('Warning:', warning);
   }
 }
 
@@ -347,21 +627,34 @@ function agentDefToDaemonConfig(
   defaultModel: string,
   provider: string,
   settings?: AgentConfig['settings']
-): DaemonAgentConfig {
+): { config: DaemonAgentConfig; warnings: string[] } {
+  const { descriptors, unsupportedToolNames } = daemonToolsForAgent(agent);
+
   return {
-    name: agent.name,
-    bio: agent.bio,
-    lore: agent.lore,
-    adjectives: agent.adjectives,
-    topics: agent.topics,
-    knowledge: agent.knowledge,
-    style: agent.style,
-    model: agent.model ?? defaultModel,
-    provider,
-    system: agent.system,
-    tools: daemonToolsForAgent(agent),
-    plugins: [DAEMON_MEMORY_PLUGIN],
-    settings,
+    config: {
+      name: agent.name,
+      bio: agent.bio,
+      lore: agent.lore,
+      adjectives: agent.adjectives,
+      topics: agent.topics,
+      knowledge: agent.knowledge,
+      style: agent.style,
+      model: agent.model ?? defaultModel,
+      provider,
+      system: agent.system,
+      tools: descriptors,
+      plugins: [DAEMON_MEMORY_PLUGIN],
+      settings,
+    },
+    warnings:
+      unsupportedToolNames.length > 0
+        ? [
+            formatUnsupportedDaemonToolWarning(
+              agent.name,
+              unsupportedToolNames
+            ),
+          ]
+        : [],
   };
 }
 
@@ -375,23 +668,31 @@ function saveAgency(dir: string, agency: AgencyConfig) {
 function buildDaemonSwarmConfig(
   agency: AgencyConfig,
   opts: Pick<LaunchOptions, 'apiKey'>
-): DaemonSwarmConfig {
+): { swarmConfig: DaemonSwarmConfig; warnings: string[] } {
   const settings = resolveDaemonModelSettings(agency.provider, opts.apiKey);
+  const manager = agentDefToDaemonConfig(
+    agency.orchestrator,
+    agency.model,
+    agency.provider,
+    settings
+  );
+  const workers = agency.agents.map((agent) =>
+    agentDefToDaemonConfig(agent, agency.model, agency.provider, settings)
+  );
 
   return {
-    strategy: agency.strategy,
-    ...(agency.maxParallelDelegations
-      ? { maxParallelDelegations: agency.maxParallelDelegations }
-      : {}),
-    manager: agentDefToDaemonConfig(
-      agency.orchestrator,
-      agency.model,
-      agency.provider,
-      settings
-    ),
-    workers: agency.agents.map((agent) =>
-      agentDefToDaemonConfig(agent, agency.model, agency.provider, settings)
-    ),
+    swarmConfig: {
+      strategy: agency.strategy,
+      ...(agency.maxParallelDelegations
+        ? { maxParallelDelegations: agency.maxParallelDelegations }
+        : {}),
+      manager: manager.config,
+      workers: workers.map((worker) => worker.config),
+    },
+    warnings: [
+      ...manager.warnings,
+      ...workers.flatMap((worker) => worker.warnings),
+    ],
   };
 }
 
@@ -667,7 +968,6 @@ async function executeDaemonTuiLaunchCommand(
               await relayLaunchSwarmEvent(bus, displayAgents, event);
               if (event.event === 'swarm:completed') {
                 sawCompletion = true;
-                break;
               }
             }
           } catch (error) {
@@ -678,7 +978,6 @@ async function executeDaemonTuiLaunchCommand(
         })();
 
         await emitLaunchTaskStart(bus, displayAgents, input);
-        launchStarted = true;
         const execution = await client.swarms.run(swarm.id, { text: input });
         await Promise.race([subscription, sleep(2000)]);
         abortController.abort();

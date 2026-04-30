@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { executeLaunchCommand } from './launch.js';
 import { relayLaunchSwarmEvent } from './launch-events.js';
 import { LAUNCH_HISTORY_FILENAME } from './launch-history.js';
-import { MOD_TOOL_MAP } from '@animaOS-SWARM/tools';
+import { ACTION_TOOL_SCHEMAS, MOD_TOOL_MAP } from '@animaOS-SWARM/tools';
 
 const DEFAULT_AGENCY_YAML = [
   'name: Launch Test Agency',
@@ -299,6 +299,767 @@ describe('launch command daemon plain-text mode', () => {
     });
   });
 
+  it('maps web_fetch into a daemon tool descriptor', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - web_fetch',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Inspect otter travel trends',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const webFetch = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'web_fetch'
+    );
+
+    expect(webFetch).toEqual(
+      expect.objectContaining({
+        name: 'web_fetch',
+        parameters: {
+          type: 'object',
+          properties: {
+            url: { type: 'string' },
+            max_length: { type: 'number' },
+          },
+          required: ['url'],
+        },
+      })
+    );
+  });
+
+  it('maps exa_search into a daemon tool descriptor', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - exa_search',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Research Malaysian adventure operators',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const exaSearch = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'exa_search'
+    );
+
+    expect(exaSearch).toEqual(
+      expect.objectContaining({
+        name: 'exa_search',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string' },
+            num_results: { type: 'number' },
+            include_text: { type: 'boolean' },
+            max_characters: { type: 'number' },
+          },
+          required: ['query'],
+        },
+      })
+    );
+  });
+
+  it('maps calculate and get_current_time into daemon tool descriptors', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - calculate',
+        '    - get_current_time',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Sanity check utility tools',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const calculate = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'calculate'
+    );
+    const currentTime = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'get_current_time'
+    );
+
+    expect(calculate).toEqual(
+      expect.objectContaining({
+        name: 'calculate',
+        parameters: {
+          type: 'object',
+          properties: {
+            expression: { type: 'string' },
+          },
+          required: ['expression'],
+        },
+      })
+    );
+
+    expect(currentTime).toEqual(
+      expect.objectContaining({
+        name: 'get_current_time',
+        parameters: {
+          type: 'object',
+          properties: {},
+        },
+      })
+    );
+  });
+
+  it('maps read_file and list_dir into daemon tool descriptors', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - read_file',
+        '    - list_dir',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Inspect the repo',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const readFile = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'read_file'
+    );
+    const listDir = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'list_dir'
+    );
+
+    expect(readFile).toEqual(
+      expect.objectContaining({
+        name: 'read_file',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            offset: { type: 'number' },
+            limit: { type: 'number' },
+          },
+          required: ['file_path'],
+        },
+      })
+    );
+
+    expect(listDir).toEqual(
+      expect.objectContaining({
+        name: 'list_dir',
+        parameters: {
+          type: 'object',
+          properties: {
+            path: { type: 'string' },
+          },
+          required: ['path'],
+        },
+      })
+    );
+  });
+
+  it('maps glob and grep into daemon tool descriptors', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - glob',
+        '    - grep',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Search the repo',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const glob = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'glob'
+    );
+    const grep = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'grep'
+    );
+
+    expect(glob).toEqual(
+      expect.objectContaining({
+        name: 'glob',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string' },
+            path: { type: 'string' },
+          },
+          required: ['pattern'],
+        },
+      })
+    );
+
+    expect(grep).toEqual(
+      expect.objectContaining({
+        name: 'grep',
+        parameters: {
+          type: 'object',
+          properties: {
+            pattern: { type: 'string' },
+            path: { type: 'string' },
+            include: { type: 'string' },
+          },
+          required: ['pattern'],
+        },
+      })
+    );
+  });
+
+  it('maps write_file, edit_file, and multi_edit into daemon tool descriptors', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - write_file',
+        '    - edit_file',
+        '    - multi_edit',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Modify the repo',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const writeFile = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'write_file'
+    );
+    const editFile = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'edit_file'
+    );
+    const multiEdit = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'multi_edit'
+    );
+
+    expect(writeFile).toEqual(
+      expect.objectContaining({
+        name: 'write_file',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            content: { type: 'string' },
+          },
+          required: ['file_path', 'content'],
+        },
+      })
+    );
+
+    expect(editFile).toEqual(
+      expect.objectContaining({
+        name: 'edit_file',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            old_string: { type: 'string' },
+            new_string: { type: 'string' },
+          },
+          required: ['file_path', 'old_string', 'new_string'],
+        },
+      })
+    );
+
+    expect(multiEdit).toEqual(
+      expect.objectContaining({
+        name: 'multi_edit',
+        parameters: {
+          type: 'object',
+          properties: {
+            file_path: { type: 'string' },
+            edits: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  old_string: { type: 'string' },
+                  new_string: { type: 'string' },
+                },
+                required: ['old_string', 'new_string'],
+              },
+            },
+          },
+          required: ['file_path', 'edits'],
+        },
+      })
+    );
+  });
+
+  it('maps bash and background process tools into daemon tool descriptors', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - bash',
+        '    - bg_start',
+        '    - bg_output',
+        '    - bg_stop',
+        '    - bg_list',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Run and monitor commands',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const bash = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'bash'
+    );
+    const bgStart = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'bg_start'
+    );
+    const bgOutput = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'bg_output'
+    );
+    const bgStop = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'bg_stop'
+    );
+    const bgList = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'bg_list'
+    );
+
+    expect(bash).toEqual(
+      expect.objectContaining({
+        name: 'bash',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+            timeout: { type: 'number' },
+            cwd: { type: 'string' },
+          },
+          required: ['command'],
+        },
+      })
+    );
+
+    expect(bgStart).toEqual(
+      expect.objectContaining({
+        name: 'bg_start',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+            cwd: { type: 'string' },
+          },
+          required: ['command'],
+        },
+      })
+    );
+
+    expect(bgOutput).toEqual(
+      expect.objectContaining({
+        name: 'bg_output',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+            all: { type: 'boolean' },
+          },
+          required: ['id'],
+        },
+      })
+    );
+
+    expect(bgStop).toEqual(
+      expect.objectContaining({
+        name: 'bg_stop',
+        parameters: {
+          type: 'object',
+          properties: {
+            id: { type: 'string' },
+          },
+          required: ['id'],
+        },
+      })
+    );
+
+    expect(bgList).toEqual(
+      expect.objectContaining({
+        name: 'bg_list',
+        parameters: {
+          type: 'object',
+          properties: {},
+        },
+      })
+    );
+  });
+
+  it('maps todo tools into daemon tool descriptors', async () => {
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        '    - todo_write',
+        '    - todo_read',
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Track progress',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const todoWrite = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'todo_write'
+    );
+    const todoRead = createdSwarm?.manager?.tools?.find(
+      (tool: { name: string }) => tool.name === 'todo_read'
+    );
+
+    expect(todoWrite).toEqual(
+      expect.objectContaining({
+        name: 'todo_write',
+        parameters: {
+          type: 'object',
+          properties: {
+            todos: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  content: { type: 'string' },
+                  status: {
+                    type: 'string',
+                    enum: ['pending', 'in_progress', 'completed'],
+                  },
+                  activeForm: { type: 'string' },
+                },
+                required: ['content', 'status', 'activeForm'],
+              },
+            },
+          },
+          required: ['todos'],
+        },
+      })
+    );
+
+    expect(todoRead).toEqual(
+      expect.objectContaining({
+        name: 'todo_read',
+        parameters: {
+          type: 'object',
+          properties: {},
+        },
+      })
+    );
+  });
+
+  it('maps every built-in tools registry entry into a daemon descriptor', async () => {
+    const builtInToolNames = ACTION_TOOL_SCHEMAS.map((tool) => tool.name);
+
+    rmSync(agencyDir, { recursive: true, force: true });
+    agencyDir = createAgencyDir(
+      [
+        'name: Launch Test Agency',
+        'description: daemon launch fixture',
+        'model: gpt-5.4',
+        'provider: openai',
+        'strategy: round-robin',
+        'orchestrator:',
+        '  name: manager',
+        '  bio: Coordinate work',
+        '  system: Orchestrate the workers',
+        '  tools:',
+        ...builtInToolNames.map((toolName) => `    - ${toolName}`),
+        'agents:',
+        '  - name: worker-a',
+        '    bio: Execute tasks',
+        '    system: Complete the assigned work',
+      ].join('\n')
+    );
+
+    const client = {
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
+    };
+
+    await executeLaunchCommand(
+      'Verify daemon tool coverage',
+      {
+        dir: agencyDir,
+        tui: false,
+      },
+      { client }
+    );
+
+    const createdSwarm = client.swarms.create.mock.calls[0]?.[0];
+    const managerToolNames = new Set(
+      (createdSwarm?.manager?.tools ?? []).map((tool: { name: string }) => tool.name)
+    );
+    const missing = builtInToolNames.filter((toolName) => !managerToolNames.has(toolName));
+
+    expect(missing).toEqual([]);
+  });
+
   it('passes maxParallelDelegations through to the daemon swarm config', async () => {
     rmSync(agencyDir, { recursive: true, force: true });
     agencyDir = createAgencyDir(
@@ -350,7 +1111,7 @@ describe('launch command daemon plain-text mode', () => {
     );
   });
 
-  it('fails fast when launch requests unsupported daemon tools', async () => {
+  it('warns and continues when launch sees unregistered tool slugs', async () => {
     rmSync(agencyDir, { recursive: true, force: true });
     agencyDir = createAgencyDir(
       [
@@ -364,7 +1125,7 @@ describe('launch command daemon plain-text mode', () => {
         '  bio: Coordinate work',
         '  system: Orchestrate the workers',
         '  tools:',
-        '    - bash',
+        '    - strategic_roadmap',
         'agents:',
         '  - name: worker-a',
         '    bio: Execute tasks',
@@ -373,7 +1134,16 @@ describe('launch command daemon plain-text mode', () => {
     );
 
     const client = {
-      swarms: mockSwarms(),
+      swarms: mockSwarms({
+        create: vi.fn().mockResolvedValue({ id: 'swarm-1' }),
+        run: vi.fn().mockResolvedValue({
+          result: {
+            status: 'success',
+            data: { text: 'daemon launch result' },
+            durationMs: 12,
+          },
+        }),
+      }),
     };
 
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -387,12 +1157,21 @@ describe('launch command daemon plain-text mode', () => {
       { client }
     );
 
-    expect(client.swarms.create).not.toHaveBeenCalled();
-    expect(errorSpy).toHaveBeenCalledWith(
-      'Error:',
-      'daemon-backed launch does not support tool(s) for agent "manager": bash. Launch now runs only through the Rust daemon; remove those tools from anima.yaml or implement them in the daemon tool registry.'
+    expect(client.swarms.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        manager: expect.objectContaining({
+          tools: expect.arrayContaining([
+            expect.objectContaining({ name: 'memory_search' }),
+            expect.objectContaining({ name: 'recent_memories' }),
+          ]),
+        }),
+      })
     );
-    expect(process.exitCode).toBe(1);
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Warning:',
+      'Ignoring unregistered tool slug(s) for agent "manager": strategic_roadmap. Launch binds only daemon-registered tools; other anima.yaml tool entries remain declarative.'
+    );
+    expect(process.exitCode).toBeUndefined();
   });
 
   it('resolves registered mod tools into daemon tool descriptors', async () => {

@@ -1,29 +1,23 @@
 mod agents;
 mod contracts;
 mod health;
+mod http;
 mod memories;
 mod swarms;
 
-use std::collections::HashMap;
-use std::io::{self, Write};
-
-use axum::body::to_bytes;
 use axum::extract::{Path, Request as AxumRequest, State};
-use axum::http::{header, HeaderValue, Request as HttpRequest, StatusCode, Uri};
-use axum::response::{IntoResponse, Response as AxumResponse};
+use axum::http::{StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response as AxumResponse};
 use axum::routing::get;
 use axum::Router;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
-use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
 use tower::ServiceBuilder;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::{DefaultOnResponse, TraceLayer};
 use tower_http::LatencyUnit;
-use tracing::{info_span, Level};
+use tracing::Level;
 use utoipa::OpenApi;
-use utoipa_scalar::{Scalar, Servable};
+use utoipa_scalar::Scalar;
 
 use crate::app::{DaemonConfig, SharedDaemonState};
 
@@ -33,6 +27,8 @@ use self::contracts::{
     MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, RecentMemoriesQuery,
     SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
 };
+use self::http::{json_response, make_http_span, read_limited_body, request_query};
+pub(super) use self::http::{parse_json_body, serialize_json};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -127,8 +123,10 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
                         .latency_unit(LatencyUnit::Millis),
                 ),
         );
-    let standard_routes = Router::new()
-        .merge(Scalar::with_url("/docs", ApiDoc::openapi()))
+    let timed_routes = Router::new()
+        .route("/openapi.json", get(openapi_entry))
+        .route("/docs", get(docs_entry))
+        .route("/docs/", get(docs_entry))
         .route("/health", get(health_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/memories", axum::routing::post(create_memory_entry))
@@ -144,10 +142,6 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             get(get_agent_entry).delete(delete_agent_entry),
         )
         .route(
-            "/api/agents/{agent_id}/run",
-            axum::routing::post(run_agent_entry),
-        )
-        .route(
             "/api/agents/{agent_id}/memories/recent",
             get(agent_recent_memories_entry),
         )
@@ -156,37 +150,36 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             get(list_swarms_entry).post(create_swarm_entry),
         )
         .route("/api/swarms/{swarm_id}", get(get_swarm_entry))
-        .route("/api/swarms/{swarm_id}/run", axum::routing::post(run_swarm_entry))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             config.request_timeout,
         ));
+    let run_routes = Router::new()
+        .route(
+            "/api/agents/{agent_id}/run",
+            axum::routing::post(run_agent_entry),
+        )
+        .route("/api/swarms/{swarm_id}/run", axum::routing::post(run_swarm_entry));
 
     Router::new()
-        .merge(standard_routes)
+        .merge(timed_routes)
+        .merge(run_routes)
         .route("/api/swarms/{swarm_id}/events", get(swarm_events_entry))
         .fallback(not_found_entry)
         .layer(request_middleware)
         .with_state(app_state)
 }
 
-fn make_http_span<B>(request: &HttpRequest<B>) -> tracing::Span {
-    let request_id = request
-        .headers()
-        .get("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-
-    info_span!(
-        "http_request",
-        method = %request.method(),
-        uri = %request.uri(),
-        request_id = %request_id,
-    )
-}
-
 async fn health_entry() -> AxumResponse {
     json_response(StatusCode::OK, &health::handle_health())
+}
+
+async fn openapi_entry() -> AxumResponse {
+    json_response(StatusCode::OK, &ApiDoc::openapi())
+}
+
+async fn docs_entry() -> Html<String> {
+    Html(Scalar::new(ApiDoc::openapi()).to_html())
 }
 
 #[utoipa::path(
@@ -522,113 +515,5 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
     match memories::handle_search_memories(query, state).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
-    }
-}
-
-pub(super) fn parse_json_body<T: DeserializeOwned>(body: Vec<u8>) -> Result<T, ApiError> {
-    let body = std::str::from_utf8(&body)
-        .map_err(|_| ApiError::bad_request_static("request body must be valid UTF-8"))?;
-    serde_json::from_str(body)
-        .map_err(|_| ApiError::bad_request_static("request body must be valid JSON"))
-}
-
-async fn read_limited_body(request: AxumRequest, limit: usize) -> Result<Vec<u8>, AxumResponse> {
-    to_bytes(request.into_body(), limit)
-        .await
-        .map(|body| body.to_vec())
-        .map_err(|_| ApiError::malformed_request().into_response())
-}
-
-pub(super) fn serialize_json<T: Serialize>(value: &T) -> String {
-    let mut body = Vec::new();
-    let mut serializer =
-        serde_json::Serializer::with_formatter(&mut body, ContractJsonFormatter::default());
-    value
-        .serialize(&mut serializer)
-        .expect("response body should serialize");
-    String::from_utf8(body).expect("serialized response should be utf-8")
-}
-
-fn json_response<T: Serialize>(status: StatusCode, value: &T) -> AxumResponse {
-    let body = serialize_json(value);
-    (
-        status,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        )],
-        body,
-    )
-        .into_response()
-}
-
-fn request_query(uri: &Uri) -> Result<HashMap<String, String>, ()> {
-    parse_query_string(uri.query().unwrap_or_default())
-}
-
-fn parse_query_string(query: &str) -> Result<HashMap<String, String>, ()> {
-    let mut params = HashMap::new();
-    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        params.insert(percent_decode(key)?, percent_decode(value)?);
-    }
-    Ok(params)
-}
-
-fn percent_decode(value: &str) -> Result<String, ()> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::new();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                decoded.push(b' ');
-                index += 1;
-            }
-            b'%' => {
-                if index + 2 >= bytes.len() {
-                    return Err(());
-                }
-                decoded.push((hex_value(bytes[index + 1])? << 4) | hex_value(bytes[index + 2])?);
-                index += 3;
-            }
-            byte => {
-                decoded.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8(decoded).map_err(|_| ())
-}
-
-fn hex_value(byte: u8) -> Result<u8, ()> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(()),
-    }
-}
-
-#[derive(Default)]
-struct ContractJsonFormatter {
-    inner: CompactFormatter,
-}
-
-impl Formatter for ContractJsonFormatter {
-    fn write_char_escape<W>(&mut self, writer: &mut W, char_escape: CharEscape) -> io::Result<()>
-    where
-        W: ?Sized + Write,
-    {
-        match char_escape {
-            CharEscape::Backspace => writer.write_all(b"\\u0008"),
-            CharEscape::FormFeed => writer.write_all(b"\\u000c"),
-            CharEscape::AsciiControl(byte) => {
-                write!(writer, "\\u{byte:04x}")
-            }
-            _ => self.inner.write_char_escape(writer, char_escape),
-        }
     }
 }

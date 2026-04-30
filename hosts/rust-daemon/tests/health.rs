@@ -113,7 +113,7 @@ async fn openapi_endpoint_returns_spec_json() {
 }
 
 #[tokio::test]
-async fn swagger_ui_endpoint_returns_html() {
+async fn docs_endpoint_returns_html() {
     let response = app()
         .oneshot(
             Request::builder()
@@ -139,7 +139,7 @@ async fn swagger_ui_endpoint_returns_html() {
         .expect("body reads");
     let body = std::str::from_utf8(&body).expect("body is utf-8");
     assert!(
-        body.contains("SwaggerUI") || body.contains("swagger-ui"),
+        body.contains("Scalar") || body.contains("api-reference"),
         "{body}"
     );
 }
