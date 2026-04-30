@@ -163,12 +163,12 @@ describe("MemoryProvider.get()", () => {
 		for (let i = 1; i <= 5; i++) {
 			manager.add({ agentId: "a1", agentName: "researcher", type: "fact", content: `high importance fact ${i}`, importance: 0.9 })
 		}
+		// Low-importance memory that BM25 will not rank highly for this query
+		manager.add({ agentId: "a1", agentName: "researcher", type: "fact", content: "barely relevant obscure widget detail", importance: 0.1 })
 		// 3 more high-importance memories added after — fill recent slots
 		for (let i = 6; i <= 8; i++) {
 			manager.add({ agentId: "a1", agentName: "researcher", type: "fact", content: `high importance fact ${i}`, importance: 0.9 })
 		}
-		// Low-importance memory that BM25 will not rank highly for this query
-		manager.add({ agentId: "a1", agentName: "researcher", type: "fact", content: "barely relevant obscure widget detail", importance: 0.1 })
 
 		const result = await provider.get(runtime, makeMessage("high importance fact"))
 		expect(result.text).toContain("high importance fact")

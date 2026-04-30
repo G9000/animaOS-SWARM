@@ -13,6 +13,7 @@ import { Chat } from './components/Chat';
 import { CreateAgent } from './components/CreateAgent';
 import { CreateAgency } from './components/CreateAgency';
 import { CreateSwarm } from './components/CreateSwarm';
+import { MemoryInspector } from './components/MemoryInspector';
 
 type View = 'chat' | 'create' | 'empty';
 
@@ -24,6 +25,7 @@ export function Playground() {
   const [view, setView] = useState<View>('empty');
   const [loadError, setLoadError] = useState<string | null>(null);
   const [providerList, setProviderList] = useState<Provider[] | null>(null);
+  const [memoryRefreshKey, setMemoryRefreshKey] = useState(0);
 
   const refreshAgents = useCallback(async () => {
     try {
@@ -152,6 +154,11 @@ export function Playground() {
     setView('chat');
   }
 
+  async function handleAfterRun() {
+    await refreshActive();
+    setMemoryRefreshKey((value) => value + 1);
+  }
+
   return (
     <div className="grid grid-rows-[auto_1fr] grid-cols-1 h-screen">
       <header className="flex items-center gap-3 px-5 h-14 border-b border-[var(--border)] bg-[var(--surface)]">
@@ -196,53 +203,60 @@ export function Playground() {
           onDelete={handleDelete}
         />
 
-        <section className="min-w-0 min-h-0 overflow-hidden bg-[var(--bg)]">
-          {view === 'empty' && (
-            <EmptyState
-              kind={kind}
-              hasItems={
-                kind === 'agencies'
-                  ? false
-                  : kind === 'agents'
-                  ? agentList.length > 0
-                  : swarmList.length > 0
-              }
-              onNew={handleNew}
-            />
-          )}
-          {view === 'create' && kind === 'agents' && (
-            <div className="h-full overflow-y-auto">
-              <CreateAgent
-                onCreated={handleCreated}
+        <section className="min-w-0 min-h-0 grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_380px] overflow-hidden bg-[var(--bg)]">
+          <div className="min-w-0 min-h-0 overflow-hidden">
+            {view === 'empty' && (
+              <EmptyState
+                kind={kind}
+                hasItems={
+                  kind === 'agencies'
+                    ? false
+                    : kind === 'agents'
+                    ? agentList.length > 0
+                    : swarmList.length > 0
+                }
+                onNew={handleNew}
+              />
+            )}
+            {view === 'create' && kind === 'agents' && (
+              <div className="h-full overflow-y-auto">
+                <CreateAgent
+                  onCreated={handleCreated}
+                  onCancel={() => setView('empty')}
+                  providers={providerList}
+                />
+              </div>
+            )}
+            {view === 'create' && kind === 'swarms' && (
+              <div className="h-full overflow-y-auto">
+                <CreateSwarm
+                  onCreated={handleCreated}
+                  onCancel={() => setView('empty')}
+                  providers={providerList}
+                />
+              </div>
+            )}
+            {view === 'create' && kind === 'agencies' && (
+              <CreateAgency
                 onCancel={() => setView('empty')}
+                onSwarmCreated={handleAgencySpawned}
                 providers={providerList}
               />
-            </div>
-          )}
-          {view === 'create' && kind === 'swarms' && (
-            <div className="h-full overflow-y-auto">
-              <CreateSwarm
-                onCreated={handleCreated}
-                onCancel={() => setView('empty')}
-                providers={providerList}
+            )}
+            {view === 'chat' && kind !== 'agencies' && selected && (
+              <Chat
+                key={selectedId ?? ''}
+                kind={kind}
+                entity={selected}
+                onAfterRun={handleAfterRun}
               />
-            </div>
-          )}
-          {view === 'create' && kind === 'agencies' && (
-            <CreateAgency
-              onCancel={() => setView('empty')}
-              onSwarmCreated={handleAgencySpawned}
-              providers={providerList}
-            />
-          )}
-          {view === 'chat' && kind !== 'agencies' && selected && (
-            <Chat
-              key={selectedId ?? ''}
-              kind={kind}
-              entity={selected}
-              onAfterRun={refreshActive}
-            />
-          )}
+            )}
+          </div>
+          <MemoryInspector
+            agents={agentList}
+            selectedAgentId={kind === 'agents' ? selectedId : null}
+            refreshKey={memoryRefreshKey}
+          />
         </section>
       </main>
     </div>

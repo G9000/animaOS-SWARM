@@ -19,6 +19,11 @@ const daemonManifestPath = resolve(
   workspaceRoot,
   'Cargo.toml'
 );
+const daemonTargetDir = resolve(
+  workspaceRoot,
+  'target',
+  'sdk-daemon-integration'
+);
 
 describe.sequential('@animaOS-SWARM/sdk real daemon integration', () => {
   let daemonProcess: ChildProcess | null = null;
@@ -38,6 +43,7 @@ describe.sequential('@animaOS-SWARM/sdk real daemon integration', () => {
           ...process.env,
           ANIMAOS_RS_HOST: '127.0.0.1',
           ANIMAOS_RS_PORT: String(port),
+          CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR ?? daemonTargetDir,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       }

@@ -15,7 +15,20 @@ export type {
 } from './client.js';
 
 export { MemoriesClient } from './memories.js';
-export type { CreateMemoryInput, RecentMemoriesOptions } from './memories.js';
+export type {
+  CreateAgentRelationshipInput,
+  CreateMemoryEntityInput,
+  CreateMemoryInput,
+  EvaluatedMemoryInput,
+  MemoryEntity,
+  MemoryEntityOptions,
+  MemoryEvaluation,
+  MemoryEvaluationDecision,
+  MemoryEvaluationOutcome,
+  MemoryRecallOptions,
+  MemoryRecallResult,
+  RecentMemoriesOptions,
+} from './memories.js';
 
 export { SwarmsClient, swarm } from './swarms.js';
 export type {
@@ -45,8 +58,12 @@ export type {
 
 export type {
   Memory,
+  AgentRelationship,
+  AgentRelationshipOptions,
   MemorySearchOptions,
   MemorySearchResult,
+  NewAgentRelationshipInput,
+  RelationshipEndpointKind,
   MemoryType,
 } from '@animaOS-SWARM/memory';
 

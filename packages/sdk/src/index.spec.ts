@@ -308,6 +308,221 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
     );
   });
 
+  it('manages memory entities, evaluations, and recall through the daemon', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          {
+            kind: 'user',
+            id: 'user-1',
+            name: 'Leo',
+            aliases: ['operator'],
+            summary: 'Primary operator',
+            createdAt: 1712448000000,
+            updatedAt: 1712448000000,
+          },
+          { status: 201 }
+        )
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          entities: [
+            {
+              kind: 'user',
+              id: 'user-1',
+              name: 'Leo',
+              aliases: ['operator'],
+              summary: 'Primary operator',
+              createdAt: 1712448000000,
+              updatedAt: 1712448000000,
+            },
+          ],
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          decision: 'ignore',
+          reason: 'memory is too short and below the importance threshold',
+          score: 0.03,
+          suggestedImportance: 0.05,
+          duplicateMemoryId: null,
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          evaluation: {
+            decision: 'store',
+            reason: 'memory contains distinct evidence',
+            score: 0.74,
+            suggestedImportance: 0.74,
+            duplicateMemoryId: null,
+          },
+          memory: {
+            id: 'memory-9',
+            agentId: 'agent-1',
+            agentName: 'researcher',
+            type: 'fact',
+            content: 'User prefers concise release notes',
+            importance: 0.74,
+            createdAt: 1712448002000,
+            tags: ['preference'],
+            scope: 'private',
+          },
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          results: [
+            {
+              memory: {
+                id: 'memory-9',
+                agentId: 'agent-1',
+                agentName: 'researcher',
+                type: 'fact',
+                content: 'User prefers concise release notes',
+                importance: 0.74,
+                createdAt: 1712448002000,
+                tags: ['preference'],
+                scope: 'private',
+              },
+              score: 0.61,
+              lexicalScore: 0,
+              vectorScore: 0,
+              relationshipScore: 0.9,
+              recencyScore: 0,
+              importanceScore: 0.74,
+            },
+          ],
+        })
+      );
+
+    const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
+
+    await expect(
+      client.memories.createEntity({
+        kind: 'user',
+        id: 'user-1',
+        name: 'Leo',
+        aliases: ['operator'],
+        summary: 'Primary operator',
+      })
+    ).resolves.toMatchObject({
+      kind: 'user',
+      id: 'user-1',
+    });
+
+    await expect(
+      client.memories.entities({ kind: 'user', alias: 'operator', limit: 5 })
+    ).resolves.toEqual([
+      expect.objectContaining({
+        id: 'user-1',
+        aliases: ['operator'],
+      }),
+    ]);
+
+    await expect(
+      client.memories.evaluate({
+        agentId: 'agent-1',
+        agentName: 'researcher',
+        type: 'fact',
+        content: 'ok',
+        importance: 0.05,
+      })
+    ).resolves.toMatchObject({
+      decision: 'ignore',
+    });
+
+    await expect(
+      client.memories.addEvaluated({
+        agentId: 'agent-1',
+        agentName: 'researcher',
+        type: 'fact',
+        content: 'User prefers concise release notes',
+        importance: 0.4,
+        tags: ['preference'],
+        minContentChars: 8,
+      })
+    ).resolves.toMatchObject({
+      evaluation: {
+        decision: 'store',
+      },
+      memory: {
+        id: 'memory-9',
+      },
+    });
+
+    await expect(
+      client.memories.recall('evidence probe', {
+        entityId: 'user-1',
+        agentId: 'agent-1',
+        recentLimit: 0,
+        limit: 3,
+      })
+    ).resolves.toEqual([
+      expect.objectContaining({
+        memory: expect.objectContaining({
+          id: 'memory-9',
+        }),
+        relationshipScore: 0.9,
+      }),
+    ]);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://daemon.test/api/memories/entities',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          kind: 'user',
+          id: 'user-1',
+          name: 'Leo',
+          aliases: ['operator'],
+          summary: 'Primary operator',
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'http://daemon.test/api/memories/entities?kind=user&alias=operator&limit=5',
+      expect.any(Object)
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      'http://daemon.test/api/memories/evaluations',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          agentId: 'agent-1',
+          agentName: 'researcher',
+          type: 'fact',
+          content: 'ok',
+          importance: 0.05,
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      'http://daemon.test/api/memories/evaluated',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          agentId: 'agent-1',
+          agentName: 'researcher',
+          type: 'fact',
+          content: 'User prefers concise release notes',
+          importance: 0.4,
+          tags: ['preference'],
+          minContentChars: 8,
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      'http://daemon.test/api/memories/recall?q=evidence+probe&agentId=agent-1&limit=3&entityId=user-1&recentLimit=0',
+      expect.any(Object)
+    );
+  });
+
   it('creates and runs a swarm through the daemon', async () => {
     fetchMock
       .mockResolvedValueOnce(

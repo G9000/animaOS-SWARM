@@ -121,6 +121,29 @@ export interface MemorySearchResult extends Memory {
   score: number;
 }
 
+export type RelationshipEndpointKind = 'agent' | 'user' | 'system' | 'external';
+
+export interface AgentRelationship {
+  id: string;
+  sourceKind: RelationshipEndpointKind;
+  sourceAgentId: string;
+  sourceAgentName: string;
+  targetKind: RelationshipEndpointKind;
+  targetAgentId: string;
+  targetAgentName: string;
+  relationshipType: string;
+  summary?: string | null;
+  strength: number;
+  confidence: number;
+  evidenceMemoryIds: string[];
+  tags?: string[] | null;
+  roomId?: string | null;
+  worldId?: string | null;
+  sessionId?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface AgentConfig {
   name: string;
   model: string;
@@ -171,6 +194,40 @@ export interface MemorySearchOptions {
   sessionId?: string;
   limit?: number;
   minImportance?: number;
+}
+
+export interface AgentRelationshipCreateRequest {
+  sourceKind?: RelationshipEndpointKind;
+  sourceAgentId: string;
+  sourceAgentName: string;
+  targetKind?: RelationshipEndpointKind;
+  targetAgentId: string;
+  targetAgentName: string;
+  relationshipType: string;
+  summary?: string;
+  strength?: number;
+  confidence?: number;
+  evidenceMemoryIds?: string[];
+  tags?: string[];
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+}
+
+export interface AgentRelationshipOptions {
+  entityId?: string;
+  agentId?: string;
+  sourceKind?: RelationshipEndpointKind;
+  sourceAgentId?: string;
+  targetKind?: RelationshipEndpointKind;
+  targetAgentId?: string;
+  relationshipType?: string;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  minStrength?: number;
+  minConfidence?: number;
+  limit?: number;
 }
 
 // ── Core fetch helper ────────────────────────────────────────────────────────
@@ -329,5 +386,32 @@ export const memories = {
     return request<{ memories: Memory[] }>(
       `/api/memories/recent${qs ? `?${qs}` : ''}`
     ).then((r) => r.memories);
+  },
+
+  createRelationship: (body: AgentRelationshipCreateRequest) =>
+    request<AgentRelationship>('/api/memories/relationships', {
+      method: 'POST',
+      json: body,
+    }),
+
+  relationships: (opts?: AgentRelationshipOptions) => {
+    const params = new URLSearchParams();
+    if (opts?.entityId) params.set('entityId', opts.entityId);
+    if (opts?.agentId) params.set('agentId', opts.agentId);
+    if (opts?.sourceKind) params.set('sourceKind', opts.sourceKind);
+    if (opts?.sourceAgentId) params.set('sourceAgentId', opts.sourceAgentId);
+    if (opts?.targetKind) params.set('targetKind', opts.targetKind);
+    if (opts?.targetAgentId) params.set('targetAgentId', opts.targetAgentId);
+    if (opts?.relationshipType) params.set('relationshipType', opts.relationshipType);
+    if (opts?.roomId) params.set('roomId', opts.roomId);
+    if (opts?.worldId) params.set('worldId', opts.worldId);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+    if (opts?.minStrength !== undefined) params.set('minStrength', String(opts.minStrength));
+    if (opts?.minConfidence !== undefined) params.set('minConfidence', String(opts.minConfidence));
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return request<{ relationships: AgentRelationship[] }>(
+      `/api/memories/relationships${qs ? `?${qs}` : ''}`
+    ).then((r) => r.relationships);
   },
 };

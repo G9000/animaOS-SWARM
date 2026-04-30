@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
+import { resolve } from 'node:path';
 
 const workspaceRoot = process.argv[2];
 const port = process.argv[3];
+const targetDir = resolve(workspaceRoot, 'target', 'workspace-dev-fixture');
 
 spawn('bun', ['x', 'nx', 'run', 'rust-daemon:dev'], {
   cwd: workspaceRoot,
@@ -9,6 +11,7 @@ spawn('bun', ['x', 'nx', 'run', 'rust-daemon:dev'], {
     ...process.env,
     ANIMAOS_RS_HOST: '127.0.0.1',
     ANIMAOS_RS_PORT: port,
+    CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR ?? targetDir,
   },
   stdio: 'ignore',
 });

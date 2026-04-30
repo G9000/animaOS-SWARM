@@ -268,12 +268,22 @@ async fn run_agent_persists_reflection_memory_from_evaluator() {
     let (_, create_response) = create_agent(&app, r#"{"name":"operator","model":"gpt-5.4"}"#).await;
     let agent_id = extract_json_string_field(&create_response, "id");
 
-    let (run_status, run_response) =
-        run_agent(&app, &agent_id, r#"{"text":"Reflect on response"}"#).await;
+    let (run_status, run_response) = run_agent(
+        &app,
+        &agent_id,
+        r#"{"text":"Reflect on response","metadata":{"userId":"user-42","userName":"Leo"}}"#,
+    )
+    .await;
     let (_, recent_response) = send_empty_request(
         &app,
         "GET",
         &format!("/api/agents/{agent_id}/memories/recent?limit=3"),
+    )
+    .await;
+    let (relationships_status, relationships_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/relationships?entityId=user-42&targetKind=user",
     )
     .await;
 
@@ -283,6 +293,33 @@ async fn run_agent_persists_reflection_memory_from_evaluator() {
     assert!(
         recent_response.contains("evaluated response: operator handled task: Reflect on response")
     );
+    assert_eq!(relationships_status, StatusCode::OK);
+    assert!(relationships_response.contains("\"targetKind\":\"user\""));
+    assert!(relationships_response.contains("\"targetAgentId\":\"user-42\""));
+    assert!(relationships_response.contains("\"relationshipType\":\"responds_to\""));
+}
+
+#[tokio::test]
+async fn run_agent_without_user_metadata_does_not_create_user_relationship() {
+    let app = test_app();
+    let (_, create_response) = create_agent(&app, r#"{"name":"operator","model":"gpt-5.4"}"#).await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (run_status, _) = run_agent(&app, &agent_id, r#"{"text":"Reflect without user"}"#).await;
+    let (recent_status, recent_response) = send_empty_request(
+        &app,
+        "GET",
+        &format!("/api/agents/{agent_id}/memories/recent?limit=3"),
+    )
+    .await;
+    let (relationships_status, relationships_response) =
+        send_empty_request(&app, "GET", "/api/memories/relationships?targetKind=user").await;
+
+    assert_eq!(run_status, StatusCode::OK);
+    assert_eq!(recent_status, StatusCode::OK);
+    assert!(recent_response.contains("\"type\":\"reflection\""));
+    assert_eq!(relationships_status, StatusCode::OK);
+    assert!(relationships_response.contains("\"relationships\":[]"));
 }
 
 #[tokio::test]

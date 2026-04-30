@@ -80,8 +80,15 @@ application endpoints. The summary below matches the live router in
 | `GET` | `/api/memories/search` | Keyword search. Required `?q=`. Optional `?type=`, `?agentId=`, `?agentName=`, `?scope=`, `?roomId=`, `?worldId=`, `?sessionId=`, `?limit=`, `?minImportance=`. |
 | `GET` | `/api/search` | Alias for `/api/memories/search` with the same query parameters and response shape. |
 | `GET` | `/api/memories/recent` | Recent memories. Optional `?agentId=`, `?agentName=`, `?scope=`, `?roomId=`, `?worldId=`, `?sessionId=`, `?limit=`. |
+| `POST` | `/api/memories/entities` | Create or update a memory entity. Required fields: `kind` (`agent`, `user`, `system`, `external`), `id`, `name`. Optional fields: `aliases`, `summary`. |
+| `GET` | `/api/memories/entities` | List memory entities. Optional `?entityId=`, `?kind=`, `?name=`, `?alias=`, `?limit=`. |
+| `POST` | `/api/memories/evaluations` | Evaluate a candidate memory without storing it. Accepts the memory create fields plus optional `minContentChars` and `minImportance`; returns `store`, `merge`, or `ignore`. |
+| `POST` | `/api/memories/evaluated` | Evaluate and conditionally store a memory. Returns the evaluation plus the stored memory when the decision is `store`; duplicate/low-value candidates do not append new memory records. |
+| `GET` | `/api/memories/recall` | Hybrid recall. Required `?q=`. Optional memory filters plus `?entityId=`, `?recallAgentId=`, `?limit=`, `?lexicalLimit=`, `?recentLimit=`, `?relationshipLimit=`. Returns score breakdowns for lexical, vector, relationship, recency, and importance signals. |
+| `POST` | `/api/memories/relationships` | Create or update a directed memory relationship edge. Required fields: `sourceAgentId`, `sourceAgentName`, `targetAgentId`, `targetAgentName`, `relationshipType`. Optional fields: `sourceKind`, `targetKind` (`agent`, `user`, `system`, `external`; default `agent`), `summary`, `strength`, `confidence`, `evidenceMemoryIds`, `tags`, `roomId`, `worldId`, `sessionId`. |
+| `GET` | `/api/memories/relationships` | List relationship edges. Optional `?entityId=`, `?agentId=`, `?sourceKind=`, `?sourceAgentId=`, `?targetKind=`, `?targetAgentId=`, `?relationshipType=`, `?roomId=`, `?worldId=`, `?sessionId=`, `?minStrength=`, `?minConfidence=`, `?limit=`. |
 
-Set `ANIMAOS_RS_MEMORY_FILE=/path/to/memories.json` to load daemon runtime memories from a JSON file on startup and autosave memory writes from HTTP routes, tools, and runtime evaluators.
+Set `ANIMAOS_RS_MEMORY_FILE=/path/to/memories.json` to load daemon runtime memories, entities, and relationships from a JSON file on startup and autosave memory writes from HTTP routes, tools, and runtime evaluators. Runtime evaluation now uses evaluated writes for reflection evidence and links the responding agent to the user entity when request metadata includes `userId`/`userName`.
 
 ### Swarms
 

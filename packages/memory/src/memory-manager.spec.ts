@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { unlinkSync, existsSync, writeFileSync } from "node:fs"
 import { MemoryManager } from "./memory-manager.js"
-import type { NewMemoryInput } from "./memory-manager.js"
+import type { NewAgentRelationshipInput, NewMemoryInput } from "./memory-manager.js"
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -14,6 +14,25 @@ function base(overrides: Partial<NewMemoryInput> = {}): NewMemoryInput {
 		type: "fact",
 		content: "TypeScript is a statically typed language",
 		importance: 0.5,
+		...overrides,
+	}
+}
+
+function baseRelationship(overrides: Partial<NewAgentRelationshipInput> = {}): NewAgentRelationshipInput {
+	return {
+		sourceAgentId: "planner",
+		sourceAgentName: "Planner",
+		targetAgentId: "critic",
+		targetAgentName: "Critic",
+		relationshipType: "collaborates_with",
+		summary: "Critic pressure-tests Planner's launch assumptions.",
+		strength: 0.8,
+		confidence: 0.7,
+		evidenceMemoryIds: ["mem-1"],
+		tags: ["launch"],
+		roomId: "room-1",
+		worldId: "world-1",
+		sessionId: "session-1",
 		...overrides,
 	}
 }
@@ -238,6 +257,109 @@ describe("MemoryManager.getRecent()", () => {
 	})
 })
 
+// ─── agent relationships ───────────────────────────────────────────────────
+
+describe("MemoryManager agent relationships", () => {
+	let manager: MemoryManager
+
+	beforeEach(() => { manager = new MemoryManager() })
+
+	it("creates a first-class directed edge between agents", () => {
+		const relationship = manager.upsertAgentRelationship(baseRelationship())
+
+		expect(relationship.id).toBeDefined()
+		expect(relationship.sourceKind).toBe("agent")
+		expect(relationship.sourceAgentId).toBe("planner")
+		expect(relationship.targetKind).toBe("agent")
+		expect(relationship.targetAgentId).toBe("critic")
+		expect(relationship.relationshipType).toBe("collaborates_with")
+		expect(relationship.evidenceMemoryIds).toEqual(["mem-1"])
+		expect(manager.relationshipCount).toBe(1)
+	})
+
+	it("supports agent-user relationship edges", () => {
+		const relationship = manager.upsertAgentRelationship(baseRelationship({
+			targetKind: "user",
+			targetAgentId: "user-1",
+			targetAgentName: "User",
+			relationshipType: "responds_to",
+		}))
+
+		expect(relationship.sourceKind).toBe("agent")
+		expect(relationship.targetKind).toBe("user")
+		expect(relationship.targetAgentId).toBe("user-1")
+
+		const relationships = manager.listAgentRelationships({
+			entityId: "user-1",
+			targetKind: "user",
+		})
+
+		expect(relationships).toHaveLength(1)
+		expect(relationships[0].relationshipType).toBe("responds_to")
+	})
+
+	it("rejects blank relationship endpoint IDs", () => {
+		expect(() => manager.upsertAgentRelationship(baseRelationship({
+			sourceAgentId: "  ",
+		}))).toThrow("sourceAgentId must not be empty")
+	})
+
+	it("rejects invalid relationship endpoint kinds at runtime", () => {
+		expect(() => manager.upsertAgentRelationship(baseRelationship({
+			sourceKind: "person" as unknown as NewAgentRelationshipInput["sourceKind"],
+		}))).toThrow("sourceKind must be one of agent, user, system, external")
+	})
+
+	it("upserts matching edges and merges evidence", () => {
+		const first = manager.upsertAgentRelationship(baseRelationship())
+		const updated = manager.upsertAgentRelationship(baseRelationship({
+			summary: "Critic is the right reviewer before launch.",
+			strength: 0.95,
+			confidence: 0.9,
+			evidenceMemoryIds: ["mem-1", "mem-2"],
+			tags: ["launch", "review"],
+		}))
+
+		expect(updated.id).toBe(first.id)
+		expect(updated.summary).toBe("Critic is the right reviewer before launch.")
+		expect(updated.strength).toBe(0.95)
+		expect(updated.confidence).toBe(0.9)
+		expect(updated.evidenceMemoryIds).toEqual(["mem-1", "mem-2"])
+		expect(updated.tags).toEqual(["launch", "review"])
+		expect(manager.relationshipCount).toBe(1)
+	})
+
+	it("filters relationships by either agent and world", () => {
+		manager.upsertAgentRelationship(baseRelationship())
+		manager.upsertAgentRelationship(baseRelationship({
+			sourceAgentId: "writer",
+			sourceAgentName: "Writer",
+			targetAgentId: "researcher",
+			targetAgentName: "Researcher",
+			relationshipType: "hands_off_to",
+			worldId: "world-2",
+		}))
+
+		const relationships = manager.listAgentRelationships({
+			agentId: "critic",
+			worldId: "world-1",
+			minStrength: 0.5,
+		})
+
+		expect(relationships).toHaveLength(1)
+		expect(relationships[0].sourceAgentId).toBe("planner")
+		expect(relationships[0].targetAgentId).toBe("critic")
+	})
+
+	it("clears relationships involving a removed agent", () => {
+		manager.upsertAgentRelationship(baseRelationship())
+
+		manager.clear("critic")
+
+		expect(manager.relationshipCount).toBe(0)
+	})
+})
+
 // ─── forget() ────────────────────────────────────────────────────────────────
 
 describe("MemoryManager.forget()", () => {
@@ -340,6 +462,110 @@ describe("MemoryManager persistence", () => {
 		reloaded.load()
 
 		expect(reloaded.size).toBe(2)
+	})
+
+	it("save() and load() restore agent relationships", () => {
+		manager.upsertAgentRelationship(baseRelationship())
+		manager.save()
+
+		const reloaded = new MemoryManager(file)
+		reloaded.load()
+
+		const relationships = reloaded.listAgentRelationships()
+		expect(relationships).toHaveLength(1)
+		expect(relationships[0].sourceAgentId).toBe("planner")
+		expect(relationships[0].targetAgentId).toBe("critic")
+		expect(relationships[0].evidenceMemoryIds).toEqual(["mem-1"])
+	})
+
+	it("load() still accepts legacy array-only memory files", () => {
+		writeFileSync(file, JSON.stringify([
+			{
+				id: "mem-1",
+				agentId: "agent-1",
+				agentName: "researcher",
+				type: "fact",
+				content: "legacy memory",
+				importance: 0.8,
+				createdAt: 123,
+				tags: null,
+			},
+		]))
+
+		const reloaded = new MemoryManager(file)
+		reloaded.load()
+
+		expect(reloaded.size).toBe(1)
+		expect(reloaded.relationshipCount).toBe(0)
+	})
+
+	it("load() defaults legacy relationship endpoint kinds to agent", () => {
+		writeFileSync(file, JSON.stringify({
+			version: 1,
+			memories: [],
+			agentRelationships: [
+				{
+					id: "rel-1",
+					sourceAgentId: "planner",
+					sourceAgentName: "Planner",
+					targetAgentId: "critic",
+					targetAgentName: "Critic",
+					relationshipType: "collaborates_with",
+					strength: 0.8,
+					confidence: 0.7,
+					evidenceMemoryIds: ["mem-1"],
+					createdAt: 1,
+					updatedAt: 2,
+				},
+			],
+		}))
+
+		const reloaded = new MemoryManager(file)
+		reloaded.load()
+
+		const relationships = reloaded.listAgentRelationships()
+		expect(relationships).toHaveLength(1)
+		expect(relationships[0].sourceKind).toBe("agent")
+		expect(relationships[0].targetKind).toBe("agent")
+	})
+
+	it("load() skips invalid stored relationships without dropping memories", () => {
+		writeFileSync(file, JSON.stringify({
+			version: 1,
+			memories: [
+				{
+					id: "mem-1",
+					agentId: "agent-1",
+					agentName: "researcher",
+					type: "fact",
+					content: "valid memory",
+					importance: 0.8,
+					createdAt: 123,
+					tags: null,
+				},
+			],
+			agentRelationships: [
+				{
+					id: "rel-bad",
+					sourceKind: "person",
+					sourceAgentId: "planner",
+					sourceAgentName: "Planner",
+					targetAgentId: "critic",
+					targetAgentName: "Critic",
+					relationshipType: "collaborates_with",
+					strength: 0.8,
+					confidence: 0.7,
+					createdAt: 1,
+					updatedAt: 2,
+				},
+			],
+		}))
+
+		const reloaded = new MemoryManager(file)
+		reloaded.load()
+
+		expect(reloaded.size).toBe(1)
+		expect(reloaded.relationshipCount).toBe(0)
 	})
 
 	it("load() restores the search index so search works after reload", () => {

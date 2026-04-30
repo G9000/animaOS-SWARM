@@ -14,8 +14,12 @@ pub(crate) use agents::{
     AgentRuntimeSnapshotResponse, AgentsEnvelope,
 };
 pub(crate) use memories::{
-    MemoriesEnvelope, MemoryCreateRequest, MemoryResponse, MemorySearchEnvelope, MemorySearchQuery,
-    MemorySearchResultResponse, RecentMemoriesQuery,
+    AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
+    AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,
+    MemoryEntityCreateRequest, MemoryEntityQuery, MemoryEntityResponse,
+    MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest, MemoryEvaluationResponse,
+    MemoryRecallEnvelope, MemoryRecallQuery, MemoryRecallResultResponse, MemoryResponse,
+    MemorySearchEnvelope, MemorySearchQuery, MemorySearchResultResponse, RecentMemoriesQuery,
 };
 pub(crate) use providers::{ProviderResponse, ProvidersEnvelope};
 pub(crate) use shared::{

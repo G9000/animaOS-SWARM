@@ -17,6 +17,147 @@ export interface TaskResult {
   durationMs?: number;
 }
 
+export type MemoryType = 'fact' | 'observation' | 'task_result' | 'reflection';
+export type MemoryScope = 'shared' | 'private' | 'room';
+
+export interface Memory {
+  id: string;
+  agentId: string;
+  agentName: string;
+  type: MemoryType;
+  content: string;
+  importance: number;
+  createdAt: number;
+  tags?: string[] | null;
+  scope: MemoryScope;
+  roomId?: string | null;
+  worldId?: string | null;
+  sessionId?: string | null;
+}
+
+export type RelationshipEndpointKind = 'agent' | 'user' | 'system' | 'external';
+
+export interface AgentRelationship {
+  id: string;
+  sourceKind: RelationshipEndpointKind;
+  sourceAgentId: string;
+  sourceAgentName: string;
+  targetKind: RelationshipEndpointKind;
+  targetAgentId: string;
+  targetAgentName: string;
+  relationshipType: string;
+  summary?: string | null;
+  strength: number;
+  confidence: number;
+  evidenceMemoryIds: string[];
+  tags?: string[] | null;
+  roomId?: string | null;
+  worldId?: string | null;
+  sessionId?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AgentRelationshipOptions {
+  entityId?: string;
+  agentId?: string;
+  sourceKind?: RelationshipEndpointKind;
+  sourceAgentId?: string;
+  targetKind?: RelationshipEndpointKind;
+  targetAgentId?: string;
+  relationshipType?: string;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  minStrength?: number;
+  minConfidence?: number;
+  limit?: number;
+}
+
+export interface RecentMemoriesOptions {
+  agentId?: string;
+  agentName?: string;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  limit?: number;
+}
+
+export interface MemoryEntity {
+  kind: RelationshipEndpointKind;
+  id: string;
+  name: string;
+  aliases: string[];
+  summary?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MemoryEntityOptions {
+  entityId?: string;
+  kind?: RelationshipEndpointKind;
+  name?: string;
+  alias?: string;
+  limit?: number;
+}
+
+export type MemoryEvaluationDecision = 'store' | 'merge' | 'ignore';
+
+export interface MemoryEvaluation {
+  decision: MemoryEvaluationDecision;
+  reason: string;
+  score: number;
+  suggestedImportance: number;
+  duplicateMemoryId?: string | null;
+}
+
+export interface EvaluatedMemoryInput {
+  agentId: string;
+  agentName: string;
+  type: MemoryType;
+  content: string;
+  importance: number;
+  tags?: string[] | null;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  minContentChars?: number;
+  minImportance?: number;
+}
+
+export interface MemoryEvaluationOutcome {
+  evaluation: MemoryEvaluation;
+  memory?: Memory | null;
+}
+
+export interface MemoryRecallOptions {
+  entityId?: string;
+  agentId?: string;
+  agentName?: string;
+  type?: MemoryType;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  limit?: number;
+  lexicalLimit?: number;
+  recentLimit?: number;
+  relationshipLimit?: number;
+  minImportance?: number;
+}
+
+export interface MemoryRecallResult {
+  memory: Memory;
+  score: number;
+  lexicalScore: number;
+  vectorScore: number;
+  relationshipScore: number;
+  recencyScore: number;
+  importanceScore: number;
+}
+
 export interface AgentConfig {
   name: string;
   model: string;
@@ -182,10 +323,10 @@ export const agents = {
       json: config,
     }).then((r) => r.agent),
 
-  run: (id: string, task: string) =>
+  run: (id: string, task: string, metadata?: Record<string, string>) =>
     request<{ agent: AgentSnapshot; result: TaskResult }>(
       `/api/agents/${id}/run`,
-      { method: 'POST', json: { task } }
+      { method: 'POST', json: metadata ? { task, metadata } : { task } }
     ),
 
   delete: (id: string) =>
@@ -210,6 +351,90 @@ export const swarms = {
       `/api/swarms/${id}/run`,
       { method: 'POST', json: { task } }
     ),
+};
+
+export const memories = {
+  recent: (opts?: RecentMemoriesOptions) => {
+    const params = new URLSearchParams();
+    if (opts?.agentId) params.set('agentId', opts.agentId);
+    if (opts?.agentName) params.set('agentName', opts.agentName);
+    if (opts?.scope) params.set('scope', opts.scope);
+    if (opts?.roomId) params.set('roomId', opts.roomId);
+    if (opts?.worldId) params.set('worldId', opts.worldId);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return request<{ memories: Memory[] }>(
+      `/api/memories/recent${qs ? `?${qs}` : ''}`
+    ).then((r) => r.memories);
+  },
+
+  entities: (opts?: MemoryEntityOptions) => {
+    const params = new URLSearchParams();
+    if (opts?.entityId) params.set('entityId', opts.entityId);
+    if (opts?.kind) params.set('kind', opts.kind);
+    if (opts?.name) params.set('name', opts.name);
+    if (opts?.alias) params.set('alias', opts.alias);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return request<{ entities: MemoryEntity[] }>(
+      `/api/memories/entities${qs ? `?${qs}` : ''}`
+    ).then((r) => r.entities);
+  },
+
+  evaluate: (input: EvaluatedMemoryInput) =>
+    request<MemoryEvaluation>('/api/memories/evaluations', {
+      method: 'POST',
+      json: input,
+    }),
+
+  addEvaluated: (input: EvaluatedMemoryInput) =>
+    request<MemoryEvaluationOutcome>('/api/memories/evaluated', {
+      method: 'POST',
+      json: input,
+    }),
+
+  recall: (query: string, opts?: MemoryRecallOptions) => {
+    const params = new URLSearchParams();
+    params.set('q', query);
+    if (opts?.entityId) params.set('entityId', opts.entityId);
+    if (opts?.agentId) params.set('agentId', opts.agentId);
+    if (opts?.agentName) params.set('agentName', opts.agentName);
+    if (opts?.type) params.set('type', opts.type);
+    if (opts?.scope) params.set('scope', opts.scope);
+    if (opts?.roomId) params.set('roomId', opts.roomId);
+    if (opts?.worldId) params.set('worldId', opts.worldId);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts?.lexicalLimit !== undefined) params.set('lexicalLimit', String(opts.lexicalLimit));
+    if (opts?.recentLimit !== undefined) params.set('recentLimit', String(opts.recentLimit));
+    if (opts?.relationshipLimit !== undefined) params.set('relationshipLimit', String(opts.relationshipLimit));
+    if (opts?.minImportance !== undefined) params.set('minImportance', String(opts.minImportance));
+    return request<{ results: MemoryRecallResult[] }>(
+      `/api/memories/recall?${params.toString()}`
+    ).then((r) => r.results);
+  },
+
+  relationships: (opts?: AgentRelationshipOptions) => {
+    const params = new URLSearchParams();
+    if (opts?.entityId) params.set('entityId', opts.entityId);
+    if (opts?.agentId) params.set('agentId', opts.agentId);
+    if (opts?.sourceKind) params.set('sourceKind', opts.sourceKind);
+    if (opts?.sourceAgentId) params.set('sourceAgentId', opts.sourceAgentId);
+    if (opts?.targetKind) params.set('targetKind', opts.targetKind);
+    if (opts?.targetAgentId) params.set('targetAgentId', opts.targetAgentId);
+    if (opts?.relationshipType) params.set('relationshipType', opts.relationshipType);
+    if (opts?.roomId) params.set('roomId', opts.roomId);
+    if (opts?.worldId) params.set('worldId', opts.worldId);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+    if (opts?.minStrength !== undefined) params.set('minStrength', String(opts.minStrength));
+    if (opts?.minConfidence !== undefined) params.set('minConfidence', String(opts.minConfidence));
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return request<{ relationships: AgentRelationship[] }>(
+      `/api/memories/relationships${qs ? `?${qs}` : ''}`
+    ).then((r) => r.relationships);
+  },
 };
 
 export function coerceText(data: unknown): string {

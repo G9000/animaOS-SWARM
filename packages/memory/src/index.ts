@@ -15,6 +15,10 @@ export type {
 	MemorySearchResult,
 	MemorySearchOptions,
 	NewMemoryInput,
+	AgentRelationship,
+	AgentRelationshipOptions,
+	NewAgentRelationshipInput,
+	RelationshipEndpointKind,
 } from "./memory-manager.js"
 
 export { MemoryProvider } from "./memory-provider.js"

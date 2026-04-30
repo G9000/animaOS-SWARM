@@ -1,23 +1,44 @@
 use std::str;
 
-use super::{validate_importance, Memory, MemoryScope, MemoryType};
+use super::storage::MemoryStore;
+use super::{
+    validate_importance, AgentRelationship, Memory, MemoryEntity, MemoryScope, MemoryType,
+    RelationshipEndpointKind,
+};
 
-pub(super) fn serialize_memories(memories: &[Memory]) -> String {
-    let mut output = String::from("[\n");
+pub(super) fn serialize_memory_store(
+    memories: &[Memory],
+    memory_entities: &[MemoryEntity],
+    agent_relationships: &[AgentRelationship],
+) -> String {
+    let mut output = String::from("{\n  \"version\":1,\n  \"memories\":");
+    push_memories_array(&mut output, memories, "  ");
+    output.push_str(",\n  \"entities\":");
+    push_entities_array(&mut output, memory_entities, "  ");
+    output.push_str(",\n  \"agentRelationships\":");
+    push_relationships_array(&mut output, agent_relationships, "  ");
+    output.push_str("\n}\n");
+    output
+}
+
+fn push_memories_array(output: &mut String, memories: &[Memory], indent: &str) {
+    let item_indent = format!("{indent}  ");
+    output.push_str("[\n");
     for (index, memory) in memories.iter().enumerate() {
         if index > 0 {
             output.push_str(",\n");
         }
-        output.push_str("  {");
-        push_string_field(&mut output, "id", &memory.id);
+        output.push_str(&item_indent);
+        output.push('{');
+        push_string_field(output, "id", &memory.id);
         output.push(',');
-        push_string_field(&mut output, "agentId", &memory.agent_id);
+        push_string_field(output, "agentId", &memory.agent_id);
         output.push(',');
-        push_string_field(&mut output, "agentName", &memory.agent_name);
+        push_string_field(output, "agentName", &memory.agent_name);
         output.push(',');
-        push_string_field(&mut output, "type", memory.memory_type.as_str());
+        push_string_field(output, "type", memory.memory_type.as_str());
         output.push(',');
-        push_string_field(&mut output, "content", &memory.content);
+        push_string_field(output, "content", &memory.content);
         output.push(',');
         output.push_str(&format!("\"importance\":{}", memory.importance));
         output.push(',');
@@ -40,21 +61,110 @@ pub(super) fn serialize_memories(memories: &[Memory]) -> String {
             }
         }
         output.push(',');
-        push_string_field(&mut output, "scope", memory.scope.as_str());
+        push_string_field(output, "scope", memory.scope.as_str());
         output.push(',');
-        push_optional_string_field(&mut output, "roomId", memory.room_id.as_deref());
+        push_optional_string_field(output, "roomId", memory.room_id.as_deref());
         output.push(',');
-        push_optional_string_field(&mut output, "worldId", memory.world_id.as_deref());
+        push_optional_string_field(output, "worldId", memory.world_id.as_deref());
         output.push(',');
-        push_optional_string_field(&mut output, "sessionId", memory.session_id.as_deref());
+        push_optional_string_field(output, "sessionId", memory.session_id.as_deref());
         output.push('}');
     }
-    output.push_str("\n]\n");
-    output
+    output.push('\n');
+    output.push_str(indent);
+    output.push(']');
 }
 
-pub(super) fn deserialize_memories(input: &str) -> Result<Vec<Memory>, ()> {
-    JsonParser::new(input).parse_memories()
+fn push_entities_array(output: &mut String, entities: &[MemoryEntity], indent: &str) {
+    let item_indent = format!("{indent}  ");
+    output.push_str("[\n");
+    for (index, entity) in entities.iter().enumerate() {
+        if index > 0 {
+            output.push_str(",\n");
+        }
+        output.push_str(&item_indent);
+        output.push('{');
+        push_string_field(output, "kind", entity.kind.as_str());
+        output.push(',');
+        push_string_field(output, "id", &entity.id);
+        output.push(',');
+        push_string_field(output, "name", &entity.name);
+        output.push(',');
+        push_string_array_field(output, "aliases", &entity.aliases);
+        output.push(',');
+        push_optional_string_field(output, "summary", entity.summary.as_deref());
+        output.push(',');
+        output.push_str(&format!("\"createdAt\":{}", entity.created_at));
+        output.push(',');
+        output.push_str(&format!("\"updatedAt\":{}", entity.updated_at));
+        output.push('}');
+    }
+    output.push('\n');
+    output.push_str(indent);
+    output.push(']');
+}
+
+fn push_relationships_array(
+    output: &mut String,
+    relationships: &[AgentRelationship],
+    indent: &str,
+) {
+    let item_indent = format!("{indent}  ");
+    output.push_str("[\n");
+    for (index, relationship) in relationships.iter().enumerate() {
+        if index > 0 {
+            output.push_str(",\n");
+        }
+        output.push_str(&item_indent);
+        output.push('{');
+        push_string_field(output, "id", &relationship.id);
+        output.push(',');
+        push_string_field(output, "sourceKind", relationship.source_kind.as_str());
+        output.push(',');
+        push_string_field(output, "sourceAgentId", &relationship.source_agent_id);
+        output.push(',');
+        push_string_field(output, "sourceAgentName", &relationship.source_agent_name);
+        output.push(',');
+        push_string_field(output, "targetKind", relationship.target_kind.as_str());
+        output.push(',');
+        push_string_field(output, "targetAgentId", &relationship.target_agent_id);
+        output.push(',');
+        push_string_field(output, "targetAgentName", &relationship.target_agent_name);
+        output.push(',');
+        push_string_field(output, "relationshipType", &relationship.relationship_type);
+        output.push(',');
+        push_optional_string_field(output, "summary", relationship.summary.as_deref());
+        output.push(',');
+        output.push_str(&format!("\"strength\":{}", relationship.strength));
+        output.push(',');
+        output.push_str(&format!("\"confidence\":{}", relationship.confidence));
+        output.push(',');
+        push_string_array_field(
+            output,
+            "evidenceMemoryIds",
+            &relationship.evidence_memory_ids,
+        );
+        output.push(',');
+        push_optional_string_array_field(output, "tags", relationship.tags.as_deref());
+        output.push(',');
+        push_optional_string_field(output, "roomId", relationship.room_id.as_deref());
+        output.push(',');
+        push_optional_string_field(output, "worldId", relationship.world_id.as_deref());
+        output.push(',');
+        push_optional_string_field(output, "sessionId", relationship.session_id.as_deref());
+        output.push(',');
+        output.push_str(&format!("\"createdAt\":{}", relationship.created_at));
+        output.push(',');
+        output.push_str(&format!("\"updatedAt\":{}", relationship.updated_at));
+        output.push('}');
+    }
+    output.push('\n');
+    output.push_str(indent);
+    output.push(']');
+}
+
+pub(super) fn deserialize_memory_store(input: &str) -> Result<MemoryStore, ()> {
+    JsonParser::new(input).parse_memory_store()
 }
 
 fn push_string_field(output: &mut String, key: &str, value: &str) {
@@ -77,6 +187,36 @@ fn push_optional_string_field(output: &mut String, key: &str, value: Option<&str
         }
         None => output.push_str("null"),
     }
+}
+
+fn push_string_array_field(output: &mut String, key: &str, values: &[String]) {
+    output.push('"');
+    output.push_str(key);
+    output.push_str("\":");
+    push_string_array(output, values);
+}
+
+fn push_optional_string_array_field(output: &mut String, key: &str, values: Option<&[String]>) {
+    output.push('"');
+    output.push_str(key);
+    output.push_str("\":");
+    match values {
+        Some(values) => push_string_array(output, values),
+        None => output.push_str("null"),
+    }
+}
+
+fn push_string_array(output: &mut String, values: &[String]) {
+    output.push('[');
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        output.push('"');
+        output.push_str(&escape_json(value));
+        output.push('"');
+    }
+    output.push(']');
 }
 
 fn escape_json(value: &str) -> String {
@@ -110,8 +250,67 @@ impl<'a> JsonParser<'a> {
         }
     }
 
-    fn parse_memories(&mut self) -> Result<Vec<Memory>, ()> {
+    fn parse_memory_store(&mut self) -> Result<MemoryStore, ()> {
         self.skip_whitespace();
+        if self.peek() == Some(b'[') {
+            let memories = self.parse_memory_array()?;
+            self.expect_end()?;
+            return Ok(MemoryStore {
+                memories,
+                memory_entities: Vec::new(),
+                agent_relationships: Vec::new(),
+            });
+        }
+
+        self.expect(b'{')?;
+        self.skip_whitespace();
+
+        let mut memories = None;
+        let mut memory_entities = None;
+        let mut agent_relationships = None;
+        if self.consume(b'}') {
+            return Ok(MemoryStore {
+                memories: Vec::new(),
+                memory_entities: Vec::new(),
+                agent_relationships: Vec::new(),
+            });
+        }
+
+        loop {
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+
+            match key.as_str() {
+                "version" => {
+                    self.parse_number()?;
+                }
+                "memories" => memories = Some(self.parse_memory_array()?),
+                "entities" => memory_entities = Some(self.parse_entity_array()?),
+                "agentRelationships" => {
+                    agent_relationships = Some(self.parse_relationship_array()?)
+                }
+                _ => return Err(()),
+            }
+
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+
+        self.expect_end()?;
+        Ok(MemoryStore {
+            memories: memories.unwrap_or_default(),
+            memory_entities: memory_entities.unwrap_or_default(),
+            agent_relationships: agent_relationships.unwrap_or_default(),
+        })
+    }
+
+    fn parse_memory_array(&mut self) -> Result<Vec<Memory>, ()> {
         self.expect(b'[')?;
         self.skip_whitespace();
 
@@ -130,11 +329,211 @@ impl<'a> JsonParser<'a> {
             self.skip_whitespace();
         }
 
-        self.skip_whitespace();
-        if self.position != self.input.len() {
-            return Err(());
-        }
         Ok(memories)
+    }
+
+    fn parse_entity_array(&mut self) -> Result<Vec<MemoryEntity>, ()> {
+        self.expect(b'[')?;
+        self.skip_whitespace();
+
+        let mut entities = Vec::new();
+        if self.consume(b']') {
+            return Ok(entities);
+        }
+
+        loop {
+            entities.push(self.parse_entity()?);
+            self.skip_whitespace();
+            if self.consume(b']') {
+                break;
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+
+        Ok(entities)
+    }
+
+    fn parse_entity(&mut self) -> Result<MemoryEntity, ()> {
+        self.skip_whitespace();
+        self.expect(b'{')?;
+
+        let mut kind = None;
+        let mut id = None;
+        let mut name = None;
+        let mut aliases = None;
+        let mut summary = None;
+        let mut created_at = None;
+        let mut updated_at = None;
+
+        loop {
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+
+            match key.as_str() {
+                "kind" => {
+                    kind = Some(
+                        RelationshipEndpointKind::from_str(&self.parse_string()?)
+                            .map_err(|_| ())?,
+                    )
+                }
+                "id" => id = Some(self.parse_string()?),
+                "name" => name = Some(self.parse_string()?),
+                "aliases" => aliases = Some(self.parse_string_array()?),
+                "summary" => summary = self.parse_optional_string()?,
+                "createdAt" => {
+                    created_at = Some(self.parse_number()?.parse::<u128>().map_err(|_| ())?)
+                }
+                "updatedAt" => {
+                    updated_at = Some(self.parse_number()?.parse::<u128>().map_err(|_| ())?)
+                }
+                _ => return Err(()),
+            }
+
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+        }
+
+        Ok(MemoryEntity {
+            kind: kind.ok_or(())?,
+            id: id.ok_or(())?,
+            name: name.ok_or(())?,
+            aliases: aliases.unwrap_or_default(),
+            summary,
+            created_at: created_at.ok_or(())?,
+            updated_at: updated_at.ok_or(())?,
+        })
+    }
+
+    fn parse_relationship_array(&mut self) -> Result<Vec<AgentRelationship>, ()> {
+        self.expect(b'[')?;
+        self.skip_whitespace();
+
+        let mut relationships = Vec::new();
+        if self.consume(b']') {
+            return Ok(relationships);
+        }
+
+        loop {
+            relationships.push(self.parse_relationship()?);
+            self.skip_whitespace();
+            if self.consume(b']') {
+                break;
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+
+        Ok(relationships)
+    }
+
+    fn parse_relationship(&mut self) -> Result<AgentRelationship, ()> {
+        self.skip_whitespace();
+        self.expect(b'{')?;
+
+        let mut id = None;
+        let mut source_kind = None;
+        let mut source_agent_id = None;
+        let mut source_agent_name = None;
+        let mut target_kind = None;
+        let mut target_agent_id = None;
+        let mut target_agent_name = None;
+        let mut relationship_type = None;
+        let mut summary = None;
+        let mut strength = None;
+        let mut confidence = None;
+        let mut evidence_memory_ids = None;
+        let mut tags = None;
+        let mut room_id = None;
+        let mut world_id = None;
+        let mut session_id = None;
+        let mut created_at = None;
+        let mut updated_at = None;
+
+        loop {
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+
+            match key.as_str() {
+                "id" => id = Some(self.parse_string()?),
+                "sourceKind" => {
+                    source_kind = Some(
+                        RelationshipEndpointKind::from_str(&self.parse_string()?)
+                            .map_err(|_| ())?,
+                    )
+                }
+                "sourceAgentId" => source_agent_id = Some(self.parse_string()?),
+                "sourceAgentName" => source_agent_name = Some(self.parse_string()?),
+                "targetKind" => {
+                    target_kind = Some(
+                        RelationshipEndpointKind::from_str(&self.parse_string()?)
+                            .map_err(|_| ())?,
+                    )
+                }
+                "targetAgentId" => target_agent_id = Some(self.parse_string()?),
+                "targetAgentName" => target_agent_name = Some(self.parse_string()?),
+                "relationshipType" => relationship_type = Some(self.parse_string()?),
+                "summary" => summary = self.parse_optional_string()?,
+                "strength" => strength = Some(parse_unit_interval(&self.parse_number()?)?),
+                "confidence" => confidence = Some(parse_unit_interval(&self.parse_number()?)?),
+                "evidenceMemoryIds" => evidence_memory_ids = Some(self.parse_string_array()?),
+                "tags" => tags = self.parse_optional_string_array()?,
+                "roomId" => room_id = self.parse_optional_string()?,
+                "worldId" => world_id = self.parse_optional_string()?,
+                "sessionId" => session_id = self.parse_optional_string()?,
+                "createdAt" => {
+                    created_at = Some(self.parse_number()?.parse::<u128>().map_err(|_| ())?)
+                }
+                "updatedAt" => {
+                    updated_at = Some(self.parse_number()?.parse::<u128>().map_err(|_| ())?)
+                }
+                _ => return Err(()),
+            }
+
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+        }
+
+        Ok(AgentRelationship {
+            id: id.ok_or(())?,
+            source_kind: source_kind.unwrap_or_default(),
+            source_agent_id: source_agent_id.ok_or(())?,
+            source_agent_name: source_agent_name.ok_or(())?,
+            target_kind: target_kind.unwrap_or_default(),
+            target_agent_id: target_agent_id.ok_or(())?,
+            target_agent_name: target_agent_name.ok_or(())?,
+            relationship_type: relationship_type.ok_or(())?,
+            summary,
+            strength: strength.ok_or(())?,
+            confidence: confidence.ok_or(())?,
+            evidence_memory_ids: evidence_memory_ids.unwrap_or_default(),
+            tags,
+            room_id,
+            world_id,
+            session_id,
+            created_at: created_at.ok_or(())?,
+            updated_at: updated_at.ok_or(())?,
+        })
     }
 
     fn parse_memory(&mut self) -> Result<Memory, ()> {
@@ -217,20 +616,28 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_tags(&mut self) -> Result<Option<Vec<String>>, ()> {
+        self.parse_optional_string_array()
+    }
+
+    fn parse_optional_string_array(&mut self) -> Result<Option<Vec<String>>, ()> {
         if self.consume_literal("null") {
             return Ok(None);
         }
 
+        Ok(Some(self.parse_string_array()?))
+    }
+
+    fn parse_string_array(&mut self) -> Result<Vec<String>, ()> {
         self.expect(b'[')?;
         self.skip_whitespace();
 
-        let mut tags = Vec::new();
+        let mut values = Vec::new();
         if self.consume(b']') {
-            return Ok(Some(tags));
+            return Ok(values);
         }
 
         loop {
-            tags.push(self.parse_string()?);
+            values.push(self.parse_string()?);
             self.skip_whitespace();
             if self.consume(b']') {
                 break;
@@ -239,7 +646,7 @@ impl<'a> JsonParser<'a> {
             self.skip_whitespace();
         }
 
-        Ok(Some(tags))
+        Ok(values)
     }
 
     fn parse_string(&mut self) -> Result<String, ()> {
@@ -377,6 +784,24 @@ impl<'a> JsonParser<'a> {
                 break;
             }
         }
+    }
+
+    fn expect_end(&mut self) -> Result<(), ()> {
+        self.skip_whitespace();
+        if self.position == self.input.len() {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+}
+
+fn parse_unit_interval(value: &str) -> Result<f64, ()> {
+    let value = value.parse::<f64>().map_err(|_| ())?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(())
     }
 }
 

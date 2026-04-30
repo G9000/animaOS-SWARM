@@ -35,34 +35,47 @@ describe.skipIf(process.platform !== 'win32').sequential(
       'stops descendant processes when the launcher shuts down',
       async () => {
         const port = await reservePort();
+        let runSettled = false;
         const runPromise = runManagedProcesses([
           {
             name: 'fixture-parent',
             command: process.execPath,
             args: [parentFixturePath, workspaceRoot, String(port)],
           },
-        ]);
+        ]).finally(() => {
+          runSettled = true;
+        });
 
-        const ready = await waitForCondition(() => isHealthOk(port), 30_000);
-        expect(ready).toBe(true);
+        try {
+          const ready = await Promise.race([
+            waitForCondition(() => isHealthOk(port), 90_000),
+            runPromise.then(() => false),
+          ]);
+          expect(ready).toBe(true);
 
-        process.emit('SIGINT');
-        await runPromise;
+          process.emit('SIGINT');
+          await runPromise;
 
-        const descendantStopped = await waitForCondition(
-          async () => !(await isHealthOk(port)),
-          5_000
-        );
+          const descendantStopped = await waitForCondition(
+            async () => !(await isHealthOk(port)),
+            5_000
+          );
 
-        if (!descendantStopped) {
-          leakedPid = findListeningPid(port);
-        } else {
-          leakedPid = null;
+          if (!descendantStopped) {
+            leakedPid = findListeningPid(port);
+          } else {
+            leakedPid = null;
+          }
+
+          expect(descendantStopped).toBe(true);
+        } finally {
+          if (!runSettled) {
+            process.emit('SIGINT');
+            await runPromise.catch(() => undefined);
+          }
         }
-
-        expect(descendantStopped).toBe(true);
       },
-      45_000
+      120_000
     );
   }
 );

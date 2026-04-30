@@ -27,9 +27,13 @@ use crate::app::{DaemonConfig, SharedDaemonState};
 
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
-    AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope, AgentsEnvelope,
-    DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope, MemoryCreateRequest,
-    MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, ProviderResponse, ProvidersEnvelope,
+    AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRelationshipCreateRequest,
+    AgentRelationshipQuery, AgentRelationshipResponse, AgentRelationshipsEnvelope,
+    AgentRunEnvelope, AgentsEnvelope, DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope,
+    MemoryCreateRequest, MemoryEntitiesEnvelope, MemoryEntityCreateRequest, MemoryEntityQuery,
+    MemoryEntityResponse, MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest,
+    MemoryEvaluationResponse, MemoryRecallEnvelope, MemoryRecallQuery, MemoryResponse,
+    MemorySearchEnvelope, MemorySearchQuery, ProviderResponse, ProvidersEnvelope,
     ReadinessResponse, RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope,
     SwarmsEnvelope, TaskRequest,
 };
@@ -48,6 +52,13 @@ use crate::runtime_model::provider_summaries;
         memories_search_entry,
         search_alias_entry,
         memories_recent_entry,
+        create_memory_entity_entry,
+        list_memory_entities_entry,
+        evaluate_memory_entry,
+        add_evaluated_memory_entry,
+        recall_memories_entry,
+        create_agent_relationship_entry,
+        list_agent_relationships_entry,
         list_agents_entry,
         create_agent_entry,
         get_agent_entry,
@@ -166,6 +177,23 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         .route("/api/memories/search", get(memories_search_entry))
         .route("/api/search", get(search_alias_entry))
         .route("/api/memories/recent", get(memories_recent_entry))
+        .route(
+            "/api/memories/entities",
+            get(list_memory_entities_entry).post(create_memory_entity_entry),
+        )
+        .route(
+            "/api/memories/evaluations",
+            axum::routing::post(evaluate_memory_entry),
+        )
+        .route(
+            "/api/memories/evaluated",
+            axum::routing::post(add_evaluated_memory_entry),
+        )
+        .route("/api/memories/recall", get(recall_memories_entry))
+        .route(
+            "/api/memories/relationships",
+            get(list_agent_relationships_entry).post(create_agent_relationship_entry),
+        )
         .route(
             "/api/agents",
             get(list_agents_entry).post(create_agent_entry),
@@ -377,6 +405,173 @@ async fn memories_recent_entry(State(state): State<AppState>, uri: Uri) -> AxumR
     };
 
     match memories::handle_recent_memories(query, &state.daemon).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/memories/entities",
+    tag = "memories",
+    request_body = MemoryEntityCreateRequest,
+    responses(
+        (status = 201, description = "Memory entity created or updated", body = MemoryEntityResponse),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn create_memory_entity_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match memories::handle_create_memory_entity(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::CREATED, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/memories/entities",
+    tag = "memories",
+    params(MemoryEntityQuery),
+    responses(
+        (status = 200, description = "Memory entities", body = MemoryEntitiesEnvelope),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn list_memory_entities_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
+    let query = match request_query(&uri) {
+        Ok(query) => match MemoryEntityQuery::from_query_map(&query) {
+            Ok(query) => query,
+            Err(message) => return ApiError::bad_request_static(message).into_response(),
+        },
+        Err(()) => return ApiError::malformed_request().into_response(),
+    };
+
+    match memories::handle_list_memory_entities(query, &state.daemon).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/memories/evaluations",
+    tag = "memories",
+    request_body = MemoryEvaluationRequest,
+    responses(
+        (status = 200, description = "Memory evaluation", body = MemoryEvaluationResponse),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn evaluate_memory_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match memories::handle_evaluate_memory(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/memories/evaluated",
+    tag = "memories",
+    request_body = MemoryEvaluationRequest,
+    responses(
+        (status = 200, description = "Evaluated memory write outcome", body = MemoryEvaluationOutcomeResponse),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn add_evaluated_memory_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match memories::handle_add_evaluated_memory(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/memories/recall",
+    tag = "memories",
+    params(MemoryRecallQuery),
+    responses(
+        (status = 200, description = "Hybrid memory recall results", body = MemoryRecallEnvelope),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn recall_memories_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
+    let query = match request_query(&uri) {
+        Ok(query) => match MemoryRecallQuery::from_query_map(&query) {
+            Ok(query) => query,
+            Err(message) => return ApiError::bad_request_static(message).into_response(),
+        },
+        Err(()) => return ApiError::malformed_request().into_response(),
+    };
+
+    match memories::handle_recall_memories(query, &state.daemon).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/memories/relationships",
+    tag = "memories",
+    request_body = AgentRelationshipCreateRequest,
+    responses(
+        (status = 201, description = "Agent relationship created or updated", body = AgentRelationshipResponse),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn create_agent_relationship_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match memories::handle_create_agent_relationship(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::CREATED, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/memories/relationships",
+    tag = "memories",
+    params(AgentRelationshipQuery),
+    responses(
+        (status = 200, description = "Agent relationships", body = AgentRelationshipsEnvelope),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn list_agent_relationships_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
+    let query = match request_query(&uri) {
+        Ok(query) => match AgentRelationshipQuery::from_query_map(&query) {
+            Ok(query) => query,
+            Err(message) => return ApiError::bad_request_static(message).into_response(),
+        },
+        Err(()) => return ApiError::malformed_request().into_response(),
+    };
+
+    match memories::handle_list_agent_relationships(query, &state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
     }

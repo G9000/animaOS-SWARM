@@ -2,6 +2,7 @@ use anima_daemon::{app as daemon_app, app_with_config, DaemonConfig};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use serde_json::Value;
 use tower::util::ServiceExt;
 
 fn test_app() -> Router {
@@ -50,6 +51,18 @@ async fn send_empty_request(app: &Router, method: &str, uri: &str) -> (StatusCod
             .expect("request builds"),
     )
     .await
+}
+
+fn parse_json_body(body: &str) -> Value {
+    serde_json::from_str(body).expect("response body should be valid JSON")
+}
+
+fn extract_json_string_field(body: &str, field: &str) -> String {
+    parse_json_body(body)
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("response should include string field {field}"))
+        .to_string()
 }
 
 #[tokio::test]
@@ -214,6 +227,223 @@ async fn recent_memories_filters_by_session_id() {
     assert_eq!(recent_status, StatusCode::OK);
     assert!(recent_response.contains("\"content\":\"first session note\""));
     assert!(!recent_response.contains("\"content\":\"second session note\""));
+}
+
+#[tokio::test]
+async fn create_and_list_memory_entities_round_trip() {
+    let app = test_app();
+    let body = r#"{"kind":"user","id":"user-1","name":"Leo","aliases":["operator"],"summary":"Primary operator"}"#;
+
+    let (create_status, create_response) =
+        send_json_request(&app, "POST", "/api/memories/entities", body).await;
+    let (list_status, list_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/entities?kind=user&alias=operator",
+    )
+    .await;
+
+    assert_eq!(create_status, StatusCode::CREATED);
+    assert!(create_response.contains("\"kind\":\"user\""));
+    assert!(create_response.contains("\"id\":\"user-1\""));
+    assert_eq!(list_status, StatusCode::OK);
+    let response = parse_json_body(&list_response);
+    let entities = response["entities"]
+        .as_array()
+        .expect("entities should be an array");
+    assert_eq!(entities.len(), 1);
+    assert_eq!(entities[0]["id"], "user-1");
+    assert_eq!(entities[0]["aliases"][0], "operator");
+}
+
+#[tokio::test]
+async fn create_memory_entity_rejects_invalid_kind() {
+    let app = test_app();
+    let body = r#"{"kind":"person","id":"user-1","name":"Leo"}"#;
+
+    let (status, response) = send_json_request(&app, "POST", "/api/memories/entities", body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(response.contains("endpoint kind must be one of agent, user, system, external"));
+}
+
+#[tokio::test]
+async fn add_evaluated_memory_ignores_low_value_without_persisting() {
+    let app = test_app();
+    let body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":"ok","importance":0.05}"#;
+
+    let (status, response) = send_json_request(&app, "POST", "/api/memories/evaluated", body).await;
+    let (recent_status, recent_response) =
+        send_empty_request(&app, "GET", "/api/memories/recent?agentId=agent-1").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let outcome = parse_json_body(&response);
+    assert_eq!(outcome["evaluation"]["decision"], "ignore");
+    assert!(outcome["memory"].is_null());
+    assert_eq!(recent_status, StatusCode::OK);
+    assert!(!recent_response.contains("\"content\":\"ok\""));
+}
+
+#[tokio::test]
+async fn add_evaluated_memory_merges_duplicate_without_appending() {
+    let app = test_app();
+    let original_body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":"duplicate marker exact","importance":0.4}"#;
+    let duplicate_body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":" duplicate   marker exact ","importance":0.9}"#;
+
+    let (create_status, create_response) =
+        send_json_request(&app, "POST", "/api/memories", original_body).await;
+    let original_id = extract_json_string_field(&create_response, "id");
+    let (duplicate_status, duplicate_response) =
+        send_json_request(&app, "POST", "/api/memories/evaluated", duplicate_body).await;
+    let (_, recent_response) =
+        send_empty_request(&app, "GET", "/api/memories/recent?agentId=agent-1&limit=5").await;
+
+    assert_eq!(create_status, StatusCode::CREATED);
+    assert_eq!(duplicate_status, StatusCode::OK);
+    let outcome = parse_json_body(&duplicate_response);
+    assert_eq!(outcome["evaluation"]["decision"], "merge");
+    assert_eq!(
+        outcome["evaluation"]["duplicateMemoryId"].as_str(),
+        Some(original_id.as_str())
+    );
+    assert!(outcome["memory"].is_null());
+    assert_eq!(recent_response.matches("duplicate marker exact").count(), 1);
+}
+
+#[tokio::test]
+async fn recall_memories_uses_relationship_evidence_without_recent_fallback() {
+    let app = test_app();
+    let memory_body = r#"{"agentId":"planner","agentName":"Planner","type":"fact","content":"Launch rollback rehearsal should happen before release","importance":0.8,"worldId":"world-1"}"#;
+
+    let (memory_status, memory_response) =
+        send_json_request(&app, "POST", "/api/memories", memory_body).await;
+    let memory_id = extract_json_string_field(&memory_response, "id");
+    let relationship_body = format!(
+        "{{\"sourceAgentId\":\"planner\",\"sourceAgentName\":\"Planner\",\"targetKind\":\"user\",\"targetAgentId\":\"user-1\",\"targetAgentName\":\"Leo\",\"relationshipType\":\"responds_to\",\"strength\":0.9,\"confidence\":0.8,\"evidenceMemoryIds\":[\"{memory_id}\"],\"worldId\":\"world-1\"}}"
+    );
+    let (relationship_status, _) = send_json_request(
+        &app,
+        "POST",
+        "/api/memories/relationships",
+        &relationship_body,
+    )
+    .await;
+    let (recall_status, recall_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/recall?q=no-keyword-match&entityId=user-1&worldId=world-1&recentLimit=0&limit=5",
+    )
+    .await;
+
+    assert_eq!(memory_status, StatusCode::CREATED);
+    assert_eq!(relationship_status, StatusCode::CREATED);
+    assert_eq!(recall_status, StatusCode::OK);
+    let response = parse_json_body(&recall_response);
+    let results = response["results"]
+        .as_array()
+        .expect("results should be an array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["memory"]["id"].as_str(),
+        Some(memory_id.as_str())
+    );
+    assert_eq!(results[0]["lexicalScore"].as_f64(), Some(0.0));
+    assert_eq!(results[0]["recencyScore"].as_f64(), Some(0.0));
+    assert!(results[0]["relationshipScore"].as_f64().unwrap() > 0.7);
+}
+
+#[tokio::test]
+async fn recall_memories_rejects_missing_query() {
+    let app = test_app();
+    let (status, response) = send_empty_request(&app, "GET", "/api/memories/recall").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(response.contains("q query parameter is required"));
+}
+
+#[tokio::test]
+async fn create_agent_relationship_returns_relationship_edge() {
+    let app = test_app();
+    let body = r#"{"sourceAgentId":"planner","sourceAgentName":"Planner","targetAgentId":"critic","targetAgentName":"Critic","relationshipType":"collaborates_with","summary":"Critic pressure-tests launch plans.","strength":0.8,"confidence":0.7,"evidenceMemoryIds":["mem-1"],"worldId":"world-1"}"#;
+
+    let (status, response) =
+        send_json_request(&app, "POST", "/api/memories/relationships", body).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(response.contains("\"sourceKind\":\"agent\""));
+    assert!(response.contains("\"sourceAgentId\":\"planner\""));
+    assert!(response.contains("\"targetKind\":\"agent\""));
+    assert!(response.contains("\"targetAgentId\":\"critic\""));
+    assert!(response.contains("\"relationshipType\":\"collaborates_with\""));
+    assert!(response.contains("\"evidenceMemoryIds\":[\"mem-1\"]"));
+}
+
+#[tokio::test]
+async fn create_agent_relationship_rejects_invalid_endpoint_kind() {
+    let app = test_app();
+    let body = r#"{"sourceKind":"person","sourceAgentId":"planner","sourceAgentName":"Planner","targetAgentId":"critic","targetAgentName":"Critic","relationshipType":"collaborates_with"}"#;
+
+    let (status, response) =
+        send_json_request(&app, "POST", "/api/memories/relationships", body).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(response.contains("endpoint kind must be one of agent, user, system, external"));
+}
+
+#[tokio::test]
+async fn list_agent_relationships_rejects_invalid_endpoint_kind() {
+    let app = test_app();
+    let (status, response) =
+        send_empty_request(&app, "GET", "/api/memories/relationships?targetKind=person").await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(response.contains("endpoint kind must be one of agent, user, system, external"));
+}
+
+#[tokio::test]
+async fn create_agent_user_relationship_returns_user_endpoint_edge() {
+    let app = test_app();
+    let body = r#"{"sourceAgentId":"planner","sourceAgentName":"Planner","targetKind":"user","targetAgentId":"user-1","targetAgentName":"Leo","relationshipType":"responds_to","strength":0.6,"confidence":0.8,"evidenceMemoryIds":["mem-1"],"worldId":"world-1"}"#;
+
+    let (status, response) =
+        send_json_request(&app, "POST", "/api/memories/relationships", body).await;
+    let (list_status, list_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/relationships?entityId=user-1&targetKind=user",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(response.contains("\"targetKind\":\"user\""));
+    assert!(response.contains("\"targetAgentId\":\"user-1\""));
+    assert_eq!(list_status, StatusCode::OK);
+    assert!(list_response.contains("\"relationshipType\":\"responds_to\""));
+}
+
+#[tokio::test]
+async fn list_agent_relationships_filters_by_agent_and_world() {
+    let app = test_app();
+    let first_body = r#"{"sourceAgentId":"planner","sourceAgentName":"Planner","targetAgentId":"critic","targetAgentName":"Critic","relationshipType":"collaborates_with","strength":0.8,"confidence":0.7,"worldId":"world-1"}"#;
+    let second_body = r#"{"sourceAgentId":"writer","sourceAgentName":"Writer","targetAgentId":"researcher","targetAgentName":"Researcher","relationshipType":"hands_off_to","strength":0.8,"confidence":0.7,"worldId":"world-2"}"#;
+
+    let (first_status, _) =
+        send_json_request(&app, "POST", "/api/memories/relationships", first_body).await;
+    let (second_status, _) =
+        send_json_request(&app, "POST", "/api/memories/relationships", second_body).await;
+    let (list_status, list_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/relationships?agentId=critic&worldId=world-1",
+    )
+    .await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CREATED);
+    assert_eq!(list_status, StatusCode::OK);
+    assert!(list_response.contains("\"relationships\":"));
+    assert!(list_response.contains("\"targetAgentId\":\"critic\""));
+    assert!(!list_response.contains("\"targetAgentId\":\"researcher\""));
 }
 
 #[tokio::test]

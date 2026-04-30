@@ -4,7 +4,10 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use super::{
-    MemoryManager, MemoryScope, MemorySearchOptions, MemoryType, NewMemory, RecentMemoryOptions,
+    AgentRelationshipOptions, MemoryEntityOptions, MemoryError, MemoryEvaluationDecision,
+    MemoryEvaluationOptions, MemoryManager, MemoryRecallOptions, MemoryScope, MemorySearchOptions,
+    MemoryType, MemoryVectorIndex, NewAgentRelationship, NewMemory, NewMemoryEntity,
+    RecentMemoryOptions, RelationshipEndpointKind, VectorMemoryHit,
 };
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +36,38 @@ fn temp_path(label: &str) -> std::path::PathBuf {
 
 fn add_memory(manager: &mut MemoryManager, memory: NewMemory) -> super::Memory {
     manager.add(memory).expect("memory should be added")
+}
+
+fn base_relationship(overrides: impl FnOnce(&mut NewAgentRelationship)) -> NewAgentRelationship {
+    let mut relationship = NewAgentRelationship {
+        source_kind: None,
+        source_agent_id: "planner".into(),
+        source_agent_name: "Planner".into(),
+        target_kind: None,
+        target_agent_id: "critic".into(),
+        target_agent_name: "Critic".into(),
+        relationship_type: "collaborates_with".into(),
+        summary: Some("Critic pressure-tests Planner's launch assumptions.".into()),
+        strength: 0.8,
+        confidence: 0.7,
+        evidence_memory_ids: vec!["mem-1".into()],
+        tags: Some(vec!["launch".into()]),
+        room_id: Some("room-1".into()),
+        world_id: Some("world-1".into()),
+        session_id: Some("session-1".into()),
+    };
+    overrides(&mut relationship);
+    relationship
+}
+
+struct StaticVectorIndex {
+    hits: Vec<VectorMemoryHit>,
+}
+
+impl MemoryVectorIndex for StaticVectorIndex {
+    fn search(&self, _query: &str, limit: usize) -> Vec<VectorMemoryHit> {
+        self.hits.iter().take(limit).cloned().collect()
+    }
 }
 
 #[test]
@@ -447,6 +482,409 @@ fn search_filters_by_scope_and_room() {
 }
 
 #[test]
+fn upsert_entity_creates_and_merges_identity_record() {
+    let mut manager = MemoryManager::new();
+    let first = manager
+        .upsert_entity(NewMemoryEntity {
+            kind: RelationshipEndpointKind::User,
+            id: "user-1".into(),
+            name: "Leo".into(),
+            aliases: vec!["leoca".into()],
+            summary: Some("Primary playground user".into()),
+        })
+        .expect("entity should be created");
+
+    let updated = manager
+        .upsert_entity(NewMemoryEntity {
+            kind: RelationshipEndpointKind::User,
+            id: "user-1".into(),
+            name: "Leo C".into(),
+            aliases: vec!["leoca".into(), "g9000".into()],
+            summary: None,
+        })
+        .expect("entity should be updated");
+
+    assert_eq!(first.id, updated.id);
+    assert_eq!(updated.kind, RelationshipEndpointKind::User);
+    assert_eq!(updated.name, "Leo C");
+    assert_eq!(
+        updated.aliases,
+        vec!["leoca".to_string(), "g9000".to_string()]
+    );
+    assert_eq!(updated.summary.as_deref(), Some("Primary playground user"));
+    assert_eq!(manager.entity_count(), 1);
+}
+
+#[test]
+fn list_entities_filters_by_kind_and_alias() {
+    let mut manager = MemoryManager::new();
+    manager
+        .upsert_entity(NewMemoryEntity {
+            kind: RelationshipEndpointKind::User,
+            id: "user-1".into(),
+            name: "Leo".into(),
+            aliases: vec!["operator".into()],
+            summary: None,
+        })
+        .expect("user entity should be created");
+    manager
+        .upsert_entity(NewMemoryEntity {
+            kind: RelationshipEndpointKind::Agent,
+            id: "agent-1".into(),
+            name: "Planner".into(),
+            aliases: vec!["operator".into()],
+            summary: None,
+        })
+        .expect("agent entity should be created");
+
+    let users = manager.list_entities(MemoryEntityOptions {
+        kind: Some(RelationshipEndpointKind::User),
+        alias: Some("operator".into()),
+        ..MemoryEntityOptions::default()
+    });
+
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, "user-1");
+}
+
+#[test]
+fn add_registers_agent_entity_without_rejecting_memory() {
+    let mut manager = MemoryManager::new();
+    add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.agent_id = "agent-entity".into();
+            memory.agent_name = "Entity Agent".into();
+        }),
+    );
+
+    let entity = manager
+        .get_entity(RelationshipEndpointKind::Agent, "agent-entity")
+        .expect("agent entity should be registered");
+
+    assert_eq!(entity.name, "Entity Agent");
+}
+
+#[test]
+fn evaluate_new_memory_detects_exact_duplicate() {
+    let mut manager = MemoryManager::new();
+    let existing = add_memory(&mut manager, base(|_| {}));
+
+    let evaluation = manager
+        .evaluate_new_memory(
+            &base(|memory| memory.content = " TypeScript   is a statically typed language ".into()),
+            MemoryEvaluationOptions::default(),
+        )
+        .expect("evaluation should succeed");
+
+    assert_eq!(evaluation.decision, MemoryEvaluationDecision::Merge);
+    assert_eq!(
+        evaluation.duplicate_memory_id.as_deref(),
+        Some(existing.id.as_str())
+    );
+}
+
+#[test]
+fn add_evaluated_ignores_low_value_short_memory() {
+    let mut manager = MemoryManager::new();
+    let outcome = manager
+        .add_evaluated(
+            base(|memory| {
+                memory.content = "ok".into();
+                memory.importance = 0.05;
+            }),
+            MemoryEvaluationOptions::default(),
+        )
+        .expect("evaluated add should succeed");
+
+    assert_eq!(
+        outcome.evaluation.decision,
+        MemoryEvaluationDecision::Ignore
+    );
+    assert!(outcome.memory.is_none());
+    assert_eq!(manager.size(), 0);
+}
+
+#[test]
+fn add_evaluated_stores_distinct_memory_with_suggested_importance() {
+    let mut manager = MemoryManager::new();
+    let outcome = manager
+        .add_evaluated(
+            base(|memory| {
+                memory.content = "The user prefers concise design review notes.".into();
+                memory.importance = 0.4;
+                memory.tags = Some(vec!["preference".into()]);
+                memory.world_id = Some("world-1".into());
+            }),
+            MemoryEvaluationOptions::default(),
+        )
+        .expect("evaluated add should succeed");
+
+    assert_eq!(outcome.evaluation.decision, MemoryEvaluationDecision::Store);
+    let stored = outcome.memory.expect("memory should be stored");
+    assert!(stored.importance > 0.4);
+    assert_eq!(manager.size(), 1);
+}
+
+#[test]
+fn upsert_agent_relationship_creates_agent_edge() {
+    let mut manager = MemoryManager::new();
+
+    let relationship = manager
+        .upsert_agent_relationship(base_relationship(|_| {}))
+        .expect("relationship should be created");
+
+    assert!(!relationship.id.is_empty());
+    assert_eq!(relationship.source_kind, RelationshipEndpointKind::Agent);
+    assert_eq!(relationship.source_agent_id, "planner");
+    assert_eq!(relationship.target_kind, RelationshipEndpointKind::Agent);
+    assert_eq!(relationship.target_agent_id, "critic");
+    assert_eq!(relationship.relationship_type, "collaborates_with");
+    assert_eq!(relationship.evidence_memory_ids, vec!["mem-1".to_string()]);
+    assert_eq!(manager.relationship_count(), 1);
+}
+
+#[test]
+fn upsert_agent_relationship_supports_agent_user_edges() {
+    let mut manager = MemoryManager::new();
+    let relationship = manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.target_kind = Some(RelationshipEndpointKind::User);
+            relationship.target_agent_id = "user-1".into();
+            relationship.target_agent_name = "User".into();
+            relationship.relationship_type = "responds_to".into();
+        }))
+        .expect("agent-user relationship should be created");
+
+    assert_eq!(relationship.source_kind, RelationshipEndpointKind::Agent);
+    assert_eq!(relationship.target_kind, RelationshipEndpointKind::User);
+    assert_eq!(relationship.target_agent_id, "user-1");
+
+    let relationships = manager.list_agent_relationships(AgentRelationshipOptions {
+        entity_id: Some("user-1".into()),
+        target_kind: Some(RelationshipEndpointKind::User),
+        ..AgentRelationshipOptions::default()
+    });
+
+    assert_eq!(relationships.len(), 1);
+    assert_eq!(relationships[0].relationship_type, "responds_to");
+}
+
+#[test]
+fn upsert_agent_relationship_registers_endpoint_entities() {
+    let mut manager = MemoryManager::new();
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.target_kind = Some(RelationshipEndpointKind::User);
+            relationship.target_agent_id = "user-1".into();
+            relationship.target_agent_name = "Leo".into();
+        }))
+        .expect("relationship should be created");
+
+    let source = manager
+        .get_entity(RelationshipEndpointKind::Agent, "planner")
+        .expect("source entity should exist");
+    let target = manager
+        .get_entity(RelationshipEndpointKind::User, "user-1")
+        .expect("target entity should exist");
+
+    assert_eq!(source.name, "Planner");
+    assert_eq!(target.name, "Leo");
+}
+
+#[test]
+fn list_agent_relationships_agent_filter_ignores_non_agent_endpoints() {
+    let mut manager = MemoryManager::new();
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.target_kind = Some(RelationshipEndpointKind::User);
+            relationship.target_agent_id = "critic".into();
+            relationship.target_agent_name = "Critic User".into();
+            relationship.relationship_type = "responds_to".into();
+        }))
+        .expect("agent-user relationship should be created");
+
+    let agent_relationships = manager.list_agent_relationships(AgentRelationshipOptions {
+        agent_id: Some("critic".into()),
+        ..AgentRelationshipOptions::default()
+    });
+    let entity_relationships = manager.list_agent_relationships(AgentRelationshipOptions {
+        entity_id: Some("critic".into()),
+        target_kind: Some(RelationshipEndpointKind::User),
+        ..AgentRelationshipOptions::default()
+    });
+
+    assert!(agent_relationships.is_empty());
+    assert_eq!(entity_relationships.len(), 1);
+}
+
+#[test]
+fn upsert_agent_relationship_rejects_blank_endpoint_ids() {
+    let mut manager = MemoryManager::new();
+    let error = manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.source_agent_id = "  ".into();
+        }))
+        .expect_err("blank endpoint should be rejected");
+
+    assert_eq!(error, MemoryError::InvalidRelationshipEndpoint);
+}
+
+#[test]
+fn upsert_agent_relationship_merges_existing_edge_evidence() {
+    let mut manager = MemoryManager::new();
+    let first = manager
+        .upsert_agent_relationship(base_relationship(|_| {}))
+        .expect("relationship should be created");
+
+    let updated = manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.summary = Some("Critic is the right reviewer before launch.".into());
+            relationship.strength = 0.95;
+            relationship.confidence = 0.9;
+            relationship.evidence_memory_ids = vec!["mem-1".into(), "mem-2".into()];
+            relationship.tags = Some(vec!["launch".into(), "review".into()]);
+        }))
+        .expect("relationship should update");
+
+    assert_eq!(updated.id, first.id);
+    assert_eq!(
+        updated.summary.as_deref(),
+        Some("Critic is the right reviewer before launch.")
+    );
+    assert_eq!(updated.strength, 0.95);
+    assert_eq!(updated.confidence, 0.9);
+    assert_eq!(
+        updated.evidence_memory_ids,
+        vec!["mem-1".to_string(), "mem-2".to_string()]
+    );
+    assert_eq!(
+        updated.tags,
+        Some(vec!["launch".to_string(), "review".to_string()])
+    );
+    assert_eq!(manager.relationship_count(), 1);
+}
+
+#[test]
+fn list_agent_relationships_filters_by_agent_and_world() {
+    let mut manager = MemoryManager::new();
+    manager
+        .upsert_agent_relationship(base_relationship(|_| {}))
+        .expect("relationship should be created");
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.source_agent_id = "writer".into();
+            relationship.source_agent_name = "Writer".into();
+            relationship.target_agent_id = "researcher".into();
+            relationship.target_agent_name = "Researcher".into();
+            relationship.world_id = Some("world-2".into());
+            relationship.strength = 0.4;
+        }))
+        .expect("second relationship should be created");
+
+    let relationships = manager.list_agent_relationships(AgentRelationshipOptions {
+        agent_id: Some("critic".into()),
+        world_id: Some("world-1".into()),
+        min_strength: Some(0.5),
+        ..AgentRelationshipOptions::default()
+    });
+
+    assert_eq!(relationships.len(), 1);
+    assert_eq!(relationships[0].source_agent_id, "planner");
+    assert_eq!(relationships[0].target_agent_id, "critic");
+}
+
+#[test]
+fn clear_with_agent_id_removes_agent_relationships() {
+    let mut manager = MemoryManager::new();
+    manager
+        .upsert_agent_relationship(base_relationship(|_| {}))
+        .expect("relationship should be created");
+
+    manager.clear(Some("critic"));
+
+    assert_eq!(manager.relationship_count(), 0);
+}
+
+#[test]
+fn recall_uses_relationship_evidence_without_keyword_match() {
+    let mut manager = MemoryManager::new();
+    let memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.agent_id = "planner".into();
+            memory.agent_name = "Planner".into();
+            memory.content = "Launch checklist requires a rollback rehearsal.".into();
+            memory.importance = 0.7;
+            memory.world_id = Some("world-1".into());
+        }),
+    );
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.target_kind = Some(RelationshipEndpointKind::User);
+            relationship.target_agent_id = "user-1".into();
+            relationship.target_agent_name = "Leo".into();
+            relationship.relationship_type = "responds_to".into();
+            relationship.evidence_memory_ids = vec![memory.id.clone()];
+            relationship.world_id = Some("world-1".into());
+        }))
+        .expect("relationship should be created");
+
+    let results = manager.recall(
+        "unrelated query text",
+        MemoryRecallOptions {
+            entity_id: Some("user-1".into()),
+            recent_limit: Some(0),
+            limit: Some(5),
+            search: MemorySearchOptions {
+                world_id: Some("world-1".into()),
+                ..MemorySearchOptions::default()
+            },
+            ..MemoryRecallOptions::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory.id, memory.id);
+    assert!(results[0].relationship_score > 0.5);
+}
+
+#[test]
+fn recall_with_vector_index_can_retrieve_semantic_hit() {
+    let mut manager = MemoryManager::new();
+    add_memory(
+        &mut manager,
+        base(|memory| memory.content = "Lexical only note about TypeScript".into()),
+    );
+    let vector_memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "User likes quiet operational dashboards".into();
+            memory.importance = 0.8;
+        }),
+    );
+    let vector_index = StaticVectorIndex {
+        hits: vec![VectorMemoryHit {
+            memory_id: vector_memory.id.clone(),
+            score: 0.92,
+        }],
+    };
+
+    let results = manager.recall_with_vector_index(
+        "semantic design preference",
+        MemoryRecallOptions {
+            recent_limit: Some(0),
+            limit: Some(3),
+            ..MemoryRecallOptions::default()
+        },
+        Some(&vector_index),
+    );
+
+    assert_eq!(results[0].memory.id, vector_memory.id);
+    assert_eq!(results[0].vector_score, 1.0);
+}
+
+#[test]
 fn get_recent_returns_newest_first() {
     let mut manager = MemoryManager::new();
     add_memory(
@@ -821,6 +1259,86 @@ fn load_restores_memories_from_json_file() {
 
     assert_eq!(reloaded.size(), 2);
     let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
+}
+
+#[test]
+fn save_and_load_restores_agent_relationships() {
+    let path = temp_path("relationships");
+    let _ = remove_file(&path);
+
+    let mut manager = MemoryManager::with_storage_file(path.clone());
+    manager
+        .upsert_agent_relationship(base_relationship(|_| {}))
+        .expect("relationship should be created");
+    manager.save().expect("save should succeed");
+
+    let contents = std::fs::read_to_string(&path).expect("saved file should be readable");
+    assert!(contents.contains("agentRelationships"));
+    assert!(contents.contains("collaborates_with"));
+
+    let mut reloaded = MemoryManager::with_storage_file(path);
+    reloaded.load().expect("load should succeed");
+
+    let relationships = reloaded.list_agent_relationships(AgentRelationshipOptions::default());
+    assert_eq!(relationships.len(), 1);
+    assert_eq!(relationships[0].source_agent_id, "planner");
+    assert_eq!(relationships[0].target_agent_id, "critic");
+    assert_eq!(
+        relationships[0].evidence_memory_ids,
+        vec!["mem-1".to_string()]
+    );
+    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
+}
+
+#[test]
+fn save_and_load_restores_entities() {
+    let path = temp_path("entities");
+    let _ = remove_file(&path);
+
+    let mut manager = MemoryManager::with_storage_file(path.clone());
+    manager
+        .upsert_entity(NewMemoryEntity {
+            kind: RelationshipEndpointKind::User,
+            id: "user-1".into(),
+            name: "Leo".into(),
+            aliases: vec!["operator".into()],
+            summary: Some("Primary operator".into()),
+        })
+        .expect("entity should be created");
+    manager.save().expect("save should succeed");
+
+    let contents = std::fs::read_to_string(&path).expect("saved file should be readable");
+    assert!(contents.contains("\"entities\""));
+    assert!(contents.contains("Primary operator"));
+
+    let mut reloaded = MemoryManager::with_storage_file(path);
+    reloaded.load().expect("load should succeed");
+
+    let entity = reloaded
+        .get_entity(RelationshipEndpointKind::User, "user-1")
+        .expect("entity should be restored");
+    assert_eq!(entity.name, "Leo");
+    assert_eq!(entity.aliases, vec!["operator".to_string()]);
+    assert_eq!(entity.summary.as_deref(), Some("Primary operator"));
+    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
+}
+
+#[test]
+fn load_still_accepts_legacy_memory_array_file() {
+    let path = temp_path("legacy-array");
+    let _ = remove_file(&path);
+    std::fs::write(
+        &path,
+        r#"[{"id":"mem-1","agentId":"agent-1","agentName":"researcher","type":"fact","content":"legacy memory","importance":0.8,"createdAt":123,"tags":null}]"#,
+    )
+    .expect("fixture written");
+
+    let mut manager = MemoryManager::with_storage_file(path.clone());
+    manager.load().expect("legacy load should succeed");
+
+    assert_eq!(manager.size(), 1);
+    assert_eq!(manager.relationship_count(), 0);
+    let _ = remove_file(&path);
 }
 
 #[test]
