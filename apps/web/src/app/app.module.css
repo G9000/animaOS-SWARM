@@ -19,6 +19,7 @@
   margin-left: auto;
   display: flex;
   align-items: center;
+  gap: 0.75rem;
 }
 
 .kicker {
@@ -50,6 +51,12 @@
 
 .err {
   color: var(--app-danger);
+  font-size: 0.82rem;
+  margin: 0;
+}
+
+.ok {
+  color: var(--app-success);
   font-size: 0.82rem;
   margin: 0;
 }
@@ -104,6 +111,13 @@
   padding: 1.25rem 1.5rem;
 }
 
+.panelHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
 .panelTitle {
   margin: 0 0 1rem;
   font-size: 0.72rem;
@@ -145,4 +159,270 @@
 .mono {
   color: var(--app-text-muted);
   font-size: 0.78rem;
+}
+
+.form {
+  margin-top: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.formGrid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.fieldWide {
+  grid-column: 1 / -1;
+}
+
+.checkboxRow {
+  display: flex;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+}
+
+.checkboxLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--app-text-secondary);
+  font-size: 0.82rem;
+}
+
+.checkboxLabel input {
+  accent-color: var(--app-accent);
+}
+
+.fieldLabel {
+  color: var(--app-text-muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.input {
+  width: 100%;
+  border: 1px solid var(--app-border-strong);
+  background: var(--app-surface-strong);
+  color: var(--app-text-primary);
+  padding: 0.8rem 0.9rem;
+}
+
+.textarea {
+  min-height: 8rem;
+  resize: vertical;
+}
+
+.buttonRow {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.actionButton {
+  border: 1px solid var(--app-accent);
+  background: var(--app-accent);
+  color: #161103;
+  padding: 0.72rem 0.95rem;
+  cursor: pointer;
+  font-size: 0.78rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.actionButton:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.actionButtonGhost {
+  background: transparent;
+  color: var(--app-text-primary);
+}
+
+.preview {
+  margin-top: 1.5rem;
+  border-top: 1px solid var(--app-border);
+  padding-top: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.previewHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.previewTitle {
+  margin: 0;
+  font-size: 1rem;
+  color: var(--app-text-primary);
+}
+
+.previewMeta {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.metaBadge,
+.tag,
+.roleBadge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--app-border-strong);
+  color: var(--app-text-secondary);
+  padding: 0.28rem 0.45rem;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.roleBadge[data-role='orchestrator'] {
+  border-color: var(--app-accent);
+  color: var(--app-text-primary);
+}
+
+.copyBlock {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.copyTitle {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--app-text-muted);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  font-weight: 400;
+}
+
+.copyText {
+  margin: 0;
+  color: var(--app-text-secondary);
+  font-size: 0.84rem;
+}
+
+.tagRow {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.fileList {
+  margin: 0;
+  padding-left: 1rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.fileItem {
+  color: var(--app-text-secondary);
+  font-size: 0.82rem;
+  word-break: break-word;
+}
+
+.cards {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.agentCard {
+  border: 1px solid var(--app-border);
+  background: var(--app-surface-strong);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.agentHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+
+.agentName {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--app-text-primary);
+}
+
+.agentPosition {
+  margin: 0.25rem 0 0;
+  color: var(--app-text-muted);
+  font-size: 0.78rem;
+}
+
+.agentFacts {
+  display: grid;
+  gap: 0.65rem;
+  margin: 0;
+}
+
+.agentFacts div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.agentFacts dt {
+  color: var(--app-text-muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.agentFacts dd {
+  margin: 0;
+  color: var(--app-text-secondary);
+  font-size: 0.8rem;
+}
+
+.systemBlock {
+  border-top: 1px solid var(--app-border);
+  padding-top: 0.75rem;
+}
+
+.systemText {
+  margin: 0;
+  color: var(--app-text-secondary);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 720px) {
+  .shell {
+    padding: 1rem;
+  }
+
+  .header,
+  .previewHeader,
+  .panelHeader {
+    flex-direction: column;
+  }
+
+  .headerRight {
+    margin-left: 0;
+  }
+
+  .formGrid {
+    grid-template-columns: 1fr;
+  }
 }

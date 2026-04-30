@@ -89,7 +89,10 @@ pub(super) fn write_todo_list_from_root(
     let todo_file = todo_file_path_from_root(workspace_root, "todo_write")?;
     if let Some(parent) = todo_file.parent() {
         fs::create_dir_all(parent).map_err(|error| {
-            format!("todo_write failed to create todo directory {}: {error}", parent.display())
+            format!(
+                "todo_write failed to create todo directory {}: {error}",
+                parent.display()
+            )
         })?;
     }
 
@@ -98,8 +101,14 @@ pub(super) fn write_todo_list_from_root(
     fs::write(&todo_file, serialized)
         .map_err(|error| format!("todo_write failed to persist todo list: {error}"))?;
 
-    let completed = todos.iter().filter(|todo| todo.status == "completed").count();
-    let in_progress = todos.iter().filter(|todo| todo.status == "in_progress").count();
+    let completed = todos
+        .iter()
+        .filter(|todo| todo.status == "completed")
+        .count();
+    let in_progress = todos
+        .iter()
+        .filter(|todo| todo.status == "in_progress")
+        .count();
     let pending = todos.iter().filter(|todo| todo.status == "pending").count();
     let mut message = format!(
         "Todos updated ({} completed, {} in progress, {} pending).",
@@ -140,7 +149,10 @@ pub(super) fn read_todo_list_from_root(workspace_root: &Path) -> Result<String, 
         .join("\n"))
 }
 
-fn load_todo_items_from_root(workspace_root: &Path, tool_name: &str) -> Result<Vec<TodoItem>, String> {
+fn load_todo_items_from_root(
+    workspace_root: &Path,
+    tool_name: &str,
+) -> Result<Vec<TodoItem>, String> {
     let todo_file = todo_file_path_from_root(workspace_root, tool_name)?;
     if !todo_file.exists() {
         return Ok(Vec::new());
@@ -163,15 +175,22 @@ fn validate_todo_items(todos: &[TodoItem]) -> Result<Vec<String>, String> {
 
     for (index, todo) in todos.iter().enumerate() {
         if todo.content.trim().is_empty() {
-            return Err(format!("todos[{index}]: content must be a non-empty string"));
+            return Err(format!(
+                "todos[{index}]: content must be a non-empty string"
+            ));
         }
-        if !matches!(todo.status.as_str(), "pending" | "in_progress" | "completed") {
+        if !matches!(
+            todo.status.as_str(),
+            "pending" | "in_progress" | "completed"
+        ) {
             return Err(format!(
                 "todos[{index}]: status must be pending | in_progress | completed"
             ));
         }
         if todo.active_form.trim().is_empty() {
-            return Err(format!("todos[{index}]: activeForm must be a non-empty string"));
+            return Err(format!(
+                "todos[{index}]: activeForm must be a non-empty string"
+            ));
         }
         if todo.status == "in_progress" {
             in_progress += 1;
@@ -195,7 +214,9 @@ fn parse_todo_item(value: &DataValue, index: usize) -> Result<TodoItem, String> 
     let content = match fields.get("content") {
         Some(DataValue::String(value)) if !value.trim().is_empty() => value.clone(),
         Some(DataValue::String(_)) | Some(_) | None => {
-            return Err(format!("todos[{index}]: content must be a non-empty string"));
+            return Err(format!(
+                "todos[{index}]: content must be a non-empty string"
+            ));
         }
     };
     let status = match fields.get("status") {
@@ -209,7 +230,9 @@ fn parse_todo_item(value: &DataValue, index: usize) -> Result<TodoItem, String> 
     let active_form = match fields.get("activeForm") {
         Some(DataValue::String(value)) if !value.trim().is_empty() => value.clone(),
         Some(DataValue::String(_)) | Some(_) | None => {
-            return Err(format!("todos[{index}]: activeForm must be a non-empty string"));
+            return Err(format!(
+                "todos[{index}]: activeForm must be a non-empty string"
+            ));
         }
     };
 
@@ -225,5 +248,7 @@ pub(super) fn todo_file_path_from_root(
     tool_name: &str,
 ) -> Result<PathBuf, String> {
     let canonical_root = canonical_workspace_root(workspace_root, tool_name)?;
-    Ok(canonical_root.join(TODO_DIRECTORY_NAME).join(TODO_FILE_NAME))
+    Ok(canonical_root
+        .join(TODO_DIRECTORY_NAME)
+        .join(TODO_FILE_NAME))
 }

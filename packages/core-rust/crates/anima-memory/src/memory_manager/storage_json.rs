@@ -1,6 +1,6 @@
 use std::str;
 
-use super::{validate_importance, Memory, MemoryType};
+use super::{validate_importance, Memory, MemoryScope, MemoryType};
 
 pub(super) fn serialize_memories(memories: &[Memory]) -> String {
     let mut output = String::from("[\n");
@@ -39,6 +39,14 @@ pub(super) fn serialize_memories(memories: &[Memory]) -> String {
                 output.push(']');
             }
         }
+        output.push(',');
+        push_string_field(&mut output, "scope", memory.scope.as_str());
+        output.push(',');
+        push_optional_string_field(&mut output, "roomId", memory.room_id.as_deref());
+        output.push(',');
+        push_optional_string_field(&mut output, "worldId", memory.world_id.as_deref());
+        output.push(',');
+        push_optional_string_field(&mut output, "sessionId", memory.session_id.as_deref());
         output.push('}');
     }
     output.push_str("\n]\n");
@@ -55,6 +63,20 @@ fn push_string_field(output: &mut String, key: &str, value: &str) {
     output.push_str("\":\"");
     output.push_str(&escape_json(value));
     output.push('"');
+}
+
+fn push_optional_string_field(output: &mut String, key: &str, value: Option<&str>) {
+    output.push('"');
+    output.push_str(key);
+    output.push_str("\":");
+    match value {
+        Some(value) => {
+            output.push('"');
+            output.push_str(&escape_json(value));
+            output.push('"');
+        }
+        None => output.push_str("null"),
+    }
 }
 
 fn escape_json(value: &str) -> String {
@@ -127,6 +149,10 @@ impl<'a> JsonParser<'a> {
         let mut importance = None;
         let mut created_at = None;
         let mut tags = None;
+        let mut scope = None;
+        let mut room_id = None;
+        let mut world_id = None;
+        let mut session_id = None;
 
         loop {
             self.skip_whitespace();
@@ -153,6 +179,10 @@ impl<'a> JsonParser<'a> {
                     created_at = Some(self.parse_number()?.parse::<u128>().map_err(|_| ())?)
                 }
                 "tags" => tags = Some(self.parse_tags()?),
+                "scope" => scope = Some(MemoryScope::parse(&self.parse_string()?)?),
+                "roomId" => room_id = self.parse_optional_string()?,
+                "worldId" => world_id = self.parse_optional_string()?,
+                "sessionId" => session_id = self.parse_optional_string()?,
                 _ => return Err(()),
             }
 
@@ -172,7 +202,18 @@ impl<'a> JsonParser<'a> {
             importance: importance.ok_or(())?,
             created_at: created_at.ok_or(())?,
             tags: tags.ok_or(())?,
+            scope: scope.unwrap_or_else(|| default_scope(&room_id)),
+            room_id,
+            world_id,
+            session_id,
         })
+    }
+
+    fn parse_optional_string(&mut self) -> Result<Option<String>, ()> {
+        if self.consume_literal("null") {
+            return Ok(None);
+        }
+        Ok(Some(self.parse_string()?))
     }
 
     fn parse_tags(&mut self) -> Result<Option<Vec<String>>, ()> {
@@ -336,5 +377,13 @@ impl<'a> JsonParser<'a> {
                 break;
             }
         }
+    }
+}
+
+fn default_scope(room_id: &Option<String>) -> MemoryScope {
+    if room_id.as_deref().is_some_and(|value| !value.is_empty()) {
+        MemoryScope::Room
+    } else {
+        MemoryScope::Private
     }
 }

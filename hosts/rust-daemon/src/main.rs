@@ -42,6 +42,7 @@ async fn main() -> io::Result<()> {
         persistence_mode = config.persistence_mode.as_str(),
         max_concurrent_runs = config.max_concurrent_runs,
         max_background_processes = config.max_background_processes,
+        runtime_memory_file = std::env::var("ANIMAOS_RS_MEMORY_FILE").unwrap_or_else(|_| "memory-only".to_string()),
         control_plane_durability = "ephemeral",
         "anima-daemon listening"
     );

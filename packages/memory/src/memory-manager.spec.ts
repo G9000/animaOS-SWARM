@@ -3,11 +3,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { unlinkSync, existsSync, writeFileSync } from "node:fs"
 import { MemoryManager } from "./memory-manager.js"
-import type { Memory } from "./memory-manager.js"
+import type { NewMemoryInput } from "./memory-manager.js"
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
-function base(overrides: Partial<Omit<Memory, "id" | "createdAt">> = {}): Omit<Memory, "id" | "createdAt"> {
+function base(overrides: Partial<NewMemoryInput> = {}): NewMemoryInput {
 	return {
 		agentId: "agent-1",
 		agentName: "researcher",

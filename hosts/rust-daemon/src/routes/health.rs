@@ -13,7 +13,10 @@ pub(crate) async fn handle_readiness(
 ) -> ReadinessResponse {
     let (database_configured, background_process_count) = {
         let guard = state.read().await;
-        (guard.database_configured(), guard.background_process_count())
+        (
+            guard.database_configured(),
+            guard.background_process_count(),
+        )
     };
 
     let mut issues = Vec::new();

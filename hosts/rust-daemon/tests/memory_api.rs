@@ -65,6 +65,20 @@ async fn create_memory_returns_created_memory() {
 }
 
 #[tokio::test]
+async fn create_memory_accepts_scope_and_session_metadata() {
+    let app = test_app();
+    let body = r#"{"agentId":"agent-1","agentName":"researcher","type":"fact","content":"room scoped note","importance":0.8,"scope":"room","roomId":"room-1","worldId":"world-1","sessionId":"session-1"}"#;
+
+    let (status, response) = send_json_request(&app, "POST", "/api/memories", body).await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(response.contains("\"scope\":\"room\""));
+    assert!(response.contains("\"roomId\":\"room-1\""));
+    assert!(response.contains("\"worldId\":\"world-1\""));
+    assert!(response.contains("\"sessionId\":\"session-1\""));
+}
+
+#[tokio::test]
 async fn create_memory_rejects_missing_required_fields() {
     let app = test_app();
     let body =
@@ -160,6 +174,46 @@ async fn search_memories_applies_agent_name_filter() {
     assert_eq!(search_status, StatusCode::OK);
     assert!(search_response.contains("\"agentName\":\"writer\""));
     assert!(!search_response.contains("\"agentName\":\"researcher\""));
+}
+
+#[tokio::test]
+async fn search_memories_filters_by_scope_and_room() {
+    let app = test_app();
+    let room_a_body = r#"{"agentId":"a1","agentName":"researcher","type":"fact","content":"shared planning topic","importance":0.8,"scope":"room","roomId":"room-a"}"#;
+    let room_b_body = r#"{"agentId":"a1","agentName":"researcher","type":"fact","content":"shared planning topic","importance":0.8,"scope":"room","roomId":"room-b"}"#;
+
+    let (room_a_status, _) = send_json_request(&app, "POST", "/api/memories", room_a_body).await;
+    let (room_b_status, _) = send_json_request(&app, "POST", "/api/memories", room_b_body).await;
+    let (search_status, search_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/search?q=planning%20topic&scope=room&roomId=room-a",
+    )
+    .await;
+
+    assert_eq!(room_a_status, StatusCode::CREATED);
+    assert_eq!(room_b_status, StatusCode::CREATED);
+    assert_eq!(search_status, StatusCode::OK);
+    assert!(search_response.contains("\"roomId\":\"room-a\""));
+    assert!(!search_response.contains("\"roomId\":\"room-b\""));
+}
+
+#[tokio::test]
+async fn recent_memories_filters_by_session_id() {
+    let app = test_app();
+    let first_body = r#"{"agentId":"a1","agentName":"researcher","type":"fact","content":"first session note","importance":0.8,"sessionId":"session-a"}"#;
+    let second_body = r#"{"agentId":"a1","agentName":"researcher","type":"fact","content":"second session note","importance":0.8,"sessionId":"session-b"}"#;
+
+    let (first_status, _) = send_json_request(&app, "POST", "/api/memories", first_body).await;
+    let (second_status, _) = send_json_request(&app, "POST", "/api/memories", second_body).await;
+    let (recent_status, recent_response) =
+        send_empty_request(&app, "GET", "/api/memories/recent?sessionId=session-a").await;
+
+    assert_eq!(first_status, StatusCode::CREATED);
+    assert_eq!(second_status, StatusCode::CREATED);
+    assert_eq!(recent_status, StatusCode::OK);
+    assert!(recent_response.contains("\"content\":\"first session note\""));
+    assert!(!recent_response.contains("\"content\":\"second session note\""));
 }
 
 #[tokio::test]

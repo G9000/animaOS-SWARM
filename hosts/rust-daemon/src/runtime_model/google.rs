@@ -18,7 +18,10 @@ pub(super) fn build_google_body(
         "system_instruction".into(),
         json!({ "parts": [{ "text": request.system }] }),
     );
-    body.insert("contents".into(), Value::Array(build_google_contents(request)?));
+    body.insert(
+        "contents".into(),
+        Value::Array(build_google_contents(request)?),
+    );
 
     if let Some(tools) = build_google_tools(config)? {
         body.insert("tools".into(), json!([{ "function_declarations": tools }]));
@@ -95,7 +98,9 @@ fn google_function_call_parts(message: &Message) -> Result<Vec<Value>, String> {
             };
             let name = required_data_string(tool_call, "name")?;
             let args = match tool_call.get("args") {
-                Some(DataValue::Object(args)) => data_value_to_json(&DataValue::Object(args.clone())),
+                Some(DataValue::Object(args)) => {
+                    data_value_to_json(&DataValue::Object(args.clone()))
+                }
                 _ => json!({}),
             };
             Ok(json!({

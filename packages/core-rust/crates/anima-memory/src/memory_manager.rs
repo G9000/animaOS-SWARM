@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::storage::{load_memories, save_memories};
 pub use self::types::{
-    Memory, MemoryError, MemorySearchOptions, MemorySearchResult, MemoryType, NewMemory,
-    RecentMemoryOptions,
+    Memory, MemoryError, MemoryScope, MemorySearchOptions, MemorySearchResult, MemoryType,
+    NewMemory, RecentMemoryOptions,
 };
 use crate::bm25::BM25;
 
@@ -52,6 +52,12 @@ impl MemoryManager {
             importance,
             created_at: now_millis(),
             tags: memory.tags,
+            scope: memory
+                .scope
+                .unwrap_or_else(|| default_scope(&memory.room_id)),
+            room_id: memory.room_id,
+            world_id: memory.world_id,
+            session_id: memory.session_id,
         };
 
         self.memories.insert(full.id.clone(), full.clone());
@@ -90,6 +96,18 @@ impl MemoryManager {
             {
                 continue;
             }
+            if opts.scope.is_some_and(|scope| memory.scope != scope) {
+                continue;
+            }
+            if option_filter_misses(opts.room_id.as_deref(), memory.room_id.as_deref()) {
+                continue;
+            }
+            if option_filter_misses(opts.world_id.as_deref(), memory.world_id.as_deref()) {
+                continue;
+            }
+            if option_filter_misses(opts.session_id.as_deref(), memory.session_id.as_deref()) {
+                continue;
+            }
             if memory.importance < min_importance {
                 continue;
             }
@@ -120,6 +138,18 @@ impl MemoryManager {
                     .as_deref()
                     .is_some_and(|agent_name| memory.agent_name != agent_name)
                 {
+                    return false;
+                }
+                if opts.scope.is_some_and(|scope| memory.scope != scope) {
+                    return false;
+                }
+                if option_filter_misses(opts.room_id.as_deref(), memory.room_id.as_deref()) {
+                    return false;
+                }
+                if option_filter_misses(opts.world_id.as_deref(), memory.world_id.as_deref()) {
+                    return false;
+                }
+                if option_filter_misses(opts.session_id.as_deref(), memory.session_id.as_deref()) {
                     return false;
                 }
                 true
@@ -211,12 +241,28 @@ fn build_index_text(memory: &Memory) -> String {
     let mut parts = vec![
         memory.content.clone(),
         memory.memory_type.as_str().to_string(),
+        memory.scope.as_str().to_string(),
         memory.agent_name.clone(),
     ];
+    parts.extend(memory.room_id.iter().cloned());
+    parts.extend(memory.world_id.iter().cloned());
+    parts.extend(memory.session_id.iter().cloned());
     if let Some(tags) = &memory.tags {
         parts.extend(tags.iter().cloned());
     }
     parts.join(" ")
+}
+
+fn default_scope(room_id: &Option<String>) -> MemoryScope {
+    if room_id.as_deref().is_some_and(|value| !value.is_empty()) {
+        MemoryScope::Room
+    } else {
+        MemoryScope::Private
+    }
+}
+
+fn option_filter_misses(expected: Option<&str>, actual: Option<&str>) -> bool {
+    expected.is_some_and(|expected| actual != Some(expected))
 }
 
 pub(super) fn validate_importance(importance: f64) -> Result<f64, MemoryError> {

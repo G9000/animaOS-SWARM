@@ -7,6 +7,13 @@ pub enum MemoryType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryScope {
+    Shared,
+    Private,
+    Room,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryError {
     InvalidImportance,
 }
@@ -27,6 +34,10 @@ pub struct NewMemory {
     pub content: String,
     pub importance: f64,
     pub tags: Option<Vec<String>>,
+    pub scope: Option<MemoryScope>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -39,6 +50,10 @@ pub struct Memory {
     pub importance: f64,
     pub created_at: u128,
     pub tags: Option<Vec<String>>,
+    pub scope: MemoryScope,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -52,6 +67,10 @@ pub struct MemorySearchResult {
     pub created_at: u128,
     pub tags: Option<Vec<String>>,
     pub score: f64,
+    pub scope: MemoryScope,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -59,6 +78,10 @@ pub struct MemorySearchOptions {
     pub agent_id: Option<String>,
     pub agent_name: Option<String>,
     pub memory_type: Option<MemoryType>,
+    pub scope: Option<MemoryScope>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
     pub limit: Option<usize>,
     pub min_importance: Option<f64>,
 }
@@ -67,6 +90,10 @@ pub struct MemorySearchOptions {
 pub struct RecentMemoryOptions {
     pub agent_id: Option<String>,
     pub agent_name: Option<String>,
+    pub scope: Option<MemoryScope>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
     pub limit: Option<usize>,
 }
 
@@ -91,6 +118,25 @@ impl MemoryType {
     }
 }
 
+impl MemoryScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Private => "private",
+            Self::Room => "room",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ()> {
+        match value {
+            "shared" => Ok(Self::Shared),
+            "private" => Ok(Self::Private),
+            "room" => Ok(Self::Room),
+            _ => Err(()),
+        }
+    }
+}
+
 impl MemorySearchResult {
     pub(super) fn from_memory(memory: &Memory, score: f64) -> Self {
         Self {
@@ -103,6 +149,10 @@ impl MemorySearchResult {
             created_at: memory.created_at,
             tags: memory.tags.clone(),
             score,
+            scope: memory.scope,
+            room_id: memory.room_id.clone(),
+            world_id: memory.world_id.clone(),
+            session_id: memory.session_id.clone(),
         }
     }
 }

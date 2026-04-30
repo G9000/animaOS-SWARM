@@ -8,7 +8,14 @@ export { DocumentStore } from "./document-store.js"
 export type { DocumentChunk, DocumentSearchResult } from "./document-store.js"
 
 export { MemoryManager } from "./memory-manager.js"
-export type { Memory, MemoryType, MemorySearchResult, MemorySearchOptions } from "./memory-manager.js"
+export type {
+	Memory,
+	MemoryScope,
+	MemoryType,
+	MemorySearchResult,
+	MemorySearchOptions,
+	NewMemoryInput,
+} from "./memory-manager.js"
 
 export { MemoryProvider } from "./memory-provider.js"
 export { ObservationEvaluator } from "./observation-evaluator.js"

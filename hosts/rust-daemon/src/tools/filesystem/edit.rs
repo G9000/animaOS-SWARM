@@ -6,7 +6,10 @@ use super::super::workspace::{
 };
 use super::FileEditOperation;
 
-pub(in super::super) fn write_workspace_file(file_path: &str, content: &str) -> Result<String, String> {
+pub(in super::super) fn write_workspace_file(
+    file_path: &str,
+    content: &str,
+) -> Result<String, String> {
     let workspace_root = workspace_root_path("write_file")?;
     write_workspace_file_from_root(&workspace_root, file_path, content)
 }
@@ -26,10 +29,18 @@ pub(in super::super) fn write_workspace_file_from_root(
     fs::write(&target, content)
         .map_err(|error| format!("write_file failed to write {file_path}: {error}"))?;
 
-    Ok(format!("Wrote {} chars to {}", content.chars().count(), file_path))
+    Ok(format!(
+        "Wrote {} chars to {}",
+        content.chars().count(),
+        file_path
+    ))
 }
 
-pub(in super::super) fn edit_workspace_file(file_path: &str, old_string: &str, new_string: &str) -> Result<String, String> {
+pub(in super::super) fn edit_workspace_file(
+    file_path: &str,
+    old_string: &str,
+    new_string: &str,
+) -> Result<String, String> {
     let workspace_root = workspace_root_path("edit_file")?;
     edit_workspace_file_from_root(&workspace_root, file_path, old_string, new_string)
 }
@@ -41,8 +52,8 @@ pub(in super::super) fn edit_workspace_file_from_root(
     new_string: &str,
 ) -> Result<String, String> {
     let target = resolve_existing_workspace_file(workspace_root, file_path, "edit_file")?;
-    let content =
-        fs::read_to_string(&target).map_err(|error| format!("edit_file failed to read {file_path}: {error}"))?;
+    let content = fs::read_to_string(&target)
+        .map_err(|error| format!("edit_file failed to read {file_path}: {error}"))?;
     let normalized_content = normalize_line_endings(&content);
     let normalized_old_string = normalize_line_endings(old_string);
 
@@ -59,7 +70,10 @@ pub(in super::super) fn edit_workspace_file_from_root(
     Ok(format!("Edited {}", file_path))
 }
 
-pub(in super::super) fn multi_edit_workspace_file(file_path: &str, edits: &[FileEditOperation]) -> Result<String, String> {
+pub(in super::super) fn multi_edit_workspace_file(
+    file_path: &str,
+    edits: &[FileEditOperation],
+) -> Result<String, String> {
     let workspace_root = workspace_root_path("multi_edit")?;
     multi_edit_workspace_file_from_root(&workspace_root, file_path, edits)
 }

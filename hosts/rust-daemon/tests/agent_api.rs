@@ -420,8 +420,7 @@ async fn run_agent_executes_todo_write_and_read_round_trip() {
 
     let (write_status, write_response) =
         run_agent(&app, &agent_id, r#"{"text":"plan release patch"}"#).await;
-    let (read_status, read_response) =
-        run_agent(&app, &agent_id, r#"{"text":"read todos"}"#).await;
+    let (read_status, read_response) = run_agent(&app, &agent_id, r#"{"text":"read todos"}"#).await;
 
     assert_eq!(write_status, StatusCode::OK);
     assert!(write_response.contains("Todos updated (1 completed, 1 in progress, 1 pending)."));
@@ -454,8 +453,7 @@ async fn run_agent_executes_filesystem_tools_round_trip() {
         run_agent(&app, &agent_id, r#"{"text":"write file release patch"}"#).await;
     let (read_status, read_response) =
         run_agent(&app, &agent_id, r#"{"text":"read file release patch"}"#).await;
-    let (list_status, list_response) =
-        run_agent(&app, &agent_id, r#"{"text":"list notes"}"#).await;
+    let (list_status, list_response) = run_agent(&app, &agent_id, r#"{"text":"list notes"}"#).await;
 
     assert_eq!(write_status, StatusCode::OK);
     assert!(write_response.contains("Wrote 23 chars to notes/release-patch.txt"));

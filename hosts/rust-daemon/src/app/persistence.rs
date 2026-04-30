@@ -1,6 +1,8 @@
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use anima_memory::MemoryManager;
 use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
 
@@ -11,6 +13,8 @@ pub(super) async fn configure_persistence(
     state: &SharedDaemonState,
     persistence_mode: PersistenceMode,
 ) -> io::Result<()> {
+    configure_memory_file(state).await?;
+
     match persistence_mode {
         PersistenceMode::Memory => {
             if std::env::var_os("DATABASE_URL").is_some() {
@@ -56,4 +60,42 @@ pub(super) async fn configure_persistence(
             Ok(())
         }
     }
+}
+
+async fn configure_memory_file(state: &SharedDaemonState) -> io::Result<()> {
+    let Some(path) = memory_file_from_env()? else {
+        return Ok(());
+    };
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut manager = MemoryManager::with_storage_file(path.clone());
+    manager.load()?;
+    let loaded_count = manager.size();
+    state.write().await.replace_memory(manager);
+
+    info!(
+        memory_file = %path.display(),
+        loaded_count,
+        "runtime memory file configured"
+    );
+    Ok(())
+}
+
+fn memory_file_from_env() -> io::Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os("ANIMAOS_RS_MEMORY_FILE") else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ANIMAOS_RS_MEMORY_FILE must not be empty",
+        ));
+    }
+    Ok(Some(PathBuf::from(value)))
 }

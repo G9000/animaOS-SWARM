@@ -3,7 +3,11 @@ use serde_json::{json, Value};
 
 use crate::events::EventFanout;
 
-pub(super) fn publish_runtime_event(event_stream: &EventFanout, agent_name: &str, event: EngineEvent) {
+pub(super) fn publish_runtime_event(
+    event_stream: &EventFanout,
+    agent_name: &str,
+    event: EngineEvent,
+) {
     let Some(agent_id) = event.agent_id.as_deref() else {
         return;
     };

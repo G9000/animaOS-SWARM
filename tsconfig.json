@@ -41,6 +41,12 @@
     },
     {
       "path": "./mods/crypto-trader"
+    },
+    {
+      "path": "./packages/ui"
+    },
+    {
+      "path": "./apps/playground"
     }
   ]
 }

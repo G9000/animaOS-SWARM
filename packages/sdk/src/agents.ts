@@ -25,6 +25,10 @@ export interface AgentMemory {
   importance: number;
   createdAt: number;
   tags?: string[] | null;
+  scope: 'shared' | 'private' | 'room';
+  roomId?: string | null;
+  worldId?: string | null;
+  sessionId?: string | null;
 }
 
 export interface AgentRunResponse {

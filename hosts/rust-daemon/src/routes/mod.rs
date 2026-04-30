@@ -1,3 +1,4 @@
+mod agencies;
 mod agents;
 mod contracts;
 mod health;
@@ -25,20 +26,24 @@ use utoipa_scalar::Scalar;
 use crate::app::{DaemonConfig, SharedDaemonState};
 
 use self::contracts::{
+    AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope, AgentsEnvelope,
     DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope, MemoryCreateRequest,
-    MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, ReadinessResponse,
-    RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope,
-    TaskRequest,
+    MemoryResponse, MemorySearchEnvelope, MemorySearchQuery, ProviderResponse, ProvidersEnvelope,
+    ReadinessResponse, RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope,
+    SwarmsEnvelope, TaskRequest,
 };
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
 pub(super) use self::http::{parse_json_body, serialize_json};
+use crate::runtime_model::provider_summaries;
 
 #[derive(OpenApi)]
 #[openapi(
     paths(
         api_health_entry,
         ready_entry,
+        create_agency_entry,
+        generate_agency_entry,
         create_memory_entry,
         memories_search_entry,
         search_alias_entry,
@@ -53,13 +58,16 @@ pub(super) use self::http::{parse_json_body, serialize_json};
         create_swarm_entry,
         get_swarm_entry,
         run_swarm_entry,
-        swarm_events_entry
+        swarm_events_entry,
+        list_providers_entry
     ),
     tags(
         (name = "health", description = "Daemon health endpoints"),
+        (name = "agencies", description = "Agency generation and team drafting"),
         (name = "agents", description = "Agent management and execution"),
         (name = "memories", description = "Memory storage and search"),
-        (name = "swarms", description = "Swarm creation, execution, and streaming")
+        (name = "swarms", description = "Swarm creation, execution, and streaming"),
+        (name = "providers", description = "Model provider catalog")
     )
 )]
 struct ApiDoc;
@@ -146,6 +154,14 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/ready", get(ready_entry))
+        .route(
+            "/api/agencies/create",
+            axum::routing::post(create_agency_entry),
+        )
+        .route(
+            "/api/agencies/generate",
+            axum::routing::post(generate_agency_entry),
+        )
         .route("/api/memories", axum::routing::post(create_memory_entry))
         .route("/api/memories/search", get(memories_search_entry))
         .route("/api/search", get(search_alias_entry))
@@ -167,6 +183,7 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             get(list_swarms_entry).post(create_swarm_entry),
         )
         .route("/api/swarms/{swarm_id}", get(get_swarm_entry))
+        .route("/api/providers", get(list_providers_entry))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             config.request_timeout,
@@ -176,7 +193,10 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             "/api/agents/{agent_id}/run",
             axum::routing::post(run_agent_entry),
         )
-        .route("/api/swarms/{swarm_id}/run", axum::routing::post(run_swarm_entry))
+        .route(
+            "/api/swarms/{swarm_id}/run",
+            axum::routing::post(run_swarm_entry),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             config.request_timeout,
@@ -248,6 +268,49 @@ async fn metrics_entry(State(state): State<AppState>) -> AxumResponse {
 
 #[utoipa::path(
     post,
+    path = "/api/agencies/create",
+    tag = "agencies",
+    request_body = AgencyCreateRequest,
+    responses(
+        (status = 201, description = "Agency workspace created", body = AgencyCreateResponse),
+        (status = 400, description = "Invalid request, invalid model output, or invalid workspace path", body = ErrorBody)
+    )
+)]
+async fn create_agency_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match agencies::handle_create_agency(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::CREATED, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/agencies/generate",
+    tag = "agencies",
+    request_body = AgencyGenerateRequest,
+    responses(
+        (status = 200, description = "Generated agency draft", body = AgencyGenerateResponse),
+        (status = 400, description = "Invalid request or model output", body = ErrorBody)
+    )
+)]
+async fn generate_agency_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match agencies::handle_generate_agency(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    post,
     path = "/api/memories",
     tag = "memories",
     request_body = MemoryCreateRequest,
@@ -256,10 +319,7 @@ async fn metrics_entry(State(state): State<AppState>) -> AxumResponse {
         (status = 400, description = "Invalid request", body = ErrorBody)
     )
 )]
-async fn create_memory_entry(
-    State(state): State<AppState>,
-    request: AxumRequest,
-) -> AxumResponse {
+async fn create_memory_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => match memories::handle_create_memory(body, &state.daemon).await {
             Ok(response) => json_response(StatusCode::CREATED, &response),
@@ -345,10 +405,7 @@ async fn list_agents_entry(State(state): State<AppState>) -> AxumResponse {
         (status = 400, description = "Invalid request", body = ErrorBody)
     )
 )]
-async fn create_agent_entry(
-    State(state): State<AppState>,
-    request: AxumRequest,
-) -> AxumResponse {
+async fn create_agent_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => match agents::handle_create_agent(body, &state.daemon).await {
             Ok(response) => json_response(StatusCode::CREATED, &response),
@@ -485,10 +542,7 @@ async fn list_swarms_entry(State(state): State<AppState>) -> AxumResponse {
         (status = 400, description = "Invalid request", body = ErrorBody)
     )
 )]
-async fn create_swarm_entry(
-    State(state): State<AppState>,
-    request: AxumRequest,
-) -> AxumResponse {
+async fn create_swarm_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => match swarms::handle_create_swarm(body, &state.daemon).await {
             Ok(response) => json_response(StatusCode::CREATED, &response),
@@ -567,6 +621,26 @@ async fn swarm_events_entry(
     Path(swarm_id): Path<String>,
 ) -> AxumResponse {
     swarms::handle_subscribe_swarm_events(&swarm_id, &state.daemon).await
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/providers",
+    tag = "providers",
+    responses((status = 200, description = "Supported model providers", body = ProvidersEnvelope))
+)]
+async fn list_providers_entry() -> AxumResponse {
+    let providers = provider_summaries()
+        .into_iter()
+        .map(|summary| ProviderResponse {
+            id: summary.id.to_string(),
+            label: summary.label.to_string(),
+            requires_key: summary.requires_key,
+            configured: summary.configured,
+            api_key_envs: summary.api_key_envs.iter().map(|s| s.to_string()).collect(),
+        })
+        .collect::<Vec<_>>();
+    json_response(StatusCode::OK, &ProvidersEnvelope { providers })
 }
 
 async fn not_found_entry() -> AxumResponse {
@@ -739,11 +813,9 @@ mod tests {
         let body = to_bytes(second.into_body(), usize::MAX)
             .await
             .expect("body reads");
-        assert!(
-            std::str::from_utf8(&body)
-                .expect("body is utf-8")
-                .contains("too many concurrent run requests")
-        );
+        assert!(std::str::from_utf8(&body)
+            .expect("body is utf-8")
+            .contains("too many concurrent run requests"));
 
         let first = first.await.expect("first join succeeds");
         assert_eq!(first.status(), StatusCode::OK);

@@ -1,6 +1,7 @@
 /// <reference types='vitest' />
 import { defineConfig, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
+import tailwindcss from '@tailwindcss/vite';
 
 type ViteProxy = Parameters<NonNullable<ProxyOptions['configure']>>[0];
 
@@ -74,7 +75,7 @@ export default defineConfig(() => {
       port: 4200,
       host: 'localhost',
     },
-    plugins: [react()],
+    plugins: [react(), tailwindcss()],
     build: {
       outDir: './dist',
       emptyOutDir: true,

@@ -110,7 +110,9 @@ fn anthropic_assistant_tool_use(message: &Message) -> Result<Vec<Value>, String>
             let id = required_data_string(tool_call, "id")?;
             let name = required_data_string(tool_call, "name")?;
             let input = match tool_call.get("args") {
-                Some(DataValue::Object(args)) => data_value_to_json(&DataValue::Object(args.clone())),
+                Some(DataValue::Object(args)) => {
+                    data_value_to_json(&DataValue::Object(args.clone()))
+                }
                 Some(_) => return Err("assistant toolCall args must be an object".to_string()),
                 None => json!({}),
             };

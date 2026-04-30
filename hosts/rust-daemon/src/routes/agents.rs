@@ -87,6 +87,10 @@ pub(crate) async fn handle_recent_agent_memories(
     let memories = memory.read().await.get_recent(RecentMemoryOptions {
         agent_id: Some(runtime_agent_id),
         agent_name: None,
+        scope: None,
+        room_id: None,
+        world_id: None,
+        session_id: None,
         limit: query.limit,
     });
 
@@ -115,7 +119,11 @@ pub(crate) async fn handle_run_agent(
     let result = runtime
         .run_with_tools(content, |agent, user_message, tool_call| {
             let tool_context = tool_context.clone();
-            async move { tool_context.execute_tool(agent, user_message, tool_call).await }
+            async move {
+                tool_context
+                    .execute_tool(agent, user_message, tool_call)
+                    .await
+            }
         })
         .await;
     let (snapshot, runtime_id, runtime_name, memory) = {
@@ -124,21 +132,33 @@ pub(crate) async fn handle_run_agent(
     };
 
     if let Some(content) = result.data.as_ref() {
-        if let Err(error) = memory
-            .write()
-            .await
-            .add(NewMemory {
-                agent_id: runtime_id.clone(),
-                agent_name: runtime_name.clone(),
-                memory_type: MemoryType::TaskResult,
-                content: content.text.clone(),
-                importance: 0.8,
-                tags: Some(vec!["runtime".into(), "task-result".into()]),
-            })
-        {
+        let persist_result = {
+            let mut memory_guard = memory.write().await;
+            memory_guard
+                .add(NewMemory {
+                    agent_id: runtime_id.clone(),
+                    agent_name: runtime_name.clone(),
+                    memory_type: MemoryType::TaskResult,
+                    content: content.text.clone(),
+                    importance: 0.8,
+                    tags: Some(vec!["runtime".into(), "task-result".into()]),
+                    scope: None,
+                    room_id: None,
+                    world_id: None,
+                    session_id: None,
+                })
+                .map(|_| ())
+                .map_err(|error| error.message().to_string())
+                .and_then(|_| {
+                    memory_guard
+                        .save()
+                        .map_err(|error| format!("failed to persist memory: {error}"))
+                })
+        };
+        if let Err(error) = persist_result {
             warn!(
                 agent_id = %runtime_id,
-                error = %error.message(),
+                error = %error,
                 "failed to persist runtime task result memory"
             );
         }

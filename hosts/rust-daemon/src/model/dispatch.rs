@@ -137,7 +137,10 @@ fn maybe_write_file_dispatch(
 
     let topic = parse_write_file_topic(input)?;
     let mut args = BTreeMap::new();
-    args.insert("file_path".into(), DataValue::String(topic_file_path(&topic)));
+    args.insert(
+        "file_path".into(),
+        DataValue::String(topic_file_path(&topic)),
+    );
     args.insert(
         "content".into(),
         DataValue::String(format!("notes for {topic}")),
@@ -161,7 +164,10 @@ fn maybe_read_file_dispatch(
 
     let topic = parse_read_file_topic(input)?;
     let mut args = BTreeMap::new();
-    args.insert("file_path".into(), DataValue::String(topic_file_path(&topic)));
+    args.insert(
+        "file_path".into(),
+        DataValue::String(topic_file_path(&topic)),
+    );
 
     Some(DeterministicToolDispatch {
         name: "read_file",
@@ -171,10 +177,7 @@ fn maybe_read_file_dispatch(
     })
 }
 
-fn maybe_list_dir_dispatch(
-    config: &AgentConfig,
-    input: &str,
-) -> Option<DeterministicToolDispatch> {
+fn maybe_list_dir_dispatch(config: &AgentConfig, input: &str) -> Option<DeterministicToolDispatch> {
     if !has_tool(config, "list_dir") || !should_list_notes_dir(input) {
         return None;
     }
@@ -244,7 +247,10 @@ fn parse_todo_write_topic(input: &str) -> Option<String> {
 }
 
 fn should_read_todos(input: &str) -> bool {
-    matches_normalized_input(input, &["read todos", "todo read", "show todos", "list todos"])
+    matches_normalized_input(
+        input,
+        &["read todos", "todo read", "show todos", "list todos"],
+    )
 }
 
 fn parse_write_file_topic(input: &str) -> Option<String> {

@@ -5,8 +5,8 @@ use anima_core::{
 use serde_json::{json, Map, Value};
 
 use super::common::{
-    assistant_tool_calls_json, response_content_text, response_usage, tool_call_args,
-    tool_call_id, tool_parameters_schema_json,
+    assistant_tool_calls_json, response_content_text, response_usage, tool_call_args, tool_call_id,
+    tool_parameters_schema_json,
 };
 
 pub(super) fn build_openai_compatible_body(
@@ -163,11 +163,10 @@ fn parse_openai_compatible_tool_calls(
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| "provider tool call is missing a function name".to_string())?;
-            let args = tool_call_args(
-                function
-                    .get("arguments")
-                    .ok_or_else(|| "provider tool call is missing function arguments".to_string())?,
-            )?;
+            let args =
+                tool_call_args(function.get("arguments").ok_or_else(|| {
+                    "provider tool call is missing function arguments".to_string()
+                })?)?;
 
             Ok(ToolCall {
                 id: id.to_string(),
@@ -176,5 +175,11 @@ fn parse_openai_compatible_tool_calls(
             })
         })
         .collect::<Result<Vec<_>, _>>()
-        .map(|tool_calls| if tool_calls.is_empty() { None } else { Some(tool_calls) })
+        .map(|tool_calls| {
+            if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            }
+        })
 }

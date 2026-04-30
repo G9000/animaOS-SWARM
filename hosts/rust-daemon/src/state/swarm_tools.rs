@@ -55,7 +55,11 @@ pub(super) async fn execute_swarm_tool(
 
             delegate_task(agent_name, instruction).await
         }
-        _ => tool_context.execute_tool(agent, user_message, tool_call).await,
+        _ => {
+            tool_context
+                .execute_tool(agent, user_message, tool_call)
+                .await
+        }
     }
 }
 

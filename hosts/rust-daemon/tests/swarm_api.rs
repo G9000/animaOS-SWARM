@@ -28,8 +28,8 @@ async fn run_swarm(app: &Router, swarm_id: &str, body: &str) -> (StatusCode, Str
 }
 
 use support::{
-    extract_json_string_field, extract_json_u64_field, extract_sse_event_data,
-    send_empty_request, send_json_request, test_app, use_temp_workspace_root,
+    extract_json_string_field, extract_json_u64_field, extract_sse_event_data, send_empty_request,
+    send_json_request, test_app, use_temp_workspace_root,
 };
 
 #[tokio::test]
@@ -311,7 +311,9 @@ async fn swarm_event_stream_emits_todo_tool_results() {
     let run_handle = {
         let app = app.clone();
         let swarm_id = swarm_id.clone();
-        tokio::spawn(async move { run_swarm(&app, &swarm_id, r#"{"text":"plan release patch"}"#).await })
+        tokio::spawn(
+            async move { run_swarm(&app, &swarm_id, r#"{"text":"plan release patch"}"#).await },
+        )
     };
 
     let stream = response.into_body().into_data_stream();
@@ -322,7 +324,8 @@ async fn swarm_event_stream_emits_todo_tool_results() {
         match futures::poll!(stream.next()) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
-                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed") {
+                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed")
+                {
                     break;
                 }
             }
@@ -397,7 +400,9 @@ async fn swarm_event_stream_emits_write_file_tool_results() {
     let run_handle = {
         let app = app.clone();
         let swarm_id = swarm_id.clone();
-        tokio::spawn(async move { run_swarm(&app, &swarm_id, r#"{"text":"write file release patch"}"#).await })
+        tokio::spawn(async move {
+            run_swarm(&app, &swarm_id, r#"{"text":"write file release patch"}"#).await
+        })
     };
 
     let stream = response.into_body().into_data_stream();
@@ -408,7 +413,8 @@ async fn swarm_event_stream_emits_write_file_tool_results() {
         match futures::poll!(stream.next()) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
-                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed") {
+                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed")
+                {
                     break;
                 }
             }

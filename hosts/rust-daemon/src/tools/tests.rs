@@ -12,9 +12,9 @@ use super::{
     },
     process::{
         background::{
-            list_background_processes, new_shared_process_manager,
-            read_background_process_output, set_background_process_limit,
-            start_background_process_from_root, stop_background_process,
+            list_background_processes, new_shared_process_manager, read_background_process_output,
+            set_background_process_limit, start_background_process_from_root,
+            stop_background_process,
         },
         shell::execute_bash_command_from_root,
     },
@@ -337,8 +337,11 @@ fn glob_workspace_paths_returns_workspace_relative_matches() {
     let workspace = create_temp_workspace("glob");
     fs::create_dir_all(workspace.join("src/nested")).expect("create nested dirs");
     fs::write(workspace.join("src/main.ts"), "export const a = 1;\n").expect("write main");
-    fs::write(workspace.join("src/nested/util.ts"), "export const b = 2;\n")
-        .expect("write util");
+    fs::write(
+        workspace.join("src/nested/util.ts"),
+        "export const b = 2;\n",
+    )
+    .expect("write util");
     fs::write(workspace.join("README.md"), "hello\n").expect("write readme");
 
     let result =
@@ -390,12 +393,14 @@ fn edit_workspace_file_applies_over_escaped_match() {
     let file_path = workspace.join("notes.txt");
     fs::write(&file_path, "alpha\nbeta\n").expect("write file");
 
-    let result =
-        edit_workspace_file_from_root(&workspace, "notes.txt", "alpha\\nbeta", "updated")
-            .expect("edit workspace file");
+    let result = edit_workspace_file_from_root(&workspace, "notes.txt", "alpha\\nbeta", "updated")
+        .expect("edit workspace file");
 
     assert_eq!(result, "Edited notes.txt");
-    assert_eq!(fs::read_to_string(&file_path).expect("read file"), "updated\n");
+    assert_eq!(
+        fs::read_to_string(&file_path).expect("read file"),
+        "updated\n"
+    );
 
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
@@ -423,7 +428,10 @@ fn multi_edit_workspace_file_is_atomic_on_missing_match() {
     .expect_err("multi edit should fail");
 
     assert!(error.contains("Edit 2/2"));
-    assert_eq!(fs::read_to_string(&file_path).expect("read file"), "alpha\nbeta\n");
+    assert_eq!(
+        fs::read_to_string(&file_path).expect("read file"),
+        "alpha\nbeta\n"
+    );
 
     fs::remove_dir_all(workspace).expect("remove workspace");
 }

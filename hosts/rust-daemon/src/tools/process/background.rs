@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use super::super::workspace::{canonical_workspace_root, resolve_workspace_search_root, workspace_root_path};
+use super::super::workspace::{
+    canonical_workspace_root, resolve_workspace_search_root, workspace_root_path,
+};
 use super::shell::{resolve_shell_launcher, truncate_shell_output};
 
 const MAX_PROCESS_OUTPUT_LINES: usize = 2_000;
@@ -102,8 +104,11 @@ pub(in super::super) fn start_background_process_from_root(
     command: &str,
     cwd: &str,
 ) -> Result<String, String> {
-    let cwd_path =
-        resolve_workspace_search_root(&canonical_workspace_root(workspace_root, "bg_start")?, cwd, "bg_start")?;
+    let cwd_path = resolve_workspace_search_root(
+        &canonical_workspace_root(workspace_root, "bg_start")?,
+        cwd,
+        "bg_start",
+    )?;
 
     let mut manager = process_manager
         .lock()
@@ -208,7 +213,12 @@ pub(in super::super) fn read_background_process_output(
         format!("(exited: {})", exit_code.unwrap_or(-1))
     };
 
-    Ok(format!("[{}] {}\n{}", id, status, truncate_shell_output(&raw)))
+    Ok(format!(
+        "[{}] {}\n{}",
+        id,
+        status,
+        truncate_shell_output(&raw)
+    ))
 }
 
 pub(in super::super) fn stop_background_process(

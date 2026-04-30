@@ -38,6 +38,15 @@ describe('workspace-dev orchestration', () => {
             VITE_HOST_KEY: 'rust',
           },
         },
+        {
+          name: '@animaOS-SWARM/playground',
+          command: 'bun',
+          args: ['x', 'nx', 'run', '@animaOS-SWARM/playground:serve'],
+          env: {
+            UI_BACKEND_ORIGIN: 'http://127.0.0.1:8080',
+            VITE_HOST_KEY: 'rust',
+          },
+        },
       ],
     });
   });
@@ -61,6 +70,15 @@ describe('workspace-dev orchestration', () => {
           name: '@animaOS-SWARM/web',
           command: 'bun',
           args: ['x', 'nx', 'run', '@animaOS-SWARM/web:serve'],
+          env: {
+            UI_BACKEND_ORIGIN: 'http://127.0.0.1:8080',
+            VITE_HOST_KEY: 'rust',
+          },
+        },
+        {
+          name: '@animaOS-SWARM/playground',
+          command: 'bun',
+          args: ['x', 'nx', 'run', '@animaOS-SWARM/playground:serve'],
           env: {
             UI_BACKEND_ORIGIN: 'http://127.0.0.1:8080',
             VITE_HOST_KEY: 'rust',

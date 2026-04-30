@@ -25,15 +25,15 @@ impl Provider for RecentMemoriesProvider {
         runtime: &AgentRuntime,
         _message: &Message,
     ) -> Result<ProviderResult, String> {
-        let memories = self
-            .memory
-            .read()
-            .await
-            .get_recent(RecentMemoryOptions {
-                agent_id: Some(runtime.id().to_string()),
-                agent_name: None,
-                limit: Some(3),
-            });
+        let memories = self.memory.read().await.get_recent(RecentMemoryOptions {
+            agent_id: Some(runtime.id().to_string()),
+            agent_name: None,
+            scope: None,
+            room_id: None,
+            world_id: None,
+            session_id: None,
+            limit: Some(3),
+        });
 
         let text = if memories.is_empty() {
             "no recent memories".to_string()

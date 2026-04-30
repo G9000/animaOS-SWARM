@@ -19,9 +19,17 @@ pub(crate) use process::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
     DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
+pub(crate) use workspace::{
+    canonical_workspace_root, normalized_relative_path, resolve_workspace_write_path,
+    workspace_root_path,
+};
 
-type ToolHandler =
-    fn(ToolExecutionContext, AgentState, Message, ToolCall) -> BoxFuture<'static, TaskResult<Content>>;
+type ToolHandler = fn(
+    ToolExecutionContext,
+    AgentState,
+    Message,
+    ToolCall,
+) -> BoxFuture<'static, TaskResult<Content>>;
 
 #[derive(Clone)]
 pub(crate) struct ToolRegistry {
@@ -97,6 +105,12 @@ impl ToolRegistry {
 
     pub(crate) fn lookup(&self, name: &str) -> Option<ToolHandler> {
         self.handlers.get(name).copied()
+    }
+
+    pub(crate) fn tool_names(&self) -> Vec<String> {
+        let mut names = self.handlers.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     pub(crate) fn validate_tools(&self, tools: Option<&[ToolDescriptor]>) -> Result<(), String> {

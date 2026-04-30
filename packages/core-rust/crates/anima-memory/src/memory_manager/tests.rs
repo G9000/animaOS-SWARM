@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
-use super::{MemoryManager, MemorySearchOptions, MemoryType, NewMemory, RecentMemoryOptions};
+use super::{
+    MemoryManager, MemoryScope, MemorySearchOptions, MemoryType, NewMemory, RecentMemoryOptions,
+};
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -15,6 +17,10 @@ fn base(overrides: impl FnOnce(&mut NewMemory)) -> NewMemory {
         content: "TypeScript is a statically typed language".into(),
         importance: 0.5,
         tags: None,
+        scope: None,
+        room_id: None,
+        world_id: None,
+        session_id: None,
     };
     overrides(&mut memory);
     memory
@@ -75,6 +81,10 @@ fn add_preserves_provided_fields() {
             memory.content = "Task was completed successfully".into();
             memory.importance = 0.9;
             memory.tags = Some(vec!["done".into(), "verified".into()]);
+            memory.scope = Some(MemoryScope::Room);
+            memory.room_id = Some("room-1".into());
+            memory.world_id = Some("world-1".into());
+            memory.session_id = Some("session-1".into());
         }),
     );
 
@@ -87,6 +97,29 @@ fn add_preserves_provided_fields() {
         memory.tags,
         Some(vec!["done".to_string(), "verified".to_string()])
     );
+    assert_eq!(memory.scope, MemoryScope::Room);
+    assert_eq!(memory.room_id.as_deref(), Some("room-1"));
+    assert_eq!(memory.world_id.as_deref(), Some("world-1"));
+    assert_eq!(memory.session_id.as_deref(), Some("session-1"));
+}
+
+#[test]
+fn add_defaults_room_scope_when_room_id_is_present() {
+    let mut manager = MemoryManager::new();
+    let memory = add_memory(
+        &mut manager,
+        base(|memory| memory.room_id = Some("room-1".into())),
+    );
+
+    assert_eq!(memory.scope, MemoryScope::Room);
+}
+
+#[test]
+fn add_defaults_private_scope_without_room_id() {
+    let mut manager = MemoryManager::new();
+    let memory = add_memory(&mut manager, base(|_| {}));
+
+    assert_eq!(memory.scope, MemoryScope::Private);
 }
 
 #[test]
@@ -380,6 +413,40 @@ fn search_combines_filters() {
 }
 
 #[test]
+fn search_filters_by_scope_and_room() {
+    let mut manager = MemoryManager::new();
+    add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "shared planning note".into();
+            memory.scope = Some(MemoryScope::Room);
+            memory.room_id = Some("room-a".into());
+        }),
+    );
+    add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "shared planning note".into();
+            memory.scope = Some(MemoryScope::Room);
+            memory.room_id = Some("room-b".into());
+        }),
+    );
+
+    let results = manager.search(
+        "planning note",
+        MemorySearchOptions {
+            scope: Some(MemoryScope::Room),
+            room_id: Some("room-a".into()),
+            ..MemorySearchOptions::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].room_id.as_deref(), Some("room-a"));
+    assert_eq!(results[0].scope, MemoryScope::Room);
+}
+
+#[test]
 fn get_recent_returns_newest_first() {
     let mut manager = MemoryManager::new();
     add_memory(
@@ -516,6 +583,33 @@ fn get_recent_filters_by_agent_name() {
     assert!(recent
         .iter()
         .all(|result| result.agent_name == "researcher"));
+}
+
+#[test]
+fn get_recent_filters_by_session_id() {
+    let mut manager = MemoryManager::new();
+    add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "older session".into();
+            memory.session_id = Some("session-a".into());
+        }),
+    );
+    add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "newer session".into();
+            memory.session_id = Some("session-b".into());
+        }),
+    );
+
+    let recent = manager.get_recent(RecentMemoryOptions {
+        session_id: Some("session-a".into()),
+        ..RecentMemoryOptions::default()
+    });
+
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].content, "older session");
 }
 
 #[test]

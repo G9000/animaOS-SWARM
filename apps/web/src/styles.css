@@ -1,3 +1,7 @@
+@import 'tailwindcss';
+
+@source '../../packages/ui/src/**/*.{ts,tsx}';
+
 :root {
   --app-background: #030303;
   --app-surface: #0a0a0a;

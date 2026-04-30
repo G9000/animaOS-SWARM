@@ -75,11 +75,13 @@ pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> 
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
     let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
-    let state = Arc::new(RwLock::new(DaemonState::with_model_adapter_and_events_and_limits(
-        Arc::new(RuntimeModelAdapter::from_env()),
-        event_fanout,
-        config.max_background_processes,
-    )));
+    let state = Arc::new(RwLock::new(
+        DaemonState::with_model_adapter_and_events_and_limits(
+            Arc::new(RuntimeModelAdapter::from_env()),
+            event_fanout,
+            config.max_background_processes,
+        ),
+    ));
 
     configure_persistence(&state, config.persistence_mode).await?;
 

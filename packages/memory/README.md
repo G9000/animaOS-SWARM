@@ -26,12 +26,15 @@ manager.add({
   type: 'fact',
   content: 'Launch recovered after a /health recheck.',
   importance: 0.8,
+  scope: 'private',
   tags: ['launch', 'health'],
 });
 
 const results = manager.search('launch health');
 console.log(results[0]?.content);
 ```
+
+Memories can also be scoped with `scope: 'shared' | 'private' | 'room'` plus optional `roomId`, `worldId`, and `sessionId` filters. If a new memory omits `scope`, the manager defaults it to `room` when `roomId` is present and `private` otherwise.
 
 ## Build
 

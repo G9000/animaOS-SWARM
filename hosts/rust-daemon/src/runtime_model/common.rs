@@ -99,9 +99,7 @@ pub(super) fn tool_call_args(value: &Value) -> Result<BTreeMap<String, DataValue
     }
 }
 
-pub(super) fn json_value_to_data_map(
-    value: &Value,
-) -> Result<BTreeMap<String, DataValue>, String> {
+pub(super) fn json_value_to_data_map(value: &Value) -> Result<BTreeMap<String, DataValue>, String> {
     match value {
         Value::Object(values) => values
             .iter()

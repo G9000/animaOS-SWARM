@@ -10,15 +10,21 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use super::common::{data_value_to_json, tool_parameters_schema_json};
-use super::{RuntimeModelAdapter, RuntimeModelAdapterConfig, PROVIDER_DEFS};
+use super::{provider_summaries, RuntimeModelAdapter, RuntimeModelAdapterConfig, PROVIDER_DEFS};
 
 fn test_config(overrides: &[(&str, Option<&str>, &str)]) -> RuntimeModelAdapterConfig {
     let providers = PROVIDER_DEFS
         .iter()
         .map(|(name, def)| {
-            if let Some((_, key, url)) = overrides.iter().find(|(provider_name, _, _)| provider_name == name)
+            if let Some((_, key, url)) = overrides
+                .iter()
+                .find(|(provider_name, _, _)| provider_name == name)
             {
-                (name.to_string(), key.map(|value| value.to_string()), url.to_string())
+                (
+                    name.to_string(),
+                    key.map(|value| value.to_string()),
+                    url.to_string(),
+                )
             } else {
                 (name.to_string(), None, def.default_base_url.to_string())
             }
@@ -412,11 +418,8 @@ async fn runtime_adapter_routes_google_through_native_gemini_api() {
     );
 
     let base_url = spawn_server(app).await;
-    let adapter = RuntimeModelAdapter::with_config(test_config(&[(
-        "google",
-        Some("goog-key"),
-        &base_url,
-    )]));
+    let adapter =
+        RuntimeModelAdapter::with_config(test_config(&[("google", Some("goog-key"), &base_url)]));
 
     let mut config = agent_config("google");
     config.model = "gemini-2.0-flash".into();
@@ -538,6 +541,51 @@ async fn runtime_adapter_accepts_kimi_as_moonshot_alias() {
         .expect("kimi alias should generate through moonshot");
 
     assert_eq!(response.content.text, "kimi alias response");
+}
+
+#[test]
+fn provider_summaries_use_canonical_provider_metadata() {
+    let summaries = provider_summaries();
+
+    assert_eq!(summaries[0].id, "deterministic");
+    assert_eq!(summaries[0].label, "Deterministic (mock)");
+    assert!(!summaries[0].requires_key);
+    assert!(summaries[0].configured);
+
+    let ollama = summaries
+        .iter()
+        .find(|summary| summary.id == "ollama")
+        .expect("ollama should be listed");
+    assert_eq!(ollama.label, "Ollama (local)");
+    assert!(!ollama.requires_key);
+    assert!(ollama.configured);
+
+    let xai = summaries
+        .iter()
+        .find(|summary| summary.id == "xai")
+        .expect("xai should be listed");
+    assert_eq!(xai.label, "xAI (Grok)");
+    assert!(xai.requires_key);
+    assert_eq!(xai.api_key_envs[0], "XAI_API_KEY");
+}
+
+#[tokio::test]
+async fn runtime_adapter_reports_alias_provider_metadata_when_key_is_missing() {
+    let adapter = RuntimeModelAdapter::with_config(test_config(&[]));
+
+    let error = adapter
+        .generate(&agent_config("grok"), &request())
+        .await
+        .expect_err("missing xai key should fail through grok alias");
+
+    assert!(
+        error.contains("XAI_API_KEY"),
+        "error should explain missing xai key: {error}"
+    );
+    assert!(
+        error.contains("xAI (Grok)"),
+        "error should use canonical provider label: {error}"
+    );
 }
 
 #[test]

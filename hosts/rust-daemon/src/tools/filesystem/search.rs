@@ -9,7 +9,11 @@ use super::super::workspace::{
     walk_search_tree, workspace_root_path,
 };
 
-pub(in super::super) fn read_workspace_file(file_path: &str, offset: usize, limit: usize) -> Result<String, String> {
+pub(in super::super) fn read_workspace_file(
+    file_path: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<String, String> {
     let workspace_root = workspace_root_path("read_file")?;
     read_workspace_file_from_root(&workspace_root, file_path, offset, limit)
 }
@@ -135,7 +139,11 @@ pub(in super::super) fn glob_workspace_paths_from_root(
     }
 }
 
-pub(in super::super) fn grep_workspace_files(pattern: &str, path: &str, include: Option<&str>) -> Result<String, String> {
+pub(in super::super) fn grep_workspace_files(
+    pattern: &str,
+    path: &str,
+    include: Option<&str>,
+) -> Result<String, String> {
     let workspace_root = workspace_root_path("grep")?;
     grep_workspace_files_from_root(&workspace_root, pattern, path, include)
 }
@@ -195,7 +203,9 @@ fn grep_single_file(
     matches: &mut Vec<String>,
 ) -> Result<(), String> {
     let relative_path = normalized_relative_path(workspace_root, file_path)?;
-    if !include_pattern.is_empty() && !path_matches_glob(include_pattern, include_matcher, &relative_path) {
+    if !include_pattern.is_empty()
+        && !path_matches_glob(include_pattern, include_matcher, &relative_path)
+    {
         return Ok(());
     }
 
@@ -277,5 +287,8 @@ fn truncate_chars(input: &str, max_characters: usize) -> String {
         return input.to_string();
     }
 
-    format!("{}...", input.chars().take(max_characters).collect::<String>())
+    format!(
+        "{}...",
+        input.chars().take(max_characters).collect::<String>()
+    )
 }

@@ -36,19 +36,27 @@ impl Evaluator for ReflectionMemoryEvaluator {
 
         let state = runtime.state();
         let reflection = format!("evaluated response: {}", response.text);
-        let memory = self
-            .memory
-            .write()
-            .await
-            .add(NewMemory {
-                agent_id: state.id,
-                agent_name: state.name,
-                memory_type: MemoryType::Reflection,
-                content: reflection.clone(),
-                importance: 0.6,
-                tags: Some(vec!["runtime".into(), "evaluator-reflection".into()]),
-            })
-            .map_err(|error| error.message().to_string())?;
+        let memory = {
+            let mut memory_guard = self.memory.write().await;
+            let memory = memory_guard
+                .add(NewMemory {
+                    agent_id: state.id,
+                    agent_name: state.name,
+                    memory_type: MemoryType::Reflection,
+                    content: reflection.clone(),
+                    importance: 0.6,
+                    tags: Some(vec!["runtime".into(), "evaluator-reflection".into()]),
+                    scope: None,
+                    room_id: None,
+                    world_id: None,
+                    session_id: None,
+                })
+                .map_err(|error| error.message().to_string())?;
+            memory_guard
+                .save()
+                .map_err(|error| format!("failed to persist reflection memory: {error}"))?;
+            memory
+        };
 
         let mut metadata = BTreeMap::new();
         metadata.insert("memoryId".into(), DataValue::String(memory.id));

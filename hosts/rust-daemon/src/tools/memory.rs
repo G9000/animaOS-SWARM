@@ -32,18 +32,20 @@ pub(super) fn execute_memory_search(
             None => 3,
         };
 
-        let results = context
-            .memory
-            .read()
-            .await
-            .search(
-                &query,
-                MemorySearchOptions {
-                    agent_id: Some(agent.id.clone()),
-                    limit: Some(limit),
-                    ..MemorySearchOptions::default()
-                },
-            );
+        let results = context.memory.read().await.search(
+            &query,
+            MemorySearchOptions {
+                agent_id: Some(agent.id.clone()),
+                agent_name: None,
+                memory_type: None,
+                scope: None,
+                room_id: None,
+                world_id: None,
+                session_id: None,
+                limit: Some(limit),
+                min_importance: None,
+            },
+        );
 
         let mut metadata = BTreeMap::new();
         metadata.insert("query".into(), DataValue::String(query));
@@ -82,19 +84,18 @@ pub(super) fn execute_memory_add(
             _ => return TaskResult::error("memory_add content must be a non-empty string", 0),
         };
 
-        let memory_type = match tool_call.args.get("type") {
-            None => MemoryType::Fact,
-            Some(DataValue::String(value)) => match MemoryType::parse(value) {
-                Ok(memory_type) => memory_type,
-                Err(()) => {
-                    return TaskResult::error(
+        let memory_type =
+            match tool_call.args.get("type") {
+                None => MemoryType::Fact,
+                Some(DataValue::String(value)) => match MemoryType::parse(value) {
+                    Ok(memory_type) => memory_type,
+                    Err(()) => return TaskResult::error(
                         "memory_add type must be one of fact, observation, task_result, reflection",
                         0,
-                    )
-                }
-            },
-            Some(_) => return TaskResult::error("memory_add type must be a string", 0),
-        };
+                    ),
+                },
+                Some(_) => return TaskResult::error("memory_add type must be a string", 0),
+            };
 
         let importance = match tool_call.args.get("importance") {
             None => 0.8,
@@ -106,20 +107,27 @@ pub(super) fn execute_memory_add(
             }
         };
 
-        let memory = match context
-            .memory
-            .write()
-            .await
-            .add(NewMemory {
+        let memory = {
+            let mut memory_guard = context.memory.write().await;
+            let memory = match memory_guard.add(NewMemory {
                 agent_id: agent.id.clone(),
                 agent_name: agent.name.clone(),
                 memory_type,
                 content: content.clone(),
                 importance,
                 tags: Some(vec!["runtime".into(), "tool-memory-add".into()]),
+                scope: None,
+                room_id: None,
+                world_id: None,
+                session_id: None,
             }) {
-            Ok(memory) => memory,
-            Err(error) => return TaskResult::error(error.message(), 0),
+                Ok(memory) => memory,
+                Err(error) => return TaskResult::error(error.message(), 0),
+            };
+            if let Err(error) = memory_guard.save() {
+                return TaskResult::error(format!("failed to persist memory: {error}"), 0);
+            }
+            memory
         };
 
         let mut metadata = BTreeMap::new();
@@ -166,6 +174,10 @@ pub(super) fn execute_recent_memories(
             .get_recent(anima_memory::RecentMemoryOptions {
                 agent_id: Some(agent.id.clone()),
                 agent_name: None,
+                scope: None,
+                room_id: None,
+                world_id: None,
+                session_id: None,
                 limit: Some(limit),
             });
 

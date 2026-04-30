@@ -5,8 +5,8 @@ mod render;
 mod tests;
 
 use anima_core::{
-    AgentConfig, Content, MessageRole, ModelAdapter, ModelGenerateRequest,
-    ModelGenerateResponse, ModelStopReason, TokenUsage, ToolCall,
+    AgentConfig, Content, MessageRole, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse,
+    ModelStopReason, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 

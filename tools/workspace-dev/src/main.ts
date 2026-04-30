@@ -58,6 +58,16 @@ export function buildWorkspaceDevPlan(
     },
   });
 
+  processes.push({
+    name: '@animaOS-SWARM/playground',
+    command: 'bun',
+    args: ['x', 'nx', 'run', '@animaOS-SWARM/playground:serve'],
+    env: {
+      UI_BACKEND_ORIGIN: host.baseUrl,
+      VITE_HOST_KEY: host.key,
+    },
+  });
+
   return {
     host,
     processes,

@@ -121,7 +121,10 @@ pub(super) fn execute_exa_search(
                 let mut metadata = BTreeMap::new();
                 metadata.insert("provider".into(), DataValue::String("exa".into()));
                 metadata.insert("query".into(), DataValue::String(query));
-                metadata.insert("resultCount".into(), DataValue::Number(results.len() as f64));
+                metadata.insert(
+                    "resultCount".into(),
+                    DataValue::Number(results.len() as f64),
+                );
                 metadata.insert(
                     "urls".into(),
                     DataValue::Array(
@@ -192,7 +195,10 @@ async fn fetch_web_text(url: &str, max_length: usize) -> Result<(String, String)
     }
 
     if text.chars().count() > max_length {
-        text = format!("{}\n...[truncated]", text.chars().take(max_length).collect::<String>());
+        text = format!(
+            "{}\n...[truncated]",
+            text.chars().take(max_length).collect::<String>()
+        );
     }
 
     Ok((text, content_type))
@@ -337,7 +343,10 @@ fn truncate_chars(input: &str, max_characters: usize) -> String {
         return input.to_string();
     }
 
-    format!("{}...", input.chars().take(max_characters).collect::<String>())
+    format!(
+        "{}...",
+        input.chars().take(max_characters).collect::<String>()
+    )
 }
 
 fn first_non_empty_env_value(names: &[&str]) -> Option<String> {

@@ -12,12 +12,12 @@ use anima_core::{
 use async_trait::async_trait;
 use reqwest::Client;
 
-use crate::model::DeterministicModelAdapter;
 use self::{
     anthropic::{build_anthropic_body, parse_anthropic_response},
     google::{build_google_body, parse_google_response},
     openai_compatible::{build_openai_compatible_body, parse_openai_compatible_response},
 };
+use crate::model::DeterministicModelAdapter;
 
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
@@ -35,7 +35,18 @@ const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderKind {
+    Anthropic,
+    Google,
+    OpenAiCompatible,
+}
+
 struct ProviderDef {
+    label: &'static str,
+    aliases: &'static [&'static str],
+    kind: ProviderKind,
+    requires_key: bool,
     api_key_envs: &'static [&'static str],
     base_url_envs: &'static [&'static str],
     default_base_url: &'static str,
@@ -45,6 +56,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "openai",
         ProviderDef {
+            label: "OpenAI",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["OPENAI_API_KEY", "OPENAI_KEY", "OPENAI_TOKEN"],
             base_url_envs: &["OPENAI_BASE_URL"],
             default_base_url: DEFAULT_OPENAI_BASE_URL,
@@ -53,6 +68,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "anthropic",
         ProviderDef {
+            label: "Anthropic",
+            aliases: &[],
+            kind: ProviderKind::Anthropic,
+            requires_key: true,
             api_key_envs: &[
                 "ANTHROPIC_API_KEY",
                 "ANTHROPIC_KEY",
@@ -66,6 +85,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "google",
         ProviderDef {
+            label: "Google (Gemini)",
+            aliases: &["gemini"],
+            kind: ProviderKind::Google,
+            requires_key: true,
             api_key_envs: &[
                 "GOOGLE_API_KEY",
                 "GOOGLE_KEY",
@@ -80,6 +103,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "ollama",
         ProviderDef {
+            label: "Ollama (local)",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: false,
             api_key_envs: &["OLLAMA_API_KEY"],
             base_url_envs: &["OLLAMA_BASE_URL"],
             default_base_url: DEFAULT_OLLAMA_BASE_URL,
@@ -88,6 +115,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "groq",
         ProviderDef {
+            label: "Groq",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["GROQ_API_KEY", "GROQ_KEY", "GROQ_TOKEN"],
             base_url_envs: &["GROQ_BASE_URL"],
             default_base_url: DEFAULT_GROQ_BASE_URL,
@@ -96,6 +127,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "xai",
         ProviderDef {
+            label: "xAI (Grok)",
+            aliases: &["grok"],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["XAI_API_KEY", "XAI_KEY", "GROK_API_KEY"],
             base_url_envs: &["XAI_BASE_URL"],
             default_base_url: DEFAULT_XAI_BASE_URL,
@@ -104,6 +139,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "openrouter",
         ProviderDef {
+            label: "OpenRouter",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["OPENROUTER_API_KEY", "OPENROUTER_KEY", "OPENROUTER_TOKEN"],
             base_url_envs: &["OPENROUTER_BASE_URL"],
             default_base_url: DEFAULT_OPENROUTER_BASE_URL,
@@ -112,6 +151,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "mistral",
         ProviderDef {
+            label: "Mistral",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["MISTRAL_API_KEY", "MISTRAL_KEY", "MISTRAL_TOKEN"],
             base_url_envs: &["MISTRAL_BASE_URL"],
             default_base_url: DEFAULT_MISTRAL_BASE_URL,
@@ -120,6 +163,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "together",
         ProviderDef {
+            label: "Together AI",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["TOGETHER_API_KEY", "TOGETHER_KEY", "TOGETHER_TOKEN"],
             base_url_envs: &["TOGETHER_BASE_URL"],
             default_base_url: DEFAULT_TOGETHER_BASE_URL,
@@ -128,6 +175,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "deepseek",
         ProviderDef {
+            label: "DeepSeek",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["DEEPSEEK_API_KEY"],
             base_url_envs: &["DEEPSEEK_BASE_URL"],
             default_base_url: DEFAULT_DEEPSEEK_BASE_URL,
@@ -136,6 +187,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "fireworks",
         ProviderDef {
+            label: "Fireworks",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["FIREWORKS_API_KEY"],
             base_url_envs: &["FIREWORKS_BASE_URL"],
             default_base_url: DEFAULT_FIREWORKS_BASE_URL,
@@ -144,6 +199,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "perplexity",
         ProviderDef {
+            label: "Perplexity",
+            aliases: &[],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &["PERPLEXITY_API_KEY"],
             base_url_envs: &["PERPLEXITY_BASE_URL"],
             default_base_url: DEFAULT_PERPLEXITY_BASE_URL,
@@ -152,6 +211,10 @@ const PROVIDER_DEFS: &[(&str, ProviderDef)] = &[
     (
         "moonshot",
         ProviderDef {
+            label: "Moonshot (Kimi)",
+            aliases: &["kimi"],
+            kind: ProviderKind::OpenAiCompatible,
+            requires_key: true,
             api_key_envs: &[
                 "MOONSHOT_API_KEY",
                 "MOONSHOT_KEY",
@@ -171,21 +234,13 @@ fn provider_def(name: &str) -> Option<&'static ProviderDef> {
         .map(|(_, def)| def)
 }
 
-fn openai_compatible_provider(provider: &str) -> Option<(&'static str, bool)> {
-    match provider {
-        "openai" => Some(("openai", true)),
-        "ollama" => Some(("ollama", false)),
-        "groq" => Some(("groq", true)),
-        "xai" | "grok" => Some(("xai", true)),
-        "openrouter" => Some(("openrouter", true)),
-        "mistral" => Some(("mistral", true)),
-        "together" => Some(("together", true)),
-        "deepseek" => Some(("deepseek", true)),
-        "fireworks" => Some(("fireworks", true)),
-        "perplexity" => Some(("perplexity", true)),
-        "moonshot" | "kimi" => Some(("moonshot", true)),
-        _ => None,
-    }
+fn provider_def_for_request(provider: &str) -> Option<(&'static str, &'static ProviderDef)> {
+    PROVIDER_DEFS
+        .iter()
+        .find(|(provider_name, def)| {
+            *provider_name == provider || def.aliases.iter().any(|alias| *alias == provider)
+        })
+        .map(|(provider_name, def)| (*provider_name, def))
 }
 
 fn first_env_value(names: &[&str]) -> Option<String> {
@@ -194,6 +249,37 @@ fn first_env_value(names: &[&str]) -> Option<String> {
             .ok()
             .and_then(|value| (!value.trim().is_empty()).then_some(value))
     })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderSummary {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub requires_key: bool,
+    pub configured: bool,
+    pub api_key_envs: &'static [&'static str],
+}
+
+pub(crate) fn provider_summaries() -> Vec<ProviderSummary> {
+    let mut summaries = Vec::with_capacity(PROVIDER_DEFS.len() + 1);
+    summaries.push(ProviderSummary {
+        id: "deterministic",
+        label: "Deterministic (mock)",
+        requires_key: false,
+        configured: true,
+        api_key_envs: &[],
+    });
+    for (name, def) in PROVIDER_DEFS {
+        let configured = !def.requires_key || first_env_value(def.api_key_envs).is_some();
+        summaries.push(ProviderSummary {
+            id: name,
+            label: def.label,
+            requires_key: def.requires_key,
+            configured,
+            api_key_envs: def.api_key_envs,
+        });
+    }
+    summaries
 }
 
 #[derive(Clone, Debug)]
@@ -270,25 +356,27 @@ impl RuntimeModelAdapter {
 
     async fn generate_openai_compat_provider(
         &self,
-        provider_name: &str,
-        require_key: bool,
+        provider_name: &'static str,
+        provider_def: &'static ProviderDef,
         config: &AgentConfig,
         request: &ModelGenerateRequest,
     ) -> Result<ModelGenerateResponse, String> {
         let (api_key, base_url) = self.resolve_provider_creds(provider_name, config);
 
-        if require_key && api_key.is_none() {
-            let env_name = provider_def(provider_name)
-                .and_then(|def| def.api_key_envs.first().copied())
+        if provider_def.requires_key && api_key.is_none() {
+            let env_name = provider_def
+                .api_key_envs
+                .first()
+                .copied()
                 .unwrap_or("API_KEY");
             return Err(format!(
-                "{env_name} is not configured for daemon-backed {provider_name} models"
+                "{env_name} is not configured for daemon-backed {} models",
+                provider_def.label
             ));
         }
 
-        let display = capitalise(provider_name);
         self.generate_openai_compatible(
-            &display,
+            provider_def.label,
             &join_base_url(&base_url, "/chat/completions"),
             api_key.as_deref(),
             config,
@@ -451,16 +539,25 @@ impl ModelAdapter for RuntimeModelAdapter {
 
         match provider.as_str() {
             "deterministic" | "test" => DeterministicModelAdapter.generate(config, request).await,
-            "anthropic" => self.generate_anthropic(config, request).await,
-            "google" | "gemini" => self.generate_google(config, request).await,
             other => {
-                if let Some((provider_name, require_key)) = openai_compatible_provider(other) {
-                    self.generate_openai_compat_provider(provider_name, require_key, config, request)
-                        .await
-                } else {
-                    Err(format!(
+                let Some((provider_name, provider_def)) = provider_def_for_request(other) else {
+                    return Err(format!(
                         "unsupported model provider for daemon-backed runtime: {other}"
-                    ))
+                    ));
+                };
+
+                match provider_def.kind {
+                    ProviderKind::Anthropic => self.generate_anthropic(config, request).await,
+                    ProviderKind::Google => self.generate_google(config, request).await,
+                    ProviderKind::OpenAiCompatible => {
+                        self.generate_openai_compat_provider(
+                            provider_name,
+                            provider_def,
+                            config,
+                            request,
+                        )
+                        .await
+                    }
                 }
             }
         }
@@ -488,12 +585,4 @@ fn agent_setting_string(config: &AgentConfig, key: &str) -> Option<String> {
 
 fn join_base_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
-}
-
-fn capitalise(value: &str) -> String {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
 }

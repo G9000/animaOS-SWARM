@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs"
 import { BM25 } from "./bm25.js"
 
 export type MemoryType = "fact" | "observation" | "task_result" | "reflection"
+export type MemoryScope = "shared" | "private" | "room"
 
 export interface Memory {
 	id: string
@@ -13,6 +14,10 @@ export interface Memory {
 	importance: number // 0-1
 	createdAt: number
 	tags?: string[]
+	scope: MemoryScope
+	roomId?: string
+	worldId?: string
+	sessionId?: string
 }
 
 export interface MemorySearchResult extends Memory {
@@ -23,8 +28,16 @@ export interface MemorySearchOptions {
 	agentId?: string
 	agentName?: string
 	type?: MemoryType
+	scope?: MemoryScope
+	roomId?: string
+	worldId?: string
+	sessionId?: string
 	limit?: number
 	minImportance?: number
+}
+
+export type NewMemoryInput = Omit<Memory, "id" | "createdAt" | "scope"> & {
+	scope?: MemoryScope
 }
 
 export class MemoryManager {
@@ -36,9 +49,10 @@ export class MemoryManager {
 		this.storageFile = storageFile
 	}
 
-	add(memory: Omit<Memory, "id" | "createdAt">): Memory {
+	add(memory: NewMemoryInput): Memory {
 		const full: Memory = {
 			...memory,
+			scope: memory.scope ?? (memory.roomId ? "room" : "private"),
 			id: randomUUID(),
 			createdAt: Date.now(),
 		}
@@ -47,15 +61,19 @@ export class MemoryManager {
 		const indexText = [
 			full.content,
 			full.type,
+			full.scope,
 			full.agentName,
+			full.roomId,
+			full.worldId,
+			full.sessionId,
 			...(full.tags ?? []),
-		].join(" ")
+		].filter(Boolean).join(" ")
 		this.index.addDocument(full.id, indexText)
 		return full
 	}
 
 	search(query: string, opts: MemorySearchOptions = {}): MemorySearchResult[] {
-		const { agentId, agentName, type, limit = 10, minImportance = 0 } = opts
+		const { agentId, agentName, type, scope, roomId, worldId, sessionId, limit = 10, minImportance = 0 } = opts
 		const raw = this.index.search(query, limit * 3) // over-fetch then filter
 
 		const results: MemorySearchResult[] = []
@@ -65,6 +83,10 @@ export class MemoryManager {
 			if (agentId && mem.agentId !== agentId) continue
 			if (agentName && mem.agentName !== agentName) continue
 			if (type && mem.type !== type) continue
+			if (scope && mem.scope !== scope) continue
+			if (roomId && mem.roomId !== roomId) continue
+			if (worldId && mem.worldId !== worldId) continue
+			if (sessionId && mem.sessionId !== sessionId) continue
 			if (mem.importance < minImportance) continue
 			results.push({ ...mem, score: r.score })
 			if (results.length >= limit) break
@@ -72,12 +94,16 @@ export class MemoryManager {
 		return results
 	}
 
-	getRecent(opts: { agentId?: string; agentName?: string; limit?: number } = {}): Memory[] {
-		const { agentId, agentName, limit = 20 } = opts
+	getRecent(opts: { agentId?: string; agentName?: string; scope?: MemoryScope; roomId?: string; worldId?: string; sessionId?: string; limit?: number } = {}): Memory[] {
+		const { agentId, agentName, scope, roomId, worldId, sessionId, limit = 20 } = opts
 		return Array.from(this.memories.values())
 			.filter((m) => {
 				if (agentId && m.agentId !== agentId) return false
 				if (agentName && m.agentName !== agentName) return false
+				if (scope && m.scope !== scope) return false
+				if (roomId && m.roomId !== roomId) return false
+				if (worldId && m.worldId !== worldId) return false
+				if (sessionId && m.sessionId !== sessionId) return false
 				return true
 			})
 			.sort((a, b) => b.createdAt - a.createdAt)
@@ -115,8 +141,9 @@ export class MemoryManager {
 			const raw = readFileSync(this.storageFile, "utf-8")
 			const data = JSON.parse(raw) as Memory[]
 			for (const mem of data) {
+				mem.scope ??= mem.roomId ? "room" : "private"
 				this.memories.set(mem.id, mem)
-				const indexText = [mem.content, mem.type, mem.agentName, ...(mem.tags ?? [])].join(" ")
+				const indexText = [mem.content, mem.type, mem.scope, mem.agentName, mem.roomId, mem.worldId, mem.sessionId, ...(mem.tags ?? [])].filter(Boolean).join(" ")
 				this.index.addDocument(mem.id, indexText)
 			}
 		} catch {

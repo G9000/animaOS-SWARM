@@ -3,20 +3,22 @@ pub(super) mod events;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 
+use self::events::{publish_swarm_event, subscribe_swarm_events_response};
 use super::contracts::{
-    SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmStateResponse,
-    SwarmsEnvelope, TaskRequest, TaskResultResponse,
+    SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmStateResponse, SwarmsEnvelope,
+    TaskRequest, TaskResultResponse,
 };
 use super::ApiError;
 use crate::app::SharedDaemonState;
-use self::events::{publish_swarm_event, subscribe_swarm_events_response};
 
 pub(crate) async fn handle_create_swarm(
     body: Vec<u8>,
     state: &SharedDaemonState,
 ) -> Result<SwarmEnvelope, ApiError> {
     let request: SwarmCreateRequest = super::parse_json_body(body)?;
-    let config = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let config = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let (coordinator, event_stream, global_event_fanout) = {
         let guard = state.read().await;
@@ -84,7 +86,9 @@ pub(crate) async fn handle_run_swarm(
     state: &SharedDaemonState,
 ) -> Result<SwarmRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
-    let content = request.into_domain().map_err(ApiError::bad_request_static)?;
+    let content = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
 
     let (coordinator, global_event_fanout, swarm_event_fanout) = {
         let guard = state.read().await;

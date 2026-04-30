@@ -65,14 +65,23 @@ application endpoints. The summary below matches the live router in
 | `POST` | `/api/agents/{agent_id}/run` | Run the agent with `{"text":"..."}`. Blocks until completion and returns the updated snapshot plus task result. |
 | `GET` | `/api/agents/{agent_id}/memories/recent` | Get recent memories for the agent. Optional `?limit=N`. |
 
+### Agencies
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/agencies/create` | Generate an agency and materialize a CLI-style workspace under the daemon workspace root. Body includes `name`, `description`, `teamSize`, optional `provider`, optional `model`, optional `modelPool`, optional `outputDir`, optional `seedMemories`, and optional `overwrite`. Writes `anima.yaml`, `org-chart.mmd`, `README.md`, and `agents/*/profile.md` plus workspace placeholders, and can also write `agents/*/memory/seed.json` files with LLM-generated starter memories. The response includes the created file list plus seed-memory counts. |
+| `POST` | `/api/agencies/generate` | Generate an agency draft from a plain-language description. Body includes `name`, `description`, `teamSize`, optional `provider`, optional `model`, and optional `modelPool`. Returns a mission, values, and normalized agent definitions that can be spawned into a swarm without unsupported tool slugs. |
+
 ### Memories
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/memories` | Store a memory. Required fields: `agentId`, `agentName`, `type`, `content`, `importance` (0-1). |
-| `GET` | `/api/memories/search` | Keyword search. Required `?q=`. Optional `?type=`, `?agentId=`, `?agentName=`, `?limit=`, `?minImportance=`. |
+| `POST` | `/api/memories` | Store a memory. Required fields: `agentId`, `agentName`, `type`, `content`, `importance` (0-1). Optional fields: `scope` (`shared`, `private`, `room`), `roomId`, `worldId`, `sessionId`, and `tags`. |
+| `GET` | `/api/memories/search` | Keyword search. Required `?q=`. Optional `?type=`, `?agentId=`, `?agentName=`, `?scope=`, `?roomId=`, `?worldId=`, `?sessionId=`, `?limit=`, `?minImportance=`. |
 | `GET` | `/api/search` | Alias for `/api/memories/search` with the same query parameters and response shape. |
-| `GET` | `/api/memories/recent` | Recent memories. Optional `?agentId=`, `?agentName=`, `?limit=`. |
+| `GET` | `/api/memories/recent` | Recent memories. Optional `?agentId=`, `?agentName=`, `?scope=`, `?roomId=`, `?worldId=`, `?sessionId=`, `?limit=`. |
+
+Set `ANIMAOS_RS_MEMORY_FILE=/path/to/memories.json` to load daemon runtime memories from a JSON file on startup and autosave memory writes from HTTP routes, tools, and runtime evaluators.
 
 ### Swarms
 

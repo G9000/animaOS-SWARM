@@ -6,6 +6,64 @@ export interface HealthResponse {
   uptime_secs?: number;
 }
 
+export interface ProviderResponse {
+  id: string;
+  label: string;
+  requiresKey: boolean;
+  configured: boolean;
+  apiKeyEnvs: string[];
+}
+
+export interface AgencyGenerateRequest {
+  name?: string;
+  description?: string;
+  teamSize?: number;
+  provider?: string;
+  model?: string;
+  modelPool?: string[];
+}
+
+export interface AgencyCreateRequest extends AgencyGenerateRequest {
+  outputDir?: string;
+  seedMemories?: boolean;
+  overwrite?: boolean;
+}
+
+export interface AgentDefinitionResponse {
+  name: string;
+  position?: string;
+  role: 'orchestrator' | 'worker';
+  bio?: string;
+  lore?: string;
+  adjectives?: string[];
+  topics?: string[];
+  knowledge?: string[];
+  style?: string;
+  system?: string;
+  model?: string;
+  tools?: string[];
+  collaboratesWith?: string[];
+}
+
+export interface AgencyGenerateResponse {
+  name: string;
+  description: string;
+  provider: string;
+  model: string;
+  teamSize: number;
+  mission?: string;
+  values?: string[];
+  agents: AgentDefinitionResponse[];
+}
+
+export interface AgencyCreateResponse {
+  agency: AgencyGenerateResponse;
+  outputDir: string;
+  files: string[];
+  seedMemoryCount: number;
+  seededAgents: number;
+}
+
 export interface TokenUsage {
   promptTokens: number;
   completionTokens: number;
@@ -53,6 +111,10 @@ export interface Memory {
   importance: number;
   createdAt: number;
   tags?: string[];
+  scope: 'shared' | 'private' | 'room';
+  roomId?: string | null;
+  worldId?: string | null;
+  sessionId?: string | null;
 }
 
 export interface MemorySearchResult extends Memory {
@@ -64,8 +126,13 @@ export interface AgentConfig {
   model: string;
   bio?: string;
   lore?: string;
+  knowledge?: string[];
+  topics?: string[];
+  adjectives?: string[];
+  style?: string;
   system?: string;
   provider?: string;
+  tools?: string[];
 }
 
 export interface WorkerConfig extends AgentConfig {}
@@ -87,6 +154,10 @@ export interface MemoryCreateRequest {
   content: string;
   importance: number;
   tags?: string[];
+  scope?: 'shared' | 'private' | 'room';
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
 }
 
 export interface MemorySearchOptions {
@@ -94,6 +165,10 @@ export interface MemorySearchOptions {
   type?: string;
   agentId?: string;
   agentName?: string;
+  scope?: 'shared' | 'private' | 'room';
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
   limit?: number;
   minImportance?: number;
 }
@@ -131,6 +206,27 @@ async function request<T>(
 
 export const health = {
   get: () => request<HealthResponse>('/api/health'),
+};
+
+export const providers = {
+  list: () =>
+    request<{ providers: ProviderResponse[] }>('/api/providers').then(
+      (r) => r.providers
+    ),
+};
+
+export const agencies = {
+  generate: (body: AgencyGenerateRequest) =>
+    request<AgencyGenerateResponse>('/api/agencies/generate', {
+      method: 'POST',
+      json: body,
+    }),
+
+  create: (body: AgencyCreateRequest) =>
+    request<AgencyCreateResponse>('/api/agencies/create', {
+      method: 'POST',
+      json: body,
+    }),
 };
 
 // ── Agents ───────────────────────────────────────────────────────────────────
@@ -209,6 +305,10 @@ export const memories = {
     if (opts.type) params.set('type', opts.type);
     if (opts.agentId) params.set('agentId', opts.agentId);
     if (opts.agentName) params.set('agentName', opts.agentName);
+    if (opts.scope) params.set('scope', opts.scope);
+    if (opts.roomId) params.set('roomId', opts.roomId);
+    if (opts.worldId) params.set('worldId', opts.worldId);
+    if (opts.sessionId) params.set('sessionId', opts.sessionId);
     if (opts.limit !== undefined) params.set('limit', String(opts.limit));
     if (opts.minImportance !== undefined) params.set('minImportance', String(opts.minImportance));
     return request<{ results: MemorySearchResult[] }>(
@@ -216,10 +316,14 @@ export const memories = {
     ).then((r) => r.results);
   },
 
-  recent: (opts?: { agentId?: string; agentName?: string; limit?: number }) => {
+  recent: (opts?: { agentId?: string; agentName?: string; scope?: 'shared' | 'private' | 'room'; roomId?: string; worldId?: string; sessionId?: string; limit?: number }) => {
     const params = new URLSearchParams();
     if (opts?.agentId) params.set('agentId', opts.agentId);
     if (opts?.agentName) params.set('agentName', opts.agentName);
+    if (opts?.scope) params.set('scope', opts.scope);
+    if (opts?.roomId) params.set('roomId', opts.roomId);
+    if (opts?.worldId) params.set('worldId', opts.worldId);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
     if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
     const qs = params.toString();
     return request<{ memories: Memory[] }>(

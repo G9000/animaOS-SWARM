@@ -18,7 +18,8 @@
     "server": "bun x nx serve @animaOS-SWARM/server",
     "test": "bun x nx run-many -t test",
     "typecheck": "bun x nx run-many -t typecheck",
-    "web": "bun x nx dev @animaOS-SWARM/web"
+    "web": "bun x nx dev @animaOS-SWARM/web",
+    "playground": "bun x nx dev @animaOS-SWARM/playground"
   },
   "private": true,
   "dependencies": {
@@ -26,6 +27,8 @@
     "react-dom": "^19.2.5"
   },
   "devDependencies": {
+    "@babel/core": "^7.14.5",
+    "@babel/preset-react": "^7.14.5",
     "@nx/devkit": "^22.7.1",
     "@nx/esbuild": "^22.7.1",
     "@nx/js": "^22.7.1",
@@ -39,6 +42,7 @@
     "@swc-node/register": "1.11.1",
     "@swc/core": "^1.15.32",
     "@swc/helpers": "^0.5.21",
+    "@tailwindcss/vite": "^4",
     "@types/node": "^20.19.9",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
@@ -51,6 +55,7 @@
     "nx": "^22.7.1",
     "oxlint": "^1.62.0",
     "prettier": "^3.8.3",
+    "tailwindcss": "^4",
     "tslib": "^2.3.0",
     "typescript": "^5.9.3",
     "vite": "^8.0.10",

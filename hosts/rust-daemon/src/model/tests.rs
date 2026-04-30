@@ -38,8 +38,8 @@ fn deterministic_adapter_aggregates_trailing_tool_messages() {
         max_tokens: None,
     };
 
-    let response =
-        block_on(adapter.generate(&config_with_memory_search(), &request)).expect("adapter should generate");
+    let response = block_on(adapter.generate(&config_with_memory_search(), &request))
+        .expect("adapter should generate");
 
     assert!(
         response.content.text.contains("alpha result"),
@@ -61,7 +61,12 @@ fn deterministic_adapter_issues_todo_write_and_read_calls() {
         &config_with_tools(&["todo_write", "todo_read"]),
         &ModelGenerateRequest {
             system: "You are helpful".into(),
-            messages: vec![message("msg-1", "room-1", MessageRole::User, "plan release patch")],
+            messages: vec![message(
+                "msg-1",
+                "room-1",
+                MessageRole::User,
+                "plan release patch",
+            )],
             temperature: None,
             max_tokens: None,
         },
@@ -74,7 +79,9 @@ fn deterministic_adapter_issues_todo_write_and_read_calls() {
         .and_then(|calls| calls.first())
         .expect("todo write should produce a tool call");
     assert_eq!(tool_call.name, "todo_write");
-    assert!(matches!(tool_call.args.get("todos"), Some(DataValue::Array(values)) if values.len() == 3));
+    assert!(
+        matches!(tool_call.args.get("todos"), Some(DataValue::Array(values)) if values.len() == 3)
+    );
 
     let read_response = block_on(adapter.generate(
         &config_with_tools(&["todo_read"]),

@@ -2,6 +2,7 @@ import type {
   Memory,
   MemorySearchOptions,
   MemorySearchResult,
+  MemoryScope,
   MemoryType,
 } from '@animaOS-SWARM/memory';
 
@@ -14,11 +15,19 @@ export interface CreateMemoryInput {
   content: string;
   importance: number;
   tags?: string[] | null;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
 }
 
 export interface RecentMemoriesOptions {
   agentId?: string;
   agentName?: string;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
   limit?: number;
 }
 
@@ -48,6 +57,18 @@ export class MemoriesClient {
     if (options.type !== undefined) {
       search.set('type', options.type);
     }
+    if (options.scope !== undefined) {
+      search.set('scope', options.scope);
+    }
+    if (options.roomId !== undefined) {
+      search.set('roomId', options.roomId);
+    }
+    if (options.worldId !== undefined) {
+      search.set('worldId', options.worldId);
+    }
+    if (options.sessionId !== undefined) {
+      search.set('sessionId', options.sessionId);
+    }
     if (options.limit !== undefined) {
       search.set('limit', String(options.limit));
     }
@@ -70,6 +91,18 @@ export class MemoriesClient {
     }
     if (options.agentName !== undefined) {
       search.set('agentName', options.agentName);
+    }
+    if (options.scope !== undefined) {
+      search.set('scope', options.scope);
+    }
+    if (options.roomId !== undefined) {
+      search.set('roomId', options.roomId);
+    }
+    if (options.worldId !== undefined) {
+      search.set('worldId', options.worldId);
+    }
+    if (options.sessionId !== undefined) {
+      search.set('sessionId', options.sessionId);
     }
     if (options.limit !== undefined) {
       search.set('limit', String(options.limit));

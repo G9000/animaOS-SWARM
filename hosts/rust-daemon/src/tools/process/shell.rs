@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::super::workspace::{canonical_workspace_root, resolve_workspace_search_root, workspace_root_path};
+use super::super::workspace::{
+    canonical_workspace_root, resolve_workspace_search_root, workspace_root_path,
+};
 
 const BASH_MAX_OUTPUT_CHARS: usize = 30_000;
 const BASH_MAX_OUTPUT_LINES: usize = 500;
@@ -31,7 +33,11 @@ pub(in super::super) fn execute_bash_command_from_root(
     timeout_ms: u64,
     cwd: &str,
 ) -> Result<BashCommandResult, String> {
-    let cwd = resolve_workspace_search_root(&canonical_workspace_root(workspace_root, "bash")?, cwd, "bash")?;
+    let cwd = resolve_workspace_search_root(
+        &canonical_workspace_root(workspace_root, "bash")?,
+        cwd,
+        "bash",
+    )?;
     let (executable, flags) = resolve_shell_launcher()?;
 
     let mut child = Command::new(&executable)

@@ -5,9 +5,7 @@ mod swarm_tools;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anima_core::{
-    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, DatabaseAdapter, ModelAdapter,
-};
+use anima_core::{AgentConfig, AgentRuntime, AgentRuntimeSnapshot, DatabaseAdapter, ModelAdapter};
 use anima_memory::MemoryManager;
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
@@ -110,6 +108,10 @@ impl DaemonState {
 
     pub(crate) fn memory_handle(&self) -> SharedMemoryStore {
         Arc::clone(&self.memory)
+    }
+
+    pub(crate) fn replace_memory(&mut self, memory: MemoryManager) {
+        self.memory = Arc::new(AsyncRwLock::new(memory));
     }
 
     pub(crate) fn agent_count(&self) -> usize {
@@ -242,7 +244,9 @@ impl DaemonState {
     }
 
     pub(crate) fn agent_runtime_id(&self, agent_id: &str) -> Option<String> {
-        self.agents.get(agent_id).map(|runtime| runtime.id().to_string())
+        self.agents
+            .get(agent_id)
+            .map(|runtime| runtime.id().to_string())
     }
 
     pub(crate) fn take_agent_runtime(
@@ -280,5 +284,4 @@ impl DaemonState {
 
         Ok(())
     }
-
 }

@@ -1,9 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anima_core::{
-    AgentConfig, AgentRuntime, Content, EngineEvent, ModelAdapter, TokenUsage,
-};
+use anima_core::{AgentConfig, AgentRuntime, Content, EngineEvent, ModelAdapter, TokenUsage};
 use anima_swarm::coordinator::{
     CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentShell,
 };
@@ -18,7 +16,10 @@ use super::swarm_tools::execute_swarm_tool;
 use super::{DaemonState, SharedMemoryStore};
 
 impl DaemonState {
-    pub(super) fn swarm_agent_factory(&self, event_stream: EventFanout) -> Arc<CoordinatorAgentFactoryFn> {
+    pub(super) fn swarm_agent_factory(
+        &self,
+        event_stream: EventFanout,
+    ) -> Arc<CoordinatorAgentFactoryFn> {
         let memory = Arc::clone(&self.memory);
         let model_adapter = Arc::clone(&self.model_adapter);
         let tool_registry = self.tool_registry.clone();
@@ -34,11 +35,8 @@ impl DaemonState {
             let db = db.clone();
 
             Box::pin(async move {
-                let tool_context = ToolExecutionContext::new(
-                    Arc::clone(&memory),
-                    tool_registry,
-                    process_manager,
-                );
+                let tool_context =
+                    ToolExecutionContext::new(Arc::clone(&memory), tool_registry, process_manager);
                 let runtime_events: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new({
                     let event_stream = event_stream.clone();
                     let agent_name = context.config.name.clone();

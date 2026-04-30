@@ -49,6 +49,10 @@ for result in results {
 
 The string keys are used internally in the search index and in JSON serialization.
 
+## Memory scope
+
+Every stored memory has a `MemoryScope`: `shared`, `private`, or `room`. New memories default to `room` when `room_id` is supplied and `private` otherwise. Optional `room_id`, `world_id`, and `session_id` fields let callers keep short-term room/session recall separate from durable per-agent facts while still using one indexed store.
+
 ## Storage
 
 ### In-memory only
@@ -70,7 +74,7 @@ When a storage file is configured, call `load()` once at startup to restore memo
 
 ## Search
 
-`search(query, opts)` runs BM25 ranking over the full-text index. The index is built from each memory's `content`, `memory_type`, `agent_name`, and any `tags`. No embeddings or external models are involved.
+`search(query, opts)` runs BM25 ranking over the full-text index. The index is built from each memory's `content`, `memory_type`, `scope`, `agent_name`, optional room/world/session IDs, and any `tags`. No embeddings or external models are involved.
 
 `MemorySearchOptions` fields:
 
@@ -79,6 +83,10 @@ When a storage file is configured, call `load()` once at startup to restore memo
 | `agent_id` | `Option<String>` | Restrict results to a specific agent ID |
 | `agent_name` | `Option<String>` | Restrict results to a specific agent name |
 | `memory_type` | `Option<MemoryType>` | Restrict results to one memory type |
+| `scope` | `Option<MemoryScope>` | Restrict results to `shared`, `private`, or `room` memories |
+| `room_id` | `Option<String>` | Restrict results to a room |
+| `world_id` | `Option<String>` | Restrict results to a world |
+| `session_id` | `Option<String>` | Restrict results to a session |
 | `limit` | `Option<usize>` | Maximum number of results (default: 10) |
 | `min_importance` | `Option<f64>` | Exclude memories below this importance threshold |
 
@@ -86,7 +94,7 @@ Results are returned as `Vec<MemorySearchResult>`, which extends `Memory` with a
 
 ## Other API
 
-- `get_recent(RecentMemoryOptions)` — returns the most recently added memories, sorted by creation time. Accepts `agent_id`, `agent_name`, and `limit` filters.
+- `get_recent(RecentMemoryOptions)` — returns the most recently added memories, sorted by creation time. Accepts `agent_id`, `agent_name`, `scope`, `room_id`, `world_id`, `session_id`, and `limit` filters.
 - `forget(id)` — removes a single memory by ID from both the store and the index.
 - `clear(agent_id)` — removes all memories, or all memories for a specific agent if an ID is provided.
 - `size()` — returns the total number of stored memories.

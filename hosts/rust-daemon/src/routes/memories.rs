@@ -1,4 +1,4 @@
-use anima_memory::{MemorySearchOptions, RecentMemoryOptions};
+use anima_memory::{MemoryScope, MemorySearchOptions, RecentMemoryOptions};
 
 use super::contracts::{
     MemoriesEnvelope, MemoryCreateRequest, MemoryResponse, MemorySearchEnvelope, MemorySearchQuery,
@@ -19,9 +19,13 @@ pub(crate) async fn handle_create_memory(
     let memory = {
         let memory = { state.read().await.memory_handle() };
         let mut memory_guard = memory.write().await;
-        memory_guard
+        let memory = memory_guard
             .add(new_memory)
-            .map_err(|error| ApiError::bad_request(error.message()))?
+            .map_err(|error| ApiError::bad_request(error.message()))?;
+        memory_guard.save().map_err(|error| {
+            ApiError::service_unavailable(format!("failed to persist memory: {error}"))
+        })?;
+        memory
     };
 
     Ok(MemoryResponse::from(&memory))
@@ -44,6 +48,13 @@ pub(crate) async fn handle_search_memories(
         ),
     };
 
+    let scope = match query.scope {
+        None => None,
+        Some(value) => Some(MemoryScope::parse(&value).map_err(|_| {
+            ApiError::bad_request_static("scope must be one of shared, private, room")
+        })?),
+    };
+
     let results = {
         let memory = { state.read().await.memory_handle() };
         let memory_guard = memory.read().await;
@@ -53,6 +64,10 @@ pub(crate) async fn handle_search_memories(
                 agent_id: query.agent_id,
                 agent_name: query.agent_name,
                 memory_type,
+                scope,
+                room_id: query.room_id,
+                world_id: query.world_id,
+                session_id: query.session_id,
                 limit: query.limit,
                 min_importance: query.min_importance,
             },
@@ -72,11 +87,21 @@ pub(crate) async fn handle_recent_memories(
     state: &SharedDaemonState,
 ) -> Result<MemoriesEnvelope, ApiError> {
     let memories = {
+        let scope = match query.scope {
+            None => None,
+            Some(value) => Some(MemoryScope::parse(&value).map_err(|_| {
+                ApiError::bad_request_static("scope must be one of shared, private, room")
+            })?),
+        };
         let memory = { state.read().await.memory_handle() };
         let memory_guard = memory.read().await;
         memory_guard.get_recent(RecentMemoryOptions {
             agent_id: query.agent_id,
             agent_name: query.agent_name,
+            scope,
+            room_id: query.room_id,
+            world_id: query.world_id,
+            session_id: query.session_id,
             limit: query.limit,
         })
     };
