@@ -69,6 +69,7 @@ fn swarm_types_keep_ts_shape_fields() {
         id: "swarm-1".into(),
         status: SwarmStatus::Idle,
         agent_ids: vec!["manager".into(), "worker-a".into(), "worker-b".into()],
+        messages: Vec::new(),
         results: vec![TaskResult::success(text_content("done"), 12)],
         token_usage: TokenUsage {
             prompt_tokens: 5,

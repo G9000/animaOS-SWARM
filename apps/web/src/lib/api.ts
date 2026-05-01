@@ -77,6 +77,12 @@ export interface TaskResult {
   durationMs?: number;
 }
 
+export interface Content {
+  text: string;
+  attachments?: unknown[] | null;
+  metadata?: Record<string, unknown> | null;
+}
+
 export interface AgentState {
   id: string;
   name: string;
@@ -92,10 +98,19 @@ export interface AgentSnapshot {
   lastTask?: TaskResult;
 }
 
+export interface AgentMessage {
+  id: string;
+  from: string;
+  to: string;
+  content: Content;
+  timestamp: number;
+}
+
 export interface SwarmState {
   id: string;
   status: string;
   agentIds: string[];
+  messages: AgentMessage[];
   results: TaskResult[];
   tokenUsage: TokenUsage;
   startedAt?: number;

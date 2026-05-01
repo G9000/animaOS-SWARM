@@ -1,10 +1,19 @@
 use anima_core::{DataValue, Message, MessageRole};
 
 pub(super) fn recent_memory_context(system: &str) -> Option<String> {
+    context_line(system, "recent_memories", "no recent memories")
+}
+
+pub(super) fn swarm_inbox_context(system: &str) -> Option<String> {
+    context_line(system, "swarm_inbox", "no swarm messages")
+}
+
+fn context_line(system: &str, name: &str, empty_value: &str) -> Option<String> {
+    let prefix = format!("[{name}]: ");
     system
         .lines()
-        .find_map(|line| line.strip_prefix("[recent_memories]: "))
-        .filter(|value| !value.is_empty() && *value != "no recent memories")
+        .find_map(|line| line.strip_prefix(&prefix))
+        .filter(|value| !value.is_empty() && *value != empty_value)
         .map(ToString::to_string)
 }
 

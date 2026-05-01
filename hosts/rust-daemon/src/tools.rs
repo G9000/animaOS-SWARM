@@ -104,6 +104,8 @@ impl ToolRegistry {
         registry.register("bg_output", process::execute_bg_output);
         registry.register("bg_stop", process::execute_bg_stop);
         registry.register("bg_list", process::execute_bg_list);
+        registry.register("send_message", execute_swarm_only_tool);
+        registry.register("broadcast_message", execute_swarm_only_tool);
         registry
     }
 
@@ -134,4 +136,18 @@ impl ToolRegistry {
 
         Ok(())
     }
+}
+
+fn execute_swarm_only_tool(
+    _context: ToolExecutionContext,
+    _agent: AgentState,
+    _user_message: Message,
+    tool_call: ToolCall,
+) -> BoxFuture<'static, TaskResult<Content>> {
+    Box::pin(async move {
+        TaskResult::error(
+            format!("{} is only available inside a swarm", tool_call.name),
+            0,
+        )
+    })
 }

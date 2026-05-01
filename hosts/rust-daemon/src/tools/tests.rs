@@ -232,6 +232,29 @@ fn tool_registry_accepts_bash_and_background_descriptors() {
 }
 
 #[test]
+fn tool_registry_accepts_swarm_messaging_descriptors() {
+    let registry = ToolRegistry::new();
+    let tools = vec![
+        ToolDescriptor {
+            name: "send_message".into(),
+            description: "Send a swarm message".into(),
+            parameters: BTreeMap::new(),
+            examples: None,
+        },
+        ToolDescriptor {
+            name: "broadcast_message".into(),
+            description: "Broadcast a swarm message".into(),
+            parameters: BTreeMap::new(),
+            examples: None,
+        },
+    ];
+
+    assert!(registry.validate_tools(Some(&tools)).is_ok());
+    assert!(registry.lookup("send_message").is_some());
+    assert!(registry.lookup("broadcast_message").is_some());
+}
+
+#[test]
 fn tool_registry_accepts_todo_descriptors() {
     let registry = ToolRegistry::new();
     let tools = vec![

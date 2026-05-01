@@ -10,8 +10,11 @@ use anima_core::{
 };
 use async_trait::async_trait;
 
-use self::dispatch::{deterministic_tool_dispatch, DeterministicToolDispatch};
-use self::render::{recent_memory_context, render_tool_result_for_model, trailing_tool_messages};
+use self::dispatch::{DeterministicToolDispatch, deterministic_tool_dispatch};
+use self::render::{
+    recent_memory_context, render_tool_result_for_model, swarm_inbox_context,
+    trailing_tool_messages,
+};
 
 pub(crate) struct DeterministicModelAdapter;
 
@@ -39,6 +42,7 @@ impl ModelAdapter for DeterministicModelAdapter {
             .map(|message| message.content.text.as_str())
             .unwrap_or("");
         let recent_context = recent_memory_context(&request.system);
+        let inbox_context = swarm_inbox_context(&request.system);
 
         if !tool_results.is_empty() {
             let output_text = format!("{} handled task: {}", config.name, tool_results.join("\n"));
@@ -48,6 +52,13 @@ impl ModelAdapter for DeterministicModelAdapter {
         if input.eq_ignore_ascii_case("recall context") {
             if let Some(context) = recent_context {
                 let output_text = format!("{} recalled context: {}", config.name, context);
+                return Ok(text_response(output_text, prompt_tokens));
+            }
+        }
+
+        if input.to_ascii_lowercase().contains("recall inbox") {
+            if let Some(context) = inbox_context {
+                let output_text = format!("{} recalled swarm inbox: {}", config.name, context);
                 return Ok(text_response(output_text, prompt_tokens));
             }
         }

@@ -20,6 +20,8 @@ pub(super) fn deterministic_tool_dispatch(
         .or_else(|| maybe_write_file_dispatch(config, input))
         .or_else(|| maybe_read_file_dispatch(config, input))
         .or_else(|| maybe_list_dir_dispatch(config, input))
+        .or_else(|| maybe_broadcast_message_dispatch(config, input))
+        .or_else(|| maybe_send_message_dispatch(config, input))
         .or_else(|| maybe_memory_search_dispatch(config, input))
 }
 
@@ -208,6 +210,72 @@ fn maybe_memory_search_dispatch(
         name: "memory_search",
         response_text: "searching memories",
         id_prefix: "tool-call-",
+        args,
+    })
+}
+
+fn maybe_broadcast_message_dispatch(
+    config: &AgentConfig,
+    input: &str,
+) -> Option<DeterministicToolDispatch> {
+    if !has_tool(config, "broadcast_message") {
+        return None;
+    }
+
+    let message = parse_prefixed_topic(input, &["broadcast ", "broadcast message "])?;
+    let mut args = BTreeMap::new();
+    args.insert("message".into(), DataValue::String(message));
+
+    Some(DeterministicToolDispatch {
+        name: "broadcast_message",
+        response_text: "broadcasting message",
+        id_prefix: "tool-call-broadcast-",
+        args,
+    })
+}
+
+fn maybe_send_message_dispatch(
+    config: &AgentConfig,
+    input: &str,
+) -> Option<DeterministicToolDispatch> {
+    if !has_tool(config, "send_message") {
+        return None;
+    }
+
+    let trimmed = input.trim();
+    let rest = trimmed
+        .strip_prefix("send to ")
+        .or_else(|| trimmed.strip_prefix("send message to "))?;
+    let (target, message) = rest.split_once(':')?;
+    let target = target.trim();
+    let message = message.trim();
+    if target.is_empty() || message.is_empty() {
+        return None;
+    }
+
+    let mut args = BTreeMap::new();
+    if let Some(to_agent_id) = target.strip_prefix("id ") {
+        args.insert(
+            "to_agent_id".into(),
+            DataValue::String(to_agent_id.trim().to_string()),
+        );
+    } else if let Some(to_agent_name) = target.strip_prefix("name ") {
+        args.insert(
+            "to_agent_name".into(),
+            DataValue::String(to_agent_name.trim().to_string()),
+        );
+    } else {
+        args.insert(
+            "to_agent_name".into(),
+            DataValue::String(target.to_string()),
+        );
+    }
+    args.insert("message".into(), DataValue::String(message.to_string()));
+
+    Some(DeterministicToolDispatch {
+        name: "send_message",
+        response_text: "sending message",
+        id_prefix: "tool-call-send-",
         args,
     })
 }

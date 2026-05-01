@@ -211,6 +211,8 @@ impl TestHarness {
                 let run_id = agent_id.clone();
                 let send = context.send.clone();
                 let broadcast = context.broadcast.clone();
+                let inbox = context.inbox.clone();
+                let participants = context.participants.clone();
                 let stop_state = shared.clone();
                 let stop_id = agent_id.clone();
                 let clear_state = shared.clone();
@@ -222,6 +224,8 @@ impl TestHarness {
                         let run_id = run_id.clone();
                         let send = send.clone();
                         let broadcast = broadcast.clone();
+                        let inbox = inbox.clone();
+                        let participants = participants.clone();
                         Box::pin(async move {
                             run_state
                                 .lock()
@@ -242,6 +246,36 @@ impl TestHarness {
                                 broadcast(text_content(message))
                                     .await
                                     .expect("broadcast hook should succeed");
+                            }
+                            if input == "inbox" {
+                                let messages = inbox().await.expect("inbox hook should succeed");
+                                let text = messages
+                                    .iter()
+                                    .map(|message| {
+                                        format!(
+                                            "{}->{}:{}",
+                                            message.from, message.to, message.content.text
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" | ");
+                                return TaskResult::success(text_content(&text), 1);
+                            }
+                            if input == "participants" {
+                                let participants = participants()
+                                    .await
+                                    .expect("participants hook should succeed");
+                                let text = participants
+                                    .iter()
+                                    .map(|participant| {
+                                        format!(
+                                            "{}:{}",
+                                            participant.agent_name, participant.agent_id
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" | ");
+                                return TaskResult::success(text_content(&text), 1);
                             }
                             TaskResult::success(
                                 text_content(&format!("{run_id} handled {input}")),
@@ -635,7 +669,9 @@ fn supervisor_strategy_batch_delegates_workers_concurrently() {
                                 assert!(
                                     text.contains("[worker-a] worker-a finished research alpha")
                                 );
-                                assert!(text.contains("[worker-b] worker-b finished research beta"));
+                                assert!(
+                                    text.contains("[worker-b] worker-b finished research beta")
+                                );
 
                                 TaskResult::success(text_content("batched synthesis"), 1)
                             })
@@ -1272,22 +1308,46 @@ fn dispatch_injects_runtime_managed_send_and_broadcast_hooks() {
                 .await;
             assert_eq!(send_result.status, TaskStatus::Success);
 
-            let bus = ctx.message_bus();
-            let bus = bus
-                .lock()
-                .expect("message bus mutex should not be poisoned");
-            let manager_inbox = bus.get_messages(&manager.id);
-            let worker_inbox = bus.get_messages(&worker.id);
-            let all_messages = bus.get_all_messages();
+            {
+                let bus = ctx.message_bus();
+                let bus = bus
+                    .lock()
+                    .expect("message bus mutex should not be poisoned");
+                let manager_inbox = bus.get_messages(&manager.id);
+                let worker_inbox = bus.get_messages(&worker.id);
+                let all_messages = bus.get_all_messages();
 
-            assert_eq!(manager_inbox.len(), 1);
-            assert_eq!(manager_inbox[0].from, worker.id);
-            assert_eq!(manager_inbox[0].content.text, "worker reply");
-            assert_eq!(worker_inbox.len(), 1);
-            assert_eq!(worker_inbox[0].from, manager.id);
-            assert_eq!(worker_inbox[0].to, "broadcast");
-            assert_eq!(worker_inbox[0].content.text, "team update");
-            assert_eq!(all_messages.len(), 2);
+                assert_eq!(manager_inbox.len(), 1);
+                assert_eq!(manager_inbox[0].from, worker.id);
+                assert_eq!(manager_inbox[0].content.text, "worker reply");
+                assert_eq!(worker_inbox.len(), 1);
+                assert_eq!(worker_inbox[0].from, manager.id);
+                assert_eq!(worker_inbox[0].to, "broadcast");
+                assert_eq!(worker_inbox[0].content.text, "team update");
+                assert_eq!(all_messages.len(), 2);
+            }
+
+            let worker_inbox_result = worker.run("inbox".into()).await;
+            assert_eq!(worker_inbox_result.status, TaskStatus::Success);
+            let worker_inbox_text = worker_inbox_result
+                .data
+                .as_ref()
+                .map(|content| content.text.as_str())
+                .expect("worker inbox result should contain text");
+            assert_eq!(
+                worker_inbox_text,
+                format!("{}->broadcast:team update", manager.id)
+            );
+
+            let participants_result = manager.run("participants".into()).await;
+            assert_eq!(participants_result.status, TaskStatus::Success);
+            let participants_text = participants_result
+                .data
+                .as_ref()
+                .map(|content| content.text.as_str())
+                .expect("participants result should contain text");
+            assert!(participants_text.contains(&format!("manager:{}", manager.id)));
+            assert!(participants_text.contains(&format!("worker-a:{}", worker.id)));
 
             TaskResult::success(text_content("hooks exercised"), 1)
         })
@@ -1300,6 +1360,14 @@ fn dispatch_injects_runtime_managed_send_and_broadcast_hooks() {
     let result = block_on(coordinator.dispatch("exercise hooks"));
 
     assert_eq!(result.status, TaskStatus::Success);
+    let state = coordinator.get_state();
+    assert_eq!(state.messages.len(), 2);
+    assert!(state.messages[0].from.starts_with("manager-"));
+    assert_eq!(state.messages[0].to, "broadcast");
+    assert_eq!(state.messages[0].content.text, "team update");
+    assert!(state.messages[1].from.starts_with("worker-a-"));
+    assert!(state.messages[1].to.starts_with("manager-"));
+    assert_eq!(state.messages[1].content.text, "worker reply");
 }
 
 #[test]
@@ -1421,12 +1489,14 @@ fn start_rolls_back_workers_created_before_a_later_spawn_failure() {
     assert!(state.agent_ids.is_empty());
     assert!(state.results.is_empty());
     assert_eq!(state.token_usage.total_tokens, 0);
-    assert!(coordinator
-        .get_message_bus()
-        .lock()
-        .expect("message bus mutex should not be poisoned")
-        .get_all_messages()
-        .is_empty());
+    assert!(
+        coordinator
+            .get_message_bus()
+            .lock()
+            .expect("message bus mutex should not be poisoned")
+            .get_all_messages()
+            .is_empty()
+    );
 
     block_on(coordinator.stop()).expect("stop after rollback should succeed");
     assert_eq!(harness.snapshot().stop_log.len(), 1);
@@ -1822,11 +1892,12 @@ fn stale_send_and_broadcast_hooks_cannot_mutate_message_bus_after_agent_cleanup(
         .expect("manager broadcast hook should be captured");
 
     let bus = coordinator.get_message_bus();
-    assert!(bus
-        .lock()
-        .expect("message bus mutex should not be poisoned")
-        .get_all_messages()
-        .is_empty());
+    assert!(
+        bus.lock()
+            .expect("message bus mutex should not be poisoned")
+            .get_all_messages()
+            .is_empty()
+    );
 
     let send_error = block_on(send(worker_id.clone(), text_content("late direct message")))
         .expect_err("stale send hook should fail");
@@ -1992,10 +2063,12 @@ fn round_robin_strategy_rejects_zero_turns_before_spawning_agents() {
         Some("Round-robin strategy requires at least one turn")
     );
     assert!(result.data.is_none());
-    assert!(spawn_log
-        .lock()
-        .expect("spawn log mutex should not be poisoned")
-        .is_empty());
+    assert!(
+        spawn_log
+            .lock()
+            .expect("spawn log mutex should not be poisoned")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2200,8 +2273,10 @@ fn dynamic_strategy_routes_workers_through_choose_speaker_and_preserves_history(
                                     .map(|(_, input)| input.clone())
                                     .expect("writer input should be recorded");
                                 assert!(recorded_writer_input.contains("Conversation so far:"));
-                                assert!(recorded_writer_input
-                                    .contains("[analyst]: analyst response: pattern one"));
+                                assert!(
+                                    recorded_writer_input
+                                        .contains("[analyst]: analyst response: pattern one")
+                                );
 
                                 let done_result =
                                     choose_speaker("DONE".into(), "Finish the synthesis".into())
@@ -2376,8 +2451,10 @@ fn dynamic_strategy_returns_error_for_unknown_agent_choice() {
             .as_slice(),
         ["analyst", "writer", "manager"]
     );
-    assert!(worker_inputs
-        .lock()
-        .expect("worker input mutex should not be poisoned")
-        .is_empty());
+    assert!(
+        worker_inputs
+            .lock()
+            .expect("worker input mutex should not be poisoned")
+            .is_empty()
+    );
 }

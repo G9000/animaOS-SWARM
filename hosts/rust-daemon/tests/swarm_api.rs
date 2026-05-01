@@ -1,9 +1,9 @@
 mod support;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
-use futures::{pin_mut, StreamExt};
+use futures::{StreamExt, pin_mut};
 use tower::util::ServiceExt;
 
 async fn create_swarm(app: &Router) -> (StatusCode, String) {
@@ -87,6 +87,27 @@ async fn run_swarm_accepts_task_field_alias() {
     assert_eq!(status, StatusCode::OK);
     assert!(response.contains("\"status\":\"success\""));
     assert!(response.contains("[manager]: manager handled task: Coordinate the patch"));
+}
+
+#[tokio::test]
+async fn send_message_can_target_configured_agent_name() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let (status, response) = run_swarm(
+        &app,
+        &swarm_id,
+        r#"{"text":"send to worker-a: named handoff and recall inbox"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.contains("sent message to worker-a"));
+    assert!(response.contains("\"messages\":[{"));
+    assert!(response.contains("\"content\":{\"text\":\"named handoff and recall inbox\""));
+    assert!(response.contains("worker-a recalled swarm inbox:"));
+    assert!(response.contains("named handoff and recall inbox"));
 }
 
 #[tokio::test]
@@ -185,6 +206,72 @@ async fn swarm_event_stream_emits_live_agent_activity_and_lifecycle_events() {
     assert!(completed_data.contains(&format!("\"swarmId\":\"{swarm_id}\"")));
     assert!(completed_data.contains("\"result\":{"));
     assert!(completed_data.contains("\"status\":\"success\""));
+}
+
+#[tokio::test]
+async fn swarm_event_stream_emits_swarm_messaging_tool_results() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/swarms/{swarm_id}/events"))
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("event stream responds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let run_handle = {
+        let app = app.clone();
+        let swarm_id = swarm_id.clone();
+        tokio::spawn(async move {
+            run_swarm(
+                &app,
+                &swarm_id,
+                r#"{"text":"broadcast team update and recall inbox"}"#,
+            )
+            .await
+        })
+    };
+
+    let stream = response.into_body().into_data_stream();
+    pin_mut!(stream);
+
+    let mut chunks = String::new();
+    for _ in 0..256 {
+        match futures::poll!(stream.next()) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
+                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed")
+                {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(Some(Err(error))) => panic!("stream errored: {error}"),
+            std::task::Poll::Ready(None) => break,
+            std::task::Poll::Pending => tokio::task::yield_now().await,
+        }
+    }
+
+    let (run_status, run_response) = run_handle.await.expect("run task should finish");
+
+    assert_eq!(run_status, StatusCode::OK);
+    assert!(run_response.contains("broadcast message sent to swarm"));
+    assert!(run_response.contains("worker-a recalled swarm inbox:"));
+    assert!(run_response.contains("team update and recall inbox"));
+
+    let tool_after_data =
+        extract_sse_event_data(&chunks, "tool:after").expect("tool after event data exists");
+    assert!(tool_after_data.contains("\"toolName\":\"broadcast_message\""));
+    assert!(tool_after_data.contains("\"status\":\"success\""));
+    assert!(tool_after_data.contains("\"result\":\"broadcast message sent to swarm\""));
 }
 
 #[tokio::test]

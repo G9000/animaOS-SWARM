@@ -11,7 +11,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
 
 use crate::strategies::resolve_strategy;
-use crate::types::SwarmDelegation;
+use crate::types::{AgentMessage, SwarmDelegation};
 use crate::{MessageBus, SwarmConfig, SwarmState, SwarmStatus};
 
 static NEXT_COORDINATOR_ID: AtomicU64 = AtomicU64::new(0);
@@ -27,6 +27,12 @@ pub type CoordinatorSendFn =
 
 pub type CoordinatorBroadcastFn =
     dyn Fn(Content) -> CoordinatorFuture<Result<(), String>> + Send + Sync;
+
+pub type CoordinatorInboxFn =
+    dyn Fn() -> CoordinatorFuture<Result<Vec<AgentMessage>, String>> + Send + Sync;
+
+pub type CoordinatorParticipantsFn =
+    dyn Fn() -> CoordinatorFuture<Result<Vec<CoordinatorParticipant>, String>> + Send + Sync;
 
 pub type CoordinatorDelegateFn =
     dyn Fn(String, String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
@@ -44,8 +50,16 @@ pub struct CoordinatorAgentFactoryContext {
     pub agent_id: String,
     pub send: Arc<CoordinatorSendFn>,
     pub broadcast: Arc<CoordinatorBroadcastFn>,
+    pub inbox: Arc<CoordinatorInboxFn>,
+    pub participants: Arc<CoordinatorParticipantsFn>,
     pub delegate_task: Option<Arc<CoordinatorDelegateFn>>,
     pub delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoordinatorParticipant {
+    pub agent_id: String,
+    pub agent_name: String,
 }
 
 #[derive(Clone)]
@@ -222,6 +236,7 @@ impl CoordinatorAgentLiveness {
 }
 
 struct CoordinatorManagedAgent {
+    name: String,
     shell: CoordinatorAgentShell,
     liveness: Arc<CoordinatorAgentLiveness>,
 }
@@ -249,6 +264,7 @@ impl SwarmCoordinator {
             id,
             status: SwarmStatus::Idle,
             agent_ids: Vec::new(),
+            messages: Vec::new(),
             results: Vec::new(),
             token_usage: TokenUsage::default(),
             started_at: None,
@@ -386,6 +402,7 @@ impl SwarmCoordinator {
 
         self.with_state(|state| {
             state.status = SwarmStatus::Idle;
+            state.messages.clear();
             state.completed_at = Some(now_millis());
         });
 
@@ -396,6 +413,7 @@ impl SwarmCoordinator {
         if self.has_live_agents() {
             self.capture_live_token_usage();
         }
+        self.capture_message_history();
 
         self.inner
             .state
@@ -462,6 +480,7 @@ impl SwarmCoordinator {
 
         let completed_at = now_millis();
         let result_status = result.status;
+        let messages = self.message_history();
         self.with_state(|state| {
             state.completed_at = Some(completed_at);
             state.status = if result_status == TaskStatus::Success {
@@ -469,6 +488,7 @@ impl SwarmCoordinator {
             } else {
                 SwarmStatus::Failed
             };
+            state.messages = messages;
             state.results.push(result.clone());
         });
 
@@ -476,6 +496,7 @@ impl SwarmCoordinator {
     }
 
     fn state_snapshot(&self) -> SwarmState {
+        self.capture_message_history();
         self.inner
             .state
             .lock()
@@ -504,6 +525,7 @@ impl SwarmCoordinator {
         delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
     ) -> Result<CoordinatorAgentRef, String> {
         let agent_id = next_id(&config.name, &NEXT_AGENT_ID);
+        let agent_name = config.name.clone();
         let liveness = Arc::new(CoordinatorAgentLiveness::default());
         let delegate_task = delegate_task.map(|delegate_task| {
             self.build_delegate_hook(&agent_id, liveness.clone(), delegate_task)
@@ -517,6 +539,8 @@ impl SwarmCoordinator {
             agent_id: agent_id.clone(),
             send: self.build_send_hook(&agent_id, liveness.clone()),
             broadcast: self.build_broadcast_hook(&agent_id, liveness.clone()),
+            inbox: self.build_inbox_hook(&agent_id, liveness.clone()),
+            participants: self.build_participants_hook(&agent_id, liveness.clone()),
             delegate_task,
             delegate_tasks,
         })
@@ -542,7 +566,11 @@ impl SwarmCoordinator {
             .expect("coordinator agents mutex should not be poisoned")
             .insert(
                 agent_id.clone(),
-                CoordinatorManagedAgent { shell, liveness },
+                CoordinatorManagedAgent {
+                    name: agent_name,
+                    shell,
+                    liveness,
+                },
             );
         self.with_state(|state| {
             state.agent_ids.push(agent_id.clone());
@@ -580,8 +608,10 @@ impl SwarmCoordinator {
             .expect("message bus mutex should not be poisoned")
             .clear_inboxes();
 
+        let messages = self.message_history();
         self.with_state(|state| {
             state.token_usage = TokenUsage::default();
+            state.messages = messages;
         });
 
         let clear_hooks = self
@@ -670,6 +700,21 @@ impl SwarmCoordinator {
         });
     }
 
+    fn capture_message_history(&self) {
+        let messages = self.message_history();
+        self.with_state(|state| {
+            state.messages = messages;
+        });
+    }
+
+    fn message_history(&self) -> Vec<AgentMessage> {
+        self.inner
+            .message_bus
+            .lock()
+            .expect("message bus mutex should not be poisoned")
+            .get_all_messages()
+    }
+
     fn has_live_agents(&self) -> bool {
         !self
             .inner
@@ -749,6 +794,61 @@ impl SwarmCoordinator {
                     .expect("message bus mutex should not be poisoned")
                     .broadcast(&from_agent_id, content);
                 Ok(())
+            })
+        })
+    }
+
+    fn build_inbox_hook(
+        &self,
+        agent_id: &str,
+        liveness: Arc<CoordinatorAgentLiveness>,
+    ) -> Arc<CoordinatorInboxFn> {
+        let message_bus = self.inner.message_bus.clone();
+        let agent_id = agent_id.to_string();
+        Arc::new(move || {
+            let message_bus = message_bus.clone();
+            let agent_id = agent_id.clone();
+            let liveness = liveness.clone();
+            Box::pin(async move {
+                if !liveness.is_active() {
+                    return Err(inactive_agent_error(&agent_id));
+                }
+                Ok(message_bus
+                    .lock()
+                    .expect("message bus mutex should not be poisoned")
+                    .get_messages(&agent_id))
+            })
+        })
+    }
+
+    fn build_participants_hook(
+        &self,
+        agent_id: &str,
+        liveness: Arc<CoordinatorAgentLiveness>,
+    ) -> Arc<CoordinatorParticipantsFn> {
+        let inner = self.inner.clone();
+        let agent_id = agent_id.to_string();
+        Arc::new(move || {
+            let inner = inner.clone();
+            let agent_id = agent_id.clone();
+            let liveness = liveness.clone();
+            Box::pin(async move {
+                if !liveness.is_active() {
+                    return Err(inactive_agent_error(&agent_id));
+                }
+
+                let mut participants = inner
+                    .agents
+                    .lock()
+                    .expect("coordinator agents mutex should not be poisoned")
+                    .iter()
+                    .map(|(agent_id, agent)| CoordinatorParticipant {
+                        agent_id: agent_id.clone(),
+                        agent_name: agent.name.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                participants.sort_by(|left, right| left.agent_id.cmp(&right.agent_id));
+                Ok(participants)
             })
         })
     }

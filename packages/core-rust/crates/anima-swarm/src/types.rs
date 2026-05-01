@@ -55,6 +55,7 @@ pub struct SwarmState {
     pub id: String,
     pub status: SwarmStatus,
     pub agent_ids: Vec<String>,
+    pub messages: Vec<AgentMessage>,
     pub results: Vec<TaskResult<Content>>,
     pub token_usage: TokenUsage,
     pub started_at: Option<u128>,

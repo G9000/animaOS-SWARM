@@ -70,7 +70,7 @@ sequenceDiagram
 
 ## Strategy: Supervisor
 
-Manager breaks the task down and delegates subtasks to workers in parallel. Workers are independent — they don't talk to each other. Manager synthesises all results.
+Manager breaks the task down and delegates subtasks to workers in parallel. Manager synthesises all results. Agents can also use swarm messaging tools to send direct handoffs or broadcast context through the shared message bus.
 
 ```mermaid
 sequenceDiagram
@@ -159,8 +159,11 @@ graph LR
     Tools -->|"result"| AR
     AR -->|"events"| EB
     AR -->|"send(targetId, msg)"| MB
+    MB -->|"message history"| AR
     AR --> Output
 ```
+
+Swarm snapshots include the global message history as `messages`, so direct sends and broadcasts are inspectable through `POST /api/swarms/:id/run`, `GET /api/swarms/:id`, list responses, and SSE state payloads.
 
 ## Event Flow (SSE)
 

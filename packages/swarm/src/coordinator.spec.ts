@@ -587,6 +587,25 @@ describe('SwarmCoordinator.getState()', () => {
     const state = coord.getState();
     expect(state.tokenUsage.totalTokens).toBeGreaterThan(0);
   });
+
+  it('includes message bus history in snapshots', () => {
+    const coord = new SwarmCoordinator(
+      baseConfig('round-robin', ['w1']),
+      textAdapter('ok')
+    );
+
+    coord
+      .getMessageBus()
+      .send('manager-1', 'worker-2', { text: 'handoff note' });
+
+    expect(coord.getState().messages).toMatchObject([
+      {
+        from: 'manager-1',
+        to: 'worker-2',
+        content: { text: 'handoff note' },
+      },
+    ]);
+  });
 });
 
 // ─── getMessageBus() ─────────────────────────────────────────────────────────

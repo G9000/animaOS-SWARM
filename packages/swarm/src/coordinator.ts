@@ -46,6 +46,7 @@ export class SwarmCoordinator {
       id: this.id,
       status: 'idle',
       agentIds: [],
+      messages: [],
       results: [],
       tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
@@ -290,6 +291,7 @@ export class SwarmCoordinator {
     if (this.agents.size > 0) {
       this.aggregateTokenUsage();
     }
+    this.state.messages = this.messageBus.getAllMessages();
     return { ...this.state };
   }
 

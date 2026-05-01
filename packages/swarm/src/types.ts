@@ -23,6 +23,7 @@ export interface SwarmState {
   id: UUID;
   status: SwarmStatus;
   agentIds: string[];
+  messages: AgentMessage[];
   results: TaskResult[];
   tokenUsage: {
     promptTokens: number;

@@ -1,9 +1,9 @@
-use anima_swarm::{SwarmConfig, SwarmState, SwarmStrategy};
+use anima_swarm::{AgentMessage, SwarmConfig, SwarmState, SwarmStrategy};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::agents::AgentConfigRequest;
-use super::shared::{TaskResultResponse, TokenUsageResponse};
+use super::shared::{ContentResponse, TaskResultResponse, TokenUsageResponse};
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -11,10 +11,21 @@ pub(crate) struct SwarmStateResponse {
     pub(crate) id: String,
     pub(crate) status: String,
     pub(crate) agent_ids: Vec<String>,
+    pub(crate) messages: Vec<SwarmMessageResponse>,
     pub(crate) results: Vec<TaskResultResponse>,
     pub(crate) token_usage: TokenUsageResponse,
     pub(crate) started_at: Option<u128>,
     pub(crate) completed_at: Option<u128>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SwarmMessageResponse {
+    pub(crate) id: String,
+    pub(crate) from: String,
+    pub(crate) to: String,
+    pub(crate) content: ContentResponse,
+    pub(crate) timestamp: u128,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -89,10 +100,27 @@ impl From<&SwarmState> for SwarmStateResponse {
             id: value.id.clone(),
             status: value.status.as_str().to_string(),
             agent_ids: value.agent_ids.clone(),
+            messages: value
+                .messages
+                .iter()
+                .map(SwarmMessageResponse::from)
+                .collect(),
             results: value.results.iter().map(TaskResultResponse::from).collect(),
             token_usage: TokenUsageResponse::from(&value.token_usage),
             started_at: value.started_at,
             completed_at: value.completed_at,
+        }
+    }
+}
+
+impl From<&AgentMessage> for SwarmMessageResponse {
+    fn from(value: &AgentMessage) -> Self {
+        Self {
+            id: value.id.clone(),
+            from: value.from.clone(),
+            to: value.to.clone(),
+            content: ContentResponse::from(&value.content),
+            timestamp: value.timestamp,
         }
     }
 }
