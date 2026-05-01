@@ -14,6 +14,7 @@ use anima_core::{AgentState, Content, Message, TaskResult, ToolCall, ToolDescrip
 use futures::future::BoxFuture;
 
 use crate::memory_embeddings::SharedMemoryEmbeddings;
+use crate::memory_store::MemoryStoreConfig;
 use crate::state::SharedMemoryStore;
 
 pub(crate) use process::{
@@ -41,6 +42,7 @@ pub(crate) struct ToolRegistry {
 pub(crate) struct ToolExecutionContext {
     pub(super) memory: SharedMemoryStore,
     pub(super) memory_embeddings: SharedMemoryEmbeddings,
+    pub(super) memory_store: Option<MemoryStoreConfig>,
     tool_registry: ToolRegistry,
     pub(super) process_manager: SharedProcessManager,
 }
@@ -49,12 +51,14 @@ impl ToolExecutionContext {
     pub(crate) fn new(
         memory: SharedMemoryStore,
         memory_embeddings: SharedMemoryEmbeddings,
+        memory_store: Option<MemoryStoreConfig>,
         tool_registry: ToolRegistry,
         process_manager: SharedProcessManager,
     ) -> Self {
         Self {
             memory,
             memory_embeddings,
+            memory_store,
             tool_registry,
             process_manager,
         }

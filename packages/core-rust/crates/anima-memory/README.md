@@ -1,6 +1,6 @@
 # anima-memory
 
-`anima-memory` is the memory service used by AnimaOS agents. It provides a `MemoryManager` that stores agent memories in an in-memory hash map, indexed with a BM25 full-text search engine for keyword-based retrieval. It also stores durable memory entities, first-class relationship edges, evaluated write decisions, and hybrid recall scores so identity, collaboration history, and evidence-backed retrieval can be modeled separately from free-text memories. Persistence to a JSON file or SQLite snapshot is optional. There are no external service dependencies and no async runtime requirements.
+`anima-memory` is the host-agnostic memory engine used by AnimaOS agents. It provides a `MemoryManager` that stores agent memories in an in-memory hash map, indexed with a BM25 full-text search engine for keyword-based retrieval. It also stores durable memory entities, first-class relationship edges, evaluated write decisions, temporal facts/relationships, and hybrid recall scores so identity, collaboration history, and evidence-backed retrieval can be modeled separately from free-text memories. The crate has no file, database, external service, or async runtime dependencies; hosts own persistence.
 
 ## Quick usage
 
@@ -51,7 +51,7 @@ for result in results {
 | `TaskResult` | `"task_result"` | Output or outcome recorded after completing a task |
 | `Reflection` | `"reflection"` | Higher-order inferences drawn from other memories |
 
-The string keys are used internally in the search index and in JSON serialization.
+The string keys are used internally in the search index and by host adapters that serialize domain records.
 
 ## Memory scope
 
@@ -86,45 +86,48 @@ Relationship fields include:
 
 Use `list_agent_relationships(AgentRelationshipOptions)` to filter by any entity ID, agent ID, directed endpoint, endpoint kind, relationship type, context IDs, minimum strength/confidence, and limit.
 
-## Storage
+## Temporal facts and relationships
 
-### In-memory only
+Temporal records model durable extracted truth separately from raw episodic memories. Raw `Memory` rows remain immutable evidence; temporal facts and temporal relationships point back to evidence memory IDs and carry validity windows so callers can ask what is true now versus what was true at an earlier instant.
+
+Use `add_temporal_fact(NewTemporalFact)` for statements about an entity, such as a user preference or profile attribute. A temporal fact includes a subject endpoint, predicate, optional object endpoint, optional scalar value, `observed_at`, optional `valid_from` / `valid_to`, confidence, evidence memory IDs, optional context IDs, tags, and status.
+
+Active temporal facts also participate in `recall(...)`. When a query is relevant to a currently valid fact, the fact boosts its evidence memories first and only falls back to subject/value text matches for facts that do not carry explicit evidence memory IDs. `MemoryRecallOptions.temporal_limit` controls how many active facts are considered; use `Some(0)` to disable this lane for a call. `MemoryRecallOptions.temporal_intent_terms` lets hosts add domain- or language-specific intent words beyond the built-in English defaults, and `MemoryRecallOptions.weights` can tune recall signal weights for benchmarks or host-specific ranking profiles.
+
+Use `add_temporal_relationship(NewTemporalRelationship)` for time-varying directed graph edges, such as an agent's current trust in another agent, a user-agent collaboration link, or a relationship that supersedes an older belief. Relationship records include source/target endpoints, relationship type, optional summary, strength, confidence, observation and validity times, evidence memory IDs, context IDs, tags, and status.
+
+Both temporal APIs support supersession. When a new record lists `supersedes_fact_ids` or `supersedes_relationship_ids`, matching older records are marked `TemporalRecordStatus::Superseded`; if they did not already have `valid_to`, it is set to the new record's `valid_from` or `observed_at`. Superseded and retracted records remain stored for audit and historical recall, but list queries hide inactive records by default.
+
+Temporal query options:
+
+| API | Filters |
+|---|---|
+| `list_temporal_facts(TemporalFactOptions)` | Subject kind/ID, predicate, object kind/ID, status, `valid_at`, context IDs, minimum confidence, inactive inclusion, limit |
+| `list_temporal_relationships(TemporalRelationshipOptions)` | Source/target kind/ID, relationship type, status, `valid_at`, context IDs, minimum strength/confidence, inactive inclusion, limit |
+
+`get_temporal_fact(id)`, `get_temporal_relationship(id)`, `forget_temporal_fact(id)`, and `forget_temporal_relationship(id)` provide direct record access. The core crate only stores and filters these temporal records; extraction, conflict policy, and host route shape remain host responsibilities.
+
+## Host persistence boundary
+
+`MemoryManager` is in-memory only. Core owns memory behavior and the domain model; hosts own reality such as files, databases, migrations, credentials, and startup/shutdown policy.
 
 ```rust
 let manager = MemoryManager::new();
 ```
 
-Memories live only in process memory. Nothing is written to disk.
-
-### JSON file persistence
-
-```rust
-let mut manager = MemoryManager::with_storage_file("/var/data/memories.json");
-manager.load()?; // load existing memories from disk on startup
-```
-
-When a storage file is configured, call `load()` once at startup to restore memories and agent relationships from disk. Call `save()` to flush the current state to disk — this is not done automatically on `add()` or relationship upserts, so callers are responsible for deciding when to persist. New saves use an object format with `memories` and `agentRelationships`; older array-only memory files still load.
-
-The current storage object contains `memories`, `entities`, and `agentRelationships`. Older object files without `entities` still load, and entities are backfilled from loaded memories and relationships when possible.
-
-### SQLite persistence
-
-```rust
-let mut manager = MemoryManager::with_sqlite_file("/var/data/memories.sqlite");
-manager.load()?;
-// ... mutate memories, entities, relationships, retention state ...
-manager.save()?;
-```
-
-SQLite persistence stores the same snapshot as JSON in normalized tables for memories, tags, entities, aliases, relationship edges, relationship evidence, and relationship tags. `save()` replaces the previous snapshot in a transaction, so removed memories and pruned relationships do not linger as stale rows. The `sqlite` crate feature is enabled by default for this package; disable default features if an embedding host wants memory without the SQLite adapter.
+For host adapters, `snapshot()` exports a pure in-memory `MemoryManagerSnapshot`, and `replace_snapshot(snapshot)` hydrates a manager while rebuilding BM25 indexes and relationship/entity lookup state. JSON, SQLite, Postgres, Chroma, or any other durable adapter should live in the host or an adapter package and translate to/from that snapshot or public domain APIs.
 
 ## Search
 
 `search(query, opts)` runs BM25 ranking over the full-text index. The index is built from each memory's `content`, `memory_type`, `scope`, `agent_name`, optional room/world/session IDs, and any `tags`. BM25 search does not require embeddings or external models.
 
-`recall(query, opts)` performs hybrid recall over BM25 results, recent memories, relationship evidence, and importance. `recall_with_vector_index(query, opts, Some(index))` also accepts an optional `MemoryVectorIndex` implementation, letting hosts plug in embeddings or a vector database later without making the core crate depend on one.
+Default BM25 query processing uses `TextAnalyzer::multilingual()`: Unicode-aware tokenization, no stop-word removal, no language-specific stemming, and CJK character/bigram tokens for text without whitespace. This keeps the production default language-neutral. The analyzer is strongest for whitespace-delimited Unicode scripts and CJK/Hangul/Kana text; Arabic scriptio continua, Thai dictionary segmentation, and Indic grapheme/word-boundary handling need a future segmenter before they should be treated as fully supported. `TextAnalyzer::unicode()` is retained as an alias for the multilingual analyzer.
 
-Each `MemoryRecallResult` includes the memory plus score breakdowns: `lexical_score`, `vector_score`, `relationship_score`, `recency_score`, and `importance_score`.
+Domain-specific query expansion is opt-in through `QueryExpander`; use `MemoryManager::with_query_expander(...)`, `MemoryManager::with_text_analyzer_and_query_expander(...)`, `BM25::with_expander(...)`, or `BM25::with_expander_and_analyzer(...)` when a host or benchmark has explicit expansion rules. The LOCOMO benchmark helpers, including `locomo_query_expander()`, are behind the `locomo-eval` Cargo feature and are not compiled or exported by default, so production memory recall does not inherit benchmark-specific synonyms by default.
+
+`recall(query, opts)` performs hybrid recall over BM25 results, recent memories, relationship evidence, active temporal fact evidence, and importance. `recall_with_vector_index(query, opts, Some(index))` also accepts an optional `MemoryVectorIndex` implementation, letting hosts plug in embeddings or a vector database later without making the core crate depend on one.
+
+Each `MemoryRecallResult` includes the memory plus score breakdowns: `lexical_score`, `vector_score`, `relationship_score`, `temporal_score`, `recency_score`, and `importance_score`.
 
 Use `trace_memory(memory_id)` to inspect why a memory participates in the graph. It returns the memory, relationships that cite it as evidence, and the involved durable entities. This is the core primitive behind evidence trace UI surfaces.
 
@@ -158,9 +161,11 @@ let recall = manager.recall_with_vector_index("release briefing style", opts, So
 
 ## Memory eval harness
 
-`run_memory_eval_cases(&baseline_memory_eval_cases())` runs deterministic quality checks over evaluated writes, relationship-backed recall, agent-agent handoff memory, room/world isolation, vector recall false-positive suppression, trace evidence, retention behavior, decay behavior, and SQLite reload coverage. The returned `MemoryEvalReport` exposes `passed()`, `total_checks()`, `passed_checks()`, and `failure_messages()` so embedding/vector adapters can prove they improve recall without breaking existing memory guarantees.
+`run_memory_eval_cases(&baseline_memory_eval_cases())` runs deterministic quality checks over evaluated writes, relationship-backed recall, agent-agent handoff memory, room/world isolation, vector recall false-positive suppression, trace evidence, retention behavior, and decay behavior. The returned `MemoryEvalReport` exposes `passed()`, `total_checks()`, `passed_checks()`, and `failure_messages()` so embedding/vector adapters can prove they improve recall without breaking existing memory guarantees.
 
-In the Nx workspace, run the focused harness with `bun x nx run core-rust:memory-eval`; full core validation remains `bun x nx run core-rust:test`.
+With the `locomo-eval` feature enabled, `run_locomo_eval_cases(&locomo_smoke_eval_cases())` runs a LOCOMO-style long-memory smoke benchmark over single-hop profile recall, temporal preference updates, agent-agent handoff, speaker attribution, abstention on unknown answers, and semantic vector recall. It reports pass/fail plus `recall_at_k()`, `answer_coverage()`, and `false_positive_rate()`. The LOCOMO harness opts into `locomo_query_expander()` explicitly; the default `MemoryManager::new()` path remains domain-neutral. The public LOCOMO CSV and labeled benchmark JSON can be fetched into the local git-ignored cache with `bun x nx run core-rust:memory-locomo-fetch`. The production dataset target `bun x nx run core-rust:memory-locomo-dataset` reports pure core, LOCOMO-tuned, temporal-seeded, and eval-only temporal-rerank profiles over all cached benchmark conversation turns, scores category 1-4 questions against official evidence turn IDs, supports `LOCOMO_TEMPORAL_WEIGHT_SWEEP` and `LOCOMO_TEMPORAL_RERANK_WEIGHT_SWEEP`, and can print bounded miss diagnostics with question/evidence relation labels via `LOCOMO_MISS_REPORT_CATEGORY=3` or `LOCOMO_CATEGORY3_MISS_REPORT=1`.
+
+In the Nx workspace, run the focused harness with `bun x nx run core-rust:memory-eval`, fetch LOCOMO data with `bun x nx run core-rust:memory-locomo-fetch`, run the LOCOMO-style smoke benchmark with `bun x nx run core-rust:memory-locomo`, run the labeled dataset benchmark with `bun x nx run core-rust:memory-locomo-dataset`, and use `bun x nx run core-rust:test` for full core validation.
 
 `MemorySearchOptions` fields:
 
@@ -181,13 +186,14 @@ Results are returned as `Vec<MemorySearchResult>`, which extends `Memory` with a
 ## Other API
 
 - `get_recent(RecentMemoryOptions)` — returns the most recently added memories, sorted by creation time. Accepts `agent_id`, `agent_name`, `scope`, `room_id`, `world_id`, `session_id`, and `limit` filters.
-- `recall(query, MemoryRecallOptions)` — hybrid recall over lexical, relationship, recent, and importance signals.
+- `recall(query, MemoryRecallOptions)` — hybrid recall over lexical, relationship, temporal fact, recent, and importance signals.
 - `recall_with_vector_index(query, MemoryRecallOptions, Option<&dyn MemoryVectorIndex>)` — hybrid recall with an optional vector search adapter.
 - `InMemoryVectorIndex` — in-process cosine-similarity vector index that implements `MemoryVectorIndex`.
 - `trace_memory(id)` — returns the memory, citing relationships, and involved entities for evidence inspection.
 - `evaluate_new_memory(NewMemory, MemoryEvaluationOptions)` — evaluates whether a candidate memory should be stored, merged, or ignored.
 - `add_evaluated(NewMemory, MemoryEvaluationOptions)` — evaluates and conditionally stores a memory.
 - `apply_retention(MemoryRetentionPolicy)` — applies decay/removal rules and returns a retention report.
+- `snapshot()` / `replace_snapshot(MemoryManagerSnapshot)` — export or hydrate pure in-memory state for host-owned persistence adapters.
 - `run_memory_eval_cases(&[MemoryEvalCase])` — runs reusable memory quality scenarios and returns a structured report.
 - `upsert_entity(NewMemoryEntity)` — creates or updates a durable memory entity.
 - `list_entities(MemoryEntityOptions)` — lists identity records by entity filters.
@@ -200,6 +206,16 @@ Results are returned as `Vec<MemorySearchResult>`, which extends `Memory` with a
 - `list_agent_relationships(AgentRelationshipOptions)` — lists relationship edges with endpoint/context filters.
 - `forget_agent_relationship(id)` — removes one relationship edge.
 - `relationship_count()` — returns the total number of stored relationship edges.
+- `add_temporal_fact(NewTemporalFact)` — stores an evidence-backed temporal fact with validity and supersession metadata.
+- `list_temporal_facts(TemporalFactOptions)` — lists temporal facts by subject, predicate, object, status, valid time, context, and confidence filters.
+- `get_temporal_fact(id)` — returns one temporal fact by ID.
+- `forget_temporal_fact(id)` — removes one temporal fact and prunes supersession references to it.
+- `temporal_fact_count()` — returns the total number of stored temporal facts.
+- `add_temporal_relationship(NewTemporalRelationship)` — stores an evidence-backed time-varying relationship edge.
+- `list_temporal_relationships(TemporalRelationshipOptions)` — lists temporal relationships by endpoint, relationship type, status, valid time, context, strength, and confidence filters.
+- `get_temporal_relationship(id)` — returns one temporal relationship by ID.
+- `forget_temporal_relationship(id)` — removes one temporal relationship and prunes supersession references to it.
+- `temporal_relationship_count()` — returns the total number of stored temporal relationships.
 
 ## Importance
 

@@ -34,13 +34,54 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
-        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/memory-eval -p anima-memory baseline_memory_eval_cases_pass --features sqlite"
+        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/memory-eval -p anima-memory baseline_memory_eval_cases_pass"
       },
       "inputs": [
         "default",
         "{workspaceRoot}/Cargo.toml",
         "{workspaceRoot}/Cargo.lock",
         "{workspaceRoot}/packages/core-rust/crates/anima-memory/**/*"
+      ]
+    },
+    "memory-locomo": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": ".",
+        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/memory-locomo -p anima-memory locomo_smoke_eval_cases_pass --features locomo-eval"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/anima-memory/**/*"
+      ]
+    },
+    "memory-locomo-fetch": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": ".",
+        "command": "bun tools/memory-eval/download-locomo.mjs"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/tools/memory-eval/download-locomo.mjs"
+      ]
+    },
+    "memory-locomo-dataset": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": ".",
+        "command": "bun tools/memory-eval/run-locomo-dataset.mjs"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/anima-memory/**/*",
+        "{workspaceRoot}/tools/memory-eval/download-locomo.mjs",
+        "{workspaceRoot}/tools/memory-eval/run-locomo-dataset.mjs"
       ]
     },
     "lint": {

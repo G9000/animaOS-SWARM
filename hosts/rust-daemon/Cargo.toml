@@ -7,11 +7,12 @@ authors.workspace = true
 
 [dependencies]
 anima-core = { path = "../../packages/core-rust/crates/anima-core" }
-anima-memory = { path = "../../packages/core-rust/crates/anima-memory" }
+anima-memory = { path = "../../packages/core-rust/crates/anima-memory", features = ["locomo-eval"] }
 anima-swarm = { path = "../../packages/core-rust/crates/anima-swarm" }
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+fastembed = { version = "5.13.4", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
 futures = "0.3"
 meval = "0.2"
 regex = "1"

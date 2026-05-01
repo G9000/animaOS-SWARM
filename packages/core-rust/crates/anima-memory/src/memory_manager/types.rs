@@ -24,6 +24,15 @@ pub enum MemoryError {
     InvalidRelationshipType,
     InvalidRelationshipStrength,
     InvalidRelationshipConfidence,
+    InvalidTemporalSubject,
+    InvalidTemporalSubjectName,
+    InvalidTemporalPredicate,
+    InvalidTemporalObject,
+    InvalidTemporalObjectName,
+    InvalidTemporalRelationshipType,
+    InvalidTemporalStrength,
+    InvalidTemporalConfidence,
+    InvalidTemporalValidityRange,
 }
 
 impl MemoryError {
@@ -42,6 +51,17 @@ impl MemoryError {
             Self::InvalidRelationshipType => "relationshipType must not be empty",
             Self::InvalidRelationshipStrength => "strength must be between 0 and 1",
             Self::InvalidRelationshipConfidence => "confidence must be between 0 and 1",
+            Self::InvalidTemporalSubject => "temporal subject ID must not be empty",
+            Self::InvalidTemporalSubjectName => "temporal subject name must not be empty",
+            Self::InvalidTemporalPredicate => "temporal predicate must not be empty",
+            Self::InvalidTemporalObject => "temporal fact must have an object endpoint or value",
+            Self::InvalidTemporalObjectName => "temporal object name must not be empty",
+            Self::InvalidTemporalRelationshipType => "temporal relationship type must not be empty",
+            Self::InvalidTemporalStrength => "temporal strength must be between 0 and 1",
+            Self::InvalidTemporalConfidence => "temporal confidence must be between 0 and 1",
+            Self::InvalidTemporalValidityRange => {
+                "validTo must be greater than or equal to validFrom"
+            }
         }
     }
 }
@@ -163,6 +183,168 @@ pub struct AgentRelationshipOptions {
     pub limit: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TemporalRecordStatus {
+    #[default]
+    Active,
+    Superseded,
+    Retracted,
+}
+
+impl TemporalRecordStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+            Self::Retracted => "retracted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, ()> {
+        match value {
+            "active" => Ok(Self::Active),
+            "superseded" => Ok(Self::Superseded),
+            "retracted" => Ok(Self::Retracted),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewTemporalFact {
+    pub subject_kind: RelationshipEndpointKind,
+    pub subject_id: String,
+    pub subject_name: String,
+    pub predicate: String,
+    pub object_kind: Option<RelationshipEndpointKind>,
+    pub object_id: Option<String>,
+    pub object_name: Option<String>,
+    pub value: Option<String>,
+    pub valid_from: Option<u128>,
+    pub valid_to: Option<u128>,
+    pub observed_at: Option<u128>,
+    pub confidence: f64,
+    pub evidence_memory_ids: Vec<String>,
+    pub supersedes_fact_ids: Vec<String>,
+    pub status: Option<TemporalRecordStatus>,
+    pub tags: Option<Vec<String>>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemporalFact {
+    pub id: String,
+    pub subject_kind: RelationshipEndpointKind,
+    pub subject_id: String,
+    pub subject_name: String,
+    pub predicate: String,
+    pub object_kind: Option<RelationshipEndpointKind>,
+    pub object_id: Option<String>,
+    pub object_name: Option<String>,
+    pub value: Option<String>,
+    pub valid_from: Option<u128>,
+    pub valid_to: Option<u128>,
+    pub observed_at: u128,
+    pub confidence: f64,
+    pub evidence_memory_ids: Vec<String>,
+    pub supersedes_fact_ids: Vec<String>,
+    pub status: TemporalRecordStatus,
+    pub tags: Option<Vec<String>>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: u128,
+    pub updated_at: u128,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TemporalFactOptions {
+    pub subject_kind: Option<RelationshipEndpointKind>,
+    pub subject_id: Option<String>,
+    pub predicate: Option<String>,
+    pub object_kind: Option<RelationshipEndpointKind>,
+    pub object_id: Option<String>,
+    pub status: Option<TemporalRecordStatus>,
+    pub valid_at: Option<u128>,
+    pub include_inactive: bool,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
+    pub min_confidence: Option<f64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewTemporalRelationship {
+    pub source_kind: RelationshipEndpointKind,
+    pub source_id: String,
+    pub source_name: String,
+    pub target_kind: RelationshipEndpointKind,
+    pub target_id: String,
+    pub target_name: String,
+    pub relationship_type: String,
+    pub summary: Option<String>,
+    pub strength: f64,
+    pub confidence: f64,
+    pub valid_from: Option<u128>,
+    pub valid_to: Option<u128>,
+    pub observed_at: Option<u128>,
+    pub evidence_memory_ids: Vec<String>,
+    pub supersedes_relationship_ids: Vec<String>,
+    pub status: Option<TemporalRecordStatus>,
+    pub tags: Option<Vec<String>>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TemporalRelationship {
+    pub id: String,
+    pub source_kind: RelationshipEndpointKind,
+    pub source_id: String,
+    pub source_name: String,
+    pub target_kind: RelationshipEndpointKind,
+    pub target_id: String,
+    pub target_name: String,
+    pub relationship_type: String,
+    pub summary: Option<String>,
+    pub strength: f64,
+    pub confidence: f64,
+    pub valid_from: Option<u128>,
+    pub valid_to: Option<u128>,
+    pub observed_at: u128,
+    pub evidence_memory_ids: Vec<String>,
+    pub supersedes_relationship_ids: Vec<String>,
+    pub status: TemporalRecordStatus,
+    pub tags: Option<Vec<String>>,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: u128,
+    pub updated_at: u128,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TemporalRelationshipOptions {
+    pub source_kind: Option<RelationshipEndpointKind>,
+    pub source_id: Option<String>,
+    pub target_kind: Option<RelationshipEndpointKind>,
+    pub target_id: Option<String>,
+    pub relationship_type: Option<String>,
+    pub status: Option<TemporalRecordStatus>,
+    pub valid_at: Option<u128>,
+    pub include_inactive: bool,
+    pub room_id: Option<String>,
+    pub world_id: Option<String>,
+    pub session_id: Option<String>,
+    pub min_strength: Option<f64>,
+    pub min_confidence: Option<f64>,
+    pub limit: Option<usize>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewMemory {
     pub agent_id: String,
@@ -271,6 +453,29 @@ pub struct MemoryEvaluationOutcome {
     pub memory: Option<Memory>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MemoryRecallWeights {
+    pub lexical: f64,
+    pub vector: f64,
+    pub relationship: f64,
+    pub temporal: f64,
+    pub recency: f64,
+    pub importance: f64,
+}
+
+impl Default for MemoryRecallWeights {
+    fn default() -> Self {
+        Self {
+            lexical: 0.55,
+            vector: 0.15,
+            relationship: 0.20,
+            temporal: 0.00,
+            recency: 0.05,
+            importance: 0.05,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemoryRecallOptions {
     pub search: MemorySearchOptions,
@@ -280,6 +485,9 @@ pub struct MemoryRecallOptions {
     pub lexical_limit: Option<usize>,
     pub recent_limit: Option<usize>,
     pub relationship_limit: Option<usize>,
+    pub temporal_limit: Option<usize>,
+    pub temporal_intent_terms: Vec<String>,
+    pub weights: Option<MemoryRecallWeights>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -299,6 +507,7 @@ pub struct MemoryRecallResult {
     pub lexical_score: f64,
     pub vector_score: f64,
     pub relationship_score: f64,
+    pub temporal_score: f64,
     pub recency_score: f64,
     pub importance_score: f64,
 }
@@ -330,6 +539,15 @@ pub struct MemoryRetentionReport {
     pub decayed_memories: Vec<MemoryImportanceAdjustment>,
     pub removed_memory_ids: Vec<String>,
     pub removed_relationship_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemoryManagerSnapshot {
+    pub memories: Vec<Memory>,
+    pub memory_entities: Vec<MemoryEntity>,
+    pub agent_relationships: Vec<AgentRelationship>,
+    pub temporal_facts: Vec<TemporalFact>,
+    pub temporal_relationships: Vec<TemporalRelationship>,
 }
 
 impl MemoryType {

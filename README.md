@@ -35,6 +35,8 @@ The reusable Rust runtime core lives under `packages/core-rust`, the current run
 
 ## Development
 
+See [docs/testing.md](docs/testing.md) for focused memory, daemon, SDK, playground, and provider-embedding validation commands.
+
 ```bash
 # Build all packages
 bun run build

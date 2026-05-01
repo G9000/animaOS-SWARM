@@ -1084,15 +1084,7 @@ fn baseline_relationship(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "sqlite")]
-    use std::fs::remove_file;
-    #[cfg(feature = "sqlite")]
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
-
-    #[cfg(feature = "sqlite")]
-    static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn baseline_memory_eval_cases_pass() {
@@ -1127,48 +1119,5 @@ mod tests {
         assert_eq!(report.total_checks(), 1);
         assert_eq!(report.failure_messages().len(), 1);
         assert!(report.failure_messages()[0].contains("nonexistent memory"));
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[test]
-    fn sqlite_reload_preserves_baseline_recall_and_trace_checks() {
-        let path = temp_sqlite_path("memory-eval-reload");
-        let _ = remove_file(&path);
-
-        let mut manager = MemoryManager::with_sqlite_file(path.clone());
-        let seed_case = relationship_recall_case();
-        for memory in &seed_case.seed_memories {
-            manager.add(memory.clone()).expect("seed memory should add");
-        }
-        for seed in &seed_case.seed_relationships {
-            let mut relationship = seed.relationship.clone();
-            for expected in &seed.evidence_content_contains {
-                relationship.evidence_memory_ids.push(
-                    find_memory_id_by_content(&manager, expected)
-                        .expect("evidence memory should resolve"),
-                );
-            }
-            manager
-                .upsert_agent_relationship(relationship)
-                .expect("relationship should add");
-        }
-        manager.save().expect("sqlite save should succeed");
-
-        let mut reloaded = MemoryManager::with_sqlite_file(path.clone());
-        reloaded.load().expect("sqlite load should succeed");
-        let result = run_memory_eval_checks("sqlite reload", &mut reloaded, &seed_case.checks);
-
-        assert!(
-            result.checks.iter().all(|check| check.passed),
-            "{:?}",
-            result.checks
-        );
-        let _ = remove_file(&path);
-    }
-
-    #[cfg(feature = "sqlite")]
-    fn temp_sqlite_path(label: &str) -> std::path::PathBuf {
-        let suffix = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("anima-memory-eval-{label}-{suffix}.sqlite"))
     }
 }

@@ -89,6 +89,7 @@ export interface MemoryRecallOptions extends MemorySearchOptions {
   lexicalLimit?: number;
   recentLimit?: number;
   relationshipLimit?: number;
+  temporalLimit?: number;
 }
 
 export interface MemoryRecallResult {
@@ -97,6 +98,7 @@ export interface MemoryRecallResult {
   lexicalScore: number;
   vectorScore: number;
   relationshipScore: number;
+  temporalScore: number;
   recencyScore: number;
   importanceScore: number;
 }
@@ -354,6 +356,9 @@ export class MemoriesClient {
     }
     if (options.relationshipLimit !== undefined) {
       search.set('relationshipLimit', String(options.relationshipLimit));
+    }
+    if (options.temporalLimit !== undefined) {
+      search.set('temporalLimit', String(options.temporalLimit));
     }
 
     const response = await this.client.requestJson<{

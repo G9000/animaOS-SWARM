@@ -1,65 +1,67 @@
-mod storage;
-mod storage_json;
-#[cfg(feature = "sqlite")]
-mod storage_sqlite;
 #[cfg(test)]
 mod tests;
 mod types;
 
 use std::collections::{BTreeSet, HashMap};
-use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use self::storage::{load_memory_store, save_memory_store, MemoryStorageFormat};
 pub use self::types::{
     AgentRelationship, AgentRelationshipOptions, Memory, MemoryEntity, MemoryEntityOptions,
     MemoryError, MemoryEvaluation, MemoryEvaluationDecision, MemoryEvaluationOptions,
-    MemoryEvaluationOutcome, MemoryEvidenceTrace, MemoryImportanceAdjustment, MemoryRecallOptions,
-    MemoryRecallResult, MemoryRetentionPolicy, MemoryRetentionReport, MemoryScope,
-    MemorySearchOptions, MemorySearchResult, MemoryType, MemoryVectorIndex, NewAgentRelationship,
-    NewMemory, NewMemoryEntity, RecentMemoryOptions, RelationshipEndpointKind, VectorMemoryHit,
+    MemoryEvaluationOutcome, MemoryEvidenceTrace, MemoryImportanceAdjustment,
+    MemoryManagerSnapshot, MemoryRecallOptions, MemoryRecallResult, MemoryRecallWeights,
+    MemoryRetentionPolicy, MemoryRetentionReport, MemoryScope, MemorySearchOptions,
+    MemorySearchResult, MemoryType, MemoryVectorIndex, NewAgentRelationship, NewMemory,
+    NewMemoryEntity, NewTemporalFact, NewTemporalRelationship, RecentMemoryOptions,
+    RelationshipEndpointKind, TemporalFact, TemporalFactOptions, TemporalRecordStatus,
+    TemporalRelationship, TemporalRelationshipOptions, VectorMemoryHit,
 };
-use crate::bm25::BM25;
+use crate::bm25::{QueryExpander, TextAnalyzer, BM25};
 
 static NEXT_MEMORY_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_RELATIONSHIP_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_TEMPORAL_FACT_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_TEMPORAL_RELATIONSHIP_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 pub struct MemoryManager {
     memories: HashMap<String, Memory>,
     memory_entities: HashMap<String, MemoryEntity>,
     agent_relationships: HashMap<String, AgentRelationship>,
+    temporal_facts: HashMap<String, TemporalFact>,
+    temporal_relationships: HashMap<String, TemporalRelationship>,
     index: BM25,
-    storage_file: Option<PathBuf>,
-    storage_format: MemoryStorageFormat,
 }
 
 impl MemoryManager {
     pub fn new() -> Self {
+        Self::with_text_analyzer_and_query_expander(
+            TextAnalyzer::default(),
+            QueryExpander::default(),
+        )
+    }
+
+    pub fn with_text_analyzer(text_analyzer: TextAnalyzer) -> Self {
+        Self::with_text_analyzer_and_query_expander(text_analyzer, QueryExpander::default())
+    }
+
+    pub fn with_query_expander(query_expander: QueryExpander) -> Self {
+        Self::with_text_analyzer_and_query_expander(TextAnalyzer::default(), query_expander)
+    }
+
+    pub fn with_text_analyzer_and_query_expander(
+        text_analyzer: TextAnalyzer,
+        query_expander: QueryExpander,
+    ) -> Self {
         Self {
             memories: HashMap::new(),
             memory_entities: HashMap::new(),
             agent_relationships: HashMap::new(),
-            index: BM25::default(),
-            storage_file: None,
-            storage_format: MemoryStorageFormat::Json,
+            temporal_facts: HashMap::new(),
+            temporal_relationships: HashMap::new(),
+            index: BM25::with_expander_and_analyzer(query_expander, text_analyzer),
         }
-    }
-
-    pub fn with_storage_file(path: impl Into<PathBuf>) -> Self {
-        let mut manager = Self::new();
-        manager.storage_file = Some(path.into());
-        manager
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub fn with_sqlite_file(path: impl Into<PathBuf>) -> Self {
-        let mut manager = Self::new();
-        manager.storage_file = Some(path.into());
-        manager.storage_format = MemoryStorageFormat::Sqlite;
-        manager
     }
 
     pub fn add(&mut self, memory: NewMemory) -> Result<Memory, MemoryError> {
@@ -253,9 +255,55 @@ impl MemoryManager {
             }
         }
 
+        let temporal_limit = opts.temporal_limit.unwrap_or(limit);
+        if temporal_limit > 0 {
+            let facts = self.list_temporal_facts(TemporalFactOptions {
+                subject_id: opts.entity_id.clone(),
+                status: Some(TemporalRecordStatus::Active),
+                valid_at: Some(now_millis()),
+                room_id: opts.search.room_id.clone(),
+                world_id: opts.search.world_id.clone(),
+                session_id: opts.search.session_id.clone(),
+                limit: Some(temporal_limit),
+                ..TemporalFactOptions::default()
+            });
+
+            for fact in facts.iter().filter(|fact| {
+                temporal_fact_relevant_to_query(query, fact, &opts.temporal_intent_terms)
+            }) {
+                let temporal_score = fact.confidence.clamp(0.0, 1.0);
+                for memory_id in &fact.evidence_memory_ids {
+                    let Some(memory) = self.memories.get(memory_id) else {
+                        continue;
+                    };
+                    if !memory_matches_search_options(memory, &opts.search) {
+                        continue;
+                    }
+                    let candidate = recall_candidate(&mut candidates, memory);
+                    candidate.temporal_score = candidate.temporal_score.max(temporal_score);
+                }
+
+                if fact.evidence_memory_ids.is_empty() {
+                    for memory in self.memories.values() {
+                        if !memory_matches_search_options(memory, &opts.search) {
+                            continue;
+                        }
+                        if !temporal_memory_mentions_fact(memory, fact) {
+                            continue;
+                        }
+                        let candidate = recall_candidate(&mut candidates, memory);
+                        candidate.temporal_score =
+                            candidate.temporal_score.max(temporal_score * 0.85);
+                    }
+                }
+            }
+        }
+
         let mut results: Vec<_> = candidates
             .into_values()
-            .map(|candidate| candidate.into_result(max_lexical_score))
+            .map(|candidate| {
+                candidate.into_result(max_lexical_score, opts.weights.unwrap_or_default())
+            })
             .collect();
         results.sort_by(|left, right| {
             right
@@ -680,6 +728,254 @@ impl MemoryManager {
         relationships
     }
 
+    pub fn add_temporal_fact(
+        &mut self,
+        fact: NewTemporalFact,
+    ) -> Result<TemporalFact, MemoryError> {
+        validate_temporal_range(fact.valid_from, fact.valid_to)?;
+        let subject_id =
+            normalize_required_string(fact.subject_id, MemoryError::InvalidTemporalSubject)?;
+        let subject_name =
+            normalize_required_string(fact.subject_name, MemoryError::InvalidTemporalSubjectName)?;
+        let predicate =
+            normalize_required_string(fact.predicate, MemoryError::InvalidTemporalPredicate)?;
+        let (object_kind, object_id, object_name) =
+            normalize_temporal_object(fact.object_kind, fact.object_id, fact.object_name)?;
+        let value = normalize_optional_string(fact.value);
+        if object_id.is_none() && value.is_none() {
+            return Err(MemoryError::InvalidTemporalObject);
+        }
+        let confidence =
+            validate_unit_interval(fact.confidence, MemoryError::InvalidTemporalConfidence)?;
+        let now = now_millis();
+        let observed_at = fact.observed_at.unwrap_or(now);
+        let supersedes_fact_ids = unique_strings(fact.supersedes_fact_ids);
+        let close_at = fact.valid_from.or(Some(observed_at));
+        for superseded_id in &supersedes_fact_ids {
+            if let Some(existing) = self.temporal_facts.get_mut(superseded_id) {
+                existing.status = TemporalRecordStatus::Superseded;
+                if existing.valid_to.is_none() {
+                    existing.valid_to = close_at;
+                }
+                existing.updated_at = now;
+            }
+        }
+        self.upsert_entity_parts(
+            fact.subject_kind,
+            subject_id.clone(),
+            subject_name.clone(),
+            Vec::new(),
+            None,
+        );
+        if let (Some(kind), Some(id), Some(name)) =
+            (object_kind, object_id.as_ref(), object_name.as_ref())
+        {
+            self.upsert_entity_parts(kind, id.clone(), name.clone(), Vec::new(), None);
+        }
+
+        let full = TemporalFact {
+            id: next_temporal_fact_id(),
+            subject_kind: fact.subject_kind,
+            subject_id,
+            subject_name,
+            predicate,
+            object_kind,
+            object_id,
+            object_name,
+            value,
+            valid_from: fact.valid_from,
+            valid_to: fact.valid_to,
+            observed_at,
+            confidence,
+            evidence_memory_ids: unique_strings(fact.evidence_memory_ids),
+            supersedes_fact_ids,
+            status: fact.status.unwrap_or_default(),
+            tags: fact
+                .tags
+                .map(unique_strings)
+                .filter(|tags| !tags.is_empty()),
+            room_id: fact.room_id,
+            world_id: fact.world_id,
+            session_id: fact.session_id,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.temporal_facts.insert(full.id.clone(), full.clone());
+        Ok(full)
+    }
+
+    pub fn get_temporal_fact(&self, id: &str) -> Option<TemporalFact> {
+        self.temporal_facts.get(id).cloned()
+    }
+
+    pub fn list_temporal_facts(&self, opts: TemporalFactOptions) -> Vec<TemporalFact> {
+        let min_confidence = opts.min_confidence.unwrap_or(0.0);
+        let mut facts: Vec<_> = self
+            .temporal_facts
+            .values()
+            .filter(|fact| temporal_fact_matches_options(fact, &opts, min_confidence))
+            .cloned()
+            .collect();
+        facts.sort_by(|left, right| {
+            right
+                .valid_from
+                .unwrap_or(right.observed_at)
+                .cmp(&left.valid_from.unwrap_or(left.observed_at))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        facts.truncate(opts.limit.unwrap_or(20));
+        facts
+    }
+
+    pub fn forget_temporal_fact(&mut self, id: &str) {
+        self.temporal_facts.remove(id);
+        for fact in self.temporal_facts.values_mut() {
+            fact.supersedes_fact_ids.retain(|value| value != id);
+        }
+    }
+
+    pub fn add_temporal_relationship(
+        &mut self,
+        relationship: NewTemporalRelationship,
+    ) -> Result<TemporalRelationship, MemoryError> {
+        validate_temporal_range(relationship.valid_from, relationship.valid_to)?;
+        let source_id = normalize_required_string(
+            relationship.source_id,
+            MemoryError::InvalidRelationshipEndpoint,
+        )?;
+        let source_name = normalize_required_string(
+            relationship.source_name,
+            MemoryError::InvalidRelationshipEndpointName,
+        )?;
+        let target_id = normalize_required_string(
+            relationship.target_id,
+            MemoryError::InvalidRelationshipEndpoint,
+        )?;
+        let target_name = normalize_required_string(
+            relationship.target_name,
+            MemoryError::InvalidRelationshipEndpointName,
+        )?;
+        let relationship_type = normalize_required_string(
+            relationship.relationship_type,
+            MemoryError::InvalidTemporalRelationshipType,
+        )?;
+        let strength =
+            validate_unit_interval(relationship.strength, MemoryError::InvalidTemporalStrength)?;
+        let confidence = validate_unit_interval(
+            relationship.confidence,
+            MemoryError::InvalidTemporalConfidence,
+        )?;
+        let now = now_millis();
+        let observed_at = relationship.observed_at.unwrap_or(now);
+        let supersedes_relationship_ids = unique_strings(relationship.supersedes_relationship_ids);
+        let close_at = relationship.valid_from.or(Some(observed_at));
+        for superseded_id in &supersedes_relationship_ids {
+            if let Some(existing) = self.temporal_relationships.get_mut(superseded_id) {
+                existing.status = TemporalRecordStatus::Superseded;
+                if existing.valid_to.is_none() {
+                    existing.valid_to = close_at;
+                }
+                existing.updated_at = now;
+            }
+        }
+        self.upsert_entity_parts(
+            relationship.source_kind,
+            source_id.clone(),
+            source_name.clone(),
+            Vec::new(),
+            None,
+        );
+        self.upsert_entity_parts(
+            relationship.target_kind,
+            target_id.clone(),
+            target_name.clone(),
+            Vec::new(),
+            None,
+        );
+
+        let full = TemporalRelationship {
+            id: next_temporal_relationship_id(),
+            source_kind: relationship.source_kind,
+            source_id,
+            source_name,
+            target_kind: relationship.target_kind,
+            target_id,
+            target_name,
+            relationship_type,
+            summary: normalize_optional_string(relationship.summary),
+            strength,
+            confidence,
+            valid_from: relationship.valid_from,
+            valid_to: relationship.valid_to,
+            observed_at,
+            evidence_memory_ids: unique_strings(relationship.evidence_memory_ids),
+            supersedes_relationship_ids,
+            status: relationship.status.unwrap_or_default(),
+            tags: relationship
+                .tags
+                .map(unique_strings)
+                .filter(|tags| !tags.is_empty()),
+            room_id: relationship.room_id,
+            world_id: relationship.world_id,
+            session_id: relationship.session_id,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.temporal_relationships
+            .insert(full.id.clone(), full.clone());
+        Ok(full)
+    }
+
+    pub fn get_temporal_relationship(&self, id: &str) -> Option<TemporalRelationship> {
+        self.temporal_relationships.get(id).cloned()
+    }
+
+    pub fn list_temporal_relationships(
+        &self,
+        opts: TemporalRelationshipOptions,
+    ) -> Vec<TemporalRelationship> {
+        let min_strength = opts.min_strength.unwrap_or(0.0);
+        let min_confidence = opts.min_confidence.unwrap_or(0.0);
+        let mut relationships: Vec<_> = self
+            .temporal_relationships
+            .values()
+            .filter(|relationship| {
+                temporal_relationship_matches_options(
+                    relationship,
+                    &opts,
+                    min_strength,
+                    min_confidence,
+                )
+            })
+            .cloned()
+            .collect();
+        relationships.sort_by(|left, right| {
+            right
+                .valid_from
+                .unwrap_or(right.observed_at)
+                .cmp(&left.valid_from.unwrap_or(left.observed_at))
+                .then_with(|| right.strength.total_cmp(&left.strength))
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        relationships.truncate(opts.limit.unwrap_or(20));
+        relationships
+    }
+
+    pub fn forget_temporal_relationship(&mut self, id: &str) {
+        self.temporal_relationships.remove(id);
+        for relationship in self.temporal_relationships.values_mut() {
+            relationship
+                .supersedes_relationship_ids
+                .retain(|value| value != id);
+        }
+    }
+
     pub fn forget_agent_relationship(&mut self, id: &str) {
         self.agent_relationships.remove(id);
     }
@@ -774,6 +1070,8 @@ impl MemoryManager {
                 self.memories.clear();
                 self.memory_entities.clear();
                 self.agent_relationships.clear();
+                self.temporal_facts.clear();
+                self.temporal_relationships.clear();
                 self.index.clear();
             }
             Some(agent_id) => {
@@ -798,15 +1096,21 @@ impl MemoryManager {
                 self.memory_entities.retain(|_, entity| {
                     entity.kind != RelationshipEndpointKind::Agent || entity.id != agent_id
                 });
+                self.temporal_facts.retain(|_, fact| {
+                    fact.subject_kind != RelationshipEndpointKind::Agent
+                        || fact.subject_id != agent_id
+                });
+                self.temporal_relationships.retain(|_, relationship| {
+                    (relationship.source_kind != RelationshipEndpointKind::Agent
+                        || relationship.source_id != agent_id)
+                        && (relationship.target_kind != RelationshipEndpointKind::Agent
+                            || relationship.target_id != agent_id)
+                });
             }
         }
     }
 
-    pub fn save(&self) -> io::Result<()> {
-        let Some(path) = &self.storage_file else {
-            return Ok(());
-        };
-
+    pub fn snapshot(&self) -> MemoryManagerSnapshot {
         let mut memories: Vec<_> = self.memories.values().cloned().collect();
         memories.sort_by(|left, right| {
             left.created_at
@@ -829,25 +1133,34 @@ impl MemoryManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        save_memory_store(
-            self.storage_format,
-            path,
-            &memories,
-            &entities,
-            &relationships,
-        )
+        let mut temporal_facts: Vec<_> = self.temporal_facts.values().cloned().collect();
+        temporal_facts.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        let mut temporal_relationships: Vec<_> =
+            self.temporal_relationships.values().cloned().collect();
+        temporal_relationships.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+
+        MemoryManagerSnapshot {
+            memories,
+            memory_entities: entities,
+            agent_relationships: relationships,
+            temporal_facts,
+            temporal_relationships,
+        }
     }
 
-    pub fn load(&mut self) -> io::Result<()> {
-        let Some(path) = &self.storage_file else {
-            return Ok(());
-        };
+    pub fn replace_snapshot(&mut self, snapshot: MemoryManagerSnapshot) {
+        self.clear(None);
 
-        let Some(store) = load_memory_store(self.storage_format, path)? else {
-            return Ok(());
-        };
-
-        for memory in store.memories {
+        for memory in snapshot.memories {
             self.memories.insert(memory.id.clone(), memory.clone());
             self.index
                 .add_document(memory.id.clone(), build_index_text(&memory));
@@ -857,11 +1170,11 @@ impl MemoryManager {
                 &memory.agent_name,
             );
         }
-        for entity in store.memory_entities {
+        for entity in snapshot.memory_entities {
             self.memory_entities
                 .insert(entity_key(entity.kind, &entity.id), entity);
         }
-        for relationship in store.agent_relationships {
+        for relationship in snapshot.agent_relationships {
             self.ensure_entity_from_parts(
                 relationship.source_kind,
                 &relationship.source_agent_id,
@@ -875,8 +1188,31 @@ impl MemoryManager {
             self.agent_relationships
                 .insert(relationship.id.clone(), relationship);
         }
-
-        Ok(())
+        for fact in snapshot.temporal_facts {
+            self.ensure_entity_from_parts(fact.subject_kind, &fact.subject_id, &fact.subject_name);
+            if let (Some(kind), Some(id), Some(name)) = (
+                fact.object_kind,
+                fact.object_id.as_deref(),
+                fact.object_name.as_deref(),
+            ) {
+                self.ensure_entity_from_parts(kind, id, name);
+            }
+            self.temporal_facts.insert(fact.id.clone(), fact);
+        }
+        for relationship in snapshot.temporal_relationships {
+            self.ensure_entity_from_parts(
+                relationship.source_kind,
+                &relationship.source_id,
+                &relationship.source_name,
+            );
+            self.ensure_entity_from_parts(
+                relationship.target_kind,
+                &relationship.target_id,
+                &relationship.target_name,
+            );
+            self.temporal_relationships
+                .insert(relationship.id.clone(), relationship);
+        }
     }
 
     pub fn size(&self) -> usize {
@@ -885,6 +1221,14 @@ impl MemoryManager {
 
     pub fn relationship_count(&self) -> usize {
         self.agent_relationships.len()
+    }
+
+    pub fn temporal_fact_count(&self) -> usize {
+        self.temporal_facts.len()
+    }
+
+    pub fn temporal_relationship_count(&self) -> usize {
+        self.temporal_relationships.len()
     }
 
     pub fn entity_count(&self) -> usize {
@@ -1015,6 +1359,7 @@ struct RecallCandidate {
     lexical_score: f64,
     vector_score: f64,
     relationship_score: f64,
+    temporal_score: f64,
     recency_score: f64,
 }
 
@@ -1025,11 +1370,16 @@ impl RecallCandidate {
             lexical_score: 0.0,
             vector_score: 0.0,
             relationship_score: 0.0,
+            temporal_score: 0.0,
             recency_score: 0.0,
         }
     }
 
-    fn into_result(self, max_lexical_score: f64) -> MemoryRecallResult {
+    fn into_result(
+        self,
+        max_lexical_score: f64,
+        weights: MemoryRecallWeights,
+    ) -> MemoryRecallResult {
         let lexical_score = if max_lexical_score > 0.0 {
             self.lexical_score / max_lexical_score
         } else {
@@ -1037,13 +1387,20 @@ impl RecallCandidate {
         };
         let vector_score = self.vector_score.clamp(0.0, 1.0);
         let relationship_score = self.relationship_score.clamp(0.0, 1.0);
+        let temporal_score = self.temporal_score.clamp(0.0, 1.0);
         let recency_score = self.recency_score.clamp(0.0, 1.0);
         let importance_score = self.memory.importance.clamp(0.0, 1.0);
-        let score = (lexical_score * 0.40)
-            + (vector_score * 0.25)
-            + (relationship_score * 0.20)
-            + (recency_score * 0.10)
-            + (importance_score * 0.05);
+        let vector_weight = if lexical_score > 0.0 {
+            weights.vector * (1.0 - lexical_score)
+        } else {
+            weights.vector
+        };
+        let score = (lexical_score * weights.lexical)
+            + (vector_score * vector_weight)
+            + (relationship_score * weights.relationship)
+            + (temporal_score * weights.temporal)
+            + (recency_score * weights.recency)
+            + (importance_score * weights.importance);
 
         MemoryRecallResult {
             memory: self.memory,
@@ -1051,6 +1408,7 @@ impl RecallCandidate {
             lexical_score,
             vector_score,
             relationship_score,
+            temporal_score,
             recency_score,
             importance_score,
         }
@@ -1118,6 +1476,296 @@ fn memory_matches_search_options(memory: &Memory, opts: &MemorySearchOptions) ->
         return false;
     }
     true
+}
+
+fn temporal_fact_relevant_to_query(
+    query: &str,
+    fact: &TemporalFact,
+    extra_intent_terms: &[String],
+) -> bool {
+    let query_terms = normalized_terms(query);
+    if query_terms.is_empty() {
+        return false;
+    }
+
+    let subject_terms = temporal_fact_subject_terms(fact);
+    let detail_terms = temporal_fact_detail_terms(fact);
+    terms_overlap(&query_terms, &detail_terms)
+        || (terms_overlap(&query_terms, &subject_terms)
+            && temporal_query_has_fact_intent(&query_terms, extra_intent_terms))
+}
+
+fn temporal_memory_mentions_fact(memory: &Memory, fact: &TemporalFact) -> bool {
+    let content_terms = normalized_terms(&memory.content);
+    if content_terms.is_empty() {
+        return false;
+    }
+
+    let subject_terms = temporal_fact_subject_terms(fact);
+    let detail_terms = temporal_fact_detail_terms(fact);
+    terms_overlap(&content_terms, &detail_terms) && terms_overlap(&content_terms, &subject_terms)
+}
+
+fn temporal_fact_subject_terms(fact: &TemporalFact) -> Vec<String> {
+    let mut terms = Vec::new();
+    extend_terms(&mut terms, &fact.subject_id);
+    extend_terms(&mut terms, &fact.subject_name);
+    terms
+}
+
+fn temporal_fact_detail_terms(fact: &TemporalFact) -> Vec<String> {
+    let mut terms = Vec::new();
+    extend_terms(&mut terms, &fact.predicate);
+    if let Some(value) = &fact.value {
+        extend_terms(&mut terms, value);
+    }
+    if let Some(object_id) = &fact.object_id {
+        extend_terms(&mut terms, object_id);
+    }
+    if let Some(object_name) = &fact.object_name {
+        extend_terms(&mut terms, object_name);
+    }
+    terms
+}
+
+fn normalized_terms(value: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    for character in value.chars() {
+        if character.is_alphanumeric() {
+            for lowercase in character.to_lowercase() {
+                current.push(lowercase);
+            }
+        } else {
+            push_normalized_term(&mut terms, &mut current);
+        }
+    }
+    push_normalized_term(&mut terms, &mut current);
+    terms
+}
+
+fn extend_terms(terms: &mut Vec<String>, value: &str) {
+    for term in normalized_terms(value) {
+        if !terms.iter().any(|existing| term_matches(existing, &term)) {
+            terms.push(term);
+        }
+    }
+}
+
+fn push_normalized_term(terms: &mut Vec<String>, current: &mut String) {
+    if current.chars().count() > 1 {
+        terms.push(current.clone());
+    }
+    current.clear();
+}
+
+fn terms_overlap(left: &[String], right: &[String]) -> bool {
+    left.iter().any(|left_term| {
+        right
+            .iter()
+            .any(|right_term| term_matches(left_term, right_term))
+    })
+}
+
+fn term_matches(left: &str, right: &str) -> bool {
+    left == right
+        || (left.len() >= 4 && right.len() >= 4 && (left.contains(right) || right.contains(left)))
+}
+
+fn temporal_query_has_fact_intent(query_terms: &[String], extra_intent_terms: &[String]) -> bool {
+    const FACT_INTENT_TERMS: &[&str] = &[
+        "current",
+        "enjoy",
+        "fact",
+        "favorite",
+        "field",
+        "fields",
+        "likely",
+        "know",
+        "known",
+        "like",
+        "prefer",
+        "preference",
+        "profile",
+        "pursue",
+        "remember",
+        "status",
+        "want",
+        "would",
+    ];
+
+    query_terms.iter().any(|query_term| {
+        FACT_INTENT_TERMS
+            .iter()
+            .any(|intent_term| term_matches(query_term, intent_term))
+            || extra_intent_terms
+                .iter()
+                .any(|intent_term| term_matches(query_term, intent_term))
+    })
+}
+
+fn temporal_fact_matches_options(
+    fact: &TemporalFact,
+    opts: &TemporalFactOptions,
+    min_confidence: f64,
+) -> bool {
+    if opts
+        .subject_kind
+        .is_some_and(|kind| fact.subject_kind != kind)
+    {
+        return false;
+    }
+    if option_filter_misses(opts.subject_id.as_deref(), Some(&fact.subject_id)) {
+        return false;
+    }
+    if option_filter_misses(opts.predicate.as_deref(), Some(&fact.predicate)) {
+        return false;
+    }
+    if opts
+        .object_kind
+        .is_some_and(|kind| fact.object_kind != Some(kind))
+    {
+        return false;
+    }
+    if option_filter_misses(opts.object_id.as_deref(), fact.object_id.as_deref()) {
+        return false;
+    }
+    if !temporal_status_matches(fact.status, opts.status, opts.include_inactive) {
+        return false;
+    }
+    if opts
+        .valid_at
+        .is_some_and(|instant| !temporal_record_valid_at(fact.valid_from, fact.valid_to, instant))
+    {
+        return false;
+    }
+    if option_filter_misses(opts.room_id.as_deref(), fact.room_id.as_deref()) {
+        return false;
+    }
+    if option_filter_misses(opts.world_id.as_deref(), fact.world_id.as_deref()) {
+        return false;
+    }
+    if option_filter_misses(opts.session_id.as_deref(), fact.session_id.as_deref()) {
+        return false;
+    }
+    fact.confidence >= min_confidence
+}
+
+fn temporal_relationship_matches_options(
+    relationship: &TemporalRelationship,
+    opts: &TemporalRelationshipOptions,
+    min_strength: f64,
+    min_confidence: f64,
+) -> bool {
+    if opts
+        .source_kind
+        .is_some_and(|kind| relationship.source_kind != kind)
+    {
+        return false;
+    }
+    if option_filter_misses(opts.source_id.as_deref(), Some(&relationship.source_id)) {
+        return false;
+    }
+    if opts
+        .target_kind
+        .is_some_and(|kind| relationship.target_kind != kind)
+    {
+        return false;
+    }
+    if option_filter_misses(opts.target_id.as_deref(), Some(&relationship.target_id)) {
+        return false;
+    }
+    if option_filter_misses(
+        opts.relationship_type.as_deref(),
+        Some(&relationship.relationship_type),
+    ) {
+        return false;
+    }
+    if !temporal_status_matches(relationship.status, opts.status, opts.include_inactive) {
+        return false;
+    }
+    if opts.valid_at.is_some_and(|instant| {
+        !temporal_record_valid_at(relationship.valid_from, relationship.valid_to, instant)
+    }) {
+        return false;
+    }
+    if option_filter_misses(opts.room_id.as_deref(), relationship.room_id.as_deref()) {
+        return false;
+    }
+    if option_filter_misses(opts.world_id.as_deref(), relationship.world_id.as_deref()) {
+        return false;
+    }
+    if option_filter_misses(
+        opts.session_id.as_deref(),
+        relationship.session_id.as_deref(),
+    ) {
+        return false;
+    }
+    relationship.strength >= min_strength && relationship.confidence >= min_confidence
+}
+
+fn temporal_status_matches(
+    actual: TemporalRecordStatus,
+    expected: Option<TemporalRecordStatus>,
+    include_inactive: bool,
+) -> bool {
+    match expected {
+        Some(expected) => actual == expected,
+        None if include_inactive => true,
+        None => actual == TemporalRecordStatus::Active,
+    }
+}
+
+fn temporal_record_valid_at(
+    valid_from: Option<u128>,
+    valid_to: Option<u128>,
+    instant: u128,
+) -> bool {
+    valid_from.is_none_or(|valid_from| valid_from <= instant)
+        && valid_to.is_none_or(|valid_to| valid_to >= instant)
+}
+
+fn validate_temporal_range(
+    valid_from: Option<u128>,
+    valid_to: Option<u128>,
+) -> Result<(), MemoryError> {
+    if let (Some(valid_from), Some(valid_to)) = (valid_from, valid_to) {
+        if valid_to < valid_from {
+            return Err(MemoryError::InvalidTemporalValidityRange);
+        }
+    }
+    Ok(())
+}
+
+fn normalize_temporal_object(
+    object_kind: Option<RelationshipEndpointKind>,
+    object_id: Option<String>,
+    object_name: Option<String>,
+) -> Result<
+    (
+        Option<RelationshipEndpointKind>,
+        Option<String>,
+        Option<String>,
+    ),
+    MemoryError,
+> {
+    let object_id = normalize_optional_string(object_id);
+    let object_name = normalize_optional_string(object_name);
+    if object_kind.is_none() && object_id.is_none() && object_name.is_none() {
+        return Ok((None, None, None));
+    }
+
+    let Some(object_id) = object_id else {
+        return Err(MemoryError::InvalidTemporalObject);
+    };
+    let Some(object_name) = object_name else {
+        return Err(MemoryError::InvalidTemporalObjectName);
+    };
+    Ok((
+        Some(object_kind.unwrap_or(RelationshipEndpointKind::External)),
+        Some(object_id),
+        Some(object_name),
+    ))
 }
 
 fn memory_evaluation_score(memory: &NewMemory, importance: f64) -> f64 {
@@ -1258,6 +1906,16 @@ fn next_memory_id() -> String {
 fn next_relationship_id() -> String {
     let next = NEXT_RELATIONSHIP_ID.fetch_add(1, Ordering::Relaxed);
     format!("rel-{}-{next}", now_millis())
+}
+
+fn next_temporal_fact_id() -> String {
+    let next = NEXT_TEMPORAL_FACT_ID.fetch_add(1, Ordering::Relaxed);
+    format!("tfact-{}-{next}", now_millis())
+}
+
+fn next_temporal_relationship_id() -> String {
+    let next = NEXT_TEMPORAL_RELATIONSHIP_ID.fetch_add(1, Ordering::Relaxed);
+    format!("trel-{}-{next}", now_millis())
 }
 
 fn memory_id_sequence(id: &str) -> u64 {

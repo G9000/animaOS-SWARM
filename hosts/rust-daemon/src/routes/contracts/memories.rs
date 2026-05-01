@@ -136,6 +136,7 @@ pub(crate) struct MemoryRecallResultResponse {
     pub(crate) lexical_score: f64,
     pub(crate) vector_score: f64,
     pub(crate) relationship_score: f64,
+    pub(crate) temporal_score: f64,
     pub(crate) recency_score: f64,
     pub(crate) importance_score: f64,
 }
@@ -368,6 +369,7 @@ pub(crate) struct MemoryRecallQuery {
     pub(crate) lexical_limit: Option<usize>,
     pub(crate) recent_limit: Option<usize>,
     pub(crate) relationship_limit: Option<usize>,
+    pub(crate) temporal_limit: Option<usize>,
     pub(crate) min_importance: Option<f64>,
 }
 
@@ -715,6 +717,11 @@ impl MemoryRecallQuery {
                 .map(String::as_str)
                 .map(parse_usize)
                 .transpose()?,
+            temporal_limit: query
+                .get("temporalLimit")
+                .map(String::as_str)
+                .map(parse_usize)
+                .transpose()?,
             min_importance: query
                 .get("minImportance")
                 .map(String::as_str)
@@ -761,6 +768,9 @@ impl MemoryRecallQuery {
                 lexical_limit: self.lexical_limit,
                 recent_limit: self.recent_limit,
                 relationship_limit: self.relationship_limit,
+                temporal_limit: self.temporal_limit,
+                temporal_intent_terms: Vec::new(),
+                weights: None,
             },
         ))
     }
@@ -869,6 +879,7 @@ impl From<&MemoryRecallResult> for MemoryRecallResultResponse {
             lexical_score: value.lexical_score,
             vector_score: value.vector_score,
             relationship_score: value.relationship_score,
+            temporal_score: value.temporal_score,
             recency_score: value.recency_score,
             importance_score: value.importance_score,
         }

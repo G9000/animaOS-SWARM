@@ -6,14 +6,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anima_core::{AgentConfig, AgentRuntime, AgentRuntimeSnapshot, DatabaseAdapter, ModelAdapter};
-use anima_memory::MemoryManager;
+use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
 use tokio::sync::RwLock as AsyncRwLock;
+use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::memory_embeddings::{MemoryEmbeddingRuntime, SharedMemoryEmbeddings};
+use crate::memory_store::MemoryStoreConfig;
 use crate::model::DeterministicModelAdapter;
 use crate::tools::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
@@ -22,9 +24,58 @@ use crate::tools::{
 
 pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
 
+const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
+const MEMORY_TEXT_ANALYZER_ENV: &str = "ANIMAOS_RS_MEMORY_TEXT_ANALYZER";
+
+pub(crate) fn memory_manager_from_env() -> MemoryManager {
+    let text_analyzer = memory_text_analyzer_from_env();
+    match memory_query_expander_from_env() {
+        Some(query_expander) => {
+            MemoryManager::with_text_analyzer_and_query_expander(text_analyzer, query_expander)
+        }
+        None => MemoryManager::with_text_analyzer(text_analyzer),
+    }
+}
+
+pub(crate) fn memory_text_analyzer_from_env() -> TextAnalyzer {
+    let Ok(value) = std::env::var(MEMORY_TEXT_ANALYZER_ENV) else {
+        return TextAnalyzer::default();
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "default" | "multilingual" | "unicode" => TextAnalyzer::multilingual(),
+        unknown => {
+            warn!(
+                env = MEMORY_TEXT_ANALYZER_ENV,
+                value = unknown,
+                "unknown memory text analyzer profile; using multilingual search"
+            );
+            TextAnalyzer::default()
+        }
+    }
+}
+
+pub(crate) fn memory_query_expander_from_env() -> Option<QueryExpander> {
+    let Ok(value) = std::env::var(MEMORY_QUERY_EXPANDER_ENV) else {
+        return None;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "none" | "off" | "disabled" => None,
+        "locomo" | "locomo-benchmark" => Some(locomo_query_expander()),
+        unknown => {
+            warn!(
+                env = MEMORY_QUERY_EXPANDER_ENV,
+                value = unknown,
+                "unknown memory query expander profile; using default BM25 search"
+            );
+            None
+        }
+    }
+}
+
 pub(crate) struct DaemonState {
     pub(crate) memory: SharedMemoryStore,
     pub(crate) memory_embeddings: SharedMemoryEmbeddings,
+    pub(crate) memory_store: Option<MemoryStoreConfig>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
@@ -88,11 +139,12 @@ impl DaemonState {
         event_fanout: EventFanout,
         max_background_processes: usize,
     ) -> Self {
-        let memory = Arc::new(AsyncRwLock::new(MemoryManager::new()));
+        let memory = Arc::new(AsyncRwLock::new(memory_manager_from_env()));
         let memory_embeddings = Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::local_default()));
         Self {
             memory,
             memory_embeddings,
+            memory_store: None,
             agents: HashMap::new(),
             swarms: HashMap::new(),
             swarm_events: HashMap::new(),
@@ -118,8 +170,16 @@ impl DaemonState {
         Arc::clone(&self.memory_embeddings)
     }
 
+    pub(crate) fn memory_store_config(&self) -> Option<MemoryStoreConfig> {
+        self.memory_store.clone()
+    }
+
     pub(crate) fn replace_memory(&mut self, memory: MemoryManager) {
         self.memory = Arc::new(AsyncRwLock::new(memory));
+    }
+
+    pub(crate) fn set_memory_store(&mut self, memory_store: Option<MemoryStoreConfig>) {
+        self.memory_store = memory_store;
     }
 
     pub(crate) fn replace_memory_embeddings(&mut self, embeddings: MemoryEmbeddingRuntime) {
@@ -226,6 +286,7 @@ impl DaemonState {
         runtime.set_evaluators(default_evaluators(
             Arc::clone(&self.memory),
             Arc::clone(&self.memory_embeddings),
+            self.memory_store.clone(),
         ));
         if let Some(db) = &self.db {
             runtime.set_database(Arc::clone(db));
@@ -272,6 +333,7 @@ impl DaemonState {
         let tool_context = ToolExecutionContext::new(
             Arc::clone(&self.memory),
             Arc::clone(&self.memory_embeddings),
+            self.memory_store.clone(),
             self.tool_registry.clone(),
             Arc::clone(&self.process_manager),
         );
@@ -287,6 +349,7 @@ impl DaemonState {
         String,
         SharedMemoryStore,
         SharedMemoryEmbeddings,
+        Option<MemoryStoreConfig>,
     ) {
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
@@ -299,6 +362,7 @@ impl DaemonState {
             agent_name,
             Arc::clone(&self.memory),
             Arc::clone(&self.memory_embeddings),
+            self.memory_store.clone(),
         )
     }
 

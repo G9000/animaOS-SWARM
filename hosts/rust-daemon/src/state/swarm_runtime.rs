@@ -23,6 +23,7 @@ impl DaemonState {
     ) -> Arc<CoordinatorAgentFactoryFn> {
         let memory = Arc::clone(&self.memory);
         let memory_embeddings = Arc::clone(&self.memory_embeddings);
+        let memory_store = self.memory_store.clone();
         let model_adapter = Arc::clone(&self.model_adapter);
         let tool_registry = self.tool_registry.clone();
         let process_manager = Arc::clone(&self.process_manager);
@@ -31,6 +32,7 @@ impl DaemonState {
         Arc::new(move |context: CoordinatorAgentFactoryContext| {
             let memory = Arc::clone(&memory);
             let memory_embeddings = Arc::clone(&memory_embeddings);
+            let memory_store = memory_store.clone();
             let model_adapter = Arc::clone(&model_adapter);
             let tool_registry = tool_registry.clone();
             let process_manager = Arc::clone(&process_manager);
@@ -41,6 +43,7 @@ impl DaemonState {
                 let tool_context = ToolExecutionContext::new(
                     Arc::clone(&memory),
                     Arc::clone(&memory_embeddings),
+                    memory_store.clone(),
                     tool_registry,
                     process_manager,
                 );
@@ -56,6 +59,7 @@ impl DaemonState {
                     Arc::clone(&model_adapter),
                     Arc::clone(&memory),
                     Arc::clone(&memory_embeddings),
+                    memory_store.clone(),
                     Arc::clone(&runtime_events),
                 );
                 if let Some(db) = &db {
@@ -84,6 +88,7 @@ impl DaemonState {
                             let config = config.clone();
                             let memory = Arc::clone(&memory);
                             let memory_embeddings = Arc::clone(&memory_embeddings);
+                            let memory_store = memory_store.clone();
                             let model_adapter = Arc::clone(&model_adapter);
                             let token_usage = Arc::clone(&token_usage);
                             let needs_reset = Arc::clone(&needs_reset);
@@ -100,6 +105,7 @@ impl DaemonState {
                                         Arc::clone(&model_adapter),
                                         Arc::clone(&memory),
                                         Arc::clone(&memory_embeddings),
+                                        memory_store,
                                         Arc::clone(&runtime_events),
                                     );
                                     if let Some(db) = &db {
@@ -189,12 +195,13 @@ fn build_swarm_runtime(
     model_adapter: Arc<dyn ModelAdapter>,
     memory: SharedMemoryStore,
     memory_embeddings: SharedMemoryEmbeddings,
+    memory_store: Option<crate::memory_store::MemoryStoreConfig>,
     event_listener: Arc<dyn Fn(EngineEvent) + Send + Sync>,
 ) -> AgentRuntime {
     let mut runtime = AgentRuntime::new(config, model_adapter);
     runtime.set_event_listener(event_listener);
     runtime.set_providers(default_providers(Arc::clone(&memory)));
-    runtime.set_evaluators(default_evaluators(memory, memory_embeddings));
+    runtime.set_evaluators(default_evaluators(memory, memory_embeddings, memory_store));
     runtime.init();
     runtime
 }

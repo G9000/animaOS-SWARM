@@ -5,6 +5,8 @@ use anima_memory::{MemoryRecallOptions, MemorySearchOptions, MemoryType, NewMemo
 use futures::future::BoxFuture;
 use tracing::warn;
 
+use crate::memory_store::save_memory_manager;
+
 use super::ToolExecutionContext;
 
 pub(super) fn execute_memory_search(
@@ -135,7 +137,7 @@ pub(super) fn execute_memory_add(
                 Ok(memory) => memory,
                 Err(error) => return TaskResult::error(error.message(), 0),
             };
-            if let Err(error) = memory_guard.save() {
+            if let Err(error) = save_memory_manager(context.memory_store.as_ref(), &memory_guard) {
                 return TaskResult::error(format!("failed to persist memory: {error}"), 0);
             }
             memory

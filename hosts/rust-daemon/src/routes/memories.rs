@@ -1,6 +1,6 @@
 use anima_memory::{
-    baseline_memory_eval_cases, run_memory_eval_cases, Memory, MemoryScope, MemorySearchOptions,
-    RecentMemoryOptions,
+    baseline_memory_eval_cases, run_memory_eval_cases, Memory, MemoryManager, MemoryScope,
+    MemorySearchOptions, RecentMemoryOptions,
 };
 use tracing::warn;
 
@@ -17,6 +17,7 @@ use super::contracts::{
 use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::memory_embeddings::SharedMemoryEmbeddings;
+use crate::memory_store::{save_memory_manager, MemoryStoreConfig};
 
 pub(crate) async fn handle_create_memory(
     body: Vec<u8>,
@@ -27,18 +28,24 @@ pub(crate) async fn handle_create_memory(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let (memory_handle, embeddings_handle) = {
+    let (memory_handle, embeddings_handle, memory_store) = {
         let guard = state.read().await;
-        (guard.memory_handle(), guard.memory_embeddings_handle())
+        (
+            guard.memory_handle(),
+            guard.memory_embeddings_handle(),
+            guard.memory_store_config(),
+        )
     };
     let memory = {
         let mut memory_guard = memory_handle.write().await;
         let memory = memory_guard
             .add(new_memory)
             .map_err(|error| ApiError::bad_request(error.message()))?;
-        memory_guard.save().map_err(|error| {
-            ApiError::service_unavailable(format!("failed to persist memory: {error}"))
-        })?;
+        persist_memory_store(
+            memory_store.as_ref(),
+            &memory_guard,
+            "failed to persist memory",
+        )?;
         memory
     };
     index_memory_embedding(&embeddings_handle, &memory).await;
@@ -136,14 +143,19 @@ pub(crate) async fn handle_create_memory_entity(
         .map_err(ApiError::bad_request_static)?;
 
     let entity = {
-        let memory = { state.read().await.memory_handle() };
+        let (memory, memory_store) = {
+            let guard = state.read().await;
+            (guard.memory_handle(), guard.memory_store_config())
+        };
         let mut memory_guard = memory.write().await;
         let entity = memory_guard
             .upsert_entity(new_entity)
             .map_err(|error| ApiError::bad_request(error.message()))?;
-        memory_guard.save().map_err(|error| {
-            ApiError::service_unavailable(format!("failed to persist memory entity: {error}"))
-        })?;
+        persist_memory_store(
+            memory_store.as_ref(),
+            &memory_guard,
+            "failed to persist memory entity",
+        )?;
         entity
     };
 
@@ -194,9 +206,13 @@ pub(crate) async fn handle_add_evaluated_memory(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let (memory_handle, embeddings_handle) = {
+    let (memory_handle, embeddings_handle, memory_store) = {
         let guard = state.read().await;
-        (guard.memory_handle(), guard.memory_embeddings_handle())
+        (
+            guard.memory_handle(),
+            guard.memory_embeddings_handle(),
+            guard.memory_store_config(),
+        )
     };
     let outcome = {
         let mut memory_guard = memory_handle.write().await;
@@ -204,11 +220,11 @@ pub(crate) async fn handle_add_evaluated_memory(
             .add_evaluated(new_memory, options)
             .map_err(|error| ApiError::bad_request(error.message()))?;
         if outcome.memory.is_some() {
-            memory_guard.save().map_err(|error| {
-                ApiError::service_unavailable(format!(
-                    "failed to persist evaluated memory: {error}"
-                ))
-            })?;
+            persist_memory_store(
+                memory_store.as_ref(),
+                &memory_guard,
+                "failed to persist evaluated memory",
+            )?;
         }
         outcome
     };
@@ -285,9 +301,13 @@ pub(crate) async fn handle_apply_memory_retention(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let (memory_handle, embeddings_handle) = {
+    let (memory_handle, embeddings_handle, memory_store) = {
         let guard = state.read().await;
-        (guard.memory_handle(), guard.memory_embeddings_handle())
+        (
+            guard.memory_handle(),
+            guard.memory_embeddings_handle(),
+            guard.memory_store_config(),
+        )
     };
     let report = {
         let mut memory_guard = memory_handle.write().await;
@@ -298,11 +318,11 @@ pub(crate) async fn handle_apply_memory_retention(
             || !report.removed_memory_ids.is_empty()
             || !report.removed_relationship_ids.is_empty()
         {
-            memory_guard.save().map_err(|error| {
-                ApiError::service_unavailable(format!(
-                    "failed to persist memory retention changes: {error}"
-                ))
-            })?;
+            persist_memory_store(
+                memory_store.as_ref(),
+                &memory_guard,
+                "failed to persist memory retention changes",
+            )?;
         }
         report
     };
@@ -334,6 +354,15 @@ async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_id
     }
 }
 
+fn persist_memory_store(
+    memory_store: Option<&MemoryStoreConfig>,
+    manager: &MemoryManager,
+    message: &'static str,
+) -> Result<(), ApiError> {
+    save_memory_manager(memory_store, manager)
+        .map_err(|error| ApiError::service_unavailable(format!("{message}: {error}")))
+}
+
 pub(crate) async fn handle_create_agent_relationship(
     body: Vec<u8>,
     state: &SharedDaemonState,
@@ -344,14 +373,19 @@ pub(crate) async fn handle_create_agent_relationship(
         .map_err(ApiError::bad_request_static)?;
 
     let relationship = {
-        let memory = { state.read().await.memory_handle() };
+        let (memory, memory_store) = {
+            let guard = state.read().await;
+            (guard.memory_handle(), guard.memory_store_config())
+        };
         let mut memory_guard = memory.write().await;
         let relationship = memory_guard
             .upsert_agent_relationship(new_relationship)
             .map_err(|error| ApiError::bad_request(error.message()))?;
-        memory_guard.save().map_err(|error| {
-            ApiError::service_unavailable(format!("failed to persist agent relationship: {error}"))
-        })?;
+        persist_memory_store(
+            memory_store.as_ref(),
+            &memory_guard,
+            "failed to persist agent relationship",
+        )?;
         relationship
     };
 

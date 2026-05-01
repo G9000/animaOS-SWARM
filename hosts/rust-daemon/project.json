@@ -57,6 +57,24 @@
         "{workspaceRoot}/packages/core-rust/crates/**/*"
       ]
     },
+    "memory-locomo-agent": {
+      "executor": "nx:run-commands",
+      "cache": false,
+      "options": {
+        "cwd": ".",
+        "command": "bun tools/memory-eval/run-locomo-agent.mjs"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/hosts/rust-daemon/**/*",
+        "{workspaceRoot}/packages/core-rust/crates/**/*",
+        "{workspaceRoot}/packages/sdk/src/**/*",
+        "{workspaceRoot}/tools/memory-eval/download-locomo.mjs",
+        "{workspaceRoot}/tools/memory-eval/run-locomo-agent.mjs"
+      ]
+    },
     "lint": {
       "executor": "nx:run-commands",
       "options": {

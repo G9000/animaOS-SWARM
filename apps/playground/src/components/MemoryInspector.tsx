@@ -691,10 +691,11 @@ function RecallRow({
           {Math.round(result.score * 100)}%
         </span>
       </div>
-      <div className="mt-2 grid grid-cols-5 gap-1 text-[10px] text-[var(--muted-2)]">
+      <div className="mt-2 grid grid-cols-6 gap-1 text-[10px] text-[var(--muted-2)]">
         <Score label="lex" value={result.lexicalScore} />
         <Score label="vec" value={result.vectorScore} />
         <Score label="rel" value={result.relationshipScore} />
+        <Score label="tmp" value={result.temporalScore} />
         <Score label="new" value={result.recencyScore} />
         <Score label="imp" value={result.importanceScore} />
       </div>

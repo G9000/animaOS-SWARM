@@ -61,8 +61,8 @@
 - [ ] Keep tokenization behavior aligned with TS:
   - lowercase normalization
   - non-alphanumeric stripping
-  - stop-word filtering
-  - simple suffix stemming
+  - language-neutral Unicode terms
+  - CJK character/bigram terms for text without whitespace
 
 **Verification:**
 - `cargo test --manifest-path packages/animaos-rs/Cargo.toml -p anima-memory bm25`

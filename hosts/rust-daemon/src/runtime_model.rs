@@ -1,6 +1,7 @@
 mod anthropic;
 mod common;
 mod google;
+mod ollama;
 mod openai_compatible;
 
 #[cfg(test)]
@@ -15,6 +16,7 @@ use reqwest::Client;
 use self::{
     anthropic::{build_anthropic_body, parse_anthropic_response},
     google::{build_google_body, parse_google_response},
+    ollama::{build_ollama_body, parse_ollama_response},
     openai_compatible::{build_openai_compatible_body, parse_openai_compatible_response},
 };
 use crate::model::DeterministicModelAdapter;
@@ -375,6 +377,17 @@ impl RuntimeModelAdapter {
             ));
         }
 
+        if provider_name == "ollama" && config.tools.as_ref().is_none_or(|tools| tools.is_empty()) {
+            return self
+                .generate_ollama_native(
+                    &ollama_native_endpoint(&base_url),
+                    api_key.as_deref(),
+                    config,
+                    request,
+                )
+                .await;
+        }
+
         self.generate_openai_compatible(
             provider_def.label,
             &join_base_url(&base_url, "/chat/completions"),
@@ -472,6 +485,48 @@ impl RuntimeModelAdapter {
             .map_err(|error| format!("Google response parse failed: {error}"))?;
 
         parse_google_response(&payload)
+    }
+
+    async fn generate_ollama_native(
+        &self,
+        endpoint: &str,
+        api_key: Option<&str>,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        let body = build_ollama_body(config, request)?;
+        let mut request_builder = self
+            .client
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .json(&body);
+
+        if let Some(api_key) = api_key {
+            request_builder = request_builder.bearer_auth(api_key);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|error| format!("Ollama request failed: {error}"))?;
+        let status = response.status();
+        let payload_text = response
+            .text()
+            .await
+            .map_err(|error| format!("Ollama response read failed: {error}"))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "Ollama API error ({}): {}",
+                status.as_u16(),
+                payload_text
+            ));
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&payload_text)
+            .map_err(|error| format!("Ollama response parse failed: {error}"))?;
+
+        parse_ollama_response(&payload)
     }
 
     async fn generate_openai_compatible(
@@ -585,4 +640,10 @@ fn agent_setting_string(config: &AgentConfig, key: &str) -> Option<String> {
 
 fn join_base_url(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
+}
+
+fn ollama_native_endpoint(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let native_base = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    join_base_url(native_base, "/api/chat")
 }

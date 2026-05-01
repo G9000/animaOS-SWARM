@@ -1,13 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anima_memory::{
     InMemoryVectorIndex, Memory, MemoryTextEmbedder, MemoryVectorError, MemoryVectorIndex,
     VectorMemoryHit,
 };
+use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use reqwest::blocking::Client as BlockingHttpClient;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,8 @@ const DEFAULT_OLLAMA_EMBEDDING_DIMENSION: usize = 768;
 const DEFAULT_EMBEDDING_TIMEOUT_MS: u64 = 15_000;
 const LOCAL_PROVIDER: &str = "local";
 const LOCAL_MODEL: &str = "local-semantic-v1";
+const FASTEMBED_PROVIDER: &str = "fastembed";
+const DEFAULT_FASTEMBED_MODEL: &str = "intfloat/multilingual-e5-small";
 const OPENAI_PROVIDER: &str = "openai";
 const OPENAI_COMPATIBLE_PROVIDER: &str = "openai-compatible";
 const OLLAMA_PROVIDER: &str = "ollama";
@@ -106,6 +109,9 @@ impl MemoryEmbeddingRuntime {
                 }
                 MemoryEmbeddingProvider::Local(LocalMemoryEmbedder::new(dimension))
             }
+            FASTEMBED_PROVIDER | "local-model" | "local-neural" | "local-multilingual" => {
+                MemoryEmbeddingProvider::FastEmbed(FastEmbedMemoryEmbedder::from_env(dimension)?)
+            }
             OLLAMA_PROVIDER => MemoryEmbeddingProvider::OpenAiCompatible(
                 OpenAiCompatibleMemoryEmbedder::from_env(OpenAiCompatibleEmbeddingConfig {
                     provider: OLLAMA_PROVIDER,
@@ -160,7 +166,7 @@ impl MemoryEmbeddingRuntime {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "ANIMAOS_RS_MEMORY_EMBEDDINGS must be local, ollama, openai, openai-compatible, or disabled",
+                    "ANIMAOS_RS_MEMORY_EMBEDDINGS must be local, fastembed, ollama, openai, openai-compatible, or disabled",
                 ))
             }
         };
@@ -301,13 +307,19 @@ impl MemoryVectorIndex for MemoryEmbeddingRuntime {
         if !self.enabled {
             return Vec::new();
         }
-        self.index.search(query, limit)
+        let Ok(embedding) = self.embedder.embed_query(query) else {
+            return Vec::new();
+        };
+        self.index
+            .search_embedding(&embedding, limit)
+            .unwrap_or_default()
     }
 }
 
 #[derive(Clone, Debug)]
 enum MemoryEmbeddingProvider {
     Local(LocalMemoryEmbedder),
+    FastEmbed(FastEmbedMemoryEmbedder),
     OpenAiCompatible(OpenAiCompatibleMemoryEmbedder),
 }
 
@@ -315,6 +327,7 @@ impl MemoryEmbeddingProvider {
     fn provider(&self) -> &str {
         match self {
             Self::Local(_) => LOCAL_PROVIDER,
+            Self::FastEmbed(_) => FASTEMBED_PROVIDER,
             Self::OpenAiCompatible(embedder) => &embedder.provider,
         }
     }
@@ -322,6 +335,7 @@ impl MemoryEmbeddingProvider {
     fn model(&self) -> &str {
         match self {
             Self::Local(_) => LOCAL_MODEL,
+            Self::FastEmbed(embedder) => &embedder.model_name,
             Self::OpenAiCompatible(embedder) => &embedder.model,
         }
     }
@@ -329,6 +343,7 @@ impl MemoryEmbeddingProvider {
     fn storage_model(&self) -> String {
         match self {
             Self::Local(_) => LOCAL_MODEL.to_string(),
+            Self::FastEmbed(embedder) => format!("{FASTEMBED_PROVIDER}:{}", embedder.model_name),
             Self::OpenAiCompatible(embedder) => format!("{}:{}", embedder.provider, embedder.model),
         }
     }
@@ -336,6 +351,7 @@ impl MemoryEmbeddingProvider {
     fn dimension_hint(&self) -> Option<usize> {
         match self {
             Self::Local(embedder) => Some(embedder.dimension),
+            Self::FastEmbed(embedder) => Some(embedder.dimension),
             Self::OpenAiCompatible(embedder) => Some(embedder.dimension),
         }
     }
@@ -346,14 +362,27 @@ impl MemoryEmbeddingProvider {
             None => true,
         }
     }
+
+    fn embed_memory(&self, text: &str) -> Result<Vec<f32>, MemoryVectorError> {
+        match self {
+            Self::Local(embedder) => embedder.embed(text),
+            Self::FastEmbed(embedder) => embedder.embed_memory(text),
+            Self::OpenAiCompatible(embedder) => embedder.embed(text),
+        }
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, MemoryVectorError> {
+        match self {
+            Self::Local(embedder) => embedder.embed(text),
+            Self::FastEmbed(embedder) => embedder.embed_query(text),
+            Self::OpenAiCompatible(embedder) => embedder.embed(text),
+        }
+    }
 }
 
 impl MemoryTextEmbedder for MemoryEmbeddingProvider {
     fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryVectorError> {
-        match self {
-            Self::Local(embedder) => embedder.embed(text),
-            Self::OpenAiCompatible(embedder) => embedder.embed(text),
-        }
+        self.embed_memory(text)
     }
 }
 
@@ -390,6 +419,144 @@ impl MemoryTextEmbedder for LocalMemoryEmbedder {
         }
 
         Ok(vector)
+    }
+}
+
+#[derive(Clone)]
+struct FastEmbedMemoryEmbedder {
+    model_name: String,
+    dimension: usize,
+    prompt_style: FastEmbedPromptStyle,
+    model: Arc<Mutex<TextEmbedding>>,
+}
+
+impl std::fmt::Debug for FastEmbedMemoryEmbedder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FastEmbedMemoryEmbedder")
+            .field("model_name", &self.model_name)
+            .field("dimension", &self.dimension)
+            .field("prompt_style", &self.prompt_style)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastEmbedPromptStyle {
+    None,
+    E5,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FastEmbedEmbeddingConfig {
+    model: EmbeddingModel,
+    model_name: String,
+    dimension: usize,
+    prompt_style: FastEmbedPromptStyle,
+    cache_dir: Option<PathBuf>,
+    show_download_progress: bool,
+}
+
+impl FastEmbedMemoryEmbedder {
+    fn from_env(dimension: Option<usize>) -> io::Result<Self> {
+        let config = FastEmbedEmbeddingConfig::from_env(dimension)?;
+        let mut options = TextInitOptions::new(config.model.clone())
+            .with_show_download_progress(config.show_download_progress);
+        if let Some(cache_dir) = &config.cache_dir {
+            options = options.with_cache_dir(cache_dir.clone());
+        }
+        let model = TextEmbedding::try_new(options).map_err(fastembed_error)?;
+        Ok(Self {
+            model_name: config.model_name,
+            dimension: config.dimension,
+            prompt_style: config.prompt_style,
+            model: Arc::new(Mutex::new(model)),
+        })
+    }
+
+    fn embed_memory(&self, text: &str) -> Result<Vec<f32>, MemoryVectorError> {
+        self.embed_prefixed(text, FastEmbedTextRole::Passage)
+    }
+
+    fn embed_query(&self, text: &str) -> Result<Vec<f32>, MemoryVectorError> {
+        self.embed_prefixed(text, FastEmbedTextRole::Query)
+    }
+
+    fn embed_prefixed(
+        &self,
+        text: &str,
+        role: FastEmbedTextRole,
+    ) -> Result<Vec<f32>, MemoryVectorError> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(MemoryVectorError::EmbeddingUnavailable);
+        }
+        let input = self.prefixed_text(text, role);
+        let mut model = self
+            .model
+            .lock()
+            .map_err(|_| MemoryVectorError::EmbeddingUnavailable)?;
+        let embedding = model
+            .embed([input], None)
+            .map_err(|_| MemoryVectorError::EmbeddingUnavailable)?
+            .into_iter()
+            .next()
+            .filter(|embedding| !embedding.is_empty())
+            .ok_or(MemoryVectorError::EmbeddingUnavailable)?;
+        if embedding.len() != self.dimension {
+            return Err(MemoryVectorError::DimensionMismatch);
+        }
+        Ok(embedding)
+    }
+
+    fn prefixed_text(&self, text: &str, role: FastEmbedTextRole) -> String {
+        match (self.prompt_style, role) {
+            (FastEmbedPromptStyle::E5, FastEmbedTextRole::Query) => format!("query: {text}"),
+            (FastEmbedPromptStyle::E5, FastEmbedTextRole::Passage) => format!("passage: {text}"),
+            (FastEmbedPromptStyle::None, _) => text.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastEmbedTextRole {
+    Query,
+    Passage,
+}
+
+impl FastEmbedEmbeddingConfig {
+    fn from_env(dimension: Option<usize>) -> io::Result<Self> {
+        let model_name = std::env::var("ANIMAOS_RS_MEMORY_EMBEDDING_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_FASTEMBED_MODEL.to_string());
+        let model = parse_fastembed_model(&model_name)?;
+        let model_info = TextEmbedding::get_model_info(&model).map_err(fastembed_error)?;
+        let expected_dimension = model_info.dim;
+        if let Some(dimension) = dimension {
+            if dimension != expected_dimension {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "ANIMAOS_RS_MEMORY_EMBEDDING_DIMENSIONS must be {expected_dimension} for fastembed model {model_name}"
+                    ),
+                ));
+            }
+        }
+        let resolved_model_name = model_info.model_code.clone();
+        let prompt_style = prompt_style_for_model(&model_info.model);
+        Ok(Self {
+            model,
+            model_name: resolved_model_name,
+            dimension: expected_dimension,
+            prompt_style,
+            cache_dir: env_path("ANIMAOS_RS_MEMORY_EMBEDDINGS_CACHE_DIR")?,
+            show_download_progress: bool_from_env(
+                "ANIMAOS_RS_MEMORY_EMBEDDINGS_SHOW_DOWNLOAD_PROGRESS",
+                true,
+            )?,
+        })
     }
 }
 
@@ -744,6 +911,65 @@ fn timeout_millis_from_env() -> io::Result<u64> {
     Ok(timeout)
 }
 
+fn bool_from_env(name: &'static str, default: bool) -> io::Result<bool> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must not be empty"),
+        ));
+    }
+    match value.to_string_lossy().trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be true or false"),
+        )),
+    }
+}
+
+fn parse_fastembed_model(model: &str) -> io::Result<EmbeddingModel> {
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    let parsed = match normalized.as_str() {
+        "intfloat/multilingual-e5-small" | "multilingual-e5-small" | "e5-small" => {
+            EmbeddingModel::MultilingualE5Small
+        }
+        "intfloat/multilingual-e5-base" | "multilingual-e5-base" | "e5-base" => {
+            EmbeddingModel::MultilingualE5Base
+        }
+        "qdrant/multilingual-e5-large-onnx"
+        | "intfloat/multilingual-e5-large"
+        | "multilingual-e5-large"
+        | "e5-large" => EmbeddingModel::MultilingualE5Large,
+        "baai/bge-m3" | "bge-m3" => EmbeddingModel::BGEM3,
+        "xenova/paraphrase-multilingual-minilm-l12-v2"
+        | "paraphrase-multilingual-minilm-l12-v2" => EmbeddingModel::ParaphraseMLMiniLML12V2,
+        "qdrant/paraphrase-multilingual-minilm-l12-v2-onnx-q"
+        | "paraphrase-multilingual-minilm-l12-v2-q" => EmbeddingModel::ParaphraseMLMiniLML12V2Q,
+        "xenova/paraphrase-multilingual-mpnet-base-v2"
+        | "paraphrase-multilingual-mpnet-base-v2" => EmbeddingModel::ParaphraseMLMpnetBaseV2,
+        _ => model.parse::<EmbeddingModel>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported fastembed memory embedding model: {model}"),
+            )
+        })?,
+    };
+    Ok(parsed)
+}
+
+fn prompt_style_for_model(model: &EmbeddingModel) -> FastEmbedPromptStyle {
+    match model {
+        EmbeddingModel::MultilingualE5Small
+        | EmbeddingModel::MultilingualE5Base
+        | EmbeddingModel::MultilingualE5Large => FastEmbedPromptStyle::E5,
+        _ => FastEmbedPromptStyle::None,
+    }
+}
+
 fn first_non_empty_env_value(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| {
         std::env::var(name)
@@ -812,6 +1038,10 @@ fn json_error(error: serde_json::Error) -> io::Error {
 
 fn http_client_error(error: reqwest::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
+fn fastembed_error(error: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
 
 static SEMANTIC_GROUPS: &[&[&str]] = &[
@@ -1065,6 +1295,107 @@ mod tests {
         drop(guards);
     }
 
+    #[test]
+    fn fastembed_config_defaults_to_multilingual_e5_small() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not poison");
+        let guards = [
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDING_MODEL"),
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDING_DIMENSIONS"),
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDINGS_CACHE_DIR"),
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDINGS_SHOW_DOWNLOAD_PROGRESS"),
+        ];
+
+        let config = FastEmbedEmbeddingConfig::from_env(None)
+            .expect("default fastembed config should parse without downloading");
+
+        assert_eq!(config.model, EmbeddingModel::MultilingualE5Small);
+        assert_eq!(config.model_name, DEFAULT_FASTEMBED_MODEL);
+        assert_eq!(config.dimension, 384);
+        assert_eq!(config.prompt_style, FastEmbedPromptStyle::E5);
+        assert!(config.show_download_progress);
+        drop(guards);
+    }
+
+    #[test]
+    fn fastembed_config_accepts_model_aliases_and_cache_dir() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not poison");
+        let cache_dir = std::env::temp_dir().join("anima-fastembed-cache-test");
+        let cache_dir_string = cache_dir.to_string_lossy().to_string();
+        let guards = [
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDING_MODEL", "bge-m3"),
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDING_DIMENSIONS", "1024"),
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDINGS_CACHE_DIR", &cache_dir_string),
+            EnvGuard::set(
+                "ANIMAOS_RS_MEMORY_EMBEDDINGS_SHOW_DOWNLOAD_PROGRESS",
+                "false",
+            ),
+        ];
+
+        let config = FastEmbedEmbeddingConfig::from_env(Some(1024))
+            .expect("alias config should parse without downloading");
+
+        assert_eq!(config.model, EmbeddingModel::BGEM3);
+        assert_eq!(config.model_name, "BAAI/bge-m3");
+        assert_eq!(config.dimension, 1024);
+        assert_eq!(config.prompt_style, FastEmbedPromptStyle::None);
+        assert_eq!(config.cache_dir, Some(cache_dir));
+        assert!(!config.show_download_progress);
+        drop(guards);
+    }
+
+    #[test]
+    fn fastembed_config_rejects_dimension_mismatch_before_download() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not poison");
+        let guards = [
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDING_MODEL", "multilingual-e5-small"),
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDING_DIMENSIONS", "768"),
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDINGS_CACHE_DIR"),
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDINGS_SHOW_DOWNLOAD_PROGRESS"),
+        ];
+
+        let error = match FastEmbedEmbeddingConfig::from_env(Some(768)) {
+            Ok(_) => panic!("dimension mismatch should fail before model download"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("must be 384"));
+        drop(guards);
+    }
+
+    #[test]
+    #[ignore = "downloads a fastembed model from Hugging Face"]
+    fn fastembed_real_model_generates_multilingual_vectors() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not poison");
+        let cache_dir = std::env::temp_dir().join("anima-fastembed-real-model-test");
+        let cache_dir_string = cache_dir.to_string_lossy().to_string();
+        let guards = [
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDING_MODEL", DEFAULT_FASTEMBED_MODEL),
+            EnvGuard::unset("ANIMAOS_RS_MEMORY_EMBEDDING_DIMENSIONS"),
+            EnvGuard::set("ANIMAOS_RS_MEMORY_EMBEDDINGS_CACHE_DIR", &cache_dir_string),
+            EnvGuard::set(
+                "ANIMAOS_RS_MEMORY_EMBEDDINGS_SHOW_DOWNLOAD_PROGRESS",
+                "false",
+            ),
+        ];
+
+        let embedder = FastEmbedMemoryEmbedder::from_env(None)
+            .expect("fastembed model should download and load");
+        let memory = embedder
+            .embed_memory("Le gusta el te de menta antes de las demos de lanzamiento")
+            .expect("Spanish passage should embed");
+        let query = embedder
+            .embed_query("What drink does the user like before launch demos?")
+            .expect("cross-language query should embed");
+
+        assert_eq!(memory.len(), 384);
+        assert_eq!(query.len(), 384);
+        assert!(memory.iter().all(|value| value.is_finite()));
+        assert!(query.iter().all(|value| value.is_finite()));
+        assert!(cosine(&memory, &query) > 0.0);
+        drop(guards);
+    }
+
     fn test_memory(id: &str, content: &str) -> Memory {
         Memory {
             id: id.to_string(),
@@ -1115,6 +1446,25 @@ mod tests {
         });
 
         (format!("http://{address}/v1"), requests)
+    }
+
+    fn cosine(left: &[f32], right: &[f32]) -> f64 {
+        let dot: f64 = left
+            .iter()
+            .zip(right.iter())
+            .map(|(left, right)| f64::from(*left) * f64::from(*right))
+            .sum();
+        let left_magnitude = left
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        let right_magnitude = right
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        dot / (left_magnitude * right_magnitude)
     }
 
     struct EnvGuard {

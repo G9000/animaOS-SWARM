@@ -1,5 +1,3 @@
-use std::fs::{remove_file, write};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -7,10 +5,10 @@ use super::{
     AgentRelationshipOptions, MemoryEntityOptions, MemoryError, MemoryEvaluationDecision,
     MemoryEvaluationOptions, MemoryManager, MemoryRecallOptions, MemoryRetentionPolicy,
     MemoryScope, MemorySearchOptions, MemoryType, MemoryVectorIndex, NewAgentRelationship,
-    NewMemory, NewMemoryEntity, RecentMemoryOptions, RelationshipEndpointKind, VectorMemoryHit,
+    NewMemory, NewMemoryEntity, NewTemporalFact, NewTemporalRelationship, RecentMemoryOptions,
+    RelationshipEndpointKind, TemporalFactOptions, TemporalRecordStatus,
+    TemporalRelationshipOptions, VectorMemoryHit,
 };
-
-static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn base(overrides: impl FnOnce(&mut NewMemory)) -> NewMemory {
     let mut memory = NewMemory {
@@ -27,17 +25,6 @@ fn base(overrides: impl FnOnce(&mut NewMemory)) -> NewMemory {
     };
     overrides(&mut memory);
     memory
-}
-
-fn temp_path(label: &str) -> std::path::PathBuf {
-    let suffix = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("anima-memory-{label}-{suffix}.json"))
-}
-
-#[cfg(feature = "sqlite")]
-fn temp_sqlite_path(label: &str) -> std::path::PathBuf {
-    let suffix = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("anima-memory-{label}-{suffix}.sqlite"))
 }
 
 fn add_memory(manager: &mut MemoryManager, memory: NewMemory) -> super::Memory {
@@ -58,6 +45,61 @@ fn base_relationship(overrides: impl FnOnce(&mut NewAgentRelationship)) -> NewAg
         confidence: 0.7,
         evidence_memory_ids: vec!["mem-1".into()],
         tags: Some(vec!["launch".into()]),
+        room_id: Some("room-1".into()),
+        world_id: Some("world-1".into()),
+        session_id: Some("session-1".into()),
+    };
+    overrides(&mut relationship);
+    relationship
+}
+
+fn base_temporal_fact(overrides: impl FnOnce(&mut NewTemporalFact)) -> NewTemporalFact {
+    let mut fact = NewTemporalFact {
+        subject_kind: RelationshipEndpointKind::User,
+        subject_id: "user-leo".into(),
+        subject_name: "Leo".into(),
+        predicate: "prefers_drink".into(),
+        object_kind: None,
+        object_id: None,
+        object_name: None,
+        value: Some("mint tea".into()),
+        valid_from: Some(1_700_000_000_000),
+        valid_to: None,
+        observed_at: Some(1_700_000_000_000),
+        confidence: 0.84,
+        evidence_memory_ids: Vec::new(),
+        supersedes_fact_ids: Vec::new(),
+        status: None,
+        tags: Some(vec!["preference".into()]),
+        room_id: Some("room-1".into()),
+        world_id: Some("world-1".into()),
+        session_id: Some("session-1".into()),
+    };
+    overrides(&mut fact);
+    fact
+}
+
+fn base_temporal_relationship(
+    overrides: impl FnOnce(&mut NewTemporalRelationship),
+) -> NewTemporalRelationship {
+    let mut relationship = NewTemporalRelationship {
+        source_kind: RelationshipEndpointKind::Agent,
+        source_id: "planner".into(),
+        source_name: "Planner".into(),
+        target_kind: RelationshipEndpointKind::Agent,
+        target_id: "critic".into(),
+        target_name: "Critic".into(),
+        relationship_type: "trusts_for_launch_review".into(),
+        summary: Some("Planner trusts Critic for launch review.".into()),
+        strength: 0.65,
+        confidence: 0.72,
+        valid_from: Some(1_700_000_000_000),
+        valid_to: None,
+        observed_at: Some(1_700_000_000_000),
+        evidence_memory_ids: Vec::new(),
+        supersedes_relationship_ids: Vec::new(),
+        status: None,
+        tags: Some(vec!["agent-agent".into()]),
         room_id: Some("room-1".into()),
         world_id: Some("world-1".into()),
         session_id: Some("session-1".into()),
@@ -736,6 +778,320 @@ fn trace_memory_returns_relationship_evidence_and_entities() {
 }
 
 #[test]
+fn temporal_fact_supersession_prefers_current_fact_by_default() {
+    let mut manager = MemoryManager::new();
+    let january = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "In January, Leo preferred espresso before demos.".into();
+        }),
+    );
+    let april = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "In April, Leo switched to mint tea before demos.".into();
+        }),
+    );
+    let old_fact = manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.value = Some("espresso".into());
+            fact.valid_from = Some(1_704_067_200_000);
+            fact.observed_at = Some(1_704_067_200_000);
+            fact.evidence_memory_ids = vec![january.id.clone()];
+        }))
+        .expect("old fact should be added");
+    let current_fact = manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.value = Some("mint tea".into());
+            fact.valid_from = Some(1_711_923_200_000);
+            fact.observed_at = Some(1_711_923_200_000);
+            fact.evidence_memory_ids = vec![april.id.clone()];
+            fact.supersedes_fact_ids = vec![old_fact.id.clone()];
+        }))
+        .expect("current fact should be added");
+
+    let current = manager.list_temporal_facts(TemporalFactOptions {
+        subject_id: Some("user-leo".into()),
+        predicate: Some("prefers_drink".into()),
+        valid_at: Some(1_713_000_000_000),
+        ..TemporalFactOptions::default()
+    });
+    let historical = manager.list_temporal_facts(TemporalFactOptions {
+        subject_id: Some("user-leo".into()),
+        predicate: Some("prefers_drink".into()),
+        valid_at: Some(1_705_000_000_000),
+        include_inactive: true,
+        ..TemporalFactOptions::default()
+    });
+    let superseded = manager
+        .get_temporal_fact(&old_fact.id)
+        .expect("superseded fact should still exist");
+
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, current_fact.id);
+    assert_eq!(current[0].value.as_deref(), Some("mint tea"));
+    assert_eq!(historical.len(), 1);
+    assert_eq!(historical[0].id, old_fact.id);
+    assert_eq!(superseded.status, TemporalRecordStatus::Superseded);
+    assert_eq!(superseded.valid_to, Some(1_711_923_200_000));
+    assert_eq!(manager.temporal_fact_count(), 2);
+}
+
+#[test]
+fn temporal_fact_rejects_invalid_ranges_and_empty_values() {
+    let mut manager = MemoryManager::new();
+
+    let range_error = manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.valid_from = Some(200);
+            fact.valid_to = Some(100);
+        }))
+        .expect_err("invalid temporal range should fail");
+    let empty_error = manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.object_id = None;
+            fact.object_name = None;
+            fact.value = None;
+        }))
+        .expect_err("fact without object or value should fail");
+
+    assert_eq!(range_error, MemoryError::InvalidTemporalValidityRange);
+    assert_eq!(empty_error, MemoryError::InvalidTemporalObject);
+}
+
+#[test]
+fn recall_uses_active_temporal_fact_evidence() {
+    let mut manager = MemoryManager::new();
+    let evidence = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "In April, Leo switched to mint tea before demos.".into();
+            memory.importance = 0.4;
+        }),
+    );
+    manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.predicate = "prefers_drink".into();
+            fact.value = Some("mint tea".into());
+            fact.evidence_memory_ids = vec![evidence.id.clone()];
+        }))
+        .expect("temporal fact should add");
+
+    let results = manager.recall(
+        "What drink does Leo prefer before demos?",
+        MemoryRecallOptions {
+            lexical_limit: Some(0),
+            recent_limit: Some(0),
+            relationship_limit: Some(0),
+            temporal_limit: Some(5),
+            limit: Some(3),
+            ..MemoryRecallOptions::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory.id, evidence.id);
+    assert!(results[0].temporal_score > 0.8);
+    assert_eq!(results[0].lexical_score, 0.0);
+}
+
+#[test]
+fn recall_temporal_fact_accepts_custom_intent_terms() {
+    let mut manager = MemoryManager::new();
+    let evidence = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "Leo switched to yerba mate before demos.".into();
+            memory.importance = 0.4;
+        }),
+    );
+    manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.predicate = "prefers_drink".into();
+            fact.value = Some("yerba mate".into());
+            fact.evidence_memory_ids = vec![evidence.id.clone()];
+        }))
+        .expect("temporal fact should add");
+
+    let results = manager.recall(
+        "Leo bebida",
+        MemoryRecallOptions {
+            lexical_limit: Some(0),
+            recent_limit: Some(0),
+            relationship_limit: Some(0),
+            temporal_limit: Some(5),
+            temporal_intent_terms: vec!["bebida".into()],
+            limit: Some(3),
+            ..MemoryRecallOptions::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory.id, evidence.id);
+    assert!(results[0].temporal_score > 0.8);
+}
+
+#[test]
+fn recall_ignores_superseded_temporal_fact_evidence() {
+    let mut manager = MemoryManager::new();
+    let old_evidence = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "In January, Leo preferred espresso before demos.".into();
+        }),
+    );
+    let current_evidence = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "In April, Leo switched to mint tea before demos.".into();
+        }),
+    );
+    let old_fact = manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.value = Some("espresso".into());
+            fact.evidence_memory_ids = vec![old_evidence.id.clone()];
+        }))
+        .expect("old fact should add");
+    manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.value = Some("mint tea".into());
+            fact.evidence_memory_ids = vec![current_evidence.id.clone()];
+            fact.supersedes_fact_ids = vec![old_fact.id.clone()];
+        }))
+        .expect("current fact should add");
+
+    let results = manager.recall(
+        "What does Leo prefer before demos?",
+        MemoryRecallOptions {
+            lexical_limit: Some(0),
+            recent_limit: Some(0),
+            temporal_limit: Some(5),
+            limit: Some(3),
+            ..MemoryRecallOptions::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory.id, current_evidence.id);
+    assert!(results[0].temporal_score > 0.8);
+}
+
+#[test]
+fn recall_temporal_fact_respects_context_filters() {
+    let mut manager = MemoryManager::new();
+    let evidence = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "Leo prefers mint tea in the private planning room.".into();
+            memory.scope = Some(MemoryScope::Room);
+            memory.room_id = Some("room-2".into());
+        }),
+    );
+    manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.value = Some("mint tea".into());
+            fact.evidence_memory_ids = vec![evidence.id];
+            fact.room_id = Some("room-2".into());
+        }))
+        .expect("temporal fact should add");
+
+    let results = manager.recall(
+        "What drink does Leo prefer?",
+        MemoryRecallOptions {
+            lexical_limit: Some(0),
+            recent_limit: Some(0),
+            temporal_limit: Some(5),
+            limit: Some(3),
+            search: MemorySearchOptions {
+                scope: Some(MemoryScope::Room),
+                room_id: Some("room-1".into()),
+                ..MemorySearchOptions::default()
+            },
+            ..MemoryRecallOptions::default()
+        },
+    );
+
+    assert!(results.is_empty());
+}
+
+#[test]
+fn recall_temporal_text_fallback_requires_subject_anchor() {
+    let mut manager = MemoryManager::new();
+    let leo_memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "Leo prefers mint tea before demos.".into();
+        }),
+    );
+    add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "Maya prefers mint tea before finance reviews.".into();
+        }),
+    );
+    manager
+        .add_temporal_fact(base_temporal_fact(|fact| {
+            fact.value = Some("mint tea".into());
+            fact.evidence_memory_ids = Vec::new();
+        }))
+        .expect("temporal fact should add");
+
+    let results = manager.recall(
+        "What drink does Leo prefer?",
+        MemoryRecallOptions {
+            lexical_limit: Some(0),
+            recent_limit: Some(0),
+            temporal_limit: Some(5),
+            limit: Some(3),
+            ..MemoryRecallOptions::default()
+        },
+    );
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].memory.id, leo_memory.id);
+    assert!(results[0].temporal_score > 0.7);
+}
+
+#[test]
+fn temporal_relationship_supersession_tracks_agent_relationship_evolution() {
+    let mut manager = MemoryManager::new();
+    let old_relationship = manager
+        .add_temporal_relationship(base_temporal_relationship(|relationship| {
+            relationship.summary = Some("Planner has limited confidence in Critic.".into());
+            relationship.strength = 0.35;
+            relationship.valid_from = Some(1_704_067_200_000);
+            relationship.observed_at = Some(1_704_067_200_000);
+        }))
+        .expect("old relationship should be added");
+    let current_relationship = manager
+        .add_temporal_relationship(base_temporal_relationship(|relationship| {
+            relationship.summary = Some("Planner now trusts Critic for launch review.".into());
+            relationship.strength = 0.91;
+            relationship.valid_from = Some(1_711_923_200_000);
+            relationship.observed_at = Some(1_711_923_200_000);
+            relationship.supersedes_relationship_ids = vec![old_relationship.id.clone()];
+        }))
+        .expect("current relationship should be added");
+
+    let current = manager.list_temporal_relationships(TemporalRelationshipOptions {
+        source_id: Some("planner".into()),
+        target_id: Some("critic".into()),
+        valid_at: Some(1_713_000_000_000),
+        ..TemporalRelationshipOptions::default()
+    });
+    let superseded = manager
+        .get_temporal_relationship(&old_relationship.id)
+        .expect("superseded relationship should remain traceable");
+
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].id, current_relationship.id);
+    assert_eq!(current[0].strength, 0.91);
+    assert_eq!(superseded.status, TemporalRecordStatus::Superseded);
+    assert_eq!(superseded.valid_to, Some(1_711_923_200_000));
+    assert_eq!(manager.temporal_relationship_count(), 2);
+}
+
+#[test]
 fn list_agent_relationships_agent_filter_ignores_non_agent_endpoints() {
     let mut manager = MemoryManager::new();
     manager
@@ -982,6 +1338,46 @@ fn recall_with_vector_index_can_retrieve_semantic_hit() {
 
     assert_eq!(results[0].memory.id, vector_memory.id);
     assert_eq!(results[0].vector_score, 1.0);
+}
+
+#[test]
+fn recall_prioritizes_exact_lexical_evidence_over_noisy_vector_hit() {
+    let mut manager = MemoryManager::new();
+    let exact_memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content =
+                "Melanie's kids love nature. The kids love forest hikes and nature views.".into();
+            memory.importance = 0.55;
+        }),
+    );
+    let noisy_vector_memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "Melanie likes learning about animals at the museum.".into();
+            memory.importance = 0.55;
+        }),
+    );
+    let vector_index = StaticVectorIndex {
+        hits: vec![VectorMemoryHit {
+            memory_id: noisy_vector_memory.id,
+            score: 1.0,
+        }],
+    };
+
+    let results = manager.recall_with_vector_index(
+        "What nature and forest things do Melanie's kids love?",
+        MemoryRecallOptions {
+            recent_limit: Some(0),
+            limit: Some(2),
+            ..MemoryRecallOptions::default()
+        },
+        Some(&vector_index),
+    );
+
+    assert_eq!(results[0].memory.id, exact_memory.id);
+    assert!(results[0].lexical_score > results[1].lexical_score);
+    assert_eq!(results[1].vector_score, 1.0);
 }
 
 #[test]
@@ -1316,497 +1712,6 @@ fn clear_removes_cleared_memories_from_search_index() {
     let results = manager.search("agent B fact", MemorySearchOptions::default());
     assert!(!results.is_empty());
     assert!(results.iter().all(|result| result.agent_id == "a2"));
-}
-
-#[test]
-fn save_writes_memories_to_json_file() {
-    let path = temp_path("save");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "saved fact".into()),
-    );
-    manager.save().expect("save should succeed");
-
-    let contents = std::fs::read_to_string(&path).expect("saved file should be readable");
-    assert!(contents.contains("saved fact"));
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_restores_memories_from_json_file() {
-    let path = temp_path("load");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "persisted memory".into()),
-    );
-    add_memory(
-        &mut manager,
-        base(|memory| {
-            memory.content = "another persisted memory".into();
-            memory.agent_name = "writer".into();
-        }),
-    );
-    manager.save().expect("save should succeed");
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-
-    assert_eq!(reloaded.size(), 2);
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[test]
-fn save_and_load_restores_agent_relationships() {
-    let path = temp_path("relationships");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager
-        .upsert_agent_relationship(base_relationship(|_| {}))
-        .expect("relationship should be created");
-    manager.save().expect("save should succeed");
-
-    let contents = std::fs::read_to_string(&path).expect("saved file should be readable");
-    assert!(contents.contains("agentRelationships"));
-    assert!(contents.contains("collaborates_with"));
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-
-    let relationships = reloaded.list_agent_relationships(AgentRelationshipOptions::default());
-    assert_eq!(relationships.len(), 1);
-    assert_eq!(relationships[0].source_agent_id, "planner");
-    assert_eq!(relationships[0].target_agent_id, "critic");
-    assert_eq!(
-        relationships[0].evidence_memory_ids,
-        vec!["mem-1".to_string()]
-    );
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[test]
-fn save_and_load_restores_entities() {
-    let path = temp_path("entities");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager
-        .upsert_entity(NewMemoryEntity {
-            kind: RelationshipEndpointKind::User,
-            id: "user-1".into(),
-            name: "Leo".into(),
-            aliases: vec!["operator".into()],
-            summary: Some("Primary operator".into()),
-        })
-        .expect("entity should be created");
-    manager.save().expect("save should succeed");
-
-    let contents = std::fs::read_to_string(&path).expect("saved file should be readable");
-    assert!(contents.contains("\"entities\""));
-    assert!(contents.contains("Primary operator"));
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-
-    let entity = reloaded
-        .get_entity(RelationshipEndpointKind::User, "user-1")
-        .expect("entity should be restored");
-    assert_eq!(entity.name, "Leo");
-    assert_eq!(entity.aliases, vec!["operator".to_string()]);
-    assert_eq!(entity.summary.as_deref(), Some("Primary operator"));
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[test]
-fn load_still_accepts_legacy_memory_array_file() {
-    let path = temp_path("legacy-array");
-    let _ = remove_file(&path);
-    std::fs::write(
-        &path,
-        r#"[{"id":"mem-1","agentId":"agent-1","agentName":"researcher","type":"fact","content":"legacy memory","importance":0.8,"createdAt":123,"tags":null}]"#,
-    )
-    .expect("fixture written");
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager.load().expect("legacy load should succeed");
-
-    assert_eq!(manager.size(), 1);
-    assert_eq!(manager.relationship_count(), 0);
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_restores_search_index() {
-    let path = temp_path("index");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| {
-            memory.content = "Nx is a build system for monorepos".into();
-        }),
-    );
-    manager.save().expect("save should succeed");
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-
-    let results = reloaded.search("Nx monorepo build", MemorySearchOptions::default());
-    assert!(!results.is_empty());
-    assert!(results[0].content.contains("Nx"));
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[test]
-fn load_preserves_id_and_created_at() {
-    let path = temp_path("preserve");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    let original = add_memory(
-        &mut manager,
-        base(|memory| memory.content = "to be preserved".into()),
-    );
-    manager.save().expect("save should succeed");
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-
-    let restored = reloaded.get_recent(RecentMemoryOptions::default())[0].clone();
-    assert_eq!(restored.id, original.id);
-    assert_eq!(restored.created_at, original.created_at);
-    assert_eq!(restored.content, original.content);
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[test]
-fn load_is_a_noop_when_file_does_not_exist() {
-    let path = temp_path("missing");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path);
-    manager
-        .load()
-        .expect("load should not fail for missing file");
-    assert_eq!(manager.size(), 0);
-}
-
-#[test]
-fn load_is_a_noop_without_storage_file() {
-    let mut manager = MemoryManager::new();
-    manager
-        .load()
-        .expect("load should not fail without a configured file");
-    assert_eq!(manager.size(), 0);
-}
-
-#[test]
-fn save_is_a_noop_without_storage_file() {
-    let mut manager = MemoryManager::new();
-    add_memory(&mut manager, base(|_| {}));
-    manager
-        .save()
-        .expect("save should not fail without a configured file");
-}
-
-#[test]
-fn load_recovers_from_corrupted_file() {
-    let path = temp_path("corrupted");
-    let _ = remove_file(&path);
-    write(&path, "{ this is not valid JSON }").expect("corrupted file should be written");
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager
-        .load()
-        .expect("load should not fail for corrupted JSON");
-    assert_eq!(manager.size(), 0);
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_ignores_out_of_range_importance_in_json_file() {
-    let path = temp_path("invalid-importance");
-    let _ = remove_file(&path);
-    std::fs::write(
-        &path,
-        r#"[{"id":"mem-1","agentId":"agent-1","agentName":"researcher","type":"fact","content":"bad importance","importance":1.1,"createdAt":123,"tags":null}]"#,
-    )
-    .expect("fixture written");
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager
-        .load()
-        .expect("load should recover from invalid importance");
-
-    assert_eq!(manager.size(), 0, "invalid importance should not be loaded");
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_is_idempotent() {
-    let path = temp_path("idempotent");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "unique memory".into()),
-    );
-    manager.save().expect("save should succeed");
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("first load should succeed");
-    reloaded.load().expect("second load should succeed");
-
-    assert_eq!(reloaded.size(), 1);
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[test]
-fn save_can_be_called_multiple_times() {
-    let path = temp_path("save-many");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "fact one".into()),
-    );
-    manager.save().expect("first save should succeed");
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "fact two".into()),
-    );
-    manager.save().expect("second save should succeed");
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-    assert_eq!(reloaded.size(), 2);
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_save_and_load_restores_memory_graph() {
-    let path = temp_sqlite_path("graph-round-trip");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_sqlite_file(path.clone());
-    let memory = add_memory(
-        &mut manager,
-        base(|memory| {
-            memory.agent_id = "planner".into();
-            memory.agent_name = "Planner".into();
-            memory.content = "SQLite should preserve the rollback rehearsal preference".into();
-            memory.importance = 0.82;
-            memory.tags = Some(vec!["preference".into(), "rollback".into()]);
-            memory.scope = Some(MemoryScope::Room);
-            memory.room_id = Some("room-1".into());
-            memory.world_id = Some("world-1".into());
-            memory.session_id = Some("session-1".into());
-        }),
-    );
-    manager
-        .upsert_entity(NewMemoryEntity {
-            kind: RelationshipEndpointKind::User,
-            id: "user-1".into(),
-            name: "Leo".into(),
-            aliases: vec!["operator".into()],
-            summary: Some("Primary operator".into()),
-        })
-        .expect("entity should be created");
-    manager
-        .upsert_agent_relationship(base_relationship(|relationship| {
-            relationship.source_agent_id = "planner".into();
-            relationship.source_agent_name = "Planner".into();
-            relationship.target_kind = Some(RelationshipEndpointKind::User);
-            relationship.target_agent_id = "user-1".into();
-            relationship.target_agent_name = "Leo".into();
-            relationship.relationship_type = "responds_to".into();
-            relationship.evidence_memory_ids = vec![memory.id.clone()];
-            relationship.tags = Some(vec!["runtime".into(), "user-stated".into()]);
-        }))
-        .expect("relationship should be created");
-    manager.save().expect("sqlite save should succeed");
-
-    let mut reloaded = MemoryManager::with_sqlite_file(path.clone());
-    reloaded.load().expect("sqlite load should succeed");
-
-    let results = reloaded.search("rollback rehearsal", MemorySearchOptions::default());
-    assert_eq!(reloaded.size(), 1);
-    assert!(!results.is_empty());
-    assert_eq!(
-        results[0].tags,
-        Some(vec!["preference".into(), "rollback".into()])
-    );
-
-    let entity = reloaded
-        .get_entity(RelationshipEndpointKind::User, "user-1")
-        .expect("user entity should reload");
-    assert_eq!(entity.aliases, vec!["operator".to_string()]);
-    assert_eq!(entity.summary.as_deref(), Some("Primary operator"));
-
-    let trace = reloaded
-        .trace_memory(&memory.id)
-        .expect("trace should reload");
-    assert_eq!(trace.relationships.len(), 1);
-    assert_eq!(trace.relationships[0].evidence_memory_ids, vec![memory.id]);
-    assert!(trace
-        .entities
-        .iter()
-        .any(|entity| entity.kind == RelationshipEndpointKind::User && entity.id == "user-1"));
-
-    let _ = remove_file(&path);
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_save_replaces_previous_snapshot() {
-    let path = temp_sqlite_path("replace-snapshot");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_sqlite_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "stale sqlite memory".into()),
-    );
-    manager.save().expect("first sqlite save should succeed");
-
-    manager.clear(None);
-    add_memory(
-        &mut manager,
-        base(|memory| memory.content = "fresh sqlite memory".into()),
-    );
-    manager.save().expect("second sqlite save should succeed");
-
-    let mut reloaded = MemoryManager::with_sqlite_file(path.clone());
-    reloaded.load().expect("sqlite load should succeed");
-
-    assert_eq!(reloaded.size(), 1);
-    assert!(reloaded
-        .search("fresh sqlite", MemorySearchOptions::default())
-        .iter()
-        .any(|memory| memory.content == "fresh sqlite memory"));
-    assert!(!reloaded
-        .search("stale", MemorySearchOptions::default())
-        .iter()
-        .any(|memory| memory.content == "stale sqlite memory"));
-
-    let _ = remove_file(&path);
-}
-
-#[cfg(feature = "sqlite")]
-#[test]
-fn sqlite_load_is_a_noop_when_file_does_not_exist() {
-    let path = temp_sqlite_path("missing");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_sqlite_file(path);
-    manager
-        .load()
-        .expect("sqlite load should not fail for missing file");
-
-    assert_eq!(manager.size(), 0);
-}
-
-#[test]
-fn save_escapes_control_characters_in_json_file() {
-    let path = temp_path("control-chars");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    add_memory(
-        &mut manager,
-        base(|memory| {
-            memory.content = format!("has{}backspace{}formfeed", '\u{0008}', '\u{000c}');
-        }),
-    );
-    manager.save().expect("save should succeed");
-
-    let contents = std::fs::read_to_string(&path).expect("saved file should be readable");
-    assert!(
-        contents.contains("\\u0008"),
-        "saved JSON should escape backspace: {contents:?}"
-    );
-    assert!(
-        contents.contains("\\u000c"),
-        "saved JSON should escape form-feed: {contents:?}"
-    );
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_decodes_surrogate_pair_unicode_escape() {
-    let path = temp_path("surrogate-pair");
-    let _ = remove_file(&path);
-    std::fs::write(
-        &path,
-        r#"[{"id":"mem-1","agentId":"agent-1","agentName":"researcher","type":"fact","content":"launch \ud83d\ude80","importance":0.8,"createdAt":123,"tags":["emoji"]}]"#,
-    )
-    .expect("fixture written");
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager.load().expect("load should succeed");
-
-    let memories = manager.get_recent(RecentMemoryOptions::default());
-    assert_eq!(memories.len(), 1);
-    assert_eq!(memories[0].content, "launch 🚀");
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_ignores_unescaped_newline_in_json_string() {
-    let path = temp_path("raw-newline");
-    let _ = remove_file(&path);
-    std::fs::write(
-        &path,
-        format!(
-            "[{{\"id\":\"mem-1\",\"agentId\":\"agent-1\",\"agentName\":\"researcher\",\"type\":\"fact\",\"content\":\"bad{}json\",\"importance\":0.8,\"createdAt\":123,\"tags\":null}}]",
-            '\n'
-        ),
-    )
-    .expect("fixture written");
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    manager
-        .load()
-        .expect("load should recover from malformed file");
-
-    assert_eq!(manager.size(), 0, "malformed file should not be loaded");
-    let _ = remove_file(&path);
-}
-
-#[test]
-fn load_preserves_unicode_content_and_tags() {
-    let path = temp_path("unicode");
-    let _ = remove_file(&path);
-
-    let mut manager = MemoryManager::with_storage_file(path.clone());
-    let original = add_memory(
-        &mut manager,
-        base(|memory| {
-            memory.agent_name = "分析者".into();
-            memory.content = "Café 猫 🚀".into();
-            memory.tags = Some(vec!["naïve".into(), "测试".into()]);
-        }),
-    );
-    manager.save().expect("save should succeed");
-
-    let mut reloaded = MemoryManager::with_storage_file(path);
-    reloaded.load().expect("load should succeed");
-
-    let restored = reloaded.get_recent(RecentMemoryOptions::default())[0].clone();
-    assert_eq!(restored.agent_name, original.agent_name);
-    assert_eq!(restored.content, original.content);
-    assert_eq!(restored.tags, original.tags);
-    let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
 }
 
 #[test]

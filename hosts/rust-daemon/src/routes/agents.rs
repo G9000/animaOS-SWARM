@@ -8,6 +8,7 @@ use super::contracts::{
 };
 use super::ApiError;
 use crate::app::SharedDaemonState;
+use crate::memory_store::save_memory_manager;
 
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
@@ -126,7 +127,7 @@ pub(crate) async fn handle_run_agent(
             }
         })
         .await;
-    let (snapshot, runtime_id, runtime_name, memory, memory_embeddings) = {
+    let (snapshot, runtime_id, runtime_name, memory, memory_embeddings, memory_store) = {
         let mut guard = state.write().await;
         guard.restore_agent_runtime(runtime)
     };
@@ -146,7 +147,7 @@ pub(crate) async fn handle_run_agent(
                 world_id: None,
                 session_id: None,
             }) {
-                Ok(memory) => match memory_guard.save() {
+                Ok(memory) => match save_memory_manager(memory_store.as_ref(), &memory_guard) {
                     Ok(()) => Ok(memory),
                     Err(error) => Err(format!("failed to persist memory: {error}")),
                 },

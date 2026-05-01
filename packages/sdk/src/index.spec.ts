@@ -389,6 +389,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
               lexicalScore: 0,
               vectorScore: 0,
               relationshipScore: 0.9,
+              temporalScore: 0.8,
               recencyScore: 0,
               importanceScore: 0.74,
             },
@@ -546,6 +547,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
         entityId: 'user-1',
         agentId: 'agent-1',
         recentLimit: 0,
+        temporalLimit: 7,
         limit: 3,
       })
     ).resolves.toEqual([
@@ -554,6 +556,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
           id: 'memory-9',
         }),
         relationshipScore: 0.9,
+        temporalScore: 0.8,
       }),
     ]);
 
@@ -639,7 +642,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       5,
-      'http://daemon.test/api/memories/recall?q=evidence+probe&agentId=agent-1&limit=3&entityId=user-1&recentLimit=0',
+      'http://daemon.test/api/memories/recall?q=evidence+probe&agentId=agent-1&limit=3&entityId=user-1&recentLimit=0&temporalLimit=7',
       expect.any(Object)
     );
     expect(fetchMock).toHaveBeenNthCalledWith(

@@ -121,35 +121,37 @@ async fn runtime_adapter_routes_openai_requests_through_real_http_adapter() {
 #[tokio::test]
 async fn runtime_adapter_routes_ollama_requests_through_real_http_adapter() {
     let app = Router::new().route(
-        "/v1/chat/completions",
-        post(|Json(_body): Json<Value>| async move {
+        "/api/chat",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body.get("think"), Some(&Value::Bool(false)));
+            assert_eq!(body.get("stream"), Some(&Value::Bool(false)));
+            assert_eq!(
+                body.pointer("/options/num_predict").and_then(Value::as_u64),
+                Some(512)
+            );
+            assert_eq!(
+                body.pointer("/options/temperature").and_then(Value::as_f64),
+                Some(0.2)
+            );
             Json(json!({
-                "choices": [
-                    {
-                        "message": {
-                            "content": "researched and drafted the campaign"
-                        },
-                        "finish_reason": "stop"
-                    }
-                ],
-                "usage": {
-                    "prompt_tokens": 5,
-                    "completion_tokens": 7,
-                    "total_tokens": 12
-                }
+                "model": "ollama-test",
+                "message": {
+                    "role": "assistant",
+                    "content": "researched and drafted the campaign"
+                },
+                "done": true,
+                "done_reason": "stop",
+                "prompt_eval_count": 5,
+                "eval_count": 7
             }))
         }),
     );
 
     let base_url = spawn_server(app).await;
-    let adapter = RuntimeModelAdapter::with_config(test_config(&[(
-        "ollama",
-        None,
-        &format!("{base_url}/v1"),
-    )]));
+    let adapter = RuntimeModelAdapter::with_config(test_config(&[("ollama", None, &base_url)]));
 
     let response = adapter
-        .generate(&agent_config("ollama"), &request())
+        .generate(&agent_config_without_tools("ollama"), &request())
         .await
         .expect("ollama adapter should generate");
 
@@ -267,6 +269,12 @@ fn agent_config(provider: &str) -> AgentConfig {
         plugins: None,
         settings: None,
     }
+}
+
+fn agent_config_without_tools(provider: &str) -> AgentConfig {
+    let mut config = agent_config(provider);
+    config.tools = None;
+    config
 }
 
 fn request() -> ModelGenerateRequest {

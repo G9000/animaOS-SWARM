@@ -290,7 +290,8 @@ function RelationshipPanel({
                   </span>
                 </div>
                 <div className="mt-1 text-[11px] text-[var(--muted-2)]">
-                  relationship {Math.round(result.relationshipScore * 100)}% · importance{' '}
+                  relationship {Math.round(result.relationshipScore * 100)}% · temporal{' '}
+                  {Math.round(result.temporalScore * 100)}% · importance{' '}
                   {Math.round(result.importanceScore * 100)}%
                 </div>
               </div>

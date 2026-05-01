@@ -145,6 +145,7 @@ export interface MemoryRecallOptions {
   lexicalLimit?: number;
   recentLimit?: number;
   relationshipLimit?: number;
+  temporalLimit?: number;
   minImportance?: number;
 }
 
@@ -154,6 +155,7 @@ export interface MemoryRecallResult {
   lexicalScore: number;
   vectorScore: number;
   relationshipScore: number;
+  temporalScore: number;
   recencyScore: number;
   importanceScore: number;
 }
@@ -469,6 +471,7 @@ export const memories = {
     if (opts?.lexicalLimit !== undefined) params.set('lexicalLimit', String(opts.lexicalLimit));
     if (opts?.recentLimit !== undefined) params.set('recentLimit', String(opts.recentLimit));
     if (opts?.relationshipLimit !== undefined) params.set('relationshipLimit', String(opts.relationshipLimit));
+    if (opts?.temporalLimit !== undefined) params.set('temporalLimit', String(opts.temporalLimit));
     if (opts?.minImportance !== undefined) params.set('minImportance', String(opts.minImportance));
     return request<{ results: MemoryRecallResult[] }>(
       `/api/memories/recall?${params.toString()}`
