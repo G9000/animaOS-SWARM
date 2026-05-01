@@ -1,15 +1,22 @@
-use anima_memory::{MemoryScope, MemorySearchOptions, RecentMemoryOptions};
+use anima_memory::{
+    baseline_memory_eval_cases, run_memory_eval_cases, Memory, MemoryScope, MemorySearchOptions,
+    RecentMemoryOptions,
+};
+use tracing::warn;
 
 use super::contracts::{
     AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
     AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,
     MemoryEntityCreateRequest, MemoryEntityQuery, MemoryEntityResponse,
     MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest, MemoryEvaluationResponse,
-    MemoryRecallEnvelope, MemoryRecallQuery, MemoryRecallResultResponse, MemoryResponse,
-    MemorySearchEnvelope, MemorySearchQuery, MemorySearchResultResponse, RecentMemoriesQuery,
+    MemoryEvidenceTraceResponse, MemoryReadinessResponse, MemoryRecallEnvelope, MemoryRecallQuery,
+    MemoryRecallResultResponse, MemoryResponse, MemoryRetentionReportResponse,
+    MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery, MemorySearchResultResponse,
+    RecentMemoriesQuery,
 };
 use super::ApiError;
 use crate::app::SharedDaemonState;
+use crate::memory_embeddings::SharedMemoryEmbeddings;
 
 pub(crate) async fn handle_create_memory(
     body: Vec<u8>,
@@ -20,9 +27,12 @@ pub(crate) async fn handle_create_memory(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
+    let (memory_handle, embeddings_handle) = {
+        let guard = state.read().await;
+        (guard.memory_handle(), guard.memory_embeddings_handle())
+    };
     let memory = {
-        let memory = { state.read().await.memory_handle() };
-        let mut memory_guard = memory.write().await;
+        let mut memory_guard = memory_handle.write().await;
         let memory = memory_guard
             .add(new_memory)
             .map_err(|error| ApiError::bad_request(error.message()))?;
@@ -31,6 +41,7 @@ pub(crate) async fn handle_create_memory(
         })?;
         memory
     };
+    index_memory_embedding(&embeddings_handle, &memory).await;
 
     Ok(MemoryResponse::from(&memory))
 }
@@ -183,9 +194,12 @@ pub(crate) async fn handle_add_evaluated_memory(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
+    let (memory_handle, embeddings_handle) = {
+        let guard = state.read().await;
+        (guard.memory_handle(), guard.memory_embeddings_handle())
+    };
     let outcome = {
-        let memory = { state.read().await.memory_handle() };
-        let mut memory_guard = memory.write().await;
+        let mut memory_guard = memory_handle.write().await;
         let outcome = memory_guard
             .add_evaluated(new_memory, options)
             .map_err(|error| ApiError::bad_request(error.message()))?;
@@ -198,6 +212,9 @@ pub(crate) async fn handle_add_evaluated_memory(
         }
         outcome
     };
+    if let Some(memory) = &outcome.memory {
+        index_memory_embedding(&embeddings_handle, memory).await;
+    }
 
     Ok(MemoryEvaluationOutcomeResponse {
         evaluation: MemoryEvaluationResponse::from(&outcome.evaluation),
@@ -211,9 +228,13 @@ pub(crate) async fn handle_recall_memories(
 ) -> Result<MemoryRecallEnvelope, ApiError> {
     let (search_query, options) = query.into_domain().map_err(ApiError::bad_request_static)?;
     let results = {
-        let memory = { state.read().await.memory_handle() };
+        let (memory, embeddings) = {
+            let guard = state.read().await;
+            (guard.memory_handle(), guard.memory_embeddings_handle())
+        };
         let memory_guard = memory.read().await;
-        memory_guard.recall(&search_query, options)
+        let embeddings_guard = embeddings.read().await;
+        memory_guard.recall_with_vector_index(&search_query, options, Some(&*embeddings_guard))
     };
 
     Ok(MemoryRecallEnvelope {
@@ -222,6 +243,95 @@ pub(crate) async fn handle_recall_memories(
             .map(MemoryRecallResultResponse::from)
             .collect(),
     })
+}
+
+pub(crate) async fn handle_memory_trace(
+    memory_id: String,
+    state: &SharedDaemonState,
+) -> Result<MemoryEvidenceTraceResponse, ApiError> {
+    let trace = {
+        let memory = { state.read().await.memory_handle() };
+        let memory_guard = memory.read().await;
+        memory_guard.trace_memory(&memory_id)
+    }
+    .ok_or_else(ApiError::not_found)?;
+
+    Ok(MemoryEvidenceTraceResponse::from(&trace))
+}
+
+pub(crate) async fn handle_memory_readiness(
+    state: &SharedDaemonState,
+) -> Result<MemoryReadinessResponse, ApiError> {
+    let eval_report = run_memory_eval_cases(&baseline_memory_eval_cases());
+    let embedding_status = {
+        let embeddings = { state.read().await.memory_embeddings_handle() };
+        let embeddings_guard = embeddings.read().await;
+        embeddings_guard.status()
+    };
+
+    Ok(MemoryReadinessResponse {
+        passed: eval_report.passed() && embedding_status.enabled,
+        embeddings: (&embedding_status).into(),
+        evaluation: (&eval_report).into(),
+    })
+}
+
+pub(crate) async fn handle_apply_memory_retention(
+    body: Vec<u8>,
+    state: &SharedDaemonState,
+) -> Result<MemoryRetentionReportResponse, ApiError> {
+    let request: MemoryRetentionRequest = super::parse_json_body(body)?;
+    let policy = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
+
+    let (memory_handle, embeddings_handle) = {
+        let guard = state.read().await;
+        (guard.memory_handle(), guard.memory_embeddings_handle())
+    };
+    let report = {
+        let mut memory_guard = memory_handle.write().await;
+        let report = memory_guard
+            .apply_retention(policy)
+            .map_err(|error| ApiError::bad_request(error.message()))?;
+        if !report.decayed_memories.is_empty()
+            || !report.removed_memory_ids.is_empty()
+            || !report.removed_relationship_ids.is_empty()
+        {
+            memory_guard.save().map_err(|error| {
+                ApiError::service_unavailable(format!(
+                    "failed to persist memory retention changes: {error}"
+                ))
+            })?;
+        }
+        report
+    };
+    remove_memory_embeddings(&embeddings_handle, &report.removed_memory_ids).await;
+
+    Ok(MemoryRetentionReportResponse::from(&report))
+}
+
+async fn index_memory_embedding(embeddings: &SharedMemoryEmbeddings, memory: &Memory) {
+    if let Err(error) = embeddings.write().await.upsert_memory(memory) {
+        warn!(
+            memory_id = %memory.id,
+            error = %error,
+            "failed to index memory embedding"
+        );
+    }
+}
+
+async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_ids: &[String]) {
+    if memory_ids.is_empty() {
+        return;
+    }
+    if let Err(error) = embeddings.write().await.remove_memories(memory_ids) {
+        warn!(
+            removed_count = memory_ids.len(),
+            error = %error,
+            "failed to remove memory embeddings"
+        );
+    }
 }
 
 pub(crate) async fn handle_create_agent_relationship(

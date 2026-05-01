@@ -6,11 +6,14 @@ use anima_memory::{
     RelationshipEndpointKind,
 };
 use async_trait::async_trait;
+use tracing::warn;
 
+use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::state::SharedMemoryStore;
 
 pub(super) struct ReflectionMemoryEvaluator {
     pub(super) memory: SharedMemoryStore,
+    pub(super) memory_embeddings: SharedMemoryEmbeddings,
 }
 
 #[async_trait]
@@ -47,12 +50,13 @@ impl Evaluator for ReflectionMemoryEvaluator {
         let user_text = compact_text(&message.content.text, 500);
         let response_text = compact_text(&response.text, 900);
         let reflection = format!("evaluated response: {response_text}\nuser request: {user_text}");
+        let extracted_user_memory = extract_explicit_user_memory(&user_text);
         let mut tags = vec!["runtime".into(), "memory-evaluator".into()];
         if user_id.is_some() {
             tags.push("agent-user".into());
         }
 
-        let (outcome, relationship) = {
+        let (outcome, extracted_outcome, relationship, embedded_memories) = {
             let mut memory_guard = self.memory.write().await;
             let outcome = memory_guard
                 .add_evaluated(
@@ -71,13 +75,42 @@ impl Evaluator for ReflectionMemoryEvaluator {
                     MemoryEvaluationOptions::default(),
                 )
                 .map_err(|error| error.message().to_string())?;
-            let evidence_memory_id = outcome
-                .memory
-                .as_ref()
-                .map(|memory| memory.id.clone())
-                .or_else(|| outcome.evaluation.duplicate_memory_id.clone());
-            let relationship = match (user_id.as_ref(), evidence_memory_id.as_ref()) {
-                (Some(user_id), Some(evidence_memory_id)) => Some(
+            let extracted_outcome = match extracted_user_memory {
+                Some(content) => Some(
+                    memory_guard
+                        .add_evaluated(
+                            NewMemory {
+                                agent_id: state.id.clone(),
+                                agent_name: state.name.clone(),
+                                memory_type: MemoryType::Fact,
+                                content,
+                                importance: 0.72,
+                                tags: Some(vec![
+                                    "runtime".into(),
+                                    "memory-evaluator".into(),
+                                    "user-stated".into(),
+                                ]),
+                                scope: None,
+                                room_id: Some(message.room_id.clone()),
+                                world_id: world_id.clone(),
+                                session_id: session_id.clone(),
+                            },
+                            MemoryEvaluationOptions {
+                                min_content_chars: 8,
+                                min_importance: 0.2,
+                            },
+                        )
+                        .map_err(|error| error.message().to_string())?,
+                ),
+                None => None,
+            };
+            let mut evidence_memory_ids = Vec::new();
+            push_outcome_memory_id(&mut evidence_memory_ids, &outcome);
+            if let Some(extracted_outcome) = &extracted_outcome {
+                push_outcome_memory_id(&mut evidence_memory_ids, extracted_outcome);
+            }
+            let relationship = match (user_id.as_ref(), evidence_memory_ids.is_empty()) {
+                (Some(user_id), false) => Some(
                     memory_guard
                         .upsert_agent_relationship(NewAgentRelationship {
                             source_kind: Some(RelationshipEndpointKind::Agent),
@@ -95,7 +128,7 @@ impl Evaluator for ReflectionMemoryEvaluator {
                             )),
                             strength: 0.55,
                             confidence: 0.75,
-                            evidence_memory_ids: vec![evidence_memory_id.clone()],
+                            evidence_memory_ids,
                             tags: Some(tags),
                             room_id: Some(message.room_id.clone()),
                             world_id,
@@ -108,8 +141,31 @@ impl Evaluator for ReflectionMemoryEvaluator {
             memory_guard
                 .save()
                 .map_err(|error| format!("failed to persist evaluated memory: {error}"))?;
-            (outcome, relationship)
+            let embedded_memories = outcome
+                .memory
+                .iter()
+                .chain(
+                    extracted_outcome
+                        .iter()
+                        .filter_map(|outcome| outcome.memory.as_ref()),
+                )
+                .cloned()
+                .collect::<Vec<_>>();
+            (outcome, extracted_outcome, relationship, embedded_memories)
         };
+
+        if !embedded_memories.is_empty() {
+            let mut embeddings = self.memory_embeddings.write().await;
+            for memory in &embedded_memories {
+                if let Err(error) = embeddings.upsert_memory(memory) {
+                    warn!(
+                        memory_id = %memory.id,
+                        error = %error,
+                        "failed to index evaluated memory embedding"
+                    );
+                }
+            }
+        }
 
         let mut metadata = BTreeMap::new();
         metadata.insert(
@@ -124,6 +180,20 @@ impl Evaluator for ReflectionMemoryEvaluator {
                 "duplicateMemoryId".into(),
                 DataValue::String(duplicate_id.clone()),
             );
+        }
+        if let Some(extracted_outcome) = &extracted_outcome {
+            if let Some(memory) = &extracted_outcome.memory {
+                metadata.insert(
+                    "extractedMemoryId".into(),
+                    DataValue::String(memory.id.clone()),
+                );
+            }
+            if let Some(duplicate_id) = &extracted_outcome.evaluation.duplicate_memory_id {
+                metadata.insert(
+                    "extractedDuplicateMemoryId".into(),
+                    DataValue::String(duplicate_id.clone()),
+                );
+            }
         }
 
         let feedback = if let Some(relationship) = relationship {
@@ -160,6 +230,38 @@ fn evaluation_decision_label(decision: MemoryEvaluationDecision) -> &'static str
         MemoryEvaluationDecision::Merge => "merge",
         MemoryEvaluationDecision::Ignore => "ignore",
     }
+}
+
+fn push_outcome_memory_id(
+    memory_ids: &mut Vec<String>,
+    outcome: &anima_memory::MemoryEvaluationOutcome,
+) {
+    let id = outcome
+        .memory
+        .as_ref()
+        .map(|memory| memory.id.clone())
+        .or_else(|| outcome.evaluation.duplicate_memory_id.clone());
+    if let Some(id) = id {
+        memory_ids.push(id);
+    }
+}
+
+fn extract_explicit_user_memory(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.starts_with("remember ") || lower.starts_with("please remember ") {
+        return Some(format!("user stated memory: {text}"));
+    }
+    if lower.contains("i prefer ")
+        || lower.contains("i like ")
+        || lower.contains("my preference is ")
+    {
+        return Some(format!("user stated preference: {text}"));
+    }
+    None
 }
 
 fn metadata_string(message: &Message, keys: &[&str]) -> Option<String> {

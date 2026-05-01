@@ -1,6 +1,6 @@
 # anima-memory
 
-`anima-memory` is the memory service used by AnimaOS agents. It provides a `MemoryManager` that stores agent memories in an in-memory hash map, indexed with a BM25 full-text search engine for keyword-based retrieval. It also stores durable memory entities, first-class relationship edges, evaluated write decisions, and hybrid recall scores so identity, collaboration history, and evidence-backed retrieval can be modeled separately from free-text memories. Persistence to a JSON file is optional. There are no external database dependencies and no async runtime requirements.
+`anima-memory` is the memory service used by AnimaOS agents. It provides a `MemoryManager` that stores agent memories in an in-memory hash map, indexed with a BM25 full-text search engine for keyword-based retrieval. It also stores durable memory entities, first-class relationship edges, evaluated write decisions, and hybrid recall scores so identity, collaboration history, and evidence-backed retrieval can be modeled separately from free-text memories. Persistence to a JSON file or SQLite snapshot is optional. There are no external service dependencies and no async runtime requirements.
 
 ## Quick usage
 
@@ -107,17 +107,60 @@ When a storage file is configured, call `load()` once at startup to restore memo
 
 The current storage object contains `memories`, `entities`, and `agentRelationships`. Older object files without `entities` still load, and entities are backfilled from loaded memories and relationships when possible.
 
+### SQLite persistence
+
+```rust
+let mut manager = MemoryManager::with_sqlite_file("/var/data/memories.sqlite");
+manager.load()?;
+// ... mutate memories, entities, relationships, retention state ...
+manager.save()?;
+```
+
+SQLite persistence stores the same snapshot as JSON in normalized tables for memories, tags, entities, aliases, relationship edges, relationship evidence, and relationship tags. `save()` replaces the previous snapshot in a transaction, so removed memories and pruned relationships do not linger as stale rows. The `sqlite` crate feature is enabled by default for this package; disable default features if an embedding host wants memory without the SQLite adapter.
+
 ## Search
 
-`search(query, opts)` runs BM25 ranking over the full-text index. The index is built from each memory's `content`, `memory_type`, `scope`, `agent_name`, optional room/world/session IDs, and any `tags`. No embeddings or external models are involved.
+`search(query, opts)` runs BM25 ranking over the full-text index. The index is built from each memory's `content`, `memory_type`, `scope`, `agent_name`, optional room/world/session IDs, and any `tags`. BM25 search does not require embeddings or external models.
 
 `recall(query, opts)` performs hybrid recall over BM25 results, recent memories, relationship evidence, and importance. `recall_with_vector_index(query, opts, Some(index))` also accepts an optional `MemoryVectorIndex` implementation, letting hosts plug in embeddings or a vector database later without making the core crate depend on one.
 
 Each `MemoryRecallResult` includes the memory plus score breakdowns: `lexical_score`, `vector_score`, `relationship_score`, `recency_score`, and `importance_score`.
 
+Use `trace_memory(memory_id)` to inspect why a memory participates in the graph. It returns the memory, relationships that cite it as evidence, and the involved durable entities. This is the core primitive behind evidence trace UI surfaces.
+
+### Vector adapter
+
+The core crate includes `InMemoryVectorIndex`, a host-agnostic cosine-similarity adapter for memory embeddings. Hosts provide a `MemoryTextEmbedder` implementation, upsert memory embeddings with `upsert_text()` or `upsert_embedding()`, and pass the index into `recall_with_vector_index()`. The adapter validates IDs, dimensions, finite values, and non-zero vectors, but it does not call model providers itself.
+
+```rust
+use anima_memory::{InMemoryVectorIndex, MemoryTextEmbedder, MemoryVectorError};
+
+struct HostEmbedder;
+
+impl MemoryTextEmbedder for HostEmbedder {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryVectorError> {
+        host_embedding_for(text).map_err(|_| MemoryVectorError::EmbeddingUnavailable)
+    }
+}
+
+let mut index = InMemoryVectorIndex::new(HostEmbedder);
+index.upsert_embedding(memory.id.clone(), vec![0.12, 0.98, 0.03])?;
+let recall = manager.recall_with_vector_index("release briefing style", opts, Some(&index));
+```
+
 ## Memory evaluation
 
 `evaluate_new_memory(memory, options)` scores a candidate write before storage. It can return `Store`, `Merge`, or `Ignore`, with a reason, suggested importance, and duplicate memory ID when applicable. `add_evaluated(memory, options)` uses that decision directly: distinct memories are stored with the suggested importance, duplicates and low-value short memories are not appended.
+
+## Retention and decay
+
+`apply_retention(MemoryRetentionPolicy)` applies an explicit maintenance pass over the in-memory store. A policy can remove memories older than `max_age_millis`, remove memories below `min_importance`, keep only the strongest `max_memories`, and decay memory importance by `decay_half_life_millis`. Removed evidence IDs are pruned from relationships, and relationships with no remaining evidence are removed. The returned `MemoryRetentionReport` lists decayed memories, removed memory IDs, and removed relationship IDs.
+
+## Memory eval harness
+
+`run_memory_eval_cases(&baseline_memory_eval_cases())` runs deterministic quality checks over evaluated writes, relationship-backed recall, agent-agent handoff memory, room/world isolation, vector recall false-positive suppression, trace evidence, retention behavior, decay behavior, and SQLite reload coverage. The returned `MemoryEvalReport` exposes `passed()`, `total_checks()`, `passed_checks()`, and `failure_messages()` so embedding/vector adapters can prove they improve recall without breaking existing memory guarantees.
+
+In the Nx workspace, run the focused harness with `bun x nx run core-rust:memory-eval`; full core validation remains `bun x nx run core-rust:test`.
 
 `MemorySearchOptions` fields:
 
@@ -140,8 +183,12 @@ Results are returned as `Vec<MemorySearchResult>`, which extends `Memory` with a
 - `get_recent(RecentMemoryOptions)` — returns the most recently added memories, sorted by creation time. Accepts `agent_id`, `agent_name`, `scope`, `room_id`, `world_id`, `session_id`, and `limit` filters.
 - `recall(query, MemoryRecallOptions)` — hybrid recall over lexical, relationship, recent, and importance signals.
 - `recall_with_vector_index(query, MemoryRecallOptions, Option<&dyn MemoryVectorIndex>)` — hybrid recall with an optional vector search adapter.
+- `InMemoryVectorIndex` — in-process cosine-similarity vector index that implements `MemoryVectorIndex`.
+- `trace_memory(id)` — returns the memory, citing relationships, and involved entities for evidence inspection.
 - `evaluate_new_memory(NewMemory, MemoryEvaluationOptions)` — evaluates whether a candidate memory should be stored, merged, or ignored.
 - `add_evaluated(NewMemory, MemoryEvaluationOptions)` — evaluates and conditionally stores a memory.
+- `apply_retention(MemoryRetentionPolicy)` — applies decay/removal rules and returns a retention report.
+- `run_memory_eval_cases(&[MemoryEvalCase])` — runs reusable memory quality scenarios and returns a structured report.
 - `upsert_entity(NewMemoryEntity)` — creates or updates a durable memory entity.
 - `list_entities(MemoryEntityOptions)` — lists identity records by entity filters.
 - `get_entity(kind, id)` — returns one entity by endpoint kind and ID.

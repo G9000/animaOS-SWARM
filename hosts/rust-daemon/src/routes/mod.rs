@@ -32,10 +32,11 @@ use self::contracts::{
     AgentRunEnvelope, AgentsEnvelope, DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope,
     MemoryCreateRequest, MemoryEntitiesEnvelope, MemoryEntityCreateRequest, MemoryEntityQuery,
     MemoryEntityResponse, MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest,
-    MemoryEvaluationResponse, MemoryRecallEnvelope, MemoryRecallQuery, MemoryResponse,
-    MemorySearchEnvelope, MemorySearchQuery, ProviderResponse, ProvidersEnvelope,
-    ReadinessResponse, RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope,
-    SwarmsEnvelope, TaskRequest,
+    MemoryEvaluationResponse, MemoryEvidenceTraceResponse, MemoryReadinessResponse,
+    MemoryRecallEnvelope, MemoryRecallQuery, MemoryResponse, MemoryRetentionReportResponse,
+    MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery, ProviderResponse,
+    ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope,
+    SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
 };
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
 pub(super) use self::http::{parse_json_body, serialize_json};
@@ -57,6 +58,9 @@ use crate::runtime_model::provider_summaries;
         evaluate_memory_entry,
         add_evaluated_memory_entry,
         recall_memories_entry,
+        memory_trace_entry,
+        memory_readiness_entry,
+        apply_memory_retention_entry,
         create_agent_relationship_entry,
         list_agent_relationships_entry,
         list_agents_entry,
@@ -190,6 +194,12 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
             axum::routing::post(add_evaluated_memory_entry),
         )
         .route("/api/memories/recall", get(recall_memories_entry))
+        .route("/api/memories/readiness", get(memory_readiness_entry))
+        .route(
+            "/api/memories/retention",
+            axum::routing::post(apply_memory_retention_entry),
+        )
+        .route("/api/memories/{memory_id}/trace", get(memory_trace_entry))
         .route(
             "/api/memories/relationships",
             get(list_agent_relationships_entry).post(create_agent_relationship_entry),
@@ -526,6 +536,62 @@ async fn recall_memories_entry(State(state): State<AppState>, uri: Uri) -> AxumR
     match memories::handle_recall_memories(query, &state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/memories/{memory_id}/trace",
+    tag = "memories",
+    params(("memory_id" = String, Path, description = "Memory ID to trace")),
+    responses(
+        (status = 200, description = "Memory evidence trace", body = MemoryEvidenceTraceResponse),
+        (status = 404, description = "Memory not found", body = ErrorBody)
+    )
+)]
+async fn memory_trace_entry(
+    State(state): State<AppState>,
+    Path(memory_id): Path<String>,
+) -> AxumResponse {
+    match memories::handle_memory_trace(memory_id, &state.daemon).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/memories/readiness",
+    tag = "memories",
+    responses((status = 200, description = "Memory quality and embedding readiness", body = MemoryReadinessResponse))
+)]
+async fn memory_readiness_entry(State(state): State<AppState>) -> AxumResponse {
+    match memories::handle_memory_readiness(&state.daemon).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/memories/retention",
+    tag = "memories",
+    request_body = MemoryRetentionRequest,
+    responses(
+        (status = 200, description = "Memory retention report", body = MemoryRetentionReportResponse),
+        (status = 400, description = "Invalid request", body = ErrorBody)
+    )
+)]
+async fn apply_memory_retention_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match memories::handle_apply_memory_retention(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
     }
 }
 

@@ -42,12 +42,22 @@ async fn main() -> io::Result<()> {
         persistence_mode = config.persistence_mode.as_str(),
         max_concurrent_runs = config.max_concurrent_runs,
         max_background_processes = config.max_background_processes,
-        runtime_memory_file = std::env::var("ANIMAOS_RS_MEMORY_FILE").unwrap_or_else(|_| "memory-only".to_string()),
+        runtime_memory_store = runtime_memory_store_label(),
         control_plane_durability = "ephemeral",
         "anima-daemon listening"
     );
 
     serve(listener, config).await
+}
+
+fn runtime_memory_store_label() -> String {
+    if let Ok(path) = std::env::var("ANIMAOS_RS_MEMORY_SQLITE_FILE") {
+        return format!("sqlite:{path}");
+    }
+    if let Ok(path) = std::env::var("ANIMAOS_RS_MEMORY_FILE") {
+        return format!("json:{path}");
+    }
+    "memory-only".to_string()
 }
 
 fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {

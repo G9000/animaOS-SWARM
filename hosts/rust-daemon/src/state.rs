@@ -13,6 +13,7 @@ use tokio::sync::RwLock as AsyncRwLock;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
+use crate::memory_embeddings::{MemoryEmbeddingRuntime, SharedMemoryEmbeddings};
 use crate::model::DeterministicModelAdapter;
 use crate::tools::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
@@ -23,6 +24,7 @@ pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
 
 pub(crate) struct DaemonState {
     pub(crate) memory: SharedMemoryStore,
+    pub(crate) memory_embeddings: SharedMemoryEmbeddings,
     pub(crate) agents: HashMap<String, AgentRuntime>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
@@ -87,8 +89,10 @@ impl DaemonState {
         max_background_processes: usize,
     ) -> Self {
         let memory = Arc::new(AsyncRwLock::new(MemoryManager::new()));
+        let memory_embeddings = Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::local_default()));
         Self {
             memory,
+            memory_embeddings,
             agents: HashMap::new(),
             swarms: HashMap::new(),
             swarm_events: HashMap::new(),
@@ -110,8 +114,16 @@ impl DaemonState {
         Arc::clone(&self.memory)
     }
 
+    pub(crate) fn memory_embeddings_handle(&self) -> SharedMemoryEmbeddings {
+        Arc::clone(&self.memory_embeddings)
+    }
+
     pub(crate) fn replace_memory(&mut self, memory: MemoryManager) {
         self.memory = Arc::new(AsyncRwLock::new(memory));
+    }
+
+    pub(crate) fn replace_memory_embeddings(&mut self, embeddings: MemoryEmbeddingRuntime) {
+        self.memory_embeddings = Arc::new(AsyncRwLock::new(embeddings));
     }
 
     pub(crate) fn agent_count(&self) -> usize {
@@ -211,7 +223,10 @@ impl DaemonState {
         self.tool_registry.validate_tools(config.tools.as_deref())?;
         let mut runtime = AgentRuntime::new(config, Arc::clone(&self.model_adapter));
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
-        runtime.set_evaluators(default_evaluators(Arc::clone(&self.memory)));
+        runtime.set_evaluators(default_evaluators(
+            Arc::clone(&self.memory),
+            Arc::clone(&self.memory_embeddings),
+        ));
         if let Some(db) = &self.db {
             runtime.set_database(Arc::clone(db));
         }
@@ -256,6 +271,7 @@ impl DaemonState {
         let runtime = self.agents.remove(agent_id)?;
         let tool_context = ToolExecutionContext::new(
             Arc::clone(&self.memory),
+            Arc::clone(&self.memory_embeddings),
             self.tool_registry.clone(),
             Arc::clone(&self.process_manager),
         );
@@ -265,13 +281,25 @@ impl DaemonState {
     pub(crate) fn restore_agent_runtime(
         &mut self,
         runtime: AgentRuntime,
-    ) -> (AgentRuntimeSnapshot, String, String, SharedMemoryStore) {
+    ) -> (
+        AgentRuntimeSnapshot,
+        String,
+        String,
+        SharedMemoryStore,
+        SharedMemoryEmbeddings,
+    ) {
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;
         self.agents.insert(agent_id.clone(), runtime);
 
-        (snapshot, agent_id, agent_name, Arc::clone(&self.memory))
+        (
+            snapshot,
+            agent_id,
+            agent_name,
+            Arc::clone(&self.memory),
+            Arc::clone(&self.memory_embeddings),
+        )
     }
 
     fn validate_swarm_tools(&self, config: &SwarmConfig) -> Result<(), String> {

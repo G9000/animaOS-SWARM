@@ -126,41 +126,51 @@ pub(crate) async fn handle_run_agent(
             }
         })
         .await;
-    let (snapshot, runtime_id, runtime_name, memory) = {
+    let (snapshot, runtime_id, runtime_name, memory, memory_embeddings) = {
         let mut guard = state.write().await;
         guard.restore_agent_runtime(runtime)
     };
 
     if let Some(content) = result.data.as_ref() {
-        let persist_result = {
+        let persist_result: Result<_, String> = {
             let mut memory_guard = memory.write().await;
-            memory_guard
-                .add(NewMemory {
-                    agent_id: runtime_id.clone(),
-                    agent_name: runtime_name.clone(),
-                    memory_type: MemoryType::TaskResult,
-                    content: content.text.clone(),
-                    importance: 0.8,
-                    tags: Some(vec!["runtime".into(), "task-result".into()]),
-                    scope: None,
-                    room_id: None,
-                    world_id: None,
-                    session_id: None,
-                })
-                .map(|_| ())
-                .map_err(|error| error.message().to_string())
-                .and_then(|_| {
-                    memory_guard
-                        .save()
-                        .map_err(|error| format!("failed to persist memory: {error}"))
-                })
+            match memory_guard.add(NewMemory {
+                agent_id: runtime_id.clone(),
+                agent_name: runtime_name.clone(),
+                memory_type: MemoryType::TaskResult,
+                content: content.text.clone(),
+                importance: 0.8,
+                tags: Some(vec!["runtime".into(), "task-result".into()]),
+                scope: None,
+                room_id: None,
+                world_id: None,
+                session_id: None,
+            }) {
+                Ok(memory) => match memory_guard.save() {
+                    Ok(()) => Ok(memory),
+                    Err(error) => Err(format!("failed to persist memory: {error}")),
+                },
+                Err(error) => Err(error.message().to_string()),
+            }
         };
-        if let Err(error) = persist_result {
-            warn!(
-                agent_id = %runtime_id,
-                error = %error,
-                "failed to persist runtime task result memory"
-            );
+        match persist_result {
+            Ok(memory) => {
+                if let Err(error) = memory_embeddings.write().await.upsert_memory(&memory) {
+                    warn!(
+                        agent_id = %runtime_id,
+                        memory_id = %memory.id,
+                        error = %error,
+                        "failed to index runtime task result memory embedding"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    agent_id = %runtime_id,
+                    error = %error,
+                    "failed to persist runtime task result memory"
+                );
+            }
         }
     }
 

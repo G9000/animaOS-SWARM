@@ -1,6 +1,7 @@
 mod app;
 mod components;
 mod events;
+mod memory_embeddings;
 mod model;
 mod routes;
 mod runtime_model;

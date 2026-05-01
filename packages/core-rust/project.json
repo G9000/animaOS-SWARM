@@ -30,6 +30,19 @@
         "{workspaceRoot}/packages/core-rust/crates/**/*"
       ]
     },
+    "memory-eval": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": ".",
+        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/memory-eval -p anima-memory baseline_memory_eval_cases_pass --features sqlite"
+      },
+      "inputs": [
+        "default",
+        "{workspaceRoot}/Cargo.toml",
+        "{workspaceRoot}/Cargo.lock",
+        "{workspaceRoot}/packages/core-rust/crates/anima-memory/**/*"
+      ]
+    },
     "lint": {
       "executor": "nx:run-commands",
       "options": {

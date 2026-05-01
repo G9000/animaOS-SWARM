@@ -101,6 +101,66 @@ export interface MemoryRecallResult {
   importanceScore: number;
 }
 
+export interface MemoryEvidenceTrace {
+  memory: Memory;
+  relationships: AgentRelationship[];
+  entities: MemoryEntity[];
+}
+
+export interface MemoryImportanceAdjustment {
+  memoryId: string;
+  previousImportance: number;
+  newImportance: number;
+}
+
+export interface MemoryRetentionInput {
+  maxAgeMillis?: number;
+  minImportance?: number;
+  maxMemories?: number;
+  decayHalfLifeMillis?: number;
+}
+
+export interface MemoryRetentionReport {
+  decayedMemories: MemoryImportanceAdjustment[];
+  removedMemoryIds: string[];
+  removedRelationshipIds: string[];
+}
+
+export interface MemoryEmbeddingStatus {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  dimension: number;
+  vectorCount: number;
+  persisted: boolean;
+  storageFile?: string | null;
+}
+
+export interface MemoryEvalCheckResult {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface MemoryEvalCaseResult {
+  name: string;
+  checks: MemoryEvalCheckResult[];
+}
+
+export interface MemoryEvalReport {
+  passed: boolean;
+  totalChecks: number;
+  passedChecks: number;
+  failureMessages: string[];
+  cases: MemoryEvalCaseResult[];
+}
+
+export interface MemoryReadiness {
+  passed: boolean;
+  embeddings: MemoryEmbeddingStatus;
+  evaluation: MemoryEvalReport;
+}
+
 export class MemoriesClient {
   constructor(private readonly client: DaemonClient) {}
 
@@ -301,6 +361,28 @@ export class MemoriesClient {
     }>(`/api/memories/recall?${search.toString()}`);
 
     return response.results;
+  }
+
+  async trace(memoryId: string): Promise<MemoryEvidenceTrace> {
+    return this.client.requestJson<MemoryEvidenceTrace>(
+      `/api/memories/${encodeURIComponent(memoryId)}/trace`
+    );
+  }
+
+  async applyRetention(
+    input: MemoryRetentionInput
+  ): Promise<MemoryRetentionReport> {
+    return this.client.requestJson<MemoryRetentionReport>(
+      '/api/memories/retention',
+      {
+        method: 'POST',
+        body: input,
+      }
+    );
+  }
+
+  async readiness(): Promise<MemoryReadiness> {
+    return this.client.requestJson<MemoryReadiness>('/api/memories/readiness');
   }
 
   async createRelationship(

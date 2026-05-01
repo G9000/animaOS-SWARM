@@ -158,6 +158,66 @@ export interface MemoryRecallResult {
   importanceScore: number;
 }
 
+export interface MemoryEvidenceTrace {
+  memory: Memory;
+  relationships: AgentRelationship[];
+  entities: MemoryEntity[];
+}
+
+export interface MemoryImportanceAdjustment {
+  memoryId: string;
+  previousImportance: number;
+  newImportance: number;
+}
+
+export interface MemoryRetentionInput {
+  maxAgeMillis?: number;
+  minImportance?: number;
+  maxMemories?: number;
+  decayHalfLifeMillis?: number;
+}
+
+export interface MemoryRetentionReport {
+  decayedMemories: MemoryImportanceAdjustment[];
+  removedMemoryIds: string[];
+  removedRelationshipIds: string[];
+}
+
+export interface MemoryEmbeddingStatus {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  dimension: number;
+  vectorCount: number;
+  persisted: boolean;
+  storageFile?: string | null;
+}
+
+export interface MemoryEvalCheckResult {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface MemoryEvalCaseResult {
+  name: string;
+  checks: MemoryEvalCheckResult[];
+}
+
+export interface MemoryEvalReport {
+  passed: boolean;
+  totalChecks: number;
+  passedChecks: number;
+  failureMessages: string[];
+  cases: MemoryEvalCaseResult[];
+}
+
+export interface MemoryReadiness {
+  passed: boolean;
+  embeddings: MemoryEmbeddingStatus;
+  evaluation: MemoryEvalReport;
+}
+
 export interface AgentConfig {
   name: string;
   model: string;
@@ -414,6 +474,19 @@ export const memories = {
       `/api/memories/recall?${params.toString()}`
     ).then((r) => r.results);
   },
+
+  trace: (memoryId: string) =>
+    request<MemoryEvidenceTrace>(
+      `/api/memories/${encodeURIComponent(memoryId)}/trace`
+    ),
+
+  applyRetention: (input: MemoryRetentionInput) =>
+    request<MemoryRetentionReport>('/api/memories/retention', {
+      method: 'POST',
+      json: input,
+    }),
+
+  readiness: () => request<MemoryReadiness>('/api/memories/readiness'),
 
   relationships: (opts?: AgentRelationshipOptions) => {
     const params = new URLSearchParams();

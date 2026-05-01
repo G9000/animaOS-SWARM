@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use super::{
     AgentRelationshipOptions, MemoryEntityOptions, MemoryError, MemoryEvaluationDecision,
-    MemoryEvaluationOptions, MemoryManager, MemoryRecallOptions, MemoryScope, MemorySearchOptions,
-    MemoryType, MemoryVectorIndex, NewAgentRelationship, NewMemory, NewMemoryEntity,
-    RecentMemoryOptions, RelationshipEndpointKind, VectorMemoryHit,
+    MemoryEvaluationOptions, MemoryManager, MemoryRecallOptions, MemoryRetentionPolicy,
+    MemoryScope, MemorySearchOptions, MemoryType, MemoryVectorIndex, NewAgentRelationship,
+    NewMemory, NewMemoryEntity, RecentMemoryOptions, RelationshipEndpointKind, VectorMemoryHit,
 };
 
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -32,6 +32,12 @@ fn base(overrides: impl FnOnce(&mut NewMemory)) -> NewMemory {
 fn temp_path(label: &str) -> std::path::PathBuf {
     let suffix = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!("anima-memory-{label}-{suffix}.json"))
+}
+
+#[cfg(feature = "sqlite")]
+fn temp_sqlite_path(label: &str) -> std::path::PathBuf {
+    let suffix = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("anima-memory-{label}-{suffix}.sqlite"))
 }
 
 fn add_memory(manager: &mut MemoryManager, memory: NewMemory) -> super::Memory {
@@ -693,6 +699,43 @@ fn upsert_agent_relationship_registers_endpoint_entities() {
 }
 
 #[test]
+fn trace_memory_returns_relationship_evidence_and_entities() {
+    let mut manager = MemoryManager::new();
+    let memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.agent_id = "planner".into();
+            memory.agent_name = "Planner".into();
+            memory.content = "The launch plan needs a rollback rehearsal.".into();
+        }),
+    );
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.target_kind = Some(RelationshipEndpointKind::User);
+            relationship.target_agent_id = "user-1".into();
+            relationship.target_agent_name = "Leo".into();
+            relationship.relationship_type = "responds_to".into();
+            relationship.evidence_memory_ids = vec![memory.id.clone()];
+        }))
+        .expect("relationship should be created");
+
+    let trace = manager
+        .trace_memory(&memory.id)
+        .expect("trace should exist for stored memory");
+
+    assert_eq!(trace.memory.id, memory.id);
+    assert_eq!(trace.relationships.len(), 1);
+    assert_eq!(
+        trace.relationships[0].target_kind,
+        RelationshipEndpointKind::User
+    );
+    assert!(trace
+        .entities
+        .iter()
+        .any(|entity| entity.kind == RelationshipEndpointKind::User && entity.id == "user-1"));
+}
+
+#[test]
 fn list_agent_relationships_agent_filter_ignores_non_agent_endpoints() {
     let mut manager = MemoryManager::new();
     manager
@@ -804,6 +847,63 @@ fn clear_with_agent_id_removes_agent_relationships() {
     manager.clear(Some("critic"));
 
     assert_eq!(manager.relationship_count(), 0);
+}
+
+#[test]
+fn apply_retention_removes_low_importance_memory_and_orphan_relationship() {
+    let mut manager = MemoryManager::new();
+    let memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.agent_id = "planner".into();
+            memory.agent_name = "Planner".into();
+            memory.importance = 0.1;
+        }),
+    );
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.evidence_memory_ids = vec![memory.id.clone()];
+        }))
+        .expect("relationship should be created");
+
+    let report = manager
+        .apply_retention(MemoryRetentionPolicy {
+            min_importance: Some(0.2),
+            ..MemoryRetentionPolicy::default()
+        })
+        .expect("retention should succeed");
+
+    assert_eq!(report.removed_memory_ids, vec![memory.id]);
+    assert_eq!(report.removed_relationship_ids.len(), 1);
+    assert_eq!(manager.size(), 0);
+    assert_eq!(manager.relationship_count(), 0);
+}
+
+#[test]
+fn apply_retention_decays_old_memory_importance() {
+    let mut manager = MemoryManager::new();
+    let memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.content = "Durable but fading memory".into();
+            memory.importance = 0.8;
+        }),
+    );
+
+    let report = manager
+        .apply_retention_at(
+            MemoryRetentionPolicy {
+                decay_half_life_millis: Some(1),
+                ..MemoryRetentionPolicy::default()
+            },
+            memory.created_at + 1,
+        )
+        .expect("retention should succeed");
+    let retained = manager.get(&memory.id).expect("memory should remain");
+
+    assert_eq!(report.decayed_memories.len(), 1);
+    assert!(retained.importance < 0.8);
+    assert!(retained.importance > 0.0);
 }
 
 #[test]
@@ -1490,6 +1590,130 @@ fn save_can_be_called_multiple_times() {
     reloaded.load().expect("load should succeed");
     assert_eq!(reloaded.size(), 2);
     let _ = remove_file(reloaded.storage_file.as_ref().expect("path should exist"));
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_save_and_load_restores_memory_graph() {
+    let path = temp_sqlite_path("graph-round-trip");
+    let _ = remove_file(&path);
+
+    let mut manager = MemoryManager::with_sqlite_file(path.clone());
+    let memory = add_memory(
+        &mut manager,
+        base(|memory| {
+            memory.agent_id = "planner".into();
+            memory.agent_name = "Planner".into();
+            memory.content = "SQLite should preserve the rollback rehearsal preference".into();
+            memory.importance = 0.82;
+            memory.tags = Some(vec!["preference".into(), "rollback".into()]);
+            memory.scope = Some(MemoryScope::Room);
+            memory.room_id = Some("room-1".into());
+            memory.world_id = Some("world-1".into());
+            memory.session_id = Some("session-1".into());
+        }),
+    );
+    manager
+        .upsert_entity(NewMemoryEntity {
+            kind: RelationshipEndpointKind::User,
+            id: "user-1".into(),
+            name: "Leo".into(),
+            aliases: vec!["operator".into()],
+            summary: Some("Primary operator".into()),
+        })
+        .expect("entity should be created");
+    manager
+        .upsert_agent_relationship(base_relationship(|relationship| {
+            relationship.source_agent_id = "planner".into();
+            relationship.source_agent_name = "Planner".into();
+            relationship.target_kind = Some(RelationshipEndpointKind::User);
+            relationship.target_agent_id = "user-1".into();
+            relationship.target_agent_name = "Leo".into();
+            relationship.relationship_type = "responds_to".into();
+            relationship.evidence_memory_ids = vec![memory.id.clone()];
+            relationship.tags = Some(vec!["runtime".into(), "user-stated".into()]);
+        }))
+        .expect("relationship should be created");
+    manager.save().expect("sqlite save should succeed");
+
+    let mut reloaded = MemoryManager::with_sqlite_file(path.clone());
+    reloaded.load().expect("sqlite load should succeed");
+
+    let results = reloaded.search("rollback rehearsal", MemorySearchOptions::default());
+    assert_eq!(reloaded.size(), 1);
+    assert!(!results.is_empty());
+    assert_eq!(
+        results[0].tags,
+        Some(vec!["preference".into(), "rollback".into()])
+    );
+
+    let entity = reloaded
+        .get_entity(RelationshipEndpointKind::User, "user-1")
+        .expect("user entity should reload");
+    assert_eq!(entity.aliases, vec!["operator".to_string()]);
+    assert_eq!(entity.summary.as_deref(), Some("Primary operator"));
+
+    let trace = reloaded
+        .trace_memory(&memory.id)
+        .expect("trace should reload");
+    assert_eq!(trace.relationships.len(), 1);
+    assert_eq!(trace.relationships[0].evidence_memory_ids, vec![memory.id]);
+    assert!(trace
+        .entities
+        .iter()
+        .any(|entity| entity.kind == RelationshipEndpointKind::User && entity.id == "user-1"));
+
+    let _ = remove_file(&path);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_save_replaces_previous_snapshot() {
+    let path = temp_sqlite_path("replace-snapshot");
+    let _ = remove_file(&path);
+
+    let mut manager = MemoryManager::with_sqlite_file(path.clone());
+    add_memory(
+        &mut manager,
+        base(|memory| memory.content = "stale sqlite memory".into()),
+    );
+    manager.save().expect("first sqlite save should succeed");
+
+    manager.clear(None);
+    add_memory(
+        &mut manager,
+        base(|memory| memory.content = "fresh sqlite memory".into()),
+    );
+    manager.save().expect("second sqlite save should succeed");
+
+    let mut reloaded = MemoryManager::with_sqlite_file(path.clone());
+    reloaded.load().expect("sqlite load should succeed");
+
+    assert_eq!(reloaded.size(), 1);
+    assert!(reloaded
+        .search("fresh sqlite", MemorySearchOptions::default())
+        .iter()
+        .any(|memory| memory.content == "fresh sqlite memory"));
+    assert!(!reloaded
+        .search("stale", MemorySearchOptions::default())
+        .iter()
+        .any(|memory| memory.content == "stale sqlite memory"));
+
+    let _ = remove_file(&path);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_load_is_a_noop_when_file_does_not_exist() {
+    let path = temp_sqlite_path("missing");
+    let _ = remove_file(&path);
+
+    let mut manager = MemoryManager::with_sqlite_file(path);
+    manager
+        .load()
+        .expect("sqlite load should not fail for missing file");
+
+    assert_eq!(manager.size(), 0);
 }
 
 #[test]

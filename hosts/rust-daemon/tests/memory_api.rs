@@ -353,12 +353,152 @@ async fn recall_memories_uses_relationship_evidence_without_recent_fallback() {
 }
 
 #[tokio::test]
+async fn recall_memories_uses_vector_index_without_lexical_overlap() {
+    let app = test_app();
+    let memory_body = r#"{"agentId":"planner","agentName":"Planner","type":"fact","content":"Operator wants concise ship notes","importance":0.8}"#;
+
+    let (memory_status, memory_response) =
+        send_json_request(&app, "POST", "/api/memories", memory_body).await;
+    let memory_id = extract_json_string_field(&memory_response, "id");
+    let (recall_status, recall_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/recall?q=release%20briefing%20style&recentLimit=0&limit=1",
+    )
+    .await;
+
+    assert_eq!(memory_status, StatusCode::CREATED);
+    assert_eq!(recall_status, StatusCode::OK);
+    let response = parse_json_body(&recall_response);
+    let results = response["results"]
+        .as_array()
+        .expect("results should be an array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["memory"]["id"].as_str(),
+        Some(memory_id.as_str())
+    );
+    assert_eq!(results[0]["lexicalScore"].as_f64(), Some(0.0));
+    assert!(results[0]["vectorScore"].as_f64().unwrap() > 0.0);
+}
+
+#[tokio::test]
+async fn memory_readiness_reports_eval_and_embedding_status() {
+    let app = test_app();
+
+    let (status, response) = send_empty_request(&app, "GET", "/api/memories/readiness").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let readiness = parse_json_body(&response);
+    assert_eq!(readiness["passed"], true);
+    assert_eq!(readiness["embeddings"]["enabled"], true);
+    assert_eq!(readiness["embeddings"]["provider"], "local");
+    assert_eq!(readiness["evaluation"]["passed"], true);
+    assert_eq!(readiness["evaluation"]["totalChecks"].as_u64(), Some(14));
+}
+
+#[tokio::test]
 async fn recall_memories_rejects_missing_query() {
     let app = test_app();
     let (status, response) = send_empty_request(&app, "GET", "/api/memories/recall").await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(response.contains("q query parameter is required"));
+}
+
+#[tokio::test]
+async fn memory_trace_returns_evidence_relationships_and_entities() {
+    let app = test_app();
+    let memory_body = r#"{"agentId":"planner","agentName":"Planner","type":"fact","content":"Traceable launch memory","importance":0.8}"#;
+
+    let (memory_status, memory_response) =
+        send_json_request(&app, "POST", "/api/memories", memory_body).await;
+    let memory_id = extract_json_string_field(&memory_response, "id");
+    let relationship_body = format!(
+        "{{\"sourceAgentId\":\"planner\",\"sourceAgentName\":\"Planner\",\"targetKind\":\"user\",\"targetAgentId\":\"user-1\",\"targetAgentName\":\"Leo\",\"relationshipType\":\"responds_to\",\"evidenceMemoryIds\":[\"{memory_id}\"]}}"
+    );
+    let (relationship_status, _) = send_json_request(
+        &app,
+        "POST",
+        "/api/memories/relationships",
+        &relationship_body,
+    )
+    .await;
+    let (trace_status, trace_response) =
+        send_empty_request(&app, "GET", &format!("/api/memories/{memory_id}/trace")).await;
+
+    assert_eq!(memory_status, StatusCode::CREATED);
+    assert_eq!(relationship_status, StatusCode::CREATED);
+    assert_eq!(trace_status, StatusCode::OK);
+    let trace = parse_json_body(&trace_response);
+    assert_eq!(trace["memory"]["id"].as_str(), Some(memory_id.as_str()));
+    assert_eq!(trace["relationships"][0]["targetKind"], "user");
+    assert!(trace["entities"]
+        .as_array()
+        .expect("entities should be an array")
+        .iter()
+        .any(|entity| entity["id"] == "user-1"));
+}
+
+#[tokio::test]
+async fn memory_trace_returns_not_found_for_missing_memory() {
+    let app = test_app();
+    let (status, response) = send_empty_request(&app, "GET", "/api/memories/missing/trace").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(response.contains("not found"));
+}
+
+#[tokio::test]
+async fn memory_retention_removes_low_importance_memory() {
+    let app = test_app();
+    let memory_body = r#"{"agentId":"planner","agentName":"Planner","type":"fact","content":"Low value memory","importance":0.1}"#;
+
+    let (memory_status, memory_response) =
+        send_json_request(&app, "POST", "/api/memories", memory_body).await;
+    let memory_id = extract_json_string_field(&memory_response, "id");
+    let retention_body = r#"{"minImportance":0.2}"#;
+    let (retention_status, retention_response) =
+        send_json_request(&app, "POST", "/api/memories/retention", retention_body).await;
+    let (trace_status, _) =
+        send_empty_request(&app, "GET", &format!("/api/memories/{memory_id}/trace")).await;
+
+    assert_eq!(memory_status, StatusCode::CREATED);
+    assert_eq!(retention_status, StatusCode::OK);
+    let report = parse_json_body(&retention_response);
+    assert_eq!(
+        report["removedMemoryIds"][0].as_str(),
+        Some(memory_id.as_str())
+    );
+    assert_eq!(trace_status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn memory_retention_removes_vector_embeddings() {
+    let app = test_app();
+    let memory_body = r#"{"agentId":"planner","agentName":"Planner","type":"fact","content":"Operator wants concise ship notes","importance":0.1}"#;
+
+    let (memory_status, _) = send_json_request(&app, "POST", "/api/memories", memory_body).await;
+    let (before_status, before_response) =
+        send_empty_request(&app, "GET", "/api/memories/readiness").await;
+    let (retention_status, _) = send_json_request(
+        &app,
+        "POST",
+        "/api/memories/retention",
+        r#"{"minImportance":0.2}"#,
+    )
+    .await;
+    let (after_status, after_response) =
+        send_empty_request(&app, "GET", "/api/memories/readiness").await;
+
+    assert_eq!(memory_status, StatusCode::CREATED);
+    assert_eq!(before_status, StatusCode::OK);
+    assert_eq!(retention_status, StatusCode::OK);
+    assert_eq!(after_status, StatusCode::OK);
+    let before = parse_json_body(&before_response);
+    let after = parse_json_body(&after_response);
+    assert_eq!(before["embeddings"]["vectorCount"].as_u64(), Some(1));
+    assert_eq!(after["embeddings"]["vectorCount"].as_u64(), Some(0));
 }
 
 #[tokio::test]

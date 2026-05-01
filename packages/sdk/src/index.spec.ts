@@ -394,6 +394,96 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             },
           ],
         })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          memory: {
+            id: 'memory-9',
+            agentId: 'agent-1',
+            agentName: 'researcher',
+            type: 'fact',
+            content: 'User prefers concise release notes',
+            importance: 0.74,
+            createdAt: 1712448002000,
+            tags: ['preference'],
+            scope: 'private',
+          },
+          relationships: [
+            {
+              id: 'relationship-1',
+              sourceKind: 'agent',
+              sourceAgentId: 'agent-1',
+              sourceAgentName: 'researcher',
+              targetKind: 'user',
+              targetAgentId: 'user-1',
+              targetAgentName: 'Leo',
+              relationshipType: 'responds_to',
+              summary: 'researcher responded to Leo',
+              strength: 0.8,
+              confidence: 0.7,
+              evidenceMemoryIds: ['memory-9'],
+              tags: ['preference'],
+              createdAt: 1712448003000,
+              updatedAt: 1712448003000,
+            },
+          ],
+          entities: [
+            {
+              kind: 'user',
+              id: 'user-1',
+              name: 'Leo',
+              aliases: ['operator'],
+              summary: 'Primary operator',
+              createdAt: 1712448000000,
+              updatedAt: 1712448000000,
+            },
+          ],
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          decayedMemories: [
+            {
+              memoryId: 'memory-9',
+              previousImportance: 0.74,
+              newImportance: 0.37,
+            },
+          ],
+          removedMemoryIds: ['memory-old'],
+          removedRelationshipIds: ['relationship-old'],
+        })
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          passed: true,
+          embeddings: {
+            enabled: true,
+            provider: 'local',
+            model: 'local-semantic-v1',
+            dimension: 96,
+            vectorCount: 3,
+            persisted: true,
+            storageFile: 'memory.sqlite',
+          },
+          evaluation: {
+            passed: true,
+            totalChecks: 14,
+            passedChecks: 14,
+            failureMessages: [],
+            cases: [
+              {
+                name: 'relationship recall',
+                checks: [
+                  {
+                    name: 'recall top 3',
+                    passed: true,
+                    detail: 'matched expected memory',
+                  },
+                ],
+              },
+            ],
+          },
+        })
       );
 
     const client = createDaemonClient({ baseUrl: 'http://daemon.test' });
@@ -467,6 +557,37 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
       }),
     ]);
 
+    await expect(client.memories.trace('memory-9')).resolves.toMatchObject({
+      memory: { id: 'memory-9' },
+      relationships: [expect.objectContaining({ id: 'relationship-1' })],
+      entities: [expect.objectContaining({ id: 'user-1' })],
+    });
+
+    await expect(
+      client.memories.applyRetention({
+        minImportance: 0.2,
+        maxMemories: 100,
+        decayHalfLifeMillis: 86_400_000,
+      })
+    ).resolves.toMatchObject({
+      decayedMemories: [expect.objectContaining({ memoryId: 'memory-9' })],
+      removedMemoryIds: ['memory-old'],
+      removedRelationshipIds: ['relationship-old'],
+    });
+
+    await expect(client.memories.readiness()).resolves.toMatchObject({
+      passed: true,
+      embeddings: {
+        enabled: true,
+        provider: 'local',
+        vectorCount: 3,
+      },
+      evaluation: {
+        totalChecks: 14,
+        passedChecks: 14,
+      },
+    });
+
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       'http://daemon.test/api/memories/entities',
@@ -519,6 +640,28 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       5,
       'http://daemon.test/api/memories/recall?q=evidence+probe&agentId=agent-1&limit=3&entityId=user-1&recentLimit=0',
+      expect.any(Object)
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      'http://daemon.test/api/memories/memory-9/trace',
+      expect.any(Object)
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
+      'http://daemon.test/api/memories/retention',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          minImportance: 0.2,
+          maxMemories: 100,
+          decayHalfLifeMillis: 86_400_000,
+        }),
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      8,
+      'http://daemon.test/api/memories/readiness',
       expect.any(Object)
     );
   });

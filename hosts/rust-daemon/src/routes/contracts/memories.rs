@@ -2,14 +2,17 @@ use std::collections::HashMap;
 
 use anima_memory::{
     AgentRelationship, AgentRelationshipOptions, Memory, MemoryEntity, MemoryEntityOptions,
-    MemoryEvaluation, MemoryEvaluationDecision, MemoryEvaluationOptions, MemoryRecallOptions,
-    MemoryRecallResult, MemoryScope, MemorySearchOptions, MemorySearchResult, MemoryType,
+    MemoryEvalCaseResult, MemoryEvalCheckResult, MemoryEvalReport, MemoryEvaluation,
+    MemoryEvaluationDecision, MemoryEvaluationOptions, MemoryEvidenceTrace,
+    MemoryImportanceAdjustment, MemoryRecallOptions, MemoryRecallResult, MemoryRetentionPolicy,
+    MemoryRetentionReport, MemoryScope, MemorySearchOptions, MemorySearchResult, MemoryType,
     NewAgentRelationship, NewMemory, NewMemoryEntity, RelationshipEndpointKind,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use super::shared::{parse_importance, parse_usize, required_string};
+use crate::memory_embeddings::MemoryEmbeddingStatus;
 
 fn parse_relationship_endpoint_kind(value: &str) -> Result<RelationshipEndpointKind, &'static str> {
     RelationshipEndpointKind::from_str(value)
@@ -142,6 +145,75 @@ pub(crate) struct MemoryRecallEnvelope {
     pub(crate) results: Vec<MemoryRecallResultResponse>,
 }
 
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryEvidenceTraceResponse {
+    pub(crate) memory: MemoryResponse,
+    pub(crate) relationships: Vec<AgentRelationshipResponse>,
+    pub(crate) entities: Vec<MemoryEntityResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryImportanceAdjustmentResponse {
+    pub(crate) memory_id: String,
+    pub(crate) previous_importance: f64,
+    pub(crate) new_importance: f64,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryRetentionReportResponse {
+    pub(crate) decayed_memories: Vec<MemoryImportanceAdjustmentResponse>,
+    pub(crate) removed_memory_ids: Vec<String>,
+    pub(crate) removed_relationship_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryEmbeddingStatusResponse {
+    pub(crate) enabled: bool,
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) dimension: usize,
+    pub(crate) vector_count: usize,
+    pub(crate) persisted: bool,
+    pub(crate) storage_file: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryEvalCheckResultResponse {
+    pub(crate) name: String,
+    pub(crate) passed: bool,
+    pub(crate) detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryEvalCaseResultResponse {
+    pub(crate) name: String,
+    pub(crate) checks: Vec<MemoryEvalCheckResultResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryEvalReportResponse {
+    pub(crate) passed: bool,
+    pub(crate) total_checks: usize,
+    pub(crate) passed_checks: usize,
+    pub(crate) failure_messages: Vec<String>,
+    pub(crate) cases: Vec<MemoryEvalCaseResultResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryReadinessResponse {
+    pub(crate) passed: bool,
+    pub(crate) embeddings: MemoryEmbeddingStatusResponse,
+    pub(crate) evaluation: MemoryEvalReportResponse,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryCreateRequest {
@@ -204,6 +276,15 @@ pub(crate) struct MemoryEvaluationRequest {
     pub(crate) session_id: Option<String>,
     pub(crate) min_content_chars: Option<usize>,
     pub(crate) min_importance: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryRetentionRequest {
+    pub(crate) max_age_millis: Option<u128>,
+    pub(crate) min_importance: Option<f64>,
+    pub(crate) max_memories: Option<usize>,
+    pub(crate) decay_half_life_millis: Option<u128>,
 }
 
 #[derive(Clone, Debug, Deserialize, IntoParams, ToSchema, Default)]
@@ -424,6 +505,34 @@ impl MemoryEvaluationRequest {
                 min_importance,
             },
         ))
+    }
+}
+
+impl MemoryRetentionRequest {
+    pub(crate) fn into_domain(self) -> Result<MemoryRetentionPolicy, &'static str> {
+        if self.max_age_millis == Some(0) {
+            return Err("maxAgeMillis must be greater than 0");
+        }
+        if self.decay_half_life_millis == Some(0) {
+            return Err("decayHalfLifeMillis must be greater than 0");
+        }
+        if self.max_memories == Some(0) {
+            return Err("maxMemories must be greater than 0");
+        }
+        let default_options = MemoryEvaluationOptions::default();
+        let min_importance = self
+            .min_importance
+            .unwrap_or(default_options.min_importance);
+        if !min_importance.is_finite() || !(0.0..=1.0).contains(&min_importance) {
+            return Err("minImportance must be between 0 and 1");
+        }
+
+        Ok(MemoryRetentionPolicy {
+            max_age_millis: self.max_age_millis,
+            min_importance: self.min_importance,
+            max_memories: self.max_memories,
+            decay_half_life_millis: self.decay_half_life_millis,
+        })
     }
 }
 
@@ -762,6 +871,104 @@ impl From<&MemoryRecallResult> for MemoryRecallResultResponse {
             relationship_score: value.relationship_score,
             recency_score: value.recency_score,
             importance_score: value.importance_score,
+        }
+    }
+}
+
+impl From<&MemoryEvidenceTrace> for MemoryEvidenceTraceResponse {
+    fn from(value: &MemoryEvidenceTrace) -> Self {
+        Self {
+            memory: MemoryResponse::from(&value.memory),
+            relationships: value
+                .relationships
+                .iter()
+                .map(AgentRelationshipResponse::from)
+                .collect(),
+            entities: value
+                .entities
+                .iter()
+                .map(MemoryEntityResponse::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&MemoryImportanceAdjustment> for MemoryImportanceAdjustmentResponse {
+    fn from(value: &MemoryImportanceAdjustment) -> Self {
+        Self {
+            memory_id: value.memory_id.clone(),
+            previous_importance: value.previous_importance,
+            new_importance: value.new_importance,
+        }
+    }
+}
+
+impl From<&MemoryRetentionReport> for MemoryRetentionReportResponse {
+    fn from(value: &MemoryRetentionReport) -> Self {
+        Self {
+            decayed_memories: value
+                .decayed_memories
+                .iter()
+                .map(MemoryImportanceAdjustmentResponse::from)
+                .collect(),
+            removed_memory_ids: value.removed_memory_ids.clone(),
+            removed_relationship_ids: value.removed_relationship_ids.clone(),
+        }
+    }
+}
+
+impl From<&MemoryEmbeddingStatus> for MemoryEmbeddingStatusResponse {
+    fn from(value: &MemoryEmbeddingStatus) -> Self {
+        Self {
+            enabled: value.enabled,
+            provider: value.provider.clone(),
+            model: value.model.clone(),
+            dimension: value.dimension,
+            vector_count: value.vector_count,
+            persisted: value.persisted,
+            storage_file: value
+                .storage_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        }
+    }
+}
+
+impl From<&MemoryEvalCheckResult> for MemoryEvalCheckResultResponse {
+    fn from(value: &MemoryEvalCheckResult) -> Self {
+        Self {
+            name: value.name.clone(),
+            passed: value.passed,
+            detail: value.detail.clone(),
+        }
+    }
+}
+
+impl From<&MemoryEvalCaseResult> for MemoryEvalCaseResultResponse {
+    fn from(value: &MemoryEvalCaseResult) -> Self {
+        Self {
+            name: value.name.clone(),
+            checks: value
+                .checks
+                .iter()
+                .map(MemoryEvalCheckResultResponse::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<&MemoryEvalReport> for MemoryEvalReportResponse {
+    fn from(value: &MemoryEvalReport) -> Self {
+        Self {
+            passed: value.passed(),
+            total_checks: value.total_checks(),
+            passed_checks: value.passed_checks(),
+            failure_messages: value.failure_messages(),
+            cases: value
+                .cases
+                .iter()
+                .map(MemoryEvalCaseResultResponse::from)
+                .collect(),
         }
     }
 }

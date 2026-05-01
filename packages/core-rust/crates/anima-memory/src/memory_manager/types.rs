@@ -303,6 +303,35 @@ pub struct MemoryRecallResult {
     pub importance_score: f64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryEvidenceTrace {
+    pub memory: Memory,
+    pub relationships: Vec<AgentRelationship>,
+    pub entities: Vec<MemoryEntity>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemoryRetentionPolicy {
+    pub max_age_millis: Option<u128>,
+    pub min_importance: Option<f64>,
+    pub max_memories: Option<usize>,
+    pub decay_half_life_millis: Option<u128>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryImportanceAdjustment {
+    pub memory_id: String,
+    pub previous_importance: f64,
+    pub new_importance: f64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemoryRetentionReport {
+    pub decayed_memories: Vec<MemoryImportanceAdjustment>,
+    pub removed_memory_ids: Vec<String>,
+    pub removed_relationship_ids: Vec<String>,
+}
+
 impl MemoryType {
     pub const fn as_str(self) -> &'static str {
         match self {

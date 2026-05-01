@@ -5,15 +5,17 @@ import {
   type AgentSnapshot,
   type EvaluatedMemoryInput,
   type Memory,
+  type MemoryEvidenceTrace,
   type MemoryEntity,
   type MemoryEvaluation,
   type MemoryEvaluationOutcome,
   type MemoryRecallResult,
+  type MemoryReadiness,
   type MemoryType,
 } from '../lib/api';
 import { playgroundUserId } from '../lib/playgroundUser';
 
-type InspectorTab = 'state' | 'recall' | 'evaluate';
+type InspectorTab = 'state' | 'recall' | 'evaluate' | 'ready';
 
 interface Props {
   agents: AgentSnapshot[];
@@ -28,6 +30,8 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
   const [recent, setRecent] = useState<Memory[]>([]);
   const [entities, setEntities] = useState<MemoryEntity[]>([]);
   const [relationships, setRelationships] = useState<AgentRelationship[]>([]);
+  const [trace, setTrace] = useState<MemoryEvidenceTrace | null>(null);
+  const [readiness, setReadiness] = useState<MemoryReadiness | null>(null);
   const [recallQuery, setRecallQuery] = useState('relationship evidence probe');
   const [recallResults, setRecallResults] = useState<MemoryRecallResult[]>([]);
   const [draftContent, setDraftContent] = useState('');
@@ -57,7 +61,7 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
     setLoading(true);
     try {
       const trimmedEntityId = entityId.trim();
-      const [recentMemories, entityList, relationshipList] = await Promise.all([
+      const [recentMemories, entityList, relationshipList, readinessReport] = await Promise.all([
         memories.recent({
           agentId: agentId || undefined,
           limit: 8,
@@ -68,10 +72,12 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
           entityId: trimmedEntityId || undefined,
           limit: 8,
         }),
+        memories.readiness(),
       ]);
       setRecent(recentMemories);
       setEntities(entityList);
       setRelationships(relationshipList);
+      setReadiness(readinessReport);
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -97,6 +103,18 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
         limit: 5,
       });
       setRecallResults(results);
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadTrace(memoryId: string) {
+    setLoading(true);
+    try {
+      setTrace(await memories.trace(memoryId));
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -158,7 +176,7 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
         </div>
 
         <div className="mt-3 flex rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-1">
-          {(['state', 'recall', 'evaluate'] as const).map((value) => (
+          {(['state', 'recall', 'evaluate', 'ready'] as const).map((value) => (
             <button
               key={value}
               onClick={() => setTab(value)}
@@ -194,6 +212,7 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
             recent={recent}
             entities={entities}
             relationships={relationships}
+            onTrace={loadTrace}
           />
         )}
 
@@ -203,6 +222,7 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
             results={recallResults}
             onQueryChange={setRecallQuery}
             onRun={runRecall}
+            onTrace={loadTrace}
           />
         )}
 
@@ -222,8 +242,119 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
             onStore={() => evaluateDraft(true)}
           />
         )}
+
+        {tab === 'ready' && (
+          <ReadinessView readiness={readiness} onRefresh={loadState} />
+        )}
+
+        {trace && <TraceView trace={trace} onClose={() => setTrace(null)} />}
       </div>
     </aside>
+  );
+}
+
+function ReadinessView({
+  readiness,
+  onRefresh,
+}: {
+  readiness: MemoryReadiness | null;
+  onRefresh: () => void;
+}) {
+  if (!readiness) {
+    return (
+      <div className="mt-4 grid gap-3">
+        <EmptyLine text="No readiness report." />
+        <button
+          onClick={onRefresh}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--border)] text-[var(--text-2)] hover:bg-[var(--hover)]"
+        >
+          Refresh
+        </button>
+      </div>
+    );
+  }
+
+  const failedChecks = readiness.evaluation.cases.flatMap((evalCase) =>
+    evalCase.checks.filter((check) => !check.passed)
+  );
+
+  return (
+    <div className="mt-4 grid gap-3">
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-sm font-medium text-[var(--text)]">Memory readiness</span>
+          <span
+            className={`rounded px-2 py-0.5 text-[11px] font-medium ${
+              readiness.passed
+                ? 'bg-[var(--ok)]/15 text-[var(--ok)]'
+                : 'bg-[var(--err)]/15 text-[var(--err)]'
+            }`}
+          >
+            {readiness.passed ? 'passing' : 'failing'}
+          </span>
+        </div>
+        <div className="mt-2 grid grid-cols-2 gap-2 text-[11px] text-[var(--muted-2)]">
+          <Metric label="checks" value={`${readiness.evaluation.passedChecks}/${readiness.evaluation.totalChecks}`} />
+          <Metric label="vectors" value={String(readiness.embeddings.vectorCount)} />
+          <Metric label="provider" value={readiness.embeddings.provider} />
+          <Metric label="persisted" value={readiness.embeddings.persisted ? 'yes' : 'no'} />
+        </div>
+      </div>
+
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-xs">
+        <div className="font-medium text-[var(--text)]">Embedding index</div>
+        <div className="mt-2 grid gap-1 text-[var(--muted)]">
+          <div className="truncate">{readiness.embeddings.model}</div>
+          <div className="tabular-nums">{readiness.embeddings.dimension} dimensions</div>
+          {readiness.embeddings.storageFile && (
+            <div className="truncate font-mono text-[11px] text-[var(--muted-2)]">
+              {readiness.embeddings.storageFile}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <SectionTitle title="Eval Cases" count={readiness.evaluation.cases.length} />
+      <div className="grid gap-2">
+        {readiness.evaluation.cases.map((evalCase) => (
+          <div
+            key={evalCase.name}
+            className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-xs"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate font-medium text-[var(--text)]">{evalCase.name}</span>
+              <span className="tabular-nums text-[var(--muted-2)]">
+                {evalCase.checks.filter((check) => check.passed).length}/{evalCase.checks.length}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {failedChecks.length > 0 && (
+        <div className="grid gap-2">
+          <SectionTitle title="Failures" count={failedChecks.length} />
+          {failedChecks.map((check) => (
+            <div
+              key={`${check.name}:${check.detail}`}
+              className="rounded-md border border-[var(--err)]/30 bg-[var(--err)]/10 px-3 py-2 text-xs text-[var(--err)]"
+            >
+              <div className="font-medium">{check.name}</div>
+              <div className="mt-1">{check.detail}</div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1">
+      <div>{label}</div>
+      <div className="truncate tabular-nums text-[var(--text-2)]">{value}</div>
+    </div>
   );
 }
 
@@ -269,17 +400,19 @@ function StateView({
   recent,
   entities,
   relationships,
+  onTrace,
 }: {
   recent: Memory[];
   entities: MemoryEntity[];
   relationships: AgentRelationship[];
+  onTrace: (memoryId: string) => void;
 }) {
   return (
     <div className="mt-4 grid gap-4">
       <SectionTitle title="Recent" count={recent.length} />
       <div className="grid gap-2">
         {recent.map((memory) => (
-          <MemoryRow key={memory.id} memory={memory} />
+          <MemoryRow key={memory.id} memory={memory} onTrace={onTrace} />
         ))}
         {recent.length === 0 && <EmptyLine text="No memories." />}
       </div>
@@ -323,11 +456,13 @@ function RecallView({
   results,
   onQueryChange,
   onRun,
+  onTrace,
 }: {
   query: string;
   results: MemoryRecallResult[];
   onQueryChange: (value: string) => void;
   onRun: () => void;
+  onTrace: (memoryId: string) => void;
 }) {
   return (
     <div className="mt-4 grid gap-3">
@@ -351,7 +486,7 @@ function RecallView({
       </button>
       <div className="grid gap-2">
         {results.map((result) => (
-          <RecallRow key={result.memory.id} result={result} />
+          <RecallRow key={result.memory.id} result={result} onTrace={onTrace} />
         ))}
         {results.length === 0 && <EmptyLine text="No recall results." />}
       </div>
@@ -484,7 +619,13 @@ function EvaluationResult({
   );
 }
 
-function MemoryRow({ memory }: { memory: Memory }) {
+function MemoryRow({
+  memory,
+  onTrace,
+}: {
+  memory: Memory;
+  onTrace?: (memoryId: string) => void;
+}) {
   return (
     <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
       <div className="flex items-center justify-between gap-2">
@@ -497,7 +638,19 @@ function MemoryRow({ memory }: { memory: Memory }) {
       </div>
       <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-[var(--muted-2)]">
         <span className="truncate">{memory.agentName}</span>
-        <span className="tabular-nums">{Math.round(memory.importance * 100)}%</span>
+        <span className="flex items-center gap-2">
+          {onTrace && (
+            <button
+              onClick={() => onTrace(memory.id)}
+              className="text-[11px] text-[var(--accent)] hover:underline"
+            >
+              Trace
+            </button>
+          )}
+          <span className="tabular-nums">
+            {Math.round(memory.importance * 100)}%
+          </span>
+        </span>
       </div>
     </div>
   );
@@ -521,7 +674,13 @@ function RelationshipRow({ relationship }: { relationship: AgentRelationship }) 
   );
 }
 
-function RecallRow({ result }: { result: MemoryRecallResult }) {
+function RecallRow({
+  result,
+  onTrace,
+}: {
+  result: MemoryRecallResult;
+  onTrace: (memoryId: string) => void;
+}) {
   return (
     <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
       <div className="flex items-center justify-between gap-2">
@@ -538,6 +697,68 @@ function RecallRow({ result }: { result: MemoryRecallResult }) {
         <Score label="rel" value={result.relationshipScore} />
         <Score label="new" value={result.recencyScore} />
         <Score label="imp" value={result.importanceScore} />
+      </div>
+      <button
+        onClick={() => onTrace(result.memory.id)}
+        className="mt-2 text-[11px] text-[var(--accent)] hover:underline"
+      >
+        Trace evidence
+      </button>
+    </div>
+  );
+}
+
+function TraceView({
+  trace,
+  onClose,
+}: {
+  trace: MemoryEvidenceTrace;
+  onClose: () => void;
+}) {
+  return (
+    <div className="mt-4 grid gap-3 rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium uppercase tracking-wide text-[var(--muted-2)]">
+          Evidence trace
+        </span>
+        <button
+          onClick={onClose}
+          className="text-[11px] text-[var(--muted)] hover:text-[var(--text)]"
+        >
+          Close
+        </button>
+      </div>
+      <MemoryRow memory={trace.memory} />
+
+      <div className="grid gap-2">
+        <SectionTitle title="Edges" count={trace.relationships.length} />
+        {trace.relationships.map((relationship) => (
+          <RelationshipRow key={relationship.id} relationship={relationship} />
+        ))}
+        {trace.relationships.length === 0 && <EmptyLine text="No citing edges." />}
+      </div>
+
+      <div className="grid gap-2">
+        <SectionTitle title="Entities" count={trace.entities.length} />
+        {trace.entities.map((entity) => (
+          <div
+            key={`${entity.kind}:${entity.id}`}
+            className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="truncate text-xs font-medium text-[var(--text)]">
+                {entity.name}
+              </span>
+              <span className="shrink-0 text-[11px] text-[var(--muted)]">
+                {entity.kind}
+              </span>
+            </div>
+            <div className="mt-1 truncate font-mono text-[11px] text-[var(--muted-2)]">
+              {entity.id}
+            </div>
+          </div>
+        ))}
+        {trace.entities.length === 0 && <EmptyLine text="No entities." />}
       </div>
     </div>
   );

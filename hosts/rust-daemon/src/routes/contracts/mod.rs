@@ -18,8 +18,10 @@ pub(crate) use memories::{
     AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,
     MemoryEntityCreateRequest, MemoryEntityQuery, MemoryEntityResponse,
     MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest, MemoryEvaluationResponse,
-    MemoryRecallEnvelope, MemoryRecallQuery, MemoryRecallResultResponse, MemoryResponse,
-    MemorySearchEnvelope, MemorySearchQuery, MemorySearchResultResponse, RecentMemoriesQuery,
+    MemoryEvidenceTraceResponse, MemoryReadinessResponse, MemoryRecallEnvelope, MemoryRecallQuery,
+    MemoryRecallResultResponse, MemoryResponse, MemoryRetentionReportResponse,
+    MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery, MemorySearchResultResponse,
+    RecentMemoriesQuery,
 };
 pub(crate) use providers::{ProviderResponse, ProvidersEnvelope};
 pub(crate) use shared::{

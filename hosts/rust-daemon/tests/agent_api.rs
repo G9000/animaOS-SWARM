@@ -271,7 +271,7 @@ async fn run_agent_persists_reflection_memory_from_evaluator() {
     let (run_status, run_response) = run_agent(
         &app,
         &agent_id,
-        r#"{"text":"Reflect on response","metadata":{"userId":"user-42","userName":"Leo"}}"#,
+        r#"{"text":"I prefer terse release summaries","metadata":{"userId":"user-42","userName":"Leo"}}"#,
     )
     .await;
     let (_, recent_response) = send_empty_request(
@@ -290,9 +290,9 @@ async fn run_agent_persists_reflection_memory_from_evaluator() {
     assert_eq!(run_status, StatusCode::OK);
     assert!(run_response.contains("\"status\":\"success\""));
     assert!(recent_response.contains("\"type\":\"reflection\""));
-    assert!(
-        recent_response.contains("evaluated response: operator handled task: Reflect on response")
-    );
+    assert!(recent_response
+        .contains("evaluated response: operator handled task: I prefer terse release summaries"));
+    assert!(recent_response.contains("user stated preference: I prefer terse release summaries"));
     assert_eq!(relationships_status, StatusCode::OK);
     assert!(relationships_response.contains("\"targetKind\":\"user\""));
     assert!(relationships_response.contains("\"targetAgentId\":\"user-42\""));

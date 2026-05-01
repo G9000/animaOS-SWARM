@@ -23,6 +23,13 @@ For an implementation walkthrough, see [Rust Daemon Architecture](../../docs/rus
 | `ANIMAOS_RS_PERSISTENCE_MODE` | No | Persistence mode: `memory` (default) or `postgres`. `postgres` requires `DATABASE_URL` and fails startup if Postgres is unavailable or migrations fail. |
 | `ANIMAOS_RS_MAX_CONCURRENT_RUNS` | No | Max number of concurrent `/api/agents/{id}/run` and `/api/swarms/{id}/run` requests before the daemon returns `503 Service Unavailable` (default `8`). |
 | `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES` | No | Max number of concurrently running `bg_start` processes allowed by the daemon tool surface (default `8`). |
+| `ANIMAOS_RS_MEMORY_EMBEDDINGS` | No | Runtime memory embedding mode: `local` (default), `ollama`, `openai`, `openai-compatible`, or `disabled`. Local embeddings are deterministic and run in process; provider modes call an OpenAI-compatible `/embeddings` endpoint. |
+| `ANIMAOS_RS_MEMORY_EMBEDDING_MODEL` | No | Provider embedding model. Defaults to `text-embedding-3-small` for `openai`/`openai-compatible` and `nomic-embed-text` for `ollama`. |
+| `ANIMAOS_RS_MEMORY_EMBEDDING_DIMENSIONS` | No | Expected embedding vector size. Local defaults to `96` with a minimum of `24`; `openai` defaults to `1536`; `ollama` defaults to `768`. |
+| `ANIMAOS_RS_MEMORY_EMBEDDINGS_BASE_URL` | No | OpenAI-compatible embedding base URL. Defaults to `https://api.openai.com/v1` for OpenAI-compatible modes and `http://127.0.0.1:11434/v1` for `ollama`. Provider-specific `OPENAI_BASE_URL` and `OLLAMA_BASE_URL` are also recognized. |
+| `ANIMAOS_RS_MEMORY_EMBEDDINGS_API_KEY` | No | API key for provider-backed memory embeddings. `openai` requires this or `OPENAI_API_KEY`; `ollama` and `openai-compatible` treat it as optional for local/private endpoints. |
+| `ANIMAOS_RS_MEMORY_EMBEDDINGS_TIMEOUT_MS` | No | HTTP timeout for provider-backed embedding calls (default `15000`). |
+| `ANIMAOS_RS_MEMORY_EMBEDDINGS_SQLITE_FILE` | No | SQLite file for embedding vectors. When omitted and `ANIMAOS_RS_MEMORY_SQLITE_FILE` is set, vectors use the same SQLite file in separate `memory_embeddings` tables. |
 
 Other provider keys follow the same pattern: `GOOGLE_API_KEY`, `GROQ_API_KEY`,
 `MOONSHOT_API_KEY`, `OLLAMA_API_KEY`, and so on. Moonshot/Kimi uses the
@@ -85,10 +92,13 @@ application endpoints. The summary below matches the live router in
 | `POST` | `/api/memories/evaluations` | Evaluate a candidate memory without storing it. Accepts the memory create fields plus optional `minContentChars` and `minImportance`; returns `store`, `merge`, or `ignore`. |
 | `POST` | `/api/memories/evaluated` | Evaluate and conditionally store a memory. Returns the evaluation plus the stored memory when the decision is `store`; duplicate/low-value candidates do not append new memory records. |
 | `GET` | `/api/memories/recall` | Hybrid recall. Required `?q=`. Optional memory filters plus `?entityId=`, `?recallAgentId=`, `?limit=`, `?lexicalLimit=`, `?recentLimit=`, `?relationshipLimit=`. Returns score breakdowns for lexical, vector, relationship, recency, and importance signals. |
+| `GET` | `/api/memories/readiness` | Memory readiness report. Runs the baseline memory eval harness and returns embedding provider, model, vector count, persistence status, total checks, passed checks, and failure messages. |
+| `GET` | `/api/memories/{memory_id}/trace` | Return an evidence trace for one memory, including the memory, relationships that cite it, and involved entities. |
+| `POST` | `/api/memories/retention` | Apply an explicit retention/decay policy. Optional fields: `maxAgeMillis`, `minImportance`, `maxMemories`, and `decayHalfLifeMillis`. Returns decayed memory adjustments plus removed memory and relationship IDs. |
 | `POST` | `/api/memories/relationships` | Create or update a directed memory relationship edge. Required fields: `sourceAgentId`, `sourceAgentName`, `targetAgentId`, `targetAgentName`, `relationshipType`. Optional fields: `sourceKind`, `targetKind` (`agent`, `user`, `system`, `external`; default `agent`), `summary`, `strength`, `confidence`, `evidenceMemoryIds`, `tags`, `roomId`, `worldId`, `sessionId`. |
 | `GET` | `/api/memories/relationships` | List relationship edges. Optional `?entityId=`, `?agentId=`, `?sourceKind=`, `?sourceAgentId=`, `?targetKind=`, `?targetAgentId=`, `?relationshipType=`, `?roomId=`, `?worldId=`, `?sessionId=`, `?minStrength=`, `?minConfidence=`, `?limit=`. |
 
-Set `ANIMAOS_RS_MEMORY_FILE=/path/to/memories.json` to load daemon runtime memories, entities, and relationships from a JSON file on startup and autosave memory writes from HTTP routes, tools, and runtime evaluators. Runtime evaluation now uses evaluated writes for reflection evidence and links the responding agent to the user entity when request metadata includes `userId`/`userName`.
+Set `ANIMAOS_RS_MEMORY_SQLITE_FILE=/path/to/memories.sqlite` to load daemon runtime memories, entities, relationships, and memory embeddings from SQLite on startup and autosave memory writes from HTTP routes, tools, runtime evaluators, and retention policy runs. For lightweight JSON memory persistence, set `ANIMAOS_RS_MEMORY_FILE=/path/to/memories.json` instead; embeddings remain in process unless `ANIMAOS_RS_MEMORY_EMBEDDINGS_SQLITE_FILE` is also set. Set only one memory store variable. Runtime evaluation uses evaluated writes for reflection evidence, extracts explicit user-stated preference/remember facts, indexes stored memories for semantic recall, and links the responding agent to the user entity when request metadata includes `userId`/`userName`.
 
 ### Swarms
 
@@ -111,6 +121,18 @@ ANTHROPIC_API_KEY=sk-ant-... cargo run -p anima-daemon
 # With Postgres persistence
 ANIMAOS_RS_PERSISTENCE_MODE=postgres \
 DATABASE_URL=postgres://user:pass@localhost/anima \
+  ANTHROPIC_API_KEY=sk-ant-... \
+  cargo run -p anima-daemon
+
+# With durable runtime memory in SQLite
+ANIMAOS_RS_MEMORY_SQLITE_FILE=./data/runtime-memories.sqlite \
+  ANTHROPIC_API_KEY=sk-ant-... \
+  cargo run -p anima-daemon
+
+# With Ollama/OpenAI-compatible semantic memory embeddings
+ANIMAOS_RS_MEMORY_SQLITE_FILE=./data/runtime-memories.sqlite \
+ANIMAOS_RS_MEMORY_EMBEDDINGS=ollama \
+ANIMAOS_RS_MEMORY_EMBEDDING_MODEL=nomic-embed-text \
   ANTHROPIC_API_KEY=sk-ant-... \
   cargo run -p anima-daemon
 ```

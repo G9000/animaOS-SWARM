@@ -8,7 +8,7 @@ Current SDK coverage includes:
 
 - daemon health checks via `client.health()`
 - agent create, list, get, run, and recent-memory reads
-- memory create, search, and recent-memory reads
+- memory create, search, recent-memory reads, entities, evaluated writes, hybrid recall, evidence trace, retention, readiness/eval reporting, and relationships
 - swarm create, get, run, and live SSE event subscriptions
 - daemon-specific error surfaces for HTTP failures and connection failures
 
@@ -24,11 +24,21 @@ const client = createDaemonClient({
 const health = await client.health();
 const agents = await client.agents.list();
 const memories = await client.memories.search('launch warning', { limit: 5 });
+const recalled = await client.memories.recall('rollback rehearsal', {
+  entityId: 'user-1',
+  recentLimit: 0,
+});
+const trace = recalled[0]
+  ? await client.memories.trace(recalled[0].memory.id)
+  : null;
+const memoryReadiness = await client.memories.readiness();
 
 console.log({
   daemon: health.status,
   agents: agents.length,
   matchingMemories: memories.length,
+  tracedRelationships: trace?.relationships.length ?? 0,
+  memoryReady: memoryReadiness.passed,
 });
 ```
 

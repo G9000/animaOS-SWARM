@@ -9,6 +9,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::events::EventFanout;
+use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::tools::ToolExecutionContext;
 
 use super::runtime_events::publish_runtime_event;
@@ -21,6 +22,7 @@ impl DaemonState {
         event_stream: EventFanout,
     ) -> Arc<CoordinatorAgentFactoryFn> {
         let memory = Arc::clone(&self.memory);
+        let memory_embeddings = Arc::clone(&self.memory_embeddings);
         let model_adapter = Arc::clone(&self.model_adapter);
         let tool_registry = self.tool_registry.clone();
         let process_manager = Arc::clone(&self.process_manager);
@@ -28,6 +30,7 @@ impl DaemonState {
 
         Arc::new(move |context: CoordinatorAgentFactoryContext| {
             let memory = Arc::clone(&memory);
+            let memory_embeddings = Arc::clone(&memory_embeddings);
             let model_adapter = Arc::clone(&model_adapter);
             let tool_registry = tool_registry.clone();
             let process_manager = Arc::clone(&process_manager);
@@ -35,8 +38,12 @@ impl DaemonState {
             let db = db.clone();
 
             Box::pin(async move {
-                let tool_context =
-                    ToolExecutionContext::new(Arc::clone(&memory), tool_registry, process_manager);
+                let tool_context = ToolExecutionContext::new(
+                    Arc::clone(&memory),
+                    Arc::clone(&memory_embeddings),
+                    tool_registry,
+                    process_manager,
+                );
                 let runtime_events: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new({
                     let event_stream = event_stream.clone();
                     let agent_name = context.config.name.clone();
@@ -48,6 +55,7 @@ impl DaemonState {
                     context.config.clone(),
                     Arc::clone(&model_adapter),
                     Arc::clone(&memory),
+                    Arc::clone(&memory_embeddings),
                     Arc::clone(&runtime_events),
                 );
                 if let Some(db) = &db {
@@ -75,6 +83,7 @@ impl DaemonState {
                             let runtime = Arc::clone(&runtime);
                             let config = config.clone();
                             let memory = Arc::clone(&memory);
+                            let memory_embeddings = Arc::clone(&memory_embeddings);
                             let model_adapter = Arc::clone(&model_adapter);
                             let token_usage = Arc::clone(&token_usage);
                             let needs_reset = Arc::clone(&needs_reset);
@@ -90,6 +99,7 @@ impl DaemonState {
                                         config,
                                         Arc::clone(&model_adapter),
                                         Arc::clone(&memory),
+                                        Arc::clone(&memory_embeddings),
                                         Arc::clone(&runtime_events),
                                     );
                                     if let Some(db) = &db {
@@ -178,12 +188,13 @@ fn build_swarm_runtime(
     config: AgentConfig,
     model_adapter: Arc<dyn ModelAdapter>,
     memory: SharedMemoryStore,
+    memory_embeddings: SharedMemoryEmbeddings,
     event_listener: Arc<dyn Fn(EngineEvent) + Send + Sync>,
 ) -> AgentRuntime {
     let mut runtime = AgentRuntime::new(config, model_adapter);
     runtime.set_event_listener(event_listener);
     runtime.set_providers(default_providers(Arc::clone(&memory)));
-    runtime.set_evaluators(default_evaluators(memory));
+    runtime.set_evaluators(default_evaluators(memory, memory_embeddings));
     runtime.init();
     runtime
 }

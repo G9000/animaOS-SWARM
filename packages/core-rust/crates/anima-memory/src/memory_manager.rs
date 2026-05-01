@@ -1,20 +1,23 @@
 mod storage;
 mod storage_json;
+#[cfg(feature = "sqlite")]
+mod storage_sqlite;
 #[cfg(test)]
 mod tests;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use self::storage::{load_memory_store, save_memory_store};
+use self::storage::{load_memory_store, save_memory_store, MemoryStorageFormat};
 pub use self::types::{
     AgentRelationship, AgentRelationshipOptions, Memory, MemoryEntity, MemoryEntityOptions,
     MemoryError, MemoryEvaluation, MemoryEvaluationDecision, MemoryEvaluationOptions,
-    MemoryEvaluationOutcome, MemoryRecallOptions, MemoryRecallResult, MemoryScope,
+    MemoryEvaluationOutcome, MemoryEvidenceTrace, MemoryImportanceAdjustment, MemoryRecallOptions,
+    MemoryRecallResult, MemoryRetentionPolicy, MemoryRetentionReport, MemoryScope,
     MemorySearchOptions, MemorySearchResult, MemoryType, MemoryVectorIndex, NewAgentRelationship,
     NewMemory, NewMemoryEntity, RecentMemoryOptions, RelationshipEndpointKind, VectorMemoryHit,
 };
@@ -30,6 +33,7 @@ pub struct MemoryManager {
     agent_relationships: HashMap<String, AgentRelationship>,
     index: BM25,
     storage_file: Option<PathBuf>,
+    storage_format: MemoryStorageFormat,
 }
 
 impl MemoryManager {
@@ -40,12 +44,21 @@ impl MemoryManager {
             agent_relationships: HashMap::new(),
             index: BM25::default(),
             storage_file: None,
+            storage_format: MemoryStorageFormat::Json,
         }
     }
 
     pub fn with_storage_file(path: impl Into<PathBuf>) -> Self {
         let mut manager = Self::new();
         manager.storage_file = Some(path.into());
+        manager
+    }
+
+    #[cfg(feature = "sqlite")]
+    pub fn with_sqlite_file(path: impl Into<PathBuf>) -> Self {
+        let mut manager = Self::new();
+        manager.storage_file = Some(path.into());
+        manager.storage_format = MemoryStorageFormat::Sqlite;
         manager
     }
 
@@ -259,6 +272,58 @@ impl MemoryManager {
         let id = normalize_required_string(entity.id, MemoryError::InvalidEntityId)?;
         let name = normalize_required_string(entity.name, MemoryError::InvalidEntityName)?;
         Ok(self.upsert_entity_parts(entity.kind, id, name, entity.aliases, entity.summary))
+    }
+
+    pub fn get(&self, id: &str) -> Option<Memory> {
+        self.memories.get(id).cloned()
+    }
+
+    pub fn trace_memory(&self, id: &str) -> Option<MemoryEvidenceTrace> {
+        let memory = self.memories.get(id)?.clone();
+        let mut relationships: Vec<_> = self
+            .agent_relationships
+            .values()
+            .filter(|relationship| {
+                relationship
+                    .evidence_memory_ids
+                    .iter()
+                    .any(|value| value == id)
+            })
+            .cloned()
+            .collect();
+        relationships.sort_by(|left, right| {
+            right
+                .strength
+                .total_cmp(&left.strength)
+                .then_with(|| right.confidence.total_cmp(&left.confidence))
+                .then_with(|| right.updated_at.cmp(&left.updated_at))
+        });
+
+        let mut entity_keys = BTreeSet::new();
+        entity_keys.insert(entity_key(
+            RelationshipEndpointKind::Agent,
+            &memory.agent_id,
+        ));
+        for relationship in &relationships {
+            entity_keys.insert(entity_key(
+                relationship.source_kind,
+                &relationship.source_agent_id,
+            ));
+            entity_keys.insert(entity_key(
+                relationship.target_kind,
+                &relationship.target_agent_id,
+            ));
+        }
+        let entities = entity_keys
+            .iter()
+            .filter_map(|key| self.memory_entities.get(key).cloned())
+            .collect();
+
+        Some(MemoryEvidenceTrace {
+            memory,
+            relationships,
+            entities,
+        })
     }
 
     pub fn get_entity(&self, kind: RelationshipEndpointKind, id: &str) -> Option<MemoryEntity> {
@@ -619,6 +684,85 @@ impl MemoryManager {
         self.agent_relationships.remove(id);
     }
 
+    pub fn apply_retention(
+        &mut self,
+        policy: MemoryRetentionPolicy,
+    ) -> Result<MemoryRetentionReport, MemoryError> {
+        self.apply_retention_at(policy, now_millis())
+    }
+
+    pub fn apply_retention_at(
+        &mut self,
+        policy: MemoryRetentionPolicy,
+        now: u128,
+    ) -> Result<MemoryRetentionReport, MemoryError> {
+        if let Some(min_importance) = policy.min_importance {
+            validate_importance(min_importance)?;
+        }
+        let mut report = MemoryRetentionReport::default();
+        if let Some(half_life) = policy.decay_half_life_millis.filter(|value| *value > 0) {
+            for memory in self.memories.values_mut() {
+                let age = now.saturating_sub(memory.created_at);
+                if age == 0 {
+                    continue;
+                }
+                let previous_importance = memory.importance;
+                let factor = 0.5_f64.powf(age as f64 / half_life as f64);
+                let new_importance = (previous_importance * factor).clamp(0.0, 1.0);
+                if new_importance < previous_importance {
+                    memory.importance = new_importance;
+                    report.decayed_memories.push(MemoryImportanceAdjustment {
+                        memory_id: memory.id.clone(),
+                        previous_importance,
+                        new_importance,
+                    });
+                }
+            }
+        }
+
+        let mut removed = BTreeSet::new();
+        if let Some(max_age) = policy.max_age_millis {
+            for memory in self.memories.values() {
+                if now.saturating_sub(memory.created_at) > max_age {
+                    removed.insert(memory.id.clone());
+                }
+            }
+        }
+        if let Some(min_importance) = policy.min_importance {
+            for memory in self.memories.values() {
+                if memory.importance < min_importance {
+                    removed.insert(memory.id.clone());
+                }
+            }
+        }
+        if let Some(max_memories) = policy.max_memories {
+            let mut ranked: Vec<_> = self
+                .memories
+                .values()
+                .filter(|memory| !removed.contains(&memory.id))
+                .cloned()
+                .collect();
+            ranked.sort_by(|left, right| {
+                right
+                    .importance
+                    .total_cmp(&left.importance)
+                    .then_with(|| right.created_at.cmp(&left.created_at))
+                    .then_with(|| right.id.cmp(&left.id))
+            });
+            for memory in ranked.into_iter().skip(max_memories) {
+                removed.insert(memory.id);
+            }
+        }
+
+        for id in &removed {
+            self.memories.remove(id);
+            self.index.remove_document(id);
+            report.removed_memory_ids.push(id.clone());
+        }
+        report.removed_relationship_ids = self.prune_relationship_evidence(&removed);
+        Ok(report)
+    }
+
     pub fn forget(&mut self, id: &str) {
         self.memories.remove(id);
         self.index.remove_document(id);
@@ -685,7 +829,13 @@ impl MemoryManager {
                 .then_with(|| left.id.cmp(&right.id))
         });
 
-        save_memory_store(path, &memories, &entities, &relationships)
+        save_memory_store(
+            self.storage_format,
+            path,
+            &memories,
+            &entities,
+            &relationships,
+        )
     }
 
     pub fn load(&mut self) -> io::Result<()> {
@@ -693,7 +843,7 @@ impl MemoryManager {
             return Ok(());
         };
 
-        let Some(store) = load_memory_store(path)? else {
+        let Some(store) = load_memory_store(self.storage_format, path)? else {
             return Ok(());
         };
 
@@ -817,6 +967,29 @@ impl MemoryManager {
                 && existing.session_id == memory.session_id
                 && normalize_text_for_match(&existing.content) == normalized_content
         })
+    }
+
+    fn prune_relationship_evidence(
+        &mut self,
+        removed_memory_ids: &BTreeSet<String>,
+    ) -> Vec<String> {
+        if removed_memory_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let mut empty_relationships = Vec::new();
+        for relationship in self.agent_relationships.values_mut() {
+            relationship
+                .evidence_memory_ids
+                .retain(|id| !removed_memory_ids.contains(id));
+            if relationship.evidence_memory_ids.is_empty() {
+                empty_relationships.push(relationship.id.clone());
+            }
+        }
+        for id in &empty_relationships {
+            self.agent_relationships.remove(id);
+        }
+        empty_relationships
     }
 }
 

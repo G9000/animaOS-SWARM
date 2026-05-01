@@ -7,6 +7,11 @@ authors.workspace = true
 
 [dependencies]
 anima-core = { path = "../anima-core" }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
 
 [lints]
 workspace = true

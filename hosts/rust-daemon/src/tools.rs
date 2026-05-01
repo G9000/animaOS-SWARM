@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use anima_core::{AgentState, Content, Message, TaskResult, ToolCall, ToolDescriptor};
 use futures::future::BoxFuture;
 
+use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::state::SharedMemoryStore;
 
 pub(crate) use process::{
@@ -39,6 +40,7 @@ pub(crate) struct ToolRegistry {
 #[derive(Clone)]
 pub(crate) struct ToolExecutionContext {
     pub(super) memory: SharedMemoryStore,
+    pub(super) memory_embeddings: SharedMemoryEmbeddings,
     tool_registry: ToolRegistry,
     pub(super) process_manager: SharedProcessManager,
 }
@@ -46,11 +48,13 @@ pub(crate) struct ToolExecutionContext {
 impl ToolExecutionContext {
     pub(crate) fn new(
         memory: SharedMemoryStore,
+        memory_embeddings: SharedMemoryEmbeddings,
         tool_registry: ToolRegistry,
         process_manager: SharedProcessManager,
     ) -> Self {
         Self {
             memory,
+            memory_embeddings,
             tool_registry,
             process_manager,
         }

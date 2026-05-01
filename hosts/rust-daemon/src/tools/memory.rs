@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall};
-use anima_memory::{MemorySearchOptions, MemoryType, NewMemory};
+use anima_memory::{MemoryRecallOptions, MemorySearchOptions, MemoryType, NewMemory};
 use futures::future::BoxFuture;
+use tracing::warn;
 
 use super::ToolExecutionContext;
 
@@ -32,20 +33,30 @@ pub(super) fn execute_memory_search(
             None => 3,
         };
 
-        let results = context.memory.read().await.search(
-            &query,
-            MemorySearchOptions {
-                agent_id: Some(agent.id.clone()),
-                agent_name: None,
-                memory_type: None,
-                scope: None,
-                room_id: None,
-                world_id: None,
-                session_id: None,
-                limit: Some(limit),
-                min_importance: None,
-            },
-        );
+        let results = {
+            let memory_guard = context.memory.read().await;
+            let embeddings_guard = context.memory_embeddings.read().await;
+            memory_guard.recall_with_vector_index(
+                &query,
+                MemoryRecallOptions {
+                    search: MemorySearchOptions {
+                        agent_id: Some(agent.id.clone()),
+                        agent_name: None,
+                        memory_type: None,
+                        scope: None,
+                        room_id: None,
+                        world_id: None,
+                        session_id: None,
+                        limit: Some(limit),
+                        min_importance: None,
+                    },
+                    limit: Some(limit),
+                    recent_limit: Some(0),
+                    ..MemoryRecallOptions::default()
+                },
+                Some(&*embeddings_guard),
+            )
+        };
 
         let mut metadata = BTreeMap::new();
         metadata.insert("query".into(), DataValue::String(query));
@@ -56,7 +67,7 @@ pub(super) fn execute_memory_search(
         } else {
             results
                 .into_iter()
-                .map(|result| result.content)
+                .map(|result| result.memory.content)
                 .collect::<Vec<_>>()
                 .join("\n")
         };
@@ -129,6 +140,19 @@ pub(super) fn execute_memory_add(
             }
             memory
         };
+
+        if let Err(error) = context
+            .memory_embeddings
+            .write()
+            .await
+            .upsert_memory(&memory)
+        {
+            warn!(
+                memory_id = %memory.id,
+                error = %error,
+                "failed to index memory_add embedding"
+            );
+        }
 
         let mut metadata = BTreeMap::new();
         metadata.insert("memoryId".into(), DataValue::String(memory.id));
