@@ -1,0 +1,177 @@
+---
+title: Operations
+description: Operational notes, building, and testing the Rust daemon
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Operational Notes
+
+### Ephemeral Control Plane
+
+The daemon is an explicit `ephemeral` control plane. Agent and swarm runtime state lives in memory. This means:
+
+- **Process restart = lost runtime state.** Agents and swarms must be recreated after a restart.
+- **Postgres persistence adds step-log durability only.** It does not make the daemon stateful across restarts.
+- **Snapshots preserve memory state.** Set `ANIMAOS_RS_MEMORY_SQLITE_FILE` or `ANIMAOS_RS_MEMORY_FILE` to persist memories across restarts.
+
+### Readiness Behavior
+
+Readiness reports `database: "missing"` and returns `503` when `ANIMAOS_RS_PERSISTENCE_MODE=postgres` is set without a working database adapter. This allows orchestrators (Kubernetes, Docker Compose) to retry or fail fast.
+
+### Metrics
+
+Prometheus metrics exposed at `/metrics`:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `anima_daemon_agents` | Gauge | Current number of registered agents |
+| `anima_daemon_swarms` | Gauge | Current number of registered swarms |
+| `anima_daemon_background_processes` | Gauge | Current bg processes |
+| `anima_daemon_max_concurrent_runs` | Gauge | Configured concurrent run limit |
+| `anima_daemon_max_background_processes` | Gauge | Configured bg process limit |
+| `http_requests_total` | Counter | Total HTTP requests |
+| `http_request_duration_seconds` | Histogram | Request latency |
+
+### Logging
+
+The daemon emits structured logs through `tracing`. Every HTTP request is logged with:
+- `method` — HTTP method
+- `uri` — Request path
+- `latency_ms` — Request duration
+- `x-request-id` — Request correlation ID
+- `status` — Response status code
+
+Example:
+
+```
+2024-05-01T12:00:00Z  INFO  method=POST uri=/api/agents/550e8400/run latency_ms=2500 status=200 x_request_id=abc123
+```
+
+### Request Correlation
+
+The daemon adds `x-request-id` to all HTTP responses. If the client sends `x-request-id` in the request, the daemon propagates it. Otherwise, it generates a UUID. This allows correlating client logs with server logs.
+
+## Building
+
+```bash
+# Release build
+bun x nx run rust-daemon:build --skipNxCache
+
+# The binary is written to target/release/anima-daemon (or .exe on Windows)
+```
+
+### Cross-Compilation
+
+```bash
+# Linux from macOS
+rustup target add x86_64-unknown-linux-gnu
+cargo build --release -p anima-daemon --target x86_64-unknown-linux-gnu
+
+# ARM64
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release -p anima-daemon --target aarch64-unknown-linux-gnu
+```
+
+## Testing
+
+```bash
+# Run daemon tests
+bun x nx run rust-daemon:test --skipNxCache
+
+# On Windows, if the binary is locked by a running process:
+CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache
+```
+
+<Aside type="note">
+  The Windows workaround uses a separate target directory so the running binary and test binary don't conflict.
+</Aside>
+
+### Integration Tests
+
+Daemon integration tests spin up the full Axum server and make HTTP requests against it. They use:
+- Mock model adapters (no real LLM calls)
+- In-memory memory stores
+- Random ports to avoid conflicts
+
+### Load Testing
+
+For load testing, use `k6` or `autocannon`:
+
+```bash
+# Start daemon
+bun run daemon
+
+# Load test agent creation
+autocannon -c 10 -d 30 http://127.0.0.1:8080/api/agents
+```
+
+## Debugging
+
+### Enable Debug Logs
+
+```bash
+RUST_LOG=debug cargo run -p anima-daemon
+```
+
+Or per-module:
+
+```bash
+RUST_LOG=anima_daemon=debug,anima_core=trace cargo run -p anima-daemon
+```
+
+### Attach Debugger
+
+```bash
+# Run with debug symbols
+cargo build -p anima-daemon
+rust-lldb target/debug/anima-daemon
+```
+
+### Inspect Memory Snapshots
+
+```bash
+# SQLite snapshot
+sqlite3 data/runtime-memories.sqlite ".schema"
+
+# JSON snapshot
+jq '.memories | length' data/runtime-memories.json
+```
+
+## Deployment
+
+### Docker
+
+```dockerfile
+FROM rust:1.75 as builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p anima-daemon
+
+FROM debian:bookworm-slim
+COPY --from=builder /app/target/release/anima-daemon /usr/local/bin/
+EXPOSE 8080
+CMD ["anima-daemon"]
+```
+
+### systemd
+
+```ini
+[Unit]
+Description=animaOS Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/anima-daemon
+Restart=always
+Environment=ANIMAOS_RS_PORT=8080
+Environment=ANIMAOS_RS_MEMORY_SQLITE_FILE=/var/lib/anima/memories.sqlite
+
+[Install]
+WantedBy=multi-user.target
+```

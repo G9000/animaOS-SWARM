@@ -1,5 +1,5 @@
 import type { Content, TaskResult, TokenUsage } from '@animaOS-SWARM/core';
-import type { SwarmConfig, SwarmState } from '@animaOS-SWARM/swarm';
+import type { AgentMessage, SwarmConfig, SwarmState } from '@animaOS-SWARM/swarm';
 
 import type { DaemonClient, DaemonEvent } from './client.js';
 
@@ -14,6 +14,11 @@ export interface SwarmEventPayload<T = unknown> {
   swarmId: string;
   state: SwarmState;
   result: TaskResult<T> | null;
+}
+
+export interface SwarmMessagePayload {
+  swarmId: string;
+  message: AgentMessage;
 }
 
 export interface SwarmAgentEventPayload {
@@ -43,6 +48,7 @@ export interface SwarmAgentTokensPayload extends SwarmAgentEventPayload {
 
 export type SwarmStreamEventPayload<T = unknown> =
   | SwarmEventPayload<T>
+  | SwarmMessagePayload
   | SwarmAgentEventPayload
   | SwarmTaskFailedPayload
   | SwarmToolBeforePayload

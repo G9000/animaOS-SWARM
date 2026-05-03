@@ -87,6 +87,7 @@ export interface AgentState {
   id: string;
   name: string;
   status: string;
+  config?: AgentConfig;
   createdAt: number;
   tokenUsage: TokenUsage;
 }
@@ -94,8 +95,18 @@ export interface AgentState {
 export interface AgentSnapshot {
   state: AgentState;
   messageCount: number;
+  messages: AgentTranscriptMessage[];
   eventCount: number;
   lastTask?: TaskResult;
+}
+
+export interface AgentTranscriptMessage {
+  id: string;
+  agentId: string;
+  roomId: string;
+  content: Content;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  createdAt: number;
 }
 
 export interface AgentMessage {
@@ -117,16 +128,87 @@ export interface SwarmState {
   completedAt?: number;
 }
 
+export type SwarmStreamEventName =
+  | 'swarm:created'
+  | 'swarm:running'
+  | 'swarm:completed'
+  | 'swarm:message'
+  | 'task:started'
+  | 'task:completed'
+  | 'task:failed'
+  | 'tool:before'
+  | 'tool:after'
+  | 'agent:tokens'
+  | 'agent:terminated';
+
+export interface SwarmLifecycleEventPayload {
+  swarmId: string;
+  state: SwarmState;
+  result?: TaskResult | null;
+}
+
+export interface SwarmMessageEventPayload {
+  swarmId: string;
+  message: AgentMessage;
+}
+
+export interface SwarmAgentEventPayload {
+  agentId: string;
+  agentName: string;
+  error?: string;
+}
+
+export interface SwarmToolEventPayload extends SwarmAgentEventPayload {
+  toolName: string;
+  args?: Record<string, unknown>;
+  status?: string;
+  durationMs?: number;
+  result?: string;
+}
+
+export interface SwarmAgentTokensEventPayload extends SwarmAgentEventPayload {
+  usage: TokenUsage;
+}
+
+export type SwarmStreamEventPayload =
+  | SwarmLifecycleEventPayload
+  | SwarmMessageEventPayload
+  | SwarmAgentEventPayload
+  | SwarmToolEventPayload
+  | SwarmAgentTokensEventPayload;
+
+export interface SwarmStreamEvent {
+  event: SwarmStreamEventName;
+  data: SwarmStreamEventPayload;
+}
+
+const swarmStreamEventNames: SwarmStreamEventName[] = [
+  'swarm:created',
+  'swarm:running',
+  'swarm:completed',
+  'swarm:message',
+  'task:started',
+  'task:completed',
+  'task:failed',
+  'tool:before',
+  'tool:after',
+  'agent:tokens',
+  'agent:terminated',
+];
+
+export type MemoryType = 'fact' | 'observation' | 'task_result' | 'reflection';
+export type MemoryScope = 'shared' | 'private' | 'room';
+
 export interface Memory {
   id: string;
   agentId: string;
   agentName: string;
-  type: string;
+  type: MemoryType;
   content: string;
   importance: number;
   createdAt: number;
-  tags?: string[];
-  scope: 'shared' | 'private' | 'room';
+  tags?: string[] | null;
+  scope: MemoryScope;
   roomId?: string | null;
   worldId?: string | null;
   sessionId?: string | null;
@@ -155,6 +237,16 @@ export interface AgentRelationship {
   roomId?: string | null;
   worldId?: string | null;
   sessionId?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MemoryEntity {
+  kind: RelationshipEndpointKind;
+  id: string;
+  name: string;
+  aliases: string[];
+  summary?: string | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -188,11 +280,11 @@ export interface SwarmCreateRequest {
 export interface MemoryCreateRequest {
   agentId: string;
   agentName: string;
-  type: 'fact' | 'observation' | 'task_result' | 'reflection';
+  type: MemoryType;
   content: string;
   importance: number;
-  tags?: string[];
-  scope?: 'shared' | 'private' | 'room';
+  tags?: string[] | null;
+  scope?: MemoryScope;
   roomId?: string;
   worldId?: string;
   sessionId?: string;
@@ -200,15 +292,41 @@ export interface MemoryCreateRequest {
 
 export interface MemorySearchOptions {
   q: string;
-  type?: string;
+  type?: MemoryType;
   agentId?: string;
   agentName?: string;
-  scope?: 'shared' | 'private' | 'room';
+  scope?: MemoryScope;
   roomId?: string;
   worldId?: string;
   sessionId?: string;
   limit?: number;
   minImportance?: number;
+}
+
+export interface RecentMemoriesOptions {
+  agentId?: string;
+  agentName?: string;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  limit?: number;
+}
+
+export interface MemoryEntityCreateRequest {
+  kind: RelationshipEndpointKind;
+  id: string;
+  name: string;
+  aliases?: string[];
+  summary?: string;
+}
+
+export interface MemoryEntityOptions {
+  entityId?: string;
+  kind?: RelationshipEndpointKind;
+  name?: string;
+  alias?: string;
+  limit?: number;
 }
 
 export interface AgentRelationshipCreateRequest {
@@ -243,6 +361,114 @@ export interface AgentRelationshipOptions {
   minStrength?: number;
   minConfidence?: number;
   limit?: number;
+}
+
+export type MemoryEvaluationDecision = 'store' | 'merge' | 'ignore';
+
+export interface MemoryEvaluation {
+  decision: MemoryEvaluationDecision;
+  reason: string;
+  score: number;
+  suggestedImportance: number;
+  duplicateMemoryId?: string | null;
+}
+
+export interface EvaluatedMemoryRequest extends MemoryCreateRequest {
+  minContentChars?: number;
+  minImportance?: number;
+}
+
+export interface MemoryEvaluationOutcome {
+  evaluation: MemoryEvaluation;
+  memory?: Memory | null;
+}
+
+export interface MemoryRecallOptions {
+  entityId?: string;
+  agentId?: string;
+  agentName?: string;
+  type?: MemoryType;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+  limit?: number;
+  lexicalLimit?: number;
+  recentLimit?: number;
+  relationshipLimit?: number;
+  temporalLimit?: number;
+  minImportance?: number;
+}
+
+export interface MemoryRecallResult {
+  memory: Memory;
+  score: number;
+  lexicalScore: number;
+  vectorScore: number;
+  relationshipScore: number;
+  temporalScore: number;
+  recencyScore: number;
+  importanceScore: number;
+}
+
+export interface MemoryEvidenceTrace {
+  memory: Memory;
+  relationships: AgentRelationship[];
+  entities: MemoryEntity[];
+}
+
+export interface MemoryImportanceAdjustment {
+  memoryId: string;
+  previousImportance: number;
+  newImportance: number;
+}
+
+export interface MemoryRetentionRequest {
+  maxAgeMillis?: number;
+  minImportance?: number;
+  maxMemories?: number;
+  decayHalfLifeMillis?: number;
+}
+
+export interface MemoryRetentionReport {
+  decayedMemories: MemoryImportanceAdjustment[];
+  removedMemoryIds: string[];
+  removedRelationshipIds: string[];
+}
+
+export interface MemoryEmbeddingStatus {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  dimension: number;
+  vectorCount: number;
+  persisted: boolean;
+  storageFile?: string | null;
+}
+
+export interface MemoryEvalCheckResult {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface MemoryEvalCaseResult {
+  name: string;
+  checks: MemoryEvalCheckResult[];
+}
+
+export interface MemoryEvalReport {
+  passed: boolean;
+  totalChecks: number;
+  passedChecks: number;
+  failureMessages: string[];
+  cases: MemoryEvalCaseResult[];
+}
+
+export interface MemoryReadiness {
+  passed: boolean;
+  embeddings: MemoryEmbeddingStatus;
+  evaluation: MemoryEvalReport;
 }
 
 // ── Core fetch helper ────────────────────────────────────────────────────────
@@ -354,15 +580,38 @@ export const swarms = {
 
   streamEvents: (
     id: string,
-    onEvent: (event: { swarmId: string; state: SwarmState; result?: TaskResult }) => void,
+    onEvent: (event: SwarmStreamEvent) => void,
     onClose?: () => void
   ): (() => void) => {
     const source = new EventSource(`/api/swarms/${id}/events`);
-    source.onmessage = (e) => {
-      try { onEvent(JSON.parse(e.data as string)); } catch { /* ignore */ }
+    const handlers = swarmStreamEventNames.map((eventName) => {
+      const handler = (event: Event) => {
+        const message = event as MessageEvent<string>;
+        try {
+          onEvent({
+            event: eventName,
+            data: JSON.parse(message.data) as SwarmStreamEventPayload,
+          });
+        } catch {
+          // Ignore malformed stream frames and keep the live connection open.
+        }
+      };
+      source.addEventListener(eventName, handler);
+      return [eventName, handler] as const;
+    });
+    const errorHandler = () => {
+      source.close();
+      onClose?.();
     };
-    source.onerror = () => { source.close(); onClose?.(); };
-    return () => source.close();
+    source.addEventListener('error', errorHandler);
+
+    return () => {
+      for (const [eventName, handler] of handlers) {
+        source.removeEventListener(eventName, handler);
+      }
+      source.removeEventListener('error', errorHandler);
+      source.close();
+    };
   },
 };
 
@@ -370,7 +619,7 @@ export const swarms = {
 
 export const memories = {
   create: (body: MemoryCreateRequest) =>
-    request<{ memory: Memory }>('/api/memories', { method: 'POST', json: body }).then((r) => r.memory),
+    request<Memory>('/api/memories', { method: 'POST', json: body }),
 
   search: (opts: MemorySearchOptions) => {
     const params = new URLSearchParams({ q: opts.q });
@@ -388,7 +637,7 @@ export const memories = {
     ).then((r) => r.results);
   },
 
-  recent: (opts?: { agentId?: string; agentName?: string; scope?: 'shared' | 'private' | 'room'; roomId?: string; worldId?: string; sessionId?: string; limit?: number }) => {
+  recent: (opts?: RecentMemoriesOptions) => {
     const params = new URLSearchParams();
     if (opts?.agentId) params.set('agentId', opts.agentId);
     if (opts?.agentName) params.set('agentName', opts.agentName);
@@ -402,6 +651,72 @@ export const memories = {
       `/api/memories/recent${qs ? `?${qs}` : ''}`
     ).then((r) => r.memories);
   },
+
+  entities: (opts?: MemoryEntityOptions) => {
+    const params = new URLSearchParams();
+    if (opts?.entityId) params.set('entityId', opts.entityId);
+    if (opts?.kind) params.set('kind', opts.kind);
+    if (opts?.name) params.set('name', opts.name);
+    if (opts?.alias) params.set('alias', opts.alias);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return request<{ entities: MemoryEntity[] }>(
+      `/api/memories/entities${qs ? `?${qs}` : ''}`
+    ).then((r) => r.entities);
+  },
+
+  createEntity: (body: MemoryEntityCreateRequest) =>
+    request<MemoryEntity>('/api/memories/entities', {
+      method: 'POST',
+      json: body,
+    }),
+
+  evaluate: (body: EvaluatedMemoryRequest) =>
+    request<MemoryEvaluation>('/api/memories/evaluations', {
+      method: 'POST',
+      json: body,
+    }),
+
+  addEvaluated: (body: EvaluatedMemoryRequest) =>
+    request<MemoryEvaluationOutcome>('/api/memories/evaluated', {
+      method: 'POST',
+      json: body,
+    }),
+
+  recall: (query: string, opts?: MemoryRecallOptions) => {
+    const params = new URLSearchParams();
+    params.set('q', query);
+    if (opts?.entityId) params.set('entityId', opts.entityId);
+    if (opts?.agentId) params.set('agentId', opts.agentId);
+    if (opts?.agentName) params.set('agentName', opts.agentName);
+    if (opts?.type) params.set('type', opts.type);
+    if (opts?.scope) params.set('scope', opts.scope);
+    if (opts?.roomId) params.set('roomId', opts.roomId);
+    if (opts?.worldId) params.set('worldId', opts.worldId);
+    if (opts?.sessionId) params.set('sessionId', opts.sessionId);
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts?.lexicalLimit !== undefined) params.set('lexicalLimit', String(opts.lexicalLimit));
+    if (opts?.recentLimit !== undefined) params.set('recentLimit', String(opts.recentLimit));
+    if (opts?.relationshipLimit !== undefined) params.set('relationshipLimit', String(opts.relationshipLimit));
+    if (opts?.temporalLimit !== undefined) params.set('temporalLimit', String(opts.temporalLimit));
+    if (opts?.minImportance !== undefined) params.set('minImportance', String(opts.minImportance));
+    return request<{ results: MemoryRecallResult[] }>(
+      `/api/memories/recall?${params.toString()}`
+    ).then((r) => r.results);
+  },
+
+  trace: (memoryId: string) =>
+    request<MemoryEvidenceTrace>(
+      `/api/memories/${encodeURIComponent(memoryId)}/trace`
+    ),
+
+  applyRetention: (body: MemoryRetentionRequest) =>
+    request<MemoryRetentionReport>('/api/memories/retention', {
+      method: 'POST',
+      json: body,
+    }),
+
+  readiness: () => request<MemoryReadiness>('/api/memories/readiness'),
 
   createRelationship: (body: AgentRelationshipCreateRequest) =>
     request<AgentRelationship>('/api/memories/relationships', {

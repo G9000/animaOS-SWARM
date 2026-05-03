@@ -1,0 +1,173 @@
+---
+title: Monorepo Structure
+description: How the animaOS monorepo is organized
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+The animaOS monorepo uses **Nx** for task orchestration and **Bun** for package management. All projects are auto-discovered via `project.json` files.
+
+## Directory Layout
+
+```
+animaos-kit/
+├── apps/
+│   ├── docs/               # Public user-facing docs (Astro + Starlight)
+│   ├── contributor-docs/   # Contributor docs (this site)
+│   └── web/                # Web UI
+├── hosts/
+│   ├── rust-daemon/        # Production Rust host
+│   ├── elixir-phoenix/     # Placeholder
+│   └── python-service/     # Placeholder
+├── packages/
+│   ├── core-rust/          # Rust engine crates
+│   │   ├── crates/
+│   │   │   ├── anima-core/
+│   │   │   ├── anima-memory/
+│   │   │   └── anima-swarm/
+│   ├── core-ts/            # TypeScript contracts
+│   ├── sdk/                # TypeScript SDK
+│   ├── cli/                # Command-line interface
+│   └── ...                 # Other shared packages
+├── tools/
+│   └── workspace-dev/      # Dev launcher
+├── nx.json                 # Nx workspace config
+├── package.json            # Root workspace manifest
+└── Cargo.toml             # Rust workspace manifest
+```
+
+## Dependency Graph
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Surfaces                              │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐ │
+│  │   SDK   │  │   CLI   │  │   TUI   │  │      Web        │ │
+│  └────┬────┘  └────┬────┘  └────┬────┘  └────────┬────────┘ │
+│       │            │            │                 │          │
+│       └────────────┴────────────┘                 │          │
+│                    │                              │          │
+│                    ▼                              ▼          │
+│           ┌─────────────────┐          ┌─────────────────┐   │
+│           │   core-ts       │          │   core-ts       │   │
+│           │   (contracts)   │          │   (contracts)   │   │
+│           └─────────────────┘          └─────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                        Hosts                                 │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────┐  │
+│  │  rust-daemon    │  │ elixir-phoenix  │  │ python-svc  │  │
+│  │   (ready)       │  │  (placeholder)  │  │(placeholder)│  │
+│  └────────┬────────┘  └─────────────────┘  └─────────────┘  │
+│           │                                                  │
+│           ▼                                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                    core-rust                         │    │
+│  │  ┌───────────┐  ┌───────────┐  ┌─────────────────┐  │    │
+│  │  │anim a-core │  │anim-memory│  │  anima-swarm    │  │    │
+│  │  │  runtime  │  │  memory   │  │  coordination   │  │    │
+│  │  └───────────┘  └───────────┘  └─────────────────┘  │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Package Details
+
+### `packages/core-rust/`
+
+Reusable Rust engine crates. These have **no I/O dependencies** — no HTTP clients, no database drivers, no filesystem access. They operate on pure data structures and trait interfaces.
+
+| Crate | What it does | Key exports |
+|-------|-------------|-------------|
+| `anima-core` | Agent execution loop, trait interfaces, runtime primitives | `AgentRuntime`, `ModelAdapter`, `Provider`, `Evaluator`, `DatabaseAdapter`, `EngineEvent` |
+| `anima-memory` | BM25-backed memory storage, vector search, temporal reasoning | `MemoryManager`, `BM25`, `MemoryRecallResult`, `MemoryEvaluationDecision` |
+| `anima-swarm` | Multi-agent coordination strategies | `SwarmCoordinator`, `MessageBus`, `SwarmStrategy` |
+
+See [Rust Core](/architecture/rust-core/) for details.
+
+### `packages/core-ts/`
+
+Shared TypeScript contracts used by the SDK, CLI, TUI, and any TypeScript host. Contains **no runtime dependencies** on HTTP frameworks or databases.
+
+Key modules:
+- `types/` — Agent, component, model, plugin, event types
+- `runtime/` — `AgentRuntime`, `EventBus`
+- `adapters/` — OpenAI, Anthropic, Ollama model adapters
+- `helpers/` — Typed identity functions (`agent()`, `action()`, `plugin()`)
+- `daemon-health/` — Daemon warning transition helpers
+
+See [TypeScript Core](/architecture/typescript-core/) for details.
+
+### `hosts/rust-daemon/`
+
+The production-ready Rust host. It wraps the core crates in an Axum HTTP/SSE server, providing:
+- Provider adapters (OpenAI, Anthropic, Ollama, etc.)
+- Snapshot persistence (JSON + optional SQLite)
+- Optional Postgres step-log durability
+- SSE streaming for swarm events
+- Prometheus metrics, readiness probes, OpenAPI docs
+
+See [Rust Daemon](/hosts/rust-daemon/) for details.
+
+### `tools/workspace-dev/`
+
+Manages the dev environment. It reads `nx.json` and starts the selected host plus any dependent processes (web UI, docs, playground).
+
+```bash
+# Start the Rust host + web UI + docs
+bun dev --host rust
+
+# Start a different host (when implemented)
+bun dev --host elixir
+```
+
+The supported host keys are `rust`, `elixir`, and `python`. Only `rust` is production-ready today.
+
+<Aside type="note">
+  Hosts are intentionally separate from packages. If code is intended to be reused by multiple hosts, it belongs under `packages/`, not `hosts/`.
+</Aside>
+
+## Nx Project Discovery
+
+Nx discovers projects by scanning for `project.json` files. To see all projects:
+
+```bash
+bun x nx show projects
+```
+
+To see a project's targets:
+
+```bash
+bun x nx show project @animaOS-SWARM/docs
+```
+
+To see the dependency graph:
+
+```bash
+bun x nx graph
+```
+
+## Adding a New Package
+
+1. Create the directory under `packages/` or `hosts/`
+2. Add a `project.json` with `name`, `sourceRoot`, and `targets`
+3. Nx will auto-discover it on the next command
+
+See the existing `project.json` files in `apps/docs/` and `hosts/rust-daemon/` for examples.
+
+## Build Order
+
+Nx handles build order via the dependency graph. Key relationships:
+
+- `@animaOS-SWARM/sdk` depends on `@animaOS-SWARM/core`
+- `@animaOS-SWARM/cli` depends on `@animaOS-SWARM/sdk`
+- `rust-daemon` depends on `anima-core`, `anima-memory`, `anima-swarm`
+- `workspace-dev` depends on all app projects
+
+When you run `bun x nx build @animaOS-SWARM/sdk`, Nx automatically builds `@animaOS-SWARM/core` first.

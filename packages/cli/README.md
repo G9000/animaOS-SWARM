@@ -10,7 +10,7 @@ Plain-text launch supports both one-shot and interactive flows. In interactive `
 
 Current CLI coverage includes:
 
-- agency scaffolding through `create`
+- single-agent and agency scaffolding through `create`
 - daemon-backed execution through `run`, `chat`, `launch`, and `agents`
 - TUI and plain-text launch flows, including `/help` and `/health` in interactive `--no-tui` mode
 - provider and API-key forwarding into daemon-backed runs
@@ -19,8 +19,9 @@ Current CLI coverage includes:
 ## Quick Example
 
 ```bash
-# Scaffold a new agency
-bun run animaos create demo-team --yes
+# Scaffold a single agent or a full agency
+bun run animaos create agent helper -d "Answer support questions" --yes
+bun run animaos create agency demo-team --yes
 
 # Run a daemon-backed task
 bun run animaos run "Summarize the current agency setup"
@@ -36,6 +37,17 @@ Run `bun run build:cli-sdk` to build the CLI and its SDK dependency, or `bun x n
 ## Run
 
 Run `bun run animaos --help` or `bun run animaos launch "your task"`.
+
+```bash
+# Interactive picker: agent or agency
+bun run animaos create
+
+# Explicit modes
+bun run animaos create agent helper -d "Research medical literature"
+bun run animaos create agency content-team -d "Research topics and write articles" -s 5
+```
+
+`create` uses configured remote provider credentials when available, and falls back to a deterministic local scaffolder when no provider key is present. Pass `-p openai`, `-p anthropic`, or another provider to force LLM generation.
 
 ```bash
 # Single-shot plain-text launch

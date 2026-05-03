@@ -68,6 +68,18 @@ export function buildWorkspaceDevPlan(
     },
   });
 
+  processes.push({
+    name: '@animaOS-SWARM/docs',
+    command: 'bun',
+    args: ['x', 'nx', 'run', '@animaOS-SWARM/docs:dev'],
+  });
+
+  processes.push({
+    name: '@animaOS-SWARM/contributor-docs',
+    command: 'bun',
+    args: ['x', 'nx', 'run', '@animaOS-SWARM/contributor-docs:dev'],
+  });
+
   return {
     host,
     processes,

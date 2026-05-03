@@ -1,0 +1,30 @@
+{
+  "name": "@animaOS-SWARM/contributor-docs",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "apps/contributor-docs/src",
+  "projectType": "application",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/contributor-docs",
+        "command": "astro build"
+      },
+      "outputs": ["{projectRoot}/dist"]
+    },
+    "dev": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/contributor-docs",
+        "command": "astro dev"
+      }
+    },
+    "preview": {
+      "executor": "nx:run-commands",
+      "options": {
+        "cwd": "apps/contributor-docs",
+        "command": "astro preview"
+      }
+    }
+  }
+}

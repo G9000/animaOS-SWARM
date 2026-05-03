@@ -1,7 +1,24 @@
-use anima_core::{DataValue, EngineEvent, EventType};
+use anima_core::{AttachmentType, Content, DataValue, EngineEvent, EventType};
+use anima_swarm::AgentMessage;
 use serde_json::{json, Value};
 
 use crate::events::EventFanout;
+
+pub(super) fn publish_swarm_message_event(
+    global_event_fanout: &EventFanout,
+    swarm_event_fanout: &EventFanout,
+    swarm_id: &str,
+    message: &AgentMessage,
+) {
+    let payload = json!({
+        "swarmId": swarm_id,
+        "message": agent_message_to_json(message),
+    })
+    .to_string();
+
+    global_event_fanout.publish("swarm:message", payload.clone());
+    swarm_event_fanout.publish("swarm:message", payload);
+}
 
 pub(super) fn publish_runtime_event(
     event_stream: &EventFanout,
@@ -108,5 +125,54 @@ fn data_value_to_json(value: &DataValue) -> Value {
                 .map(|(key, value)| (key.clone(), data_value_to_json(value)))
                 .collect(),
         ),
+    }
+}
+
+fn agent_message_to_json(message: &AgentMessage) -> Value {
+    json!({
+        "id": message.id,
+        "from": message.from,
+        "to": message.to,
+        "content": content_to_json(&message.content),
+        "timestamp": message.timestamp,
+    })
+}
+
+fn content_to_json(content: &Content) -> Value {
+    let metadata = content.metadata.as_ref().map(|metadata| {
+        Value::Object(
+            metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), data_value_to_json(value)))
+                .collect(),
+        )
+    });
+    let attachments = content.attachments.as_ref().map(|attachments| {
+        Value::Array(
+            attachments
+                .iter()
+                .map(|attachment| {
+                    json!({
+                        "type": attachment_type_to_str(&attachment.attachment_type),
+                        "name": attachment.name,
+                        "data": attachment.data,
+                    })
+                })
+                .collect(),
+        )
+    });
+
+    json!({
+        "text": content.text,
+        "metadata": metadata,
+        "attachments": attachments,
+    })
+}
+
+fn attachment_type_to_str(attachment_type: &AttachmentType) -> &'static str {
+    match attachment_type {
+        AttachmentType::File => "file",
+        AttachmentType::Image => "image",
+        AttachmentType::Url => "url",
     }
 }

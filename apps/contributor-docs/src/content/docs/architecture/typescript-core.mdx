@@ -1,0 +1,223 @@
+---
+title: TypeScript Core
+description: Shared contracts, types, and typed helpers for animaOS
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`@animaOS-SWARM/core` lives in `packages/core-ts/` and provides the shared TypeScript contracts used by the SDK, CLI, and any TypeScript host. It contains **no runtime dependencies** on HTTP frameworks or databases — it is pure types and lightweight helpers.
+
+## Module Structure
+
+```
+src/
+├── index.ts           # Public exports
+├── types/
+│   ├── index.ts       # Type re-exports
+│   ├── agent.ts       # AgentConfig, AgentState, AgentSettings
+│   ├── components.ts  # Action, Provider, Evaluator
+│   ├── events.ts      # EventType, Event, IEventBus
+│   ├── model.ts       # ModelConfig, GenerateOptions, ToolCall
+│   ├── plugin.ts      # Plugin
+│   └── primitives.ts  # UUID, Content, Message, TaskResult
+├── runtime/
+│   ├── index.ts       # Runtime re-exports
+│   ├── agent-runtime.ts  # AgentRuntime implementation
+│   └── event-bus.ts      # EventBus implementation
+├── adapters/
+│   ├── index.ts       # Adapter re-exports
+│   ├── openai.ts      # OpenAI model adapter
+│   ├── anthropic.ts   # Anthropic model adapter
+│   └── ollama.ts      # Ollama model adapter
+├── helpers.ts         # agent(), action(), plugin() helpers
+└── daemon-health.ts   # Daemon warning transition helpers
+```
+
+## Agent Types
+
+### AgentConfig
+
+```typescript
+export interface AgentConfig {
+  name: string;
+  model: string;
+  provider?: string;
+  system?: string;
+  bio?: string;
+  lore?: string;
+  knowledge?: string[];
+  topics?: string[];
+  adjectives?: string[];
+  style?: string;
+  tools?: Action[];
+  plugins?: Plugin[];
+  settings?: AgentSettings;
+}
+```
+
+### AgentSettings
+
+```typescript
+export interface AgentSettings {
+  temperature?: number;
+  maxTokens?: number;
+  timeout?: number;
+  maxRetries?: number;
+  [key: string]: unknown;
+}
+```
+
+### IAgentRuntime
+
+The runtime interface that actions, providers, and evaluators receive:
+
+```typescript
+export interface IAgentRuntime {
+  agentId: UUID;
+  config: AgentConfig;
+  run(input: string | Content): Promise<TaskResult>;
+  getActions(): Action[];
+  registerPlugin(plugin: Plugin): void;
+  send(targetAgentId: string, message: Content): Promise<void>;
+  spawn(config: AgentConfig & { task?: string }): Promise<TaskResult>;
+  broadcast(message: Content): Promise<void>;
+  stop(): Promise<void>;
+}
+```
+
+## AgentRuntime Implementation
+
+The TypeScript `AgentRuntime` mirrors the Rust implementation but runs in Node/Bun:
+
+```typescript
+export class AgentRuntime implements IAgentRuntime {
+  readonly agentId: UUID;
+  readonly config: AgentConfig;
+  
+  private state: AgentState;
+  private actions: Map<string, Action> = new Map();
+  private providers: Provider[] = [];
+  private evaluators: Evaluator[] = [];
+  private plugins: Plugin[] = [];
+  private modelAdapter: IModelAdapter;
+  private eventBus: IEventBus;
+  
+  constructor(options: AgentRuntimeOptions);
+  async init(): Promise<void>;
+  async run(input: string | Content): Promise<TaskResult>;
+}
+```
+
+Key differences from the Rust runtime:
+- Uses `Map` instead of `HashMap`
+- Emits events via the TypeScript `EventBus`
+- Uses `randomUUID()` from `node:crypto`
+- Tool loop also aborts after 8 iterations
+
+## EventBus
+
+```typescript
+export class EventBus implements IEventBus {
+  private listeners = new Map<EventType, Array<EventHandler<unknown>>>();
+
+  on<T>(type: EventType, handler: EventHandler<T>): () => void;
+  async emit<T>(type: EventType, data: T, agentId?: string): Promise<void>;
+  clear(): void;
+}
+```
+
+Event types:
+
+```typescript
+export type EventType =
+  | 'agent:spawned'
+  | 'task:started'
+  | 'tool:invoked'
+  | 'tool:completed'
+  | 'message:generated'
+  | 'task:completed'
+  | 'swarm:created'
+  | 'swarm:task:started'
+  | 'swarm:teardown';
+```
+
+## Model Adapters
+
+TypeScript model adapters implement `IModelAdapter`:
+
+```typescript
+export interface IModelAdapter {
+  generate(options: GenerateOptions): Promise<GenerateResult>;
+  generateStream?(options: GenerateOptions): AsyncGenerator<StreamChunk>;
+}
+```
+
+Built-in adapters:
+- `OpenAIAdapter` — OpenAI-compatible API (OpenAI, Groq, Moonshot, DeepSeek)
+- `AnthropicAdapter` — Anthropic Messages API
+- `OllamaAdapter` — Ollama local models
+
+## Helpers
+
+Typed identity functions for IntelliSense:
+
+```typescript
+export function agent<T extends AgentConfig>(config: T): T;
+export function action<T extends Action>(config: T): T;
+export function plugin<T extends Plugin>(config: T): T;
+```
+
+Usage:
+
+```typescript
+import { agent, action, plugin } from '@animaOS-SWARM/core';
+
+const myAgent = agent({
+  name: 'researcher',
+  model: 'gpt-4o',
+  // TypeScript knows every valid field
+});
+```
+
+## Daemon Health
+
+Helpers for monitoring daemon connectivity:
+
+```typescript
+export interface DaemonWarningTransition {
+  from: string | null;
+  to: string | null;
+  source: 'manual' | 'poll';
+}
+
+export function describeDaemonWarningTransition(
+  from: string | null,
+  to: string | null,
+  source: 'manual' | 'poll',
+): { message: string; severity: 'info' | 'warning' | 'critical' };
+```
+
+Used by the CLI and TUI to show daemon status changes.
+
+## Consumers
+
+`@animaOS-SWARM/core` is consumed by:
+
+| Package | Purpose |
+|---------|---------|
+| `@animaOS-SWARM/sdk` | HTTP client for the daemon |
+| `@animaOS-SWARM/cli` | Command-line interface |
+| `@animaOS-SWARM/tui` | Terminal user interface |
+| `@animaOS-SWARM/web` | Web UI |
+
+## Installation
+
+```bash
+bun add @animaOS-SWARM/core
+```
+
+> **Note:** The `@animaOS-SWARM/sdk` re-exports everything from `@animaOS-SWARM/core`, so you typically only need one import source in application code.

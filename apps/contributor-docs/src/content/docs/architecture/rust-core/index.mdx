@@ -1,0 +1,104 @@
+---
+title: Rust Core
+description: Host-agnostic runtime engine — agents, memory, and swarm coordination in pure Rust
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+The Rust core is the heart of animaOS. It lives in `packages/core-rust/crates/` and follows a single rule: **core defines behavior, hosts provide reality**.
+
+This means the core has zero I/O dependencies — no HTTP clients, no database drivers, no filesystem access. It operates on pure data structures and trait interfaces. A host (like the Rust Daemon) wraps the core and provides the "real world": network calls to LLM providers, persistence to disk, and HTTP APIs.
+
+## Crate Structure
+
+```
+packages/core-rust/
+├── Cargo.toml              # Workspace manifest
+└── crates/
+    ├── anima-core/
+    │   ├── src/
+    │   │   ├── lib.rs        # Public exports
+    │   │   ├── agent.rs      # AgentConfig, AgentState, AgentStatus
+    │   │   ├── components.rs # Provider, Evaluator traits
+    │   │   ├── events.rs     # EngineEvent, EventType
+    │   │   ├── model.rs      # ModelAdapter, ModelGenerateRequest
+    │   │   ├── persistence.rs # DatabaseAdapter, Step
+    │   │   ├── primitives.rs # Content, Message, TaskResult
+    │   │   └── runtime.rs    # AgentRuntime, AgentRuntimeSnapshot
+    │   └── Cargo.toml
+    ├── anima-memory/
+    │   ├── src/
+    │   │   ├── lib.rs        # Public exports
+    │   │   ├── bm25.rs       # BM25 index, TextAnalyzer
+    │   │   ├── memory_manager.rs # MemoryManager, recall, evaluate
+    │   │   ├── vector_index.rs   # InMemoryVectorIndex
+    │   │   └── eval_harness.rs   # Memory eval test cases
+    │   └── Cargo.toml
+    └── anima-swarm/
+        ├── src/
+        │   ├── lib.rs        # Public exports
+        │   ├── coordinator.rs # SwarmCoordinator
+        │   ├── message_bus.rs # MessageBus
+        │   ├── strategies.rs  # Supervisor, RoundRobin, Dynamic
+        │   └── types.rs       # SwarmConfig, SwarmState
+        └── Cargo.toml
+```
+
+## Public API Surface
+
+### `anima-core`
+
+| Module | Key Types |
+|--------|-----------|
+| `agent` | `AgentConfig`, `AgentSettings`, `AgentState`, `AgentStatus`, `TokenUsage` |
+| `components` | `Evaluator`, `EvaluatorResult`, `Provider`, `ProviderResult` |
+| `events` | `EngineEvent`, `EventType` |
+| `model` | `ModelAdapter`, `ModelGenerateRequest`, `ModelGenerateResponse`, `ToolCall` |
+| `persistence` | `DatabaseAdapter`, `PersistenceError`, `Step`, `StepStatus` |
+| `primitives` | `AgentId`, `Content`, `Message`, `TaskResult`, `Attachment` |
+| `runtime` | `AgentRuntime`, `AgentRuntimeSnapshot` |
+
+### `anima-memory`
+
+| Module | Key Types |
+|--------|-----------|
+| `bm25` | `BM25`, `TextAnalyzer`, `TextAnalysisProfile`, `QueryExpander` |
+| `memory_manager` | `MemoryManager`, `Memory`, `MemoryRecallResult`, `MemoryEvaluationDecision` |
+| `vector_index` | `InMemoryVectorIndex`, `MemoryTextEmbedder`, `MemoryVectorError` |
+| `eval_harness` | `MemoryEvalCase`, `MemoryEvalReport`, `baseline_memory_eval_cases` |
+
+### `anima-swarm`
+
+| Module | Key Types |
+|--------|-----------|
+| `coordinator` | `SwarmCoordinator` |
+| `message_bus` | `MessageBus` |
+| `strategies` | `SwarmStrategy`, `StrategyFn`, `StrategyContext` |
+| `types` | `SwarmConfig`, `SwarmState`, `SwarmStatus`, `AgentMessage` |
+
+## Architecture
+
+**Host Layer** — Axum HTTP server, provider adapters, snapshot I/O
+
+**Rust Core** — Three crates with zero I/O dependencies:
+
+| Crate | Key Types |
+|-------|-----------|
+| `anima-core` | `AgentRuntime`, `ModelAdapter` (trait), `Provider` (trait), `Evaluator` (trait), `EventBus` |
+| `anima-memory` | `MemoryManager`, `BM25`, vector search, temporal KG, relationship graph |
+| `anima-swarm` | `SwarmCoordinator`, `MessageBus`, strategies (supervisor, round-robin, dynamic) |
+
+## Design Rules
+
+1. **Zero I/O** — Core crates never open sockets, files, or database connections
+2. **Trait boundaries** — All external concerns are abstracted behind traits (`ModelAdapter`, `DatabaseAdapter`)
+3. **Snapshot persistence** — State is fully serializable via `snapshot()` / `replace_snapshot()`
+4. **Pure algorithms** — BM25, cosine similarity, and temporal scoring are implemented from scratch with no external ML dependencies
+
+<Aside type="note">
+  Because the core has no filesystem access, the host is responsible for reading/writing snapshot bytes. This makes the core trivial to test and embed in any environment.
+</Aside>

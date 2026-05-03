@@ -41,6 +41,19 @@ export interface Memory {
   sessionId?: string | null;
 }
 
+export interface MemoryCreateInput {
+  agentId: string;
+  agentName: string;
+  type: MemoryType;
+  content: string;
+  importance: number;
+  tags?: string[] | null;
+  scope?: MemoryScope;
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
+}
+
 export type RelationshipEndpointKind = 'agent' | 'user' | 'system' | 'external';
 
 export interface AgentRelationship {
@@ -98,6 +111,32 @@ export interface MemoryEntity {
   summary?: string | null;
   createdAt: number;
   updatedAt: number;
+}
+
+export interface MemoryEntityCreateInput {
+  kind: RelationshipEndpointKind;
+  id: string;
+  name: string;
+  aliases?: string[];
+  summary?: string;
+}
+
+export interface AgentRelationshipCreateInput {
+  sourceKind?: RelationshipEndpointKind;
+  sourceAgentId: string;
+  sourceAgentName: string;
+  targetKind?: RelationshipEndpointKind;
+  targetAgentId: string;
+  targetAgentName: string;
+  relationshipType: string;
+  summary?: string;
+  strength?: number;
+  confidence?: number;
+  evidenceMemoryIds?: string[];
+  tags?: string[];
+  roomId?: string;
+  worldId?: string;
+  sessionId?: string;
 }
 
 export interface MemoryEntityOptions {
@@ -300,8 +339,18 @@ export interface AgentState {
 export interface AgentSnapshot {
   state: AgentState;
   messageCount: number;
+  messages: AgentTranscriptMessage[];
   eventCount: number;
   lastTask?: TaskResult;
+}
+
+export interface AgentTranscriptMessage {
+  id: string;
+  agentId: string;
+  roomId: string;
+  content: Content;
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  createdAt: number;
 }
 
 export interface AgentMessage {
@@ -332,6 +381,74 @@ export interface SwarmCreateRequest {
   maxTurns?: number;
   tokenBudget?: number;
 }
+
+export type SwarmStreamEventName =
+  | 'swarm:created'
+  | 'swarm:running'
+  | 'swarm:completed'
+  | 'swarm:message'
+  | 'task:started'
+  | 'task:completed'
+  | 'task:failed'
+  | 'tool:before'
+  | 'tool:after'
+  | 'agent:tokens'
+  | 'agent:terminated';
+
+export interface SwarmLifecycleEventPayload {
+  swarmId: string;
+  state: SwarmState;
+  result?: TaskResult | null;
+}
+
+export interface SwarmMessageEventPayload {
+  swarmId: string;
+  message: AgentMessage;
+}
+
+export interface SwarmAgentEventPayload {
+  agentId: string;
+  agentName: string;
+  error?: string;
+}
+
+export interface SwarmToolEventPayload extends SwarmAgentEventPayload {
+  toolName: string;
+  args?: Record<string, unknown>;
+  status?: string;
+  durationMs?: number;
+  result?: string;
+}
+
+export interface SwarmAgentTokensEventPayload extends SwarmAgentEventPayload {
+  usage: TokenUsage;
+}
+
+export type SwarmStreamEventPayload =
+  | SwarmLifecycleEventPayload
+  | SwarmMessageEventPayload
+  | SwarmAgentEventPayload
+  | SwarmToolEventPayload
+  | SwarmAgentTokensEventPayload;
+
+export interface SwarmStreamEvent {
+  event: SwarmStreamEventName;
+  data: SwarmStreamEventPayload;
+}
+
+const swarmStreamEventNames: SwarmStreamEventName[] = [
+  'swarm:created',
+  'swarm:running',
+  'swarm:completed',
+  'swarm:message',
+  'task:started',
+  'task:completed',
+  'task:failed',
+  'tool:before',
+  'tool:after',
+  'agent:tokens',
+  'agent:terminated',
+];
 
 async function request<T>(
   path: string,
@@ -428,9 +545,49 @@ export const swarms = {
       `/api/swarms/${id}/run`,
       { method: 'POST', json: { task } }
     ),
+
+  streamEvents: (
+    id: string,
+    onEvent: (event: SwarmStreamEvent) => void,
+    onError?: () => void
+  ) => {
+    const source = new EventSource(`/api/swarms/${id}/events`);
+    const handlers = swarmStreamEventNames.map((eventName) => {
+      const handler = (event: Event) => {
+        const message = event as MessageEvent<string>;
+        try {
+          onEvent({
+            event: eventName,
+            data: JSON.parse(message.data) as SwarmStreamEventPayload,
+          });
+        } catch {
+          // Ignore malformed stream frames and keep the live connection open.
+        }
+      };
+      source.addEventListener(eventName, handler);
+      return [eventName, handler] as const;
+    });
+    source.onerror = () => {
+      onError?.();
+      source.close();
+    };
+
+    return () => {
+      for (const [eventName, handler] of handlers) {
+        source.removeEventListener(eventName, handler);
+      }
+      source.close();
+    };
+  },
 };
 
 export const memories = {
+  create: (input: MemoryCreateInput) =>
+    request<Memory>('/api/memories', {
+      method: 'POST',
+      json: input,
+    }),
+
   recent: (opts?: RecentMemoriesOptions) => {
     const params = new URLSearchParams();
     if (opts?.agentId) params.set('agentId', opts.agentId);
@@ -458,6 +615,12 @@ export const memories = {
       `/api/memories/entities${qs ? `?${qs}` : ''}`
     ).then((r) => r.entities);
   },
+
+  createEntity: (input: MemoryEntityCreateInput) =>
+    request<MemoryEntity>('/api/memories/entities', {
+      method: 'POST',
+      json: input,
+    }),
 
   evaluate: (input: EvaluatedMemoryInput) =>
     request<MemoryEvaluation>('/api/memories/evaluations', {
@@ -526,6 +689,12 @@ export const memories = {
       `/api/memories/relationships${qs ? `?${qs}` : ''}`
     ).then((r) => r.relationships);
   },
+
+  createRelationship: (input: AgentRelationshipCreateInput) =>
+    request<AgentRelationship>('/api/memories/relationships', {
+      method: 'POST',
+      json: input,
+    }),
 };
 
 export function coerceText(data: unknown): string {

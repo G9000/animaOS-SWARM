@@ -2,6 +2,7 @@ mod support;
 
 use axum::http::StatusCode;
 use axum::Router;
+use serde_json::Value;
 use support::{
     extract_json_string_field, send_empty_request, send_json_request, test_app,
     use_temp_workspace_root,
@@ -13,6 +14,16 @@ async fn create_agent(app: &Router, body: &str) -> (StatusCode, String) {
 
 async fn run_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, String) {
     send_json_request(app, "POST", &format!("/api/agents/{agent_id}/run"), body).await
+}
+
+fn extract_result_text(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("result")?
+        .get("data")?
+        .get("text")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 #[tokio::test]
@@ -294,9 +305,67 @@ async fn run_agent_persists_reflection_memory_from_evaluator() {
         .contains("evaluated response: operator handled task: I prefer terse release summaries"));
     assert!(recent_response.contains("user stated preference: I prefer terse release summaries"));
     assert_eq!(relationships_status, StatusCode::OK);
-    assert!(relationships_response.contains("\"targetKind\":\"user\""));
-    assert!(relationships_response.contains("\"targetAgentId\":\"user-42\""));
-    assert!(relationships_response.contains("\"relationshipType\":\"responds_to\""));
+    let relationships_json: Value =
+        serde_json::from_str(&relationships_response).expect("relationships response is json");
+    let relationships = relationships_json["relationships"]
+        .as_array()
+        .expect("relationships should be an array");
+    assert_eq!(relationships.len(), 1);
+    let relationship = &relationships[0];
+    assert_eq!(relationship["targetKind"], "user");
+    assert_eq!(relationship["targetAgentId"], "user-42");
+    assert_eq!(relationship["relationshipType"], "responds_to");
+    assert!(relationship["tags"]
+        .as_array()
+        .expect("relationship tags should be an array")
+        .iter()
+        .any(|tag| tag == "relation:communication_preference"));
+    let relationship_id = relationship["id"]
+        .as_str()
+        .expect("relationship should include id");
+    let evidence_memory_ids = relationship["evidenceMemoryIds"]
+        .as_array()
+        .expect("relationship should include evidence memory ids");
+    assert!(evidence_memory_ids.len() >= 2);
+    let evidence_memory_id = evidence_memory_ids[0]
+        .as_str()
+        .expect("evidence memory id should be a string");
+
+    let (recall_status, recall_response) = send_empty_request(
+        &app,
+        "GET",
+        "/api/memories/recall?q=no-keyword-match&entityId=user-42&recentLimit=0&limit=5",
+    )
+    .await;
+    assert_eq!(recall_status, StatusCode::OK);
+    let recall_json: Value =
+        serde_json::from_str(&recall_response).expect("recall response is json");
+    let recall_results = recall_json["results"]
+        .as_array()
+        .expect("recall results should be an array");
+    assert!(recall_results.iter().any(|result| {
+        result["memory"]["id"] == evidence_memory_id
+            && result["relationshipScore"].as_f64().unwrap_or_default() > 0.0
+    }));
+
+    let (trace_status, trace_response) = send_empty_request(
+        &app,
+        "GET",
+        &format!("/api/memories/{evidence_memory_id}/trace"),
+    )
+    .await;
+    assert_eq!(trace_status, StatusCode::OK);
+    let trace_json: Value = serde_json::from_str(&trace_response).expect("trace response is json");
+    assert!(trace_json["relationships"]
+        .as_array()
+        .expect("trace relationships should be an array")
+        .iter()
+        .any(|trace_relationship| trace_relationship["id"] == relationship_id));
+    assert!(trace_json["entities"]
+        .as_array()
+        .expect("trace entities should be an array")
+        .iter()
+        .any(|entity| entity["id"] == "user-42"));
 }
 
 #[tokio::test]
@@ -333,6 +402,9 @@ async fn get_agent_reflects_runtime_context_after_run() {
 
     assert_eq!(status, StatusCode::OK);
     assert!(response.contains("\"messageCount\":2"));
+    assert!(response.contains("\"messages\":[{"));
+    assert!(response.contains("\"role\":\"user\""));
+    assert!(response.contains("\"role\":\"assistant\""));
     assert!(response.contains("\"eventCount\":8"));
     assert!(!response.contains("\"promptTokens\":0,\"completionTokens\":0,\"totalTokens\":0"));
     assert!(response.contains("\"lastTask\":{"));
@@ -439,9 +511,12 @@ async fn run_agent_does_not_reuse_previous_tool_result_between_runs() {
     let _ = send_json_request(&app, "POST", "/api/memories", &beta_memory).await;
     let (_, second_run) = run_agent(&app, &agent_id, r#"{"text":"beta"}"#).await;
 
-    assert!(first_run.contains("alpha prior answer"));
-    assert!(second_run.contains("beta prior answer"));
-    assert!(!second_run.contains("alpha prior answer"));
+    let first_text = extract_result_text(&first_run).expect("first run should return text");
+    let second_text = extract_result_text(&second_run).expect("second run should return text");
+
+    assert!(first_text.contains("alpha prior answer"));
+    assert!(second_text.contains("beta prior answer"));
+    assert!(!second_text.contains("alpha prior answer"));
 }
 
 #[tokio::test]

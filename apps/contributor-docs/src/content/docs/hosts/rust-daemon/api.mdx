@@ -1,0 +1,218 @@
+---
+title: HTTP API
+description: HTTP and SSE endpoints exposed by the Rust daemon
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+The daemon serves operational endpoints, `/api/*` application endpoints, and a Scalar UI at `/docs`.
+
+## Operational Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness check. Always returns `200 OK` with `{"status":"ok"}` |
+| `GET` | `/ready` | Readiness check. Returns `200` when ready, `503` with issues |
+| `GET` | `/metrics` | Prometheus-style metrics |
+| `GET` | `/openapi.json` | OpenAPI 3.0 document for all routes |
+| `GET` | `/docs` | Scalar API explorer (interactive docs UI) |
+
+### Health Response
+
+```json
+{
+  "status": "ok"
+}
+```
+
+### Readiness Response
+
+```json
+{
+  "status": "ready",
+  "controlPlaneDurability": "ephemeral",
+  "database": "connected",
+  "agents": 3,
+  "swarms": 1
+}
+```
+
+If `ANIMAOS_RS_PERSISTENCE_MODE=postgres` is set without a working DB:
+
+```json
+{
+  "status": "not_ready",
+  "database": "missing",
+  "issues": ["Postgres connection failed"]
+}
+```
+
+## Agents
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/agents` | List all registered agent snapshots |
+| `POST` | `/api/agents` | Create an agent. Body: `AgentConfig` JSON |
+| `GET` | `/api/agents/{id}` | Get one agent snapshot |
+| `DELETE` | `/api/agents/{id}` | Remove an agent runtime |
+| `POST` | `/api/agents/{id}/run` | Run the agent with `{"text":"..."}`. Blocks until completion |
+| `GET` | `/api/agents/{id}/memories/recent` | Get recent memories. Optional `?limit=N` |
+
+### Create Agent Request
+
+```json
+{
+  "name": "researcher",
+  "model": "gpt-4o",
+  "provider": "openai",
+  "system": "You are a research assistant.",
+  "bio": "I help users find and synthesize information.",
+  "knowledge": ["machine learning", "neuroscience"],
+  "tools": [
+    {
+      "name": "web_search",
+      "description": "Search the web",
+      "parameters": { "query": { "type": "string" } }
+    }
+  ]
+}
+```
+
+### Create Agent Response
+
+```json
+{
+  "state": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "name": "researcher",
+    "status": "idle",
+    "config": { ... },
+    "created_at": 1715000000000,
+    "token_usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+  },
+  "message_count": 0,
+  "event_count": 0,
+  "last_task": null
+}
+```
+
+### Run Agent Request
+
+```json
+{
+  "text": "What are the main types of neural networks?"
+}
+```
+
+### Run Agent Response
+
+```json
+{
+  "agent": { ... },
+  "result": {
+    "status": "success",
+    "data": { "text": "The main types are..." },
+    "duration_ms": 2500
+  }
+}
+```
+
+## Swarms
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/swarms` | List all registered swarm snapshots |
+| `POST` | `/api/swarms` | Create a swarm. Body: `SwarmConfig` JSON |
+| `GET` | `/api/swarms/{id}` | Get one swarm snapshot |
+| `POST` | `/api/swarms/{id}/run` | Run swarm task. Body: `{"text":"..."}` |
+| `GET` | `/api/swarms/{id}/events` | SSE event stream |
+
+### Create Swarm Request
+
+```json
+{
+  "strategy": "supervisor",
+  "manager": {
+    "name": "manager",
+    "model": "gpt-4o",
+    "system": "You manage a team of researchers."
+  },
+  "workers": [
+    { "name": "researcher-1", "model": "gpt-4o-mini" },
+    { "name": "researcher-2", "model": "gpt-4o-mini" }
+  ],
+  "max_turns": 10
+}
+```
+
+### Swarm SSE Events
+
+```
+event: swarm:task:started
+data: {"swarm_id":"...","input":"..."}
+
+event: agent:delegated
+data: {"agent_id":"...","task":"..."}
+
+event: message:generated
+data: {"agent_id":"...","content":"..."}
+
+event: swarm:task:completed
+data: {"swarm_id":"...","result":"..."}
+```
+
+## Memories
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/memories` | Store a memory |
+| `GET` | `/api/memories/search` | Keyword search. Required `?q=` |
+| `GET` | `/api/memories/recent` | Recent memories |
+| `GET` | `/api/memories/recall` | Hybrid recall. Required `?q=` |
+| `POST` | `/api/memories/evaluations` | Evaluate memory without storing |
+| `POST` | `/api/memories/evaluated` | Evaluate and conditionally store |
+| `GET` | `/api/memories/{id}/trace` | Evidence trace |
+| `POST` | `/api/memories/retention` | Apply retention policy |
+| `GET` | `/api/memories/readiness` | Memory system health |
+| `POST` / `GET` | `/api/memories/relationships` | Create / query relationships |
+| `POST` / `GET` | `/api/memories/entities` | Create / query entities |
+
+### Store Memory Request
+
+```json
+{
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_name": "researcher",
+  "type": "episodic",
+  "content": "User asked about neural networks",
+  "importance": 0.8,
+  "scope": "shared",
+  "tags": ["ml", "question"]
+}
+```
+
+### Recall Request
+
+```bash
+GET /api/memories/recall?q=neural+networks&limit=10
+```
+
+### Recall Response
+
+```json
+[
+  {
+    "memory": { ... },
+    "lexical_score": 0.95,
+    "vector_score": 0.87,
+    "temporal_score": 0.92,
+    "relationship_score": 0.60,
+    "importance_score": 0.80,
+    "final_score": 0.88
+  }
+]
+```

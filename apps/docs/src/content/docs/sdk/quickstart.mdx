@@ -1,0 +1,189 @@
+---
+title: Quick Start
+description: Get up and running with the animaOS SDK in minutes
+---
+
+import { Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+
+## Prerequisites
+
+Before using the SDK, make sure an animaOS-compatible host is running and you have provider credentials configured.
+
+<Steps>
+
+1. **Start a host**
+
+   The SDK connects to any host implementing the animaOS HTTP/SSE contract. The reference implementation is the [Rust daemon](https://github.com/G9000/animaOS-SWARM/tree/main/hosts/rust-daemon) in this repo. It listens on `http://127.0.0.1:8080` by default.
+
+   <Tabs>
+     <TabItem label="bun">
+       ```bash
+       bun run daemon
+       ```
+     </TabItem>
+     <TabItem label="cargo">
+       ```bash
+       cargo run --manifest-path Cargo.toml -p anima-daemon
+       ```
+     </TabItem>
+   </Tabs>
+
+2. **Set provider credentials**
+
+   Your host needs at least one LLM provider API key to run agents.
+
+   ```bash
+   export OPENAI_API_KEY="sk-..."
+   # and/or
+   export ANTHROPIC_API_KEY="sk-ant-..."
+   ```
+
+3. **Verify the host is healthy**
+
+   ```bash
+   curl http://127.0.0.1:8080/api/health
+   ```
+
+</Steps>
+
+## Installation
+
+The SDK is published as `@animaOS-SWARM/sdk` and requires a modern package manager that supports ESM.
+
+<Tabs>
+  <TabItem label="bun">
+    ```bash
+    bun add @animaOS-SWARM/sdk
+    ```
+  </TabItem>
+  <TabItem label="npm">
+    ```bash
+    npm install @animaOS-SWARM/sdk
+    ```
+  </TabItem>
+  <TabItem label="pnpm">
+    ```bash
+    pnpm add @animaOS-SWARM/sdk
+    ```
+  </TabItem>
+  <TabItem label="yarn">
+    ```bash
+    yarn add @animaOS-SWARM/sdk
+    ```
+  </TabItem>
+</Tabs>
+
+## Create a Client
+
+The entry point to the SDK is `createDaemonClient`. It returns a `DaemonClient` that exposes `agents`, `swarms`, and `memories` sub-clients.
+
+```typescript
+import { createDaemonClient } from '@animaOS-SWARM/sdk';
+
+// Default: connects to http://127.0.0.1:8080
+const client = createDaemonClient();
+
+// Or with explicit options
+const client = createDaemonClient({
+  baseUrl: 'http://127.0.0.1:8080',
+  // Optional: custom fetch implementation
+  fetch: globalThis.fetch,
+});
+```
+
+### Client options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `baseUrl` | `string` | `http://127.0.0.1:8080` | Daemon HTTP endpoint |
+| `fetch` | `typeof fetch` | `globalThis.fetch` | Custom fetch implementation |
+
+## Create and Run Your First Agent
+
+```typescript
+import { agent, createDaemonClient } from '@animaOS-SWARM/sdk';
+
+const client = createDaemonClient();
+
+// 1. Create an agent
+const researcher = await client.agents.create(
+  agent({
+    name: 'researcher',
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    system: 'You are a research assistant. Provide concise, factual answers.',
+  })
+);
+
+console.log('Created agent:', researcher.state.id);
+
+// 2. Run it
+const run = await client.agents.run(researcher.state.id, {
+  text: 'What are the main types of neural networks?',
+});
+
+// 3. Handle the result
+if (run.result.status === 'success') {
+  console.log(run.result.data?.text);
+} else {
+  console.error('Run failed:', run.result.error);
+}
+```
+
+The `agent()` helper is an identity function that gives you full TypeScript IntelliSense for the `AgentConfig` shape. You can also pass a plain object if you prefer.
+
+## Error Handling
+
+The SDK throws two custom error classes. Always wrap calls in `try/catch` when operating over a network boundary.
+
+```typescript
+import { DaemonHttpError, DaemonConnectionError } from '@animaOS-SWARM/sdk';
+
+try {
+  const result = await client.agents.run(agentId, { text: 'Hello' });
+} catch (error) {
+  if (error instanceof DaemonHttpError) {
+    // Daemon responded with a non-2xx status
+    console.error(`HTTP ${error.status}:`, error.body);
+  } else if (error instanceof DaemonConnectionError) {
+    // Network failure — daemon is down or unreachable
+    console.error('Connection failed:', error.cause);
+  } else {
+    throw error; // re-throw unexpected errors
+  }
+}
+```
+
+| Error | Property | Meaning |
+|-------|----------|---------|
+| `DaemonHttpError` | `status: number` | HTTP status code from the daemon |
+| `DaemonHttpError` | `body: unknown` | Parsed JSON error body |
+| `DaemonConnectionError` | `cause: unknown` | Original fetch/network error |
+
+## Host-agnostic
+
+The SDK is designed to work with any animaOS-compatible host. Just point `baseUrl` at your host:
+
+```typescript
+const client = createDaemonClient({
+  baseUrl: 'http://my-custom-host:8080',
+});
+```
+
+The Rust daemon in this repo is the reference implementation. See [`hosts/rust-daemon`](https://github.com/G9000/animaOS-SWARM/tree/main/hosts/rust-daemon) for its full operator documentation, environment variables, and HTTP API.
+
+## Health Check
+
+Before making requests, you can verify the host is reachable:
+
+```typescript
+const health = await client.health();
+console.log(health.status); // 'ok' | 'degraded' | 'unavailable'
+```
+
+## Next Steps
+
+- **[Agents](/sdk/agents/)** — full agent lifecycle, actions, plugins, and settings
+- **[Swarms](/sdk/swarms/)** — multi-agent coordination, strategies, and SSE streaming
+- **[Memories](/sdk/memories/)** — search, recall, evaluation, retention, and relationships
+- **[API Reference](/sdk/reference/)** — complete typed API surface and helper functions

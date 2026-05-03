@@ -10,7 +10,7 @@ use anima_core::{
 };
 use async_trait::async_trait;
 
-use self::dispatch::{DeterministicToolDispatch, deterministic_tool_dispatch};
+use self::dispatch::{deterministic_tool_dispatch, DeterministicToolDispatch};
 use self::render::{
     recent_memory_context, render_tool_result_for_model, swarm_inbox_context,
     trailing_tool_messages,

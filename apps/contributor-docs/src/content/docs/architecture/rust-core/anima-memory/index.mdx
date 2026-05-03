@@ -1,0 +1,54 @@
+---
+title: anima-memory
+description: Hybrid memory system with BM25, vector search, temporal reasoning, and relationship graphs
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`anima-memory` is the hybrid memory crate. It combines lexical search (BM25), vector similarity, temporal reasoning, and relationship graphs into a single recall pipeline. All data lives in-memory — no external database is required.
+
+## Module Structure
+
+```
+src/
+├── lib.rs              # Public exports
+├── bm25.rs             # BM25 index, text analysis, query expansion
+├── memory_manager.rs   # MemoryManager, recall, evaluate, snapshot
+├── vector_index.rs     # In-memory vector index, cosine similarity
+└── eval_harness.rs     # Test cases for memory evaluation
+```
+
+## MemoryManager
+
+The central struct. Stores everything in standard library collections:
+
+```rust
+pub struct MemoryManager {
+    memories: HashMap<String, Memory>,
+    memory_entities: HashMap<String, MemoryEntity>,
+    agent_relationships: HashMap<String, AgentRelationship>,
+    temporal_facts: HashMap<String, TemporalFact>,
+    temporal_relationships: HashMap<String, TemporalRelationship>,
+    index: BM25,
+}
+```
+
+## Memory Types
+
+| Type | Description | Example |
+|------|-------------|---------|
+| `Episodic` | Specific events and interactions | "User asked about neural networks" |
+| `Semantic` | Facts and knowledge | "Neural networks are inspired by biological neurons" |
+| `Procedural` | How-to knowledge | "To create an agent, call `client.agents.create()`" |
+| `Reflective` | Agent's own thoughts and observations | "The user seems interested in ML topics" |
+
+## Design Rules
+
+1. **Zero I/O** — No filesystem access, no network calls
+2. **Snapshot persistence** — Full state serializable via `snapshot()`
+3. **Pure algorithms** — BM25 and cosine similarity from scratch
+4. **Configurable fusion** — Weights tunable per query

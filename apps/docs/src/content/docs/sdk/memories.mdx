@@ -1,0 +1,383 @@
+---
+title: Memories
+description: Search, recall, and manage agent memories with the animaOS SDK
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The memory system in animaOS provides **hybrid recall** combining BM25 lexical search, vector semantic search, temporal reasoning, and relationship graph traversal. Memories can belong to agents, rooms, worlds, or sessions, and support scoped visibility.
+
+## Create a Memory
+
+```typescript
+const memory = await client.memories.create({
+  agentId: 'agent-uuid-here',
+  agentName: 'researcher',
+  type: 'fact',
+  content: 'Rust daemon memory endpoint created',
+  importance: 0.8,
+  tags: ['sdk', 'memory'],
+  scope: 'shared',
+  roomId: 'room-1',
+  worldId: 'world-default',
+});
+```
+
+### `CreateMemoryInput` fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `agentId` | `string` | ✅ | Owning agent identifier |
+| `agentName` | `string` | ✅ | Agent name at creation time |
+| `type` | `MemoryType` | ✅ | Memory category |
+| `content` | `string` | ✅ | Memory text |
+| `importance` | `number` | ✅ | Importance score (0–1) |
+| `tags` | `string[] \| null` | — | Optional searchable tags |
+| `scope` | `MemoryScope` | — | Visibility: `shared`, `private`, or `room` |
+| `roomId` | `string` | — | Room context |
+| `worldId` | `string` | — | World context |
+| `sessionId` | `string` | — | Session context |
+
+### `MemoryType` values
+
+Common types include `fact`, `reflection`, `conversation`, `goal`, `plan`, `observation`, and `event`. The type is stored as a string and can be extended for your domain.
+
+### `MemoryScope` values
+
+| Value | Behavior |
+|-------|----------|
+| `shared` | Visible to all agents in the same context |
+| `private` | Visible only to the owning agent |
+| `room` | Visible to agents in the specified room |
+
+## Search Memories
+
+Search uses a hybrid of lexical (BM25) and vector similarity scoring.
+
+```typescript
+const results = await client.memories.search('daemon memory', {
+  agentName: 'researcher',
+  type: 'fact',
+  limit: 5,
+  minImportance: 0.5,
+});
+
+for (const result of results) {
+  console.log(`[${result.score.toFixed(3)}] ${result.memory.content}`);
+}
+```
+
+### `MemorySearchOptions`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agentId` | `string` | Filter by owning agent |
+| `agentName` | `string` | Filter by agent name |
+| `type` | `MemoryType` | Filter by memory type |
+| `scope` | `MemoryScope` | Filter by visibility scope |
+| `roomId` | `string` | Filter by room |
+| `worldId` | `string` | Filter by world |
+| `sessionId` | `string` | Filter by session |
+| `limit` | `number` | Maximum results |
+| `minImportance` | `number` | Minimum importance threshold |
+
+### `MemorySearchResult`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `memory` | `Memory` | The matched memory |
+| `score` | `number` | Combined relevance score |
+
+## Recent Memories
+
+Retrieve the most recently created memories with optional filtering:
+
+```typescript
+const memories = await client.memories.recent({
+  agentId: 'agent-uuid-here',
+  scope: 'shared',
+  limit: 20,
+});
+```
+
+### `RecentMemoriesOptions`
+
+Same fields as `MemorySearchOptions` except `type` and `minImportance`.
+
+## Recall
+
+**Recall** is the advanced retrieval API. It fuses multiple signals into a single ranked result set:
+
+- **Lexical** — BM25 keyword matching
+- **Vector** — Semantic embedding similarity
+- **Relationship** — Graph proximity via `AgentRelationship`
+- **Temporal** — Time-decayed relevance
+- **Recency** — How recently the memory was created
+- **Importance** — The stored importance score
+
+```typescript
+const results = await client.memories.recall('evidence probe', {
+  entityId: 'user-1',
+  agentId: 'agent-1',
+  temporalLimit: 7,
+  limit: 3,
+});
+
+for (const r of results) {
+  console.log(`score ${r.score.toFixed(3)} — ${r.memory.content}`);
+  console.log(`  lexical: ${r.lexicalScore.toFixed(3)}`);
+  console.log(`  vector: ${r.vectorScore.toFixed(3)}`);
+  console.log(`  relationship: ${r.relationshipScore.toFixed(3)}`);
+}
+```
+
+### `MemoryRecallOptions`
+
+All `MemorySearchOptions` plus:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `entityId` | `string` | Target entity for relationship scoring |
+| `recallAgentId` | `string` | Agent performing the recall |
+| `lexicalLimit` | `number` | Max lexical candidates |
+| `recentLimit` | `number` | Max recent candidates |
+| `relationshipLimit` | `number` | Max relationship candidates |
+| `temporalLimit` | `number` | Temporal window size |
+
+### `MemoryRecallResult`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `memory` | `Memory` | The recalled memory |
+| `score` | `number` | Fused composite score |
+| `lexicalScore` | `number` | BM25 contribution |
+| `vectorScore` | `number` | Embedding similarity contribution |
+| `relationshipScore` | `number` | Graph proximity contribution |
+| `temporalScore` | `number` | Temporal relevance contribution |
+| `recencyScore` | `number` | Recency contribution |
+| `importanceScore` | `number` | Importance contribution |
+
+## Evaluate and Store
+
+Before storing a memory, you can run it through the evaluation pipeline. The evaluator decides whether to **store**, **merge** with an existing memory, or **ignore** the input.
+
+```typescript
+const outcome = await client.memories.addEvaluated({
+  agentId: 'agent-1',
+  agentName: 'researcher',
+  type: 'fact',
+  content: 'User prefers concise release notes',
+  importance: 0.4,
+  tags: ['preference'],
+  minContentChars: 8,
+  minImportance: 0.1,
+});
+
+console.log(outcome.evaluation.decision); // 'store' | 'merge' | 'ignore'
+console.log(outcome.evaluation.reason);   // Human-readable explanation
+console.log(outcome.evaluation.score);    // Confidence score
+
+if (outcome.memory) {
+  console.log('Stored memory ID:', outcome.memory.id);
+}
+```
+
+### `MemoryEvaluationDecision`
+
+| Value | Meaning |
+|-------|---------|
+| `store` | Save as a new memory |
+| `merge` | Combine with an existing duplicate memory |
+| `ignore` | Discard — too low quality or redundant |
+
+### `MemoryEvaluationOutcome`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `evaluation` | `MemoryEvaluation` | Evaluation result |
+| `memory` | `Memory \| null` | The stored/merged memory, if any |
+
+### Evaluate without storing
+
+If you want to preview the evaluation decision before committing:
+
+```typescript
+const evaluation = await client.memories.evaluate({
+  agentId: 'agent-1',
+  agentName: 'researcher',
+  type: 'fact',
+  content: 'Something happened',
+  importance: 0.5,
+});
+
+console.log(evaluation.decision, evaluation.reason);
+```
+
+## Memory Trace
+
+Trace the evidence graph for a specific memory — its relationships and linked entities.
+
+```typescript
+const trace = await client.memories.trace('memory-uuid-here');
+
+console.log('Memory:', trace.memory.content);
+console.log('Relationships:', trace.relationships.length);
+console.log('Entities:', trace.entities.length);
+```
+
+### `MemoryEvidenceTrace`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `memory` | `Memory` | The traced memory |
+| `relationships` | `AgentRelationship[]` | Connected relationships |
+| `entities` | `MemoryEntity[]` | Linked entities |
+
+## Retention
+
+Apply automatic memory cleanup with configurable decay and importance thresholds.
+
+```typescript
+const report = await client.memories.applyRetention({
+  minImportance: 0.2,
+  maxMemories: 1000,
+  maxAgeMillis: 30 * 24 * 60 * 60 * 1000, // 30 days
+  decayHalfLifeMillis: 24 * 60 * 60 * 1000, // 1 day
+});
+
+console.log('Decayed:', report.decayedMemories.length);
+console.log('Removed:', report.removedMemoryIds.length);
+console.log('Relationships removed:', report.removedRelationshipIds.length);
+```
+
+### `MemoryRetentionInput`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `maxAgeMillis` | `number` | Delete memories older than this |
+| `minImportance` | `number` | Delete memories below this importance |
+| `maxMemories` | `number` | Keep only the N most important |
+| `decayHalfLifeMillis` | `number` | Half-life for exponential importance decay |
+
+### `MemoryRetentionReport`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decayedMemories` | `MemoryImportanceAdjustment[]` | Memories whose importance was reduced |
+| `removedMemoryIds` | `string[]` | Deleted memory IDs |
+| `removedRelationshipIds` | `string[]` | Deleted relationship IDs |
+
+## Readiness
+
+Check whether the memory subsystem is fully operational — embeddings loaded, vector store ready, and evaluation pipeline passing self-checks.
+
+```typescript
+const ready = await client.memories.readiness();
+
+console.log('Overall:', ready.passed);
+console.log('Vector count:', ready.embeddings.vectorCount);
+console.log('Embedding provider:', ready.embeddings.provider);
+console.log('Model:', ready.embeddings.model);
+console.log('Dimension:', ready.embeddings.dimension);
+console.log('Evaluation checks:', ready.evaluation.passedChecks, '/', ready.evaluation.totalChecks);
+```
+
+### `MemoryReadiness`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `passed` | `boolean` | Overall health status |
+| `embeddings` | `MemoryEmbeddingStatus` | Embedding engine status |
+| `evaluation` | `MemoryEvalReport` | Self-test results |
+
+### `MemoryEmbeddingStatus`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | `boolean` | Whether embeddings are active |
+| `provider` | `string` | Embedding provider name |
+| `model` | `string` | Model identifier |
+| `dimension` | `number` | Vector dimensionality |
+| `vectorCount` | `number` | Number of vectors stored |
+| `persisted` | `boolean` | Whether vectors are persisted |
+| `storageFile` | `string \| null` | Path to vector store file |
+
+## Relationships
+
+Memories are connected via relationships between agents and entities. You can create and query these relationships explicitly.
+
+### Create a relationship
+
+```typescript
+const relationship = await client.memories.createRelationship({
+  sourceAgentId: 'agent-a',
+  sourceKind: 'agent',
+  targetAgentId: 'agent-b',
+  targetKind: 'agent',
+  relationshipType: 'collaborator',
+  strength: 0.9,
+  confidence: 0.85,
+});
+```
+
+### Query relationships
+
+```typescript
+const relationships = await client.memories.relationships({
+  agentId: 'agent-a',
+  relationshipType: 'collaborator',
+  minStrength: 0.5,
+  limit: 10,
+});
+```
+
+### `AgentRelationshipOptions`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agentId` | `string` | Filter by participating agent |
+| `entityId` | `string` | Filter by entity |
+| `sourceKind` | `RelationshipEndpointKind` | Filter by source type |
+| `sourceAgentId` | `string` | Filter by source agent |
+| `targetKind` | `RelationshipEndpointKind` | Filter by target type |
+| `targetAgentId` | `string` | Filter by target agent |
+| `relationshipType` | `string` | Filter by relationship type |
+| `roomId` | `string` | Filter by room |
+| `worldId` | `string` | Filter by world |
+| `sessionId` | `string` | Filter by session |
+| `minStrength` | `number` | Minimum relationship strength |
+| `minConfidence` | `number` | Minimum confidence |
+| `limit` | `number` | Maximum results |
+
+## Entities
+
+Entities are typed objects that can participate in the relationship graph.
+
+```typescript
+// Create an entity
+const entity = await client.memories.createEntity({
+  kind: 'user',
+  id: 'user-42',
+  name: 'Alice',
+  aliases: ['al', 'ali'],
+  summary: 'A power user who prefers CLI tools.',
+});
+
+// List entities
+const entities = await client.memories.entities({
+  kind: 'user',
+  limit: 50,
+});
+```
+
+### `MemoryEntity`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kind` | `RelationshipEndpointKind` | Entity type |
+| `id` | `string` | Unique identifier |
+| `name` | `string` | Display name |
+| `aliases` | `string[]` | Alternative names |
+| `summary` | `string \| null` | Optional description |
+| `createdAt` | `number` | Unix timestamp (ms) |
+| `updatedAt` | `number` | Unix timestamp (ms) |

@@ -1,0 +1,218 @@
+---
+title: Testing
+description: How to test each part of the animaOS monorepo
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Rust Core
+
+### Unit Tests
+
+```bash
+# All Rust core tests
+cargo test --workspace
+
+# Individual crates
+cargo test -p anima-core
+cargo test -p anima-memory
+cargo test -p anima-swarm
+
+# With nextest (faster, better output)
+cargo nextest run --workspace
+
+# With filter
+cargo test -p anima-memory memory_manager::tests::test_recall
+```
+
+### Memory Benchmark
+
+```bash
+# LoCoMo eval (long-context memory benchmark)
+bun x nx run core-rust:memory-locomo --skipNxCache
+
+# Baseline eval harness
+bun x nx run core-rust:memory-eval --skipNxCache
+```
+
+The LoCoMo eval measures:
+- Recall precision at K=5, 10, 20
+- Latency per query
+- Memory usage at 1k, 10k, 100k memories
+
+### Mocking in Rust Tests
+
+The core uses trait objects for all external dependencies, making mocking straightforward:
+
+```rust
+#[derive(Default)]
+struct MockModelAdapter {
+    responses: Vec<ModelGenerateResponse>,
+}
+
+#[async_trait]
+impl ModelAdapter for MockModelAdapter {
+    async fn generate(&self, _req: ModelGenerateRequest) -> Result<ModelGenerateResponse, String> {
+        Ok(self.responses.get(0).cloned().unwrap())
+    }
+}
+
+#[tokio::test]
+async fn test_agent_run() {
+    let adapter = Arc::new(MockModelAdapter::default());
+    let runtime = AgentRuntime::new(config, adapter.clone());
+    let result = runtime.run("Hello").await;
+    assert!(result.status == TaskStatus::Success);
+}
+```
+
+## Rust Daemon
+
+```bash
+# Standard test run
+bun x nx run rust-daemon:test --skipNxCache
+
+# On Windows, if the binary is locked by a running process:
+CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache
+```
+
+<Aside type="note">
+  The Windows workaround uses a separate target directory so the running binary and test binary don't conflict.
+</Aside>
+
+### Integration Tests
+
+Daemon integration tests start the full Axum server and make HTTP requests:
+
+```rust
+#[tokio::test]
+async fn test_create_agent() {
+    let app = create_test_app().await;
+    let client = TestClient::new(app);
+    
+    let response = client
+        .post("/api/agents")
+        .json(&json!({"name":"test","model":"gpt-4o"}))
+        .send()
+        .await;
+    
+    assert_eq!(response.status(), 201);
+}
+```
+
+## TypeScript Packages
+
+```bash
+# Core types
+bun x nx test @animaOS-SWARM/core
+
+# SDK
+bun x nx test @animaOS-SWARM/sdk
+
+# CLI
+bun x nx test @animaOS-SWARM/cli
+
+# All TypeScript tests
+bun x nx run-many -t test -p @animaOS-SWARM/core @animaOS-SWARM/sdk @animaOS-SWARM/cli
+```
+
+### Vitest Configuration
+
+Tests use Vitest with the workspace config in `vitest.workspace.ts`:
+
+```typescript
+export default defineWorkspace([
+  'packages/*/vitest.config.ts',
+  'tools/*/vitest.config.ts',
+]);
+```
+
+### Mocking HTTP Calls
+
+Use `msw` or simple `fetch` mocks:
+
+```typescript
+import { vi } from 'vitest';
+
+beforeEach(() => {
+  globalThis.fetch = vi.fn().mockResolvedValue({
+    ok: true,
+    json: () => Promise.resolve({ status: 'ok' }),
+  });
+});
+```
+
+### Mocking the Event Bus
+
+```typescript
+const mockEventBus = {
+  on: vi.fn(),
+  emit: vi.fn().mockResolvedValue(undefined),
+  clear: vi.fn(),
+};
+
+const runtime = new AgentRuntime({
+  config: testConfig,
+  modelAdapter: mockAdapter,
+  eventBus: mockEventBus,
+});
+```
+
+## Dev Launcher
+
+```bash
+# Tests for the workspace-dev launcher
+bun x nx test workspace-dev --runInBand --skipNxCache
+```
+
+These tests verify:
+- Host argument parsing
+- Process orchestration
+- Graceful shutdown behavior
+
+## Docs
+
+```bash
+# Build public docs (catches MDX errors, broken links, etc.)
+bun x nx run @animaOS-SWARM/docs:build --skipNxCache
+
+# Build contributor docs
+bun x nx run @animaOS-SWARM/contributor-docs:build --skipNxCache
+```
+
+## Continuous Integration
+
+The CI pipeline runs:
+1. `cargo fmt --check` — Rust formatting
+2. `cargo clippy --workspace` — Rust linting
+3. `cargo test --workspace` — Rust unit tests
+4. `bun x nx affected:test` — TypeScript tests
+5. `bun x nx run @animaOS-SWARM/docs:build` — docs build
+6. `bun x nx run @animaOS-SWARM/contributor-docs:build` — contributor docs build
+
+## Test Patterns
+
+### Rust
+
+- Core tests should not depend on I/O. Mock `ModelAdapter` and `DatabaseAdapter`.
+- Use `tokio::test` for async tests.
+- Use `insta` for snapshot testing where appropriate.
+- Use `pretty_assertions` for better diff output.
+
+### TypeScript
+
+- Use Vitest (configured at the workspace root).
+- Mock HTTP calls with `msw` or simple `fetch` mocks.
+- Test helpers are in `packages/sdk/test-utils/` if present.
+- Use `expectTypeOf` from `vitest` for type-level tests.
+
+### Golden Rules
+
+1. **Never call real LLM APIs in tests.** Always mock `ModelAdapter`.
+2. **Never write to the filesystem in core tests.** Use `DatabaseAdapter` mocks.
+3. **Tests should be deterministic.** No random seeds, no time-dependent assertions.
+4. **Fast feedback.** A single crate's tests should run in < 10 seconds.

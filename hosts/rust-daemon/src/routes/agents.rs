@@ -186,7 +186,7 @@ mod tests {
     use super::handle_run_agent;
     use crate::state::DaemonState;
     use anima_core::{
-        AgentConfig, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
+        AgentConfig, AgentSettings, AgentStatus, Content, ModelAdapter, ModelGenerateRequest,
         ModelGenerateResponse, ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
@@ -286,6 +286,50 @@ mod tests {
             state.try_write().is_ok(),
             "daemon state lock should be released while the runtime future is pending"
         );
+
+        let response = block_on(future);
+        assert!(response.is_ok());
+    }
+
+    #[test]
+    fn handle_run_agent_keeps_agent_visible_while_runtime_future_is_pending() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            PendingModelAdapter,
+        ))));
+        let agent_id = block_on(async {
+            let mut guard = state.write().await;
+            guard
+                .create_agent(test_config("operator"))
+                .expect("agent should be created")
+                .state
+                .id
+        });
+        let mut future = Box::pin(handle_run_agent(
+            &agent_id,
+            br#"{"text":"run pending task"}"#.to_vec(),
+            &state,
+        ));
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+
+        assert!(
+            matches!(future.as_mut().poll(&mut context), Poll::Pending),
+            "the first poll should suspend on the pending model adapter"
+        );
+
+        block_on(async {
+            let guard = state.read().await;
+            let agents = guard.list_agents();
+            assert_eq!(agents.len(), 1, "pending runs should remain listable");
+            let snapshot = guard
+                .get_agent(&agent_id)
+                .expect("pending runs should remain readable");
+            assert_eq!(snapshot.state.status, AgentStatus::Running);
+            assert_eq!(
+                guard.agent_runtime_id(&agent_id).as_deref(),
+                Some(agent_id.as_str())
+            );
+        });
 
         let response = block_on(future);
         assert!(response.is_ok());

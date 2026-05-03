@@ -1,0 +1,50 @@
+---
+title: Evaluation
+description: Memory evaluation decisions and the eval harness
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Evaluation Decisions
+
+Before storing a memory, `evaluate()` returns a decision:
+
+| Decision | Meaning | Action |
+|----------|---------|--------|
+| `Store` | Save as a new memory | Insert into `memories` and BM25 index |
+| `Merge` | Combine with an existing duplicate | Update existing memory's content and importance |
+| `Ignore` | Too low quality or redundant | Drop the memory |
+
+The evaluator considers:
+- Content length (too short = ignore)
+- Semantic similarity to existing memories (high = merge)
+- Explicit importance score (if provided)
+- Content quality heuristics (repetition, noise)
+
+## Evaluation Harness
+
+`eval_harness.rs` contains a suite of test cases for validating memory behavior:
+
+```rust
+pub fn baseline_memory_eval_cases() -> Vec<MemoryEvalCase>;
+pub fn run_memory_eval_cases(
+    manager: &MemoryManager,
+    cases: &[MemoryEvalCase],
+) -> MemoryEvalReport;
+```
+
+Each test case defines:
+- A set of seed memories
+- A query
+- Expected memory IDs in the top-N results
+- Minimum precision/recall thresholds
+
+Run the harness with:
+
+```bash
+bun x nx run core-rust:memory-eval --skipNxCache
+```

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall};
-use anima_swarm::SwarmDelegation;
 use anima_swarm::coordinator::{
     CoordinatorBatchDelegateFn, CoordinatorBroadcastFn, CoordinatorDelegateFn,
     CoordinatorParticipant, CoordinatorParticipantsFn, CoordinatorSendFn,
 };
+use anima_swarm::SwarmDelegation;
 
 use crate::tools::ToolExecutionContext;
 
@@ -215,7 +215,7 @@ mod tests {
 
     use crate::memory_embeddings::MemoryEmbeddingRuntime;
     use crate::tools::{
-        DEFAULT_MAX_BACKGROUND_PROCESSES, ToolRegistry, new_shared_process_manager_with_limit,
+        new_shared_process_manager_with_limit, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
     };
 
     #[tokio::test]

@@ -1,0 +1,379 @@
+---
+title: API Reference
+description: Complete SDK API reference with types, errors, and helper functions
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The animaOS SDK is organized around a single `DaemonClient` with three domain-specific sub-clients: `AgentsClient`, `SwarmsClient`, and `MemoriesClient`.
+
+The SDK communicates with any animaOS-compatible host over HTTP and SSE. The [Rust daemon](https://github.com/G9000/animaOS-SWARM/tree/main/hosts/rust-daemon) in this repo is the reference implementation. Hosts that implement the same HTTP contract (agents, swarms, memories, health endpoints) work out of the box.
+
+## `DaemonClient`
+
+```typescript
+import { createDaemonClient, DaemonClient } from '@animaOS-SWARM/sdk';
+
+const client = createDaemonClient(options);
+```
+
+### Constructor options (`DaemonClientOptions`)
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `baseUrl` | `string` | `http://127.0.0.1:8080` | Daemon HTTP endpoint |
+| `fetch` | `FetchLike` | `globalThis.fetch` | Custom fetch implementation |
+
+### Methods
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `health()` | `() => Promise<DaemonHealth>` | Check daemon status |
+| `requestJson<T>(path, init?)` | `(string, RequestInit?) => Promise<T>` | Generic typed JSON request |
+| `subscribe<T>(path, init?)` | `(string, RequestInit?) => AsyncGenerator<DaemonEvent<T>>` | SSE event stream |
+
+### `DaemonHealth`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `string` | Health status: `ok`, `degraded`, or `unavailable` |
+
+### `DaemonEvent<T>`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event` | `string` | SSE event name |
+| `data` | `T` | Parsed JSON payload |
+
+---
+
+## `AgentsClient`
+
+Accessed via `client.agents`.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `create` | `(config: AgentConfig) => Promise<AgentSnapshot>` | Create a new agent |
+| `list` | `() => Promise<AgentSnapshot[]>` | List all agents |
+| `get` | `(agentId: string) => Promise<AgentSnapshot>` | Get agent by ID |
+| `run` | `(agentId: string, input: Content) => Promise<AgentRunResponse>` | Execute a task |
+| `recentMemories` | `(agentId: string, options?) => Promise<AgentMemory[]>` | Fetch recent memories |
+
+### `AgentSnapshot`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | `AgentState` | Runtime state |
+| `messageCount` | `number` | Total messages processed |
+| `eventCount` | `number` | Total events emitted |
+| `lastTask` | `TaskResult<Content> \| null` | Result of the most recent task |
+
+### `AgentRunResponse`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `agent` | `AgentSnapshot` | Updated agent snapshot |
+| `result` | `TaskResult<Content>` | Task result |
+
+### `AgentMemory`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Memory ID |
+| `agentId` | `string` | Owning agent |
+| `agentName` | `string` | Agent name |
+| `type` | `string` | Memory type |
+| `content` | `string` | Memory content |
+| `importance` | `number` | Importance score |
+| `createdAt` | `number` | Unix timestamp |
+| `tags` | `string[] \| null` | Tags |
+| `scope` | `'shared' \| 'private' \| 'room'` | Visibility scope |
+| `roomId` | `string \| null` | Room context |
+| `worldId` | `string \| null` | World context |
+| `sessionId` | `string \| null` | Session context |
+
+---
+
+## `SwarmsClient`
+
+Accessed via `client.swarms`.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `create` | `(config: SwarmConfig) => Promise<SwarmState>` | Create a swarm |
+| `get` | `(swarmId: string) => Promise<SwarmState>` | Get swarm state |
+| `run` | `(swarmId: string, input: Content) => Promise<SwarmRunResponse>` | Execute swarm task |
+| `subscribe` | `(swarmId: string, init?) => AsyncGenerator<DaemonEvent<SwarmStreamEventPayload>>` | SSE stream |
+
+### `SwarmRunResponse<T>`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `swarm` | `SwarmState` | Final swarm state |
+| `result` | `TaskResult<T>` | Synthesized result |
+
+### `SwarmState`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Swarm ID |
+| `status` | `string` | Runtime status |
+| `agentIds` | `string[]` | Participating agents |
+| `tokenUsage` | `TokenUsage` | Cumulative tokens |
+
+### `SwarmStreamEventPayload`
+
+A discriminated union of:
+
+| Type | Key fields |
+|------|-----------|
+| `SwarmEventPayload` | `swarmId`, `state`, `result` |
+| `SwarmMessagePayload` | `swarmId`, `message` |
+| `SwarmAgentEventPayload` | `agentId`, `agentName` |
+| `SwarmTaskFailedPayload` | `agentId`, `agentName`, `error` |
+| `SwarmToolBeforePayload` | `agentId`, `agentName`, `toolName`, `args` |
+| `SwarmToolAfterPayload` | `agentId`, `agentName`, `toolName`, `status`, `durationMs` |
+| `SwarmAgentTokensPayload` | `agentId`, `agentName`, `usage` |
+
+---
+
+## `MemoriesClient`
+
+Accessed via `client.memories`.
+
+| Method | Signature | Description |
+|--------|-----------|-------------|
+| `create` | `(input: CreateMemoryInput) => Promise<Memory>` | Create a memory |
+| `search` | `(query: string, options?) => Promise<MemorySearchResult[]>` | Hybrid search |
+| `recent` | `(options?) => Promise<Memory[]>` | Recent memories |
+| `recall` | `(query: string, options?) => Promise<MemoryRecallResult[]>` | Fused recall |
+| `evaluate` | `(input: EvaluatedMemoryInput) => Promise<MemoryEvaluation>` | Evaluate without storing |
+| `addEvaluated` | `(input: EvaluatedMemoryInput) => Promise<MemoryEvaluationOutcome>` | Evaluate and store |
+| `trace` | `(memoryId: string) => Promise<MemoryEvidenceTrace>` | Evidence trace |
+| `applyRetention` | `(input: MemoryRetentionInput) => Promise<MemoryRetentionReport>` | Cleanup |
+| `readiness` | `() => Promise<MemoryReadiness>` | Health check |
+| `createRelationship` | `(input: CreateAgentRelationshipInput) => Promise<AgentRelationship>` | Create relationship |
+| `relationships` | `(options?) => Promise<AgentRelationship[]>` | Query relationships |
+| `createEntity` | `(input: CreateMemoryEntityInput) => Promise<MemoryEntity>` | Create entity |
+| `entities` | `(options?) => Promise<MemoryEntity[]>` | Query entities |
+
+### `MemoryEvaluation`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decision` | `'store' \| 'merge' \| 'ignore'` | Evaluation outcome |
+| `reason` | `string` | Human-readable explanation |
+| `score` | `number` | Confidence score |
+| `suggestedImportance` | `number` | Recommended importance |
+| `duplicateMemoryId` | `string \| null` | Existing memory to merge with |
+
+### `MemoryEvaluationOutcome`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `evaluation` | `MemoryEvaluation` | Evaluation result |
+| `memory` | `Memory \| null` | Stored memory, if any |
+
+### `MemoryEvidenceTrace`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `memory` | `Memory` | Traced memory |
+| `relationships` | `AgentRelationship[]` | Connected relationships |
+| `entities` | `MemoryEntity[]` | Linked entities |
+
+### `MemoryRetentionReport`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `decayedMemories` | `MemoryImportanceAdjustment[]` | Importance adjustments |
+| `removedMemoryIds` | `string[]` | Deleted memories |
+| `removedRelationshipIds` | `string[]` | Deleted relationships |
+
+### `MemoryReadiness`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `passed` | `boolean` | Overall health |
+| `embeddings` | `MemoryEmbeddingStatus` | Embedding status |
+| `evaluation` | `MemoryEvalReport` | Self-test report |
+
+---
+
+## Core Types
+
+### `AgentConfig`
+
+| Field | Type | Required |
+|-------|------|----------|
+| `name` | `string` | ✅ |
+| `model` | `string` | ✅ |
+| `provider` | `string` | — |
+| `system` | `string` | — |
+| `bio` | `string` | — |
+| `lore` | `string` | — |
+| `knowledge` | `string[]` | — |
+| `topics` | `string[]` | — |
+| `adjectives` | `string[]` | — |
+| `style` | `string` | — |
+| `tools` | `Action[]` | — |
+| `plugins` | `Plugin[]` | — |
+| `settings` | `AgentSettings` | — |
+
+### `AgentSettings`
+
+| Field | Type |
+|-------|------|
+| `temperature` | `number` |
+| `maxTokens` | `number` |
+| `timeout` | `number` |
+| `maxRetries` | `number` |
+| `[key: string]` | `unknown` |
+
+### `AgentState`
+
+| Field | Type |
+|-------|------|
+| `id` | `UUID` |
+| `name` | `string` |
+| `status` | `AgentStatus` |
+| `config` | `AgentConfig` |
+| `createdAt` | `number` |
+| `tokenUsage` | `TokenUsage` |
+
+### `AgentStatus`
+
+`'idle' | 'running' | 'completed' | 'failed' | 'terminated'`
+
+### `Content`
+
+| Field | Type |
+|-------|------|
+| `text` | `string` |
+| `attachments` | `Attachment[]` |
+| `metadata` | `Record<string, unknown>` |
+
+### `Attachment`
+
+| Field | Type |
+|-------|------|
+| `type` | `'file' \| 'image' \| 'url'` |
+| `name` | `string` |
+| `data` | `string` |
+
+### `TaskResult<T>`
+
+| Field | Type |
+|-------|------|
+| `status` | `'success' \| 'error'` |
+| `data` | `T` |
+| `error` | `string` |
+| `durationMs` | `number` |
+
+### `TokenUsage`
+
+| Field | Type |
+|-------|------|
+| `promptTokens` | `number` |
+| `completionTokens` | `number` |
+| `totalTokens` | `number` |
+
+---
+
+## Component Types
+
+### `Action`
+
+| Field | Type | Required |
+|-------|------|----------|
+| `name` | `string` | ✅ |
+| `description` | `string` | ✅ |
+| `parameters` | `Record<string, unknown>` | ✅ |
+| `handler` | `(runtime, message, args) => Promise<TaskResult>` | ✅ |
+| `validate` | `(runtime, message) => Promise<boolean>` | — |
+| `examples` | `ActionExample[]` | — |
+
+### `Plugin`
+
+| Field | Type |
+|-------|------|
+| `name` | `string` |
+| `description` | `string` |
+| `actions` | `Action[]` |
+| `providers` | `Provider[]` |
+| `evaluators` | `Evaluator[]` |
+| `init` | `(runtime) => Promise<void>` |
+| `cleanup` | `(runtime) => Promise<void>` |
+
+### `Provider`
+
+| Field | Type |
+|-------|------|
+| `name` | `string` |
+| `description` | `string` |
+| `get` | `(runtime, message) => Promise<ProviderResult>` |
+
+### `ProviderResult`
+
+| Field | Type |
+|-------|------|
+| `text` | `string` |
+| `metadata` | `Record<string, unknown>` |
+
+### `Evaluator`
+
+| Field | Type |
+|-------|------|
+| `name` | `string` |
+| `description` | `string` |
+| `validate` | `(runtime, message) => Promise<boolean>` |
+| `handler` | `(runtime, message, response) => Promise<EvaluatorResult>` |
+
+### `EvaluatorResult`
+
+| Field | Type |
+|-------|------|
+| `score` | `number` |
+| `feedback` | `string` |
+| `followUp` | `Content` |
+| `metadata` | `Record<string, unknown>` |
+
+---
+
+## Helper Functions
+
+These are typed identity functions that provide full IntelliSense when defining configurations.
+
+| Function | Signature | Purpose |
+|----------|-----------|---------|
+| `agent(config)` | `<T extends AgentConfig>(config: T) => T` | Typed `AgentConfig` helper |
+| `swarm(config)` | `<T extends SwarmConfig>(config: T) => T` | Typed `SwarmConfig` helper |
+| `action(config)` | `<T extends Action>(config: T) => T` | Typed `Action` helper |
+| `plugin(config)` | `<T extends Plugin>(config: T) => T` | Typed `Plugin` helper |
+
+---
+
+## Errors
+
+| Class | Thrown When | Properties |
+|-------|-------------|------------|
+| `DaemonHttpError` | Daemon returns non-2xx status | `status: number`, `body: unknown` |
+| `DaemonConnectionError` | Network failure reaching daemon | `cause: unknown` |
+
+### Example: structured error handling
+
+```typescript
+import { DaemonHttpError, DaemonConnectionError } from '@animaOS-SWARM/sdk';
+
+try {
+  const result = await client.agents.run(agentId, { text: 'Hello' });
+} catch (error) {
+  if (error instanceof DaemonHttpError) {
+    console.error(`Daemon error ${error.status}:`, error.body);
+  } else if (error instanceof DaemonConnectionError) {
+    console.error('Cannot reach daemon:', error.cause);
+  } else {
+    throw error;
+  }
+}
+```

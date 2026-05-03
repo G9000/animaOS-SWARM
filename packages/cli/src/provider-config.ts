@@ -11,6 +11,8 @@ export interface ResolvedProviderConfig {
   defaultBaseUrl: string;
 }
 
+export const DETERMINISTIC_PROVIDER = 'deterministic';
+
 const DEFAULT_OPENAI_BASE_URL = 'https://api.openai.com/v1';
 const DEFAULT_ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
 const DEFAULT_GOOGLE_BASE_URL = 'https://generativelanguage.googleapis.com';
@@ -126,7 +128,9 @@ const PROVIDER_ENV: Record<string, ProviderEnvConfig> = {
 };
 
 export const PROVIDER_HELP_TEXT =
-  'Provider: openai, anthropic, google/gemini, ollama, groq, xai/grok, openrouter, mistral, together, deepseek, fireworks, perplexity, moonshot/kimi';
+  'Provider: deterministic, openai, anthropic, google/gemini, ollama, groq, xai/grok, openrouter, mistral, together, deepseek, fireworks, perplexity, moonshot/kimi';
+
+export const REMOTE_PROVIDER_IDS = Object.keys(PROVIDER_ENV);
 
 export function normalizeProvider(
   provider: string | undefined
@@ -144,6 +148,36 @@ function firstDefinedEnv(names: readonly string[]): string | undefined {
   }
 
   return undefined;
+}
+
+export function providerKeyEnvNames(
+  provider: string | undefined
+): readonly string[] {
+  const normalizedProvider = normalizeProvider(provider);
+  if (!normalizedProvider) return [];
+
+  return PROVIDER_ENV[normalizedProvider]?.keyEnv ?? [];
+}
+
+export function providerRequiresApiKey(provider: string | undefined): boolean {
+  const normalizedProvider = normalizeProvider(provider);
+  if (!normalizedProvider || normalizedProvider === DETERMINISTIC_PROVIDER) {
+    return false;
+  }
+
+  return normalizedProvider in PROVIDER_ENV && normalizedProvider !== 'ollama';
+}
+
+export function hasProviderApiKey(
+  provider: string | undefined,
+  apiKey?: string
+): boolean {
+  if (!providerRequiresApiKey(provider)) return true;
+
+  const explicitKey = apiKey?.trim();
+  if (explicitKey) return true;
+
+  return firstDefinedEnv(providerKeyEnvNames(provider)) !== undefined;
 }
 
 export function resolveProviderConfig(

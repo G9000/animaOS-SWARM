@@ -1,0 +1,32 @@
+---
+title: animaOS Contributor Docs
+description: Internal documentation for animaOS contributors and maintainers
+template: splash
+hero:
+  tagline: Internal documentation for animaOS contributors and maintainers
+  actions:
+    - text: Get Started
+      link: /overview/
+      icon: right-arrow
+      variant: primary
+    - text: Rust Core
+      link: /architecture/rust-core/
+      icon: open-book
+      variant: secondary
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Explore
+
+<CardGrid stagger>
+  <Card title="Architecture" icon="seti:rust">
+    Monorepo layout, Rust core crates, TypeScript core types, and host boundaries.
+  </Card>
+  <Card title="Rust Daemon" icon="seti:json">
+    How the Rust daemon wraps the core and exposes it over HTTP/SSE.
+  </Card>
+  <Card title="Workflow" icon="seti:git">
+    Dev setup, Nx commands, testing, and contribution guidelines.
+  </Card>
+</CardGrid>

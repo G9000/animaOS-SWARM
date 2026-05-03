@@ -52,3 +52,7 @@ Run `bun x nx build @animaOS-SWARM/core`.
 ## Test
 
 Run `bun x nx test @animaOS-SWARM/core`.
+
+## API Reference
+
+See [API.md](./API.md) for the full internal type reference. Public consumers should use [`@animaOS-SWARM/sdk`](../sdk) instead.

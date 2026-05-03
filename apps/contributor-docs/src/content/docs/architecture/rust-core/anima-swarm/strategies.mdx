@@ -1,0 +1,76 @@
+---
+title: Strategies
+description: Supervisor, RoundRobin, Dynamic, and custom strategies
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Supervisor
+
+```
+Manager receives input
+  │
+  ├─► Manager delegates subtasks to workers
+  │   Workers execute and return results
+  │
+  ├─► Manager reviews all worker results
+  │
+  └─► Manager synthesizes final answer
+```
+
+The manager has a special system prompt that instructs it to delegate, review, and synthesize. Workers receive only their assigned subtask.
+
+## RoundRobin
+
+```
+Input → Worker 1 → Worker 2 → ... → Worker N
+```
+
+Each worker sees the previous worker's output as context. The last worker produces the final answer. Good for pipeline-style workflows (e.g., draft → edit → review).
+
+## Dynamic
+
+```
+Manager receives input
+  │
+  ├─► Manager analyzes input and worker capabilities
+  ├─► Manager dynamically assigns tasks
+  │   Workers execute in parallel where possible
+  │
+  ├─► Manager monitors progress
+  ├─► Manager may re-assign or spawn additional workers
+  │
+  └─► Manager synthesizes final answer
+```
+
+The dynamic strategy uses the `StrategyContext` to make decisions:
+
+```rust
+pub struct StrategyContext {
+    pub input: Content,
+    pub swarm_state: SwarmState,
+    pub worker_results: Vec<(AgentId, TaskResult)>,
+    pub iteration: u32,
+    pub max_iterations: u32,
+}
+```
+
+## Custom Strategies
+
+Implement `StrategyFn` to create your own:
+
+```rust
+pub type StrategyFn = Box<
+    dyn Fn(&StrategyContext) -> StrategyDecision + Send + Sync,
+>;
+
+pub enum StrategyDecision {
+    Delegate { agent_id: AgentId, task: Content },
+    Synthesize { agent_id: AgentId },
+    Done { result: Content },
+}
+```

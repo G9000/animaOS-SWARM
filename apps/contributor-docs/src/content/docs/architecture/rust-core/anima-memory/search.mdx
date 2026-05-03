@@ -1,0 +1,76 @@
+---
+title: Search Pipeline
+description: BM25, vector, temporal, and relationship search stages
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`MemoryManager::recall()` runs a four-stage pipeline:
+
+| Stage | Algorithm | Signal | Weight |
+|-------|-----------|--------|--------|
+| Lexical | BM25 | Keyword relevance | `lexical_weight` |
+| Vector | Cosine similarity | Semantic meaning | `vector_weight` |
+| Temporal | Time-decay scoring | Recent events | `temporal_weight` |
+| Relationship | Graph proximity | Connected entities | `relationship_weight` |
+
+## Stage 1: Lexical (BM25)
+
+The BM25 index is built over all memory content at insertion time. Queries are tokenized using the same analyzer, then scored with the classic BM25 formula:
+
+```
+score = Σ IDF(q_i) * (f(q_i) * (k1 + 1)) / (f(q_i) + k1 * (1 - b + b * |D| / avgdl))
+```
+
+Parameters: `k1 = 1.2`, `b = 0.75` (tunable via `MemoryRecallOptions`).
+
+## Stage 2: Vector (Cosine Similarity)
+
+Memories with embeddings are stored in an `InMemoryVectorIndex`. The query embedding is compared against all memory embeddings using cosine similarity:
+
+```
+similarity = (A · B) / (||A|| * ||B||)
+```
+
+The vector index uses a flat brute-force search (exact, not approximate). At typical memory counts (< 100k), brute force is faster than HNSW indexing overhead.
+
+## Stage 3: Temporal (Time Decay)
+
+Memories are scored by recency using exponential decay:
+
+```
+temporal_score = importance * e^(-λ * age_seconds)
+```
+
+Where `λ` is the decay constant (tunable). Recent memories with high importance score highest.
+
+## Stage 4: Relationship (Graph Proximity)
+
+The relationship graph connects agents, users, and external entities. Memories associated with entities near the query entity (within N hops) receive a relationship boost.
+
+## Text Analysis Profiles
+
+| Profile | Tokenizer | Stop Words | Stemming |
+|---------|-----------|------------|----------|
+| `default` | Unicode word boundaries | English | Porter |
+| `multilingual` | Unicode + CJK | None | None |
+| `code` | Whitespace + symbols | None | None |
+
+The `multilingual` profile is recommended for agents that operate in multiple languages.
+
+## Query Expansion
+
+The BM25 module supports query expansion rules:
+
+```rust
+pub struct QueryExpansionRule {
+    pub pattern: String,
+    pub expansions: Vec<String>,
+}
+```
+
+Example: the pattern "neural network" expands to ["neural network", "NN", "deep learning", "ANN"].

@@ -12,6 +12,7 @@ export type EventType =
 	| "tool:after"
 	| "agent:tokens"
 	| "swarm:created"
+	| "swarm:message"
 	| "swarm:completed"
 	| "swarm:stopped"
 

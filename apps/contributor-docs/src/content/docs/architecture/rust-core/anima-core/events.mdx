@@ -1,0 +1,204 @@
+---
+title: Events
+description: EngineEvent types and event lifecycle
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+The event system in `anima-core` is intentionally minimal: an enum of event types, a struct that carries them, and a single callback hook on `AgentRuntime`. There is no event bus, no queue, and no pub/sub inside the crate. The host decides how to transport events.
+
+## Event Type Definitions
+
+**File:** `packages/core-rust/crates/anima-core/src/events.rs`
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventType {
+    AgentSpawned,    // "agent:spawned"
+    AgentStarted,    // "agent:started"
+    AgentCompleted,  // "agent:completed"
+    AgentFailed,     // "agent:failed"
+    AgentTerminated, // "agent:terminated"
+    AgentMessage,    // "agent:message"
+    TaskStarted,     // "task:started"
+    TaskCompleted,   // "task:completed"
+    TaskFailed,      // "task:failed"
+    ToolBefore,      // "tool:before"
+    ToolAfter,       // "tool:after"
+    AgentTokens,     // "agent:tokens"
+    SwarmCreated,    // "swarm:created"
+    SwarmCompleted,  // "swarm:completed"
+    SwarmStopped,    // "swarm:stopped"
+}
+```
+
+Every variant maps to a kebab-case string via `as_str()`. These strings are the contract between the Rust core and TypeScript consumers.
+
+## EngineEvent
+
+```rust
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineEvent<T = DataValue> {
+    pub event_type: EventType,
+    pub agent_id: Option<String>,
+    pub timestamp: u128,          // milliseconds since UNIX epoch
+    pub data: T,
+}
+```
+
+The default type parameter is `DataValue`, a JSON-like enum that can hold primitives, arrays, and objects:
+
+```rust
+pub enum DataValue {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<DataValue>),
+    Object(BTreeMap<String, DataValue>),
+}
+```
+
+This lets events carry structured payloads without pulling in `serde_json` as a public dependency of every event.
+
+## Event Lifecycle
+
+Here is every event that fires during a typical single-task run, in order:
+
+```
+AgentRuntime::new(config, adapter)
+└──► AgentSpawned          data: agent name (string)
+
+runtime.init()
+(no extra events — init just records the spawned event if not already done)
+
+runtime.run(input)
+├──► AgentStarted          data: Null
+├──► TaskStarted           data: Null
+├──► AgentMessage          data: user input text (string)
+│
+│   [if providers are registered]
+│   (no provider-specific events — success/failure is reflected in TaskFailed)
+│
+│   [model generation]
+│
+├──► AgentMessage          data: assistant response text (string)  [on completion]
+│
+│   [if tool calls]
+│   ├──► ToolBefore        data: { name, args, status: "running", durationMs: 0 }
+│   ├──► ToolAfter         data: { name, status, durationMs, result }
+│   ├──► AgentMessage      data: tool result text (string)
+│   └──► AgentTokens       data: { promptTokens, completionTokens, totalTokens }
+│   [loop back to model generation, up to 8 times]
+│
+│   [if evaluators are registered]
+│   (no evaluator-specific events — success/failure is reflected in TaskFailed)
+│
+├──► AgentCompleted        data: final response text (string)
+├──► TaskCompleted         data: Null
+└──► AgentTokens           data: { promptTokens, completionTokens, totalTokens }
+```
+
+### On Failure
+
+If any stage fails, the sequence is cut short:
+
+```
+run(input)
+├──► AgentStarted
+├──► TaskStarted
+├──► AgentMessage
+│   [provider fails]
+└──► AgentFailed           data: error message (string)
+└──► TaskFailed            data: error message (string)
+```
+
+Or:
+
+```
+run(input)
+├──► ...normal flow...
+├──► ToolBefore
+│   [model generation fails during tool loop]
+└──► AgentFailed           data: "model generation failed"
+└──► TaskFailed            data: "model generation failed"
+```
+
+### On Termination
+
+```
+runtime.stop()
+└──► AgentTerminated       data: Null
+```
+
+`stop()` does not wait for the current task to finish. It sets `AgentStatus::Terminated` and emits the event. The task loop checks status at iteration boundaries.
+
+## Event Reference
+
+| Event | When | Payload Structure |
+|-------|------|-------------------|
+| `agent:spawned` | `AgentRuntime::new()` or `init()` | `DataValue::String(name)` |
+| `agent:started` | `run()` begins | `DataValue::Null` |
+| `agent:completed` | Task finishes successfully | `DataValue::String(response_text)` |
+| `agent:failed` | Task fails at any stage | `DataValue::String(error_message)` |
+| `agent:terminated` | `stop()` called | `DataValue::Null` |
+| `agent:message` | Any message recorded | `DataValue::String(message_text)` |
+| `task:started` | `run()` begins | `DataValue::Null` |
+| `task:completed` | Task finishes successfully | `DataValue::Null` |
+| `task:failed` | Task fails | `DataValue::String(error_message)` |
+| `tool:before` | Before each tool execution | `DataValue::Object { name, args, status, durationMs }` |
+| `tool:after` | After each tool execution | `DataValue::Object { name, status, durationMs, result }` |
+| `agent:tokens` | After any model generation | `DataValue::Object { promptTokens, completionTokens, totalTokens }` |
+| `swarm:created` | Swarm initialized (in `anima-swarm`) | `DataValue::Null` |
+| `swarm:completed` | Swarm task finished | `DataValue::Null` |
+| `swarm:stopped` | Swarm stopped | `DataValue::Null` |
+
+## Listening to Events
+
+The runtime stores an optional callback:
+
+```rust
+pub fn set_event_listener(
+    &mut self,
+    listener: Arc<dyn Fn(EngineEvent) + Send + Sync>
+);
+```
+
+The callback is called **synchronously** inside `record_event`, immediately after the event is pushed to the internal `events` Vec:
+
+```rust
+fn record_event(&mut self, event_type: EventType, data: DataValue) {
+    let event = EngineEvent { event_type, agent_id: Some(...), timestamp: ..., data };
+    self.events.push(event.clone());
+    if let Some(listener) = &self.event_listener {
+        listener(event);   // <-- synchronous, blocking call
+    }
+}
+```
+
+### Host Pattern: SSE Streaming
+
+The `rust-daemon` host uses the listener to push events over Server-Sent Events:
+
+```rust
+let (tx, _rx) = broadcast::channel(128);
+let tx_clone = tx.clone();
+
+runtime.set_event_listener(Arc::new(move |event| {
+    let _ = tx_clone.send(event);  // fire-and-forget into broadcast channel
+}));
+```
+
+HTTP clients subscribe to the broadcast channel and receive events as SSE streams. Because the listener is synchronous, the host should keep it fast (channel send, not file write or network request).
+
+### In-Memory History
+
+Even without a listener, every event is stored in `runtime.events`. Hosts can query this via `runtime.events()` or capture it in a `snapshot()`.
+
+## Swarm Events
+
+The three swarm events (`swarm:created`, `swarm:completed`, `swarm:stopped`) are defined in `anima-core` so that both the core and `anima-swarm` share the same `EventType` enum. They are emitted by swarm orchestrators in `anima-swarm`, not by `AgentRuntime`.

@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use anima_core::{AgentRuntime, Content, DataValue, Evaluator, EvaluatorResult, Message};
 use anima_memory::{
-    MemoryEvaluationDecision, MemoryEvaluationOptions, MemoryType, NewAgentRelationship,
-    NewMemory, NewTemporalFact, RelationshipEndpointKind,
+    MemoryEvaluationDecision, MemoryEvaluationOptions, MemoryType, NewAgentRelationship, NewMemory,
+    NewTemporalFact, RelationshipEndpointKind,
 };
 use async_trait::async_trait;
 use tracing::warn;
@@ -147,6 +147,7 @@ impl Evaluator for ReflectionMemoryEvaluator {
             if let Some(extracted_outcome) = &extracted_outcome {
                 push_outcome_memory_id(&mut evidence_memory_ids, extracted_outcome);
             }
+            let relationship_tags = relationship_tags(&tags, extracted_user_memory.as_ref());
             let relationship = match (user_id.as_ref(), evidence_memory_ids.is_empty()) {
                 (Some(user_id), false) => Some(
                     memory_guard
@@ -167,7 +168,7 @@ impl Evaluator for ReflectionMemoryEvaluator {
                             strength: 0.55,
                             confidence: 0.75,
                             evidence_memory_ids,
-                            tags: Some(tags),
+                            tags: Some(relationship_tags),
                             room_id: Some(message.room_id.clone()),
                             world_id,
                             session_id,
@@ -309,7 +310,8 @@ fn extract_explicit_user_memory(text: &str) -> Option<ExtractedUserMemory> {
         return None;
     }
     let normalized = normalized_for_matching(text);
-    let remember_request = normalized.starts_with("remember ") || normalized.starts_with("please remember ");
+    let remember_request =
+        normalized.starts_with("remember ") || normalized.starts_with("please remember ");
     let preference_statement = contains_any(
         &normalized,
         &[
@@ -380,13 +382,35 @@ fn extracted_memory_tags(extraction: &ExtractedUserMemory) -> Vec<String> {
     tags
 }
 
+fn relationship_tags(
+    base_tags: &[String],
+    extraction: Option<&ExtractedUserMemory>,
+) -> Vec<String> {
+    let mut tags = base_tags.to_vec();
+    if let Some(extraction) = extraction {
+        for tag in extracted_memory_tags(extraction) {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+    }
+    tags
+}
+
 fn classify_user_relation_labels(normalized: &str) -> Vec<String> {
     let mut labels = Vec::new();
     push_relation_if_matches(
         &mut labels,
         normalized,
         "communication_preference",
-        &["brief", "release summaries", "summary", "summaries", "terse", "verbose"],
+        &[
+            "brief",
+            "release summaries",
+            "summary",
+            "summaries",
+            "terse",
+            "verbose",
+        ],
     );
     push_relation_if_matches(
         &mut labels,
@@ -424,15 +448,7 @@ fn classify_user_relation_labels(normalized: &str) -> Vec<String> {
         normalized,
         "hobby_preference",
         &[
-            "book",
-            "camp",
-            "camping",
-            "game",
-            "gaming",
-            "hobby",
-            "movie",
-            "movies",
-            "painting",
+            "book", "camp", "camping", "game", "gaming", "hobby", "movie", "movies", "painting",
             "travel",
         ],
     );
@@ -472,20 +488,8 @@ fn classify_user_relation_labels(normalized: &str) -> Vec<String> {
         normalized,
         "family_context",
         &[
-            "brother",
-            "daughter",
-            "family",
-            "father",
-            "husband",
-            "kid",
-            "kids",
-            "mom",
-            "mother",
-            "parent",
-            "parents",
-            "sister",
-            "son",
-            "wife",
+            "brother", "daughter", "family", "father", "husband", "kid", "kids", "mom", "mother",
+            "parent", "parents", "sister", "son", "wife",
         ],
     );
     push_relation_if_matches(
@@ -599,15 +603,16 @@ mod tests {
         assert!(extraction
             .relation_labels
             .contains(&"communication_preference".to_string()));
-        assert!(extraction.temporal_predicate.contains("communication_preference"));
+        assert!(extraction
+            .temporal_predicate
+            .contains("communication_preference"));
     }
 
     #[test]
     fn extract_explicit_user_memory_classifies_music_without_substring_noise() {
-        let extraction = extract_explicit_user_memory(
-            "I'm a fan of classical music like Bach and Mozart.",
-        )
-        .expect("music preference should extract");
+        let extraction =
+            extract_explicit_user_memory("I'm a fan of classical music like Bach and Mozart.")
+                .expect("music preference should extract");
 
         assert!(extraction
             .relation_labels
@@ -619,10 +624,9 @@ mod tests {
 
     #[test]
     fn extract_explicit_user_memory_classifies_career_interest() {
-        let extraction = extract_explicit_user_memory(
-            "I want to study counseling and work in mental health.",
-        )
-        .expect("career interest should extract");
+        let extraction =
+            extract_explicit_user_memory("I want to study counseling and work in mental health.")
+                .expect("career interest should extract");
 
         assert!(extraction
             .relation_labels
@@ -631,9 +635,8 @@ mod tests {
 
     #[test]
     fn extract_explicit_user_memory_classifies_family_context() {
-        let extraction =
-            extract_explicit_user_memory("My kids are the center of my family life.")
-                .expect("family context should extract");
+        let extraction = extract_explicit_user_memory("My kids are the center of my family life.")
+            .expect("family context should extract");
 
         assert!(extraction
             .relation_labels

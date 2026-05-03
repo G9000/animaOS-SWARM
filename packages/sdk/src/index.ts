@@ -44,6 +44,7 @@ export type {
   SwarmAgentEventPayload,
   SwarmAgentTokensPayload,
   SwarmEventPayload,
+  SwarmMessagePayload,
   SwarmStreamEventPayload,
   SwarmTaskFailedPayload,
   SwarmToolAfterPayload,

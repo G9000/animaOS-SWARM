@@ -1,0 +1,130 @@
+---
+title: Overview
+description: What is animaOS, how it works, and what you can build with it.
+---
+
+import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
+
+**animaOS** is a host-agnostic agent runtime designed for building, deploying, and operating autonomous AI agents at scale. It separates the core intelligence engine from host-specific concerns like HTTP, databases, and filesystems — so your agent logic stays pure, testable, and portable across any environment.
+
+At its heart, animaOS is three things:
+
+1. **A runtime engine** that manages agent lifecycles, executes tools, handles LLM provider calls, and maintains state.
+2. **A memory system** with hybrid recall — combining BM25 lexical search, vector semantic search, temporal reasoning, and relationship graphs.
+3. **A swarm coordinator** that orchestrates multi-agent collaboration with configurable strategies.
+
+Whether you're building a single research assistant or a fleet of cooperating agents, animaOS gives you the primitives to do it without vendor lock-in.
+
+## Philosophy
+
+<CardGrid>
+  <Card title="Host-Agnostic Core" icon="seti:rust">
+    The Rust core knows nothing about HTTP, databases, or filesystems. It operates on pure data structures and snapshots. Hosts provide the "reality" — the core provides the behavior.
+  </Card>
+  <Card title="Composable by Design" icon="seti:typescript">
+    Agents are configured, not coded. Tools, plugins, providers, and evaluators snap together like LEGO. Reuse components across projects without rewriting boilerplate.
+  </Card>
+  <Card title="Memory-First" icon="seti:db">
+    Agents remember. The memory system isn't an afterthought — it's a first-class citizen with search, recall, evaluation, retention, and relationship tracking built in.
+  </Card>
+</CardGrid>
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Your Application                       │
+│              (SDK, CLI, or custom integration)              │
+├─────────────────────────────────────────────────────────────┤
+│                        Host Layer                           │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────┐ │
+│  │ Rust Daemon │  │ Elixir Host  │  │  Python Service     │ │
+│  │ (ready)     │  │ (planned)    │  │  (planned)          │ │
+│  └─────────────┘  └──────────────┘  └─────────────────────┘ │
+├─────────────────────────────────────────────────────────────┤
+│                      Core Runtime                           │
+│  ┌──────────┐  ┌──────────────┐  ┌───────────────────────┐  │
+│  │anima-core│  │ anima-memory │  │   anima-swarm         │  │
+│  │- agent   │  │ - BM25       │  │   - coordinator       │  │
+│  │  runtime │  │ - vectors    │  │   - message bus       │  │
+│  │- events  │  │ - temporal   │  │   - strategies        │  │
+│  │- tools   │  │ - relations  │  │                       │  │
+│  └──────────┘  └──────────────┘  └───────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The **core** is where all the intelligence lives. It has zero I/O dependencies — no HTTP framework, no database driver, no filesystem access. This makes it trivial to test, embed in other applications, or port to new environments.
+
+The **host** wraps the core and exposes it over a runtime boundary. The production-ready Rust host provides an Axum HTTP/SSE server. Other hosts (Elixir, Python) are planned for future releases.
+
+## Key Concepts
+
+### Agents
+
+An agent is an autonomous LLM-powered runtime with a configuration, state, and optional tools. You define what it knows, how it behaves, and what it can do — the runtime handles the rest.
+
+- **Configuration** — name, model, provider, system prompt, personality traits
+- **Tools** — typed actions the agent can invoke (web search, file I/O, memory access)
+- **Plugins** — reusable bundles of tools, providers, and evaluators
+- **State** — runtime status, message history, token usage
+
+[Learn more about Agents →](/sdk/agents/)
+
+### Swarms
+
+A swarm is a coordinated group of agents that collaborate on a shared task. The swarm runtime manages turn-taking, message passing, and result synthesis.
+
+- **Strategies** — `round-robin`, `supervisor`, or `dynamic` delegation
+- **Manager** — the lead agent that orchestrates the group
+- **Workers** — agents that execute subtasks and report back
+- **Events** — real-time SSE stream of everything happening inside the swarm
+
+[Learn more about Swarms →](/sdk/swarms/)
+
+### Memories
+
+The memory system gives agents long-term recall through a hybrid retrieval pipeline.
+
+- **Search** — BM25 + vector similarity for finding relevant memories
+- **Recall** — fuses lexical, vector, relationship, temporal, recency, and importance signals
+- **Evaluation** — automatic deduplication and quality scoring before storage
+- **Retention** — configurable decay and cleanup to prevent unbounded growth
+- **Relationships** — graph connections between agents, users, and entities
+
+[Learn more about Memories →](/sdk/memories/)
+
+## Getting Started in 60 Seconds
+
+```bash
+# 1. Start the daemon
+bun run daemon
+
+# 2. Set your provider key
+export OPENAI_API_KEY="sk-..."
+
+# 3. Create and run an agent
+npx -y @animaOS-SWARM/sdk-cli agent create --name helper --model gpt-4o-mini
+```
+
+Or use the TypeScript SDK for full programmatic control:
+
+```typescript
+import { agent, createDaemonClient } from '@animaOS-SWARM/sdk';
+
+const client = createDaemonClient();
+
+const helper = await client.agents.create(
+  agent({
+    name: 'helper',
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    system: 'You are a helpful assistant.',
+  })
+);
+
+const result = await client.agents.run(helper.state.id, {
+  text: 'What is the capital of France?',
+});
+
+console.log(result.result.data?.text);
+```

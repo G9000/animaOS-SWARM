@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   memories,
   type AgentRelationship,
   type AgentSnapshot,
   type EvaluatedMemoryInput,
   type Memory,
+  type MemoryScope,
   type MemoryEvidenceTrace,
   type MemoryEntity,
   type MemoryEvaluation,
@@ -12,10 +13,52 @@ import {
   type MemoryRecallResult,
   type MemoryReadiness,
   type MemoryType,
+  type RelationshipEndpointKind,
 } from '../lib/api';
 import { playgroundUserId } from '../lib/playgroundUser';
 
-type InspectorTab = 'state' | 'recall' | 'evaluate' | 'ready';
+type InspectorTab = 'state' | 'graph' | 'recall' | 'evaluate' | 'ready';
+
+const inspectorTabs: Array<{ id: InspectorTab; label: string }> = [
+  { id: 'state', label: 'state' },
+  { id: 'graph', label: 'graph' },
+  { id: 'recall', label: 'recall' },
+  { id: 'evaluate', label: 'save' },
+  { id: 'ready', label: 'ready' },
+];
+
+type EntityDraft = {
+  kind: RelationshipEndpointKind;
+  id: string;
+  name: string;
+  aliases: string;
+  summary: string;
+};
+
+type RelationshipDraft = {
+  sourceKind: RelationshipEndpointKind;
+  sourceAgentId: string;
+  sourceAgentName: string;
+  targetKind: RelationshipEndpointKind;
+  targetAgentId: string;
+  targetAgentName: string;
+  relationshipType: string;
+  summary: string;
+  strength: number;
+  confidence: number;
+  evidenceMemoryIds: string;
+  tags: string;
+};
+
+type GraphFilter = 'all' | 'swarm' | 'handoffs' | 'broadcasts' | 'users';
+
+const graphFilters: Array<{ id: GraphFilter; label: string }> = [
+  { id: 'all', label: 'all' },
+  { id: 'swarm', label: 'swarm' },
+  { id: 'handoffs', label: 'handoffs' },
+  { id: 'broadcasts', label: 'broadcasts' },
+  { id: 'users', label: 'users' },
+];
 
 interface Props {
   agents: AgentSnapshot[];
@@ -36,16 +79,43 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
   const [recallResults, setRecallResults] = useState<MemoryRecallResult[]>([]);
   const [draftContent, setDraftContent] = useState('');
   const [draftType, setDraftType] = useState<MemoryType>('fact');
+  const [draftScope, setDraftScope] = useState<MemoryScope>('private');
+  const [draftTags, setDraftTags] = useState('playground-inspector');
   const [importance, setImportance] = useState(0.6);
   const [evaluation, setEvaluation] = useState<MemoryEvaluation | null>(null);
   const [outcome, setOutcome] = useState<MemoryEvaluationOutcome | null>(null);
+  const [savedMemory, setSavedMemory] = useState<Memory | null>(null);
+  const [entityDraft, setEntityDraft] = useState<EntityDraft>(() => ({
+    kind: 'user',
+    id: playgroundUserId(),
+    name: 'Playground User',
+    aliases: 'operator,me',
+    summary: '',
+  }));
+  const [relationshipDraft, setRelationshipDraft] = useState<RelationshipDraft>(() => ({
+    sourceKind: 'agent',
+    sourceAgentId: '',
+    sourceAgentName: '',
+    targetKind: 'user',
+    targetAgentId: playgroundUserId(),
+    targetAgentName: 'Playground User',
+    relationshipType: 'knows',
+    summary: '',
+    strength: 0.6,
+    confidence: 0.7,
+    evidenceMemoryIds: '',
+    tags: 'playground-inspector',
+  }));
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const knownRelationshipIds = useRef<Set<string>>(new Set());
 
   const selectedAgent = useMemo(
     () => agents.find((agent) => agent.state.id === agentId) ?? null,
     [agentId, agents]
   );
+  const selectedAgentStateId = selectedAgent?.state.id;
+  const selectedAgentStateName = selectedAgent?.state.name;
 
   useEffect(() => {
     if (selectedAgentId) {
@@ -57,6 +127,16 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
     setEntityId((current) => current || playgroundUserId());
   }, []);
 
+  useEffect(() => {
+    if (!selectedAgentStateId || !selectedAgentStateName) return;
+    setRelationshipDraft((current) => ({
+      ...current,
+      sourceKind: 'agent',
+      sourceAgentId: selectedAgentStateId,
+      sourceAgentName: selectedAgentStateName,
+    }));
+  }, [selectedAgentStateId, selectedAgentStateName]);
+
   const loadState = useCallback(async () => {
     setLoading(true);
     try {
@@ -66,11 +146,11 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
           agentId: agentId || undefined,
           limit: 8,
         }),
-        memories.entities({ limit: 8 }),
+        memories.entities({ limit: 16 }),
         memories.relationships({
           agentId: agentId || undefined,
           entityId: trimmedEntityId || undefined,
-          limit: 8,
+          limit: 24,
         }),
         memories.readiness(),
       ]);
@@ -78,13 +158,21 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
       setEntities(entityList);
       setRelationships(relationshipList);
       setReadiness(readinessReport);
+      const nextRelationshipIds = new Set(relationshipList.map((relationship) => relationship.id));
+      const hasNewRelationship = relationshipList.some(
+        (relationship) => !knownRelationshipIds.current.has(relationship.id)
+      );
+      knownRelationshipIds.current = nextRelationshipIds;
+      if (refreshKey > 0 && hasNewRelationship) {
+        setTab('graph');
+      }
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading(false);
     }
-  }, [agentId, entityId]);
+  }, [agentId, entityId, refreshKey]);
 
   useEffect(() => {
     loadState();
@@ -138,6 +226,7 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
 
     setLoading(true);
     try {
+      setSavedMemory(null);
       if (store) {
         const nextOutcome = await memories.addEvaluated(input);
         setOutcome(nextOutcome);
@@ -147,6 +236,91 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
         setEvaluation(await memories.evaluate(input));
         setOutcome(null);
       }
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveDraftDirect() {
+    if (!selectedAgent || !draftContent.trim()) return;
+
+    setLoading(true);
+    try {
+      const memory = await memories.create({
+        agentId: selectedAgent.state.id,
+        agentName: selectedAgent.state.name,
+        type: draftType,
+        content: draftContent.trim(),
+        importance,
+        tags: parseTagList(draftTags),
+        scope: draftScope,
+      });
+      setSavedMemory(memory);
+      setEvaluation(null);
+      setOutcome(null);
+      await loadState();
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createEntity() {
+    if (!entityDraft.id.trim() || !entityDraft.name.trim()) return;
+
+    setLoading(true);
+    try {
+      const entity = await memories.createEntity({
+        kind: entityDraft.kind,
+        id: entityDraft.id.trim(),
+        name: entityDraft.name.trim(),
+        aliases: parseTagList(entityDraft.aliases),
+        summary: trimOptional(entityDraft.summary),
+      });
+      setEntities((items) => upsertEntity(items, entity));
+      setEntityId(entity.id);
+      await loadState();
+      setError(null);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createRelationship() {
+    const sourceAgentId = relationshipDraft.sourceAgentId.trim();
+    const sourceAgentName = relationshipDraft.sourceAgentName.trim();
+    const targetAgentId = relationshipDraft.targetAgentId.trim();
+    const targetAgentName = relationshipDraft.targetAgentName.trim();
+    const relationshipType = relationshipDraft.relationshipType.trim();
+    if (!sourceAgentId || !sourceAgentName || !targetAgentId || !targetAgentName || !relationshipType) {
+      return;
+    }
+
+    setLoading(true);
+    try {
+      const relationship = await memories.createRelationship({
+        sourceKind: relationshipDraft.sourceKind,
+        sourceAgentId,
+        sourceAgentName,
+        targetKind: relationshipDraft.targetKind,
+        targetAgentId,
+        targetAgentName,
+        relationshipType,
+        summary: trimOptional(relationshipDraft.summary),
+        strength: relationshipDraft.strength,
+        confidence: relationshipDraft.confidence,
+        evidenceMemoryIds: parseTagList(relationshipDraft.evidenceMemoryIds),
+        tags: parseTagList(relationshipDraft.tags),
+      });
+      setRelationships((items) => upsertRelationship(items, relationship));
+      await loadState();
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -176,17 +350,17 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
         </div>
 
         <div className="mt-3 flex rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-1">
-          {(['state', 'recall', 'evaluate', 'ready'] as const).map((value) => (
+          {inspectorTabs.map(({ id, label }) => (
             <button
-              key={value}
-              onClick={() => setTab(value)}
+              key={id}
+              onClick={() => setTab(id)}
               className={`flex-1 rounded px-2 py-1 text-xs capitalize ${
-                tab === value
+                tab === id
                   ? 'bg-[var(--surface-3)] text-[var(--text)]'
                   : 'text-[var(--muted)] hover:text-[var(--text-2)]'
               }`}
             >
-              {value}
+              {label}
             </button>
           ))}
         </div>
@@ -216,6 +390,25 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
           />
         )}
 
+        {tab === 'graph' && (
+          <GraphView
+            entities={entities}
+            relationships={relationships}
+            onTrace={loadTrace}
+            entityDraft={entityDraft}
+            relationshipDraft={relationshipDraft}
+            loading={loading}
+            onEntityDraftChange={(patch) =>
+              setEntityDraft((current) => ({ ...current, ...patch }))
+            }
+            onRelationshipDraftChange={(patch) =>
+              setRelationshipDraft((current) => ({ ...current, ...patch }))
+            }
+            onCreateEntity={createEntity}
+            onCreateRelationship={createRelationship}
+          />
+        )}
+
         {tab === 'recall' && (
           <RecallView
             query={recallQuery}
@@ -231,15 +424,21 @@ export function MemoryInspector({ agents, selectedAgentId, refreshKey }: Props) 
             selectedAgent={selectedAgent}
             content={draftContent}
             memoryType={draftType}
+            memoryScope={draftScope}
+            tags={draftTags}
             importance={importance}
             evaluation={evaluation}
             outcome={outcome}
+            savedMemory={savedMemory}
             loading={loading}
             onContentChange={setDraftContent}
             onMemoryTypeChange={setDraftType}
+            onMemoryScopeChange={setDraftScope}
+            onTagsChange={setDraftTags}
             onImportanceChange={setImportance}
             onEvaluate={() => evaluateDraft(false)}
             onStore={() => evaluateDraft(true)}
+            onSaveDirect={saveDraftDirect}
           />
         )}
 
@@ -420,7 +619,11 @@ function StateView({
       <SectionTitle title="Relationships" count={relationships.length} />
       <div className="grid gap-2">
         {relationships.map((relationship) => (
-          <RelationshipRow key={relationship.id} relationship={relationship} />
+          <RelationshipRow
+            key={relationship.id}
+            relationship={relationship}
+            onTrace={onTrace}
+          />
         ))}
         {relationships.length === 0 && <EmptyLine text="No relationships." />}
       </div>
@@ -448,6 +651,549 @@ function StateView({
         {entities.length === 0 && <EmptyLine text="No entities." />}
       </div>
     </div>
+  );
+}
+
+function GraphView({
+  entities,
+  relationships,
+  onTrace,
+  entityDraft,
+  relationshipDraft,
+  loading,
+  onEntityDraftChange,
+  onRelationshipDraftChange,
+  onCreateEntity,
+  onCreateRelationship,
+}: {
+  entities: MemoryEntity[];
+  relationships: AgentRelationship[];
+  onTrace: (memoryId: string) => void;
+  entityDraft: EntityDraft;
+  relationshipDraft: RelationshipDraft;
+  loading: boolean;
+  onEntityDraftChange: (patch: Partial<EntityDraft>) => void;
+  onRelationshipDraftChange: (patch: Partial<RelationshipDraft>) => void;
+  onCreateEntity: () => void;
+  onCreateRelationship: () => void;
+}) {
+  const [filter, setFilter] = useState<GraphFilter>('all');
+  const [traceableOnly, setTraceableOnly] = useState(false);
+  const graphCounts = useMemo(
+    () => relationshipGraphCounts(relationships),
+    [relationships]
+  );
+  const filteredRelationships = useMemo(
+    () =>
+      relationships.filter(
+        (relationship) =>
+          relationshipMatchesGraphFilter(relationship, filter) &&
+          (!traceableOnly || relationship.evidenceMemoryIds.length > 0)
+      ),
+    [filter, relationships, traceableOnly]
+  );
+  const graph = useMemo(
+    () => buildRelationshipGraph(entities, filteredRelationships),
+    [entities, filteredRelationships]
+  );
+  const hiddenRelationshipCount = relationships.length - filteredRelationships.length;
+
+  return (
+    <div className="mt-4 grid gap-4">
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-3">
+        <div className="flex items-center justify-between gap-2">
+          <div>
+            <div className="text-sm font-medium text-[var(--text)]">Relationship graph</div>
+            <div className="text-[11px] text-[var(--muted-2)]">
+              {graph.nodes.length} nodes · {graph.edges.length} edges
+              {hiddenRelationshipCount > 0 ? ` · ${hiddenRelationshipCount} hidden` : ''}
+            </div>
+          </div>
+        </div>
+
+        <GraphFilterControls
+          filter={filter}
+          counts={graphCounts}
+          traceableOnly={traceableOnly}
+          onFilterChange={setFilter}
+          onTraceableOnlyChange={setTraceableOnly}
+        />
+
+        {graph.nodes.length === 0 ? (
+          <div className="mt-3">
+            <EmptyLine
+              text={relationships.length === 0 ? 'No graph data yet.' : 'No matching relationships.'}
+            />
+          </div>
+        ) : (
+          <>
+            <svg
+              viewBox="0 0 640 320"
+              className="mt-3 h-72 w-full rounded-md border border-[var(--border)] bg-[var(--surface)]"
+            >
+              <defs>
+                <marker
+                  id="memory-graph-arrow"
+                  markerWidth="8"
+                  markerHeight="8"
+                  refX="7"
+                  refY="4"
+                  orient="auto"
+                >
+                  <path d="M0,0 L8,4 L0,8 Z" fill="currentColor" />
+                </marker>
+              </defs>
+
+              {graph.edges.map((edge) => {
+                const source = graph.nodeMap.get(edge.sourceKey);
+                const target = graph.nodeMap.get(edge.targetKey);
+                if (!source || !target) return null;
+                const midX = (source.x + target.x) / 2;
+                const midY = (source.y + target.y) / 2;
+                const evidenceMemoryId = edge.evidenceMemoryIds[0];
+
+                return (
+                  <g
+                    key={edge.id}
+                    className={evidenceMemoryId ? 'cursor-pointer' : ''}
+                    style={{ color: graphEdgeColor(edge.tone) }}
+                    role={evidenceMemoryId ? 'button' : undefined}
+                    tabIndex={evidenceMemoryId ? 0 : undefined}
+                    onClick={() => {
+                      if (evidenceMemoryId) onTrace(evidenceMemoryId);
+                    }}
+                    onKeyDown={(event) => {
+                      if (!evidenceMemoryId) return;
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        onTrace(evidenceMemoryId);
+                      }
+                    }}
+                  >
+                    <title>{graphEdgeTitle(edge)}</title>
+                    <line
+                      x1={source.x}
+                      y1={source.y}
+                      x2={target.x}
+                      y2={target.y}
+                      stroke="transparent"
+                      strokeWidth="16"
+                    />
+                    <line
+                      x1={source.x}
+                      y1={source.y}
+                      x2={target.x}
+                      y2={target.y}
+                      stroke="currentColor"
+                      strokeWidth={1 + edge.strength * 3}
+                      strokeDasharray={edge.tone === 'broadcast' ? '5 4' : undefined}
+                      strokeOpacity={edge.tone === 'default' ? '0.45' : '0.74'}
+                      markerEnd="url(#memory-graph-arrow)"
+                    />
+                    <rect
+                      x={midX - 38}
+                      y={midY - 10}
+                      width="76"
+                      height="20"
+                      rx="10"
+                      fill="var(--surface)"
+                      opacity="0.92"
+                    />
+                    <text
+                      x={midX}
+                      y={midY + 4}
+                      textAnchor="middle"
+                      fontSize="10"
+                      fill="var(--text-2)"
+                    >
+                      {truncateGraphLabel(edge.label, 14)}
+                    </text>
+                    {edge.tags.length > 0 && (
+                      <text
+                        x={midX}
+                        y={midY + 18}
+                        textAnchor="middle"
+                        fontSize="9"
+                        fill="var(--muted-2)"
+                      >
+                        {truncateGraphLabel(preferredTagLabel(edge.tags), 18)}
+                      </text>
+                    )}
+                  </g>
+                );
+              })}
+
+              {graph.nodes.map((node) => (
+                <g key={node.key} transform={`translate(${node.x}, ${node.y})`}>
+                  <circle
+                    r="22"
+                    fill={graphNodeColor(node.kind)}
+                    fillOpacity="0.16"
+                    stroke={graphNodeColor(node.kind)}
+                    strokeWidth="2"
+                  />
+                  <text
+                    y="4"
+                    textAnchor="middle"
+                    fontSize="10"
+                    fontWeight="600"
+                    fill="var(--text)"
+                  >
+                    {truncateGraphLabel(node.name, 12)}
+                  </text>
+                  <text
+                    y="36"
+                    textAnchor="middle"
+                    fontSize="10"
+                    fill="var(--muted-2)"
+                  >
+                    {node.kind}
+                  </text>
+                </g>
+              ))}
+            </svg>
+
+            <div className="mt-3 grid gap-2">
+              {filteredRelationships.map((relationship) => (
+                <RelationshipRow
+                  key={relationship.id}
+                  relationship={relationship}
+                  onTrace={onTrace}
+                />
+              ))}
+              {filteredRelationships.length === 0 && (
+                <EmptyLine text="No matching relationships." />
+              )}
+            </div>
+          </>
+        )}
+      </div>
+
+      <GraphCreateForms
+        entityDraft={entityDraft}
+        relationshipDraft={relationshipDraft}
+        loading={loading}
+        onEntityDraftChange={onEntityDraftChange}
+        onRelationshipDraftChange={onRelationshipDraftChange}
+        onCreateEntity={onCreateEntity}
+        onCreateRelationship={onCreateRelationship}
+      />
+    </div>
+  );
+}
+
+function GraphFilterControls({
+  filter,
+  counts,
+  traceableOnly,
+  onFilterChange,
+  onTraceableOnlyChange,
+}: {
+  filter: GraphFilter;
+  counts: GraphCounts;
+  traceableOnly: boolean;
+  onFilterChange: (value: GraphFilter) => void;
+  onTraceableOnlyChange: (value: boolean) => void;
+}) {
+  return (
+    <div className="mt-3 grid gap-3">
+      <div className="grid grid-cols-5 gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] p-1">
+        {graphFilters.map(({ id, label }) => (
+          <button
+            key={id}
+            onClick={() => onFilterChange(id)}
+            className={`rounded px-1.5 py-1 text-[11px] capitalize ${
+              filter === id
+                ? 'bg-[var(--surface-3)] text-[var(--text)]'
+                : 'text-[var(--muted)] hover:text-[var(--text-2)]'
+            }`}
+          >
+            <span>{label}</span>
+            <span className="ml-1 tabular-nums text-[var(--muted-2)]">
+              {graphFilterCount(counts, id)}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 text-[11px] text-[var(--muted-2)]">
+        <GraphCountBadge label="handoff" value={counts.handoffs} tone="handoff" />
+        <GraphCountBadge label="broadcast" value={counts.broadcasts} tone="broadcast" />
+        <GraphCountBadge label="evidence" value={counts.traceable} tone="default" />
+      </div>
+
+      <label className="flex items-center justify-between gap-3 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--muted)]">
+        <span>Evidence only</span>
+        <input
+          type="checkbox"
+          checked={traceableOnly}
+          onChange={(event) => onTraceableOnlyChange(event.target.checked)}
+        />
+      </label>
+    </div>
+  );
+}
+
+function GraphCountBadge({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number;
+  tone: GraphRelationshipTone;
+}) {
+  return (
+    <div
+      className="rounded-md border bg-[var(--surface)] px-2 py-1"
+      style={{ borderColor: graphEdgeColor(tone) }}
+    >
+      <div className="truncate">{label}</div>
+      <div className="tabular-nums text-[var(--text-2)]">{value}</div>
+    </div>
+  );
+}
+
+function GraphCreateForms({
+  entityDraft,
+  relationshipDraft,
+  loading,
+  onEntityDraftChange,
+  onRelationshipDraftChange,
+  onCreateEntity,
+  onCreateRelationship,
+}: {
+  entityDraft: EntityDraft;
+  relationshipDraft: RelationshipDraft;
+  loading: boolean;
+  onEntityDraftChange: (patch: Partial<EntityDraft>) => void;
+  onRelationshipDraftChange: (patch: Partial<RelationshipDraft>) => void;
+  onCreateEntity: () => void;
+  onCreateRelationship: () => void;
+}) {
+  const entityDisabled =
+    loading || !entityDraft.id.trim() || !entityDraft.name.trim();
+  const relationshipDisabled =
+    loading ||
+    !relationshipDraft.sourceAgentId.trim() ||
+    !relationshipDraft.sourceAgentName.trim() ||
+    !relationshipDraft.targetAgentId.trim() ||
+    !relationshipDraft.targetAgentName.trim() ||
+    !relationshipDraft.relationshipType.trim();
+
+  return (
+    <div className="grid gap-4">
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-3">
+        <div className="text-sm font-medium text-[var(--text)]">Create entity</div>
+        <div className="mt-3 grid gap-2">
+          <EndpointKindSelect
+            label="Kind"
+            value={entityDraft.kind}
+            onChange={(kind) => onEntityDraftChange({ kind })}
+          />
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            ID
+            <input
+              value={entityDraft.id}
+              onChange={(event) => onEntityDraftChange({ id: event.target.value })}
+              placeholder="stable entity id"
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Name
+            <input
+              value={entityDraft.name}
+              onChange={(event) => onEntityDraftChange({ name: event.target.value })}
+              placeholder="display name"
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Aliases
+            <input
+              value={entityDraft.aliases}
+              onChange={(event) => onEntityDraftChange({ aliases: event.target.value })}
+              placeholder="comma,separated,aliases"
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Summary
+            <textarea
+              value={entityDraft.summary}
+              onChange={(event) => onEntityDraftChange({ summary: event.target.value })}
+              rows={2}
+              placeholder="optional entity note"
+            />
+          </label>
+          <button
+            onClick={onCreateEntity}
+            disabled={entityDisabled}
+            className="px-3 py-2 text-sm font-medium rounded-md bg-[var(--accent)] text-[var(--accent-fg)] hover:bg-[var(--accent-hover)] disabled:bg-[var(--surface-3)] disabled:text-[var(--muted-2)]"
+          >
+            Save entity
+          </button>
+        </div>
+      </div>
+
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-3">
+        <div className="text-sm font-medium text-[var(--text)]">Create relationship</div>
+        <div className="mt-3 grid gap-3">
+          <div className="grid grid-cols-2 gap-2">
+            <EndpointKindSelect
+              label="Source kind"
+              value={relationshipDraft.sourceKind}
+              onChange={(sourceKind) => onRelationshipDraftChange({ sourceKind })}
+            />
+            <EndpointKindSelect
+              label="Target kind"
+              value={relationshipDraft.targetKind}
+              onChange={(targetKind) => onRelationshipDraftChange({ targetKind })}
+            />
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+              Source ID
+              <input
+                value={relationshipDraft.sourceAgentId}
+                onChange={(event) => onRelationshipDraftChange({ sourceAgentId: event.target.value })}
+                placeholder="source id"
+              />
+            </label>
+            <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+              Source name
+              <input
+                value={relationshipDraft.sourceAgentName}
+                onChange={(event) => onRelationshipDraftChange({ sourceAgentName: event.target.value })}
+                placeholder="source name"
+              />
+            </label>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+              Target ID
+              <input
+                value={relationshipDraft.targetAgentId}
+                onChange={(event) => onRelationshipDraftChange({ targetAgentId: event.target.value })}
+                placeholder="target id"
+              />
+            </label>
+            <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+              Target name
+              <input
+                value={relationshipDraft.targetAgentName}
+                onChange={(event) => onRelationshipDraftChange({ targetAgentName: event.target.value })}
+                placeholder="target name"
+              />
+            </label>
+          </div>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Type
+            <input
+              value={relationshipDraft.relationshipType}
+              onChange={(event) => onRelationshipDraftChange({ relationshipType: event.target.value })}
+              placeholder="knows, trusts, collaborates_with"
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Summary
+            <textarea
+              value={relationshipDraft.summary}
+              onChange={(event) => onRelationshipDraftChange({ summary: event.target.value })}
+              rows={2}
+              placeholder="optional relationship evidence"
+            />
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            <RangeInput
+              label="Strength"
+              value={relationshipDraft.strength}
+              onChange={(strength) => onRelationshipDraftChange({ strength })}
+            />
+            <RangeInput
+              label="Confidence"
+              value={relationshipDraft.confidence}
+              onChange={(confidence) => onRelationshipDraftChange({ confidence })}
+            />
+          </div>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Evidence memory IDs
+            <input
+              value={relationshipDraft.evidenceMemoryIds}
+              onChange={(event) => onRelationshipDraftChange({ evidenceMemoryIds: event.target.value })}
+              placeholder="comma,separated,memoryIds"
+            />
+          </label>
+          <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+            Tags
+            <input
+              value={relationshipDraft.tags}
+              onChange={(event) => onRelationshipDraftChange({ tags: event.target.value })}
+              placeholder="comma,separated,tags"
+            />
+          </label>
+          <button
+            onClick={onCreateRelationship}
+            disabled={relationshipDisabled}
+            className="px-3 py-2 text-sm font-medium rounded-md bg-[var(--accent)] text-[var(--accent-fg)] hover:bg-[var(--accent-hover)] disabled:bg-[var(--surface-3)] disabled:text-[var(--muted-2)]"
+          >
+            Save relationship
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EndpointKindSelect({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: RelationshipEndpointKind;
+  onChange: (value: RelationshipEndpointKind) => void;
+}) {
+  return (
+    <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+      {label}
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value as RelationshipEndpointKind)}
+      >
+        <option value="agent">Agent</option>
+        <option value="user">User</option>
+        <option value="system">System</option>
+        <option value="external">External</option>
+      </select>
+    </label>
+  );
+}
+
+function RangeInput({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+      <span className="flex justify-between">
+        <span>{label}</span>
+        <span className="tabular-nums text-[var(--muted-2)]">
+          {Math.round(value * 100)}%
+        </span>
+      </span>
+      <input
+        type="range"
+        min="0"
+        max="1"
+        step="0.05"
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
   );
 }
 
@@ -498,28 +1244,40 @@ function EvaluateView({
   selectedAgent,
   content,
   memoryType,
+  memoryScope,
+  tags,
   importance,
   evaluation,
   outcome,
+  savedMemory,
   loading,
   onContentChange,
   onMemoryTypeChange,
+  onMemoryScopeChange,
+  onTagsChange,
   onImportanceChange,
   onEvaluate,
   onStore,
+  onSaveDirect,
 }: {
   selectedAgent: AgentSnapshot | null;
   content: string;
   memoryType: MemoryType;
+  memoryScope: MemoryScope;
+  tags: string;
   importance: number;
   evaluation: MemoryEvaluation | null;
   outcome: MemoryEvaluationOutcome | null;
+  savedMemory: Memory | null;
   loading: boolean;
   onContentChange: (value: string) => void;
   onMemoryTypeChange: (value: MemoryType) => void;
+  onMemoryScopeChange: (value: MemoryScope) => void;
+  onTagsChange: (value: string) => void;
   onImportanceChange: (value: number) => void;
   onEvaluate: () => void;
   onStore: () => void;
+  onSaveDirect: () => void;
 }) {
   const disabled = !selectedAgent || !content.trim() || loading;
 
@@ -539,6 +1297,25 @@ function EvaluateView({
           <option value="task_result">Task result</option>
           <option value="reflection">Reflection</option>
         </select>
+      </label>
+      <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+        Scope
+        <select
+          value={memoryScope}
+          onChange={(event) => onMemoryScopeChange(event.target.value as MemoryScope)}
+        >
+          <option value="private">Private</option>
+          <option value="shared">Shared</option>
+          <option value="room">Room</option>
+        </select>
+      </label>
+      <label className="grid gap-1.5 text-xs text-[var(--muted)]">
+        Tags
+        <input
+          value={tags}
+          onChange={(event) => onTagsChange(event.target.value)}
+          placeholder="comma,separated,tags"
+        />
       </label>
       <label className="grid gap-1.5 text-xs text-[var(--muted)]">
         Content
@@ -565,7 +1342,10 @@ function EvaluateView({
           onChange={(event) => onImportanceChange(Number(event.target.value))}
         />
       </label>
-      <div className="grid grid-cols-2 gap-2">
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-xs text-[var(--muted)]">
+        Evaluate previews the memory policy. Store runs the evaluated path. Save direct writes immediately.
+      </div>
+      <div className="grid grid-cols-3 gap-2">
         <button
           onClick={onEvaluate}
           disabled={disabled}
@@ -580,11 +1360,289 @@ function EvaluateView({
         >
           Store
         </button>
+        <button
+          onClick={onSaveDirect}
+          disabled={disabled}
+          className="px-3 py-2 text-sm rounded-md border border-[var(--border)] text-[var(--text-2)] hover:bg-[var(--hover)] disabled:text-[var(--muted-2)] disabled:bg-transparent"
+        >
+          Save direct
+        </button>
       </div>
 
       {evaluation && <EvaluationResult evaluation={evaluation} outcome={outcome} />}
+      {savedMemory && (
+        <div className="rounded-md border border-[var(--ok)]/30 bg-[var(--ok)]/10 px-3 py-2 text-xs text-[var(--ok)]">
+          saved {savedMemory.id}
+        </div>
+      )}
     </div>
   );
+}
+
+type GraphNode = {
+  key: string;
+  id: string;
+  name: string;
+  kind: string;
+  x: number;
+  y: number;
+};
+
+type GraphEdge = {
+  id: string;
+  sourceKey: string;
+  targetKey: string;
+  label: string;
+  tone: GraphRelationshipTone;
+  strength: number;
+  confidence: number;
+  tags: string[];
+  evidenceMemoryIds: string[];
+};
+
+type GraphRelationshipTone = 'handoff' | 'broadcast' | 'user' | 'default';
+
+type GraphCounts = Record<GraphFilter, number> & {
+  traceable: number;
+};
+
+function buildRelationshipGraph(
+  entities: MemoryEntity[],
+  relationships: AgentRelationship[]
+): {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  nodeMap: Map<string, GraphNode>;
+} {
+  const nodeSeed = new Map<string, { id: string; name: string; kind: string }>();
+
+  for (const entity of entities) {
+    nodeSeed.set(`${entity.kind}:${entity.id}`, {
+      id: entity.id,
+      name: entity.name,
+      kind: entity.kind,
+    });
+  }
+
+  for (const relationship of relationships) {
+    nodeSeed.set(`${relationship.sourceKind}:${relationship.sourceAgentId}`, {
+      id: relationship.sourceAgentId,
+      name: relationship.sourceAgentName,
+      kind: relationship.sourceKind,
+    });
+    nodeSeed.set(`${relationship.targetKind}:${relationship.targetAgentId}`, {
+      id: relationship.targetAgentId,
+      name: relationship.targetAgentName,
+      kind: relationship.targetKind,
+    });
+  }
+
+  const seeds = Array.from(nodeSeed.entries());
+  const width = 640;
+  const height = 320;
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const radius = Math.min(width, height) / 2 - 64;
+
+  const nodes = seeds.map(([key, node], index) => {
+    if (seeds.length === 1) {
+      return { ...node, key, x: centerX, y: centerY };
+    }
+    const angle = (Math.PI * 2 * index) / Math.max(seeds.length, 1) - Math.PI / 2;
+    return {
+      ...node,
+      key,
+      x: centerX + Math.cos(angle) * radius,
+      y: centerY + Math.sin(angle) * radius,
+    };
+  });
+
+  const nodeMap = new Map(nodes.map((node) => [node.key, node]));
+  const edges = relationships.map((relationship) => ({
+    id: relationship.id,
+    sourceKey: `${relationship.sourceKind}:${relationship.sourceAgentId}`,
+    targetKey: `${relationship.targetKind}:${relationship.targetAgentId}`,
+    label: relationship.relationshipType,
+    tone: relationshipTone(relationship),
+    strength: relationship.strength,
+    confidence: relationship.confidence,
+    tags: relationship.tags ?? [],
+    evidenceMemoryIds: relationship.evidenceMemoryIds,
+  }));
+
+  return { nodes, edges, nodeMap };
+}
+
+function graphNodeColor(kind: string): string {
+  switch (kind) {
+    case 'agent':
+      return '#0f766e';
+    case 'user':
+      return '#2563eb';
+    case 'system':
+      return '#7c3aed';
+    default:
+      return '#b45309';
+  }
+}
+
+function graphEdgeColor(tone: GraphRelationshipTone): string {
+  switch (tone) {
+    case 'handoff':
+      return '#0f766e';
+    case 'broadcast':
+      return '#7c3aed';
+    case 'user':
+      return '#2563eb';
+    default:
+      return '#94a3b8';
+  }
+}
+
+function graphToneBackground(tone: GraphRelationshipTone): string {
+  switch (tone) {
+    case 'handoff':
+      return 'rgba(15, 118, 110, 0.12)';
+    case 'broadcast':
+      return 'rgba(124, 58, 237, 0.12)';
+    case 'user':
+      return 'rgba(37, 99, 235, 0.12)';
+    default:
+      return 'rgba(148, 163, 184, 0.12)';
+  }
+}
+
+function relationshipTags(relationship: AgentRelationship): string[] {
+  return relationship.tags ?? [];
+}
+
+function hasRelationshipTag(relationship: AgentRelationship, tag: string): boolean {
+  return relationshipTags(relationship).includes(tag);
+}
+
+function isHandoffRelationship(relationship: AgentRelationship): boolean {
+  return (
+    relationship.relationshipType === 'hands_off_to' ||
+    hasRelationshipTag(relationship, 'relation:handoff')
+  );
+}
+
+function isBroadcastRelationship(relationship: AgentRelationship): boolean {
+  return (
+    relationship.relationshipType === 'broadcasts_to' ||
+    hasRelationshipTag(relationship, 'relation:broadcast')
+  );
+}
+
+function isUserRelationship(relationship: AgentRelationship): boolean {
+  return relationship.sourceKind === 'user' || relationship.targetKind === 'user';
+}
+
+function isSwarmRelationship(relationship: AgentRelationship): boolean {
+  const tags = relationshipTags(relationship);
+  return (
+    tags.includes('swarm') ||
+    tags.includes('swarm-message') ||
+    isHandoffRelationship(relationship) ||
+    isBroadcastRelationship(relationship)
+  );
+}
+
+function relationshipTone(relationship: AgentRelationship): GraphRelationshipTone {
+  if (isHandoffRelationship(relationship)) return 'handoff';
+  if (isBroadcastRelationship(relationship)) return 'broadcast';
+  if (isUserRelationship(relationship)) return 'user';
+  return 'default';
+}
+
+function relationshipMatchesGraphFilter(
+  relationship: AgentRelationship,
+  filter: GraphFilter
+): boolean {
+  switch (filter) {
+    case 'all':
+      return true;
+    case 'swarm':
+      return isSwarmRelationship(relationship);
+    case 'handoffs':
+      return isHandoffRelationship(relationship);
+    case 'broadcasts':
+      return isBroadcastRelationship(relationship);
+    case 'users':
+      return isUserRelationship(relationship);
+  }
+}
+
+function relationshipGraphCounts(relationships: AgentRelationship[]): GraphCounts {
+  return relationships.reduce<GraphCounts>(
+    (counts, relationship) => {
+      counts.all += 1;
+      if (isSwarmRelationship(relationship)) counts.swarm += 1;
+      if (isHandoffRelationship(relationship)) counts.handoffs += 1;
+      if (isBroadcastRelationship(relationship)) counts.broadcasts += 1;
+      if (isUserRelationship(relationship)) counts.users += 1;
+      if (relationship.evidenceMemoryIds.length > 0) counts.traceable += 1;
+      return counts;
+    },
+    {
+      all: 0,
+      swarm: 0,
+      handoffs: 0,
+      broadcasts: 0,
+      users: 0,
+      traceable: 0,
+    }
+  );
+}
+
+function graphFilterCount(counts: GraphCounts, filter: GraphFilter): number {
+  return counts[filter];
+}
+
+function truncateGraphLabel(value: string, maxLength: number): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 1)}…`;
+}
+
+function graphEdgeTitle(edge: GraphEdge): string {
+  const tags = edge.tags.length > 0 ? ` tags: ${edge.tags.join(', ')}` : '';
+  const evidence = edge.evidenceMemoryIds.length > 0
+    ? ` evidence: ${edge.evidenceMemoryIds.join(', ')}`
+    : ' no evidence memory ids';
+  return `${edge.label} strength ${Math.round(edge.strength * 100)}%, confidence ${Math.round(edge.confidence * 100)}%. ${tags}${evidence}`;
+}
+
+function preferredTagLabel(tags: string[]): string {
+  return tags.find((tag) => tag.startsWith('relation:')) ?? tags[0] ?? '';
+}
+
+function parseTagList(value: string): string[] | undefined {
+  const tags = value
+    .split(',')
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+
+  return tags.length > 0 ? tags : undefined;
+}
+
+function trimOptional(value: string): string | undefined {
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function upsertEntity(items: MemoryEntity[], entity: MemoryEntity): MemoryEntity[] {
+  const key = `${entity.kind}:${entity.id}`;
+  return [
+    entity,
+    ...items.filter((item) => `${item.kind}:${item.id}` !== key),
+  ].slice(0, 8);
+}
+
+function upsertRelationship(
+  items: AgentRelationship[],
+  relationship: AgentRelationship
+): AgentRelationship[] {
+  return [relationship, ...items.filter((item) => item.id !== relationship.id)].slice(0, 8);
 }
 
 function EvaluationResult({
@@ -656,19 +1714,81 @@ function MemoryRow({
   );
 }
 
-function RelationshipRow({ relationship }: { relationship: AgentRelationship }) {
+function RelationshipRow({
+  relationship,
+  onTrace,
+}: {
+  relationship: AgentRelationship;
+  onTrace?: (memoryId: string) => void;
+}) {
+  const tags = relationship.tags ?? [];
+  const tone = relationshipTone(relationship);
+
   return (
-    <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
-      <div className="truncate text-sm text-[var(--text)]">
-        {relationship.sourceAgentName} {'->'} {relationship.targetAgentName}
+    <div
+      className="rounded-md border border-l-4 bg-[var(--surface-2)] px-3 py-2"
+      style={{ borderColor: 'var(--border)', borderLeftColor: graphEdgeColor(tone) }}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 truncate text-sm text-[var(--text)]">
+          {relationship.sourceAgentName} {'->'} {relationship.targetAgentName}
+        </div>
+        <span
+          className="shrink-0 rounded-full border px-2 py-0.5 text-[10px]"
+          style={{
+            backgroundColor: graphToneBackground(tone),
+            borderColor: graphEdgeColor(tone),
+            color: graphEdgeColor(tone),
+          }}
+        >
+          {relationship.relationshipType}
+        </span>
       </div>
       <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-[var(--muted-2)]">
         <span className="truncate">
-          {relationship.sourceKind}/{relationship.targetKind} / {relationship.relationshipType}
+          {relationship.sourceKind}/{relationship.targetKind}
         </span>
         <span className="tabular-nums">
           {Math.round(relationship.strength * 100)}%
         </span>
+      </div>
+      <div className="mt-2 grid gap-2">
+        {relationship.summary && (
+          <div className="text-xs text-[var(--muted)]">{relationship.summary}</div>
+        )}
+        {tags.length > 0 && (
+          <div className="flex flex-wrap gap-1">
+            {tags.slice(0, 5).map((tag) => (
+              <span
+                key={tag}
+                className="rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 text-[10px] text-[var(--muted)]"
+              >
+                {tag}
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--muted-2)]">
+          <span className="tabular-nums">
+            confidence {Math.round(relationship.confidence * 100)}%
+          </span>
+          {relationship.evidenceMemoryIds.length > 0 && onTrace &&
+            relationship.evidenceMemoryIds.slice(0, 3).map((memoryId, index) => (
+              <button
+                key={memoryId}
+                onClick={() => onTrace(memoryId)}
+                className="text-[var(--accent)] hover:underline"
+              >
+                trace evidence {index + 1}
+              </button>
+            ))}
+          {relationship.evidenceMemoryIds.length > 0 && !onTrace && (
+            <span>{relationship.evidenceMemoryIds.length} evidence memories</span>
+          )}
+          {relationship.evidenceMemoryIds.length === 0 && (
+            <span>no evidence memories</span>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -734,7 +1854,10 @@ function TraceView({
       <div className="grid gap-2">
         <SectionTitle title="Edges" count={trace.relationships.length} />
         {trace.relationships.map((relationship) => (
-          <RelationshipRow key={relationship.id} relationship={relationship} />
+          <RelationshipRow
+            key={relationship.id}
+            relationship={relationship}
+          />
         ))}
         {trace.relationships.length === 0 && <EmptyLine text="No citing edges." />}
       </div>

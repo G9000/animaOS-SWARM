@@ -1,9 +1,10 @@
 mod support;
 
-use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use futures::{StreamExt, pin_mut};
+use axum::Router;
+use futures::{pin_mut, StreamExt};
+use serde_json::Value;
 use tower::util::ServiceExt;
 
 async fn create_swarm(app: &Router) -> (StatusCode, String) {
@@ -108,6 +109,139 @@ async fn send_message_can_target_configured_agent_name() {
     assert!(response.contains("\"content\":{\"text\":\"named handoff and recall inbox\""));
     assert!(response.contains("worker-a recalled swarm inbox:"));
     assert!(response.contains("named handoff and recall inbox"));
+
+    let (relationships_status, relationships_response) = send_empty_request(
+        &app,
+        "GET",
+        &format!(
+            "/api/memories/relationships?relationshipType=hands_off_to&roomId={swarm_id}&limit=5"
+        ),
+    )
+    .await;
+    assert_eq!(relationships_status, StatusCode::OK);
+    let relationships_json: Value =
+        serde_json::from_str(&relationships_response).expect("relationships response is json");
+    let relationships = relationships_json["relationships"]
+        .as_array()
+        .expect("relationships should be an array");
+    let relationship = relationships
+        .iter()
+        .find(|relationship| {
+            relationship["sourceAgentName"] == "manager"
+                && relationship["targetAgentName"] == "worker-a"
+                && relationship["relationshipType"] == "hands_off_to"
+        })
+        .expect("swarm handoff relationship should be persisted");
+    assert_eq!(relationship["sourceKind"], "agent");
+    assert_eq!(relationship["targetKind"], "agent");
+    assert!(relationship["tags"]
+        .as_array()
+        .expect("relationship tags should be an array")
+        .iter()
+        .any(|tag| tag == "relation:handoff"));
+    let relationship_id = relationship["id"]
+        .as_str()
+        .expect("relationship should include an id");
+    let evidence_memory_id = relationship["evidenceMemoryIds"]
+        .as_array()
+        .expect("relationship should include evidence memory ids")
+        .first()
+        .and_then(|value| value.as_str())
+        .expect("relationship should cite the message evidence memory");
+
+    let (trace_status, trace_response) = send_empty_request(
+        &app,
+        "GET",
+        &format!("/api/memories/{evidence_memory_id}/trace"),
+    )
+    .await;
+    assert_eq!(trace_status, StatusCode::OK);
+    let trace_json: Value = serde_json::from_str(&trace_response).expect("trace response is json");
+    assert!(trace_json["memory"]["content"]
+        .as_str()
+        .expect("trace memory content should be a string")
+        .contains("named handoff and recall inbox"));
+    assert!(trace_json["relationships"]
+        .as_array()
+        .expect("trace relationships should be an array")
+        .iter()
+        .any(|trace_relationship| trace_relationship["id"] == relationship_id));
+}
+
+#[tokio::test]
+async fn broadcast_message_persists_swarm_relationship() {
+    let app = test_app();
+    let (_, create_response) = create_swarm(&app).await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+
+    let (status, response) = run_swarm(
+        &app,
+        &swarm_id,
+        r#"{"text":"broadcast relationship map update and recall inbox"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(response.contains("broadcast message sent to swarm"));
+    assert!(response.contains("worker-a recalled swarm inbox:"));
+    assert!(response.contains("relationship map update and recall inbox"));
+
+    let (relationships_status, relationships_response) = send_empty_request(
+        &app,
+        "GET",
+        &format!(
+            "/api/memories/relationships?relationshipType=broadcasts_to&roomId={swarm_id}&limit=5"
+        ),
+    )
+    .await;
+    assert_eq!(relationships_status, StatusCode::OK);
+    let relationships_json: Value =
+        serde_json::from_str(&relationships_response).expect("relationships response is json");
+    let relationships = relationships_json["relationships"]
+        .as_array()
+        .expect("relationships should be an array");
+    let relationship = relationships
+        .iter()
+        .find(|relationship| {
+            relationship["sourceAgentName"] == "manager"
+                && relationship["targetAgentId"] == swarm_id
+                && relationship["relationshipType"] == "broadcasts_to"
+        })
+        .expect("swarm broadcast relationship should be persisted");
+    assert_eq!(relationship["sourceKind"], "agent");
+    assert_eq!(relationship["targetKind"], "system");
+    assert!(relationship["tags"]
+        .as_array()
+        .expect("relationship tags should be an array")
+        .iter()
+        .any(|tag| tag == "relation:broadcast"));
+    let relationship_id = relationship["id"]
+        .as_str()
+        .expect("relationship should include an id");
+    let evidence_memory_id = relationship["evidenceMemoryIds"]
+        .as_array()
+        .expect("relationship should include evidence memory ids")
+        .first()
+        .and_then(|value| value.as_str())
+        .expect("relationship should cite the broadcast evidence memory");
+
+    let (trace_status, trace_response) = send_empty_request(
+        &app,
+        "GET",
+        &format!("/api/memories/{evidence_memory_id}/trace"),
+    )
+    .await;
+    assert_eq!(trace_status, StatusCode::OK);
+    let trace_json: Value = serde_json::from_str(&trace_response).expect("trace response is json");
+    assert!(trace_json["memory"]["content"]
+        .as_str()
+        .expect("trace memory content should be a string")
+        .contains("relationship map update and recall inbox"));
+    assert!(trace_json["relationships"]
+        .as_array()
+        .expect("trace relationships should be an array")
+        .iter()
+        .any(|trace_relationship| trace_relationship["id"] == relationship_id));
 }
 
 #[tokio::test]
@@ -235,7 +369,7 @@ async fn swarm_event_stream_emits_swarm_messaging_tool_results() {
             run_swarm(
                 &app,
                 &swarm_id,
-                r#"{"text":"broadcast team update and recall inbox"}"#,
+                r#"{"text":"send to worker-a: streamed handoff and recall inbox"}"#,
             )
             .await
         })
@@ -249,7 +383,9 @@ async fn swarm_event_stream_emits_swarm_messaging_tool_results() {
         match futures::poll!(stream.next()) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 chunks.push_str(std::str::from_utf8(&bytes).expect("chunk should be utf-8"));
-                if chunks.contains("event: tool:after") && chunks.contains("event: swarm:completed")
+                if chunks.contains("event: swarm:message")
+                    && chunks.contains("event: tool:after")
+                    && chunks.contains("event: swarm:completed")
                 {
                     break;
                 }
@@ -263,15 +399,23 @@ async fn swarm_event_stream_emits_swarm_messaging_tool_results() {
     let (run_status, run_response) = run_handle.await.expect("run task should finish");
 
     assert_eq!(run_status, StatusCode::OK);
-    assert!(run_response.contains("broadcast message sent to swarm"));
+    assert!(run_response.contains("sent message to worker-a"));
     assert!(run_response.contains("worker-a recalled swarm inbox:"));
-    assert!(run_response.contains("team update and recall inbox"));
+    assert!(run_response.contains("streamed handoff and recall inbox"));
+
+    let swarm_message_data =
+        extract_sse_event_data(&chunks, "swarm:message").expect("swarm message event data exists");
+    assert!(swarm_message_data.contains(&format!("\"swarmId\":\"{swarm_id}\"")));
+    assert!(swarm_message_data.contains("\"message\":{"));
+    assert!(swarm_message_data.contains("\"from\":\"manager-"));
+    assert!(swarm_message_data.contains("\"to\":\"worker-a-"));
+    assert!(swarm_message_data.contains("\"text\":\"streamed handoff and recall inbox\""));
 
     let tool_after_data =
         extract_sse_event_data(&chunks, "tool:after").expect("tool after event data exists");
-    assert!(tool_after_data.contains("\"toolName\":\"broadcast_message\""));
+    assert!(tool_after_data.contains("\"toolName\":\"send_message\""));
     assert!(tool_after_data.contains("\"status\":\"success\""));
-    assert!(tool_after_data.contains("\"result\":\"broadcast message sent to swarm\""));
+    assert!(tool_after_data.contains("\"result\":\"sent message to worker-a (worker-a-"));
 }
 
 #[tokio::test]

@@ -1,12 +1,16 @@
 mod runtime_events;
+mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anima_core::{AgentConfig, AgentRuntime, AgentRuntimeSnapshot, DatabaseAdapter, ModelAdapter};
+use anima_core::{
+    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentStatus, DatabaseAdapter, ModelAdapter,
+};
 use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
+use anima_swarm::coordinator::CoordinatorMessageEventFn;
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
 use tokio::sync::RwLock as AsyncRwLock;
@@ -21,6 +25,8 @@ use crate::tools::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
     ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
+
+use self::swarm_relationships::{persist_swarm_message_relationship, swarm_agent_names};
 
 pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
 
@@ -77,6 +83,7 @@ pub(crate) struct DaemonState {
     pub(crate) memory_embeddings: SharedMemoryEmbeddings,
     pub(crate) memory_store: Option<MemoryStoreConfig>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
+    pub(crate) agent_snapshots: HashMap<String, AgentRuntimeSnapshot>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
     pub(crate) swarm_snapshots: HashMap<String, SwarmState>,
@@ -146,6 +153,7 @@ impl DaemonState {
             memory_embeddings,
             memory_store: None,
             agents: HashMap::new(),
+            agent_snapshots: HashMap::new(),
             swarms: HashMap::new(),
             swarm_events: HashMap::new(),
             swarm_snapshots: HashMap::new(),
@@ -187,7 +195,13 @@ impl DaemonState {
     }
 
     pub(crate) fn agent_count(&self) -> usize {
-        self.agents.len()
+        let mut count = self.agent_snapshots.len();
+        for agent_id in self.agents.keys() {
+            if !self.agent_snapshots.contains_key(agent_id) {
+                count += 1;
+            }
+        }
+        count
     }
 
     pub(crate) fn swarm_count(&self) -> usize {
@@ -220,11 +234,47 @@ impl DaemonState {
         self.validate_swarm_tools(&config)?;
 
         let event_stream = EventFanout::new(DEFAULT_EVENT_BUFFER);
+        let swarm_message_events = event_stream.clone();
+        let global_message_events = self.event_fanout();
+        let memory = Arc::clone(&self.memory);
+        let memory_embeddings = Arc::clone(&self.memory_embeddings);
+        let memory_store = self.memory_store.clone();
+        let agent_names = Arc::new(swarm_agent_names(&config));
+        let message_events: Arc<CoordinatorMessageEventFn> = Arc::new(move |swarm_id, message| {
+            let global_message_events = global_message_events.clone();
+            let swarm_message_events = swarm_message_events.clone();
+            let memory = Arc::clone(&memory);
+            let memory_embeddings = Arc::clone(&memory_embeddings);
+            let memory_store = memory_store.clone();
+            let agent_names = Arc::clone(&agent_names);
+            Box::pin(async move {
+                runtime_events::publish_swarm_message_event(
+                    &global_message_events,
+                    &swarm_message_events,
+                    &swarm_id,
+                    &message,
+                );
+                persist_swarm_message_relationship(
+                    memory,
+                    memory_embeddings,
+                    memory_store,
+                    agent_names,
+                    swarm_id,
+                    message,
+                )
+                .await;
+            })
+        });
         let strategy = resolve_strategy(config.strategy);
         let factory = self.swarm_agent_factory(event_stream.clone());
 
         Ok((
-            SwarmCoordinator::with_hooks(config, strategy, factory),
+            SwarmCoordinator::with_hooks_and_message_events(
+                config,
+                strategy,
+                factory,
+                Some(message_events),
+            ),
             event_stream,
         ))
     }
@@ -294,12 +344,19 @@ impl DaemonState {
         runtime.init();
         let agent_id = runtime.id().to_string();
         let snapshot = runtime.snapshot();
+        self.agent_snapshots
+            .insert(agent_id.clone(), snapshot.clone());
         self.agents.insert(agent_id, runtime);
         Ok(snapshot)
     }
 
     pub(crate) fn list_agents(&self) -> Vec<AgentRuntimeSnapshot> {
-        let mut snapshots: Vec<_> = self.agents.values().map(AgentRuntime::snapshot).collect();
+        let mut snapshots = self.agent_snapshots.clone();
+        for (agent_id, runtime) in &self.agents {
+            snapshots.insert(agent_id.clone(), runtime.snapshot());
+        }
+
+        let mut snapshots: Vec<_> = snapshots.into_values().collect();
         snapshots.sort_by(|left, right| {
             left.state
                 .created_at
@@ -310,10 +367,14 @@ impl DaemonState {
     }
 
     pub(crate) fn get_agent(&self, agent_id: &str) -> Option<AgentRuntimeSnapshot> {
-        self.agents.get(agent_id).map(AgentRuntime::snapshot)
+        self.agents
+            .get(agent_id)
+            .map(AgentRuntime::snapshot)
+            .or_else(|| self.agent_snapshots.get(agent_id).cloned())
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: &str) {
+        self.agent_snapshots.remove(agent_id);
         if let Some(mut runtime) = self.agents.remove(agent_id) {
             runtime.stop();
         }
@@ -323,6 +384,11 @@ impl DaemonState {
         self.agents
             .get(agent_id)
             .map(|runtime| runtime.id().to_string())
+            .or_else(|| {
+                self.agent_snapshots
+                    .get(agent_id)
+                    .map(|snapshot| snapshot.state.id.clone())
+            })
     }
 
     pub(crate) fn take_agent_runtime(
@@ -330,6 +396,9 @@ impl DaemonState {
         agent_id: &str,
     ) -> Option<(AgentRuntime, ToolExecutionContext)> {
         let runtime = self.agents.remove(agent_id)?;
+        let mut snapshot = runtime.snapshot();
+        snapshot.state.status = AgentStatus::Running;
+        self.agent_snapshots.insert(agent_id.to_string(), snapshot);
         let tool_context = ToolExecutionContext::new(
             Arc::clone(&self.memory),
             Arc::clone(&self.memory_embeddings),
@@ -354,6 +423,8 @@ impl DaemonState {
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;
+        self.agent_snapshots
+            .insert(agent_id.clone(), snapshot.clone());
         self.agents.insert(agent_id.clone(), runtime);
 
         (

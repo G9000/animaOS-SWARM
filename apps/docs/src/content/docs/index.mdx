@@ -1,0 +1,38 @@
+---
+title: animaOS Documentation
+description: 'animaOS: a host-agnostic agent runtime. Build autonomous agents, coordinate swarms, and manage long-term memory.'
+template: splash
+hero:
+  tagline: A host-agnostic runtime for autonomous agents, swarms, and long-term memory.
+  actions:
+    - text: Quick Start
+      link: /sdk/quickstart/
+      icon: right-arrow
+    - text: API Reference
+      link: /sdk/reference/
+      variant: minimal
+      icon: external
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid>
+  <Card title="SDK" icon="seti:typescript">
+    TypeScript client for any animaOS-compatible host. Create agents, run swarms, and manage memories.
+  </Card>
+  <Card title="Agents" icon="seti:html">
+    Build autonomous agents with tools, plugins, providers, and evaluators.
+  </Card>
+  <Card title="Swarms" icon="seti:docker">
+    Coordinate multi-agent teams with supervisor, round-robin, and dynamic strategies.
+  </Card>
+  <Card title="Memories" icon="seti:db">
+    Hybrid memory system with BM25 search, vector similarity, temporal reasoning, and relationship graphs.
+  </Card>
+  <Card title="CLI" icon="seti:powershell">
+    Command-line interface for running agents, managing agencies, and interactive chat.
+  </Card>
+  <Card title="TUI" icon="seti:terminal">
+    Terminal user interface for real-time swarm monitoring and event streaming.
+  </Card>
+</CardGrid>

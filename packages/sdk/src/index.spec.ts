@@ -805,6 +805,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
     fetchMock.mockResolvedValueOnce(
       sseResponse([
         'event: swarm:running\ndata: {"swarmId":"swarm-1","state":{"status":"running"},"result":null}\n\n',
+        'event: swarm:message\ndata: {"swarmId":"swarm-1","message":{"id":"swarm-msg-1","from":"manager-1","to":"worker-a-2","content":{"text":"hand off the plan"},"timestamp":123}}\n\n',
         'event: tool:after\ndata: {"agentId":"agent-1","agentName":"manager","toolName":"memory_search","status":"success","durationMs":12,"result":"Found prior note"}\n\n',
         'event: swarm:completed\ndata: {"swarmId":"swarm-1","state":{"status":"idle"},"result":{"status":"success"}}\n\n',
       ])
@@ -815,7 +816,7 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
 
     for await (const event of client.swarms.subscribe('swarm-1')) {
       received.push(event);
-      if (received.length === 3) {
+      if (received.length === 4) {
         break;
       }
     }
@@ -838,6 +839,21 @@ describe('@animaOS-SWARM/sdk daemon clients', () => {
             status: 'running',
           },
           result: null,
+        },
+      },
+      {
+        event: 'swarm:message',
+        data: {
+          swarmId: 'swarm-1',
+          message: {
+            id: 'swarm-msg-1',
+            from: 'manager-1',
+            to: 'worker-a-2',
+            content: {
+              text: 'hand off the plan',
+            },
+            timestamp: 123,
+          },
         },
       },
       {

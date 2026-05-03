@@ -1,0 +1,231 @@
+---
+title: Swarms
+description: Multi-agent coordination with the animaOS SDK
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+A **swarm** is a coordinated group of agents that collaborate on a shared task. The swarm runtime manages turn-taking, message passing, and result synthesis according to a configurable strategy.
+
+## Swarm Configuration
+
+Use the `swarm()` helper for typed autocompletion.
+
+```typescript
+import { agent, swarm, createDaemonClient } from '@animaOS-SWARM/sdk';
+
+const client = createDaemonClient();
+
+const contentTeam = await client.swarms.create(
+  swarm({
+    strategy: 'round-robin',
+    maxTurns: 10,
+    manager: agent({
+      name: 'manager',
+      provider: 'openai',
+      model: 'gpt-4o',
+      system: 'Break complex tasks into subtasks and synthesize the final answer.',
+    }),
+    workers: [
+      agent({
+        name: 'researcher',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        system: 'Research the assigned topic and return concise findings.',
+      }),
+      agent({
+        name: 'writer',
+        provider: 'openai',
+        model: 'gpt-4o',
+        system: 'Turn approved findings into polished written output.',
+      }),
+    ],
+  })
+);
+```
+
+### `SwarmConfig` fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `strategy` | `SwarmStrategy` | ✅ | Coordination strategy (see below) |
+| `manager` | `AgentConfig` | ✅ | Lead agent that orchestrates the swarm |
+| `workers` | `AgentConfig[]` | ✅ | Agents that execute subtasks |
+| `maxTurns` | `number` | — | Maximum conversation turns before termination |
+
+### `SwarmStrategy`
+
+| Value | Behavior |
+|-------|----------|
+| `round-robin` | Each worker takes a turn in sequence |
+| `supervisor` | Manager delegates and reviews each step |
+| `dynamic` | Manager dynamically assigns tasks based on context |
+
+<Aside type="note">
+  The `manager` and `worker` agents are created automatically by the daemon when the swarm is created. You do not need to call `client.agents.create()` for them separately.
+</Aside>
+
+## Run a Swarm
+
+```typescript
+const run = await client.swarms.run('swarm-uuid-here', {
+  text: 'Write a comprehensive article about renewable energy',
+});
+
+if (run.result.status === 'success') {
+  console.log('Result:', (run.result.data as { text: string }).text);
+}
+
+console.log('Tokens used:', run.swarm.tokenUsage.totalTokens);
+console.log('Status:', run.swarm.status);
+```
+
+### `SwarmRunResponse<T>`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `swarm` | `SwarmState` | Final swarm state after execution |
+| `result` | `TaskResult<T>` | Synthesized result from the swarm |
+
+### `SwarmState`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `string` | Swarm identifier |
+| `status` | `string` | Current swarm status |
+| `agentIds` | `string[]` | IDs of all agents in the swarm |
+| `tokenUsage` | `TokenUsage` | Cumulative token consumption |
+| `createdAt` | `number` | Unix timestamp (ms) |
+
+## Subscribe to Events (SSE)
+
+Swarms emit a rich stream of events during execution. You can subscribe to these events in real-time using Server-Sent Events.
+
+```typescript
+const stream = client.swarms.subscribe('swarm-uuid-here');
+
+for await (const event of stream) {
+  // event.event is the SSE event name
+  // event.data is the parsed payload
+  console.log('Event type:', event.event);
+  console.log('Payload:', event.data);
+}
+```
+
+### Event payload types
+
+The `event.data` field is a discriminated union of several payload shapes:
+
+| Payload | Discriminator | Description |
+|---------|---------------|-------------|
+| `SwarmEventPayload` | `swarmId` + `state` | Swarm state update |
+| `SwarmMessagePayload` | `swarmId` + `message` | Agent-to-agent message |
+| `SwarmAgentEventPayload` | `agentId` + `agentName` | Generic agent event |
+| `SwarmTaskFailedPayload` | `agentId` + `error` | Agent task failure |
+| `SwarmToolBeforePayload` | `agentId` + `toolName` + `args` | Tool invocation start |
+| `SwarmToolAfterPayload` | `agentId` + `toolName` + `status` | Tool invocation complete |
+| `SwarmAgentTokensPayload` | `agentId` + `usage` | Token usage update |
+
+### Example: monitoring tool usage
+
+```typescript
+for await (const { event, data } of client.swarms.subscribe(swarmId)) {
+  if ('toolName' in data && 'status' in data) {
+    console.log(`[${data.agentName}] ${data.toolName}: ${data.status} (${data.durationMs}ms)`);
+  }
+
+  if ('error' in data) {
+    console.error(`[${data.agentName}] FAILED: ${data.error}`);
+  }
+
+  if ('usage' in data) {
+    console.log(`[${data.agentName}] tokens: ${data.usage.totalTokens}`);
+  }
+}
+```
+
+### Example: streaming with abort
+
+```typescript
+const controller = new AbortController();
+
+// Start streaming
+const streamTask = (async () => {
+  for await (const event of client.swarms.subscribe(swarmId, {
+    signal: controller.signal,
+  })) {
+    console.log(event.event, event.data);
+  }
+})();
+
+// Cancel after 30 seconds
+setTimeout(() => controller.abort(), 30_000);
+
+await streamTask;
+```
+
+## Get Swarm State
+
+```typescript
+const state = await client.swarms.get('swarm-uuid-here');
+console.log('Status:', state.status);
+console.log('Agents:', state.agentIds);
+console.log('Tokens:', state.tokenUsage.totalTokens);
+```
+
+## Full Example: Content Pipeline
+
+```typescript
+import { agent, swarm, createDaemonClient } from '@animaOS-SWARM/sdk';
+
+const client = createDaemonClient();
+
+const pipeline = await client.swarms.create(
+  swarm({
+    strategy: 'supervisor',
+    maxTurns: 15,
+    manager: agent({
+      name: 'editor',
+      provider: 'openai',
+      model: 'gpt-4o',
+      system: 'You are a senior editor. Review drafts, request revisions, and approve final copy.',
+    }),
+    workers: [
+      agent({
+        name: 'researcher',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        system: 'Research topics thoroughly. Cite sources when possible.',
+      }),
+      agent({
+        name: 'writer',
+        provider: 'openai',
+        model: 'gpt-4o',
+        system: 'Write engaging, accurate content based on approved research.',
+      }),
+      agent({
+        name: 'fact-checker',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        system: 'Verify factual claims. Flag anything uncertain.',
+      }),
+    ],
+  })
+);
+
+// Stream all events
+const stream = client.swarms.subscribe(pipeline.state.id);
+const runPromise = client.swarms.run(pipeline.state.id, {
+  text: 'Write a 500-word blog post about the James Webb Space Telescope',
+});
+
+// Process events in parallel with the run
+for await (const { event, data } of stream) {
+  if ('agentName' in data) {
+    console.log(`[${data.agentName}] ${event}`);
+  }
+}
+
+const result = await runPromise;
+console.log('Final article:', result.result.data?.text);
+```

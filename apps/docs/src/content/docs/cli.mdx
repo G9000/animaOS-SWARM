@@ -1,0 +1,167 @@
+---
+title: CLI
+description: Command-line interface for running agents, managing agencies, and controlling swarms
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+The animaOS CLI (`animaos`) is your command-and-control center for running agents, managing agencies, and launching swarms — all from the terminal.
+
+## Installation
+
+```bash
+bun add -g @animaOS-SWARM/cli
+# or use npx without installing
+npx @animaOS-SWARM/cli --help
+```
+
+<Aside type="note">
+  The CLI communicates with the animaOS daemon over HTTP. Make sure the daemon is running before executing commands.
+</Aside>
+
+## Commands
+
+### `animaos run`
+
+Run a single agent or a swarm with a one-off task.
+
+```bash
+# Single agent
+animaos run "Summarize the Rust book" -m gpt-4o-mini
+
+# Swarm with supervisor strategy
+animaos run "Build a landing page" -s supervisor -m gpt-4o
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m, --model` | `gpt-4o-mini` | Model to use |
+| `-p, --provider` | `openai` | Provider: `openai`, `anthropic`, `ollama`, `openrouter` |
+| `-n, --name` | `task-agent` | Agent name (single-agent mode) |
+| `-s, --strategy` | — | Swarm strategy: `supervisor`, `dynamic`, `round-robin` |
+| `--api-key` | — | API key override |
+| `--no-tui` | — | Force plain text output |
+
+### `animaos chat`
+
+Start an interactive REPL session with an agent.
+
+```bash
+animaos chat -m claude-3-5-sonnet -p anthropic
+```
+
+Type your messages at the `you >` prompt. Type `exit` to quit.
+
+### `animaos create`
+
+Create either a single agent workspace or a full agent agency. With no arguments, the CLI asks whether you want an agent or agency. Agency mode uses configured remote provider credentials when available and falls back to a deterministic local scaffolder when no provider key is present.
+
+```bash
+# Interactive mode: choose agent or agency
+animaos create
+
+# Single-agent workspace
+animaos create agent medicine-helper \
+  -d "Research medical literature and summarize risks clearly"
+
+# Full agency workspace
+animaos create agency content-team \
+  -d "Research topics and write high-quality articles" \
+  -s 5 \
+  --seed
+
+# Legacy shorthand still creates an agency
+animaos create content-team --yes
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kind` | — | `agent` or `agency`; equivalent to `animaos create agent ...` |
+| `-p, --provider` | auto | Provider for generation/runtime config. Uses configured remote credentials first, otherwise `deterministic` |
+| `-m, --model` | `gpt-4o-mini` | Model for generation |
+| `--models` | — | Comma-separated model pool for agents |
+| `-d, --description` | — | What the agent or agency does |
+| `-s, --size` | `4` | Agency team size (2–10) |
+| `--system` | — | System prompt for single-agent mode |
+| `--seed` | — | Generate starter memories for each agent |
+| `-y, --yes` | — | Accept the generated team without confirmation |
+
+**Output structure:**
+
+```
+content-team/
+├── anima.yaml        # Team config
+├── org-chart.mmd     # Mermaid diagram
+├── README.md         # Mission, values, roster
+└── agents/
+    ├── orchestrator/
+    │   ├── profile.md
+    │   ├── assets/
+    │   └── memory/
+    │       └── seed.json   # (if --seed)
+    └── worker-1/
+        ├── profile.md
+        ├── assets/
+        └── memory/
+```
+
+### `animaos launch`
+
+Launch an agency from its `anima.yaml` config.
+
+```bash
+cd content-team
+
+# One-shot task
+animaos launch "Write an article about Rust macros"
+
+# Interactive mode (REPL)
+animaos launch
+
+# With TUI
+animaos launch --tui
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--api-key` | — | API key override |
+| `--no-tui` | — | Disable TUI, use plain text |
+
+**Interactive commands:**
+
+| Command | Description |
+|---------|-------------|
+| `exit` | Quit |
+| `/help` | Show available commands |
+| `/health` | Recheck daemon connectivity |
+
+### `animaos agents`
+
+Inspect daemon-backed agents.
+
+```bash
+# List all agents
+animaos agents list
+
+# Show details for a specific agent
+animaos agents show researcher
+```
+
+### `animaos mod`
+
+Enable, disable, or list mods.
+
+```bash
+animaos mod enable my-mod
+animaos mod disable my-mod
+animaos mod list
+```
+
+## Environment
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | OpenAI credentials |
+| `ANTHROPIC_API_KEY` | Anthropic credentials |
+| `OLLAMA_HOST` | Ollama server URL |
+| `ANIMAOS_WORKSPACE_ROOT` | Workspace root for mod config |

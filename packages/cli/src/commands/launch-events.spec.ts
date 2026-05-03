@@ -141,6 +141,7 @@ describe('launch event bridge', () => {
           id: 'swarm-1' as any,
           status: 'idle',
           agentIds: [],
+          messages: [],
           results: [],
           tokenUsage: {
             promptTokens: 0,
@@ -162,6 +163,7 @@ describe('launch event bridge', () => {
           id: 'swarm-1' as any,
           status: 'running',
           agentIds: [],
+          messages: [],
           results: [],
           tokenUsage: {
             promptTokens: 0,
@@ -295,6 +297,7 @@ describe('launch event bridge', () => {
           id: 'swarm-1' as any,
           status: 'idle',
           agentIds: [],
+          messages: [],
           results: [],
           tokenUsage: {
             promptTokens: 0,

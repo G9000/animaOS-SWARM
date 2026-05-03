@@ -1,0 +1,186 @@
+---
+title: Building & Extending
+description: Testing the Rust core and adding new providers
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Building
+
+### Prerequisites
+
+- Rust stable (via [rustup](https://rustup.rs))
+- [cargo-nextest](https://nexte.st) (optional, recommended)
+
+### Build Commands
+
+```bash
+# Build all crates
+cargo build --workspace
+
+# Build specific crate
+cargo build -p anima-core
+cargo build -p anima-memory
+cargo build -p anima-swarm
+
+# Release build (optimized)
+cargo build --release -p anima-core
+```
+
+### Workspace Structure
+
+The `packages/core-rust/Cargo.toml` defines the workspace:
+
+```toml
+[workspace]
+members = ["crates/anima-core", "crates/anima-memory", "crates/anima-swarm"]
+resolver = "2"
+```
+
+Each crate has its own `Cargo.toml` with dependencies:
+- `anima-core` → `tokio`, `async-trait`, `serde`, `thiserror`
+- `anima-memory` → `anima-core` (for types), `serde`, `uuid`
+- `anima-swarm` → `anima-core`, `anima-memory`, `tokio`
+
+## Testing
+
+### Unit Tests
+
+```bash
+# Run all Rust core tests
+cargo test --workspace
+
+# Run with nextest (parallel, better output)
+cargo nextest run --workspace
+
+# Test specific crate
+cargo test -p anima-core
+cargo test -p anima-memory
+cargo test -p anima-swarm
+
+# Test specific module
+cargo test -p anima-memory memory_manager::tests
+```
+
+### Memory Evaluation Harness
+
+```bash
+# Run baseline memory eval cases
+bun x nx run core-rust:memory-eval --skipNxCache
+
+# Run LoCoMo eval (long-context memory benchmark)
+bun x nx run core-rust:memory-locomo --skipNxCache
+```
+
+The eval harness validates:
+- Recall precision at N
+- Fusion weight sensitivity
+- Evaluation decision accuracy (Store/Merge/Ignore)
+- Snapshot round-trip consistency
+
+### CI Pipeline
+
+The CI runs:
+1. `cargo fmt --check` — formatting
+2. `cargo clippy --workspace` — linting
+3. `cargo test --workspace` — unit tests
+4. `cargo nextest run --workspace` — parallel tests (if nextest available)
+
+## Adding a New Provider
+
+Implement `ModelAdapter` for your provider:
+
+```rust
+use anima_core::{ModelAdapter, ModelGenerateRequest, ModelGenerateResponse};
+
+pub struct MyProviderAdapter {
+    api_key: String,
+    base_url: String,
+}
+
+impl MyProviderAdapter {
+    pub fn new(api_key: String, base_url: String) -> Self {
+        Self { api_key, base_url }
+    }
+}
+
+#[async_trait]
+impl ModelAdapter for MyProviderAdapter {
+    async fn generate(
+        &self,
+        request: ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        // 1. Build the HTTP request
+        // 2. Add auth headers
+        // 3. Serialize messages to provider format
+        // 4. Make the HTTP call (in the host, not the core)
+        // 5. Parse the response
+        // 6. Map to ModelGenerateResponse
+        
+        Ok(ModelGenerateResponse {
+            content: Content { text: "...".into(), attachments: vec![], metadata: HashMap::new() },
+            tool_calls: vec![],
+            stop_reason: ModelStopReason::End,
+            usage: TokenUsage { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        })
+    }
+}
+```
+
+### Important: The adapter lives in the **host**, not the core
+
+The core only sees the `ModelAdapter` trait. The actual HTTP calls, retries, rate limiting, and error handling happen in the host (e.g., `hosts/rust-daemon/src/adapters/`).
+
+### Provider Checklist
+
+- [ ] Implement `ModelAdapter` for the provider
+- [ ] Map the provider's message format to/from `Message`
+- [ ] Map the provider's tool call format to/from `ToolCall`
+- [ ] Handle streaming (if supported) via `ModelAdapter::generate_stream()`
+- [ ] Add env var resolution (e.g., `MYPROVIDER_API_KEY`)
+- [ ] Add tests with mocked HTTP responses
+- [ ] Update the daemon's `RuntimeModelAdapter::from_env()` to detect the new provider
+
+## Adding a New Strategy
+
+Implement `StrategyFn` for custom swarm coordination:
+
+```rust
+use anima_swarm::{StrategyFn, StrategyContext, StrategyDecision};
+
+fn my_strategy() -> StrategyFn {
+    Box::new(|ctx: &StrategyContext| {
+        if ctx.iteration >= ctx.max_iterations {
+            return StrategyDecision::Done {
+                result: Content::text("Max iterations reached"),
+            };
+        }
+        
+        // Assign task to next worker in round-robin
+        let worker_idx = ctx.iteration as usize % ctx.swarm_state.worker_ids.len();
+        let agent_id = ctx.swarm_state.worker_ids[worker_idx];
+        
+        StrategyDecision::Delegate {
+            agent_id,
+            task: ctx.input.clone(),
+        }
+    })
+}
+```
+
+## Benchmarking
+
+Use `cargo bench` for criterion benchmarks:
+
+```bash
+cargo bench -p anima-memory
+```
+
+Current benchmarks:
+- `bm25_index_1000` — Index 1000 memories
+- `recall_1000` — Recall query over 1000 memories
+- `snapshot_roundtrip` — Serialize + deserialize a full snapshot

@@ -1,0 +1,116 @@
+---
+title: Rust Daemon
+description: Production-ready Rust host — overview, architecture, and startup
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`anima-daemon` in `hosts/rust-daemon` is the current production-ready host. It is an Axum HTTP/SSE boundary that wires the reusable crates in `packages/core-rust` to real infrastructure: model providers, optional Postgres persistence, and streaming clients.
+
+## Architecture
+
+```
+┌─────────────────────────────────────┐
+│         HTTP / SSE Clients          │
+├─────────────────────────────────────┤
+│         Axum Router                 │
+│  /health  /ready  /metrics          │
+│  /api/agents  /api/swarms           │
+│  /api/memories  /api/health         │
+│  /openapi.json  /docs               │
+├─────────────────────────────────────┤
+│      anima-daemon host logic        │
+│  - RuntimeModelAdapter              │
+│  - SqlxPostgresAdapter              │
+│  - Tool registry                    │
+│  - Snapshot persistence             │
+│  - Request ID propagation           │
+│  - Concurrent-run semaphore         │
+├─────────────────────────────────────┤
+│  anima-core │ anima-memory │ anima-swarm │
+│  (zero I/O, pure algorithms)        │
+└─────────────────────────────────────┘
+```
+
+The host implements:
+- `ModelAdapter` → `RuntimeModelAdapter` (OpenAI, Anthropic, Ollama, etc.)
+- `DatabaseAdapter` → `SqlxPostgresAdapter` (optional Postgres persistence)
+
+## Startup Sequence
+
+1. **Read environment variables**
+   - `ANIMAOS_RS_HOST`, `ANIMAOS_RS_PORT` — bind address
+   - `ANIMAOS_RS_MAX_REQUEST_BYTES` — body size limit (default 64 KB)
+   - `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` — per-request timeout (default 30s)
+   - `ANIMAOS_RS_PERSISTENCE_MODE` — `memory` or `postgres`
+   - `ANIMAOS_RS_MAX_CONCURRENT_RUNS` — admission limit (default 8)
+   - `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES` — bg process limit (default 8)
+
+2. **Build `RuntimeModelAdapter::from_env()`**
+   - Loads provider API keys and base URLs
+   - Supports OpenAI, Anthropic, Google Gemini, Ollama, OpenAI-compatible
+
+3. **Initialize `tracing`**
+   - Every HTTP request logged with method, URI, latency, `x-request-id`
+   - Daemon logged as `ephemeral` control plane
+
+4. **Persistence setup**
+   - `memory` mode: no external DB, runtime state only
+   - `postgres` mode: connect to `DATABASE_URL`, run migrations, fail fast on error
+
+5. **Inject `SqlxPostgresAdapter`** into shared daemon state
+   - All new agents get step persistence automatically
+
+6. **Start Axum**
+   - Request ID propagation middleware
+   - Tracing middleware
+   - Request timeouts for standard and blocking `/run` routes
+   - Semaphore-backed concurrent-run admission limit
+   - Readiness and metrics endpoints
+   - Graceful shutdown on `Ctrl+C`
+
+## Middleware Stack
+
+```
+Incoming Request
+  │
+  ├─► Request ID (generate or propagate x-request-id)
+  ├─► Tracing (log method, URI, latency)
+  ├─► Timeout (standard routes: 30s, /run routes: configurable)
+  ├─► Body Limit (default 64 KB)
+  ├─► CORS (if configured)
+  │
+  └─► Router Handler
+```
+
+## State Management
+
+The daemon uses Axum's `State` extractor to share data across handlers:
+
+```rust
+pub struct AppState {
+    pub config: DaemonConfig,
+    pub model_adapter: Arc<RuntimeModelAdapter>,
+    pub db: Option<Arc<SqlxPostgresAdapter>>,
+    pub agent_runtimes: RwLock<HashMap<AgentId, AgentRuntimeHandle>>,
+    pub swarm_coordinators: RwLock<HashMap<SwarmId, SwarmCoordinatorHandle>>,
+    pub memory_manager: RwLock<MemoryManager>,
+    pub concurrent_run_semaphore: Arc<Semaphore>,
+}
+```
+
+All runtime state is in-memory (`ephemeral` control plane). Postgres only persists step logs, not runtime state.
+
+## Graceful Shutdown
+
+On `Ctrl+C`:
+1. Stop accepting new connections
+2. Wait for in-flight requests to complete (with timeout)
+3. Serialize memory manager snapshot
+4. Write snapshot to `ANIMAOS_RS_MEMORY_FILE` or `ANIMAOS_RS_MEMORY_SQLITE_FILE`
+5. Flush Postgres connections
+6. Exit

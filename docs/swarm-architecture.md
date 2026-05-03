@@ -163,7 +163,7 @@ graph LR
     AR --> Output
 ```
 
-Swarm snapshots include the global message history as `messages`, so direct sends and broadcasts are inspectable through `POST /api/swarms/:id/run`, `GET /api/swarms/:id`, list responses, and SSE state payloads.
+Swarm snapshots include the global message history as `messages`, so direct sends and broadcasts are inspectable through `POST /api/swarms/:id/run`, `GET /api/swarms/:id`, list responses, lifecycle SSE state payloads, and live `swarm:message` SSE events. The Rust daemon also records swarm messages as memory evidence and relationship edges, using `hands_off_to` for direct agent messages and `broadcasts_to` for swarm-wide broadcasts.
 
 ## Event Flow (SSE)
 
@@ -175,6 +175,7 @@ Events emitted by `EventBus` are streamed to connected clients via `GET /api/swa
 | `agent:spawned` | An AgentRuntime is initialised |
 | `tool:before` | Agent is about to call a tool |
 | `tool:after` | Tool call completed |
+| `swarm:message` | Agent-to-agent direct send or broadcast written to the swarm message bus |
 | `agent:completed` | Agent finished a run |
 | `swarm:completed` | Task done, result ready |
 | `swarm:stopped` | Swarm shut down |

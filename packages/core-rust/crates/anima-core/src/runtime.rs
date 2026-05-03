@@ -23,6 +23,7 @@ const MAX_TOOL_ITERATIONS: usize = 8;
 pub struct AgentRuntimeSnapshot {
     pub state: AgentState,
     pub message_count: usize,
+    pub messages: Vec<Message>,
     pub event_count: usize,
     pub last_task: Option<TaskResult<Content>>,
 }
@@ -97,6 +98,7 @@ impl AgentRuntime {
         AgentRuntimeSnapshot {
             state: self.state(),
             message_count: self.messages.len(),
+            messages: self.messages.clone(),
             event_count: self.events.len(),
             last_task: self.last_task.clone(),
         }

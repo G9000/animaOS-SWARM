@@ -1,0 +1,102 @@
+---
+title: anima-core
+description: Agent runtime, event system, and trait interfaces
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`anima-core` is the agent execution crate. It owns the `AgentRuntime`, the task loop, the event system, and all trait interfaces that separate the engine from the outside world. It has **zero I/O** — no HTTP, no filesystem, no database drivers, no LLM client code. Every external concern is injected through a trait.
+
+## Where It Lives
+
+```
+packages/core-rust/crates/anima-core/
+├── Cargo.toml
+└── src/
+    ├── lib.rs           # Public module declarations + re-exports
+    ├── agent.rs         # AgentConfig, AgentState, AgentStatus, TokenUsage
+    ├── components.rs    # Provider, Evaluator traits + result types
+    ├── events.rs        # EventType, EngineEvent
+    ├── model.rs         # ModelAdapter trait, ModelGenerateRequest/Response, ToolCall
+    ├── persistence.rs   # DatabaseAdapter trait, Step, StepStatus, PersistenceError
+    ├── primitives.rs    # Content, Message, TaskResult, Attachment, DataValue
+    └── runtime.rs       # AgentRuntime, AgentRuntimeSnapshot
+```
+
+| File | Lines of Responsibility |
+|------|------------------------|
+| `lib.rs` | Declares all modules and re-exports every public type. This is the crate's public API surface. |
+| `agent.rs` | Defines what an agent is: its configuration (`AgentConfig`), its current state (`AgentState`), its lifecycle status (`AgentStatus`), and its cumulative token usage (`TokenUsage`). |
+| `components.rs` | Defines two extension hooks: `Provider` (injects context before generation) and `Evaluator` (scores or transforms the response after generation). |
+| `events.rs` | Defines the 14 event types the engine can emit (`EventType`) and the `EngineEvent` struct that carries them. |
+| `model.rs` | Defines the `ModelAdapter` trait — the bridge to any LLM provider — plus the request/response types and `ToolCall`. |
+| `persistence.rs` | Defines the `DatabaseAdapter` trait for persisting execution steps, plus `Step` and `PersistenceError`. |
+| `primitives.rs` | Shared vocabulary used across every module: `Content`, `Message`, `TaskResult`, `DataValue`, `Attachment`, and typed aliases like `AgentId`. |
+| `runtime.rs` | The heart of the crate. Implements `AgentRuntime` — the state machine, message history, provider context builder, evaluator runner, and the main task loop. |
+
+## Architecture Flow
+
+When a host (like `rust-daemon`) wants an agent to do work, the data flows like this:
+
+```
+┌─────────────────┐     ┌──────────────────────────────────────┐
+│   Host Process  │────▶│  AgentRuntime::new(config, adapter)  │
+│  (rust-daemon)  │     └──────────────────────────────────────┘
+└─────────────────┘                    │
+                                       ▼
+┌─────────────────┐     ┌──────────────────────────────────────┐
+│  Host receives  │◀────│  runtime.run_with_tools(input, ...)  │
+│   TaskResult    │     │         (async task loop)            │
+└─────────────────┘     └──────────────────────────────────────┘
+                                   │
+        ┌──────────────────────────┼──────────────────────────┐
+        ▼                          ▼                          ▼
+┌─────────────┐          ┌─────────────┐            ┌─────────────┐
+│ ModelAdapter│          │  Provider   │            │  Evaluator  │
+│  (LLM call) │          │ (context)   │            │ (scoring)   │
+└─────────────┘          └─────────────┘            └─────────────┘
+```
+
+1. The **host** creates an `AgentRuntime` with an `AgentConfig` and a `ModelAdapter`.
+2. The host optionally registers `Provider`s (context), `Evaluator`s (post-processing), and a `DatabaseAdapter` (persistence).
+3. The host calls `run()` or `run_with_tools()`, which enters the async task loop.
+4. The runtime talks to traits, not concrete types. The host provides the concrete implementations.
+
+## Public API Surface
+
+Every public type is re-exported from `lib.rs`. If you `use anima_core::*`, you get:
+
+| Category | Types |
+|----------|-------|
+| Configuration | `AgentConfig`, `AgentSettings`, `ToolDescriptor`, `ToolExample`, `PluginDescriptor` |
+| Runtime | `AgentRuntime`, `AgentRuntimeSnapshot` |
+| State | `AgentState`, `AgentStatus`, `TokenUsage` |
+| Traits | `ModelAdapter`, `Provider`, `Evaluator`, `DatabaseAdapter` |
+| Request/Response | `ModelGenerateRequest`, `ModelGenerateResponse`, `ModelStopReason`, `ToolCall`, `ProviderResult`, `EvaluatorResult` |
+| Events | `EngineEvent`, `EventType` |
+| Persistence | `Step`, `StepStatus`, `PersistenceError`, `PersistenceResult` |
+| Primitives | `Content`, `Message`, `MessageRole`, `TaskResult`, `TaskStatus`, `DataValue`, `Attachment`, `AttachmentType`, `AgentId`, `RoomId`, `MessageId`, `UuidString`, `HealthStatus`, `HEALTH_OK_JSON` |
+
+## Design Rules
+
+1. **Zero I/O** — The crate compiles without `tokio::net`, `reqwest`, `sqlx`, or any I/O dependency. All I/O happens in host-provided trait implementations.
+2. **Trait boundaries** — Every external concern is a trait. The runtime never knows which LLM, database, or tool registry is on the other side.
+3. **Snapshot persistence** — `AgentRuntimeSnapshot` contains the entire agent state: messages, events, token usage, and the last task result. A host can serialize this and resume later.
+4. **Pure algorithms** — No external ML dependencies. Token counting, prompt building, and step tracking are deterministic.
+5. **Room-scoped conversations** — Every `run()` call gets a unique `room_id`. Messages within a single task share the same room, preventing history leakage between unrelated tasks.
+
+## Lifecycle Summary
+
+```
+Idle ──▶ Running ──▶ Completed
+           │
+           └──▶ Failed
+           │
+           └──▶ Terminated  (explicit stop())
+```
+
+`AgentStatus` is a simple enum with five variants. The runtime transitions through them automatically during `run()`, or the host can call `stop()` to force `Terminated`.

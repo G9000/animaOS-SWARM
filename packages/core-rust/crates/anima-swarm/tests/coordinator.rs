@@ -669,9 +669,7 @@ fn supervisor_strategy_batch_delegates_workers_concurrently() {
                                 assert!(
                                     text.contains("[worker-a] worker-a finished research alpha")
                                 );
-                                assert!(
-                                    text.contains("[worker-b] worker-b finished research beta")
-                                );
+                                assert!(text.contains("[worker-b] worker-b finished research beta"));
 
                                 TaskResult::success(text_content("batched synthesis"), 1)
                             })
@@ -1489,14 +1487,12 @@ fn start_rolls_back_workers_created_before_a_later_spawn_failure() {
     assert!(state.agent_ids.is_empty());
     assert!(state.results.is_empty());
     assert_eq!(state.token_usage.total_tokens, 0);
-    assert!(
-        coordinator
-            .get_message_bus()
-            .lock()
-            .expect("message bus mutex should not be poisoned")
-            .get_all_messages()
-            .is_empty()
-    );
+    assert!(coordinator
+        .get_message_bus()
+        .lock()
+        .expect("message bus mutex should not be poisoned")
+        .get_all_messages()
+        .is_empty());
 
     block_on(coordinator.stop()).expect("stop after rollback should succeed");
     assert_eq!(harness.snapshot().stop_log.len(), 1);
@@ -1892,12 +1888,11 @@ fn stale_send_and_broadcast_hooks_cannot_mutate_message_bus_after_agent_cleanup(
         .expect("manager broadcast hook should be captured");
 
     let bus = coordinator.get_message_bus();
-    assert!(
-        bus.lock()
-            .expect("message bus mutex should not be poisoned")
-            .get_all_messages()
-            .is_empty()
-    );
+    assert!(bus
+        .lock()
+        .expect("message bus mutex should not be poisoned")
+        .get_all_messages()
+        .is_empty());
 
     let send_error = block_on(send(worker_id.clone(), text_content("late direct message")))
         .expect_err("stale send hook should fail");
@@ -2063,12 +2058,10 @@ fn round_robin_strategy_rejects_zero_turns_before_spawning_agents() {
         Some("Round-robin strategy requires at least one turn")
     );
     assert!(result.data.is_none());
-    assert!(
-        spawn_log
-            .lock()
-            .expect("spawn log mutex should not be poisoned")
-            .is_empty()
-    );
+    assert!(spawn_log
+        .lock()
+        .expect("spawn log mutex should not be poisoned")
+        .is_empty());
 }
 
 #[test]
@@ -2273,10 +2266,8 @@ fn dynamic_strategy_routes_workers_through_choose_speaker_and_preserves_history(
                                     .map(|(_, input)| input.clone())
                                     .expect("writer input should be recorded");
                                 assert!(recorded_writer_input.contains("Conversation so far:"));
-                                assert!(
-                                    recorded_writer_input
-                                        .contains("[analyst]: analyst response: pattern one")
-                                );
+                                assert!(recorded_writer_input
+                                    .contains("[analyst]: analyst response: pattern one"));
 
                                 let done_result =
                                     choose_speaker("DONE".into(), "Finish the synthesis".into())
@@ -2451,10 +2442,8 @@ fn dynamic_strategy_returns_error_for_unknown_agent_choice() {
             .as_slice(),
         ["analyst", "writer", "manager"]
     );
-    assert!(
-        worker_inputs
-            .lock()
-            .expect("worker input mutex should not be poisoned")
-            .is_empty()
-    );
+    assert!(worker_inputs
+        .lock()
+        .expect("worker input mutex should not be poisoned")
+        .is_empty());
 }

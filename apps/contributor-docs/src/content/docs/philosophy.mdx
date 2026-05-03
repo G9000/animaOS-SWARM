@@ -1,0 +1,53 @@
+---
+title: Philosophy
+description: Why animaOS exists and how it is designed
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Problem
+
+Agent tools today lock you in:
+
+- **Frameworks** (LangChain, AutoGen) own your abstractions. When they change, you rewrite.
+- **Platforms** (OpenAI Assistants, Claude computer use) own your runtime. When they break, you're down.
+
+## Solution
+
+Separate **engine** from **host**.
+
+The Rust core (`packages/core-rust`) has zero I/O — no HTTP, no DB, no filesystem. It only defines behavior: agent runtime, memory search, swarm coordination. A host wraps the core and provides reality: HTTP server, LLM adapters, persistence.
+
+The SDK, CLI, and TUI talk to any host over HTTP. Swap the host, keep the agents.
+
+## Memory-First
+
+Memory is not a vector DB bolt-on. It is a first-class primitive with four signals:
+
+- **Lexical** (BM25)
+- **Vector** (cosine similarity)
+- **Temporal** (time decay)
+- **Relationship** (graph proximity)
+
+## Swarms
+
+Single agents are bounded by one model's context window. Swarms distribute cognition across specialized agents with pluggable strategies (supervisor, round-robin, dynamic).
+
+## Rust + TypeScript
+
+- **Rust** runs the engine (no GC, memory-safe, embeddable).
+- **TypeScript** runs the surfaces (SDK, CLI, TUI) where DX matters.
+
+## What animaOS Is Not
+
+- Not a framework. You own your code.
+- Not a platform. You run the host.
+- Not an LLM. We run agents that use models.
+
+## In One Sentence
+
+animaOS is the engine you run when you want autonomous agents with long-term memory and swarm coordination — without giving up control of your runtime or data.

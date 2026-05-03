@@ -1,0 +1,59 @@
+---
+title: Message Bus
+description: In-memory pub/sub between swarm agents
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## MessageBus
+
+`MessageBus` is an in-memory pub/sub channel between swarm agents.
+
+```rust
+pub struct MessageBus {
+    channels: HashMap<AgentId, Vec<AgentMessage>>,
+}
+```
+
+## Operations
+
+| Method | Description |
+|--------|-------------|
+| `send(from, to, message)` | Direct message from one agent to another |
+| `broadcast(from, message)` | Message to all agents in the swarm |
+| `inbox(agent_id)` | Get all messages for an agent |
+| `clear()` | Empty all channels |
+
+Messages are persistent within a swarm run. An agent can read its inbox multiple times and see all messages since the last `clear()`.
+
+## AgentMessage
+
+```rust
+pub struct AgentMessage {
+    pub id: MessageId,
+    pub from: AgentId,
+    pub to: Option<AgentId>,  // None = broadcast
+    pub content: Content,
+    pub created_at: u64,
+}
+```
+
+## Error Handling
+
+- **Message bus overflow** — If an agent's inbox exceeds a configurable limit, old messages are dropped (FIFO).
+- **Timeout** — If the swarm exceeds `max_total_duration_ms`, the coordinator returns a partial result.
+
+## Swarm Events
+
+| Event | Fired When |
+|-------|-----------|
+| `SwarmCreated` | SwarmCoordinator initialized |
+| `SwarmTaskStarted` | `run()` called |
+| `AgentDelegated` | Strategy assigns a task |
+| `AgentCompleted` | Worker returns a result |
+| `SwarmTaskCompleted` | All work finished |
+| `SwarmTeardown` | `teardown()` called |

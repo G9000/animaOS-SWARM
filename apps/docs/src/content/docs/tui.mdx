@@ -1,0 +1,83 @@
+---
+title: TUI
+description: Terminal UI for visual swarm monitoring and agent interaction
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The animaOS Terminal UI (TUI) is a visual interface built with [Ink](https://github.com/vadimdemedes/ink) that runs inside your terminal. It gives you a real-time dashboard for watching swarms collaborate, inspecting agent activity, and sending tasks.
+
+## Launch
+
+```bash
+# Launch an agency with TUI
+cd content-team
+animaos launch --tui
+
+# Or force TUI for a one-off run
+animaos run "Build a website" -s supervisor --tui
+```
+
+## Layout
+
+```
+┌─────────────────────────────────────────────┐
+│  animaOS  │  content-team  │  supervisor   │
+├───────────┴────────────────┴───────────────┤
+│  ┌─────────┐  ┌─────────────────────────┐  │
+│  │ Agents  │  │ Message Stream          │  │
+│  │ ★ Alice │  │ Alice > Researching...  │  │
+│  │ • Bob   │  │ Bob > Drafting...       │  │
+│  │ • Carol │  │                         │  │
+│  └─────────┘  └─────────────────────────┘  │
+│  ┌────────────────────────────────────────┐ │
+│  │ Result Log                             │ │
+│  │ • Task completed — 12.3s               │ │
+│  └────────────────────────────────────────┘ │
+├─────────────────────────────────────────────┤
+│  task > _                                   │
+├─────────────────────────────────────────────┤
+│  Status: running  │  Tokens: 4,231          │
+└─────────────────────────────────────────────┘
+```
+
+## Panels
+
+| Panel | Description |
+|-------|-------------|
+| **Agents** | Shows all agents in the swarm with their role (★ orchestrator, • worker) and status |
+| **Message Stream** | Real-time messages and events between agents |
+| **Tool Panel** | Displays tool invocations, arguments, and results as they happen |
+| **Result Log** | History of completed tasks with duration and token usage |
+| **Input Bar** | Type tasks and slash commands |
+| **Status Bar** | Swarm status, total token usage, and daemon health indicator |
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show available commands |
+| `/health` | Check daemon connectivity |
+| `/clear` | Clear the message stream |
+| `/history` | Toggle history view |
+
+## Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Submit task |
+| `Tab` | Cycle between panels |
+| `Ctrl+C` | Quit |
+
+## Live Events
+
+The TUI subscribes to the daemon's SSE event stream, so you see everything in real time:
+
+- Agent status changes (`idle` → `running` → `completed`)
+- Tool invocations with arguments and results
+- Token usage updates per agent
+- Swarm completion events
+
+<Aside type="tip">
+  The TUI works best in a terminal that supports true color and at least 80×24 characters. Resize your terminal if panels feel cramped.
+</Aside>

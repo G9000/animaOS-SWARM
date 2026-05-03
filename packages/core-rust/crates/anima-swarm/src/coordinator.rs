@@ -34,6 +34,9 @@ pub type CoordinatorInboxFn =
 pub type CoordinatorParticipantsFn =
     dyn Fn() -> CoordinatorFuture<Result<Vec<CoordinatorParticipant>, String>> + Send + Sync;
 
+pub type CoordinatorMessageEventFn =
+    dyn Fn(String, AgentMessage) -> CoordinatorFuture<()> + Send + Sync;
+
 pub type CoordinatorDelegateFn =
     dyn Fn(String, String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
 
@@ -202,9 +205,11 @@ pub struct SwarmCoordinator {
 }
 
 struct CoordinatorInner {
+    swarm_id: String,
     config: SwarmConfig,
     state: Mutex<SwarmState>,
     message_bus: Arc<Mutex<MessageBus>>,
+    message_events: Option<Arc<CoordinatorMessageEventFn>>,
     strategy: Arc<CoordinatorStrategyFn>,
     agent_factory: Arc<CoordinatorAgentFactoryFn>,
     agents: Mutex<HashMap<String, CoordinatorManagedAgent>>,
@@ -259,9 +264,18 @@ impl SwarmCoordinator {
         strategy: Arc<CoordinatorStrategyFn>,
         agent_factory: Arc<CoordinatorAgentFactoryFn>,
     ) -> Self {
+        Self::with_hooks_and_message_events(config, strategy, agent_factory, None)
+    }
+
+    pub fn with_hooks_and_message_events(
+        config: SwarmConfig,
+        strategy: Arc<CoordinatorStrategyFn>,
+        agent_factory: Arc<CoordinatorAgentFactoryFn>,
+        message_events: Option<Arc<CoordinatorMessageEventFn>>,
+    ) -> Self {
         let id = next_id("swarm", &NEXT_COORDINATOR_ID);
         let state = SwarmState {
-            id,
+            id: id.clone(),
             status: SwarmStatus::Idle,
             agent_ids: Vec::new(),
             messages: Vec::new(),
@@ -273,9 +287,11 @@ impl SwarmCoordinator {
 
         Self {
             inner: Arc::new(CoordinatorInner {
+                swarm_id: id,
                 config,
                 state: Mutex::new(state),
                 message_bus: Arc::new(Mutex::new(MessageBus::new())),
+                message_events,
                 strategy,
                 agent_factory,
                 agents: Mutex::new(HashMap::new()),
@@ -756,19 +772,28 @@ impl SwarmCoordinator {
         liveness: Arc<CoordinatorAgentLiveness>,
     ) -> Arc<CoordinatorSendFn> {
         let message_bus = self.inner.message_bus.clone();
+        let message_events = self.inner.message_events.clone();
+        let swarm_id = self.inner.swarm_id.clone();
         let from_agent_id = from_agent_id.to_string();
         Arc::new(move |to_agent_id: String, content: Content| {
             let message_bus = message_bus.clone();
+            let message_events = message_events.clone();
+            let swarm_id = swarm_id.clone();
             let from_agent_id = from_agent_id.clone();
             let liveness = liveness.clone();
             Box::pin(async move {
                 if !liveness.is_active() {
                     return Err(inactive_agent_error(&from_agent_id));
                 }
-                message_bus
-                    .lock()
-                    .expect("message bus mutex should not be poisoned")
-                    .send(&from_agent_id, &to_agent_id, content);
+                let message = {
+                    let mut message_bus = message_bus
+                        .lock()
+                        .expect("message bus mutex should not be poisoned");
+                    message_bus.send_message(&from_agent_id, &to_agent_id, content)
+                };
+                if let Some(message_events) = message_events {
+                    message_events(swarm_id, message).await;
+                }
                 Ok(())
             })
         })
@@ -780,19 +805,28 @@ impl SwarmCoordinator {
         liveness: Arc<CoordinatorAgentLiveness>,
     ) -> Arc<CoordinatorBroadcastFn> {
         let message_bus = self.inner.message_bus.clone();
+        let message_events = self.inner.message_events.clone();
+        let swarm_id = self.inner.swarm_id.clone();
         let from_agent_id = from_agent_id.to_string();
         Arc::new(move |content: Content| {
             let message_bus = message_bus.clone();
+            let message_events = message_events.clone();
+            let swarm_id = swarm_id.clone();
             let from_agent_id = from_agent_id.clone();
             let liveness = liveness.clone();
             Box::pin(async move {
                 if !liveness.is_active() {
                     return Err(inactive_agent_error(&from_agent_id));
                 }
-                message_bus
-                    .lock()
-                    .expect("message bus mutex should not be poisoned")
-                    .broadcast(&from_agent_id, content);
+                let message = {
+                    let mut message_bus = message_bus
+                        .lock()
+                        .expect("message bus mutex should not be poisoned");
+                    message_bus.broadcast_message(&from_agent_id, content)
+                };
+                if let Some(message_events) = message_events {
+                    message_events(swarm_id, message).await;
+                }
                 Ok(())
             })
         })

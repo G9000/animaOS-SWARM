@@ -1,0 +1,244 @@
+---
+title: Development Workflow
+description: How to develop in the animaOS monorepo
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Prerequisites
+
+- [Bun](https://bun.sh) (latest)
+- [Rust](https://rustup.rs) (stable)
+- [cargo-nextest](https://nexte.st) (optional but recommended)
+- [Git](https://git-scm.com)
+
+## First Setup
+
+<Steps>
+
+1. Clone the repo
+
+   ```bash
+   git clone https://github.com/G9000/animaOS-SWARM.git
+   cd animaOS-SWARM
+   ```
+
+2. Install Node dependencies
+
+   ```bash
+   bun install
+   ```
+
+3. Verify Rust toolchain
+
+   ```bash
+   cargo --version
+   rustc --version
+   ```
+
+4. Install cargo-nextest (optional)
+
+   ```bash
+   cargo install cargo-nextest --locked
+   ```
+
+</Steps>
+
+## Running the Dev Environment
+
+The workspace dev launcher (`tools/workspace-dev`) starts the selected host plus dependent processes.
+
+```bash
+# Start Rust host + web UI + docs + contributor docs + playground
+bun dev --host rust
+
+# Start only the Rust daemon
+bun x nx run rust-daemon:dev
+
+# Start only the public docs site
+bun x nx run @animaOS-SWARM/docs:dev
+
+# Start only the contributor docs site
+bun x nx run @animaOS-SWARM/contributor-docs:dev
+```
+
+Supported host keys: `rust`, `elixir`, `python`. Only `rust` is production-ready today.
+
+### Port Map
+
+| Service | Port | Description |
+|---------|------|-------------|
+| Rust daemon | `8080` | HTTP API + SSE |
+| Web UI | `3000` | React web app |
+| Playground | `3001` | Interactive playground |
+| Public docs | `4321` | User-facing docs |
+| Contributor docs | `4322` | This site |
+
+<Aside type="tip">
+  The contributor docs run on port `4322` by default, so they won't conflict with the public docs on `4321`.
+</Aside>
+
+## IDE Setup
+
+### VS Code
+
+Recommended extensions:
+- `rust-lang.rust-analyzer` — Rust language server
+- `dbaeumer.vscode-eslint` — TypeScript linting
+- `esbenp.prettier-vscode` — Code formatting
+- `astro-build.astro-vscode` — Astro/MDX support
+
+Workspace settings in `.vscode/settings.json`:
+
+```json
+{
+  "rust-analyzer.cargo.features": "all",
+  "editor.formatOnSave": true,
+  "editor.defaultFormatter": "esbenp.prettier-vscode"
+}
+```
+
+### Rust-Analyzer
+
+The Rust workspace is in `packages/core-rust/`. Rust-Analyzer should auto-detect the `Cargo.toml`. If not, add this to `.vscode/settings.json`:
+
+```json
+{
+  "rust-analyzer.linkedProjects": [
+    "packages/core-rust/Cargo.toml",
+    "hosts/rust-daemon/Cargo.toml"
+  ]
+}
+```
+
+## Nx Commands
+
+Always prefer `bun x nx` over direct tool commands when an Nx target exists.
+
+### Rust
+
+```bash
+# Build the Rust daemon
+bun x nx run rust-daemon:build
+
+# Run Rust daemon tests
+bun x nx run rust-daemon:test --skipNxCache
+
+# Run all Rust core tests
+cargo test --workspace
+
+# Run with nextest
+cargo nextest run --workspace
+```
+
+### TypeScript
+
+```bash
+# Build a package
+bun x nx build @animaOS-SWARM/sdk
+
+# Test a package
+bun x nx test @animaOS-SWARM/core
+
+# Type check
+bun x nx typecheck @animaOS-SWARM/sdk
+
+# Lint
+bun x nx lint @animaOS-SWARM/cli
+
+# Run all TypeScript tests
+bun x nx run-many -t test
+```
+
+### Docs
+
+```bash
+# Build public docs
+bun x nx run @animaOS-SWARM/docs:build --skipNxCache
+
+# Build contributor docs
+bun x nx run @animaOS-SWARM/contributor-docs:build --skipNxCache
+```
+
+## Project Discovery
+
+```bash
+# List all projects
+bun x nx show projects
+
+# Show project details
+bun x nx show project @animaOS-SWARM/docs
+
+# Show project graph
+bun x nx graph
+
+# Show affected projects (compared to main)
+bun x nx show projects --affected
+```
+
+## Adding a New Package
+
+1. Create the directory under `packages/` or `hosts/`
+2. Add a `project.json` with `name`, `sourceRoot`, and `targets`
+3. Nx will auto-discover it on the next command
+
+Example `project.json`:
+
+```json
+{
+  "name": "@animaOS-SWARM/my-package",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/my-package/src",
+  "projectType": "library",
+  "targets": {
+    "build": {
+      "executor": "nx:run-commands",
+      "options": { "command": "tsc -p packages/my-package/tsconfig.json" }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "options": { "command": "vitest run packages/my-package" }
+    }
+  }
+}
+```
+
+## Git Workflow
+
+- Main branch: `main`
+- Feature branches: `feature/description`
+- Run affected tests before pushing:
+  ```bash
+  bun x nx affected:test
+  ```
+
+## Debugging
+
+### Rust
+
+Use `rust-lldb` or `rust-gdb`:
+
+```bash
+cargo build -p rust-daemon
+rust-lldb target/debug/anima-daemon
+```
+
+Set breakpoints in the source and run.
+
+### TypeScript
+
+Use the VS Code debugger with the built-in Node/Bun launch config:
+
+```json
+{
+  "type": "node",
+  "request": "launch",
+  "name": "Debug CLI",
+  "runtimeExecutable": "bun",
+  "args": ["x", "nx", "run", "@animaOS-SWARM/cli:dev"]
+}
+```

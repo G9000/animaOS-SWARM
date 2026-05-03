@@ -1,0 +1,283 @@
+---
+title: Traits
+description: ModelAdapter, Provider, Evaluator, and DatabaseAdapter
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`anima-core` defines four traits that form the boundary between the engine and the host. Every trait is `Send + Sync` and uses `async_trait` so hosts can implement them with async I/O (HTTP requests, database queries, filesystem reads) without the core knowing anything about it.
+
+## ModelAdapter
+
+**File:** `packages/core-rust/crates/anima-core/src/model.rs`
+
+```rust
+#[async_trait]
+pub trait ModelAdapter: Send + Sync {
+    fn provider(&self) -> &str;
+
+    async fn generate(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String>;
+}
+```
+
+`ModelAdapter` is the **only required** dependency. It is the bridge to any LLM provider.
+
+### Request
+
+```rust
+pub struct ModelGenerateRequest {
+    pub system: String,              // the fully assembled system prompt
+    pub messages: Vec<Message>,      // conversation history
+    pub temperature: Option<f64>,    // from AgentSettings
+    pub max_tokens: Option<u32>,     // from AgentSettings
+}
+```
+
+### Response
+
+```rust
+pub struct ModelGenerateResponse {
+    pub content: Content,                    // generated text + metadata
+    pub tool_calls: Option<Vec<ToolCall>>,   // only present when stop_reason = ToolCall
+    pub usage: TokenUsage,                   // prompt + completion tokens
+    pub stop_reason: ModelStopReason,        // End | ToolCall | MaxTokens
+}
+```
+
+### Implementing a Custom Adapter
+
+```rust
+use anima_core::{ModelAdapter, ModelGenerateRequest, ModelGenerateResponse};
+use async_trait::async_trait;
+
+pub struct OllamaAdapter {
+    base_url: String,
+}
+
+#[async_trait]
+impl ModelAdapter for OllamaAdapter {
+    fn provider(&self) -> &str { "ollama" }
+
+    async fn generate(
+        &self,
+        _config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        // 1. Serialize request.messages into Ollama's chat format
+        // 2. POST to /api/chat
+        // 3. Parse response JSON
+        // 4. Map stop reason to ModelStopReason
+        // 5. Return ModelGenerateResponse
+        todo!()
+    }
+}
+```
+
+The host (`rust-daemon`) provides adapters for OpenAI-compatible APIs, Anthropic, and Ollama. The core does not care which one is used.
+
+## Provider
+
+**File:** `packages/core-rust/crates/anima-core/src/components.rs` (lines 8–23)
+
+```rust
+#[async_trait]
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    async fn get(
+        &self,
+        runtime: &AgentRuntime,
+        message: &Message,
+    ) -> Result<ProviderResult, String>;
+}
+```
+
+Providers inject **dynamic context** into the system prompt before every model generation. They are called in registration order and their results are concatenated.
+
+### ProviderResult
+
+```rust
+pub struct ProviderResult {
+    pub text: String,
+    pub metadata: Option<BTreeMap<String, DataValue>>,
+}
+```
+
+### Built-in Providers
+
+The `rust-daemon` host registers providers automatically based on agent configuration:
+
+| Provider | What It Injects |
+|----------|----------------|
+| `TimeProvider` | Current local time and date |
+| `MemoryProvider` | Relevant memories from `anima-memory` via `MemoryManager::recall()` |
+| `UserInfoProvider` | User metadata (name, preferences, etc.) |
+
+### Why Providers Are Traits
+
+Providers need async I/O (database queries, HTTP calls to a memory service, filesystem reads). By making them a trait, the core stays zero-I/O while hosts can inject any data source.
+
+### Registration
+
+```rust
+runtime.register_provider(Arc::new(TimeProvider::new()));
+runtime.register_provider(Arc::new(MemoryProvider::new(memory_mgr)));
+```
+
+If any provider returns `Err`, the entire task fails with `"provider context failed"`.
+
+## Evaluator
+
+**File:** `packages/core-rust/crates/anima-core/src/components.rs` (lines 25–44)
+
+```rust
+#[async_trait]
+pub trait Evaluator: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    async fn validate(&self, runtime: &AgentRuntime, message: &Message) -> Result<bool, String>;
+    async fn evaluate(
+        &self,
+        runtime: &AgentRuntime,
+        message: &Message,
+        response: &Content,
+    ) -> Result<EvaluatorResult, String>;
+}
+```
+
+Evaluators are **post-processing hooks** that run after a model produces a final response (not after tool calls). They can validate, score, transform, or trigger follow-up actions.
+
+### Two-Phase Design
+
+1. **`validate`** — A lightweight check. Return `false` to skip this evaluator for this message. Use this to avoid expensive work when the evaluator is not relevant.
+2. **`evaluate`** — The main work. Runs only if `validate` returned `true` (or if the evaluator chooses to run unconditionally).
+
+### EvaluatorResult
+
+```rust
+pub struct EvaluatorResult {
+    pub score: Option<f64>,              // 0.0–1.0 quality score
+    pub feedback: Option<String>,        // human-readable feedback
+    pub follow_up: Option<Content>,      // trigger a follow-up task
+    pub metadata: Option<BTreeMap<String, DataValue>>,
+}
+```
+
+If any evaluator returns `Err`, the task fails with `"evaluator execution failed"`.
+
+### Example Use Cases
+
+| Evaluator | Purpose |
+|-----------|---------|
+| `SafetyEvaluator` | Check response against safety policy; reject if flagged |
+| `QualityEvaluator` | Score response relevance; log score for analytics |
+| `MemoryEvaluator` | Extract facts from response and store via memory provider |
+| `FollowUpEvaluator` | Detect incomplete answers; queue follow-up task |
+
+## DatabaseAdapter
+
+**File:** `packages/core-rust/crates/anima-core/src/persistence.rs` (lines 68–79)
+
+```rust
+#[async_trait]
+pub trait DatabaseAdapter: Send + Sync {
+    async fn write_step(&self, step: &Step) -> PersistenceResult<()>;
+
+    async fn get_step_by_idempotency_key(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> PersistenceResult<Option<Step>>;
+
+    async fn list_agent_steps(&self, agent_id: &str) -> PersistenceResult<Vec<Step>>;
+}
+```
+
+This trait is **optional**. If registered via `runtime.set_database(...)`, the runtime persists every tool execution as a `Step` record.
+
+### Step
+
+```rust
+pub struct Step {
+    pub id: String,
+    pub agent_id: String,
+    pub step_index: i32,              // monotonic index within the agent
+    pub idempotency_key: String,      // {agent_id}:{step_index}:{tool_call.id}
+    pub step_type: String,            // "tool" (future: "think", "plan")
+    pub status: StepStatus,           // Pending | Done | Failed
+    pub input: Option<serde_json::Value>,   // tool name + args
+    pub output: Option<serde_json::Value>,  // result or error
+}
+```
+
+### PersistenceError
+
+```rust
+pub enum PersistenceError {
+    Connection(String),
+    Write(String),
+    Query(String),
+}
+```
+
+Persistence failures are **non-fatal**. If `write_step` returns an error, the runtime records an `agent:message` event with the error text and continues. The task does not fail because the database is down.
+
+### Test Adapter
+
+The crate includes an in-memory adapter for tests:
+
+```rust
+#[cfg(test)]
+pub mod in_memory {
+    pub struct InMemoryAdapter {
+        steps: Arc<Mutex<Vec<Step>>>,
+    }
+}
+```
+
+## Host vs Core Boundary
+
+```
+┌─────────────────────────────────────────────┐
+│                    HOST                       │
+│  ┌─────────┐  ┌─────────┐  ┌─────────────┐  │
+│  │ OpenAI  │  │  SQLite │  │   SSE Bus   │  │
+│  │ Adapter │  │  Driver │  │   (events)  │  │
+│  └────┬────┘  └────┬────┘  └──────┬──────┘  │
+│       │            │              │         │
+│       ▼            ▼              ▼         │
+│  ┌─────────────────────────────────────┐    │
+│  │  impl ModelAdapter for OpenAIAdapter│    │
+│  │  impl DatabaseAdapter for SqliteDb  │    │
+│  │  event_listener closure ──▶ SSE     │    │
+│  └─────────────────────────────────────┘    │
+│                    │                        │
+└────────────────────┼────────────────────────┘
+                     │
+        ┌────────────┴────────────┐
+        │      TRAIT BOUNDARY      │
+        └────────────┬────────────┘
+                     │
+┌────────────────────┼────────────────────────┐
+│                    ▼                        │
+│  ┌─────────────────────────────────────┐    │
+│  │         AgentRuntime                │    │
+│  │  • calls model_adapter.generate()   │    │
+│  │  • calls db.write_step()            │    │
+│  │  • calls provider.get()             │    │
+│  │  • calls evaluator.evaluate()       │    │
+│  │  • fires event_listener(event)      │    │
+│  └─────────────────────────────────────┘    │
+│                    CORE                     │
+└─────────────────────────────────────────────┘
+```
+
+This separation is the entire reason `anima-core` is host-agnostic. The core knows *what* to do (run the task loop) but not *how* (which LLM, which database, which event transport).

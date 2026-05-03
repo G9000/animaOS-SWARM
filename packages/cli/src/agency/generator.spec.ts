@@ -1,7 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createAdapter } from './generator.js';
+import { createAdapter, generateAgentSeeds, generateAgentTeam } from './generator.js';
+
+const originalFetch = globalThis.fetch;
 
 const SUPPORTED_CREATE_PROVIDERS = [
+  'deterministic',
   'openai',
   'anthropic',
   'google',
@@ -22,7 +25,12 @@ const SUPPORTED_CREATE_PROVIDERS = [
 
 describe('createAdapter', () => {
   afterEach(() => {
-    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    if (originalFetch) {
+      globalThis.fetch = originalFetch;
+    } else {
+      Reflect.deleteProperty(globalThis, 'fetch');
+    }
     delete process.env.GEMINI_API_KEY;
     delete process.env.GOOGLE_BASE_URL;
   });
@@ -35,6 +43,54 @@ describe('createAdapter', () => {
     expect(() => createAdapter('unsupported-provider')).toThrow(
       'Unsupported provider: unsupported-provider'
     );
+  });
+
+  it('generates a deterministic agency without provider credentials', async () => {
+    const adapter = createAdapter('deterministic');
+
+    const generated = await generateAgentTeam({
+      adapter,
+      model: 'local-model',
+      agencyName: 'Medicine Lab',
+      agencyDescription: 'testing a medicine',
+      teamSize: 3,
+    });
+
+    expect(generated.agents).toHaveLength(3);
+    expect(generated.agents[0]).toMatchObject({
+      role: 'orchestrator',
+      model: 'local-model',
+    });
+    expect(generated.agents[1]?.system).toContain('Challenge assumptions');
+    expect(generated.mission).toContain('Medicine Lab');
+  });
+
+  it('generates deterministic seed memories without provider credentials', async () => {
+    const adapter = createAdapter('deterministic');
+    const seeds = await generateAgentSeeds({
+      adapter,
+      model: 'local-model',
+      agencyName: 'Medicine Lab',
+      agencyDescription: 'testing a medicine',
+      agents: [
+        {
+          name: 'Avery',
+          bio: 'Lead',
+          system: 'Coordinate work',
+        },
+      ],
+    });
+
+    expect(seeds).toEqual([
+      expect.objectContaining({
+        agentName: 'Avery',
+        entries: expect.arrayContaining([
+          expect.objectContaining({ type: 'fact' }),
+          expect.objectContaining({ type: 'observation' }),
+          expect.objectContaining({ type: 'reflection' }),
+        ]),
+      }),
+    ]);
   });
 
   it('uses gemini aliases and google generateContent for create flow', async () => {
@@ -65,7 +121,11 @@ describe('createAdapter', () => {
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       )
     );
-    vi.stubGlobal('fetch', fetchMock);
+    Object.defineProperty(globalThis, 'fetch', {
+      value: fetchMock,
+      configurable: true,
+      writable: true,
+    });
 
     const adapter = createAdapter('gemini');
     const result = await adapter.generate(

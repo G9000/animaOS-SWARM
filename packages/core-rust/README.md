@@ -31,3 +31,7 @@ cargo test -p anima-core
 cargo test -p anima-memory
 cargo test -p anima-swarm
 ```
+
+## Architecture
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for detailed contributor documentation on the runtime, memory system, swarm coordination, and design rules.

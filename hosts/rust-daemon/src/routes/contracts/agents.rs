@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anima_core::{
-    AgentConfig, AgentRuntimeSnapshot, AgentSettings, AgentState, DataValue, PluginDescriptor,
-    ToolDescriptor, ToolExample,
+    AgentConfig, AgentRuntimeSnapshot, AgentSettings, AgentState, DataValue, Message, MessageRole,
+    PluginDescriptor, ToolDescriptor, ToolExample,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,7 +10,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::shared::{
     data_value_to_json, json_to_data_value, number_value, parse_usize, required_string, u32_value,
-    u64_value, TaskResultResponse, TokenUsageResponse,
+    u64_value, ContentResponse, TaskResultResponse, TokenUsageResponse,
 };
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -83,8 +83,20 @@ pub(crate) struct AgentStateResponse {
 pub(crate) struct AgentRuntimeSnapshotResponse {
     pub(crate) state: AgentStateResponse,
     pub(crate) message_count: usize,
+    pub(crate) messages: Vec<AgentMessageResponse>,
     pub(crate) event_count: usize,
     pub(crate) last_task: Option<TaskResultResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentMessageResponse {
+    pub(crate) id: String,
+    pub(crate) agent_id: String,
+    pub(crate) room_id: String,
+    pub(crate) content: ContentResponse,
+    pub(crate) role: String,
+    pub(crate) created_at: u128,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -438,8 +450,35 @@ impl From<&AgentRuntimeSnapshot> for AgentRuntimeSnapshotResponse {
         Self {
             state: AgentStateResponse::from(&value.state),
             message_count: value.message_count,
+            messages: value
+                .messages
+                .iter()
+                .map(AgentMessageResponse::from)
+                .collect(),
             event_count: value.event_count,
             last_task: value.last_task.as_ref().map(TaskResultResponse::from),
         }
+    }
+}
+
+impl From<&Message> for AgentMessageResponse {
+    fn from(value: &Message) -> Self {
+        Self {
+            id: value.id.clone(),
+            agent_id: value.agent_id.clone(),
+            room_id: value.room_id.clone(),
+            content: ContentResponse::from(&value.content),
+            role: message_role_to_str(value.role).to_string(),
+            created_at: value.created_at,
+        }
+    }
+}
+
+fn message_role_to_str(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::System => "system",
+        MessageRole::Tool => "tool",
     }
 }

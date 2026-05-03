@@ -1,0 +1,115 @@
+---
+title: Contributor Overview
+description: How to navigate and contribute to the animaOS monorepo
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded. If you spot something missing or unclear, open an issue or PR.
+</Aside>
+
+This site is for **contributors and maintainers** of animaOS. If you are looking for user-facing SDK, CLI, or TUI documentation, see the [public docs site](https://github.com/G9000/animaOS-SWARM/tree/main/apps/docs).
+
+## What is animaOS?
+
+animaOS is a host-agnostic agent runtime. The architecture has three layers:
+
+1. **Core** — Reusable engine crates (Rust) and type contracts (TypeScript). Zero I/O.
+2. **Hosts** — Runnable backend processes that wrap core and expose it over HTTP/SSE.
+3. **Surfaces** — SDK, CLI, TUI, and web UI that talk to any compatible host.
+
+## Design Philosophy
+
+- **Core defines behavior, hosts provide reality.** The core has zero I/O dependencies. All external concerns (HTTP, databases, filesystem) are abstracted behind traits.
+- **Host-agnostic.** The SDK, CLI, and TUI work with any host implementing the HTTP contract. The Rust daemon is the reference implementation.
+- **Memory-first.** Agents have long-term memory with BM25 + vector + temporal + relationship search. This is not an afterthought — it is a first-class primitive.
+- **Composable.** Agents are built from tools, providers, evaluators, and plugins. Swarms are built from agents + strategies.
+
+## Repo Boundaries
+
+| Directory | Purpose | Language |
+|-----------|---------|----------|
+| `packages/core-rust/` | Rust engine: `anima-core`, `anima-memory`, `anima-swarm` | Rust |
+| `packages/core-ts/` | TypeScript contracts: `@animaOS-SWARM/core` | TypeScript |
+| `packages/sdk/` | TypeScript SDK: `@animaOS-SWARM/sdk` | TypeScript |
+| `packages/cli/` | Command-line interface: `@animaOS-SWARM/cli` | TypeScript |
+| `hosts/rust-daemon/` | Production-ready Rust host (Axum HTTP/SSE) | Rust |
+| `hosts/elixir-phoenix/` | Placeholder Elixir host | Elixir |
+| `hosts/python-service/` | Placeholder Python host | Python |
+| `apps/docs/` | Public user-facing documentation site | Astro |
+| `apps/contributor-docs/` | This site — contributor documentation | Astro |
+| `apps/web/` | Web UI (if present) | TypeScript |
+| `tools/workspace-dev/` | Dev launcher: `bun dev --host rust` | TypeScript |
+
+## Key Rules
+
+- **Do not move reusable code into `hosts/`.** If multiple hosts could use it, it belongs in `packages/`.
+- **Do not make core depend on HTTP frameworks or DB drivers.** All external concerns are traits.
+- **Do not remove or retarget `apps/server`.** It is retained during restructuring even though the long-term backend host boundary is `hosts/*`.
+- **Hosts are swappable.** The SDK, CLI, and TUI work with any host implementing the HTTP contract.
+
+## Getting Started
+
+<Steps>
+
+1. **Install prerequisites**
+
+   - [Bun](https://bun.sh) (latest)
+   - [Rust](https://rustup.rs) (stable)
+   - [cargo-nextest](https://nexte.st) (optional but recommended)
+
+2. **Clone and install**
+
+   ```bash
+   git clone https://github.com/G9000/animaOS-SWARM.git
+   cd animaOS-SWARM
+   bun install
+   ```
+
+3. **Verify toolchains**
+
+   ```bash
+   cargo --version
+   rustc --version
+   bun --version
+   ```
+
+4. **Start the dev environment**
+
+   ```bash
+   bun dev --host rust
+   ```
+
+   This starts the Rust daemon, web UI, playground, public docs, and contributor docs.
+
+5. **Run tests**
+
+   ```bash
+   # Rust
+   cargo test --workspace
+
+   # TypeScript
+   bun x nx run-many -t test
+   ```
+
+</Steps>
+
+## Contribution Workflow
+
+1. **Open an issue first** for large changes (new crates, breaking API changes, new hosts).
+2. **Branch from `main`** — `git checkout -b feature/description`.
+3. **Write tests** for Rust core changes and TypeScript package changes.
+4. **Run affected tests** before pushing:
+   ```bash
+   bun x nx affected:test
+   ```
+5. **Update docs** if you change public APIs or architecture.
+6. **PR description** should reference the issue and explain the change.
+
+## Code Review
+
+- All PRs require at least one review.
+- CI runs `cargo test --workspace`, `bun x nx affected:test`, and docs builds.
+- Rust changes: run `bun x nx run rust-daemon:test --skipNxCache`.
+- On Windows, if the binary is locked: `CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache`.

@@ -28,11 +28,35 @@ impl MessageBus {
     }
 
     pub fn send(&mut self, from: &str, to: &str, content: Content) {
-        <Self as SwarmMessageBus>::send(self, from, to, content);
+        self.send_message(from, to, content);
     }
 
     pub fn broadcast(&mut self, from: &str, content: Content) {
-        <Self as SwarmMessageBus>::broadcast(self, from, content);
+        self.broadcast_message(from, content);
+    }
+
+    pub fn send_message(&mut self, from: &str, to: &str, content: Content) -> AgentMessage {
+        let message = self.next_message(from, to, content);
+        self.all_messages.push(message.clone());
+
+        if let Some(inbox) = self.inboxes.get_mut(to) {
+            inbox.push(message.clone());
+        }
+
+        message
+    }
+
+    pub fn broadcast_message(&mut self, from: &str, content: Content) -> AgentMessage {
+        let message = self.next_message(from, "broadcast", content);
+        self.all_messages.push(message.clone());
+
+        for (agent_id, inbox) in &mut self.inboxes {
+            if agent_id != from {
+                inbox.push(message.clone());
+            }
+        }
+
+        message
     }
 
     pub fn get_messages(&self, agent_id: &str) -> Vec<AgentMessage> {
@@ -67,23 +91,11 @@ impl MessageBus {
 
 impl SwarmMessageBus for MessageBus {
     fn send(&mut self, from: &str, to: &str, content: Content) {
-        let message = self.next_message(from, to, content);
-        self.all_messages.push(message.clone());
-
-        if let Some(inbox) = self.inboxes.get_mut(to) {
-            inbox.push(message);
-        }
+        self.send_message(from, to, content);
     }
 
     fn broadcast(&mut self, from: &str, content: Content) {
-        let message = self.next_message(from, "broadcast", content);
-        self.all_messages.push(message.clone());
-
-        for (agent_id, inbox) in &mut self.inboxes {
-            if agent_id != from {
-                inbox.push(message.clone());
-            }
-        }
+        self.broadcast_message(from, content);
     }
 
     fn get_messages(&self, agent_id: &str) -> Vec<AgentMessage> {

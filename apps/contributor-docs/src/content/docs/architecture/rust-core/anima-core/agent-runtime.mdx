@@ -1,0 +1,254 @@
+---
+title: AgentRuntime
+description: The agent execution loop, state machine, and message flow
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`AgentRuntime` is the stateful executor at the center of `anima-core`. It is defined in `packages/core-rust/crates/anima-core/src/runtime.rs` (~700 lines) and is the only struct that orchestrates the full task loop.
+
+## Creating a Runtime
+
+```rust
+use anima_core::{AgentConfig, AgentRuntime, ModelAdapter};
+use std::sync::Arc;
+
+let config = AgentConfig {
+    name: "researcher".into(),
+    model: "gpt-4".into(),
+    bio: Some("You are a meticulous research assistant.".into()),
+    tools: Some(vec![search_tool_descriptor]),
+    ..Default::default()
+};
+
+let mut runtime = AgentRuntime::new(config, Arc::new(my_model_adapter));
+runtime.init();                       // emits AgentSpawned event
+runtime.register_provider(Arc::new(my_provider));
+runtime.register_evaluator(Arc::new(my_evaluator));
+runtime.set_database(Arc::new(my_db));
+```
+
+`AgentRuntime::new` assigns a unique agent ID (atomic counter, prefixed `agent-N`), sets status to `Idle`, and stores the config and model adapter. No network calls happen during construction.
+
+## Internal State
+
+```rust
+pub struct AgentRuntime {
+    state: AgentState,                           // id, name, status, config, tokens
+    messages: Vec<Message>,                      // full conversation history
+    last_task: Option<TaskResult<Content>>,      // result of the most recent run()
+    events: Vec<EngineEvent>,                    // every event ever emitted
+    event_listener: Option<Arc<dyn Fn(EngineEvent) + Send + Sync>>,
+    providers: Vec<Arc<dyn Provider>>,           // context injectors
+    evaluators: Vec<Arc<dyn Evaluator>>,         // post-response hooks
+    model_adapter: Arc<dyn ModelAdapter>,        // LLM bridge
+    db: Option<Arc<dyn DatabaseAdapter>>,        // optional step persistence
+    step_counter: u64,                           // monotonic step index
+}
+```
+
+| Field | Purpose |
+|-------|---------|
+| `state` | The public face of the agent. Hosts query this for dashboards, health checks, or snapshots. |
+| `messages` | Every `User`, `Assistant`, and `Tool` message the runtime has ever seen. Grows unbounded within a session. |
+| `events` | Every `EngineEvent` emitted. Stored in-memory unless the host listens and persists them. |
+| `event_listener` | Optional callback fired synchronously on every event. The `rust-daemon` host uses this to push events over SSE. |
+| `providers` | Called before every model generation to inject dynamic context (time, memories, user info). |
+| `evaluators` | Called after a final response to validate, score, or trigger follow-up actions. |
+| `model_adapter` | The only required dependency. Converts `ModelGenerateRequest` into `ModelGenerateResponse`. |
+| `db` | Optional. If set, tool execution steps are written as `Step` records with idempotency keys. |
+| `step_counter` | Monotonically increasing counter used to assign stable indices to tool-call steps. |
+
+## The Task Loop
+
+The core of the runtime is `run_with_tools`, an async method that drives the entire lifecycle of a single task:
+
+```
+run_with_tools(input, execute_tool)
+│
+├─► 1. mark_running() ──▶ status = Running
+│      emit agent:started + task:started
+│
+├─► 2. Record user message in new room
+│      emit agent:message
+│
+├─► 3. Build provider context
+│      Call each registered Provider::get()
+│      Concatenate results into context_parts
+│
+├─► 4. Build system prompt
+│      Assemble bio, lore, adjectives, topics,
+│      knowledge, style, base system text,
+│      and provider context_parts
+│
+├─► 5. Call ModelAdapter::generate(request)
+│      request = { system, messages, temperature, max_tokens }
+│
+├─► 6. Inspect ModelStopReason
+│      ├─ End / MaxTokens ──▶ run evaluators ──▶ mark_completed()
+│      │
+│      └─ ToolCall ──▶ check iteration limit (max 8)
+│            ├─ exceeded ──▶ mark_failed("tool iteration limit exceeded")
+│            └─ ok ──▶ execute each tool in parallel (join_all)
+│                  ├─ write pending Step records to db
+│                  ├─ emit tool:before for each
+│                  ├─ call execute_tool(state, message, tool_call)
+│                  ├─ write done/failed Step records to db
+│                  ├─ emit tool:after for each
+│                  ├─ append tool results to conversation
+│                  └─ LOOP back to step 5
+│
+└─► Return TaskResult<Content>
+```
+
+### Step-by-Step Breakdown
+
+**1. Mark Running**
+Status becomes `AgentStatus::Running`. Two events fire: `agent:started` and `task:started`.
+
+**2. Record User Message**
+A new `room_id` is generated (atomic counter, prefixed `room-N`). The user's `Content` is stored as a `Message` with `role = User`. This message is the anchor for the entire conversation turn.
+
+**3. Build Provider Context**
+Every registered `Provider` is called concurrently-ish (sequential `await` in a loop). Each returns a `ProviderResult` containing text and optional metadata. Results are formatted as `[provider_name]: {text}` and collected into `context_parts`.
+
+If any provider fails, the entire task fails immediately with `"provider context failed"`.
+
+**4. Build System Prompt**
+The system prompt is assembled from `AgentConfig` fields in a fixed order:
+
+1. `bio` → "## Who You Are"
+2. `lore` → "## Your Backstory"
+3. `adjectives` → "## Your Personality"
+4. `topics` → "## Your Expertise"
+5. `knowledge` → "## What You Know" (bullet list)
+6. `style` → "## How You Communicate"
+7. `system` (fallback: "You are a helpful task agent.")
+8. Provider `context_parts` → "## Context"
+
+All sections are joined with `\n\n`. This is deterministic and testable.
+
+**5. Model Generation**
+A `ModelGenerateRequest` is built containing:
+- `system`: the assembled prompt
+- `messages`: the conversation history (including the latest user message and any tool results from prior iterations)
+- `temperature` and `max_tokens` from `AgentSettings` if present
+
+The `ModelAdapter` is called. On success, token usage is accumulated into `state.token_usage`.
+
+**6. Handle Stop Reason**
+
+| `ModelStopReason` | Action |
+|-------------------|--------|
+| `End` | Normal completion. Run evaluators, mark completed. |
+| `MaxTokens` | Same as `End`. The response is treated as complete. |
+| `ToolCall` | Enter the tool loop (see below). |
+
+If the model adapter returns an error, the task fails with `"model generation failed"`.
+
+## Tool Execution Loop
+
+When the model requests tools, the runtime enters a sub-loop:
+
+```
+iterations = 0
+
+LOOP:
+  iterations += 1
+  if iterations > MAX_TOOL_ITERATIONS (8):
+      fail("tool iteration limit exceeded")
+
+  1. Record assistant message with tool_call metadata
+  2. Assign step indices (monotonic, based on step_counter)
+  3. Write pending Step records to db
+  4. Emit tool:before events
+  5. Execute all tool calls in parallel via join_all
+  6. Write done/failed Step records to db
+  7. Emit tool:after events
+  8. Append each tool result as a Tool message to conversation
+  9. Call model again with updated conversation
+  10. Check stop reason ──▶ loop or exit
+```
+
+### Step Persistence
+
+If a `DatabaseAdapter` is registered, every tool call produces **two** `Step` records:
+
+1. **Pending** — written before execution. Contains the tool name and arguments.
+2. **Done** or **Failed** — written after execution. Contains the result, status, and error (if any).
+
+The idempotency key is `{agent_id}:{step_index}:{tool_call.id}`. This lets hosts deduplicate or resume steps safely.
+
+### Parallel Execution
+
+Tool calls within a single model response are executed in parallel using `futures::future::join_all`. Each receives:
+- A clone of `AgentState`
+- The original user `Message`
+- The specific `ToolCall`
+
+Results are collected and appended to the conversation in the order the tool calls were returned by the model.
+
+## State Transitions
+
+```
+┌─────────┐   new()   ┌─────────┐   run()   ┌─────────┐
+│  (none) │ ────────▶ │  Idle   │ ────────▶ │ Running │
+└─────────┘           └─────────┘           └────┬────┘
+                                                  │
+              ┌───────────────────────────────────┼──────────┐
+              │                                   │          │
+              ▼                                   ▼          ▼
+         ┌─────────┐                        ┌─────────┐ ┌───────────┐
+         │Completed│                        │ Failed  │ │Terminated │
+         └─────────┘                        └─────────┘ └───────────┘
+              │                                   │
+              ▼                                   ▼
+         mark_completed()                    mark_failed()
+         (or normal end)                     (or error)
+```
+
+| Method | Status Change | Events Emitted |
+|--------|--------------|----------------|
+| `mark_running()` | `Idle` → `Running` | `agent:started`, `task:started` |
+| `mark_completed_in_room(...)` | `Running` → `Completed` | `agent:completed`, `task:completed` |
+| `mark_failed(...)` | `Running` → `Failed` | `agent:failed`, `task:failed` |
+| `stop()` | Any → `Terminated` | `agent:terminated` |
+
+## Snapshotting
+
+```rust
+pub fn snapshot(&self) -> AgentRuntimeSnapshot {
+    AgentRuntimeSnapshot {
+        state: self.state(),
+        message_count: self.messages.len(),
+        messages: self.messages.clone(),
+        event_count: self.events.len(),
+        last_task: self.last_task.clone(),
+    }
+}
+```
+
+A snapshot is a complete, serializable capture of the runtime. Hosts can use this for:
+- Graceful shutdown / resume
+- Debugging (dump full message history)
+- Health checks (check `message_count`, `event_count`)
+- Migration (serialize old runtime, deserialize into new process)
+
+## Return Value
+
+Both `run()` and `run_with_tools()` return `TaskResult<Content>`:
+
+```rust
+pub struct TaskResult<T> {
+    pub status: TaskStatus,      // Success | Error
+    pub data: Option<T>,         // the Content on success
+    pub error: Option<String>,   // error message on failure
+    pub duration_ms: u128,       // wall-clock time of the entire run
+}
+```
+
+`duration_ms` is measured from the start of `run_with_tools` to the moment the final status is set. It includes all model calls, all tool executions, all provider lookups, and all evaluator runs.

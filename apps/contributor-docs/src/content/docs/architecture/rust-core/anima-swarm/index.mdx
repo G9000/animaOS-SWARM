@@ -1,0 +1,77 @@
+---
+title: anima-swarm
+description: Multi-agent coordination via strategies and a message bus
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+`anima-swarm` is the multi-agent coordination crate. It sits on top of `anima-core` and provides swarm lifecycle management, message routing, and pluggable coordination strategies.
+
+## Module Structure
+
+```
+src/
+├── lib.rs           # Public exports
+├── coordinator.rs   # SwarmCoordinator
+├── message_bus.rs   # MessageBus
+├── strategies.rs    # Supervisor, RoundRobin, Dynamic
+└── types.rs         # SwarmConfig, SwarmState, AgentMessage
+```
+
+## SwarmCoordinator
+
+Owns the swarm lifecycle: create, run, and teardown.
+
+```rust
+pub struct SwarmCoordinator {
+    state: SwarmState,
+    message_bus: MessageBus,
+    strategy_fn: Arc<CoordinatorStrategyFn>,
+}
+```
+
+## Swarm Lifecycle
+
+```
+create(config)
+  │
+  ├─► Validate config (manager + workers)
+  ├─► Spawn manager AgentRuntime
+  ├─► Spawn worker AgentRuntimes
+  ├─► Wire message bus between all agents
+  └─► Return SwarmState
+
+run(input)
+  │
+  ├─► Call strategy_fn with input + swarm state
+  ├─► Strategy decides which agents run and in what order
+  ├─► Collect results from each agent run
+  ├─► Manager synthesizes final answer
+  └─► Return TaskResult
+
+teardown()
+  │
+  ├─► Stop all agent runtimes
+  ├─► Clear message bus
+  └─► Emit SwarmTeardown event
+```
+
+## SwarmState
+
+```rust
+pub struct SwarmState {
+    pub id: SwarmId,
+    pub status: SwarmStatus,
+    pub manager_id: AgentId,
+    pub worker_ids: Vec<AgentId>,
+    pub config: SwarmConfig,
+    pub created_at: u64,
+    pub token_usage: TokenUsage,
+}
+```
+
+`SwarmStatus`: `Idle`, `Running`, `Completed`, `Failed`.

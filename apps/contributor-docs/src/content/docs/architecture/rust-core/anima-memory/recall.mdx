@@ -1,0 +1,59 @@
+---
+title: Recall Fusion
+description: How the four search signals are fused into ranked results
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="Work in Progress">
+  This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
+</Aside>
+
+## Recall Fusion
+
+`MemoryManager::recall()` fuses all four signals into a single ranked list:
+
+```rust
+pub fn recall(
+    &self,
+    query: &str,
+    options: &MemoryRecallOptions,
+) -> Result<Vec<MemoryRecallResult>, MemoryError>
+```
+
+## Individual Scores
+
+Each result contains:
+- `lexical_score` — BM25 contribution (0..1)
+- `vector_score` — embedding similarity (0..1)
+- `relationship_score` — graph proximity (0..1)
+- `temporal_score` — time relevance (0..1)
+- `recency_score` — raw recency (timestamp-based)
+- `importance_score` — stored importance (0..1)
+
+## Final Score
+
+```
+final_score = w_lexical * lexical_score
+            + w_vector * vector_score
+            + w_temporal * temporal_score
+            + w_relationship * relationship_score
+            + w_importance * importance_score
+```
+
+Default weights: lexical=0.3, vector=0.3, temporal=0.2, relationship=0.1, importance=0.1.
+
+## Snapshot Boundary
+
+`MemoryManager::snapshot()` serializes the entire state. The host calls this on shutdown and `replace_snapshot()` on startup.
+
+```rust
+pub fn snapshot(&self) -> MemoryManagerSnapshot;
+pub fn replace_snapshot(&mut self, snapshot: MemoryManagerSnapshot) -> Result<(), MemoryError>;
+```
+
+The snapshot includes all memories, entities, relationships, temporal facts, BM25 index state, and vector index state.
+
+<Aside type="note">
+  Snapshot serialization uses `serde` with a versioned schema. Future versions will support MessagePack for smaller snapshots.
+</Aside>

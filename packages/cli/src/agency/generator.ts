@@ -153,6 +153,22 @@ class GoogleGenerativeAIAdapter implements IModelAdapter {
   }
 }
 
+class DeterministicCreateAdapter implements IModelAdapter {
+  readonly provider = 'deterministic';
+
+  async generate(): Promise<GenerateResult> {
+    return {
+      content: { text: '{}' },
+      usage: {
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+      },
+      stopReason: 'end',
+    };
+  }
+}
+
 /**
  * Create a model adapter for the given provider.
  */
@@ -166,6 +182,8 @@ export function createAdapter(
   const baseUrl = resolved?.baseUrl ?? resolved?.defaultBaseUrl;
 
   switch (normalizedProvider) {
+    case 'deterministic':
+      return new DeterministicCreateAdapter();
     case 'openai':
       return new DelegatingModelAdapter(
         normalizedProvider,
@@ -236,12 +254,186 @@ export interface GeneratedAgency {
   agents: AgentDefinition[];
 }
 
+const DETERMINISTIC_AGENT_NAMES = [
+  'Avery',
+  'Mira',
+  'Jonah',
+  'Priya',
+  'Ren',
+  'Nadia',
+  'Mateo',
+  'Sofia',
+  'Theo',
+  'Iris',
+];
+
+const DETERMINISTIC_WORKER_TEMPLATES = [
+  {
+    position: 'Research Lead',
+    focus: 'evidence gathering and source quality',
+    tools: ['web_research', 'source_review'],
+    adjectives: ['curious', 'precise', 'methodical'],
+  },
+  {
+    position: 'Strategy Designer',
+    focus: 'turning the goal into plans, milestones, and decision points',
+    tools: ['roadmap_planning', 'decision_mapping'],
+    adjectives: ['structured', 'pragmatic', 'systems-minded'],
+  },
+  {
+    position: 'Operations Builder',
+    focus: 'workflow design, handoffs, and execution quality',
+    tools: ['workflow_design', 'quality_checks'],
+    adjectives: ['organized', 'steady', 'execution-focused'],
+  },
+  {
+    position: 'Risk Reviewer',
+    focus: 'challenging assumptions, surfacing risks, and checking weak spots',
+    tools: ['risk_review', 'counterargument'],
+    adjectives: ['skeptical', 'rigorous', 'direct'],
+  },
+  {
+    position: 'Memory Curator',
+    focus: 'capturing reusable context and keeping team knowledge coherent',
+    tools: ['memory_synthesis', 'knowledge_mapping'],
+    adjectives: ['attentive', 'contextual', 'reflective'],
+  },
+  {
+    position: 'Delivery Editor',
+    focus: 'turning team output into clear, polished, usable artifacts',
+    tools: ['editing', 'briefing'],
+    adjectives: ['clear', 'concise', 'audience-aware'],
+  },
+];
+
+function summarizePurpose(description: string): string {
+  const trimmed = description.trim().replace(/\s+/g, ' ');
+  return trimmed.endsWith('.') ? trimmed.slice(0, -1) : trimmed;
+}
+
+function inferTopics(description: string): string[] {
+  const stopWords = new Set([
+    'about',
+    'after',
+    'agency',
+    'agent',
+    'around',
+    'build',
+    'create',
+    'helps',
+    'into',
+    'make',
+    'team',
+    'that',
+    'their',
+    'this',
+    'with',
+  ]);
+
+  const topics = description
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/\s+/)
+    .map((word) => word.replace(/^-+|-+$/g, ''))
+    .filter((word) => word.length > 3 && !stopWords.has(word));
+
+  return [...new Set(topics)].slice(0, 6);
+}
+
+function collaboratorName(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+function deterministicModel(
+  defaultModel: string,
+  modelPool: string[] | undefined,
+  index: number
+): string | undefined {
+  return modelPool && modelPool.length > 0
+    ? modelPool[index % modelPool.length]
+    : defaultModel || undefined;
+}
+
+function generateDeterministicAgentTeam(
+  opts: GenerateAgentTeamOptions
+): GeneratedAgency {
+  const requestedSize = Math.max(2, Math.min(10, opts.teamSize ?? 4));
+  const purpose = summarizePurpose(opts.agencyDescription);
+  const topics = inferTopics(opts.agencyDescription);
+  const topicList = topics.length > 0 ? topics : ['planning', 'research', 'delivery'];
+  const workerCount = requestedSize - 1;
+
+  const orchestrator: AgentDefinition = {
+    name: DETERMINISTIC_AGENT_NAMES[0],
+    position: 'Agency Orchestrator',
+    role: 'orchestrator',
+    bio: `${DETERMINISTIC_AGENT_NAMES[0]} coordinates the ${opts.agencyName} workspace and keeps the team focused on ${purpose}.`,
+    lore: 'Created by the local deterministic scaffolder so the workspace can be explored without remote model credentials.',
+    adjectives: ['calm', 'integrative', 'decisive'],
+    topics: topicList,
+    knowledge: [
+      `The agency exists to ${purpose}.`,
+      'The team should turn vague goals into concrete next actions.',
+    ],
+    style: 'Briefs the team clearly, asks for dissent, and resolves tradeoffs into next steps.',
+    system: `Coordinate the team for ${opts.agencyName}. Keep everyone oriented around this purpose: ${purpose}. Challenge assumptions, invite disagreement, and synthesize the strongest path forward.`,
+    model: deterministicModel(opts.model, opts.modelPool, 0),
+    tools: ['delegate_task', 'synthesize_findings'],
+    collaboratesWith: [],
+  };
+
+  const workerNames = DETERMINISTIC_AGENT_NAMES.slice(1, requestedSize);
+  const workers = Array.from({ length: workerCount }, (_, index): AgentDefinition => {
+    const template = DETERMINISTIC_WORKER_TEMPLATES[index % DETERMINISTIC_WORKER_TEMPLATES.length];
+    const name = workerNames[index] ?? `Specialist ${index + 1}`;
+    const previousPeer = index === 0 ? orchestrator.name : workerNames[index - 1];
+
+    return {
+      name,
+      position: template.position,
+      role: 'worker',
+      bio: `${name} owns ${template.focus} for ${opts.agencyName}.`,
+      lore: `${name} was scaffolded locally from the agency purpose and can be rewritten in anima.yaml as the team matures.`,
+      adjectives: template.adjectives,
+      topics: topicList,
+      knowledge: [
+        `The agency goal is to ${purpose}.`,
+        `This role focuses on ${template.focus}.`,
+      ],
+      style: 'Gives concrete observations, calls out uncertainty, and offers next actions instead of broad summaries.',
+      system: `Own ${template.focus} for ${opts.agencyName}. Challenge assumptions and disagree with the orchestrator when the evidence points to a better path. Keep outputs specific and useful.`,
+      model: deterministicModel(opts.model, opts.modelPool, index + 1),
+      tools: template.tools,
+      collaboratesWith: previousPeer ? [collaboratorName(previousPeer)] : [],
+    };
+  });
+
+  return {
+    mission: `Help ${opts.agencyName} ${purpose} with a clear, evidence-aware agent team.`,
+    values: [
+      'Make useful progress visible',
+      'Challenge weak assumptions early',
+      'Preserve context as working memory',
+      'Prefer concrete next actions',
+    ],
+    agents: [orchestrator, ...workers],
+  };
+}
+
 /**
  * Use an LLM to generate a full agency: mission, values, and the agent roster.
  */
 export async function generateAgentTeam(
   opts: GenerateAgentTeamOptions
 ): Promise<GeneratedAgency> {
+  if (opts.adapter.provider === 'deterministic') {
+    return generateDeterministicAgentTeam(opts);
+  }
+
   const dummyId = '00000000-0000-0000-0000-000000000000' as UUID;
 
   const config: ModelConfig = {
@@ -430,6 +622,33 @@ const VALID_SEED_TYPES = new Set<SeedMemoryType>([
 export async function generateAgentSeeds(
   opts: GenerateSeedMemoriesOptions
 ): Promise<AgentSeedMemories[]> {
+  if (opts.adapter.provider === 'deterministic') {
+    const purpose = summarizePurpose(opts.agencyDescription);
+    return opts.agents.map((agent): AgentSeedMemories => ({
+      agentName: agent.name,
+      entries: [
+        {
+          type: 'fact',
+          content: `${agent.name}'s agency context is ${opts.agencyName}: ${purpose}.`,
+          importance: 0.72,
+          tags: ['seed', 'agency'],
+        },
+        {
+          type: 'observation',
+          content: `${agent.name} should turn broad requests into concrete next actions before handing work back.`,
+          importance: 0.64,
+          tags: ['seed', 'workflow'],
+        },
+        {
+          type: 'reflection',
+          content: `${agent.name} should challenge assumptions when the current plan is underspecified or risky.`,
+          importance: 0.68,
+          tags: ['seed', 'dissent'],
+        },
+      ],
+    }));
+  }
+
   const dummyId = '00000000-0000-0000-0000-000000000000' as UUID;
 
   const config: ModelConfig = {

@@ -1,0 +1,8 @@
+{
+  "entryPoints": ["../../packages/sdk/src/index.ts"],
+  "tsconfig": "../../packages/sdk/tsconfig.lib.json",
+  "out": "./src/content/docs/sdk/reference-generated",
+  "readme": "none",
+  "name": "SDK API Reference",
+  "githubPages": false
+}

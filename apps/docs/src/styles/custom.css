@@ -1,0 +1,31 @@
+:root {
+  --sl-color-accent: #ea580c;
+  --sl-color-accent-high: #c2410c;
+  --sl-color-accent-low: #fff7ed;
+}
+
+[data-theme='dark'] {
+  --sl-color-accent: #38bdf8;
+  --sl-color-accent-high: #0ea5e9;
+  --sl-color-accent-low: #0c4a6e;
+}
+
+/* Constrain splash page content so cards don't stretch edge-to-edge */
+[data-has-hero] .sl-markdown-content {
+  max-width: 1200px;
+  margin-inline: auto;
+  padding-inline: 1.5rem;
+}
+
+/* Fix logo stretching in navbar */
+.site-title img.logo,
+a.site-title img.logo {
+  height: 2.5rem !important;
+  width: 2.5rem !important;
+  max-height: 2.5rem !important;
+  max-width: 2.5rem !important;
+  aspect-ratio: 1 / 1 !important;
+  object-fit: cover !important;
+  border-radius: 0 !important;
+  display: block !important;
+}
