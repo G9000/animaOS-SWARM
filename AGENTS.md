@@ -9,7 +9,7 @@ This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime pa
 - `packages/*` is for reusable libraries, SDKs, runtime ports, and shared tooling.
 - `hosts/*` is for runnable backend host processes only. Hosts wrap a core implementation and expose it over a runtime boundary such as HTTP, WebSocket, SSE, jobs, or another process interface.
 - `hosts/rust-daemon` is the ready Rust host. `hosts/elixir-phoenix` and `hosts/python-service` are placeholder host projects until implemented.
-- `apps/*` is for user-facing app surfaces such as the UI, UI e2e app, and the legacy local TypeScript server.
+- `apps/*` is for user-facing app surfaces such as the `web` runtime console, `playground`, `web-e2e`, the Astro docs apps, and the legacy local TypeScript server.
 - `tools/*` is for workspace tooling such as the `workspace-dev` launcher.
 
 # Architecture Rules
@@ -22,9 +22,10 @@ This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime pa
 
 # Dev Workflow
 
-- Use `bun dev --host rust` for the normal local workflow. It runs the selected host plus the web UI through `workspace-dev`.
+- Use `bun dev --host rust` for the normal local workflow. It runs the selected host plus both browser surfaces, `@animaOS-SWARM/web` and `@animaOS-SWARM/playground`, through `workspace-dev`.
 - The current supported host keys are `rust`, `elixir`, and `python`; only `rust` is production-ready today.
 - Use Nx project targets for host work: `bun x nx run rust-daemon:dev`, `bun x nx run rust-daemon:build`, `bun x nx run rust-daemon:test`, and `bun x nx run rust-daemon:lint`.
+- Use Nx project targets for docs work: `bun x nx run @animaOS-SWARM/docs:build` and `bun x nx run @animaOS-SWARM/contributor-docs:build`.
 - Use `bun x nx test workspace-dev` when changing host selection, process orchestration, or dev launcher behavior.
 - Use `bun x nx show projects --json` to confirm project names before assuming target names or paths.
 - Prefer `bun x nx ...` over direct tool commands for build/test/lint tasks when an Nx target exists.
@@ -34,6 +35,7 @@ This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime pa
 - For Rust host/core changes, run `bun x nx run rust-daemon:test --skipNxCache`.
 - On Windows, if a running daemon locks `target/debug/anima-daemon.exe`, rerun Rust host validation with `CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache`.
 - For dev launcher changes, run `bun x nx test workspace-dev --runInBand --skipNxCache`.
+- For Astro docs changes, run the relevant build target: `bun x nx run @animaOS-SWARM/docs:build --skipNxCache` or `bun x nx run @animaOS-SWARM/contributor-docs:build --skipNxCache`.
 - For TypeScript package changes, use the relevant Nx `test`, `build`, or `typecheck` target.
 - Do not claim completion unless the relevant verification commands have passed in the current tree.
 
