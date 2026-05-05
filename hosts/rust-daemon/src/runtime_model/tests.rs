@@ -263,7 +263,7 @@ fn agent_config(provider: &str) -> AgentConfig {
         tools: Some(vec![ToolDescriptor {
             name: "delegate_task".into(),
             description: "Delegate a subtask to a worker agent".into(),
-            parameters: delegate_parameters,
+            parameters_schema: delegate_parameters,
             examples: None,
         }]),
         plugins: None,
@@ -290,7 +290,7 @@ fn request() -> ModelGenerateRequest {
                 metadata: None,
             },
             role: MessageRole::User,
-            created_at: 1,
+            created_at_ms: 1,
         }],
         temperature: Some(0.2),
         max_tokens: Some(512),
@@ -617,7 +617,7 @@ fn tool_parameters_schema_wraps_property_maps_into_json_schema_objects() {
     let schema = tool_parameters_schema_json(&ToolDescriptor {
         name: "memory_search".into(),
         description: "Search memories".into(),
-        parameters: properties,
+        parameters_schema: properties,
         examples: None,
     });
 
@@ -651,7 +651,7 @@ fn tool_parameters_schema_preserves_full_json_schema_objects() {
     let normalized = tool_parameters_schema_json(&ToolDescriptor {
         name: "delegate_task".into(),
         description: "Delegate work".into(),
-        parameters: schema.clone(),
+        parameters_schema: schema.clone(),
         examples: None,
     });
 

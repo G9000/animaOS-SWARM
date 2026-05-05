@@ -5,6 +5,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anima_core::DatabaseAdapter;
 use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
@@ -69,8 +70,27 @@ pub fn app_with_config(config: DaemonConfig) -> Router {
     app_with_state(state, config)
 }
 
+pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
+    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    let mut daemon_state =
+        DaemonState::with_events_and_limits(event_fanout, DEFAULT_MAX_BACKGROUND_PROCESSES);
+    daemon_state.set_database(db);
+    let state = Arc::new(RwLock::new(daemon_state));
+    app_with_state(state, DaemonConfig::default())
+}
+
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
     routes::router(state, config)
+}
+
+pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
+    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    let state = Arc::new(RwLock::new(DaemonState::with_events_and_limits(
+        event_fanout,
+        config.max_background_processes,
+    )));
+    configure_persistence(&state, config.persistence_mode).await?;
+    Ok(app_with_state(state, config))
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {

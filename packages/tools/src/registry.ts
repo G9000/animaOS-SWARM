@@ -39,7 +39,7 @@ export const ALL_TOOL_ACTIONS: Action[] = [
   webFetchAction,
 ];
 
-/** Tool schema type — matches the Action parameters shape. */
+/** Tool schema type serialized for daemon/model APIs as `parameters`. */
 export interface ToolSchema {
   name: string;
   description: string;
@@ -50,7 +50,7 @@ export interface ToolSchema {
 export const ACTION_TOOL_SCHEMAS: ToolSchema[] = ALL_TOOL_ACTIONS.map((a) => ({
   name: a.name,
   description: a.description,
-  parameters: a.parameters,
+  parameters: a.parametersSchema,
 }));
 
 /** Lookup map built from ACTION_TOOL_SCHEMAS for O(1) access by tool name. */

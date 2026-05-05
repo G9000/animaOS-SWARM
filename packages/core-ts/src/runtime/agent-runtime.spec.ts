@@ -19,7 +19,7 @@ function mockToolAction(name: string, result: string): Action {
   return {
     name,
     description: `Test tool ${name}`,
-    parameters: {},
+    parametersSchema: {},
     handler: vi.fn().mockResolvedValue({
       status: 'success' as const,
       data: result,

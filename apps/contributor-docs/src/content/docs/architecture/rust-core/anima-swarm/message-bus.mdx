@@ -15,45 +15,55 @@ import { Aside } from '@astrojs/starlight/components';
 
 ```rust
 pub struct MessageBus {
-    channels: HashMap<AgentId, Vec<AgentMessage>>,
+  inboxes: HashMap<String, Vec<AgentMessage>>,
+  all_messages: Vec<AgentMessage>,
 }
 ```
+
+It keeps per-agent inboxes for the currently live coordinator and a global message history used for state snapshots.
 
 ## Operations
 
 | Method | Description |
 |--------|-------------|
-| `send(from, to, message)` | Direct message from one agent to another |
-| `broadcast(from, message)` | Message to all agents in the swarm |
-| `inbox(agent_id)` | Get all messages for an agent |
-| `clear()` | Empty all channels |
+| `register_agent(agent_id)` | Create an inbox for a live coordinator agent |
+| `unregister_agent(agent_id)` | Remove an inbox when an agent leaves the live pool |
+| `send_message(from, to, content)` | Direct message from one agent to another and append it to global history |
+| `broadcast_message(from, content)` | Message to every registered agent except the sender and append it to global history |
+| `get_messages(agent_id)` | Clone the current inbox for an agent |
+| `get_all_messages()` | Clone the global message history |
+| `clear()` | Remove all inboxes and global history |
+| `clear_inboxes()` | Empty inboxes while preserving registrations and global history |
 
-Messages are persistent within a swarm run. An agent can read its inbox multiple times and see all messages since the last `clear()`.
+Messages are persistent within a swarm run. The coordinator captures `get_all_messages()` into `SwarmState.messages`, which means completed message history can be included in daemon control-plane snapshots. Live inboxes are still in-memory coordinator state; they are not a mid-turn resume mechanism after process restart.
 
 ## AgentMessage
 
 ```rust
 pub struct AgentMessage {
-    pub id: MessageId,
-    pub from: AgentId,
-    pub to: Option<AgentId>,  // None = broadcast
+  pub id: String,
+  pub from: String,
+  pub to: String,           // "broadcast" for broadcast messages
     pub content: Content,
-    pub created_at: u64,
+  pub timestamp: u128,
 }
 ```
 
-## Error Handling
+## Current Boundaries
 
-- **Message bus overflow** — If an agent's inbox exceeds a configurable limit, old messages are dropped (FIFO).
-- **Timeout** — If the swarm exceeds `max_total_duration_ms`, the coordinator returns a partial result.
+- There is no FIFO overflow policy today; inboxes and global history grow for the lifetime of a live coordinator.
+- `max_turns` limits strategy turns. Request timeouts are enforced by the Rust daemon route layer, not by `anima-swarm` itself.
+- Restart recovery restores registered swarms and latest `SwarmState` snapshots through the daemon's `ANIMAOS_RS_CONTROL_PLANE_FILE`, but it does not rebuild a partially completed in-flight message-bus turn.
 
 ## Swarm Events
 
+`MessageBus` itself is transport-free and does not emit network events. The Rust daemon wires `CoordinatorMessageEventFn` to publish live swarm messages over SSE and to persist message relationships into memory.
+
+Common daemon-facing event names include:
+
 | Event | Fired When |
-|-------|-----------|
-| `SwarmCreated` | SwarmCoordinator initialized |
-| `SwarmTaskStarted` | `run()` called |
-| `AgentDelegated` | Strategy assigns a task |
-| `AgentCompleted` | Worker returns a result |
-| `SwarmTaskCompleted` | All work finished |
-| `SwarmTeardown` | `teardown()` called |
+|-------|------------|
+| `swarm:created` | A swarm is registered in the daemon |
+| `swarm:running` | A run transitions into running state |
+| `swarm:message` | A coordinator message is sent or broadcast |
+| `swarm:completed` | A run finishes and final state/result are published |

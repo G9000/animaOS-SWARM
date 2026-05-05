@@ -52,7 +52,7 @@ export async function executeWebFetch(args: WebFetchArgs): Promise<string> {
 export const webFetchAction: Action = {
 	name: "web_fetch",
 	description: "Fetch the content of a URL. Returns the text content of the page (HTML tags stripped) or JSON response.",
-	parameters: {
+	parametersSchema: {
 		type: "object",
 		properties: {
 			url: { type: "string", description: "The URL to fetch" },

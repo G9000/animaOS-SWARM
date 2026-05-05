@@ -43,11 +43,18 @@ async fn main() -> io::Result<()> {
         max_concurrent_runs = config.max_concurrent_runs,
         max_background_processes = config.max_background_processes,
         runtime_memory_store = runtime_memory_store_label(),
-        control_plane_durability = "ephemeral",
+        control_plane_durability = control_plane_store_label(),
         "anima-daemon listening"
     );
 
     serve(listener, config).await
+}
+
+fn control_plane_store_label() -> String {
+    if let Ok(path) = std::env::var("ANIMAOS_RS_CONTROL_PLANE_FILE") {
+        return format!("json:{path}");
+    }
+    "ephemeral".to_string()
 }
 
 fn runtime_memory_store_label() -> String {

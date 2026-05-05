@@ -1,5 +1,8 @@
 pub(super) mod events;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anima_swarm::SwarmStatus;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 
@@ -34,7 +37,11 @@ pub(crate) async fn handle_create_swarm(
 
     let snapshot = {
         let mut guard = state.write().await;
-        guard.register_swarm(coordinator, event_stream)
+        let snapshot = guard.register_swarm(coordinator, event_stream);
+        guard
+            .persist_control_plane()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        snapshot
     };
     publish_swarm_event(
         &global_event_fanout,
@@ -103,11 +110,23 @@ pub(crate) async fn handle_run_swarm(
         return Err(ApiError::not_found());
     };
 
+    {
+        let mut running_snapshot = coordinator.get_state();
+        running_snapshot.status = SwarmStatus::Running;
+        running_snapshot.started_at.get_or_insert_with(now_millis);
+        running_snapshot.completed_at = None;
+        let mut guard = state.write().await;
+        guard.store_swarm_snapshot(running_snapshot);
+        guard
+            .persist_control_plane()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    }
+
     let running_swarm_id = swarm_id.to_string();
     let running_global_event_fanout = global_event_fanout.clone();
     let running_swarm_event_fanout = swarm_event_fanout.clone();
     let result = coordinator
-        .dispatch_with_running_hook(content.text.clone(), move |snapshot| {
+        .dispatch_content_with_running_hook(content, move |snapshot| {
             publish_swarm_event(
                 &running_global_event_fanout,
                 running_swarm_event_fanout.as_ref(),
@@ -122,6 +141,9 @@ pub(crate) async fn handle_run_swarm(
     {
         let mut guard = state.write().await;
         guard.store_swarm_snapshot(snapshot.clone());
+        guard
+            .persist_control_plane()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     }
 
     publish_swarm_event(
@@ -163,4 +185,11 @@ pub(crate) async fn handle_subscribe_swarm_events(
     };
 
     subscribe_swarm_events_response(subscriber)
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis()
 }

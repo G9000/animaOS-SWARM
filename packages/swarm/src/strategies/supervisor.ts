@@ -20,7 +20,7 @@ export async function supervisorStrategy(ctx: StrategyContext): Promise<TaskResu
 		name: "delegate_task",
 		description: "Delegate a subtask to a worker agent. Available workers: " +
 			workers.map((w) => `"${w.name}"`).join(", "),
-		parameters: {
+		parametersSchema: {
 			type: "object",
 			properties: {
 				worker_name: { type: "string", description: "Name of the worker to delegate to" },

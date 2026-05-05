@@ -51,7 +51,13 @@ pub fn round_robin_strategy(
                 build_follow_up_prompt(ctx.task(), &history)
             };
 
-            let result = agent.agent.run(prompt).await;
+            let result = agent
+                .agent
+                .run_content(ctx.scoped_text_content(
+                    format!("round-robin:turn:{turn}:agent:{}", agent.name),
+                    prompt,
+                ))
+                .await;
             let response_text = if result.status == TaskStatus::Success {
                 result
                     .data

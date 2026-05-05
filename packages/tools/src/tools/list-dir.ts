@@ -29,7 +29,7 @@ export function executeListDir(args: ListDirArgs): {
 export const listDirAction: Action = {
   name: "list_dir",
   description: "List contents of a directory.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       path: { type: "string", description: "Directory path to list" },

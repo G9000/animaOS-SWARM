@@ -4,7 +4,7 @@
 
 **Goal:** Add a `DatabaseAdapter` trait to `anima-core` so any host can inject persistence, then implement `SqlxPostgresAdapter` in `anima-daemon` to checkpoint every tool call to Postgres — establishing "DB = truth" as the foundation of durable execution.
 
-**Architecture:** `anima-core` defines `DatabaseAdapter` as a trait with zero DB dependencies — it's the interface any host implements (Postgres, in-memory, Elixir NIF, JS callback). `AgentRuntime` accepts an `Option<Arc<dyn DatabaseAdapter>>`, writes a `pending` step before each tool call and a `done`/`failed` step after. `anima-daemon` implements `SqlxPostgresAdapter` via sqlx 0.8, runs migrations on startup, and injects the adapter into each runtime. Recovery (idempotency check on restart) is enabled by the schema; the replay logic is a follow-up plan.
+**Architecture:** `anima-core` defines `DatabaseAdapter` as a trait with zero DB dependencies — it's the interface any host implements (Postgres, in-memory, Elixir NIF, JS callback). `AgentRuntime` accepts an `Option<Arc<dyn DatabaseAdapter>>`, writes a `pending` step before each tool call and a `done`/`failed` step after. `anima-daemon` implements `SqlxPostgresAdapter` via sqlx 0.8, runs migrations on startup, and injects the adapter into each runtime. Explicit request retry keys now let retried runs reuse already-completed tool steps; full runtime replay and process-level resume are still follow-up work.
 
 **Tech Stack:** Rust, axum 0.7, sqlx 0.8, PostgreSQL 14+, async-trait, serde_json, uuid 1.x
 
@@ -1180,10 +1180,10 @@ git commit -m "test(anima-daemon): integration test verifying step_log written d
 - ✅ Postgres connected on daemon startup — Task 5
 - ✅ Migrations run on startup — Task 5
 - ✅ Host-agnostic (no Postgres in anima-core) — Tasks 1–2
-- ⏳ Idempotency check on restart (recovery/replay) — follow-up plan
+- ✅ Explicit retry-key lookup for completed tool steps — implemented
 
 **What this plan does NOT cover (follow-up plans):**
-1. **Recovery/replay** — checking idempotency keys on agent restart to skip already-completed steps. Requires a richer agent lifecycle (pause/resume).
+1. **Recovery/replay** — rehydrating an agent after daemon restart and resuming the in-flight run from persisted state. Explicit retry-key lookup exists, but full process-level replay still requires a richer agent lifecycle.
 2. **WASM bindings** — `wasm-bindgen` exports for embedding anima-core in TypeScript. Separate plan.
 3. **FFI exports** — C exports for Elixir/Python. Separate plan.
 4. **TS package cleanup** — removing `apps/server`, `packages/core`, renaming `packages/sdk` → `packages/client`. Separate plan.

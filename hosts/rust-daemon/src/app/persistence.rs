@@ -7,17 +7,19 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{info, warn};
 
 use super::{PersistenceMode, SharedDaemonState};
+use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
 use crate::memory_embeddings::MemoryEmbeddingRuntime;
 use crate::memory_store::{load_memory_snapshot, MemoryStoreConfig};
 use crate::postgres::SqlxPostgresAdapter;
 use crate::state::{memory_query_expander_from_env, memory_text_analyzer_from_env};
 
-pub(super) async fn configure_persistence(
+pub(crate) async fn configure_persistence(
     state: &SharedDaemonState,
     persistence_mode: PersistenceMode,
 ) -> io::Result<()> {
     let default_embedding_store = configure_memory_store(state).await?;
     configure_memory_embeddings(state, default_embedding_store).await?;
+    configure_control_plane_store(state).await?;
 
     match persistence_mode {
         PersistenceMode::Memory => {
@@ -64,6 +66,47 @@ pub(super) async fn configure_persistence(
             Ok(())
         }
     }
+}
+
+async fn configure_control_plane_store(state: &SharedDaemonState) -> io::Result<()> {
+    let Some(config) = control_plane_store_from_env()? else {
+        state.write().await.set_control_plane_store(None);
+        return Ok(());
+    };
+    let path = config.path().clone();
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let snapshot = load_control_plane_snapshot(&config)?;
+    let (restored_agents, restored_swarms) = if let Some(snapshot) = snapshot {
+        state
+            .write()
+            .await
+            .restore_control_plane_snapshot(snapshot)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+    } else {
+        (0, 0)
+    };
+
+    {
+        let mut guard = state.write().await;
+        guard.set_control_plane_store(Some(config.clone()));
+        guard.persist_control_plane()?;
+    }
+
+    info!(
+        control_plane_file = %path.display(),
+        storage = config.storage_label(),
+        restored_agents,
+        restored_swarms,
+        "runtime control plane store configured"
+    );
+    Ok(())
 }
 
 async fn configure_memory_store(state: &SharedDaemonState) -> io::Result<Option<PathBuf>> {
@@ -154,6 +197,13 @@ fn memory_store_from_env() -> io::Result<Option<MemoryStoreConfig>> {
         (None, Some(path)) => Ok(Some(MemoryStoreConfig::Sqlite(path))),
         (None, None) => Ok(None),
     }
+}
+
+fn control_plane_store_from_env() -> io::Result<Option<ControlPlaneStoreConfig>> {
+    let Some(path) = non_empty_env_path("ANIMAOS_RS_CONTROL_PLANE_FILE")? else {
+        return Ok(None);
+    };
+    Ok(Some(ControlPlaneStoreConfig::Json(path)))
 }
 
 fn non_empty_env_path(name: &'static str) -> io::Result<Option<PathBuf>> {

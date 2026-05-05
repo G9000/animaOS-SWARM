@@ -70,7 +70,7 @@ export function executeGrep(args: GrepArgs): {
 export const grepAction: Action = {
   name: "grep",
   description: "Search for a regex pattern across files.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       pattern: {

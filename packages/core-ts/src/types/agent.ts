@@ -21,17 +21,18 @@ export interface AgentConfig {
 export interface AgentSettings {
 	temperature?: number
 	maxTokens?: number
-	timeout?: number
+	timeoutMs?: number
 	maxRetries?: number
 	[key: string]: unknown
 }
 
 export interface AgentState {
 	id: UUID
+	/** Denormalized display name mirrored from config.name for snapshot ergonomics. */
 	name: string
 	status: AgentStatus
 	config: AgentConfig
-	createdAt: number
+	createdAtMs: number
 	tokenUsage: TokenUsage
 }
 

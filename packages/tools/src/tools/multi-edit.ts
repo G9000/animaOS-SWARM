@@ -78,7 +78,7 @@ export const multiEditAction: Action = {
   name: "multi_edit",
   description:
     "Apply multiple edits to a single file atomically. All edits are validated first; if any old_string is missing the whole batch is rejected.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       file_path: {

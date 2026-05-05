@@ -47,10 +47,12 @@ pub fn supervisor_strategy(
         let worker_refs = Arc::new(worker_refs);
         let delegation_limit = Arc::new(Semaphore::new(max_parallel_delegations));
         let delegate_task: Arc<CoordinatorDelegateFn> = {
+            let ctx = ctx.clone();
             let worker_refs = Arc::clone(&worker_refs);
             let available_workers = available_workers.clone();
             let delegation_limit = Arc::clone(&delegation_limit);
             Arc::new(move |worker_name: String, task: String| {
+                let ctx = ctx.clone();
                 let worker_refs = Arc::clone(&worker_refs);
                 let available_workers = available_workers.clone();
                 let delegation_limit = Arc::clone(&delegation_limit);
@@ -69,137 +71,156 @@ pub fn supervisor_strategy(
                         .acquire_owned()
                         .await
                         .expect("delegation semaphore should not close");
-                    worker.run(task).await
+                    worker
+                        .run_content(ctx.scoped_text_content(
+                            format!("supervisor:delegate:{worker_name}:{task}"),
+                            task,
+                        ))
+                        .await
                 })
             })
         };
-        let delegate_tasks: Arc<CoordinatorBatchDelegateFn> = {
-            let worker_refs = Arc::clone(&worker_refs);
-            let available_workers = available_workers.clone();
-            let delegation_limit = Arc::clone(&delegation_limit);
-            Arc::new(move |delegations: Vec<SwarmDelegation>| {
+        let delegate_tasks: Arc<CoordinatorBatchDelegateFn> =
+            {
+                let ctx = ctx.clone();
                 let worker_refs = Arc::clone(&worker_refs);
                 let available_workers = available_workers.clone();
                 let delegation_limit = Arc::clone(&delegation_limit);
-                Box::pin(async move {
-                    if delegations.is_empty() {
-                        return TaskResult::error(
-                            "delegate_tasks requires at least one delegation",
-                            0,
-                        );
-                    }
+                Arc::new(move |delegations: Vec<SwarmDelegation>| {
+                    let ctx = ctx.clone();
+                    let worker_refs = Arc::clone(&worker_refs);
+                    let available_workers = available_workers.clone();
+                    let delegation_limit = Arc::clone(&delegation_limit);
+                    Box::pin(async move {
+                        if delegations.is_empty() {
+                            return TaskResult::error(
+                                "delegate_tasks requires at least one delegation",
+                                0,
+                            );
+                        }
 
-                    let results: Vec<(String, TaskResult<Content>)> =
-                        join_all(delegations.into_iter().map(|delegation| {
-                            let worker_refs = Arc::clone(&worker_refs);
-                            let available_workers = available_workers.clone();
-                            let delegation_limit = Arc::clone(&delegation_limit);
-                            async move {
-                                let SwarmDelegation { worker_name, task } = delegation;
-                                let Some(worker) = worker_refs.get(&worker_name) else {
-                                    let missing_worker = worker_name.clone();
-                                    return (
-                                        worker_name,
-                                        TaskResult::error(
-                                            format!(
+                        let results: Vec<(String, TaskResult<Content>)> =
+                            join_all(delegations.into_iter().enumerate().map(
+                                |(index, delegation)| {
+                                    let ctx = ctx.clone();
+                                    let worker_refs = Arc::clone(&worker_refs);
+                                    let available_workers = available_workers.clone();
+                                    let delegation_limit = Arc::clone(&delegation_limit);
+                                    async move {
+                                        let SwarmDelegation { worker_name, task } = delegation;
+                                        let Some(worker) = worker_refs.get(&worker_name) else {
+                                            let missing_worker = worker_name.clone();
+                                            return (
+                                                worker_name,
+                                                TaskResult::error(
+                                                    format!(
                                             "Worker \"{missing_worker}\" not found. Available: {}",
                                             available_workers
                                         ),
-                                            0,
+                                                    0,
+                                                ),
+                                            );
+                                        };
+
+                                        let _permit = delegation_limit
+                                            .acquire_owned()
+                                            .await
+                                            .expect("delegation semaphore should not close");
+                                        let result = worker
+                                            .run_content(ctx.scoped_text_content(
+                                                format!(
+                                            "supervisor:delegate-batch:{index}:{worker_name}:{task}"
                                         ),
-                                    );
-                                };
-
-                                let _permit = delegation_limit
-                                    .acquire_owned()
-                                    .await
-                                    .expect("delegation semaphore should not close");
-                                (worker_name, worker.run(task).await)
-                            }
-                        }))
-                        .await;
-
-                    let mut lines = Vec::with_capacity(results.len());
-                    let mut any_error = false;
-                    let mut metadata = BTreeMap::new();
-                    metadata.insert(
-                        "delegationCount".into(),
-                        DataValue::Number(results.len() as f64),
-                    );
-                    metadata.insert(
-                        "parallelLimit".into(),
-                        DataValue::Number(max_parallel_delegations as f64),
-                    );
-                    metadata.insert(
-                        "results".into(),
-                        DataValue::Array(
-                            results
-                                .iter()
-                                .map(|(worker_name, result): &(String, TaskResult<Content>)| {
-                                    let mut entry = BTreeMap::new();
-                                    entry.insert(
-                                        "worker_name".into(),
-                                        DataValue::String(worker_name.clone()),
-                                    );
-                                    entry.insert(
-                                        "status".into(),
-                                        DataValue::String(result.status.as_str().into()),
-                                    );
-                                    if let Some(content) = result.data.as_ref() {
-                                        entry.insert(
-                                            "text".into(),
-                                            DataValue::String(content.text.clone()),
-                                        );
+                                                task,
+                                            ))
+                                            .await;
+                                        (worker_name, result)
                                     }
-                                    if let Some(error) = result.error.as_ref() {
-                                        entry.insert(
-                                            "error".into(),
-                                            DataValue::String(error.clone()),
-                                        );
-                                    }
-                                    DataValue::Object(entry)
-                                })
-                                .collect(),
-                        ),
-                    );
+                                },
+                            ))
+                            .await;
 
-                    for (worker_name, result) in results {
-                        match result.status {
-                            anima_core::TaskStatus::Success => {
-                                let text = result
-                                    .data
-                                    .as_ref()
-                                    .map(|content| content.text.as_str())
-                                    .unwrap_or_default();
-                                lines.push(format!("[{worker_name}] {text}"));
-                            }
-                            anima_core::TaskStatus::Error => {
-                                any_error = true;
-                                let error = result.error.as_deref().unwrap_or("unknown error");
-                                lines.push(format!("[{worker_name}] Error: {error}"));
+                        let mut lines = Vec::with_capacity(results.len());
+                        let mut any_error = false;
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert(
+                            "delegationCount".into(),
+                            DataValue::Number(results.len() as f64),
+                        );
+                        metadata.insert(
+                            "parallelLimit".into(),
+                            DataValue::Number(max_parallel_delegations as f64),
+                        );
+                        metadata.insert(
+                            "results".into(),
+                            DataValue::Array(
+                                results
+                                    .iter()
+                                    .map(|(worker_name, result): &(String, TaskResult<Content>)| {
+                                        let mut entry = BTreeMap::new();
+                                        entry.insert(
+                                            "worker_name".into(),
+                                            DataValue::String(worker_name.clone()),
+                                        );
+                                        entry.insert(
+                                            "status".into(),
+                                            DataValue::String(result.status.as_str().into()),
+                                        );
+                                        if let Some(content) = result.data.as_ref() {
+                                            entry.insert(
+                                                "text".into(),
+                                                DataValue::String(content.text.clone()),
+                                            );
+                                        }
+                                        if let Some(error) = result.error.as_ref() {
+                                            entry.insert(
+                                                "error".into(),
+                                                DataValue::String(error.clone()),
+                                            );
+                                        }
+                                        DataValue::Object(entry)
+                                    })
+                                    .collect(),
+                            ),
+                        );
+
+                        for (worker_name, result) in results {
+                            match result.status {
+                                anima_core::TaskStatus::Success => {
+                                    let text = result
+                                        .data
+                                        .as_ref()
+                                        .map(|content| content.text.as_str())
+                                        .unwrap_or_default();
+                                    lines.push(format!("[{worker_name}] {text}"));
+                                }
+                                anima_core::TaskStatus::Error => {
+                                    any_error = true;
+                                    let error = result.error.as_deref().unwrap_or("unknown error");
+                                    lines.push(format!("[{worker_name}] Error: {error}"));
+                                }
                             }
                         }
-                    }
 
-                    let content = Content {
-                        text: lines.join("\n"),
-                        attachments: None,
-                        metadata: Some(metadata),
-                    };
+                        let content = Content {
+                            text: lines.join("\n"),
+                            attachments: None,
+                            metadata: Some(metadata),
+                        };
 
-                    if any_error {
-                        TaskResult {
-                            status: anima_core::TaskStatus::Error,
-                            data: Some(content),
-                            error: Some("one or more delegated subtasks failed".into()),
-                            duration_ms: 0,
+                        if any_error {
+                            TaskResult {
+                                status: anima_core::TaskStatus::Error,
+                                data: Some(content),
+                                error: Some("one or more delegated subtasks failed".into()),
+                                duration_ms: 0,
+                            }
+                        } else {
+                            TaskResult::success(content, 0)
                         }
-                    } else {
-                        TaskResult::success(content, 0)
-                    }
+                    })
                 })
-            })
-        };
+            };
 
         let mut manager_config = ctx.manager_config().clone();
         let delegate_tool = ToolDescriptor {
@@ -212,7 +233,7 @@ pub fn supervisor_strategy(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            parameters: delegate_task_parameters(),
+            parameters_schema: delegate_task_parameters(),
             examples: None,
         };
         let delegate_tasks_tool = ToolDescriptor {
@@ -226,7 +247,7 @@ pub fn supervisor_strategy(
                     .join(", "),
                 max_parallel_delegations,
             ),
-            parameters: delegate_tasks_parameters(),
+            parameters_schema: delegate_tasks_parameters(),
             examples: None,
         };
 
@@ -248,7 +269,9 @@ pub fn supervisor_strategy(
             Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
         };
 
-        let result = manager.run(ctx.task().to_string()).await;
+        let result = manager
+            .run_content(ctx.scoped_task_content("supervisor:manager"))
+            .await;
         let duration_ms = start.elapsed().as_millis();
 
         TaskResult {

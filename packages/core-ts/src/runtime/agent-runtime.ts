@@ -13,10 +13,14 @@ import type {
   Plugin,
   IModelAdapter,
   ModelConfig,
+  GenerateResult,
   GenerateOptions,
   ToolCall,
   IEventBus,
+  EvaluatorDecision,
 } from '../types/index.js';
+
+const MAX_EVALUATOR_RETRIES = 2;
 
 export interface AgentRuntimeOptions {
   config: AgentConfig;
@@ -80,7 +84,7 @@ export class AgentRuntime implements IAgentRuntime {
       name: options.config.name,
       status: 'idle',
       config: options.config,
-      createdAt: Date.now(),
+      createdAtMs: Date.now(),
       tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
     };
 
@@ -130,13 +134,13 @@ export class AgentRuntime implements IAgentRuntime {
       roomId: randomUUID() as UUID,
       content,
       role: 'user',
-      createdAt: Date.now(),
+      createdAtMs: Date.now(),
     };
 
     try {
       // Build context from providers
       const contextParts: string[] = [];
-      for (const provider of this.providers) {
+      for (const provider of this.providersByPriority()) {
         const result = await provider.get(this, userMessage);
         contextParts.push(`[${provider.name}]: ${result.text}`);
       }
@@ -179,64 +183,50 @@ export class AgentRuntime implements IAgentRuntime {
       const messages: Message[] = [userMessage];
       const availableActions = this.getAvailableActions();
 
-      // Agent loop — call LLM, execute tools, repeat until done
-      let result = await this.step(
-        systemParts.join('\n'),
+      const systemPrompt = systemParts.join('\n');
+      let result = await this.runModelToolLoop(
+        systemPrompt,
         messages,
+        userMessage,
         availableActions
       );
-      let iterations = 0;
-      const maxIterations = 20;
+      let evaluatorRetries = 0;
 
-      while (
-        result.stopReason === 'tool_call' &&
-        result.toolCalls &&
-        iterations < maxIterations
-      ) {
-        iterations++;
+      while (true) {
+        const evaluatorDecision = await this.runEvaluators(
+          userMessage,
+          result.content
+        );
+        if (evaluatorDecision.type === 'accept') {
+          break;
+        }
 
-        // Add the assistant's response (with tool calls) to the conversation
+        if (evaluatorDecision.type === 'abort') {
+          throw new Error(
+            `Evaluator aborted response: ${evaluatorDecision.reason}`
+          );
+        }
+
+        if (evaluatorRetries >= MAX_EVALUATOR_RETRIES) {
+          throw new Error('Evaluator retry limit exceeded');
+        }
+
+        evaluatorRetries++;
         messages.push({
           id: randomUUID() as UUID,
           agentId: this.agentId,
           roomId: userMessage.roomId,
-          content: {
-            text: result.content.text ?? '',
-            metadata: { toolCalls: result.toolCalls },
-          },
-          role: 'assistant',
-          createdAt: Date.now(),
+          content: { text: `Evaluator feedback: ${evaluatorDecision.feedback}` },
+          role: 'system',
+          createdAtMs: Date.now(),
         });
 
-        for (const toolCall of result.toolCalls) {
-          const toolResult = await this.executeTool(toolCall, userMessage);
-
-          messages.push({
-            id: randomUUID() as UUID,
-            agentId: this.agentId,
-            roomId: userMessage.roomId,
-            content: {
-              text: JSON.stringify(toolResult),
-              metadata: { toolCallId: toolCall.id },
-            },
-            role: 'tool',
-            createdAt: Date.now(),
-          });
-        }
-
-        result = await this.step(
-          systemParts.join('\n'),
+        result = await this.runModelToolLoop(
+          systemPrompt,
           messages,
+          userMessage,
           availableActions
         );
-      }
-
-      // Run evaluators
-      for (const evaluator of this.evaluators) {
-        const shouldRun = await evaluator.validate(this, userMessage);
-        if (shouldRun) {
-          await evaluator.handler(this, userMessage, result.content);
-        }
       }
 
       this.state.status = 'completed';
@@ -301,6 +291,101 @@ export class AgentRuntime implements IAgentRuntime {
     );
 
     return result;
+  }
+
+  private async runModelToolLoop(
+    system: string,
+    messages: Message[],
+    userMessage: Message,
+    availableActions: Action[]
+  ): Promise<GenerateResult> {
+    let result = await this.step(system, messages, availableActions);
+    let iterations = 0;
+    const maxIterations = 20;
+
+    while (
+      result.stopReason === 'tool_call' &&
+      result.toolCalls &&
+      iterations < maxIterations
+    ) {
+      iterations++;
+
+      messages.push({
+        id: randomUUID() as UUID,
+        agentId: this.agentId,
+        roomId: userMessage.roomId,
+        content: {
+          text: result.content.text ?? '',
+          metadata: { toolCalls: result.toolCalls },
+        },
+        role: 'assistant',
+        createdAtMs: Date.now(),
+      });
+
+      for (const toolCall of result.toolCalls) {
+        const toolResult = await this.executeTool(toolCall, userMessage);
+
+        messages.push({
+          id: randomUUID() as UUID,
+          agentId: this.agentId,
+          roomId: userMessage.roomId,
+          content: {
+            text: JSON.stringify(toolResult),
+            metadata: { toolCallId: toolCall.id },
+          },
+          role: 'tool',
+          createdAtMs: Date.now(),
+        });
+      }
+
+      result = await this.step(system, messages, availableActions);
+    }
+
+    return result;
+  }
+
+  private async runEvaluators(
+    message: Message,
+    response: Content
+  ): Promise<EvaluatorDecision> {
+    for (const evaluator of this.evaluatorsByPriority()) {
+      const shouldRun = await evaluator.validate(this, message);
+      if (!shouldRun) {
+        continue;
+      }
+
+      const result = await evaluator.handler(this, message, response);
+      const decision = result.decision ?? { type: 'accept' as const };
+      if (decision.type !== 'accept') {
+        return decision;
+      }
+    }
+
+    return { type: 'accept' };
+  }
+
+  private providersByPriority(): Provider[] {
+    return this.providers
+      .map((provider, index) => ({ provider, index }))
+      .sort((left, right) => {
+        const priorityDelta =
+          (right.provider.priority?.() ?? 0) -
+          (left.provider.priority?.() ?? 0);
+        return priorityDelta || left.index - right.index;
+      })
+      .map(({ provider }) => provider);
+  }
+
+  private evaluatorsByPriority(): Evaluator[] {
+    return this.evaluators
+      .map((evaluator, index) => ({ evaluator, index }))
+      .sort((left, right) => {
+        const priorityDelta =
+          (right.evaluator.priority?.() ?? 0) -
+          (left.evaluator.priority?.() ?? 0);
+        return priorityDelta || left.index - right.index;
+      })
+      .map(({ evaluator }) => evaluator);
   }
 
   private async executeTool(

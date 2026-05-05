@@ -18,7 +18,7 @@ export interface Message {
 	roomId: UUID
 	content: Content
 	role: "user" | "assistant" | "system" | "tool"
-	createdAt: number
+	createdAtMs: number
 }
 
 export interface TaskResult<T = unknown> {

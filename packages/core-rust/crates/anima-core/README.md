@@ -9,6 +9,7 @@ The execution engine for AnimaOS agents. A pure Rust library with no HTTP server
 - [Agent Execution Loop](#agent-execution-loop)
 - [Step Checkpointing](#step-checkpointing)
 - [Events](#events)
+- [Testing](#testing)
 - [Implementing a Host](#implementing-a-host)
 - [Adding a New Tool](#adding-a-new-tool)
 - [Executor Compatibility](#executor-compatibility)
@@ -101,6 +102,7 @@ Checkpoint store for tool call state. Optional — inject via `set_database()`. 
 pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn priority(&self) -> u8 { 0 }
     async fn get(
         &self,
         runtime: &AgentRuntime,
@@ -109,7 +111,7 @@ pub trait Provider: Send + Sync {
 }
 ```
 
-Enriches the system prompt before each LLM call. Common uses: memory retrieval, RAG, user profile injection. Providers run in sequence; their text output is appended to the system prompt.
+Enriches the system prompt before each LLM call. Common uses: memory retrieval, RAG, user profile injection. Providers run in descending priority order, with ties preserving registration order; their text output is appended to the system prompt.
 
 ### `Evaluator`
 
@@ -118,6 +120,7 @@ Enriches the system prompt before each LLM call. Common uses: memory retrieval, 
 pub trait Evaluator: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn priority(&self) -> u8 { 0 }
     async fn validate(&self, runtime: &AgentRuntime, message: &Message) -> Result<bool, String>;
     async fn evaluate(
         &self,
@@ -128,7 +131,7 @@ pub trait Evaluator: Send + Sync {
 }
 ```
 
-Runs after the model returns a final answer (not after tool calls). Can score, flag, or append follow-up content. If `validate` returns `false`, the evaluator is skipped for that turn.
+Runs after the model returns a final answer (not after tool calls). Evaluators run in descending priority order, with ties preserving registration order. They return an explicit `EvaluatorDecision`: accept the response, request a bounded correction retry with feedback, or abort the task with a failure reason. If `validate` returns `false`, the evaluator is skipped for that turn.
 
 ---
 
@@ -237,6 +240,8 @@ runtime.set_event_listener(Arc::new(|event| {
 
 All events are also stored in `runtime.events()` for later inspection.
 
+Each event has a stable `id`, an `event_type`, an optional `agent_id`, an explicit epoch-millisecond `timestamp_ms`, and a `data` payload.
+
 ### Event types
 
 | Event string | When emitted |
@@ -253,6 +258,25 @@ All events are also stored in `runtime.events()` for later inspection.
 | `task:failed` | Same tick as `agent:failed` |
 | `tool:before` | Before tool dispatch |
 | `tool:after` | After tool result received |
+
+---
+
+## Testing
+
+`anima-core` now uses two test layers:
+
+- Inline unit tests in `src/*.rs` for narrow type, helper, and runtime behavior checks.
+- Crate-level boundary tests in `tests/*.rs` for public API coverage.
+
+The proper place for first-release runtime confidence is the split boundary suite under `tests/`: `runtime_success.rs` for happy-path behavior, `runtime_failures.rs` for failure paths, and `support/mod.rs` for shared adapters, providers, evaluators, persistence doubles, and helpers. Those suites exercise `AgentRuntime` only through the public exported surface: `ModelAdapter`, `Provider`, `Evaluator`, `DatabaseAdapter`, event emission, and tool execution.
+
+Run the crate tests from the repo root with:
+
+```bash
+cargo test -p anima-core
+```
+
+If you want to keep expanding release-facing coverage, add new host-consumer scenarios in `tests/*.rs` and keep private implementation edge cases in the inline `#[cfg(test)]` modules.
 
 ---
 
@@ -344,17 +368,32 @@ To add a tool:
 2. Include the tool schema in your `AgentConfig` so the model knows to call it:
 
 ```rust
+use std::collections::BTreeMap;
+
+use anima_core::{DataValue, ToolDescriptor};
+
 config.tools = Some(vec![
-    ToolDefinition {
+    ToolDescriptor {
         name: "my_tool".to_string(),
         description: "Does my thing".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "input": { "type": "string" }
-            },
-            "required": ["input"]
-        }),
+        parameters_schema: BTreeMap::from([
+            ("type".into(), DataValue::String("object".into())),
+            (
+                "properties".into(),
+                DataValue::Object(BTreeMap::from([(
+                    "input".into(),
+                    DataValue::Object(BTreeMap::from([(
+                        "type".into(),
+                        DataValue::String("string".into()),
+                    )])),
+                )])),
+            ),
+            (
+                "required".into(),
+                DataValue::Array(vec![DataValue::String("input".into())]),
+            ),
+        ]),
+        examples: None,
     }
 ]);
 ```

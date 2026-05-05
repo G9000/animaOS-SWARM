@@ -34,7 +34,7 @@ The daemon serves operational endpoints, `/api/*` application endpoints, and a S
 ```json
 {
   "status": "ready",
-  "controlPlaneDurability": "ephemeral",
+  "controlPlaneDurability": "json",
   "database": "connected",
   "agents": 3,
   "swarms": 1
@@ -91,12 +91,12 @@ If `ANIMAOS_RS_PERSISTENCE_MODE=postgres` is set without a working DB:
     "name": "researcher",
     "status": "idle",
     "config": { ... },
-    "created_at": 1715000000000,
-    "token_usage": { "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0 }
+    "createdAtMs": 1715000000000,
+    "tokenUsage": { "promptTokens": 0, "completionTokens": 0, "totalTokens": 0 }
   },
-  "message_count": 0,
-  "event_count": 0,
-  "last_task": null
+  "messageCount": 0,
+  "eventCount": 0,
+  "lastTask": null
 }
 ```
 

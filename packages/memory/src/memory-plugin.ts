@@ -24,7 +24,7 @@ export function createMemoryPlugin(manager: MemoryManager): Plugin {
 			{
 				name: "memory_search",
 				description: "Search your memory for past tasks, observations, and facts relevant to a query. Use this to recall what you have done before.",
-				parameters: {
+				parametersSchema: {
 					type: "object",
 					properties: {
 						query: { type: "string", description: "What to search for in memory" },
@@ -51,7 +51,7 @@ export function createMemoryPlugin(manager: MemoryManager): Plugin {
 			{
 				name: "memory_recent",
 				description: "Get your most recent memories — past tasks completed and observations made.",
-				parameters: {
+				parametersSchema: {
 					type: "object",
 					properties: {
 						limit: { type: "number", description: "Number of recent memories to retrieve (default 5)" },

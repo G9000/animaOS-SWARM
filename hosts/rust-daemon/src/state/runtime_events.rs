@@ -40,25 +40,35 @@ pub(super) fn publish_runtime_event(
 fn runtime_event_payload(agent_id: &str, agent_name: &str, event: &EngineEvent) -> Option<Value> {
     match event.event_type {
         EventType::TaskStarted => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
         })),
         EventType::TaskCompleted => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
         })),
         EventType::TaskFailed => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
             "error": data_value_as_string(&event.data).unwrap_or("task failed"),
         })),
         EventType::ToolBefore => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
             "toolName": object_field_string(&event.data, "name").unwrap_or_default(),
             "args": object_field_json(&event.data, "args").unwrap_or_else(|| json!({})),
         })),
         EventType::ToolAfter => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
             "toolName": object_field_string(&event.data, "name").unwrap_or_default(),
@@ -67,11 +77,15 @@ fn runtime_event_payload(agent_id: &str, agent_name: &str, event: &EngineEvent) 
             "result": object_field_string(&event.data, "result"),
         })),
         EventType::AgentTokens => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
             "usage": data_value_to_json(&event.data),
         })),
         EventType::AgentTerminated => Some(json!({
+            "eventId": event.id,
+            "timestampMs": event.timestamp_ms,
             "agentId": agent_id,
             "agentName": agent_name,
         })),

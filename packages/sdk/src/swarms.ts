@@ -22,6 +22,8 @@ export interface SwarmMessagePayload {
 }
 
 export interface SwarmAgentEventPayload {
+  eventId?: string;
+  timestampMs?: number;
   agentId: string;
   agentName: string;
 }

@@ -4,12 +4,12 @@ use anima_core::{DataValue, Message, TokenUsage, ToolDescriptor};
 use serde_json::{json, Value};
 
 pub(super) fn tool_parameters_schema_json(tool: &ToolDescriptor) -> Value {
-    if tool_parameters_are_json_schema(&tool.parameters) {
-        data_value_to_json(&DataValue::Object(tool.parameters.clone()))
+    if tool_parameters_are_json_schema(&tool.parameters_schema) {
+        data_value_to_json(&DataValue::Object(tool.parameters_schema.clone()))
     } else {
         json!({
             "type": "object",
-            "properties": data_value_to_json(&DataValue::Object(tool.parameters.clone())),
+            "properties": data_value_to_json(&DataValue::Object(tool.parameters_schema.clone())),
         })
     }
 }

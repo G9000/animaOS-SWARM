@@ -2,7 +2,10 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import lucode from 'lucode-starlight';
 
+const site = process.env.ANIMAOS_DOCS_SITE ?? 'https://g9000.github.io/animaOS-SWARM';
+
 export default defineConfig({
+  site,
   srcDir: './src',
   outDir: './dist',
   integrations: [

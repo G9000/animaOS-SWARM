@@ -12,7 +12,7 @@ describe('builder helpers', () => {
     const actionConfig: Action = {
       name: 'delegate',
       description: 'delegate task',
-      parameters: {},
+      parametersSchema: {},
       handler: async () => ({
         status: 'success',
         data: { text: 'delegated' },

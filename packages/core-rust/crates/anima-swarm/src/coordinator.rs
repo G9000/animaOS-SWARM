@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
 
-use anima_core::{AgentConfig, Content, TaskResult, TaskStatus, TokenUsage};
+use anima_core::{AgentConfig, Content, DataValue, TaskResult, TaskStatus, TokenUsage};
 
 use crate::strategies::resolve_strategy;
 use crate::types::{AgentMessage, SwarmDelegation};
@@ -37,6 +37,9 @@ pub type CoordinatorParticipantsFn =
 pub type CoordinatorMessageEventFn =
     dyn Fn(String, AgentMessage) -> CoordinatorFuture<()> + Send + Sync;
 
+pub type CoordinatorAgentRunFn =
+    dyn Fn(Content) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
+
 pub type CoordinatorDelegateFn =
     dyn Fn(String, String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
 
@@ -50,6 +53,7 @@ pub type CoordinatorAgentFactoryFn = dyn Fn(CoordinatorAgentFactoryContext) -> C
 #[derive(Clone)]
 pub struct CoordinatorAgentFactoryContext {
     pub config: AgentConfig,
+    pub swarm_id: String,
     pub agent_id: String,
     pub send: Arc<CoordinatorSendFn>,
     pub broadcast: Arc<CoordinatorBroadcastFn>,
@@ -69,13 +73,21 @@ pub struct CoordinatorParticipant {
 pub struct CoordinatorAgentRef {
     pub id: String,
     liveness: Arc<CoordinatorAgentLiveness>,
-    run: Arc<dyn Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync>,
+    run: Arc<CoordinatorAgentRunFn>,
 }
 
 impl CoordinatorAgentRef {
     pub fn new<F>(id: impl Into<String>, run: F) -> Self
     where
         F: Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync + 'static,
+    {
+        let run = Arc::new(run);
+        Self::new_with_content(id, move |input: Content| (run)(input.text))
+    }
+
+    pub fn new_with_content<F>(id: impl Into<String>, run: F) -> Self
+    where
+        F: Fn(Content) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync + 'static,
     {
         let id = id.into();
         Self {
@@ -87,7 +99,7 @@ impl CoordinatorAgentRef {
 
     fn with_liveness(
         id: impl Into<String>,
-        run: Arc<dyn Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync>,
+        run: Arc<CoordinatorAgentRunFn>,
         liveness: Arc<CoordinatorAgentLiveness>,
     ) -> Self {
         Self {
@@ -98,6 +110,15 @@ impl CoordinatorAgentRef {
     }
 
     pub async fn run(&self, input: String) -> TaskResult<Content> {
+        self.run_content(Content {
+            text: input,
+            attachments: None,
+            metadata: None,
+        })
+        .await
+    }
+
+    pub async fn run_content(&self, input: Content) -> TaskResult<Content> {
         if !self.liveness.is_active() {
             return inactive_agent_result(&self.id);
         }
@@ -107,7 +128,7 @@ impl CoordinatorAgentRef {
 
 #[derive(Clone)]
 pub struct CoordinatorAgentShell {
-    pub run: Arc<dyn Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync>,
+    pub run: Arc<CoordinatorAgentRunFn>,
     pub token_usage: Arc<dyn Fn() -> TokenUsage + Send + Sync>,
     pub clear_task_state: Arc<dyn Fn() + Send + Sync>,
     pub stop: Arc<dyn Fn() -> CoordinatorFuture<()> + Send + Sync>,
@@ -115,7 +136,7 @@ pub struct CoordinatorAgentShell {
 
 #[derive(Clone)]
 pub struct CoordinatorDispatchContext {
-    task: String,
+    task: Content,
     manager_config: AgentConfig,
     worker_configs: Vec<AgentConfig>,
     max_parallel_delegations: usize,
@@ -134,7 +155,7 @@ pub struct CoordinatorDispatchContext {
 
 impl CoordinatorDispatchContext {
     fn new(
-        task: String,
+        task: Content,
         manager_config: AgentConfig,
         worker_configs: Vec<AgentConfig>,
         max_parallel_delegations: usize,
@@ -162,7 +183,42 @@ impl CoordinatorDispatchContext {
     }
 
     pub fn task(&self) -> &str {
+        &self.task.text
+    }
+
+    pub fn task_content(&self) -> &Content {
         &self.task
+    }
+
+    pub fn scoped_task_content(&self, scope: impl AsRef<str>) -> Content {
+        let mut content = self.task.clone();
+        content.metadata = self.scoped_metadata(scope.as_ref());
+        content
+    }
+
+    pub fn scoped_text_content(&self, scope: impl AsRef<str>, text: impl Into<String>) -> Content {
+        Content {
+            text: text.into(),
+            attachments: None,
+            metadata: self.scoped_metadata(scope.as_ref()),
+        }
+    }
+
+    fn scoped_metadata(&self, scope: &str) -> Option<BTreeMap<String, DataValue>> {
+        let source = self.task.metadata.as_ref()?;
+        let mut metadata = source.clone();
+
+        if let Some(root_retry_key) = metadata_retry_key(source) {
+            metadata
+                .entry("swarmRetryKey".into())
+                .or_insert_with(|| DataValue::String(root_retry_key.clone()));
+            metadata.insert(
+                "retryKey".into(),
+                DataValue::String(format!("{root_retry_key}:swarm:{scope}")),
+            );
+        }
+
+        Some(metadata)
     }
 
     pub fn manager_config(&self) -> &AgentConfig {
@@ -302,6 +358,36 @@ impl SwarmCoordinator {
         }
     }
 
+    pub fn with_recovered_state_and_hooks(
+        config: SwarmConfig,
+        state: SwarmState,
+        strategy: Arc<CoordinatorStrategyFn>,
+        agent_factory: Arc<CoordinatorAgentFactoryFn>,
+        message_events: Option<Arc<CoordinatorMessageEventFn>>,
+    ) -> Self {
+        let id = state.id.clone();
+
+        Self {
+            inner: Arc::new(CoordinatorInner {
+                swarm_id: id,
+                config,
+                state: Mutex::new(state),
+                message_bus: Arc::new(Mutex::new(MessageBus::new())),
+                message_events,
+                strategy,
+                agent_factory,
+                agents: Mutex::new(HashMap::new()),
+                admitted_agent_ids: Mutex::new(HashSet::new()),
+                pool: Mutex::new(HashMap::new()),
+                dispatch_lock: AsyncMutex::new(()),
+            }),
+        }
+    }
+
+    pub fn config(&self) -> SwarmConfig {
+        self.inner.config.clone()
+    }
+
     pub async fn start(&self) -> Result<(), String> {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
         let pending_configs = self
@@ -361,7 +447,12 @@ impl SwarmCoordinator {
 
     pub async fn dispatch(&self, task: impl Into<String>) -> TaskResult<Content> {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
-        self.run_task(task.into(), None).await
+        self.run_task(text_content(task.into()), None).await
+    }
+
+    pub async fn dispatch_content(&self, task: Content) -> TaskResult<Content> {
+        let _dispatch_guard = self.inner.dispatch_lock.lock().await;
+        self.run_task(task, None).await
     }
 
     pub async fn dispatch_with_running_hook<F>(
@@ -373,7 +464,20 @@ impl SwarmCoordinator {
         F: FnOnce(SwarmState) + Send + 'static,
     {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
-        self.run_task(task.into(), Some(Box::new(on_running))).await
+        self.run_task(text_content(task.into()), Some(Box::new(on_running)))
+            .await
+    }
+
+    pub async fn dispatch_content_with_running_hook<F>(
+        &self,
+        task: Content,
+        on_running: F,
+    ) -> TaskResult<Content>
+    where
+        F: FnOnce(SwarmState) + Send + 'static,
+    {
+        let _dispatch_guard = self.inner.dispatch_lock.lock().await;
+        self.run_task(task, Some(Box::new(on_running))).await
     }
 
     pub async fn stop(&self) -> Result<(), String> {
@@ -428,8 +532,8 @@ impl SwarmCoordinator {
     pub fn get_state(&self) -> SwarmState {
         if self.has_live_agents() {
             self.capture_live_token_usage();
+            self.capture_message_history();
         }
-        self.capture_message_history();
 
         self.inner
             .state
@@ -444,7 +548,7 @@ impl SwarmCoordinator {
 
     async fn run_task(
         &self,
-        task: String,
+        task: Content,
         on_running: Option<Box<dyn FnOnce(SwarmState) + Send + 'static>>,
     ) -> TaskResult<Content> {
         self.with_state(|state| {
@@ -552,6 +656,7 @@ impl SwarmCoordinator {
         self.reserve_agent_slot(&agent_id)?;
         let shell = (self.inner.agent_factory)(CoordinatorAgentFactoryContext {
             config,
+            swarm_id: self.inner.swarm_id.clone(),
             agent_id: agent_id.clone(),
             send: self.build_send_hook(&agent_id, liveness.clone()),
             broadcast: self.build_broadcast_hook(&agent_id, liveness.clone()),
@@ -1069,6 +1174,23 @@ fn default_agent_factory() -> Arc<CoordinatorAgentFactoryFn> {
             ))
         })
     })
+}
+
+fn text_content(text: String) -> Content {
+    Content {
+        text,
+        attachments: None,
+        metadata: None,
+    }
+}
+
+fn metadata_retry_key(metadata: &BTreeMap<String, DataValue>) -> Option<String> {
+    ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"]
+        .iter()
+        .find_map(|key| match metadata.get(*key) {
+            Some(DataValue::String(value)) if !value.is_empty() => Some(value.clone()),
+            _ => None,
+        })
 }
 
 fn next_id(prefix: &str, counter: &AtomicU64) -> String {

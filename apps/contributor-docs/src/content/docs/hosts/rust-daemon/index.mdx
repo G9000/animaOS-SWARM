@@ -27,7 +27,8 @@ import { Aside } from '@astrojs/starlight/components';
 │  - RuntimeModelAdapter              │
 │  - SqlxPostgresAdapter              │
 │  - Tool registry                    │
-│  - Snapshot persistence             │
+│  - Control-plane snapshot store     │
+│  - Memory snapshot persistence      │
 │  - Request ID propagation           │
 │  - Concurrent-run semaphore         │
 ├─────────────────────────────────────┤
@@ -47,6 +48,7 @@ The host implements:
    - `ANIMAOS_RS_MAX_REQUEST_BYTES` — body size limit (default 64 KB)
    - `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` — per-request timeout (default 30s)
    - `ANIMAOS_RS_PERSISTENCE_MODE` — `memory` or `postgres`
+   - `ANIMAOS_RS_CONTROL_PLANE_FILE` — optional agent/swarm snapshot file
    - `ANIMAOS_RS_MAX_CONCURRENT_RUNS` — admission limit (default 8)
    - `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES` — bg process limit (default 8)
 
@@ -56,14 +58,15 @@ The host implements:
 
 3. **Initialize `tracing`**
    - Every HTTP request logged with method, URI, latency, `x-request-id`
-   - Daemon logged as `ephemeral` control plane
+   - Daemon logs `ephemeral` or `json` control-plane durability
 
 4. **Persistence setup**
-   - `memory` mode: no external DB, runtime state only
+   - optional `ANIMAOS_RS_CONTROL_PLANE_FILE`: restores registered agents/swarms and latest snapshots
+   - `memory` mode: no external DB, step logs are in process only
    - `postgres` mode: connect to `DATABASE_URL`, run migrations, fail fast on error
 
 5. **Inject `SqlxPostgresAdapter`** into shared daemon state
-   - All new agents get step persistence automatically
+   - All new agents get step persistence automatically, including completed-tool reuse for retried requests that repeat the same metadata retry key
 
 6. **Start Axum**
    - Request ID propagation middleware
@@ -103,7 +106,7 @@ pub struct AppState {
 }
 ```
 
-All runtime state is in-memory (`ephemeral` control plane). Postgres only persists step logs, not runtime state.
+Runtime state is in-memory by default. Set `ANIMAOS_RS_CONTROL_PLANE_FILE` to persist registered agents, registered swarms, latest snapshots, and swarm message history across restarts. Postgres persists step logs and can recover completed tool results for explicit retries that repeat the same metadata retry key; it does not resume an interrupted model turn by itself.
 
 ## Graceful Shutdown
 

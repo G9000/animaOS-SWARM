@@ -1,5 +1,6 @@
 mod support;
 
+use anima_daemon::{app_with_configured_persistence, DaemonConfig};
 use axum::http::StatusCode;
 use axum::Router;
 use serde_json::Value;
@@ -14,6 +15,29 @@ async fn create_agent(app: &Router, body: &str) -> (StatusCode, String) {
 
 async fn run_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, String) {
     send_json_request(app, "POST", &format!("/api/agents/{agent_id}/run"), body).await
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
 }
 
 fn extract_result_text(body: &str) -> Option<String> {
@@ -71,6 +95,60 @@ async fn get_agent_returns_runtime_snapshot() {
     assert_eq!(status, StatusCode::OK);
     assert!(response.contains(&format!("\"id\":\"{agent_id}\"")));
     assert!(response.contains("\"name\":\"planner\""));
+}
+
+#[tokio::test]
+async fn control_plane_store_recovers_agents_and_swarms_after_restart() {
+    let workspace = use_temp_workspace_root("control-plane-restart");
+    let control_plane_path = workspace.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+
+    let first_app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("first app should configure persistence");
+    let (_, create_agent_response) =
+        create_agent(&first_app, r#"{"name":"restored-agent","model":"gpt-5.4"}"#).await;
+    let agent_id = extract_json_string_field(&create_agent_response, "id");
+    let (_, create_swarm_response) = send_json_request(
+        &first_app,
+        "POST",
+        "/api/swarms",
+        r#"{
+            "strategy":"round-robin",
+            "manager":{"name":"manager","model":"gpt-5.4"},
+            "workers":[{"name":"worker-a","model":"gpt-5.4"}],
+            "maxTurns":1
+        }"#,
+    )
+    .await;
+    let swarm_id = extract_json_string_field(&create_swarm_response, "id");
+
+    let second_app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("second app should configure persistence");
+    let (agent_status, agent_response) =
+        send_empty_request(&second_app, "GET", &format!("/api/agents/{agent_id}")).await;
+    let (swarm_status, swarm_response) =
+        send_empty_request(&second_app, "GET", &format!("/api/swarms/{swarm_id}")).await;
+    let (agent_run_status, agent_run_response) =
+        run_agent(&second_app, &agent_id, r#"{"text":"still there?"}"#).await;
+    let (swarm_run_status, swarm_run_response) = send_json_request(
+        &second_app,
+        "POST",
+        &format!("/api/swarms/{swarm_id}/run"),
+        r#"{"text":"continue after restart"}"#,
+    )
+    .await;
+
+    assert_eq!(agent_status, StatusCode::OK);
+    assert!(agent_response.contains("\"name\":\"restored-agent\""));
+    assert_eq!(swarm_status, StatusCode::OK);
+    assert!(swarm_response.contains(&format!("\"id\":\"{swarm_id}\"")));
+    assert!(swarm_response.contains("\"status\":\"idle\""));
+    assert_eq!(agent_run_status, StatusCode::OK);
+    assert!(agent_run_response.contains("restored-agent handled task: still there?"));
+    assert_eq!(swarm_run_status, StatusCode::OK);
+    assert!(swarm_run_response.contains("continue after restart"));
 }
 
 #[tokio::test]

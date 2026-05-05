@@ -400,7 +400,7 @@ mod tests {
             name: "manager".into(),
             status: AgentStatus::Running,
             config: agent_config("manager"),
-            created_at: 1,
+            created_at_ms: 1,
             token_usage: Default::default(),
         }
     }
@@ -412,7 +412,7 @@ mod tests {
             room_id: "room-1".into(),
             content: text_content("run"),
             role: MessageRole::User,
-            created_at: 1,
+            created_at_ms: 1,
         }
     }
 

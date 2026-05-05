@@ -122,7 +122,7 @@ export const todoWriteAction: Action = {
   name: "todo_write",
   description:
     "Create or update a structured task list for tracking multi-step work. Each todo has content (imperative), status (pending|in_progress|completed), and activeForm (present continuous). Keep exactly one todo in_progress at a time.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       todos: {
@@ -154,7 +154,7 @@ export const todoWriteAction: Action = {
 export const todoReadAction: Action = {
   name: "todo_read",
   description: "Read the current todo list to check progress.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {},
   },

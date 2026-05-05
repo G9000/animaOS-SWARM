@@ -80,6 +80,25 @@ console.log('Tokens used:', run.swarm.tokenUsage.totalTokens);
 console.log('Status:', run.swarm.status);
 ```
 
+### Retrying a swarm run safely
+
+When the Rust daemon is configured with step persistence, a retried swarm run can reuse completed tool work from the original attempt. Send one stable retry key in request metadata for the logical swarm task, then repeat that same value if the client retries after a timeout or interrupted response.
+
+```typescript
+const run = await client.swarms.run('swarm-uuid-here', {
+  text: 'Coordinate the release checklist',
+  metadata: {
+    retryKey: 'release-checklist-2026-05-05',
+  },
+});
+```
+
+The coordinator scopes that root key for manager and worker turns, and each agent derives deterministic tool-step keys from the scoped retry key plus the tool payload. Reuse only happens when the retried request repeats the same `retryKey` or `idempotencyKey`; fresh swarm runs should omit the key or use a new value.
+
+<Aside type="note">
+  This protects completed tool steps during explicit retries. With `ANIMAOS_RS_CONTROL_PLANE_FILE`, the Rust daemon also restores swarm registrations and latest snapshots after process restart, but interrupted in-flight runs are marked failed and should be retried intentionally.
+</Aside>
+
 ### `SwarmRunResponse<T>`
 
 | Field | Type | Description |

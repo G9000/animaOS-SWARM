@@ -201,7 +201,7 @@ fn config_with_tools(tool_names: &[&str]) -> AgentConfig {
                 .map(|tool_name| anima_core::ToolDescriptor {
                     name: (*tool_name).into(),
                     description: format!("Tool {tool_name}"),
-                    parameters: BTreeMap::new(),
+                    parameters_schema: BTreeMap::new(),
                     examples: None,
                 })
                 .collect(),
@@ -218,7 +218,7 @@ fn message(id: &str, room_id: &str, role: MessageRole, text: &str) -> Message {
         room_id: room_id.into(),
         content: content(text),
         role,
-        created_at: 1,
+        created_at_ms: 1,
     }
 }
 
@@ -237,7 +237,7 @@ fn tool_message(id: &str, room_id: &str, text: &str, result: TaskResult<Content>
             metadata: Some(metadata),
         },
         role: MessageRole::Tool,
-        created_at: 1,
+        created_at_ms: 1,
     }
 }
 

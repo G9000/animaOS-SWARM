@@ -20,7 +20,7 @@ export async function dynamicStrategy(ctx: StrategyContext): Promise<TaskResult>
 		description: "Choose which agent speaks next. Available agents: " +
 			agents.map((a) => `"${a.name}"`).join(", ") +
 			'. Set agent_name to "DONE" to end the conversation.',
-		parameters: {
+		parametersSchema: {
 			type: "object",
 			properties: {
 				agent_name: { type: "string", description: "Name of the agent to speak next, or DONE to finish" },

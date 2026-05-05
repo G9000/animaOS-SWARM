@@ -60,7 +60,7 @@ pub struct AgentRuntime {
 | `providers` | Called before every model generation to inject dynamic context (time, memories, user info). |
 | `evaluators` | Called after a final response to validate, score, or trigger follow-up actions. |
 | `model_adapter` | The only required dependency. Converts `ModelGenerateRequest` into `ModelGenerateResponse`. |
-| `db` | Optional. If set, tool execution steps are written as `Step` records with idempotency keys. |
+| `db` | Optional. If set, tool execution steps are persisted as `Step` records, and completed steps can be reused on explicit retries when the caller repeats the same retry metadata key. |
 | `step_counter` | Monotonically increasing counter used to assign stable indices to tool-call steps. |
 
 ## The Task Loop
@@ -176,12 +176,12 @@ LOOP:
 
 ### Step Persistence
 
-If a `DatabaseAdapter` is registered, every tool call produces **two** `Step` records:
+If a `DatabaseAdapter` is registered, every logical tool step is persisted in **two phases**:
 
 1. **Pending** — written before execution. Contains the tool name and arguments.
-2. **Done** or **Failed** — written after execution. Contains the result, status, and error (if any).
+2. **Done** or **Failed** — the same logical step is rewritten after execution with the result, status, and error (if any).
 
-The idempotency key is `{agent_id}:{step_index}:{tool_call.id}`. This lets hosts deduplicate or resume steps safely.
+When request metadata includes `retryKey` or `idempotencyKey`, the runtime derives a stable logical idempotency key from the agent, the retry identity, and the tool call payload. A later retried request with the same retry key can reuse a previously completed tool step instead of re-executing it. Without explicit retry metadata, persisted steps are still durable for observability, but fresh requests do not reuse old results.
 
 ### Parallel Execution
 
@@ -232,11 +232,13 @@ pub fn snapshot(&self) -> AgentRuntimeSnapshot {
 }
 ```
 
-A snapshot is a complete, serializable capture of the runtime. Hosts can use this for:
-- Graceful shutdown / resume
+A snapshot is a complete, serializable capture of the in-memory runtime. Hosts can use this for:
+- Debug snapshots during graceful shutdown
 - Debugging (dump full message history)
 - Health checks (check `message_count`, `event_count`)
-- Migration (serialize old runtime, deserialize into new process)
+- Host-managed restore or migration work
+
+The Rust daemon now uses these snapshots when `ANIMAOS_RS_CONTROL_PLANE_FILE` is configured. It restores registered agents after restart and marks any restored running task as failed/interrupted rather than pretending mid-turn resume happened.
 
 ## Return Value
 

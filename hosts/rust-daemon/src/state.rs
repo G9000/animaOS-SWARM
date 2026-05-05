@@ -5,6 +5,7 @@ mod swarm_tools;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anima_core::{
     AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentStatus, DatabaseAdapter, ModelAdapter,
@@ -17,6 +18,9 @@ use tokio::sync::RwLock as AsyncRwLock;
 use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
+use crate::control_plane_store::{
+    save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, StoredSwarmSnapshot,
+};
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::memory_embeddings::{MemoryEmbeddingRuntime, SharedMemoryEmbeddings};
 use crate::memory_store::MemoryStoreConfig;
@@ -82,9 +86,11 @@ pub(crate) struct DaemonState {
     pub(crate) memory: SharedMemoryStore,
     pub(crate) memory_embeddings: SharedMemoryEmbeddings,
     pub(crate) memory_store: Option<MemoryStoreConfig>,
+    pub(crate) control_plane_store: Option<ControlPlaneStoreConfig>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
     pub(crate) agent_snapshots: HashMap<String, AgentRuntimeSnapshot>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
+    pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
     pub(crate) swarm_snapshots: HashMap<String, SwarmState>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
@@ -152,9 +158,11 @@ impl DaemonState {
             memory,
             memory_embeddings,
             memory_store: None,
+            control_plane_store: None,
             agents: HashMap::new(),
             agent_snapshots: HashMap::new(),
             swarms: HashMap::new(),
+            swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
             swarm_snapshots: HashMap::new(),
             model_adapter,
@@ -190,6 +198,59 @@ impl DaemonState {
         self.memory_store = memory_store;
     }
 
+    pub(crate) fn set_control_plane_store(
+        &mut self,
+        control_plane_store: Option<ControlPlaneStoreConfig>,
+    ) {
+        self.control_plane_store = control_plane_store;
+    }
+
+    pub(crate) fn persist_control_plane(&self) -> std::io::Result<()> {
+        save_control_plane_snapshot(
+            self.control_plane_store.as_ref(),
+            &self.control_plane_snapshot(),
+        )
+    }
+
+    pub(crate) fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
+        let agents = self.list_agents();
+        let mut swarms = self
+            .swarm_configs
+            .iter()
+            .filter_map(|(swarm_id, config)| {
+                self.get_swarm(swarm_id).map(|state| StoredSwarmSnapshot {
+                    config: config.clone(),
+                    state,
+                })
+            })
+            .collect::<Vec<_>>();
+        swarms.sort_by(|left, right| left.state.id.cmp(&right.state.id));
+
+        ControlPlaneSnapshot::new(agents, swarms)
+    }
+
+    pub(crate) fn restore_control_plane_snapshot(
+        &mut self,
+        snapshot: ControlPlaneSnapshot,
+    ) -> Result<(usize, usize), String> {
+        let mut restored_agents = 0;
+        let mut restored_swarms = 0;
+
+        for agent_snapshot in snapshot.agents {
+            self.restore_agent_snapshot(agent_snapshot);
+            restored_agents += 1;
+        }
+
+        for stored_swarm in snapshot.swarms {
+            let (coordinator, event_stream) =
+                self.build_recovered_swarm(stored_swarm.config, stored_swarm.state)?;
+            self.register_recovered_swarm(coordinator, event_stream);
+            restored_swarms += 1;
+        }
+
+        Ok((restored_agents, restored_swarms))
+    }
+
     pub(crate) fn replace_memory_embeddings(&mut self, embeddings: MemoryEmbeddingRuntime) {
         self.memory_embeddings = Arc::new(AsyncRwLock::new(embeddings));
     }
@@ -214,6 +275,13 @@ impl DaemonState {
 
     pub(crate) fn database_configured(&self) -> bool {
         self.db.is_some()
+    }
+
+    pub(crate) fn control_plane_durability(&self) -> String {
+        self.control_plane_store
+            .as_ref()
+            .map(|config| config.storage_label().to_string())
+            .unwrap_or_else(|| "ephemeral".to_string())
     }
 
     pub(crate) fn background_process_count(&self) -> Result<usize, String> {
@@ -279,6 +347,65 @@ impl DaemonState {
         ))
     }
 
+    pub(crate) fn build_recovered_swarm(
+        &self,
+        config: SwarmConfig,
+        mut snapshot: SwarmState,
+    ) -> Result<(SwarmCoordinator, EventFanout), String> {
+        self.validate_swarm_tools(&config)?;
+        snapshot.agent_ids.clear();
+        if snapshot.status == anima_swarm::SwarmStatus::Running {
+            snapshot.status = anima_swarm::SwarmStatus::Failed;
+            snapshot.completed_at.get_or_insert_with(now_millis);
+        }
+
+        let event_stream = EventFanout::new(DEFAULT_EVENT_BUFFER);
+        let swarm_message_events = event_stream.clone();
+        let global_message_events = self.event_fanout();
+        let memory = Arc::clone(&self.memory);
+        let memory_embeddings = Arc::clone(&self.memory_embeddings);
+        let memory_store = self.memory_store.clone();
+        let agent_names = Arc::new(swarm_agent_names(&config));
+        let message_events: Arc<CoordinatorMessageEventFn> = Arc::new(move |swarm_id, message| {
+            let global_message_events = global_message_events.clone();
+            let swarm_message_events = swarm_message_events.clone();
+            let memory = Arc::clone(&memory);
+            let memory_embeddings = Arc::clone(&memory_embeddings);
+            let memory_store = memory_store.clone();
+            let agent_names = Arc::clone(&agent_names);
+            Box::pin(async move {
+                runtime_events::publish_swarm_message_event(
+                    &global_message_events,
+                    &swarm_message_events,
+                    &swarm_id,
+                    &message,
+                );
+                persist_swarm_message_relationship(
+                    memory,
+                    memory_embeddings,
+                    memory_store,
+                    agent_names,
+                    swarm_id,
+                    message,
+                )
+                .await;
+            })
+        });
+        let strategy = resolve_strategy(config.strategy);
+        let factory = self.swarm_agent_factory(event_stream.clone());
+
+        Ok((
+            SwarmCoordinator::with_recovered_state_and_hooks(
+                config,
+                snapshot,
+                strategy,
+                factory,
+                Some(message_events),
+            ),
+            event_stream,
+        ))
+    }
+
     pub(crate) fn register_swarm(
         &mut self,
         coordinator: SwarmCoordinator,
@@ -286,10 +413,20 @@ impl DaemonState {
     ) -> SwarmState {
         let snapshot = coordinator.get_state();
         let swarm_id = snapshot.id.clone();
+        self.swarm_configs
+            .insert(swarm_id.clone(), coordinator.config());
         self.swarms.insert(swarm_id.clone(), coordinator);
         self.swarm_events.insert(swarm_id.clone(), event_stream);
         self.swarm_snapshots.insert(swarm_id, snapshot.clone());
         snapshot
+    }
+
+    pub(crate) fn register_recovered_swarm(
+        &mut self,
+        coordinator: SwarmCoordinator,
+        event_stream: EventFanout,
+    ) -> SwarmState {
+        self.register_swarm(coordinator, event_stream)
     }
 
     pub(crate) fn get_swarm(&self, swarm_id: &str) -> Option<SwarmState> {
@@ -350,6 +487,28 @@ impl DaemonState {
         Ok(snapshot)
     }
 
+    fn restore_agent_snapshot(&mut self, snapshot: AgentRuntimeSnapshot) {
+        let agent_id = snapshot.state.id.clone();
+        let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
+        runtime.set_providers(default_providers(Arc::clone(&self.memory)));
+        runtime.set_evaluators(default_evaluators(
+            Arc::clone(&self.memory),
+            Arc::clone(&self.memory_embeddings),
+            self.memory_store.clone(),
+        ));
+        if let Some(db) = &self.db {
+            runtime.set_database(Arc::clone(db));
+        }
+        if runtime.state().status == AgentStatus::Running {
+            runtime.mark_failed("daemon restarted before task completed", 0);
+        }
+
+        let restored_snapshot = runtime.snapshot();
+        self.agent_snapshots
+            .insert(agent_id.clone(), restored_snapshot);
+        self.agents.insert(agent_id, runtime);
+    }
+
     pub(crate) fn list_agents(&self) -> Vec<AgentRuntimeSnapshot> {
         let mut snapshots = self.agent_snapshots.clone();
         for (agent_id, runtime) in &self.agents {
@@ -359,8 +518,8 @@ impl DaemonState {
         let mut snapshots: Vec<_> = snapshots.into_values().collect();
         snapshots.sort_by(|left, right| {
             left.state
-                .created_at
-                .cmp(&right.state.created_at)
+                .created_at_ms
+                .cmp(&right.state.created_at_ms)
                 .then_with(|| left.state.id.cmp(&right.state.id))
         });
         snapshots
@@ -447,4 +606,11 @@ impl DaemonState {
 
         Ok(())
     }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis()
 }

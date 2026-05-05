@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::mpsc;
@@ -10,8 +10,8 @@ use std::time::Duration;
 use anima_core::{AgentConfig, Content, DataValue, TaskResult, TaskStatus, TokenUsage};
 use anima_swarm::coordinator::{
     CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentRef,
-    CoordinatorAgentShell, CoordinatorDelegateFn, CoordinatorDispatchContext,
-    CoordinatorStrategyFn,
+    CoordinatorAgentRunFn, CoordinatorAgentShell, CoordinatorDelegateFn,
+    CoordinatorDispatchContext, CoordinatorFuture, CoordinatorStrategyFn,
 };
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::strategies::supervisor::supervisor_strategy;
@@ -108,6 +108,13 @@ fn data_value_as_object(value: &DataValue) -> &std::collections::BTreeMap<String
     }
 }
 
+fn metadata_string(content: &Content, key: &str) -> Option<String> {
+    match content.metadata.as_ref()?.get(key)? {
+        DataValue::String(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
 fn block_on<F: Future>(future: F) -> F::Output {
     struct NoopWake;
 
@@ -125,6 +132,93 @@ fn block_on<F: Future>(future: F) -> F::Output {
             Poll::Pending => thread::yield_now(),
         }
     }
+}
+
+fn content_run<F>(run: F) -> Arc<CoordinatorAgentRunFn>
+where
+    F: Fn(String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync + 'static,
+{
+    Arc::new(move |input: Content| run(input.text))
+}
+
+#[test]
+fn dispatch_content_scopes_retry_metadata_for_agent_runs() {
+    let observed = Arc::new(Mutex::new(Vec::<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>::new()));
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
+        let observed = Arc::clone(&observed);
+        move |context: CoordinatorAgentFactoryContext| {
+            let observed = Arc::clone(&observed);
+            Box::pin(async move {
+                let agent_name = context.config.name.clone();
+                Ok(CoordinatorAgentShell {
+                    run: Arc::new(move |input: Content| {
+                        let observed = Arc::clone(&observed);
+                        let agent_name = agent_name.clone();
+                        Box::pin(async move {
+                            observed
+                                .lock()
+                                .expect("observed mutex should not be poisoned")
+                                .push((
+                                    agent_name.clone(),
+                                    metadata_string(&input, "retryKey"),
+                                    metadata_string(&input, "swarmRetryKey"),
+                                    metadata_string(&input, "userId"),
+                                ));
+                            TaskResult::success(
+                                text_content(&format!("{agent_name} handled {}", input.text)),
+                                1,
+                            )
+                        })
+                    }),
+                    token_usage: Arc::new(TokenUsage::default),
+                    clear_task_state: Arc::new(|| {}),
+                    stop: Arc::new(|| Box::pin(async {})),
+                })
+            })
+        }
+    });
+
+    let coordinator = SwarmCoordinator::with_hooks(
+        round_robin_config_with_turns(&["worker-a"], 2),
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        factory,
+    );
+    let mut metadata = BTreeMap::new();
+    metadata.insert("retryKey".into(), DataValue::String("swarm-run-1".into()));
+    metadata.insert("userId".into(), DataValue::String("user-42".into()));
+
+    let result = block_on(coordinator.dispatch_content(Content {
+        text: "Durable swarm".into(),
+        attachments: None,
+        metadata: Some(metadata),
+    }));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        observed
+            .lock()
+            .expect("observed mutex should not be poisoned")
+            .as_slice(),
+        [
+            (
+                "manager".to_string(),
+                Some("swarm-run-1:swarm:round-robin:turn:0:agent:manager".to_string()),
+                Some("swarm-run-1".to_string()),
+                Some("user-42".to_string()),
+            ),
+            (
+                "worker-a".to_string(),
+                Some("swarm-run-1:swarm:round-robin:turn:1:agent:worker-a".to_string()),
+                Some("swarm-run-1".to_string()),
+                Some("user-42".to_string()),
+            ),
+        ]
+    );
 }
 
 #[derive(Default)]
@@ -219,7 +313,7 @@ impl TestHarness {
                 let clear_id = agent_id.clone();
 
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(move |input| {
+                    run: content_run(move |input| {
                         let run_state = run_state.clone();
                         let run_id = run_id.clone();
                         let send = send.clone();
@@ -459,7 +553,7 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
 
                 match context.config.name.as_str() {
                     "worker-a" | "worker-b" => {
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_inputs = Arc::clone(&worker_inputs);
                             Box::pin(async move {
                                 worker_inputs
@@ -507,7 +601,7 @@ fn supervisor_strategy_delegates_to_worker_and_returns_the_manager_synthesis() {
                             .expect("supervisor manager should receive delegate_task callback")
                             .clone();
 
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let manager_inputs = Arc::clone(&manager_inputs);
                             let delegate_task = Arc::clone(&delegate_task);
                             Box::pin(async move {
@@ -609,7 +703,7 @@ fn supervisor_strategy_batch_delegates_workers_concurrently() {
                 match context.config.name.as_str() {
                     "worker-a" | "worker-b" => {
                         let worker_name = context.config.name.clone();
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_events = Arc::clone(&worker_events);
                             let worker_name = worker_name.clone();
                             Box::pin(async move {
@@ -645,7 +739,7 @@ fn supervisor_strategy_batch_delegates_workers_concurrently() {
                             .expect("manager should receive delegate_tasks callback")
                             .clone();
 
-                        let run = Arc::new(move |_input: String| {
+                        let run = content_run(move |_input: String| {
                             let delegate_tasks = Arc::clone(&delegate_tasks);
                             Box::pin(async move {
                                 let result = delegate_tasks(vec![
@@ -725,7 +819,7 @@ fn supervisor_strategy_batch_delegation_respects_parallel_limit() {
                 match context.config.name.as_str() {
                     "worker-a" | "worker-b" => {
                         let worker_name = context.config.name.clone();
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_events = Arc::clone(&worker_events);
                             let worker_name = worker_name.clone();
                             Box::pin(async move {
@@ -758,7 +852,7 @@ fn supervisor_strategy_batch_delegation_respects_parallel_limit() {
                             .expect("manager should receive delegate_tasks callback")
                             .clone();
 
-                        let run = Arc::new(move |_input: String| {
+                        let run = content_run(move |_input: String| {
                             let delegate_tasks = Arc::clone(&delegate_tasks);
                             Box::pin(async move {
                                 delegate_tasks(vec![
@@ -833,7 +927,7 @@ fn stale_delegate_callbacks_are_fenced_by_manager_liveness() {
             Box::pin(async move {
                 match context.config.name.as_str() {
                     "worker-a" => {
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_inputs = Arc::clone(&worker_inputs);
                             Box::pin(async move {
                                 worker_inputs
@@ -873,7 +967,7 @@ fn stale_delegate_callbacks_are_fenced_by_manager_liveness() {
                             .as_ref()
                             .expect("manager should receive delegate_task callback")
                             .clone();
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let delegate_task = Arc::clone(&delegate_task);
                             Box::pin(async move {
                                 assert_eq!(input, "Research and report");
@@ -1383,7 +1477,7 @@ fn spawn_agent_enforces_max_concurrent_agents_atomically_under_parallel_spawn() 
                 thread::sleep(Duration::from_millis(50));
 
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(move |input: String| {
+                    run: content_run(move |input: String| {
                         Box::pin(async move { TaskResult::success(text_content(&input), 1) })
                     }),
                     token_usage: Arc::new(TokenUsage::default),
@@ -1546,7 +1640,7 @@ fn dispatch_releases_agents_lock_before_clear_task_state_hooks() {
             let hook_entered_tx = hook_entered_tx.clone();
             Box::pin(async move {
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(|input: String| {
+                    run: content_run(|input: String| {
                         Box::pin(async move { TaskResult::success(text_content(&input), 1) })
                     }),
                     token_usage: Arc::new(TokenUsage::default),
@@ -1623,7 +1717,7 @@ fn get_state_releases_agents_lock_before_token_usage_hooks() {
             let hook_entered_tx = hook_entered_tx.clone();
             Box::pin(async move {
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(|input: String| {
+                    run: content_run(|input: String| {
                         Box::pin(async move { TaskResult::success(text_content(&input), 1) })
                     }),
                     token_usage: Arc::new(move || {
@@ -1841,7 +1935,7 @@ fn stale_send_and_broadcast_hooks_cannot_mutate_message_bus_after_agent_cleanup(
                 }
 
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(|input: String| {
+                    run: content_run(|input: String| {
                         Box::pin(async move { TaskResult::success(text_content(&input), 1) })
                     }),
                     token_usage: Arc::new(TokenUsage::default),
@@ -1929,7 +2023,7 @@ fn round_robin_strategy_cycles_agents_and_aggregates_history() {
                 let agent_name = context.config.name.clone();
                 let run_log_for_agent = Arc::clone(&run_log);
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(move |input: String| {
+                    run: content_run(move |input: String| {
                         let run_log = Arc::clone(&run_log_for_agent);
                         let agent_name = agent_name.clone();
                         Box::pin(async move {
@@ -2031,7 +2125,7 @@ fn round_robin_strategy_rejects_zero_turns_before_spawning_agents() {
                     .push(context.config.name.clone());
 
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(|_input: String| {
+                    run: content_run(|_input: String| {
                         Box::pin(async move {
                             panic!("zero-turn round robin should not invoke any agent")
                         })
@@ -2075,7 +2169,7 @@ fn round_robin_strategy_records_error_turns_in_history() {
             Box::pin(async move {
                 let agent_name = context.config.name.clone();
                 Ok(CoordinatorAgentShell {
-                    run: Arc::new(move |input: String| {
+                    run: content_run(move |input: String| {
                         let run_log = Arc::clone(&run_log);
                         let agent_name = agent_name.clone();
                         Box::pin(async move {
@@ -2149,7 +2243,7 @@ fn dynamic_strategy_routes_workers_through_choose_speaker_and_preserves_history(
 
                 match context.config.name.as_str() {
                     "analyst" => {
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_inputs = Arc::clone(&worker_inputs);
                             Box::pin(async move {
                                 worker_inputs
@@ -2172,7 +2266,7 @@ fn dynamic_strategy_routes_workers_through_choose_speaker_and_preserves_history(
                         })
                     }
                     "writer" => {
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_inputs = Arc::clone(&worker_inputs);
                             Box::pin(async move {
                                 worker_inputs
@@ -2224,7 +2318,7 @@ fn dynamic_strategy_routes_workers_through_choose_speaker_and_preserves_history(
                             .expect("dynamic manager should receive choose_speaker callback")
                             .clone();
 
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let manager_inputs = Arc::clone(&manager_inputs);
                             let choose_speaker = Arc::clone(&choose_speaker);
                             let worker_inputs = Arc::clone(&worker_inputs);
@@ -2359,7 +2453,7 @@ fn dynamic_strategy_returns_error_for_unknown_agent_choice() {
                 match context.config.name.as_str() {
                     "analyst" | "writer" => {
                         let agent_name = context.config.name.clone();
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let worker_inputs = Arc::clone(&worker_inputs);
                             let agent_name = agent_name.clone();
                             Box::pin(async move {
@@ -2386,7 +2480,7 @@ fn dynamic_strategy_returns_error_for_unknown_agent_choice() {
                             .expect("dynamic manager should receive choose_speaker callback")
                             .clone();
 
-                        let run = Arc::new(move |input: String| {
+                        let run = content_run(move |input: String| {
                             let choose_speaker = Arc::clone(&choose_speaker);
                             Box::pin(async move {
                                 assert_eq!(input, "Talk to ghost");

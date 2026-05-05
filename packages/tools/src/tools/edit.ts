@@ -69,7 +69,7 @@ export function executeEdit(args: EditArgs): {
 export const editAction: Action = {
   name: "edit_file",
   description: "Edit a file by replacing old_string with new_string.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       file_path: {

@@ -13,7 +13,7 @@ function actionsToTools(actions: Action[]): Anthropic.Tool[] {
 	return actions.map((a) => ({
 		name: a.name,
 		description: a.description,
-		input_schema: a.parameters as Anthropic.Tool.InputSchema,
+		input_schema: a.parametersSchema as Anthropic.Tool.InputSchema,
 	}))
 }
 

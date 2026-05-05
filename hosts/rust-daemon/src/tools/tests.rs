@@ -39,7 +39,7 @@ fn tool_registry_accepts_web_fetch_descriptor() {
     let tools = vec![ToolDescriptor {
         name: "web_fetch".into(),
         description: "Fetch a URL".into(),
-        parameters: BTreeMap::from([
+        parameters_schema: BTreeMap::from([
             ("type".into(), DataValue::String("object".into())),
             (
                 "properties".into(),
@@ -71,7 +71,7 @@ fn tool_registry_accepts_exa_search_descriptor() {
     let tools = vec![ToolDescriptor {
         name: "exa_search".into(),
         description: "Search Exa".into(),
-        parameters: BTreeMap::from([
+        parameters_schema: BTreeMap::from([
             ("type".into(), DataValue::String("object".into())),
             (
                 "properties".into(),
@@ -95,13 +95,13 @@ fn tool_registry_accepts_calculate_and_get_current_time_descriptors() {
         ToolDescriptor {
             name: "calculate".into(),
             description: "Evaluate math".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "get_current_time".into(),
             description: "Current time".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];
@@ -118,13 +118,13 @@ fn tool_registry_accepts_read_file_and_list_dir_descriptors() {
         ToolDescriptor {
             name: "read_file".into(),
             description: "Read a file".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "list_dir".into(),
             description: "List a directory".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];
@@ -141,13 +141,13 @@ fn tool_registry_accepts_glob_and_grep_descriptors() {
         ToolDescriptor {
             name: "glob".into(),
             description: "Find files".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "grep".into(),
             description: "Search files".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];
@@ -164,19 +164,19 @@ fn tool_registry_accepts_write_edit_and_multi_edit_descriptors() {
         ToolDescriptor {
             name: "write_file".into(),
             description: "Write a file".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "edit_file".into(),
             description: "Edit a file".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "multi_edit".into(),
             description: "Edit a file atomically".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];
@@ -194,31 +194,31 @@ fn tool_registry_accepts_bash_and_background_descriptors() {
         ToolDescriptor {
             name: "bash".into(),
             description: "Run a shell command".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "bg_start".into(),
             description: "Start background process".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "bg_output".into(),
             description: "Read background output".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "bg_stop".into(),
             description: "Stop background process".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "bg_list".into(),
             description: "List background processes".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];
@@ -238,13 +238,13 @@ fn tool_registry_accepts_swarm_messaging_descriptors() {
         ToolDescriptor {
             name: "send_message".into(),
             description: "Send a swarm message".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "broadcast_message".into(),
             description: "Broadcast a swarm message".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];
@@ -261,13 +261,13 @@ fn tool_registry_accepts_todo_descriptors() {
         ToolDescriptor {
             name: "todo_write".into(),
             description: "Write todos".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
         ToolDescriptor {
             name: "todo_read".into(),
             description: "Read todos".into(),
-            parameters: BTreeMap::new(),
+            parameters_schema: BTreeMap::new(),
             examples: None,
         },
     ];

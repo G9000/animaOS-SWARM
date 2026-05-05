@@ -2,7 +2,26 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import lucode from 'lucode-starlight';
 
+const site = process.env.ANIMAOS_CONTRIBUTOR_DOCS_SITE ?? 'https://g9000.github.io/animaOS-SWARM/contributor-docs';
+
+function contributorSidebarOverride() {
+  return {
+    name: 'contributor-sidebar-override',
+    hooks: {
+      'config:setup'({ config, updateConfig }) {
+        updateConfig({
+          components: {
+            ...(config.components ?? {}),
+            Sidebar: './src/components/Sidebar.astro',
+          },
+        });
+      },
+    },
+  };
+}
+
 export default defineConfig({
+  site,
   srcDir: './src',
   outDir: './dist',
   server: {
@@ -16,7 +35,10 @@ export default defineConfig({
       social: [
         { icon: 'github', label: 'GitHub', href: 'https://github.com/G9000/animaOS-SWARM' },
       ],
-      plugins: [lucode({ footerText: 'Built with [animaOS](https://github.com/G9000/animaOS-SWARM).' })],
+      plugins: [
+        lucode({ footerText: 'Built with [animaOS](https://github.com/G9000/animaOS-SWARM).' }),
+        contributorSidebarOverride(),
+      ],
       sidebar: [
         { label: 'Overview', link: '/overview/' },
         { label: 'Philosophy', link: '/philosophy/' },
@@ -59,9 +81,6 @@ export default defineConfig({
       ],
       customCss: ['./src/styles/custom.css'],
       favicon: '/favicon.png',
-      components: {
-        Sidebar: './src/components/Sidebar.astro',
-      },
     }),
   ],
 });

@@ -8,7 +8,7 @@ import type { Content, Message, TaskResult } from "./primitives.js"
 export interface Action {
 	name: string
 	description: string
-	parameters: Record<string, unknown>
+	parametersSchema: Record<string, unknown>
 
 	/** Validate whether this action should be available given current state */
 	validate?: (runtime: IAgentRuntime, message: Message) => Promise<boolean>
@@ -37,6 +37,8 @@ export interface ActionExample {
 export interface Provider {
 	name: string
 	description: string
+	/** Higher values run earlier. Ties preserve registration order. */
+	priority?: () => number
 
 	/** Generate context data for the current request */
 	get: (runtime: IAgentRuntime, message: Message) => Promise<ProviderResult>
@@ -54,6 +56,8 @@ export interface ProviderResult {
 export interface Evaluator {
 	name: string
 	description: string
+	/** Higher values run earlier. Ties preserve registration order. */
+	priority?: () => number
 
 	/** Whether this evaluator should run for the given message */
 	validate: (runtime: IAgentRuntime, message: Message) => Promise<boolean>
@@ -66,9 +70,14 @@ export interface Evaluator {
 	) => Promise<EvaluatorResult>
 }
 
+export type EvaluatorDecision =
+	| { type: "accept" }
+	| { type: "retry"; feedback: string }
+	| { type: "abort"; reason: string }
+
 export interface EvaluatorResult {
+	decision?: EvaluatorDecision
 	score?: number
-	feedback?: string
 	followUp?: Content
 	metadata?: Record<string, unknown>
 }

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto"
+
 import type { EventType, EventHandler, IEventBus, Event } from "../types/events.js"
 
 export class EventBus implements IEventBus {
@@ -19,9 +21,10 @@ export class EventBus implements IEventBus {
 
 	async emit<T = unknown>(type: EventType, data: T, agentId?: string): Promise<void> {
 		const event: Event<T> = {
+			id: randomUUID(),
 			type,
 			agentId,
-			timestamp: Date.now(),
+			timestampMs: Date.now(),
 			data,
 		}
 

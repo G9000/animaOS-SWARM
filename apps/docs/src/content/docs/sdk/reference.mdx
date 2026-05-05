@@ -226,7 +226,7 @@ Accessed via `client.memories`.
 |-------|------|
 | `temperature` | `number` |
 | `maxTokens` | `number` |
-| `timeout` | `number` |
+| `timeoutMs` | `number` |
 | `maxRetries` | `number` |
 | `[key: string]` | `unknown` |
 
@@ -238,7 +238,7 @@ Accessed via `client.memories`.
 | `name` | `string` |
 | `status` | `AgentStatus` |
 | `config` | `AgentConfig` |
-| `createdAt` | `number` |
+| `createdAtMs` | `number` |
 | `tokenUsage` | `TokenUsage` |
 
 ### `AgentStatus`
@@ -288,7 +288,7 @@ Accessed via `client.memories`.
 |-------|------|----------|
 | `name` | `string` | ✅ |
 | `description` | `string` | ✅ |
-| `parameters` | `Record<string, unknown>` | ✅ |
+| `parametersSchema` | `Record<string, unknown>` | ✅ |
 | `handler` | `(runtime, message, args) => Promise<TaskResult>` | ✅ |
 | `validate` | `(runtime, message) => Promise<boolean>` | — |
 | `examples` | `ActionExample[]` | — |

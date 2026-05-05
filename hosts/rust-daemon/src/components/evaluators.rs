@@ -270,10 +270,14 @@ impl Evaluator for ReflectionMemoryEvaluator {
             }
         };
 
+        metadata.insert(
+            "evaluationSummary".into(),
+            DataValue::String(feedback.into()),
+        );
+
         Ok(EvaluatorResult {
-            feedback: Some(feedback.into()),
             metadata: Some(metadata),
-            ..EvaluatorResult::default()
+            ..EvaluatorResult::accept()
         })
     }
 }
@@ -697,7 +701,7 @@ mod tests {
                 metadata: Some(message_metadata),
             },
             role: MessageRole::User,
-            created_at: 0,
+            created_at_ms: 0,
         };
         let response = Content {
             text: "operator handled task: I prefer terse release summaries".into(),

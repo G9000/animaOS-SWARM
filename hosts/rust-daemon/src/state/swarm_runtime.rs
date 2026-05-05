@@ -61,9 +61,12 @@ impl DaemonState {
                     }
                 });
                 let config = with_swarm_messaging_tools(context.config.clone());
+                let persistence_agent_id =
+                    stable_swarm_persistence_agent_id(&context.swarm_id, &config.name);
                 let inbox = context.inbox.clone();
                 let participants = context.participants.clone();
                 let mut initial_runtime = build_swarm_runtime(
+                    persistence_agent_id.clone(),
                     config.clone(),
                     Arc::clone(&model_adapter),
                     Arc::clone(&memory),
@@ -98,8 +101,9 @@ impl DaemonState {
                         let tool_context = tool_context.clone();
                         let runtime_events = Arc::clone(&runtime_events);
                         let db = db.clone();
-                        move |input: String| {
+                        move |input: Content| {
                             let runtime = Arc::clone(&runtime);
+                            let persistence_agent_id = persistence_agent_id.clone();
                             let config = config.clone();
                             let memory = Arc::clone(&memory);
                             let memory_embeddings = Arc::clone(&memory_embeddings);
@@ -120,6 +124,7 @@ impl DaemonState {
                                 let mut runtime = runtime.lock().await;
                                 if needs_reset.swap(false, Ordering::AcqRel) {
                                     let mut new_runtime = build_swarm_runtime(
+                                        persistence_agent_id,
                                         config,
                                         Arc::clone(&model_adapter),
                                         Arc::clone(&memory),
@@ -135,35 +140,28 @@ impl DaemonState {
                                     *runtime = new_runtime;
                                 }
                                 let result = runtime
-                                    .run_with_tools(
-                                        Content {
-                                            text: input,
-                                            attachments: None,
-                                            metadata: None,
-                                        },
-                                        |agent, user_message, tool_call| {
-                                            let delegate_task = delegate_task.clone();
-                                            let delegate_tasks = delegate_tasks.clone();
-                                            let send = send.clone();
-                                            let broadcast = broadcast.clone();
-                                            let participants = participants.clone();
-                                            let tool_context = tool_context.clone();
-                                            async move {
-                                                execute_swarm_tool(
-                                                    send,
-                                                    broadcast,
-                                                    participants,
-                                                    delegate_task,
-                                                    delegate_tasks,
-                                                    tool_context,
-                                                    agent,
-                                                    user_message,
-                                                    tool_call,
-                                                )
-                                                .await
-                                            }
-                                        },
-                                    )
+                                    .run_with_tools(input, |agent, user_message, tool_call| {
+                                        let delegate_task = delegate_task.clone();
+                                        let delegate_tasks = delegate_tasks.clone();
+                                        let send = send.clone();
+                                        let broadcast = broadcast.clone();
+                                        let participants = participants.clone();
+                                        let tool_context = tool_context.clone();
+                                        async move {
+                                            execute_swarm_tool(
+                                                send,
+                                                broadcast,
+                                                participants,
+                                                delegate_task,
+                                                delegate_tasks,
+                                                tool_context,
+                                                agent,
+                                                user_message,
+                                                tool_call,
+                                            )
+                                            .await
+                                        }
+                                    })
                                     .await;
 
                                 *token_usage
@@ -218,6 +216,7 @@ impl DaemonState {
 }
 
 fn build_swarm_runtime(
+    persistence_agent_id: String,
     config: AgentConfig,
     model_adapter: Arc<dyn ModelAdapter>,
     memory: SharedMemoryStore,
@@ -228,6 +227,7 @@ fn build_swarm_runtime(
     event_listener: Arc<dyn Fn(EngineEvent) + Send + Sync>,
 ) -> AgentRuntime {
     let mut runtime = AgentRuntime::new(config, model_adapter);
+    runtime.set_persistence_agent_id(persistence_agent_id);
     runtime.set_event_listener(event_listener);
     let mut providers = default_providers(Arc::clone(&memory));
     providers.push(Arc::new(SwarmInboxProvider { inbox }));
@@ -236,6 +236,10 @@ fn build_swarm_runtime(
     runtime.set_evaluators(default_evaluators(memory, memory_embeddings, memory_store));
     runtime.init();
     runtime
+}
+
+fn stable_swarm_persistence_agent_id(swarm_id: &str, agent_name: &str) -> String {
+    format!("{swarm_id}:agent:{agent_name}")
 }
 
 struct SwarmParticipantsProvider {
@@ -352,7 +356,7 @@ fn send_message_tool_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: "send_message".into(),
         description: "Send a message to another live swarm agent by coordinator agent id or configured agent name".into(),
-        parameters: send_message_parameters(),
+        parameters_schema: send_message_parameters(),
         examples: None,
     }
 }
@@ -386,7 +390,7 @@ fn broadcast_message_tool_descriptor() -> ToolDescriptor {
     ToolDescriptor {
         name: "broadcast_message".into(),
         description: "Broadcast a message to every other live swarm agent".into(),
-        parameters: object_parameters(vec![("message", "Message text to broadcast")]),
+        parameters_schema: object_parameters(vec![("message", "Message text to broadcast")]),
         examples: None,
     }
 }

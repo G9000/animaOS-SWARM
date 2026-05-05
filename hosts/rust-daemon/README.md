@@ -15,12 +15,13 @@ For an implementation walkthrough, see [Rust Daemon Architecture](../../docs/rus
 |---|---|---|
 | `ANTHROPIC_API_KEY` | Yes (for Anthropic models) | API key for the Anthropic provider. Aliases: `ANTHROPIC_KEY`, `ANTHROPIC_TOKEN`, `CLAUDE_API_KEY`. |
 | `OPENAI_API_KEY` | Yes (for OpenAI models) | API key for OpenAI-compatible providers. Aliases: `OPENAI_KEY`, `OPENAI_TOKEN`. |
-| `DATABASE_URL` | No | Postgres connection string. When set, the daemon connects, runs migrations, and injects `SqlxPostgresAdapter` into all agents for step-log persistence. Absent means in-memory only, with no step durability. |
+| `DATABASE_URL` | No | Postgres connection string. When set, the daemon connects, runs migrations, and injects `SqlxPostgresAdapter` into all agents for step-log persistence plus completed-tool reuse for retried requests that repeat the same metadata retry key. Absent means in-memory only, with no step durability. |
 | `ANIMAOS_RS_HOST` | No | Bind host (default `127.0.0.1`). |
 | `ANIMAOS_RS_PORT` | No | Bind port (default `8080`). |
 | `ANIMAOS_RS_MAX_REQUEST_BYTES` | No | Request body size limit in bytes (default `65536` / 64 KB). |
 | `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` | No | Per-request timeout in seconds for standard routes and blocking `/run` endpoints (default `30`). |
 | `ANIMAOS_RS_PERSISTENCE_MODE` | No | Persistence mode: `memory` (default) or `postgres`. `postgres` requires `DATABASE_URL` and fails startup if Postgres is unavailable or migrations fail. |
+| `ANIMAOS_RS_CONTROL_PLANE_FILE` | No | Host-owned JSON snapshot file for registered agents, swarms, and their latest runtime snapshots. When set, the daemon loads it at startup and autosaves after agent/swarm create, delete, start, and completion transitions. |
 | `ANIMAOS_RS_MEMORY_FILE` | No | Host-owned JSON snapshot file for runtime memories, entities, relationships, and temporal records. Mutating memory routes/tools/evaluators autosave the snapshot. Set only one of this and `ANIMAOS_RS_MEMORY_SQLITE_FILE`. |
 | `ANIMAOS_RS_MEMORY_SQLITE_FILE` | No | Host-owned SQLite snapshot file for runtime memories, entities, relationships, temporal records, and, by default, embedding vectors. Memory snapshots use the daemon `memory_store_snapshots` table; embeddings use separate `memory_embeddings` tables. |
 | `ANIMAOS_RS_MAX_CONCURRENT_RUNS` | No | Max number of concurrent `/api/agents/{id}/run` and `/api/swarms/{id}/run` requests before the daemon returns `503 Service Unavailable` (default `8`). |
@@ -134,6 +135,11 @@ ANIMAOS_RS_MEMORY_SQLITE_FILE=./data/runtime-memories.sqlite \
   ANTHROPIC_API_KEY=sk-ant-... \
   cargo run -p anima-daemon
 
+# With restart recovery for the agent/swarm control plane
+ANIMAOS_RS_CONTROL_PLANE_FILE=./data/control-plane.json \
+  ANTHROPIC_API_KEY=sk-ant-... \
+  cargo run -p anima-daemon
+
 # With real local multilingual semantic memory embeddings
 ANIMAOS_RS_MEMORY_SQLITE_FILE=./data/runtime-memories.sqlite \
 ANIMAOS_RS_MEMORY_EMBEDDINGS=fastembed \
@@ -156,7 +162,7 @@ curl http://127.0.0.1:8080/health
 # {"status":"ok"}
 
 curl http://127.0.0.1:8080/ready
-# {"status":"ready","controlPlaneDurability":"ephemeral",...}
+# {"status":"ready","controlPlaneDurability":"json",...}
 ```
 
 Browse the Scalar UI at `http://127.0.0.1:8080/docs`.
@@ -165,20 +171,22 @@ Browse the Scalar UI at `http://127.0.0.1:8080/docs`.
 
 ## Startup sequence
 
-1. Read `ANIMAOS_RS_HOST`, `ANIMAOS_RS_PORT`, `ANIMAOS_RS_MAX_REQUEST_BYTES`, `ANIMAOS_RS_REQUEST_TIMEOUT_SECS`, `ANIMAOS_RS_PERSISTENCE_MODE`, `ANIMAOS_RS_MAX_CONCURRENT_RUNS`, and `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES`, then bind the TCP listener.
+1. Read `ANIMAOS_RS_HOST`, `ANIMAOS_RS_PORT`, `ANIMAOS_RS_MAX_REQUEST_BYTES`, `ANIMAOS_RS_REQUEST_TIMEOUT_SECS`, `ANIMAOS_RS_PERSISTENCE_MODE`, `ANIMAOS_RS_CONTROL_PLANE_FILE`, `ANIMAOS_RS_MAX_CONCURRENT_RUNS`, and `ANIMAOS_RS_MAX_BACKGROUND_PROCESSES`, then bind the TCP listener.
 2. Build `RuntimeModelAdapter::from_env()` to load provider API keys and base URLs.
 3. Initialize `tracing` so every HTTP request is logged with method, URI, latency, and `x-request-id`, and log the daemon as an `ephemeral` control plane at startup.
-4. If persistence mode is `memory`, start without Postgres and log that choice explicitly.
-5. If persistence mode is `postgres`, require `DATABASE_URL`, connect, run embedded migrations from `./migrations`, and fail startup immediately if any step fails.
-6. Inject `SqlxPostgresAdapter` into shared daemon state so all new agents get step persistence automatically.
-7. Start Axum with request-id propagation, tracing middleware, request timeouts for both standard and blocking `/run` routes, a semaphore-backed concurrent-run admission limit, readiness and metrics endpoints, and graceful shutdown on `Ctrl+C`.
+4. If `ANIMAOS_RS_CONTROL_PLANE_FILE` is set, load registered agents and swarms from that JSON snapshot, then autosave control-plane changes back to the same file.
+5. If persistence mode is `memory`, start without Postgres and log that choice explicitly.
+6. If persistence mode is `postgres`, require `DATABASE_URL`, connect, run embedded migrations from `./migrations`, and fail startup immediately if any step fails.
+7. Inject `SqlxPostgresAdapter` into shared daemon state so all new agents get step persistence automatically, including reuse of completed tool results when a caller retries with the same metadata retry key.
+8. Start Axum with request-id propagation, tracing middleware, request timeouts for both standard and blocking `/run` routes, a semaphore-backed concurrent-run admission limit, readiness and metrics endpoints, and graceful shutdown on `Ctrl+C`.
 
 ---
 
 ## Operational notes
 
-- The daemon currently acts as an explicit `ephemeral` control plane. Agent and swarm runtime state lives in memory.
-- Postgres persistence adds step-log durability, but it does not make the daemon itself stateful across process restarts.
+- Without `ANIMAOS_RS_CONTROL_PLANE_FILE`, the daemon acts as an `ephemeral` control plane and agent/swarm registrations live only in memory.
+- With `ANIMAOS_RS_CONTROL_PLANE_FILE`, the daemon restores registered agents, registered swarms, latest snapshots, and swarm message history after process restart. Work that was marked running before the restart is restored as failed/interrupted; the daemon does not resume a model turn from the middle.
+- Postgres persistence adds step-log durability and lets retried runs reuse completed tool results when the request repeats the same metadata retry key. It complements the control-plane file rather than replacing it.
 - Readiness reports `database: "missing"` and returns `503` when `ANIMAOS_RS_PERSISTENCE_MODE=postgres` is set without a working database adapter.
 - Metrics include configured limits such as `anima_daemon_max_concurrent_runs` and `anima_daemon_max_background_processes`, plus current counts like `anima_daemon_agents`, `anima_daemon_swarms`, and `anima_daemon_background_processes`.
 

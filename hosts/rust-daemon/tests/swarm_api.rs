@@ -1,5 +1,11 @@
 mod support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use anima_core::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
+use anima_daemon::app_with_database;
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -32,6 +38,85 @@ use support::{
     extract_json_string_field, extract_json_u64_field, extract_sse_event_data, send_empty_request,
     send_json_request, test_app, use_temp_workspace_root,
 };
+
+#[derive(Default)]
+struct RecordingDatabase {
+    steps: Mutex<Vec<Step>>,
+    write_calls: AtomicUsize,
+    query_calls: AtomicUsize,
+}
+
+impl RecordingDatabase {
+    fn write_calls(&self) -> usize {
+        self.write_calls.load(Ordering::SeqCst)
+    }
+
+    fn query_calls(&self) -> usize {
+        self.query_calls.load(Ordering::SeqCst)
+    }
+
+    fn steps(&self) -> Vec<Step> {
+        self.steps
+            .lock()
+            .expect("recorded steps mutex should not be poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl DatabaseAdapter for RecordingDatabase {
+    async fn write_step(&self, step: &Step) -> PersistenceResult<()> {
+        self.write_calls.fetch_add(1, Ordering::SeqCst);
+        let mut steps = self
+            .steps
+            .lock()
+            .map_err(|error| PersistenceError::Write(format!("Mutex poisoned: {error}")))?;
+
+        if let Some(existing) = steps.iter_mut().find(|existing| {
+            existing.agent_id == step.agent_id && existing.idempotency_key == step.idempotency_key
+        }) {
+            if !matches!(existing.status, StepStatus::Done | StepStatus::Failed) {
+                existing.status = step.status.clone();
+                existing.input = step.input.clone();
+                existing.output = step.output.clone();
+            }
+            return Ok(());
+        }
+
+        steps.push(step.clone());
+        Ok(())
+    }
+
+    async fn get_step_by_idempotency_key(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> PersistenceResult<Option<Step>> {
+        self.query_calls.fetch_add(1, Ordering::SeqCst);
+        let steps = self
+            .steps
+            .lock()
+            .map_err(|error| PersistenceError::Query(format!("Mutex poisoned: {error}")))?;
+
+        Ok(steps
+            .iter()
+            .find(|step| step.agent_id == agent_id && step.idempotency_key == key)
+            .cloned())
+    }
+
+    async fn list_agent_steps(&self, agent_id: &str) -> PersistenceResult<Vec<Step>> {
+        let steps = self
+            .steps
+            .lock()
+            .map_err(|error| PersistenceError::Query(format!("Mutex poisoned: {error}")))?;
+
+        Ok(steps
+            .iter()
+            .filter(|step| step.agent_id == agent_id)
+            .cloned()
+            .collect())
+    }
+}
 
 #[tokio::test]
 async fn create_swarm_returns_created_idle_snapshot() {
@@ -75,6 +160,64 @@ async fn run_swarm_returns_result_and_updates_swarm_state() {
     assert!(response.contains(
         "[worker-a]: worker-a handled task: Continue working on this task: Coordinate the patch"
     ));
+}
+
+#[tokio::test]
+async fn retried_swarm_run_reuses_completed_tool_step_over_http() {
+    let database = Arc::new(RecordingDatabase::default());
+    let database_adapter: Arc<dyn DatabaseAdapter> = database.clone();
+    let app = app_with_database(database_adapter);
+    let (_, create_response) = create_swarm_with_body(
+        &app,
+        r#"{
+            "strategy":"round-robin",
+            "manager":{
+                "name":"manager",
+                "model":"gpt-5.4",
+                "tools":[{
+                    "name":"memory_search",
+                    "description":"Search memories",
+                    "parameters":{"query":{"type":"string"}}
+                }]
+            },
+            "workers":[{"name":"worker-a","model":"gpt-5.4"}],
+            "maxTurns":1
+        }"#,
+    )
+    .await;
+    let swarm_id = extract_json_string_field(&create_response, "id");
+    let retry_body = r#"{
+        "text":"search retry durability",
+        "metadata":{"retryKey":"swarm-http-retry-1"}
+    }"#;
+
+    let (first_status, first_response) = run_swarm(&app, &swarm_id, retry_body).await;
+    let first_write_calls = database.write_calls();
+
+    let (second_status, second_response) = run_swarm(&app, &swarm_id, retry_body).await;
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::OK);
+    assert!(first_response.contains("\"status\":\"success\""));
+    assert!(second_response.contains("\"status\":\"success\""));
+    assert_eq!(
+        first_write_calls, 2,
+        "first tool execution should write pending and terminal steps"
+    );
+    assert_eq!(
+        database.write_calls(),
+        first_write_calls,
+        "retried swarm run should recover the completed tool result without new step writes"
+    );
+    assert!(
+        database.query_calls() >= 2,
+        "each run should look up the logical retry step"
+    );
+
+    let steps = database.steps();
+    assert_eq!(steps.len(), 1, "logical retry step should stay one row");
+    assert_eq!(steps[0].status, StepStatus::Done);
+    assert_eq!(steps[0].agent_id, format!("{swarm_id}:agent:manager"));
 }
 
 #[tokio::test]

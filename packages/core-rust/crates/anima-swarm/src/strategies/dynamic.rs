@@ -48,10 +48,12 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
         let chat_history = Arc::new(Mutex::new(Vec::<HistoryEntry>::new()));
 
         let choose_speaker: Arc<CoordinatorDelegateFn> = {
+            let ctx = ctx.clone();
             let worker_refs = Arc::clone(&worker_refs);
             let chat_history = Arc::clone(&chat_history);
             let available_agents = available_agents.clone();
             Arc::new(move |agent_name: String, instruction: String| {
+                let ctx = ctx.clone();
                 let worker_refs = Arc::clone(&worker_refs);
                 let chat_history = Arc::clone(&chat_history);
                 let available_agents = available_agents.clone();
@@ -96,7 +98,12 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
                     };
 
                     let prompt = format!("{instruction}{history_text}");
-                    let result = worker.run(prompt).await;
+                    let result = worker
+                        .run_content(ctx.scoped_text_content(
+                            format!("dynamic:speaker:{agent_name}:{prompt}"),
+                            prompt,
+                        ))
+                        .await;
                     let response_text = if result.status == TaskStatus::Success {
                         result
                             .data
@@ -134,7 +141,7 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            parameters: choose_speaker_parameters(),
+                    parameters_schema: choose_speaker_parameters(),
             examples: None,
         };
 
@@ -154,7 +161,9 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
             Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
         };
 
-        let result = manager.run(ctx.task().to_string()).await;
+        let result = manager
+            .run_content(ctx.scoped_task_content("dynamic:manager"))
+            .await;
         let duration_ms = start.elapsed().as_millis();
 
         TaskResult {

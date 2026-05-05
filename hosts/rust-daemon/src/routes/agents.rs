@@ -21,9 +21,13 @@ pub(crate) async fn handle_create_agent(
 
     let snapshot = {
         let mut guard = state.write().await;
-        guard
+        let snapshot = guard
             .create_agent(config)
-            .map_err(|message| ApiError::bad_request(message))?
+            .map_err(|message| ApiError::bad_request(message))?;
+        guard
+            .persist_control_plane()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        snapshot
     };
 
     Ok(AgentEnvelope {
@@ -68,7 +72,13 @@ pub(crate) async fn handle_delete_agent(
     agent_id: &str,
     state: &SharedDaemonState,
 ) -> Result<DeleteResponse, ApiError> {
-    state.write().await.remove_agent(agent_id);
+    {
+        let mut guard = state.write().await;
+        guard.remove_agent(agent_id);
+        guard
+            .persist_control_plane()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    }
 
     Ok(DeleteResponse { deleted: true })
 }
@@ -112,7 +122,13 @@ pub(crate) async fn handle_run_agent(
 
     let Some((mut runtime, tool_context)) = ({
         let mut guard = state.write().await;
-        guard.take_agent_runtime(agent_id)
+        let taken = guard.take_agent_runtime(agent_id);
+        if taken.is_some() {
+            guard
+                .persist_control_plane()
+                .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        }
+        taken
     }) else {
         return Err(ApiError::not_found());
     };
@@ -129,7 +145,11 @@ pub(crate) async fn handle_run_agent(
         .await;
     let (snapshot, runtime_id, runtime_name, memory, memory_embeddings, memory_store) = {
         let mut guard = state.write().await;
-        guard.restore_agent_runtime(runtime)
+        let restored = guard.restore_agent_runtime(runtime);
+        guard
+            .persist_control_plane()
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        restored
     };
 
     if let Some(content) = result.data.as_ref() {

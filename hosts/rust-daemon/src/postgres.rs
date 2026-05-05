@@ -22,7 +22,7 @@ impl DatabaseAdapter for SqlxPostgresAdapter {
             r#"
             INSERT INTO step_log (id, agent_id, step_index, idempotency_key, type, status, input, output)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-            ON CONFLICT (agent_id, step_index)
+            ON CONFLICT (agent_id, idempotency_key)
             DO UPDATE SET
                 status = CASE
                     WHEN step_log.status IN ('done', 'failed') THEN step_log.status

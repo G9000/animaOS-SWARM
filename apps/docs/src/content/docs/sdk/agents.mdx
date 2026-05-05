@@ -59,7 +59,7 @@ const config = agent({
 |-------|------|---------|-------------|
 | `temperature` | `number` | — | Sampling temperature (0–2) |
 | `maxTokens` | `number` | — | Maximum tokens per response |
-| `timeout` | `number` | — | Request timeout in milliseconds |
+| `timeoutMs` | `number` | — | Request timeout in milliseconds |
 | `maxRetries` | `number` | — | Retry count on transient failures |
 
 <Aside type="note">
@@ -124,7 +124,7 @@ console.log('Token usage:', snapshot.state.tokenUsage);
 | `name` | `string` | Agent name |
 | `status` | `AgentStatus` | Current runtime status |
 | `config` | `AgentConfig` | Full configuration snapshot |
-| `createdAt` | `number` | Unix timestamp (ms) |
+| `createdAtMs` | `number` | Unix timestamp (ms) |
 | `tokenUsage` | `TokenUsage` | Cumulative token consumption |
 
 ### `TokenUsage`
@@ -167,6 +167,23 @@ interface Attachment {
 }
 ```
 
+### Retrying a run safely
+
+When the Rust daemon is configured with Postgres persistence, completed tool steps can be reused on a retried run. To opt into that behavior, send a stable retry key in `metadata` and repeat the same value when retrying the same logical request.
+
+```typescript
+const run = await client.agents.run('agent-uuid-here', {
+  text: 'Research the latest advances in quantum computing',
+  metadata: {
+    retryKey: 'quantum-brief-2026-05-04',
+  },
+});
+```
+
+- Reuse only happens when you resend the same `retryKey` or `idempotencyKey`.
+- Fresh runs should omit the key or use a new value.
+- This is tool-step retry recovery, not full daemon process resume.
+
 ### `AgentRunResponse`
 
 | Field | Type | Description |
@@ -184,7 +201,7 @@ import { action } from '@animaOS-SWARM/sdk';
 const memorySearch = action({
   name: 'memory_search',
   description: 'Search stored memories by keyword',
-  parameters: {
+  parametersSchema: {
     query: { type: 'string', description: 'Search query' },
     limit: { type: 'number', description: 'Maximum matches to return' },
   },
@@ -205,7 +222,7 @@ const memorySearch = action({
 |-------|------|----------|-------------|
 | `name` | `string` | ✅ | Unique action identifier |
 | `description` | `string` | ✅ | LLM-visible description |
-| `parameters` | `Record<string, unknown>` | ✅ | JSON Schema parameters |
+| `parametersSchema` | `Record<string, unknown>` | ✅ | JSON Schema parameters |
 | `handler` | `(runtime, message, args) => Promise<TaskResult>` | ✅ | Execution logic |
 | `validate` | `(runtime, message) => Promise<boolean>` | — | Availability check |
 | `examples` | `ActionExample[]` | — | Few-shot examples for the LLM |
@@ -297,7 +314,7 @@ const client = createDaemonClient();
 const webFetch = action({
   name: 'web_fetch',
   description: 'Fetch and summarize a URL',
-  parameters: {
+  parametersSchema: {
     url: { type: 'string', description: 'URL to fetch' },
   },
   handler: async (_runtime, _message, args) => {

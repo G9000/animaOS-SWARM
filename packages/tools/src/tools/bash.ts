@@ -96,7 +96,7 @@ export async function executeBash(args: BashArgs): Promise<ToolResult> {
 export const bashAction: Action = {
   name: "bash",
   description: "Execute a shell command and return its output.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       command: {

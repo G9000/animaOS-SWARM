@@ -526,7 +526,7 @@ export async function generateAgentTeam(
         roomId: dummyId,
         content: { text: prompt },
         role: 'user',
-        createdAt: Date.now(),
+        createdAtMs: Date.now(),
       },
     ],
   });
@@ -703,7 +703,7 @@ export async function generateAgentSeeds(
         roomId: dummyId,
         content: { text: prompt },
         role: 'user',
-        createdAt: Date.now(),
+        createdAtMs: Date.now(),
       },
     ],
   });

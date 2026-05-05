@@ -10,7 +10,7 @@ pub use agent::{
     AgentConfig, AgentSettings, AgentState, AgentStatus, PluginDescriptor, TokenUsage,
     ToolDescriptor, ToolExample,
 };
-pub use components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
+pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use events::{EngineEvent, EventType};
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,

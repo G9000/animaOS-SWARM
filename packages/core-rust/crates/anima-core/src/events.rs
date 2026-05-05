@@ -1,6 +1,7 @@
-use crate::primitives::DataValue;
+use crate::primitives::{DataValue, UuidString};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EventType {
     AgentSpawned,
     AgentStarted,
@@ -41,11 +42,12 @@ impl EventType {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineEvent<T = DataValue> {
+    pub id: UuidString,
     pub event_type: EventType,
     pub agent_id: Option<String>,
-    pub timestamp: u128,
+    pub timestamp_ms: u64,
     pub data: T,
 }
 
@@ -64,13 +66,15 @@ mod tests {
     #[test]
     fn engine_event_holds_agent_id_and_payload() {
         let event = EngineEvent {
+            id: "event-1".into(),
             event_type: EventType::TaskCompleted,
             agent_id: Some("agent-1".into()),
-            timestamp: 123,
+            timestamp_ms: 123,
             data: DataValue::String("done".into()),
         };
 
+        assert_eq!(event.id, "event-1");
         assert_eq!(event.agent_id.as_deref(), Some("agent-1"));
-        assert_eq!(event.timestamp, 123);
+        assert_eq!(event.timestamp_ms, 123);
     }
 }

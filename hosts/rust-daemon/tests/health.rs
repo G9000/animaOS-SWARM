@@ -1,12 +1,40 @@
+#[allow(dead_code)]
+mod support;
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use anima_daemon::{app, serve, DaemonConfig};
+use anima_daemon::{app, app_with_configured_persistence, serve, DaemonConfig};
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tokio::net::TcpListener;
 use tower::util::ServiceExt;
+
+use support::use_temp_workspace_root;
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 #[tokio::test]
 async fn health_endpoint_returns_ok_json() {
@@ -105,6 +133,56 @@ async fn metrics_endpoint_returns_prometheus_text() {
     assert!(
         body.contains("anima_daemon_control_plane_durability_info{mode=\"ephemeral\"} 1"),
         "{body}"
+    );
+}
+
+#[tokio::test]
+async fn readiness_and_metrics_report_json_control_plane_store() {
+    let workspace = use_temp_workspace_root("control-plane-health");
+    let control_plane_path = workspace.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    let app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("app configures persistence");
+
+    let readiness = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/ready")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("app responds");
+    let metrics = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("app responds");
+
+    let readiness_body = to_bytes(readiness.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    let readiness_body = std::str::from_utf8(&readiness_body).expect("body is utf-8");
+    assert!(
+        readiness_body.contains("\"controlPlaneDurability\":\"json\""),
+        "{readiness_body}"
+    );
+
+    let metrics_body = to_bytes(metrics.into_body(), usize::MAX)
+        .await
+        .expect("body reads");
+    let metrics_body = std::str::from_utf8(&metrics_body).expect("body is utf-8");
+    assert!(
+        metrics_body.contains("anima_daemon_control_plane_durability_info{mode=\"json\"} 1"),
+        "{metrics_body}"
     );
 }
 

@@ -43,7 +43,7 @@ pub(crate) struct AgentSettingsResponse {
     pub(crate) temperature: Option<f64>,
     #[serde(rename = "maxTokens")]
     pub(crate) max_tokens: Option<u32>,
-    pub(crate) timeout: Option<u64>,
+    pub(crate) timeout_ms: Option<u64>,
     #[serde(rename = "maxRetries")]
     pub(crate) max_retries: Option<u32>,
     pub(crate) additional: BTreeMap<String, Value>,
@@ -74,7 +74,7 @@ pub(crate) struct AgentStateResponse {
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) config: AgentConfigResponse,
-    pub(crate) created_at: u128,
+    pub(crate) created_at_ms: u128,
     pub(crate) token_usage: TokenUsageResponse,
 }
 
@@ -96,7 +96,7 @@ pub(crate) struct AgentMessageResponse {
     pub(crate) room_id: String,
     pub(crate) content: ContentResponse,
     pub(crate) role: String,
-    pub(crate) created_at: u128,
+    pub(crate) created_at_ms: u128,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -163,7 +163,8 @@ pub(crate) struct AgentSettingsRequest {
     pub(crate) temperature: Option<Value>,
     #[serde(rename = "maxTokens")]
     pub(crate) max_tokens: Option<Value>,
-    pub(crate) timeout: Option<Value>,
+    #[serde(alias = "timeout")]
+    pub(crate) timeout_ms: Option<Value>,
     #[serde(rename = "maxRetries")]
     pub(crate) max_retries: Option<Value>,
     #[serde(flatten)]
@@ -240,14 +241,14 @@ impl ToolDescriptorRequest {
             Self::Name(name) if !name.is_empty() => Ok(ToolDescriptor {
                 name,
                 description: String::new(),
-                parameters: BTreeMap::new(),
+                parameters_schema: BTreeMap::new(),
                 examples: None,
             }),
             Self::Name(_) => Err("tools must contain strings or objects"),
             Self::Detailed(value) => Ok(ToolDescriptor {
                 name: required_string(value.name, "tool name is required")?,
                 description: value.description,
-                parameters: value
+                parameters_schema: value
                     .parameters
                     .into_iter()
                     .map(|(key, value)| {
@@ -314,10 +315,10 @@ impl AgentSettingsRequest {
             .take()
             .map(|value| u32_value(value, "maxTokens"))
             .transpose()?;
-        settings.timeout = self
-            .timeout
+        settings.timeout_ms = self
+            .timeout_ms
             .take()
-            .map(|value| u64_value(value, "timeout"))
+            .map(|value| u64_value(value, "timeoutMs"))
             .transpose()?;
         settings.max_retries = self
             .max_retries
@@ -369,7 +370,7 @@ impl From<&ToolDescriptor> for ToolDescriptorResponse {
             name: value.name.clone(),
             description: value.description.clone(),
             parameters: value
-                .parameters
+                .parameters_schema
                 .iter()
                 .map(|(key, value)| (key.clone(), data_value_to_json(value)))
                 .collect(),
@@ -395,7 +396,7 @@ impl From<&AgentSettings> for AgentSettingsResponse {
         Self {
             temperature: value.temperature,
             max_tokens: value.max_tokens,
-            timeout: value.timeout,
+            timeout_ms: value.timeout_ms,
             max_retries: value.max_retries,
             additional: value
                 .additional
@@ -439,7 +440,7 @@ impl From<&AgentState> for AgentStateResponse {
             name: value.name.clone(),
             status: value.status.as_str().to_string(),
             config: AgentConfigResponse::from(&value.config),
-            created_at: value.created_at,
+            created_at_ms: value.created_at_ms,
             token_usage: TokenUsageResponse::from(&value.token_usage),
         }
     }
@@ -469,7 +470,7 @@ impl From<&Message> for AgentMessageResponse {
             room_id: value.room_id.clone(),
             content: ContentResponse::from(&value.content),
             role: message_role_to_str(value.role).to_string(),
-            created_at: value.created_at,
+            created_at_ms: value.created_at_ms,
         }
     }
 }

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
 pub type UuidString = String;
 pub type AgentId = String;
 pub type RoomId = String;
@@ -7,7 +9,7 @@ pub type MessageId = String;
 
 pub const HEALTH_OK_JSON: &str = "{\"status\":\"ok\"}";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DataValue {
     Null,
     Bool(bool),
@@ -23,28 +25,28 @@ impl Default for DataValue {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttachmentType {
     File,
     Image,
     Url,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub attachment_type: AttachmentType,
     pub name: String,
     pub data: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Content {
     pub text: String,
     pub attachments: Option<Vec<Attachment>>,
     pub metadata: Option<BTreeMap<String, DataValue>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageRole {
     User,
     Assistant,
@@ -52,17 +54,17 @@ pub enum MessageRole {
     Tool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
     pub agent_id: AgentId,
     pub room_id: RoomId,
     pub content: Content,
     pub role: MessageRole,
-    pub created_at: u128,
+    pub created_at_ms: u128,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Success,
     Error,
@@ -98,7 +100,7 @@ impl Default for HealthStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskResult<T> {
     pub status: TaskStatus,
     pub data: Option<T>,

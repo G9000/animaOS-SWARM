@@ -17,7 +17,7 @@ function actionsToTools(actions: Action[]) {
 		function: {
 			name: a.name,
 			description: a.description,
-			parameters: a.parameters,
+			parameters: a.parametersSchema,
 		},
 	}))
 }

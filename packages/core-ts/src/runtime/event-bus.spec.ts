@@ -10,7 +10,10 @@ describe("EventBus", () => {
 		await bus.emit("agent:spawned", { name: "test" })
 
 		expect(handler).toHaveBeenCalledOnce()
-		expect(handler.mock.calls[0][0].data).toEqual({ name: "test" })
+		const event = handler.mock.calls[0][0]
+		expect(event.id).toEqual(expect.any(String))
+		expect(event.timestampMs).toEqual(expect.any(Number))
+		expect(event.data).toEqual({ name: "test" })
 	})
 
 	it("should unsubscribe", async () => {

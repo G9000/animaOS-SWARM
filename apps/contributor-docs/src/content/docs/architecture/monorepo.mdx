@@ -108,8 +108,8 @@ See [TypeScript Core](/architecture/typescript-core/) for details.
 
 The production-ready Rust host. It wraps the core crates in an Axum HTTP/SSE server, providing:
 - Provider adapters (OpenAI, Anthropic, Ollama, etc.)
-- Snapshot persistence (JSON + optional SQLite)
-- Optional Postgres step-log durability
+- Memory snapshots (JSON + optional SQLite)
+- Optional Postgres step-log durability plus explicit retry-key tool-step reuse
 - SSE streaming for swarm events
 - Prometheus metrics, readiness probes, OpenAPI docs
 

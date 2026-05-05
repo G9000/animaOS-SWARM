@@ -28,6 +28,7 @@ struct ManagedProcess {
     command: String,
     child: Child,
     output_state: Arc<Mutex<ManagedProcessOutput>>,
+    output_threads: Vec<thread::JoinHandle<()>>,
     started_at: Instant,
 }
 
@@ -85,6 +86,7 @@ impl Drop for ProcessManager {
         for managed in self.processes.values_mut() {
             let _ = managed.child.kill();
             let _ = managed.child.wait();
+            join_output_readers(managed);
         }
     }
 }
@@ -143,8 +145,10 @@ pub(in super::super) fn start_background_process_from_root(
         .ok_or_else(|| "bg_start stderr could not be captured".to_string())?;
 
     let output_state = Arc::new(Mutex::new(ManagedProcessOutput::default()));
-    spawn_process_output_reader(stdout, Arc::clone(&output_state), false);
-    spawn_process_output_reader(stderr, Arc::clone(&output_state), true);
+    let output_threads = vec![
+        spawn_process_output_reader(stdout, Arc::clone(&output_state), false),
+        spawn_process_output_reader(stderr, Arc::clone(&output_state), true),
+    ];
 
     let id = format!("bg-{}", manager.next_id);
     manager.next_id += 1;
@@ -155,6 +159,7 @@ pub(in super::super) fn start_background_process_from_root(
             command: command.to_string(),
             child,
             output_state,
+            output_threads,
             started_at: Instant::now(),
         },
     );
@@ -252,6 +257,7 @@ pub(in super::super) fn stop_background_process(
         if let Ok(mut output_state) = managed.output_state.lock() {
             output_state.exit_code = status.code();
         }
+        join_output_readers(&mut managed);
     }
 
     Ok(format!("Stopped and removed {}.", id))
@@ -322,16 +328,25 @@ fn sync_managed_process_exit(managed: &mut ManagedProcess) -> Result<(), String>
             .lock()
             .map_err(|_| "background process output lock poisoned".to_string())?;
         output_state.exit_code = Some(code);
+        drop(output_state);
+        join_output_readers(managed);
     }
 
     Ok(())
+}
+
+fn join_output_readers(managed: &mut ManagedProcess) {
+    for thread in managed.output_threads.drain(..) {
+        let _ = thread.join();
+    }
 }
 
 fn spawn_process_output_reader<R>(
     reader: R,
     output_state: Arc<Mutex<ManagedProcessOutput>>,
     stderr: bool,
-) where
+) -> thread::JoinHandle<()>
+where
     R: std::io::Read + Send + 'static,
 {
     thread::spawn(move || {
@@ -357,5 +372,5 @@ fn spawn_process_output_reader<R>(
             }
             output.lines.push(rendered);
         }
-    });
+    })
 }

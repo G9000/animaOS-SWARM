@@ -11,12 +11,14 @@ import { Aside } from '@astrojs/starlight/components';
 
 ## Operational Notes
 
-### Ephemeral Control Plane
+### Control Plane Durability
 
-The daemon is an explicit `ephemeral` control plane. Agent and swarm runtime state lives in memory. This means:
+By default, the daemon is an `ephemeral` control plane and agent/swarm runtime state lives in memory. For restart recovery, set `ANIMAOS_RS_CONTROL_PLANE_FILE` to a JSON snapshot path.
 
-- **Process restart = lost runtime state.** Agents and swarms must be recreated after a restart.
-- **Postgres persistence adds step-log durability only.** It does not make the daemon stateful across restarts.
+- **JSON control-plane snapshots recover registrations.** Agents, swarms, latest snapshots, and swarm message history are restored after a restart.
+- **Interrupted runs are not resumed mid-turn.** Work marked running before restart is restored as failed/interrupted so callers can retry intentionally.
+- **Postgres persistence adds step-log durability only.** Use `ANIMAOS_RS_CONTROL_PLANE_FILE` for restart recovery of agent and swarm registrations.
+- **Retried requests can reuse completed tool steps.** When the caller repeats the same `retryKey` or `idempotencyKey` metadata, Postgres-backed step logs let the daemon skip re-executing already completed tools.
 - **Snapshots preserve memory state.** Set `ANIMAOS_RS_MEMORY_SQLITE_FILE` or `ANIMAOS_RS_MEMORY_FILE` to persist memories across restarts.
 
 ### Readiness Behavior
@@ -32,6 +34,7 @@ Prometheus metrics exposed at `/metrics`:
 | `anima_daemon_agents` | Gauge | Current number of registered agents |
 | `anima_daemon_swarms` | Gauge | Current number of registered swarms |
 | `anima_daemon_background_processes` | Gauge | Current bg processes |
+| `anima_daemon_control_plane_durability_info` | Gauge | `ephemeral` or `json` control-plane mode |
 | `anima_daemon_max_concurrent_runs` | Gauge | Configured concurrent run limit |
 | `anima_daemon_max_background_processes` | Gauge | Configured bg process limit |
 | `http_requests_total` | Counter | Total HTTP requests |
@@ -170,6 +173,7 @@ Type=simple
 ExecStart=/usr/local/bin/anima-daemon
 Restart=always
 Environment=ANIMAOS_RS_PORT=8080
+Environment=ANIMAOS_RS_CONTROL_PLANE_FILE=/var/lib/anima/control-plane.json
 Environment=ANIMAOS_RS_MEMORY_SQLITE_FILE=/var/lib/anima/memories.sqlite
 
 [Install]

@@ -29,7 +29,7 @@ export function executeWrite(args: WriteArgs): {
 export const writeAction: Action = {
   name: "write_file",
   description: "Write content to a file, creating directories as needed.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       file_path: {

@@ -9,6 +9,7 @@ authors.workspace = true
 anima-core = { path = "../anima-core" }
 anima-memory = { path = "../anima-memory" }
 futures = "0.3"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["sync"] }
 
 [lints]

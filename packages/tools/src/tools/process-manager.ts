@@ -204,7 +204,7 @@ export const bgStartAction: Action = {
   name: "bg_start",
   description:
     "Start a command in the background (dev servers, watchers, builds). Returns a process ID for reading output or stopping later.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       command: {
@@ -232,7 +232,7 @@ export const bgOutputAction: Action = {
   name: "bg_output",
   description:
     "Read output from a background process. By default returns only new lines since last read.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       id: {
@@ -259,7 +259,7 @@ export const bgOutputAction: Action = {
 export const bgStopAction: Action = {
   name: "bg_stop",
   description: "Kill a background process and remove it from the process list.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       id: {
@@ -282,7 +282,7 @@ export const bgStopAction: Action = {
 export const bgListAction: Action = {
   name: "bg_list",
   description: "List all background processes with their status and uptime.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {},
   },

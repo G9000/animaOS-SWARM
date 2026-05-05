@@ -57,6 +57,10 @@ The **core** is where all the intelligence lives. It has zero I/O dependencies â
 
 The **host** wraps the core and exposes it over a runtime boundary. The production-ready Rust host provides an Axum HTTP/SSE server. Other hosts (Elixir, Python) are planned for future releases.
 
+<Aside type="note">
+  With Postgres-backed daemon persistence enabled, tool steps are written durably and can be reused on an explicit retry. Reuse is request-keyed, not prompt-keyed: callers must repeat the same `retryKey` or `idempotencyKey` in request metadata for a retried run to reuse completed tool results.
+</Aside>
+
 ## Key Concepts
 
 ### Agents

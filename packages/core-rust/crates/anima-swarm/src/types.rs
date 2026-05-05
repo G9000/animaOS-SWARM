@@ -2,8 +2,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anima_core::{AgentConfig, Content, TaskResult, TokenUsage};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwarmStrategy {
     Supervisor,
     Dynamic,
@@ -20,7 +21,7 @@ impl SwarmStrategy {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SwarmConfig {
     pub strategy: SwarmStrategy,
     pub manager: AgentConfig,
@@ -31,7 +32,7 @@ pub struct SwarmConfig {
     pub token_budget: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SwarmStatus {
     Idle,
     Running,
@@ -50,7 +51,7 @@ impl SwarmStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SwarmState {
     pub id: String,
     pub status: SwarmStatus,
@@ -62,7 +63,7 @@ pub struct SwarmState {
     pub completed_at: Option<u128>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgentMessage {
     pub id: String,
     pub from: String,
@@ -85,7 +86,7 @@ pub type SwarmFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub type SwarmAgentRunFn =
     dyn Fn(String) -> SwarmFuture<'static, TaskResult<Content>> + Send + Sync + 'static;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwarmDelegation {
     pub worker_name: String,
     pub task: String,

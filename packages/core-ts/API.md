@@ -47,7 +47,7 @@ import { agent, action, plugin } from '@animaOS-SWARM/core';
 |-------|------|-------------|
 | `temperature` | `number` | Sampling temperature |
 | `maxTokens` | `number` | Max tokens per response |
-| `timeout` | `number` | Request timeout (ms) |
+| `timeoutMs` | `number` | Request timeout in milliseconds |
 | `maxRetries` | `number` | Retry count |
 | `[key: string]` | `unknown` | Provider-specific params |
 
@@ -56,10 +56,10 @@ import { agent, action, plugin } from '@animaOS-SWARM/core';
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | `UUID` | Unique identifier |
-| `name` | `string` | Agent name |
+| `name` | `string` | Denormalized display name mirrored from `config.name` |
 | `status` | `AgentStatus` | Runtime status |
 | `config` | `AgentConfig` | Configuration snapshot |
-| `createdAt` | `number` | Creation timestamp |
+| `createdAtMs` | `number` | Creation timestamp in epoch milliseconds |
 | `tokenUsage` | `TokenUsage` | Cumulative tokens |
 
 ### `AgentStatus`
@@ -119,7 +119,7 @@ Branded string type: `` `${string}-${string}-${string}-${string}-${string}` ``
 | `roomId` | `UUID` | Room context |
 | `content` | `Content` | Message body |
 | `role` | `'user' \| 'assistant' \| 'system' \| 'tool'` | Message role |
-| `createdAt` | `number` | Timestamp |
+| `createdAtMs` | `number` | Timestamp in epoch milliseconds |
 
 ### `TaskResult<T>`
 
@@ -140,7 +140,7 @@ The primary extension primitive — a tool an agent can invoke.
 |-------|------|----------|-------------|
 | `name` | `string` | ✅ | Unique identifier |
 | `description` | `string` | ✅ | LLM-visible description |
-| `parameters` | `Record<string, unknown>` | ✅ | JSON Schema parameters |
+| `parametersSchema` | `Record<string, unknown>` | ✅ | JSON Schema input schema |
 | `handler` | `(runtime, message, args) => Promise<TaskResult>` | ✅ | Execution logic |
 | `validate` | `(runtime, message) => Promise<boolean>` | — | Availability check |
 | `examples` | `ActionExample[]` | — | Few-shot examples |
@@ -284,22 +284,23 @@ const config = agent({
 
 | Field | Type |
 |-------|------|
-| `id` | `UUID` |
+| `id` | `string` |
 | `type` | `EventType` |
+| `agentId` | `string` |
 | `data` | `T` |
-| `createdAt` | `number` |
+| `timestampMs` | `number` |
 
 ### `EventType`
 
-`'message' | 'action' | 'evaluation' | 'thought' | 'goal' | 'memory' | 'agent' | 'swarm' | 'system'`
+`'agent:spawned' | 'agent:started' | 'agent:completed' | 'agent:failed' | 'agent:terminated' | 'agent:message' | 'task:started' | 'task:completed' | 'task:failed' | 'tool:before' | 'tool:after' | 'agent:tokens' | 'swarm:created' | 'swarm:message' | 'swarm:completed' | 'swarm:stopped'`
 
 ### `IEventBus`
 
 | Method | Signature |
 |--------|-----------|
-| `on` | `(type: EventType, handler: EventHandler<T>) => void` |
-| `off` | `(type: EventType, handler: EventHandler<T>) => void` |
-| `emit` | `(event: Event<T>) => void` |
+| `on` | `(type: EventType, handler: EventHandler<T>) => () => void` |
+| `emit` | `(type: EventType, data: T, agentId?: string) => Promise<void>` |
+| `clear` | `() => void` |
 
 ## Daemon Health
 

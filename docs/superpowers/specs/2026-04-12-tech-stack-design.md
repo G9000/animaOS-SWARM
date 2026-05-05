@@ -1,57 +1,75 @@
 # AnimaOS SWARM — Tech Stack Design
 
 **Date:** 2026-04-12
-**Status:** Locked
+**Status:** Revised To Match Current Workspace
 
 ---
 
 ## Decision Summary
 
-AnimaOS SWARM is a **concurrent, durable, replayable AI execution engine**. It runs 50-100 agents in parallel — concurrency is a given. The hard architectural problem is not concurrency (Rust/Tokio handles that trivially) but **durable execution**: keeping agents alive for days, recovering from crashes, and maintaining a replayable history of every decision.
+AnimaOS SWARM is currently a host-agnostic runtime workspace centered on reusable Rust core crates plus a single runnable Rust host. The current system is moving toward durable, replayable execution, but the live implementation today is narrower than the original April design.
 
 Core principle:
-> **Database = truth. Process = executor.**
+> **Reusable core = behavior. Runnable host = execution boundary.**
 
-This enables replayability, auditability, deterministic recovery, and time-travel debugging — all critical for long-running AI agents.
+Today that means:
+
+- `packages/core-rust` owns the reusable Rust execution crates.
+- `hosts/rust-daemon` is the production-ready HTTP and SSE host.
+- Postgres is optional persistence for step logs and explicit retry-key reuse, not a full process-resume system.
+- TypeScript packages are client and operator tooling, not the source of truth for runtime semantics.
 
 ---
 
-## Final Stack
+## Current Stack
 
 ```
-Rust (anima-daemon)     →  execution core
-Postgres                →  step log, source of truth
-TypeScript (apps/server)→  orchestration, API, scheduler
-Redis                   →  BullMQ job queue
-TypeScript (TUI/SDK/CLI)→  client tooling
-React + Vite (apps/ui)  →  web dashboard
+packages/core-rust         →  reusable Rust runtime crates
+hosts/rust-daemon          →  runnable Axum HTTP/SSE host
+Postgres (optional)        →  step-log persistence + explicit retry-key reuse
+packages/sdk / cli / tui   →  TypeScript client and operator tooling
+packages/core-ts           →  shared TypeScript core port for local tooling
+tools/workspace-dev        →  local host selection + dev orchestration
+apps/web / playground      →  browser runtime surfaces
+apps/docs                  →  Astro/Starlight documentation site
+apps/server                →  retained legacy local TS server, not execution truth
 ```
 
 ---
 
 ## Layer Breakdown
 
-### 1. Rust — `packages/animaos-rs`
+### 1. Rust Core — `packages/core-rust`
 
-**Job:** Execute agents. Nothing else.
+**Job:** Own reusable execution semantics without host-specific I/O.
 
-- Agent loop (think → act → tool → respond → repeat)
-- Tool execution with idempotency checks
-- LLM calls (all providers)
-- Memory / BM25 search
-- EventBus (ordered per agent)
-- Writes step log to Postgres at boundaries
-- Streams output via SSE
+- `anima-core` owns the agent loop, tool boundaries, lifecycle state, and persistence trait.
+- `anima-memory` owns recall, retention, entities, relationships, and vector-aware memory logic.
+- `anima-swarm` owns coordinator strategies, message bus, and swarm lifecycle.
+- The core crates do not depend on HTTP frameworks, DB drivers, or host-specific runtimes.
 
-**Why Rust:** Execution core demands performance and memory safety. The agent loop and tool execution are CPU/IO intensive. Single binary, minimal footprint for cloud deployment.
-
-**Why NOT Rust for orchestration:** Supervision trees, job scheduling, and lifecycle management require significant manual engineering in Rust. That time is better spent on execution quality.
+**Why Rust:** The execution core is CPU and I/O heavy, benefits from strong type boundaries, and needs a portable host-agnostic library surface.
 
 ---
 
-### 2. Postgres — Step Log (Source of Truth)
+### 2. Rust Host — `hosts/rust-daemon`
 
-**Job:** Be the truth.
+**Job:** Provide the current runnable runtime boundary.
+
+- Axum HTTP routes for agents, swarms, memory, health, readiness, metrics, and docs.
+- SSE stream for swarm events.
+- Runtime model adapter for real provider calls.
+- Tool registry and shared execution context.
+- Optional Postgres-backed step persistence.
+- In-memory live control plane for running agents and swarms, with optional JSON snapshot recovery for registrations and latest states.
+
+**Current constraint:** The daemon can rehydrate registered agents and swarms when `ANIMAOS_RS_CONTROL_PLANE_FILE` is configured, but it does not resume a model turn from the middle after process restart. Interrupted work is restored as failed and should be retried intentionally.
+
+---
+
+### 3. Optional Postgres — Step Log
+
+**Job:** Persist tool-step boundaries and enable explicit retry reuse.
 
 Every agent action is persisted as a step before/after execution:
 
@@ -66,7 +84,8 @@ CREATE TABLE step_log (
   input           JSONB,
   output          JSONB,
   created_at      TIMESTAMPTZ DEFAULT now(),
-  UNIQUE (agent_id, step_index)
+  UNIQUE (agent_id, step_index),
+  UNIQUE (agent_id, idempotency_key)
 );
 ```
 
@@ -74,96 +93,56 @@ CREATE TABLE step_log (
 - Checkpoint at deterministic, replayable points
 - Before side effects: write `pending`
 - After side effects: write `done` + idempotency key
-- On restart: check idempotency key before re-executing
+- On explicit retried request with the same retry key: check idempotency key before re-executing completed tool steps
 - Per-agent ordering enforced via `UNIQUE(agent_id, step_index)`
+- Logical retry reuse enforced via `UNIQUE(agent_id, idempotency_key)`
+- Full process restart rehydration remains follow-up work
 
-**Why Postgres over OTP in-memory:** GenServer state dies with the node. For day-long agents, the DB must be the truth. Elixir/OTP was considered and rejected — OTP solves runtime reliability, this system solves execution truth. Those are different problems.
-
----
-
-### 3. TypeScript — `apps/server`
-
-**Job:** Orchestration, API, scheduling.
-
-- REST API (agents, swarms, search, health)
-- WebSocket broadcast (real-time UI updates)
-- BullMQ scheduler (agent wakeups, delayed retries, external triggers)
-- Prisma + Postgres (reads/writes step log and agent state)
-- Calls Rust daemon via HTTP/SSE for execution
-
-**Why TypeScript:** Largest training data corpus for AI-assisted development. BullMQ, Prisma, and WebSocket are battle-tested. Keeps client tooling (TUI, SDK, CLI) in one language.
-
-**BullMQ usage (constrained):**
-- ✅ Schedule agent wakeups
-- ✅ Delayed retries
-- ✅ External event triggers
-- ❌ NOT for the agent loop itself (loop lives in Rust)
+**Important limitation:** This is not yet a full durable runtime. The current daemon can reuse completed tool steps on an explicit retry, but it cannot restore a live in-flight agent or swarm after a process restart.
 
 ---
 
-### 4. Redis
+### 4. TypeScript Tooling — `packages/sdk`, `packages/cli`, `packages/tui`, `packages/core-ts`
 
-**Job:** BullMQ backend only.
+**Job:** Provide developer-facing and operator-facing tooling around the runnable Rust host.
 
----
-
-### 5. TypeScript — Client Tooling
-
-| Package | Job |
-|---------|-----|
-| `packages/sdk` | Typed HTTP/WS client for TUI and CLI → server |
-| `packages/tui` | Ink-based terminal operator surface |
-| `packages/cli` | `animaos` CLI, agency scaffolding |
+- `packages/sdk` is the typed TypeScript client for the daemon.
+- `packages/cli` is the local CLI surface.
+- `packages/tui` is the primary local operator surface.
+- `packages/core-ts` is a shared TS support layer used by local tooling. It is not the execution source of truth.
 
 ---
 
-### 6. React + Vite — `apps/ui`
+### 5. Workspace Orchestration — `tools/workspace-dev`
 
-**Job:** Web dashboard for monitoring and controlling agents.
+**Job:** Start the selected host and local surfaces together in development.
 
-- Layout C: system bar + agent grid + detail panel
-- Real-time via WebSocket (Phoenix Channels replaced by native WS in TS server)
-- Zustand for UI state
-- Cyberpunk monochrome + dark gold (`#c9a227`) design system (existing)
-- Handles 50-100 concurrent agents in the grid view
-- 3D space / pixel agent visualization deferred (future view)
+- `bun dev --host rust` is the normal local workflow.
+- Host selection is centralized here rather than being hardcoded into UI or client packages.
+- The current supported host keys are `rust`, `elixir`, and `python`, but only `rust` is production-ready.
 
 ---
 
-## Why NOT Elixir
+### 6. Browser And Legacy App Surfaces
 
-Elixir/Phoenix was seriously evaluated. The decision not to use it:
-
-| Elixir strength | Our situation |
-|---|---|
-| Process = truth, in-memory state | We need DB = truth for replay |
-| OTP supervision trees | We need deterministic step log |
-| Runtime reliability | We need execution auditability |
-
-Over time, Elixir systems naturally drift toward process-as-truth. For an AI execution engine that needs replay, audit, and time-travel debugging, this drift is dangerous. Postgres as truth is a stronger guarantee than BEAM process survival.
-
-**Elixir would make life easier. Our design makes the system more powerful.**
-
-If this system ever needs distributed multi-node deployment, Temporal (or similar durable execution platform) is the natural evolution — not Elixir.
+- `apps/web` and `apps/playground` are the current browser runtime surfaces.
+- `apps/docs` is the Astro/Starlight docs site.
+- `apps/server` still exists as a legacy local TypeScript server surface, but it is not the runtime source of truth and should not be confused with `hosts/rust-daemon`.
 
 ---
 
 ## Data Flow
 
 ```
-User / TUI / CLI
+User / CLI / TUI / Web / Playground
       ↓
-TypeScript server (REST + WS)
+SDK or direct HTTP client
       ↓
 Rust anima-daemon (HTTP/SSE)
       ↓
-Agent loop executes
+packages/core-rust crates execute
       ↓  (checkpoint at boundaries)
-Postgres step_log
-      ↑
-TypeScript reads for API / UI
-      ↑
-React dashboard (WebSocket)
+Optional Postgres step_log
 ```
 
 ---
@@ -171,18 +150,18 @@ React dashboard (WebSocket)
 ## Cloud Deployment
 
 - Rust daemon: single binary, minimal Docker image
-- TypeScript server: Bun runtime container
-- Postgres: managed (RDS, Supabase, Neon)
-- Redis: managed (Upstash, Redis Cloud)
-- React: static CDN
+- Postgres: optional managed persistence for step logs
+- Browser apps: static assets or preview deployments
+- CLI/TUI/SDK: local or developer tooling packages
 
-Horizontal scaling: stateless HTTP + external Postgres/Redis. WebSocket broadcast across multiple TS server instances requires Redis pub/sub adapter (future concern).
+If a larger orchestration layer is introduced later, it should be documented as a new runtime boundary rather than treated as the current default architecture.
 
 ---
 
 ## What's Deferred
 
-- 3D space / pixel agent visualization (future UI view)
-- Multi-node WebSocket broadcast (Redis adapter)
-- Auth / access control
-- Temporal migration path (if multi-node execution needed)
+- Full live-runtime rehydration after daemon restart
+- Multi-node execution orchestration and durable scheduling
+- Additional runnable hosts beyond `hosts/rust-daemon`
+- Browser-surface maturity parity with the TUI
+- Any Redis/BullMQ-based scheduler or separate orchestration server, if that architecture is ever reintroduced

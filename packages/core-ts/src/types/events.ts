@@ -17,9 +17,10 @@ export type EventType =
 	| "swarm:stopped"
 
 export interface Event<T = unknown> {
+	id: string
 	type: EventType
 	agentId?: string
-	timestamp: number
+	timestampMs: number
 	data: T
 }
 

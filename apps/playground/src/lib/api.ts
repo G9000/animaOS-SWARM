@@ -332,7 +332,7 @@ export interface AgentState {
   name: string;
   status: string;
   config?: AgentConfig;
-  createdAt: number;
+  createdAtMs: number;
   tokenUsage: TokenUsage;
 }
 
@@ -350,7 +350,7 @@ export interface AgentTranscriptMessage {
   roomId: string;
   content: Content;
   role: 'user' | 'assistant' | 'system' | 'tool';
-  createdAt: number;
+  createdAtMs: number;
 }
 
 export interface AgentMessage {
@@ -407,6 +407,8 @@ export interface SwarmMessageEventPayload {
 }
 
 export interface SwarmAgentEventPayload {
+  eventId?: string;
+  timestampMs?: number;
   agentId: string;
   agentName: string;
   error?: string;

@@ -43,9 +43,10 @@ Every variant maps to a kebab-case string via `as_str()`. These strings are the 
 ```rust
 #[derive(Clone, Debug, PartialEq)]
 pub struct EngineEvent<T = DataValue> {
+    pub id: UuidString,
     pub event_type: EventType,
     pub agent_id: Option<String>,
-    pub timestamp: u128,          // milliseconds since UNIX epoch
+    pub timestamp_ms: u64,        // milliseconds since UNIX epoch
     pub data: T,
 }
 ```
@@ -172,7 +173,7 @@ The callback is called **synchronously** inside `record_event`, immediately afte
 
 ```rust
 fn record_event(&mut self, event_type: EventType, data: DataValue) {
-    let event = EngineEvent { event_type, agent_id: Some(...), timestamp: ..., data };
+    let event = EngineEvent { id: ..., event_type, agent_id: Some(...), timestamp_ms: ..., data };
     self.events.push(event.clone());
     if let Some(listener) = &self.event_listener {
         listener(event);   // <-- synchronous, blocking call

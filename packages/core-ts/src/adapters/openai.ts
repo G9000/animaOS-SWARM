@@ -15,7 +15,7 @@ function actionsToTools(actions: Action[]): OpenAI.Chat.Completions.ChatCompleti
 		function: {
 			name: a.name,
 			description: a.description,
-			parameters: a.parameters,
+			parameters: a.parametersSchema,
 		},
 	}))
 }

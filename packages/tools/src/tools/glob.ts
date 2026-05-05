@@ -89,7 +89,7 @@ export function executeGlob(args: GlobArgs): {
 export const globAction: Action = {
   name: "glob",
   description: "Find files matching a glob pattern.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       pattern: {

@@ -11,11 +11,12 @@ pub(crate) async fn handle_readiness(
     state: &SharedDaemonState,
     config: &DaemonConfig,
 ) -> ReadinessResponse {
-    let (database_configured, background_process_count) = {
+    let (database_configured, background_process_count, control_plane_durability) = {
         let guard = state.read().await;
         (
             guard.database_configured(),
             guard.background_process_count(),
+            guard.control_plane_durability(),
         )
     };
 
@@ -35,7 +36,7 @@ pub(crate) async fn handle_readiness(
         } else {
             "not_ready".to_string()
         },
-        control_plane_durability: "ephemeral".to_string(),
+        control_plane_durability,
         persistence_mode: config.persistence_mode.as_str().to_string(),
         database: if database_configured {
             "configured".to_string()
@@ -56,6 +57,7 @@ pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonCon
         database_configured,
         background_process_count,
         memory_handle,
+        control_plane_durability,
     ) = {
         let guard = state.read().await;
         (
@@ -65,6 +67,7 @@ pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonCon
             guard.database_configured(),
             guard.background_process_count(),
             guard.memory_handle(),
+            guard.control_plane_durability(),
         )
     };
 
@@ -119,7 +122,10 @@ pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonCon
         ),
         "# HELP anima_daemon_control_plane_durability_info Current control plane durability mode.".to_string(),
         "# TYPE anima_daemon_control_plane_durability_info gauge".to_string(),
-        "anima_daemon_control_plane_durability_info{mode=\"ephemeral\"} 1".to_string(),
+        format!(
+            "anima_daemon_control_plane_durability_info{{mode=\"{}\"}} 1",
+            control_plane_durability
+        ),
         "# HELP anima_daemon_max_request_bytes Configured max request bytes.".to_string(),
         "# TYPE anima_daemon_max_request_bytes gauge".to_string(),
         format!("anima_daemon_max_request_bytes {}", config.max_request_bytes),

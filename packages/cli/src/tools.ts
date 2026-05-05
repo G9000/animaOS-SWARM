@@ -5,7 +5,7 @@ const extraTools = [
 	action({
 		name: "get_current_time",
 		description: "Get the current date and time",
-		parameters: { type: "object", properties: {}, required: [] },
+		parametersSchema: { type: "object", properties: {}, required: [] },
 		handler: async () => ({
 			status: "success" as const,
 			data: new Date().toISOString(),
@@ -15,7 +15,7 @@ const extraTools = [
 	action({
 		name: "calculate",
 		description: "Evaluate a math expression and return the result",
-		parameters: {
+		parametersSchema: {
 			type: "object",
 			properties: {
 				expression: { type: "string", description: "The math expression to evaluate" },

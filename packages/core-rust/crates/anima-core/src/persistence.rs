@@ -111,12 +111,13 @@ pub mod in_memory {
                 .lock()
                 .map_err(|e| PersistenceError::Write(format!("Mutex poisoned: {}", e)))?;
 
-            // Upsert by (agent_id, step_index) — match Postgres semantics:
+            // Upsert by logical idempotency key first, then step index as a fallback.
             // preserve input, freeze terminal status+output
-            if let Some(existing) = steps
-                .iter_mut()
-                .find(|s| s.agent_id == step.agent_id && s.step_index == step.step_index)
-            {
+            if let Some(existing) = steps.iter_mut().find(|s| {
+                s.agent_id == step.agent_id
+                    && (s.idempotency_key == step.idempotency_key
+                        || s.step_index == step.step_index)
+            }) {
                 if !matches!(existing.status, StepStatus::Done | StepStatus::Failed) {
                     existing.status = step.status.clone();
                     if step.input.is_some() {
@@ -251,5 +252,43 @@ mod tests {
         assert_eq!(steps.len(), 1, "upsert should keep exactly one entry");
         assert_eq!(steps[0].status, StepStatus::Done);
         assert!(steps[0].output.is_some());
+    }
+
+    #[tokio::test]
+    async fn write_step_upserts_by_idempotency_key_across_retry_indices() {
+        let adapter = InMemoryAdapter::new();
+
+        let pending = make_step("agent-3", 0, "key-retry", StepStatus::Pending);
+        adapter
+            .write_step(&pending)
+            .await
+            .expect("initial write failed");
+
+        let retried_done = Step {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "agent-3".to_string(),
+            step_index: 1,
+            idempotency_key: "key-retry".to_string(),
+            step_type: "tool".to_string(),
+            status: StepStatus::Done,
+            input: pending.input.clone(),
+            output: Some(serde_json::json!({ "result": "cached" })),
+        };
+        adapter
+            .write_step(&retried_done)
+            .await
+            .expect("retry write failed");
+
+        let steps = adapter
+            .list_agent_steps("agent-3")
+            .await
+            .expect("list failed");
+
+        assert_eq!(steps.len(), 1, "retry should reuse the logical step row");
+        assert_eq!(
+            steps[0].step_index, 0,
+            "original ordering should be preserved"
+        );
+        assert_eq!(steps[0].status, StepStatus::Done);
     }
 }

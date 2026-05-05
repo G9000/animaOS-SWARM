@@ -30,7 +30,7 @@ export function executeRead(args: ReadArgs): {
 export const readAction: Action = {
   name: "read_file",
   description: "Read a file and return its contents with line numbers.",
-  parameters: {
+  parametersSchema: {
     type: "object",
     properties: {
       file_path: {
