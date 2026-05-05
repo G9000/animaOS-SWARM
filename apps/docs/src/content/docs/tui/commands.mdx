@@ -1,0 +1,73 @@
+---
+title: Commands & States
+description: Slash commands, keyboard flow, and operator states in the animaOS TUI
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+The TUI is designed as an operator surface, not just a live log window. That means its commands and state transitions matter.
+
+<CardGrid>
+  <Card title="Healthy">
+    Task submission is enabled and the TUI streams swarm events, tools, and results live.
+  </Card>
+  <Card title="Daemon Down">
+    The session falls back to command-only behavior so `/health` and `/help` still work.
+  </Card>
+  <Card title="Recovered">
+    The TUI reports recovery explicitly so you know task submission can resume.
+  </Card>
+</CardGrid>
+
+
+## Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | Show the available command surface |
+| `/health` | Recheck daemon connectivity and report healthy, recovered, or unavailable state |
+| `/history` | Open the saved run history view |
+| `/retry` | Retry the most recent task or resumed run when retry is available |
+| `/clear` | Clear the current result/history surface |
+| `/back` | Return from history or resumed-run views |
+
+## Keyboard Flow
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Submit the current task or command |
+| `Tab` | Cycle between visible panels |
+| `Ctrl+C` | Quit the TUI |
+
+## Operator States
+
+### Healthy daemon
+
+Normal task submission is enabled. The TUI streams swarm events, tool traces, token updates, and final results as they arrive.
+
+### Daemon unavailable
+
+The TUI switches into command-only behavior:
+
+- task submission is blocked
+- health checks still work
+- help remains available
+- the UI tells you to use `/health` or `/help`
+
+That makes the terminal session recoverable instead of forcing you to restart everything.
+
+### Recovery
+
+When the daemon comes back, the TUI reports recovery explicitly so you know the host is reachable again.
+
+## Why This Matters
+
+This command surface is what makes the TUI usable during real local development:
+
+- health checks without leaving the session
+- graceful behavior during temporary host failure
+- retry and history access without reconstructing context manually
+
+<Aside type="tip">
+  If you only need one plain-text answer, use `animaos run`. If you want an operator session with recovery, history, and live telemetry, use `animaos launch`.
+</Aside>

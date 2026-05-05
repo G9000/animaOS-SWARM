@@ -1,0 +1,88 @@
+---
+title: Staging Deployment
+description: Recommended online staging profile for the Rust daemon host
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+<Aside type="caution" title="V1 Staging Boundary">
+  Run one Rust daemon replica for staging unless you add a shared vector store. Postgres shares host snapshots and step logs, but vector indexes are still process-local and rebuild from memory snapshots on startup.
+</Aside>
+
+## Recommended Shape
+
+Use Postgres as the staging source of truth for host durability:
+
+- Step logs and explicit retry-key reuse use the `step_log` table.
+- Registered agents, swarms, latest states, and memory snapshots use Postgres `host_snapshots` by default.
+- `ANIMAOS_RS_CONTROL_PLANE_FILE`, `ANIMAOS_RS_MEMORY_FILE`, and `ANIMAOS_RS_MEMORY_SQLITE_FILE` should stay unset in container staging unless you intentionally mount persistent files.
+- Vector search stays in process for v1. If cold-start rebuilds become expensive, attach a persistent volume and set `ANIMAOS_RS_MEMORY_EMBEDDINGS_SQLITE_FILE`.
+
+## Container Build
+
+Build the daemon container from the repository root:
+
+```bash
+docker build -f hosts/rust-daemon/Dockerfile -t anima-daemon:staging .
+```
+
+Push that image to your staging registry, then run it with the env profile in `hosts/rust-daemon/.env.staging.example` translated into your provider's secret settings.
+
+## Required Environment
+
+The minimum online staging profile is:
+
+```bash
+ANIMAOS_RS_HOST=0.0.0.0
+ANIMAOS_RS_PORT=8080
+ANIMAOS_RS_PERSISTENCE_MODE=postgres
+DATABASE_URL=postgres://USER:PASSWORD@HOST:5432/anima_staging
+ANIMAOS_RS_MEMORY_EMBEDDINGS=local
+RUST_LOG=info,tower_http=info
+```
+
+Set at least one model provider key used by the staged agents, such as `ANTHROPIC_API_KEY` or `OPENAI_API_KEY`.
+
+<Aside type="note">
+  The daemon runs embedded SQL migrations at startup. If `ANIMAOS_RS_PERSISTENCE_MODE=postgres` is set and Postgres is unavailable, startup fails instead of silently falling back to memory mode.
+</Aside>
+
+## Vector Strategy
+
+For staging, prefer the simple path first:
+
+- `ANIMAOS_RS_MEMORY_EMBEDDINGS=local` gives cheap deterministic vectors and no external dependency.
+- `fastembed` gives better local semantic recall but can increase image/runtime requirements and needs model cache space.
+- `ollama`, `openai`, or `openai-compatible` push embedding work to a provider endpoint.
+- `ANIMAOS_RS_MEMORY_EMBEDDINGS_SQLITE_FILE=/var/lib/anima/memory-embeddings.sqlite` only helps if `/var/lib/anima` is a persistent volume.
+
+Without `ANIMAOS_RS_MEMORY_EMBEDDINGS_SQLITE_FILE`, vectors are rebuilt from the Postgres-backed memory snapshot on boot. That is acceptable for v1 staging and keeps deployment portable.
+
+## Staging Checklist
+
+<Steps>
+
+1. Provision a managed Postgres database for staging.
+
+2. Set `ANIMAOS_RS_PERSISTENCE_MODE=postgres` and `DATABASE_URL` in the host platform.
+
+3. Leave JSON/SQLite memory and control-plane file env vars unset unless the platform provides a persistent disk.
+
+4. Start with one daemon replica.
+
+5. Deploy the container image built from `hosts/rust-daemon/Dockerfile`.
+
+6. Verify liveness and readiness:
+
+   ```bash
+   curl https://staging.example.com/health
+   curl https://staging.example.com/ready
+   ```
+
+7. Confirm `/ready` reports `controlPlaneDurability: "postgres"` and `database: "configured"`.
+
+</Steps>
+
+## What This Does Not Claim
+
+Postgres staging restores registered agents, swarms, latest snapshots, swarm message history, memory snapshots, and completed tool-step reuse for explicit retries. It does not resume a model call from the middle after process restart. Restored running work is marked failed/interrupted so callers can retry intentionally.

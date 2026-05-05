@@ -53,7 +53,7 @@ pub struct AgentMessage {
 
 - There is no FIFO overflow policy today; inboxes and global history grow for the lifetime of a live coordinator.
 - `max_turns` limits strategy turns. Request timeouts are enforced by the Rust daemon route layer, not by `anima-swarm` itself.
-- Restart recovery restores registered swarms and latest `SwarmState` snapshots through the daemon's `ANIMAOS_RS_CONTROL_PLANE_FILE`, but it does not rebuild a partially completed in-flight message-bus turn.
+- Restart recovery restores registered swarms and latest `SwarmState` snapshots through the daemon's JSON or Postgres host snapshot store, but it does not rebuild a partially completed in-flight message-bus turn.
 
 ## Swarm Events
 

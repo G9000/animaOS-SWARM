@@ -100,6 +100,17 @@ pub(crate) struct DaemonState {
     pub(crate) db: Option<Arc<dyn DatabaseAdapter>>,
 }
 
+pub(crate) struct ControlPlanePersistRequest {
+    config: Option<ControlPlaneStoreConfig>,
+    snapshot: ControlPlaneSnapshot,
+}
+
+impl ControlPlanePersistRequest {
+    pub(crate) async fn save(self) -> std::io::Result<()> {
+        save_control_plane_snapshot(self.config.as_ref(), &self.snapshot).await
+    }
+}
+
 impl DaemonState {
     #[allow(dead_code)]
     pub(crate) fn new() -> Self {
@@ -205,11 +216,11 @@ impl DaemonState {
         self.control_plane_store = control_plane_store;
     }
 
-    pub(crate) fn persist_control_plane(&self) -> std::io::Result<()> {
-        save_control_plane_snapshot(
-            self.control_plane_store.as_ref(),
-            &self.control_plane_snapshot(),
-        )
+    pub(crate) fn control_plane_persist_request(&self) -> ControlPlanePersistRequest {
+        ControlPlanePersistRequest {
+            config: self.control_plane_store.clone(),
+            snapshot: self.control_plane_snapshot(),
+        }
     }
 
     pub(crate) fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {

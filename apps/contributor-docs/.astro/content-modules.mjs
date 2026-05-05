@@ -19,10 +19,13 @@ export default new Map([
 ["src/content/docs/hosts/rust-daemon/api.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fhosts%2Frust-daemon%2Fapi.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/hosts/rust-daemon/env.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fhosts%2Frust-daemon%2Fenv.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/hosts/rust-daemon/index.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fhosts%2Frust-daemon%2Findex.mdx&astroContentModuleFlag=true")],
+["src/content/docs/hosts/rust-daemon/local.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fhosts%2Frust-daemon%2Flocal.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/hosts/rust-daemon/ops.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fhosts%2Frust-daemon%2Fops.mdx&astroContentModuleFlag=true")],
+["src/content/docs/hosts/rust-daemon/staging.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fhosts%2Frust-daemon%2Fstaging.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/index.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Findex.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/overview.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Foverview.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/philosophy.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fphilosophy.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/workflow/dev.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fworkflow%2Fdev.mdx&astroContentModuleFlag=true")],
+["src/content/docs/workflow/playbook.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fworkflow%2Fplaybook.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/workflow/testing.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fworkflow%2Ftesting.mdx&astroContentModuleFlag=true")]]);
 		

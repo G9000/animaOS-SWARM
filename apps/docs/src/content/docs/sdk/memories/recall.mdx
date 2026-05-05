@@ -1,0 +1,86 @@
+---
+title: Search & Recall
+description: Lexical search, fused recall, recent-memory reads, and score interpretation in the SDK
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Memory retrieval in animaOS has two main levels:
+
+- `search()` for straightforward lexical or hybrid lookup
+- `recall()` for fused ranking across lexical, vector, relationship, temporal, recency, and importance signals
+
+<CardGrid>
+  <Card title="Search">
+    Use `search()` for direct keyword or filter-driven lookup.
+  </Card>
+  <Card title="Recall">
+    Use `recall()` when you want a fused result ranking instead of just raw matches.
+  </Card>
+  <Card title="Recent">
+    Use `recent()` when freshness matters more than retrieval scoring.
+  </Card>
+</CardGrid>
+
+## Search
+
+```typescript
+const results = await client.memories.search('daemon memory', {
+  agentName: 'researcher',
+  type: 'fact',
+  limit: 5,
+  minImportance: 0.5,
+});
+
+for (const result of results) {
+  console.log(result.score, result.memory.content);
+}
+```
+
+## Recent Memories
+
+```typescript
+const memories = await client.memories.recent({
+  agentId: 'agent-uuid-here',
+  scope: 'shared',
+  limit: 20,
+});
+```
+
+## Fused Recall
+
+```typescript
+const results = await client.memories.recall('evidence probe', {
+  entityId: 'user-1',
+  agentId: 'agent-1',
+  temporalLimit: 7,
+  limit: 3,
+});
+
+for (const r of results) {
+  console.log(r.score, r.memory.content);
+  console.log(r.lexicalScore, r.vectorScore, r.relationshipScore);
+}
+```
+
+## How to Read Recall Scores
+
+Recall combines several signals:
+
+- lexical match
+- vector similarity
+- relationship proximity
+- temporal relevance
+- recency
+- stored importance
+
+The point is not to memorize the weighting math. The point is to understand that recall is intentionally richer than plain search.
+
+<Aside type="tip">
+  Reach for `search()` when the user already knows what they are looking for. Reach for `recall()` when the system should infer the best supporting memories from multiple signals.
+</Aside>
+
+## Where Next
+
+- [Memories Overview](/sdk/memories/) for the full memory surface.
+- [Evaluation & Retention](/sdk/memories/operations/) for write-side and cleanup operations.

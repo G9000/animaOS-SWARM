@@ -19,16 +19,17 @@ pub(crate) async fn handle_create_agent(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let snapshot = {
+    let (snapshot, persist_request) = {
         let mut guard = state.write().await;
         let snapshot = guard
             .create_agent(config)
             .map_err(|message| ApiError::bad_request(message))?;
-        guard
-            .persist_control_plane()
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-        snapshot
+        (snapshot, guard.control_plane_persist_request())
     };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     Ok(AgentEnvelope {
         agent: AgentRuntimeSnapshotResponse::from(&snapshot),
@@ -72,13 +73,15 @@ pub(crate) async fn handle_delete_agent(
     agent_id: &str,
     state: &SharedDaemonState,
 ) -> Result<DeleteResponse, ApiError> {
-    {
+    let persist_request = {
         let mut guard = state.write().await;
         guard.remove_agent(agent_id);
-        guard
-            .persist_control_plane()
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-    }
+        guard.control_plane_persist_request()
+    };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     Ok(DeleteResponse { deleted: true })
 }
@@ -120,18 +123,19 @@ pub(crate) async fn handle_run_agent(
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let Some((mut runtime, tool_context)) = ({
+    let Some((mut runtime, tool_context, persist_request)) = ({
         let mut guard = state.write().await;
         let taken = guard.take_agent_runtime(agent_id);
-        if taken.is_some() {
-            guard
-                .persist_control_plane()
-                .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-        }
-        taken
+        taken.map(|(runtime, tool_context)| {
+            (runtime, tool_context, guard.control_plane_persist_request())
+        })
     }) else {
         return Err(ApiError::not_found());
     };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     let result = runtime
         .run_with_tools(content, |agent, user_message, tool_call| {
@@ -143,14 +147,31 @@ pub(crate) async fn handle_run_agent(
             }
         })
         .await;
-    let (snapshot, runtime_id, runtime_name, memory, memory_embeddings, memory_store) = {
+    let (
+        snapshot,
+        runtime_id,
+        runtime_name,
+        memory,
+        memory_embeddings,
+        memory_store,
+        persist_request,
+    ) = {
         let mut guard = state.write().await;
         let restored = guard.restore_agent_runtime(runtime);
-        guard
-            .persist_control_plane()
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-        restored
+        (
+            restored.0,
+            restored.1,
+            restored.2,
+            restored.3,
+            restored.4,
+            restored.5,
+            guard.control_plane_persist_request(),
+        )
     };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     if let Some(content) = result.data.as_ref() {
         let persist_result: Result<_, String> = {
@@ -167,7 +188,8 @@ pub(crate) async fn handle_run_agent(
                 world_id: None,
                 session_id: None,
             }) {
-                Ok(memory) => match save_memory_manager(memory_store.as_ref(), &memory_guard) {
+                Ok(memory) => match save_memory_manager(memory_store.as_ref(), &memory_guard).await
+                {
                     Ok(()) => Ok(memory),
                     Err(error) => Err(format!("failed to persist memory: {error}")),
                 },

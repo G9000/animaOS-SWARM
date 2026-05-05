@@ -16,7 +16,7 @@ Today that means:
 
 - `packages/core-rust` owns the reusable Rust execution crates.
 - `hosts/rust-daemon` is the production-ready HTTP and SSE host.
-- Postgres is optional persistence for step logs and explicit retry-key reuse, not a full process-resume system.
+- Postgres is optional host persistence for step logs, default host snapshots, and explicit retry-key reuse, not a full process-resume system.
 - TypeScript packages are client and operator tooling, not the source of truth for runtime semantics.
 
 ---
@@ -60,10 +60,10 @@ apps/server                →  retained legacy local TS server, not execution t
 - SSE stream for swarm events.
 - Runtime model adapter for real provider calls.
 - Tool registry and shared execution context.
-- Optional Postgres-backed step persistence.
-- In-memory live control plane for running agents and swarms, with optional JSON snapshot recovery for registrations and latest states.
+- Optional Postgres-backed step persistence and host snapshots.
+- In-memory live control plane for running agents and swarms, with optional JSON or Postgres snapshot recovery for registrations and latest states.
 
-**Current constraint:** The daemon can rehydrate registered agents and swarms when `ANIMAOS_RS_CONTROL_PLANE_FILE` is configured, but it does not resume a model turn from the middle after process restart. Interrupted work is restored as failed and should be retried intentionally.
+**Current constraint:** The daemon can rehydrate registered agents and swarms from a host-owned snapshot store, but it does not resume a model turn from the middle after process restart. Interrupted work is restored as failed and should be retried intentionally.
 
 ---
 

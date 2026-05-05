@@ -19,9 +19,9 @@ Its job is to:
 4. Expose the daemon tool surface through a shared `ToolRegistry` and `ToolExecutionContext`.
 5. Stream swarm events over SSE.
 6. Optionally attach a Postgres-backed `DatabaseAdapter` for step-log persistence and request-keyed retry tool-step recovery.
-7. Optionally load and autosave a host-owned JSON control-plane snapshot for registered agents and swarms.
+7. Optionally load and autosave host-owned control-plane and memory snapshots through JSON/SQLite files or the Postgres `host_snapshots` table.
 
-Without `ANIMAOS_RS_CONTROL_PLANE_FILE`, the daemon is an `ephemeral` control plane. With that file configured, it restores registered agents, registered swarms, latest snapshots, and swarm message history after restart. Running work is restored as failed/interrupted because the daemon does not resume a model turn from the middle. Enabling Postgres adds durable step logs and lets retried tool steps reuse previously completed results when the caller repeats the same explicit retry key in request metadata.
+Without `ANIMAOS_RS_CONTROL_PLANE_FILE` or Postgres mode, the daemon is an `ephemeral` control plane. With a control-plane file or Postgres mode configured, it restores registered agents, registered swarms, latest snapshots, and swarm message history after restart. Running work is restored as failed/interrupted because the daemon does not resume a model turn from the middle. Enabling Postgres also adds durable step logs and lets retried tool steps reuse previously completed results when the caller repeats the same explicit retry key in request metadata.
 
 ## High-Level Shape
 
@@ -39,7 +39,8 @@ graph TD
     Memory["MemoryManager"]
     Events["events.rs\nEventFanout"]
     Postgres["postgres.rs\nSqlxPostgresAdapter"]
-    ControlPlane["control_plane_store.rs\nJSON control-plane snapshot"]
+    ControlPlane["control_plane_store.rs\ncontrol-plane snapshot"]
+    MemoryStore["memory_store.rs\nmemory snapshot"]
     Providers["External model providers"]
 
     Client --> Main
@@ -56,6 +57,7 @@ graph TD
     Model --> Providers
     State -. optional .-> Postgres
     State -. optional .-> ControlPlane
+    State -. optional .-> MemoryStore
 ```
 
 ## Module Map
@@ -64,8 +66,9 @@ graph TD
 |---|---|
 | `hosts/rust-daemon/src/main.rs` | Reads env vars, validates config, binds the TCP listener, initializes tracing, and starts the daemon. |
 | `hosts/rust-daemon/src/app.rs` | Defines `DaemonConfig`, builds shared state, wires persistence, and serves the Axum app with graceful shutdown. |
-| `hosts/rust-daemon/src/app/persistence.rs` | Handles `memory` vs `postgres` persistence startup and injects the `SqlxPostgresAdapter` when enabled. |
-| `hosts/rust-daemon/src/control_plane_store.rs` | Host-owned JSON snapshot store for registered agents, registered swarms, and latest runtime states. |
+| `hosts/rust-daemon/src/app/persistence.rs` | Handles `memory` vs `postgres` persistence startup, injects the `SqlxPostgresAdapter`, and chooses host snapshot stores. |
+| `hosts/rust-daemon/src/control_plane_store.rs` | Host-owned JSON or Postgres snapshot store for registered agents, registered swarms, and latest runtime states. |
+| `hosts/rust-daemon/src/memory_store.rs` | Host-owned JSON, SQLite, or Postgres snapshot store for `anima-memory` state. |
 | `hosts/rust-daemon/src/routes/mod.rs` | Owns the router, request middleware, timeout policy, run admission semaphore, OpenAPI, and Scalar docs wiring. |
 | `hosts/rust-daemon/src/routes/agents.rs` | Create, list, fetch, delete, recent-memory, and run handlers for agents. |
 | `hosts/rust-daemon/src/routes/memories.rs` | HTTP surface for memory create, recent, and search operations. |
@@ -110,12 +113,13 @@ The important steps are:
    - one `ToolRegistry`
    - one shared memory store
    - one background process manager with the configured process cap
-4. `configure_persistence()` loads and configures `ANIMAOS_RS_CONTROL_PLANE_FILE` when present.
-5. `configure_persistence()` either:
+4. `configure_persistence()` either:
    - stays in pure memory mode, or
    - connects to Postgres, runs migrations from `hosts/rust-daemon/migrations`, creates `SqlxPostgresAdapter`, and injects it into shared state
-6. `routes::router()` builds the HTTP API, OpenAPI document, and Scalar UI.
-7. `serve_with_state()` runs Axum with graceful shutdown on `Ctrl+C`.
+5. `configure_persistence()` loads memory snapshots from explicit JSON/SQLite env vars, or from Postgres `host_snapshots` in Postgres mode when no file store is set.
+6. `configure_persistence()` loads registered agents and swarms from explicit `ANIMAOS_RS_CONTROL_PLANE_FILE`, or from Postgres `host_snapshots` in Postgres mode when no file store is set.
+7. `routes::router()` builds the HTTP API, OpenAPI document, and Scalar UI.
+8. `serve_with_state()` runs Axum with graceful shutdown on `Ctrl+C`.
 
 ## Shared State Model
 
@@ -132,7 +136,7 @@ The important steps are:
 | `swarm_configs` | Serializable swarm configs used to rebuild coordinators after restart. |
 | `swarm_events` | Per-swarm event fanout used for SSE subscribers. |
 | `swarm_snapshots` | Last known swarm state, so reads still have something to return after execution updates. |
-| `control_plane_store` | Optional JSON file sink/source for daemon-owned agent and swarm snapshots. |
+| `control_plane_store` | Optional JSON or Postgres sink/source for daemon-owned agent and swarm snapshots. |
 | `model_adapter` | Shared adapter for external model providers. |
 | `tool_registry` | Validates declared tools and resolves tool handlers during runtime execution. |
 | `process_manager` | Tracks daemon-launched background processes and enforces the background-process cap. |
@@ -332,13 +336,15 @@ The persistence story is intentionally layered today.
 - Requires `ANIMAOS_RS_PERSISTENCE_MODE=postgres` and `DATABASE_URL`.
 - Connects at startup and runs migrations before the server begins serving requests.
 - Injects `SqlxPostgresAdapter` into shared state so new runtimes get database-backed step logging and can reuse completed tool results for retried requests that carry the same metadata retry key.
+- Stores control-plane snapshots in the `host_snapshots` row keyed by `control_plane` unless `ANIMAOS_RS_CONTROL_PLANE_FILE` is explicitly set.
+- Stores memory snapshots in the `host_snapshots` row keyed by `memory` unless `ANIMAOS_RS_MEMORY_FILE` or `ANIMAOS_RS_MEMORY_SQLITE_FILE` is explicitly set.
 
 What Postgres mode does not currently do:
 
 - Resume a partially completed run from the middle of a model turn after a daemon restart.
-- Turn readiness into a full durable control-plane guarantee.
+- Provide a separate vector database; embedding vectors still use the configured embedding runtime and optional SQLite vector store.
 
-Readiness and metrics report `controlPlaneDurability: "ephemeral"` by default and `"json"` when the control-plane file is active.
+Readiness and metrics report `controlPlaneDurability: "ephemeral"` by default, `"json"` when the control-plane file is active, and `"postgres"` when Postgres owns the control-plane snapshot.
 
 ## Health, Readiness, And Metrics
 

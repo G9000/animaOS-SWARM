@@ -45,7 +45,8 @@ pub(crate) async fn handle_create_memory(
             memory_store.as_ref(),
             &memory_guard,
             "failed to persist memory",
-        )?;
+        )
+        .await?;
         memory
     };
     index_memory_embedding(&embeddings_handle, &memory).await;
@@ -155,7 +156,8 @@ pub(crate) async fn handle_create_memory_entity(
             memory_store.as_ref(),
             &memory_guard,
             "failed to persist memory entity",
-        )?;
+        )
+        .await?;
         entity
     };
 
@@ -224,7 +226,8 @@ pub(crate) async fn handle_add_evaluated_memory(
                 memory_store.as_ref(),
                 &memory_guard,
                 "failed to persist evaluated memory",
-            )?;
+            )
+            .await?;
         }
         outcome
     };
@@ -322,7 +325,8 @@ pub(crate) async fn handle_apply_memory_retention(
                 memory_store.as_ref(),
                 &memory_guard,
                 "failed to persist memory retention changes",
-            )?;
+            )
+            .await?;
         }
         report
     };
@@ -354,12 +358,13 @@ async fn remove_memory_embeddings(embeddings: &SharedMemoryEmbeddings, memory_id
     }
 }
 
-fn persist_memory_store(
+async fn persist_memory_store(
     memory_store: Option<&MemoryStoreConfig>,
     manager: &MemoryManager,
     message: &'static str,
 ) -> Result<(), ApiError> {
     save_memory_manager(memory_store, manager)
+        .await
         .map_err(|error| ApiError::service_unavailable(format!("{message}: {error}")))
 }
 
@@ -385,7 +390,8 @@ pub(crate) async fn handle_create_agent_relationship(
             memory_store.as_ref(),
             &memory_guard,
             "failed to persist agent relationship",
-        )?;
+        )
+        .await?;
         relationship
     };
 

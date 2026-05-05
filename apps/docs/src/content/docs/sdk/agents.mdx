@@ -7,6 +7,11 @@ import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
 
 An **agent** in animaOS is an autonomous LLM-powered runtime with a configuration, state, and optional tools. Agents can run tasks individually or be composed into [swarms](/sdk/swarms/) for multi-agent coordination.
 
+## In This Section
+
+- [Lifecycle & Retry](/sdk/agents/lifecycle/) covers create, run, inspect, recent-memory reads, and safe retry keys.
+- [Actions & Plugins](/sdk/agents/tools/) covers typed actions, plugin bundles, and registration patterns.
+
 ## Agent Configuration
 
 The `AgentConfig` interface defines everything an agent needs to operate. Use the `agent()` helper for typed autocompletion.

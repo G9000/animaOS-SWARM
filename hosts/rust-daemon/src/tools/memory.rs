@@ -137,7 +137,9 @@ pub(super) fn execute_memory_add(
                 Ok(memory) => memory,
                 Err(error) => return TaskResult::error(error.message(), 0),
             };
-            if let Err(error) = save_memory_manager(context.memory_store.as_ref(), &memory_guard) {
+            if let Err(error) =
+                save_memory_manager(context.memory_store.as_ref(), &memory_guard).await
+            {
                 return TaskResult::error(format!("failed to persist memory: {error}"), 0);
             }
             memory

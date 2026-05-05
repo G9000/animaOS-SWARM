@@ -238,7 +238,7 @@ A snapshot is a complete, serializable capture of the in-memory runtime. Hosts c
 - Health checks (check `message_count`, `event_count`)
 - Host-managed restore or migration work
 
-The Rust daemon now uses these snapshots when `ANIMAOS_RS_CONTROL_PLANE_FILE` is configured. It restores registered agents after restart and marks any restored running task as failed/interrupted rather than pretending mid-turn resume happened.
+The Rust daemon now uses these snapshots through its host-owned control-plane store, backed by `ANIMAOS_RS_CONTROL_PLANE_FILE` or Postgres `host_snapshots`. It restores registered agents after restart and marks any restored running task as failed/interrupted rather than pretending mid-turn resume happened.
 
 ## Return Value
 

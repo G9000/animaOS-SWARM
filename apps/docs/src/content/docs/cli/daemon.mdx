@@ -1,0 +1,89 @@
+---
+title: Daemon Commands
+description: Run, chat, inspect, and operate daemon-backed workflows from the CLI
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+These commands talk directly to the daemon instead of generating local workspace files.
+
+## Choose the Right Command
+
+| Command | Use it when | Notes |
+|---------|-------------|-------|
+| `run` | You want one quick result right now | Creates a temporary agent or swarm and prints plain text |
+| `chat` | You want an interactive single-agent REPL | Creates one daemon-backed agent and keeps the conversation open |
+| `agents` | You want to inspect daemon-held agents | Useful for debugging or checking host state |
+| `mod` | You want to enable, disable, or list mods | Workspace/operator configuration surface |
+
+## `animaos run`
+
+```bash
+# Single agent
+animaos run "Summarize the Rust book" -m gpt-4o-mini
+
+# Swarm
+animaos run "Build a landing page" -s supervisor -m gpt-4o
+```
+
+`run` is the fastest daemon-backed CLI path. It is ideal when you do not want to create a workspace first.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-m, --model` | `gpt-4o-mini` | Model to use |
+| `-p, --provider` | `openai` | Provider family |
+| `-n, --name` | `task-agent` | Agent name for single-agent mode |
+| `-s, --strategy` | — | Swarm strategy: `supervisor`, `dynamic`, `round-robin` |
+| `--api-key` | — | API key override |
+| `--no-tui` | — | Force plain-text output |
+
+<Aside type="caution">
+  `run` is plain-text today. The `--no-tui` flag exists for interface consistency, but daemon-backed `run` does not currently render the Ink TUI.
+</Aside>
+
+## `animaos chat`
+
+```bash
+animaos chat -m claude-3-5-sonnet -p anthropic
+```
+
+`chat` creates a daemon-backed agent and opens a terminal REPL with the `you >` prompt. Type `exit` to quit.
+
+This is the right choice when you want iterative back-and-forth without generating a whole agency workspace.
+
+## `animaos agents`
+
+```bash
+# List all registered daemon-backed agents
+animaos agents list
+
+# Show one by name or id
+animaos agents show researcher
+```
+
+Use this when you want to inspect host state after launches, retries, or debugging sessions.
+
+## `animaos mod`
+
+```bash
+animaos mod enable my-mod
+animaos mod disable my-mod
+animaos mod list
+```
+
+The mod surface is the operational side of the CLI rather than the runtime side.
+
+## Targeting a Different Daemon
+
+The CLI defaults to `http://127.0.0.1:8080`, but daemon-backed commands can be pointed elsewhere:
+
+```bash
+ANIMA_DAEMON_URL=http://127.0.0.1:8081 animaos agents list
+```
+
+That is useful for staging, alternate local ports, or multiple hosts.
+
+## Where Next
+
+- Go to [Agency Workflow](/cli/workspaces/) for `create` and `launch`.
+- Go to [Providers & Environment](/cli/providers/) for provider credentials and endpoint overrides.

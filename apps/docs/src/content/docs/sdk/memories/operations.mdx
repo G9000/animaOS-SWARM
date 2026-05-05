@@ -1,0 +1,131 @@
+---
+title: Evaluation & Retention
+description: Evaluated writes, evidence tracing, retention, readiness, entities, and relationships in the SDK
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+This page covers the write-side and maintenance-side memory APIs.
+
+<CardGrid>
+  <Card title="Evaluate">
+    Score candidate memory before storing it, merging it, or ignoring it.
+  </Card>
+  <Card title="Trace">
+    Inspect linked entities and relationships around one stored memory.
+  </Card>
+  <Card title="Retain">
+    Apply cleanup and decay rules so the memory graph does not drift into noise.
+  </Card>
+  <Card title="Readiness">
+    Check embeddings, vector counts, and evaluation health before relying on recall.
+  </Card>
+</CardGrid>
+
+## Evaluate Before Writing
+
+```typescript
+const evaluation = await client.memories.evaluate({
+  agentId: 'agent-1',
+  agentName: 'researcher',
+  type: 'fact',
+  content: 'Something happened',
+  importance: 0.5,
+});
+
+console.log(evaluation.decision, evaluation.reason);
+```
+
+Use this when your app wants to preview the memory decision without storing anything yet.
+
+## Evaluate and Store
+
+```typescript
+const outcome = await client.memories.addEvaluated({
+  agentId: 'agent-1',
+  agentName: 'researcher',
+  type: 'fact',
+  content: 'User prefers concise release notes',
+  importance: 0.4,
+  tags: ['preference'],
+  minContentChars: 8,
+  minImportance: 0.1,
+});
+
+console.log(outcome.evaluation.decision, outcome.memory?.id);
+```
+
+## Evidence Trace
+
+```typescript
+const trace = await client.memories.trace('memory-uuid-here');
+
+console.log(trace.memory.content);
+console.log(trace.relationships.length, trace.entities.length);
+```
+
+Use this when the app needs to explain why a memory matters and what it connects to.
+
+## Maintenance Loop
+
+The durable pattern is straightforward:
+
+1. evaluate or write candidate memory
+2. inspect trace when you need explainability
+3. monitor readiness when operating the subsystem
+4. run retention to keep long-lived state useful
+
+## Retention and Cleanup
+
+```typescript
+const report = await client.memories.applyRetention({
+  minImportance: 0.2,
+  maxMemories: 1000,
+  maxAgeMillis: 30 * 24 * 60 * 60 * 1000,
+  decayHalfLifeMillis: 24 * 60 * 60 * 1000,
+});
+
+console.log(report.removedMemoryIds.length);
+```
+
+## Readiness
+
+```typescript
+const ready = await client.memories.readiness();
+console.log(ready.passed, ready.embeddings.vectorCount);
+```
+
+This is the operational check for the memory subsystem: embeddings, vector counts, and evaluation self-tests.
+
+## Entities and Relationships
+
+```typescript
+const entity = await client.memories.createEntity({
+  kind: 'user',
+  id: 'user-42',
+  name: 'Alice',
+});
+
+const relationship = await client.memories.createRelationship({
+  sourceAgentId: 'agent-a',
+  sourceKind: 'agent',
+  targetAgentId: 'agent-b',
+  targetKind: 'agent',
+  relationshipType: 'collaborator',
+  strength: 0.9,
+  confidence: 0.85,
+});
+
+console.log(entity.id, relationship.relationshipType);
+```
+
+These APIs let your app build explicit graph structure instead of inferring everything from plain text alone.
+
+<Aside type="note">
+  Retrieval and write-side operations complement each other. `search()` and `recall()` find useful memory. Evaluation, retention, entities, and relationships keep that memory graph healthy over time.
+</Aside>
+
+## Where Next
+
+- [Search & Recall](/sdk/memories/recall/) for the read-side retrieval flow.
+- [API Reference](/sdk/reference/) for full type signatures.

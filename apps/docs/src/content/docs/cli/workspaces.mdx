@@ -1,0 +1,123 @@
+---
+title: Agency Workflow
+description: Create, inspect, and launch agency workspaces from the animaOS CLI
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+This page covers the CLI workflow that starts on disk rather than in the daemon: generate an agent or agency workspace locally, edit it like normal project files, then launch it against the host.
+
+## Core Split
+
+- `animaos create` is local. It writes files and does not require the daemon.
+- `animaos launch` is daemon-backed. It reads `anima.yaml`, creates a runtime swarm in the host, and runs tasks through the daemon.
+
+That split is the main reason the CLI is practical for real work: you can shape the workspace locally, review it, and only then execute it.
+
+<CardGrid>
+  <Card title="Create">
+    Generate the agent or agency workspace locally with `animaos create`.
+  </Card>
+  <Card title="Refine">
+    Edit `anima.yaml`, agent profiles, and optional seed memories before execution.
+  </Card>
+  <Card title="Launch">
+    Run the workspace against the daemon with `animaos launch` and use the TUI or plain text.
+  </Card>
+</CardGrid>
+
+## Create a Workspace
+
+```bash
+# Interactive picker
+animaos create
+
+# Single-agent workspace
+animaos create agent medicine-helper \
+  -d "Research medical literature and summarize risks clearly"
+
+# Full agency workspace
+animaos create agency content-team \
+  -d "Research topics and write high-quality articles" \
+  -s 5 \
+  --seed
+```
+
+`create` uses configured remote provider credentials when available and falls back to a deterministic local scaffolder when no provider key is present.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kind` | — | `agent` or `agency` |
+| `-p, --provider` | `auto` | Generation provider. Supports `deterministic` and the daemon-facing provider family |
+| `-m, --model` | `gpt-4o-mini` | Model for generation |
+| `--models` | — | Comma-separated model pool for generated agents |
+| `-d, --description` | — | What the agent or agency should do |
+| `-s, --size` | `4` | Agency team size |
+| `--system` | — | System prompt for single-agent mode |
+| `--seed` | — | Generate starter memories for each agent |
+| `-y, --yes` | — | Skip confirmation |
+
+## Workspace Shape
+
+The generated workspace is designed to be edited by humans before launch:
+
+```text
+content-team/
+├── anima.yaml
+├── org-chart.mmd
+├── README.md
+└── agents/
+    ├── orchestrator/
+    │   ├── profile.md
+    │   ├── assets/
+    │   └── memory/
+    │       └── seed.json
+    └── worker-1/
+        ├── profile.md
+        ├── assets/
+        └── memory/
+```
+
+The important files are:
+
+- `anima.yaml` for runtime config
+- `agents/*/profile.md` for human-readable role shaping
+- `agents/*/memory/seed.json` for optional preloaded memories posted at launch time
+
+## Launch a Workspace
+
+```bash
+cd content-team
+
+# TUI session
+animaos launch
+
+# One-shot task in the TUI workflow
+animaos launch "Write a launch announcement"
+
+# Plain-text mode
+animaos launch --no-tui "Write a launch announcement"
+```
+
+`launch` is the best operator flow when you want the TUI, saved run history, and daemon-backed workspace execution.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--api-key` | — | API key override for the current daemon-backed run |
+| `--no-tui` | — | Disable Ink and use plain text |
+
+<Aside type="tip">
+  Use `launch` when you care about durable workspace structure, team composition, saved history, or the TUI. Use `run` only when you want a quick one-off result without creating a workspace first.
+</Aside>
+
+## Seed Memories
+
+If the workspace contains `agents/<slug>/memory/seed.json`, the CLI can post those memories into the daemon before the agency starts running. That gives the launched team a useful local memory baseline without hardcoding those facts into the host.
+
+This keeps agency memory bootstrap close to the workspace itself instead of hiding it in global daemon state.
+
+## Where Next
+
+- Go to [Daemon Commands](/cli/daemon/) for `run`, `chat`, and `agents`.
+- Go to [Providers & Environment](/cli/providers/) for provider setup and env vars.
+- Go to [TUI Overview](/tui/) for the operator surface behind `launch`.

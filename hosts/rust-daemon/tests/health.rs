@@ -1,9 +1,9 @@
 #[allow(dead_code)]
 mod support;
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anima_daemon::{app, app_with_configured_persistence, serve, DaemonConfig};
 use axum::body::{to_bytes, Body};
@@ -298,7 +298,6 @@ async fn serve_exposes_health_and_error_paths_over_real_http() {
         .expect("listener binds");
     let addr = listener.local_addr().expect("listener has local addr");
     let server = tokio::spawn(async move { serve(listener, DaemonConfig::default()).await });
-    std::thread::sleep(Duration::from_millis(25));
 
     let health_response = send_raw_http(
         addr,
@@ -331,7 +330,7 @@ async fn serve_exposes_health_and_error_paths_over_real_http() {
 }
 
 fn send_raw_http(addr: SocketAddr, request: &[u8]) -> String {
-    let mut stream = TcpStream::connect(addr).expect("client connects");
+    let mut stream = connect_with_retry(addr);
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .expect("read timeout configured");
@@ -340,12 +339,32 @@ fn send_raw_http(addr: SocketAddr, request: &[u8]) -> String {
     read_http_response(&mut stream)
 }
 
+fn connect_with_retry(addr: SocketAddr) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpStream::connect(addr) {
+            Ok(stream) => return stream,
+            Err(error) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = error;
+            }
+            Err(error) => panic!("client connects: {error}"),
+        }
+    }
+}
+
 fn read_http_response(stream: &mut TcpStream) -> String {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; 1024];
 
     loop {
-        let bytes_read = stream.read(&mut chunk).expect("response read");
+        let bytes_read = match stream.read(&mut chunk) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) if error.kind() == ErrorKind::ConnectionReset && !buffer.is_empty() => {
+                break;
+            }
+            Err(error) => panic!("response read: {error}"),
+        };
         if bytes_read == 0 {
             break;
         }

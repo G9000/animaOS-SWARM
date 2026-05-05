@@ -11,3 +11,10 @@ CREATE TABLE IF NOT EXISTS step_log (
     UNIQUE (agent_id, step_index),
     UNIQUE (agent_id, idempotency_key)
 );
+
+CREATE TABLE IF NOT EXISTS host_snapshots (
+    key        TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL,
+    payload    JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

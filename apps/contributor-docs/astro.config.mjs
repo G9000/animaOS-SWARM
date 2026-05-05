@@ -12,7 +12,9 @@ function contributorSidebarOverride() {
         updateConfig({
           components: {
             ...(config.components ?? {}),
+            Hero: './src/components/Hero.astro',
             Sidebar: './src/components/Sidebar.astro',
+            PageTitle: './src/components/PageTitle.astro',
           },
         });
       },
@@ -70,11 +72,14 @@ export default defineConfig({
         ]},
         { label: 'Rust Daemon', collapsed: false, items: [
           { label: 'Overview', link: '/hosts/rust-daemon/' },
+          { label: 'Local Development', link: '/hosts/rust-daemon/local/' },
           { label: 'Environment', link: '/hosts/rust-daemon/env/' },
+          { label: 'Staging Deployment', link: '/hosts/rust-daemon/staging/' },
           { label: 'HTTP API', link: '/hosts/rust-daemon/api/' },
           { label: 'Operations', link: '/hosts/rust-daemon/ops/' },
         ]},
         { label: 'Workflow', collapsed: false, items: [
+          { label: 'Local Playbook', link: '/workflow/playbook/' },
           { label: 'Development', link: '/workflow/dev/' },
           { label: 'Testing', link: '/workflow/testing/' },
         ]},

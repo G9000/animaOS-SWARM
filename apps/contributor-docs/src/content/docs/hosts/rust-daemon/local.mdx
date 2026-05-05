@@ -1,0 +1,95 @@
+---
+title: Local Development
+description: Day-to-day local development workflow for the Rust daemon host
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+## Pick the Right Entry Point
+
+Use the entry point that matches the scope of the change:
+
+- `bun dev` for the normal workspace loop. It defaults to the Rust host and starts the daemon plus the web and docs surfaces through `tools/workspace-dev`.
+- `bun dev --host rust` when you want the explicit host form.
+- `bun x nx run rust-daemon:dev` when you only need the daemon process.
+- `cargo run -p anima-daemon` when you want the raw host process without the Nx wrapper.
+
+<Aside type="tip">
+  Use `bun dev --host rust` for UI-plus-host work. Use `bun x nx run rust-daemon:dev` when you are only changing the Axum host, persistence wiring, routes, or host-owned runtime behavior.
+</Aside>
+
+## Recommended Local Profile
+
+For local development, keep the setup simple first:
+
+```bash
+ANIMAOS_RS_MEMORY_SQLITE_FILE=./data/runtime-memories.sqlite \
+ANIMAOS_RS_MEMORY_EMBEDDINGS=local \
+ANTHROPIC_API_KEY=sk-ant-... \
+cargo run -p anima-daemon
+```
+
+That profile gives you:
+
+- durable local memory snapshots in SQLite
+- cheap deterministic local embeddings
+- no Postgres dependency for day-to-day iteration
+
+If you need to exercise durable retry behavior or Postgres-backed host snapshots locally, switch to Postgres mode:
+
+```bash
+ANIMAOS_RS_PERSISTENCE_MODE=postgres \
+DATABASE_URL=postgres://user:pass@localhost/anima \
+ANTHROPIC_API_KEY=sk-ant-... \
+cargo run -p anima-daemon
+```
+
+## Quick Verification
+
+After the daemon starts, verify the local loop immediately:
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
+```
+
+Open `http://127.0.0.1:8080/docs` to inspect the live API surface.
+
+## Common Local Tasks
+
+<Steps>
+
+1. Run the daemon tests after host or core changes.
+
+   ```bash
+   bun x nx run rust-daemon:test --skipNxCache
+   ```
+
+2. Rebuild contributor docs after docs edits.
+
+   ```bash
+   bun x nx run @animaOS-SWARM/contributor-docs:build --skipNxCache
+   ```
+
+3. Rebuild public docs if you changed user-facing docs.
+
+   ```bash
+   bun x nx run @animaOS-SWARM/docs:build --skipNxCache
+   ```
+
+</Steps>
+
+## Windows Note
+
+On Windows, a running daemon can keep `target/debug/anima-daemon.exe` locked. If that happens during validation, rerun the daemon test target with an isolated cargo target directory:
+
+```bash
+CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache
+```
+
+## Scope Boundaries
+
+- Use this page for the local development loop.
+- Use [Environment](/hosts/rust-daemon/env/) for env var details.
+- Use [Staging Deployment](/hosts/rust-daemon/staging/) for container and online staging guidance.
+- Use [Operations](/hosts/rust-daemon/ops/) for readiness, metrics, and runtime debugging.

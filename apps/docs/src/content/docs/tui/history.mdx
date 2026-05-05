@@ -1,0 +1,53 @@
+---
+title: History & Resume
+description: Saved runs, retry flows, and resumed-session behavior in the animaOS TUI
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The TUI keeps local launch history so prior agency runs can be inspected and retried instead of disappearing once the session ends.
+
+## Where History Lives
+
+For agency workspaces launched through `animaos launch`, run history is stored in:
+
+```text
+anima-history.json
+```
+
+That file lives next to `anima.yaml` in the agency directory.
+
+## What History Gives You
+
+- browse earlier runs with `/history`
+- inspect saved output without rerunning the task immediately
+- reopen a prior run after restarting the CLI
+- retry recent work with `/retry` when retry is available
+
+## Resumed Views
+
+When you reopen a saved or recent run, the TUI can switch into a resumed-session inspection state. From there:
+
+- `/back` returns to the main session surface
+- `/retry` reruns the prior task when the daemon is healthy
+- `/clear` clears the current surface
+
+## Failure and Recovery Cases
+
+History is especially useful when local runtime work is messy:
+
+- the daemon was temporarily down
+- you want to compare current behavior against a prior run
+- you want to rerun the last task without rebuilding the workspace context by hand
+
+<Aside type="note">
+  History is local CLI session state, not a database-backed host history API. It complements the daemon rather than replacing host-side persistence.
+</Aside>
+
+## Suggested Workflow
+
+1. Launch an agency with `animaos launch`.
+2. Run a few tasks.
+3. Use `/history` to inspect prior runs.
+4. Use `/retry` to rerun the last useful task.
+5. Use `/back` to return to the live operator view.

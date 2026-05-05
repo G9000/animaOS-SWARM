@@ -9,8 +9,10 @@ use anima_memory::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Row};
 
 const STORE_VERSION: u32 = 1;
+const MEMORY_SNAPSHOT_KEY: &str = "memory";
 const SQLITE_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS memory_store_snapshots (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -19,16 +21,18 @@ CREATE TABLE IF NOT EXISTS memory_store_snapshots (
 );
 "#;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) enum MemoryStoreConfig {
     Json(PathBuf),
     Sqlite(PathBuf),
+    Postgres(PgPool),
 }
 
 impl MemoryStoreConfig {
-    pub(crate) fn path(&self) -> &PathBuf {
+    pub(crate) fn file_path(&self) -> Option<&PathBuf> {
         match self {
-            Self::Json(path) | Self::Sqlite(path) => path,
+            Self::Json(path) | Self::Sqlite(path) => Some(path),
+            Self::Postgres(_) => None,
         }
     }
 
@@ -36,6 +40,14 @@ impl MemoryStoreConfig {
         match self {
             Self::Json(_) => "json",
             Self::Sqlite(_) => "sqlite",
+            Self::Postgres(_) => "postgres",
+        }
+    }
+
+    pub(crate) fn location_label(&self) -> String {
+        match self {
+            Self::Json(path) | Self::Sqlite(path) => path.display().to_string(),
+            Self::Postgres(_) => "postgres:host_snapshots/memory".into(),
         }
     }
 
@@ -43,36 +55,39 @@ impl MemoryStoreConfig {
         match self {
             Self::Json(_) => None,
             Self::Sqlite(path) => Some(path.clone()),
+            Self::Postgres(_) => None,
         }
     }
 }
 
-pub(crate) fn save_memory_manager(
+pub(crate) async fn save_memory_manager(
     config: Option<&MemoryStoreConfig>,
     manager: &MemoryManager,
 ) -> io::Result<()> {
     let Some(config) = config else {
         return Ok(());
     };
-    save_memory_snapshot(config, &manager.snapshot())
+    save_memory_snapshot(config, &manager.snapshot()).await
 }
 
-pub(crate) fn load_memory_snapshot(
+pub(crate) async fn load_memory_snapshot(
     config: &MemoryStoreConfig,
 ) -> io::Result<Option<MemoryManagerSnapshot>> {
     match config {
         MemoryStoreConfig::Json(path) => load_json_snapshot(path),
         MemoryStoreConfig::Sqlite(path) => load_sqlite_snapshot(path),
+        MemoryStoreConfig::Postgres(pool) => load_postgres_snapshot(pool).await,
     }
 }
 
-fn save_memory_snapshot(
+async fn save_memory_snapshot(
     config: &MemoryStoreConfig,
     snapshot: &MemoryManagerSnapshot,
 ) -> io::Result<()> {
     match config {
         MemoryStoreConfig::Json(path) => save_json_snapshot(path, snapshot),
         MemoryStoreConfig::Sqlite(path) => save_sqlite_snapshot(path, snapshot),
+        MemoryStoreConfig::Postgres(pool) => save_postgres_snapshot(pool, snapshot).await,
     }
 }
 
@@ -134,6 +149,10 @@ fn ensure_sqlite_schema(conn: &Connection) -> io::Result<()> {
 
 fn parse_snapshot_json(contents: &str) -> io::Result<MemoryManagerSnapshot> {
     let value = serde_json::from_str::<serde_json::Value>(contents).map_err(serde_error)?;
+    parse_snapshot_value(value)
+}
+
+fn parse_snapshot_value(value: serde_json::Value) -> io::Result<MemoryManagerSnapshot> {
     if value.is_array() {
         let memories = serde_json::from_value::<Vec<StoredMemory>>(value).map_err(serde_error)?;
         return snapshot_from_store(StoredMemoryStore {
@@ -147,6 +166,48 @@ fn parse_snapshot_json(contents: &str) -> io::Result<MemoryManagerSnapshot> {
     }
     let store = serde_json::from_value::<StoredMemoryStore>(value).map_err(serde_error)?;
     snapshot_from_store(store)
+}
+
+async fn save_postgres_snapshot(pool: &PgPool, snapshot: &MemoryManagerSnapshot) -> io::Result<()> {
+    let store = StoredMemoryStore::from(snapshot);
+    let payload = serde_json::to_value(&store).map_err(serde_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO host_snapshots (key, version, payload, updated_at)
+        VALUES ($1, $2, $3, now())
+        ON CONFLICT (key)
+        DO UPDATE SET
+            version = EXCLUDED.version,
+            payload = EXCLUDED.payload,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(MEMORY_SNAPSHOT_KEY)
+    .bind(STORE_VERSION as i32)
+    .bind(payload)
+    .execute(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn load_postgres_snapshot(pool: &PgPool) -> io::Result<Option<MemoryManagerSnapshot>> {
+    let Some(row) = sqlx::query("SELECT version, payload FROM host_snapshots WHERE key = $1")
+        .bind(MEMORY_SNAPSHOT_KEY)
+        .fetch_optional(pool)
+        .await
+        .map_err(postgres_error)?
+    else {
+        return Ok(None);
+    };
+    let version: i32 = row.get("version");
+    if version > STORE_VERSION as i32 {
+        return Err(invalid_data(format!(
+            "unsupported memory store version: {version}"
+        )));
+    }
+    let payload: serde_json::Value = row.get("payload");
+    parse_snapshot_value(payload).map(Some)
 }
 
 fn snapshot_from_store(store: StoredMemoryStore) -> io::Result<MemoryManagerSnapshot> {
@@ -687,6 +748,10 @@ fn sqlite_error(error: rusqlite::Error) -> io::Error {
     io::Error::new(io::ErrorKind::Other, error)
 }
 
+fn postgres_error(error: sqlx::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, error)
+}
+
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
@@ -713,8 +778,9 @@ mod tests {
         let config = MemoryStoreConfig::Json(path.clone());
         let manager = sample_manager();
 
-        save_memory_manager(Some(&config), &manager).expect("json save should succeed");
-        let snapshot = load_memory_snapshot(&config)
+        futures::executor::block_on(save_memory_manager(Some(&config), &manager))
+            .expect("json save should succeed");
+        let snapshot = futures::executor::block_on(load_memory_snapshot(&config))
             .expect("json load should succeed")
             .expect("json snapshot should exist");
         let mut reloaded = MemoryManager::new();
@@ -741,7 +807,8 @@ mod tests {
         let config = MemoryStoreConfig::Sqlite(path.clone());
         let mut manager = sample_manager();
 
-        save_memory_manager(Some(&config), &manager).expect("first sqlite save should succeed");
+        futures::executor::block_on(save_memory_manager(Some(&config), &manager))
+            .expect("first sqlite save should succeed");
         manager.clear(None);
         manager
             .add(NewMemory {
@@ -757,9 +824,10 @@ mod tests {
                 session_id: None,
             })
             .expect("fresh memory should add");
-        save_memory_manager(Some(&config), &manager).expect("second sqlite save should succeed");
+        futures::executor::block_on(save_memory_manager(Some(&config), &manager))
+            .expect("second sqlite save should succeed");
 
-        let snapshot = load_memory_snapshot(&config)
+        let snapshot = futures::executor::block_on(load_memory_snapshot(&config))
             .expect("sqlite load should succeed")
             .expect("sqlite snapshot should exist");
         let mut reloaded = MemoryManager::new();

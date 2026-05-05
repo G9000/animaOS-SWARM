@@ -29,7 +29,7 @@ Any host in any language can embed `anima-core` by implementing its traits. This
 
 **The database is the source of truth. The process is the executor.** Every agent action is checkpointed through persistence traits before and after execution. The host decides what backs those traits. The core doesn't care.
 
-**Implementation note (2026-05-05).** The current Rust daemon persists step logs and can reuse completed tool steps when a caller retries a request with the same explicit metadata retry key. It can also restore registered agents, registered swarms, and latest snapshots from `ANIMAOS_RS_CONTROL_PLANE_FILE`. Full crash-safe mid-turn resume remains future work; interrupted work is restored as failed.
+**Implementation note (2026-05-05).** The current Rust daemon persists step logs and can reuse completed tool steps when a caller retries a request with the same explicit metadata retry key. It can also restore registered agents, registered swarms, and latest snapshots from a host-owned control-plane snapshot, backed by `ANIMAOS_RS_CONTROL_PLANE_FILE` or by Postgres `host_snapshots` in Postgres mode. Full crash-safe mid-turn resume remains future work; interrupted work is restored as failed.
 
 **The core owns execution semantics. The host owns execution reality.** This includes timing — retry policy, wakeup schedule, and delay between steps are defined by the core as data. The host reads that data and acts on it using whatever scheduler it has. This prevents retry semantics from diverging across host implementations.
 
@@ -37,7 +37,7 @@ Any host in any language can embed `anima-core` by implementing its traits. This
 
 **The core emits events through a trait.** Agent lifecycle events — tool calls, task completion, errors — flow out of the core via an `EventSink` trait. The host decides how to route them: SSE, WebSocket, logs, or nothing. This prevents transport assumptions from leaking into the core.
 
-**Idempotency is a core rule, but current recovery is partial.** When a host provides persistence, the core can record tool-step boundaries and skip re-executing completed tool steps for an explicit retried request. Hosts can still run without persistence. The current daemon restores control-plane registrations through a host-owned JSON snapshot, but it does not resume interrupted in-flight model turns after process restart.
+**Idempotency is a core rule, but current recovery is partial.** When a host provides persistence, the core can record tool-step boundaries and skip re-executing completed tool steps for an explicit retried request. Hosts can still run without persistence. The current daemon restores control-plane registrations through a host-owned snapshot store, but it does not resume interrupted in-flight model turns after process restart.
 
 **A step is only considered complete when persisted as `done`.** A step written as `pending` means the side effect has not yet occurred — it is safe to retry. A step written as `done` means the side effect completed — it must not be re-executed. This is the execution invariant the entire system is built on. Any host, any executor, any deployment must honor it.
 

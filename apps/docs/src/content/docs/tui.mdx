@@ -5,18 +5,66 @@ description: Terminal UI for visual swarm monitoring and agent interaction
 
 import { Aside } from '@astrojs/starlight/components';
 
-The animaOS Terminal UI (TUI) is a visual interface built with [Ink](https://github.com/vadimdemedes/ink) that runs inside your terminal. It gives you a real-time dashboard for watching swarms collaborate, inspecting agent activity, and sending tasks.
+The animaOS Terminal UI (TUI) is the main operator surface for agency work. It is built with [Ink](https://github.com/vadimdemedes/ink) and runs inside your terminal, giving you a real-time view of swarm execution, tools, results, health, and saved history.
 
-## Launch
+The TUI sits behind `animaos launch`. It is designed for agency workspaces that already have an `anima.yaml`.
+
+<Aside type="caution">
+  Use `animaos launch` for the TUI. `animaos run` is plain-text today and does not render the TUI for daemon-backed runs.
+</Aside>
+
+## In This Section
+
+- [Commands & States](/tui/commands/) covers slash commands, health checks, keyboard flow, and daemon-down behavior.
+- [History & Resume](/tui/history/) covers `anima-history.json`, saved runs, retry flows, and resumed-session inspection.
+
+## Recommended Flow
+
+1. Start the daemon.
+
+   ```bash
+   bun run daemon
+   ```
+
+2. Create an agency workspace if you do not already have one.
+
+   ```bash
+   animaos create agency content-team --seed
+   ```
+
+3. Launch the workspace in the TUI.
+
+   ```bash
+   cd content-team
+   animaos launch
+   ```
+
+## Launch Modes
 
 ```bash
-# Launch an agency with TUI
+# Launch an agency in the TUI
 cd content-team
-animaos launch --tui
+animaos launch
 
-# Or force TUI for a one-off run
-animaos run "Build a website" -s supervisor --tui
+# One-shot task inside the TUI session
+animaos launch "Build a website"
+
+# Plain-text fallback for automation or CI
+animaos launch --no-tui "Build a website"
 ```
+
+`launch` uses the workspace config in `anima.yaml`, can seed daemon memories from `agents/<slug>/memory/seed.json`, and keeps local launch history for later browsing and replay.
+
+## What the TUI Is Good At
+
+- watching a swarm work in real time
+- tracking which agent is active and what tools are being called
+- checking whether the daemon is healthy without leaving the terminal
+- browsing recent run history and replaying prior work
+- staying productive when the daemon temporarily drops by switching into command-only mode
+
+Use the TUI subsections in the sidebar if you want the operator details instead of the overview.
+
 
 ## Layout
 
@@ -45,21 +93,33 @@ animaos run "Build a website" -s supervisor --tui
 
 | Panel | Description |
 |-------|-------------|
-| **Agents** | Shows all agents in the swarm with their role (★ orchestrator, • worker) and status |
-| **Message Stream** | Real-time messages and events between agents |
-| **Tool Panel** | Displays tool invocations, arguments, and results as they happen |
-| **Result Log** | History of completed tasks with duration and token usage |
-| **Input Bar** | Type tasks and slash commands |
-| **Status Bar** | Swarm status, total token usage, and daemon health indicator |
+| **Agents** | Shows the orchestrator and workers, plus their current status |
+| **Message Stream** | Real-time swarm messages and lifecycle events |
+| **Tool / Trace Views** | Shows tool calls, arguments, and returned results |
+| **Result Log** | Stores completed tasks with duration and token summaries |
+| **History View** | Lets you browse saved runs and resume inspection |
+| **Input Bar** | Accepts tasks and slash commands |
+| **Status Bar** | Shows run status, health state, and daemon-related hints |
+
+## Operator States
+
+The TUI is not just a pretty event stream. It has explicit operator behavior for the hard parts of local runtime work:
+
+- **Preflight health checks** warn you when the daemon is down before a task is sent.
+- **Command-only mode** appears when the daemon is unavailable, blocking task submission while still allowing health checks and help.
+- **Recovery messaging** tells you when daemon connectivity returns.
+- **History and resume flows** let you reopen saved runs and retry them without rebuilding context from scratch.
 
 ## Slash Commands
 
 | Command | Description |
 |---------|-------------|
 | `/help` | Show available commands |
-| `/health` | Check daemon connectivity |
-| `/clear` | Clear the message stream |
-| `/history` | Toggle history view |
+| `/health` | Check daemon connectivity and report recovery or failure state |
+| `/history` | Browse saved run history |
+| `/retry` | Rerun the most recent task or saved run when retry is available |
+| `/clear` | Clear the current result/history surface |
+| `/back` | Return from history or resumed-run views |
 
 ## Keyboard Shortcuts
 
@@ -69,7 +129,17 @@ animaos run "Build a website" -s supervisor --tui
 | `Tab` | Cycle between panels |
 | `Ctrl+C` | Quit |
 
-## Live Events
+## History and Resume
+
+Launch sessions keep local history so the TUI can show prior runs, inspect them, and offer rerun affordances. In agency workspaces, that history is stored in `anima-history.json` next to `anima.yaml`.
+
+This makes the TUI useful even outside the active run itself:
+
+- browse what happened in prior sessions
+- resume inspection after a restart
+- retry recent tasks without reconstructing the workspace manually
+
+## Live Telemetry
 
 The TUI subscribes to the daemon's SSE event stream, so you see everything in real time:
 
@@ -78,6 +148,8 @@ The TUI subscribes to the daemon's SSE event stream, so you see everything in re
 - Token usage updates per agent
 - Swarm completion events
 
+That live stream is what makes the TUI the best surface for understanding multi-agent behavior as it happens instead of after the fact.
+
 <Aside type="tip">
-  The TUI works best in a terminal that supports true color and at least 80×24 characters. Resize your terminal if panels feel cramped.
+  The TUI works best in a terminal that supports true color and at least 80x24 characters. Give it more width if you want the agent list, tool trace, and result history to stay readable during busy runs.
 </Aside>

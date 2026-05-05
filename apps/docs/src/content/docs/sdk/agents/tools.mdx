@@ -1,0 +1,107 @@
+---
+title: Actions & Plugins
+description: Typed actions, plugin bundles, and agent capability composition in the SDK
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+Actions and plugins are the main composition surface for agent capabilities in the SDK.
+
+<CardGrid>
+  <Card title="Action">
+    Use `action()` when you want one focused tool with a typed input and output contract.
+  </Card>
+  <Card title="Plugin">
+    Use `plugin()` when the capability should travel as a reusable bundle.
+  </Card>
+  <Card title="Registration">
+    Attach tools and plugins to the agent config before you register the agent with the daemon.
+  </Card>
+</CardGrid>
+
+## Actions
+
+An action is a typed tool the model can invoke.
+
+```typescript
+import { action } from '@animaOS-SWARM/sdk';
+
+const memorySearch = action({
+  name: 'memory_search',
+  description: 'Search stored memories by keyword',
+  parametersSchema: {
+    query: { type: 'string', description: 'Search query' },
+    limit: { type: 'number', description: 'Maximum matches to return' },
+  },
+  handler: async (_runtime, _message, args) => {
+    const query = typeof args.query === 'string' ? args.query : '';
+    return {
+      status: 'success',
+      data: { text: `Search requested for: ${query}` },
+      durationMs: 0,
+    };
+  },
+});
+```
+
+The key fields are:
+
+- `name`
+- `description`
+- `parametersSchema`
+- `handler`
+- optional `validate`
+- optional `examples`
+
+## Register Actions on an Agent
+
+```typescript
+const researcher = await client.agents.create(
+  agent({
+    name: 'researcher',
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    system: 'Use tools when needed.',
+    tools: [memorySearch],
+  })
+);
+```
+
+## Plugins
+
+A plugin groups actions, providers, and evaluators into a reusable module.
+
+```typescript
+import { plugin } from '@animaOS-SWARM/sdk';
+
+const researchPlugin = plugin({
+  name: 'research',
+  description: 'Web search and memory tools for research agents',
+  actions: [memorySearch],
+  providers: [],
+  evaluators: [],
+});
+```
+
+Plugins are the cleaner choice when the capability set should travel as one unit across multiple agents.
+
+## Practical Capability Split
+
+- choose `action()` for one narrow capability owned by one integration
+- choose `plugin()` when several agents should share the same capability pack
+- keep runtime-heavy behavior in the host instead of pushing orchestration into the SDK caller
+
+## When to Use What
+
+- use a single `action()` when the capability is narrow and local
+- use `plugin()` when the capability is a reusable bundle
+- use plain config when no custom behavior is needed
+
+<Aside type="tip">
+  The SDK gives you typed composition. The actual runtime execution still happens inside the host, not inside the SDK package.
+</Aside>
+
+## Where Next
+
+- [Agents Overview](/sdk/agents/) for the broader agent lifecycle.
+- [Lifecycle & Retry](/sdk/agents/lifecycle/) for the run loop and retry-key behavior.

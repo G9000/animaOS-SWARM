@@ -3,11 +3,11 @@ title: Quick Start
 description: Get up and running with the animaOS SDK in minutes
 ---
 
-import { Tabs, TabItem, Steps } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem, Steps } from '@astrojs/starlight/components';
 
 ## Prerequisites
 
-Before using the SDK, make sure an animaOS-compatible host is running and you have provider credentials configured.
+Before using the SDK, make sure an animaOS-compatible host is running and has at least one model provider configured. The SDK is a client for the host. It does not embed the runtime itself.
 
 <Steps>
 
@@ -46,6 +46,18 @@ Before using the SDK, make sure an animaOS-compatible host is running and you ha
 
 </Steps>
 
+<Aside type="tip">
+  If you are developing inside this repo, `bun dev` is the full workspace loop and `bun run daemon` is the smallest daemon-only loop.
+</Aside>
+
+## In This Section
+
+- [Client Basics](/sdk/client/) covers `DaemonClient`, health checks, base URLs, and error handling.
+- [Agents](/sdk/agents/) covers single-agent lifecycle, actions, and plugins.
+- [Swarms](/sdk/swarms/) covers multi-agent configuration and event streaming.
+- [Memories](/sdk/memories/) covers search, recall, evaluation, retention, and relationship APIs.
+- [API Reference](/sdk/reference/) covers the full typed surface.
+
 ## Installation
 
 The SDK is published as `@animaOS-SWARM/sdk` and requires a modern package manager that supports ESM.
@@ -73,6 +85,16 @@ The SDK is published as `@animaOS-SWARM/sdk` and requires a modern package manag
   </TabItem>
 </Tabs>
 
+## Mental Model
+
+The SDK is the typed HTTP and SSE client for an animaOS-compatible host.
+
+- `createDaemonClient()` gives you one `DaemonClient` instance.
+- `client.agents` covers single-agent lifecycle operations.
+- `client.swarms` covers multi-agent coordination and SSE subscriptions.
+- `client.memories` covers search, recall, evaluation, retention, entities, and relationships.
+- The runtime stays in the host. The SDK only talks to it.
+
 ## Create a Client
 
 The entry point to the SDK is `createDaemonClient`. It returns a `DaemonClient` that exposes `agents`, `swarms`, and `memories` sub-clients.
@@ -98,14 +120,22 @@ const client = createDaemonClient({
 | `baseUrl` | `string` | `http://127.0.0.1:8080` | Daemon HTTP endpoint |
 | `fetch` | `typeof fetch` | `globalThis.fetch` | Custom fetch implementation |
 
-## Create and Run Your First Agent
+## Single-Agent Flow
+
+The fastest useful SDK flow is:
+
+1. create a client
+2. create an agent
+3. run a task
+4. inspect the result
 
 ```typescript
 import { agent, createDaemonClient } from '@animaOS-SWARM/sdk';
 
 const client = createDaemonClient();
 
-// 1. Create an agent
+await client.health();
+
 const researcher = await client.agents.create(
   agent({
     name: 'researcher',
@@ -117,12 +147,13 @@ const researcher = await client.agents.create(
 
 console.log('Created agent:', researcher.state.id);
 
-// 2. Run it
 const run = await client.agents.run(researcher.state.id, {
   text: 'What are the main types of neural networks?',
+  metadata: {
+    retryKey: 'neural-networks-quickstart',
+  },
 });
 
-// 3. Handle the result
 if (run.result.status === 'success') {
   console.log(run.result.data?.text);
 } else {
@@ -131,6 +162,87 @@ if (run.result.status === 'success') {
 ```
 
 The `agent()` helper is an identity function that gives you full TypeScript IntelliSense for the `AgentConfig` shape. You can also pass a plain object if you prefer.
+
+## Memory Flow
+
+The SDK can write memories, search them lexically, and run richer recall with vector, temporal, and relationship signals.
+
+```typescript
+const memory = await client.memories.create({
+  agentId: researcher.state.id,
+  agentName: researcher.state.name,
+  type: 'fact',
+  content: 'User prefers concise technical answers.',
+  importance: 0.8,
+  tags: ['preference', 'style'],
+  scope: 'shared',
+});
+
+const matches = await client.memories.search('concise technical', {
+  agentId: researcher.state.id,
+  limit: 5,
+});
+
+const recalled = await client.memories.recall('How should I respond?', {
+  agentId: researcher.state.id,
+  entityId: 'user-1',
+  limit: 3,
+});
+
+console.log(memory.id, matches.length, recalled.length);
+```
+
+This is the main difference between the SDK and a thin raw HTTP wrapper: you get typed access to the host's agent, swarm, and memory model instead of hand-building request payloads.
+
+## Swarm Flow
+
+When you need multi-agent coordination, create a swarm and then either run it directly or subscribe to live SSE events.
+
+```typescript
+import { agent, swarm } from '@animaOS-SWARM/sdk';
+
+const editorialSwarm = await client.swarms.create(
+  swarm({
+    strategy: 'supervisor',
+    manager: agent({
+      name: 'editor',
+      provider: 'openai',
+      model: 'gpt-4o',
+      system: 'Break work into steps, review outputs, and synthesize the final answer.',
+    }),
+    workers: [
+      agent({
+        name: 'researcher',
+        provider: 'openai',
+        model: 'gpt-4o-mini',
+        system: 'Research the assigned topic and return concise findings.',
+      }),
+      agent({
+        name: 'writer',
+        provider: 'openai',
+        model: 'gpt-4o',
+        system: 'Turn approved findings into polished output.',
+      }),
+    ],
+  })
+);
+
+const result = await client.swarms.run(editorialSwarm.id, {
+  text: 'Write a short launch announcement for our Rust daemon.',
+});
+
+console.log(result.result.status, result.swarm.status);
+```
+
+If you want live telemetry, subscribe to the swarm event stream:
+
+```typescript
+for await (const event of client.swarms.subscribe(editorialSwarm.id)) {
+  console.log(event.event, event.data);
+}
+```
+
+The detailed event payload shapes live in the [Swarms](/sdk/swarms/) page and the [API Reference](/sdk/reference/).
 
 ## Error Handling
 
@@ -160,7 +272,18 @@ try {
 | `DaemonHttpError` | `body: unknown` | Parsed JSON error body |
 | `DaemonConnectionError` | `cause: unknown` | Original fetch/network error |
 
-## Host-agnostic
+## Health and Reachability
+
+Before making application requests, verify the host is reachable:
+
+```typescript
+const health = await client.health();
+console.log(health.status); // 'ok' | 'degraded' | 'unavailable'
+```
+
+This is especially useful in browser apps, edge services, or CI flows where the daemon may not already be running.
+
+## Host-Agnostic
 
 The SDK is designed to work with any animaOS-compatible host. Just point `baseUrl` at your host:
 
@@ -171,15 +294,6 @@ const client = createDaemonClient({
 ```
 
 The Rust daemon in this repo is the reference implementation. See [`hosts/rust-daemon`](https://github.com/G9000/animaOS-SWARM/tree/main/hosts/rust-daemon) for its full operator documentation, environment variables, and HTTP API.
-
-## Health Check
-
-Before making requests, you can verify the host is reachable:
-
-```typescript
-const health = await client.health();
-console.log(health.status); // 'ok' | 'degraded' | 'unavailable'
-```
 
 ## Next Steps
 

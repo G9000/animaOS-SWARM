@@ -1,0 +1,85 @@
+---
+title: Event Streaming
+description: Subscribe to swarm SSE streams and work with live event payloads in the SDK
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+The swarm stream is the live telemetry surface for multi-agent work. It is what powers dashboards, TUIs, observer tools, and progressive UI updates.
+
+<CardGrid>
+  <Card title="Lifecycle">
+    Watch state transitions as the swarm moves from idle to running to completed or failed.
+  </Card>
+  <Card title="Tooling">
+    Track tool invocations, arguments, outcomes, and durations as they happen.
+  </Card>
+  <Card title="Usage">
+    Stream token usage and per-agent activity without polling snapshots.
+  </Card>
+</CardGrid>
+
+## Subscribe to the Stream
+
+```typescript
+const stream = client.swarms.subscribe('swarm-uuid-here');
+
+for await (const event of stream) {
+  console.log(event.event, event.data);
+}
+```
+
+## Event Families
+
+The stream exposes a discriminated union of payload shapes:
+
+| Payload | Description |
+|---------|-------------|
+| `SwarmEventPayload` | Swarm-level state update |
+| `SwarmMessagePayload` | Agent-to-agent message |
+| `SwarmAgentEventPayload` | Generic agent event |
+| `SwarmTaskFailedPayload` | Agent task failure |
+| `SwarmToolBeforePayload` | Tool invocation start |
+| `SwarmToolAfterPayload` | Tool invocation complete |
+| `SwarmAgentTokensPayload` | Token usage update |
+
+## Monitor Tool Activity
+
+```typescript
+for await (const { event, data } of client.swarms.subscribe(swarmId)) {
+  if ('toolName' in data && 'status' in data) {
+    console.log(`[${data.agentName}] ${data.toolName}: ${data.status} (${data.durationMs}ms)`);
+  }
+
+  if ('error' in data) {
+    console.error(`[${data.agentName}] FAILED: ${data.error}`);
+  }
+}
+```
+
+## Cancel a Stream
+
+```typescript
+const controller = new AbortController();
+
+const streamTask = (async () => {
+  for await (const event of client.swarms.subscribe(swarmId, {
+    signal: controller.signal,
+  })) {
+    console.log(event.event, event.data);
+  }
+})();
+
+setTimeout(() => controller.abort(), 30_000);
+
+await streamTask;
+```
+
+<Aside type="tip">
+  Use snapshots for point-in-time state and SSE for live operator surfaces. The two complement each other; they are not interchangeable.
+</Aside>
+
+## Where Next
+
+- [Swarms Overview](/sdk/swarms/) for configuration and run shapes.
+- [API Reference](/sdk/reference/) for detailed payload and type names.

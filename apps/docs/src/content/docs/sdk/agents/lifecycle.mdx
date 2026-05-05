@@ -1,0 +1,92 @@
+---
+title: Lifecycle & Retry
+description: Create, run, inspect, and safely retry agents through the SDK
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+This page is the practical agent loop: create an agent, run work through it, inspect the updated snapshot, and use retry keys correctly when the host supports durable step reuse.
+
+<CardGrid>
+  <Card title="Create">
+    Register an agent in the daemon with `client.agents.create()`.
+  </Card>
+  <Card title="Run">
+    Send one `Content` payload with `client.agents.run()`.
+  </Card>
+  <Card title="Inspect">
+    Read the updated snapshot, token usage, and recent memories.
+  </Card>
+  <Card title="Retry Safely">
+    Reuse the same `retryKey` only for the same logical request.
+  </Card>
+</CardGrid>
+
+## Create an Agent
+
+```typescript
+import { agent } from '@animaOS-SWARM/sdk';
+
+const researcher = await client.agents.create(
+  agent({
+    name: 'researcher',
+    provider: 'openai',
+    model: 'gpt-4o-mini',
+    system: 'You are a concise research assistant.',
+  })
+);
+```
+
+The daemon stores the created agent and returns an `AgentSnapshot`.
+
+## Run an Agent
+
+```typescript
+const execution = await client.agents.run(researcher.state.id, {
+  text: 'Summarize the latest database durability changes.',
+});
+
+console.log(execution.result.status);
+console.log(execution.agent.state.tokenUsage.totalTokens);
+```
+
+The returned payload includes both the task result and the updated snapshot.
+
+## Inspect and Re-read
+
+```typescript
+const snapshot = await client.agents.get(researcher.state.id);
+const recent = await client.agents.recentMemories(researcher.state.id, {
+  limit: 10,
+});
+
+console.log(snapshot.state.status, recent.length);
+```
+
+This is the normal pattern after a run when your app wants to surface current agent state and memory context.
+
+## Safe Retry Keys
+
+If the host is configured for step persistence, completed tool steps can be reused when you retry the same logical request with the same key.
+
+```typescript
+const run = await client.agents.run(researcher.state.id, {
+  text: 'Compile the release notes.',
+  metadata: {
+    retryKey: 'release-notes-2026-05-05',
+  },
+});
+```
+
+- reuse the same key only when retrying the same logical work
+- omit the key or generate a new value for a fresh request
+- this is step reuse, not full mid-turn resume after a process crash
+
+<Aside type="note">
+  Retry behavior depends on host persistence. The SDK simply gives you a typed way to send the metadata; the host decides whether durable reuse is available.
+</Aside>
+
+## Where Next
+
+- [Actions & Plugins](/sdk/agents/tools/) for typed tool and plugin registration.
+- [API Reference](/sdk/reference/) for the exact response and type shapes.

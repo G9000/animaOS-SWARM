@@ -1,0 +1,108 @@
+---
+title: Client Basics
+description: DaemonClient structure, health checks, base URL configuration, and error handling
+---
+
+import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
+
+The SDK is organized around one `DaemonClient` instance. You create it once, point it at an animaOS-compatible host, and then work through the typed `agents`, `swarms`, and `memories` sub-clients.
+
+<CardGrid>
+  <Card title="Health">
+    Verify host reachability with `client.health()` before doing application work.
+  </Card>
+  <Card title="Domain Clients">
+    Use `client.agents`, `client.swarms`, and `client.memories` instead of raw request construction.
+  </Card>
+  <Card title="Transport Escape Hatches">
+    Use `requestJson()` and `subscribe()` when you need lower-level control over JSON or SSE.
+  </Card>
+</CardGrid>
+
+## Create a Client
+
+```typescript
+import { createDaemonClient } from '@animaOS-SWARM/sdk';
+
+const client = createDaemonClient();
+
+const explicitClient = createDaemonClient({
+  baseUrl: 'http://127.0.0.1:8080',
+  fetch: globalThis.fetch,
+});
+```
+
+## Client Shape
+
+The client surface is intentionally small:
+
+- `health()` for daemon status
+- `agents` for single-agent lifecycle operations
+- `swarms` for multi-agent coordination and live SSE
+- `memories` for memory search, recall, evaluation, and graph operations
+- `requestJson()` and `subscribe()` for lower-level transport access
+
+## Health and Reachability
+
+```typescript
+const health = await client.health();
+console.log(health.status); // 'ok' | 'degraded' | 'unavailable'
+```
+
+This is useful in browser apps, CLIs, and CI flows where the host may not already be running.
+
+## Generic JSON Requests
+
+If you need one lower-level typed JSON request:
+
+```typescript
+const ready = await client.requestJson<{ status: string }>('/api/ready');
+console.log(ready.status);
+```
+
+Prefer the domain clients when a typed helper already exists. `requestJson()` is the escape hatch, not the default path.
+
+## Generic SSE Subscriptions
+
+If you need raw SSE access instead of a domain helper:
+
+```typescript
+for await (const event of client.subscribe('/api/swarms/swarm-123/events')) {
+  console.log(event.event, event.data);
+}
+```
+
+Again, prefer `client.swarms.subscribe()` when the domain surface already exposes the stream you want.
+
+## Error Surfaces
+
+The SDK throws two main error types:
+
+- `DaemonHttpError` when the host responded with a non-2xx status
+- `DaemonConnectionError` when the host could not be reached at all
+
+```typescript
+import { DaemonConnectionError, DaemonHttpError } from '@animaOS-SWARM/sdk';
+
+try {
+  await client.health();
+} catch (error) {
+  if (error instanceof DaemonHttpError) {
+    console.error(error.status, error.body);
+  } else if (error instanceof DaemonConnectionError) {
+    console.error(error.cause);
+  } else {
+    throw error;
+  }
+}
+```
+
+<Aside type="tip">
+  The SDK is host-agnostic, but the Rust daemon is the reference implementation in this repo. The cleaner your `DaemonClient` setup is, the easier it is to swap hosts later without rewriting application logic.
+</Aside>
+
+## Where Next
+
+- [Quick Start](/sdk/quickstart/) for the end-to-end onboarding path.
+- [Agents](/sdk/agents/) for single-agent runtime workflows.
+- [API Reference](/sdk/reference/) for the full typed surface.

@@ -1,0 +1,240 @@
+---
+title: Local Playbook
+description: Step-by-step playbook for running the full animaOS workspace locally
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+This page is the shortest reliable path to getting the whole repo running locally.
+
+## What "Whole Repo" Means Here
+
+The normal local workspace loop starts:
+
+- the selected host, usually `rust-daemon`
+- the web app
+- the playground
+- the public docs app
+- the contributor docs app
+
+That is what `bun dev` orchestrates through `tools/workspace-dev`. `bun dev` defaults to the `rust` host, so `bun dev` and `bun dev --host rust` are equivalent for the normal local workflow.
+
+## 5-Minute Bring-Up
+
+<Steps>
+
+1. Clone the repo and enter it.
+
+   ```bash
+   git clone https://github.com/G9000/animaOS-SWARM.git
+   cd animaOS-SWARM
+   ```
+
+2. Install JavaScript dependencies.
+
+   ```bash
+   bun install
+   ```
+
+3. Verify the Rust toolchain.
+
+   ```bash
+   cargo --version
+   rustc --version
+   ```
+
+4. Set at least one provider key if you want to run real agent tasks.
+
+   ```bash
+   export ANTHROPIC_API_KEY=sk-ant-...
+   # or
+   export OPENAI_API_KEY=sk-...
+   ```
+
+5. Start the full workspace.
+
+   ```bash
+   bun dev
+   ```
+
+</Steps>
+
+<Aside type="tip">
+  The workspace dev launcher checks whether the selected host is already reachable. If the Rust daemon is already running, `bun dev --host rust` reuses it and only starts the browser surfaces and docs apps.
+</Aside>
+
+## What You Should See
+
+After bring-up, these local surfaces should be available:
+
+| Surface | URL | Notes |
+|---|---|---|
+| Rust daemon | `http://127.0.0.1:8080` | HTTP API and SSE host |
+| Web app | `http://127.0.0.1:3000` | Main browser UI |
+| Playground | `http://127.0.0.1:3001` | Interactive runtime playground |
+| Public docs | `http://127.0.0.1:4321` | User-facing docs |
+| Contributor docs | `http://127.0.0.1:4322` | Internal docs and architecture notes |
+
+Quick checks:
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
+```
+
+## Choose the Right Loop
+
+Use the smallest loop that matches your change.
+
+### Full repo loop
+
+Use this when you are touching host plus browser surfaces, docs, or overall integration.
+
+```bash
+bun dev
+```
+
+### Host-only loop
+
+Use this when you are only changing the Rust daemon.
+
+```bash
+bun x nx run rust-daemon:dev
+```
+
+### Web-only loop
+
+```bash
+bun x nx run @animaOS-SWARM/web:serve
+```
+
+### Playground-only loop
+
+```bash
+bun x nx run @animaOS-SWARM/playground:serve
+```
+
+### Docs-only loop
+
+```bash
+bun x nx run @animaOS-SWARM/docs:dev
+bun x nx run @animaOS-SWARM/contributor-docs:dev
+```
+
+### CLI plus daemon loop
+
+Use this when you are working on agency creation, launch, chat, or TUI flows.
+
+Terminal 1:
+
+```bash
+bun run daemon
+```
+
+Terminal 2:
+
+```bash
+bun run build:cli-sdk
+bun run animaos create my-agency --provider openai --model gpt-4o-mini
+cd my-agency
+bun run animaos launch "your task"
+```
+
+`create` is local and does not require the daemon. `launch`, `run`, and `chat` are daemon-backed.
+
+## Recommended Local Host Profiles
+
+### Default host development
+
+Use SQLite-backed memory snapshots and local embeddings for the fastest reliable host loop:
+
+```bash
+ANIMAOS_RS_MEMORY_SQLITE_FILE=./data/runtime-memories.sqlite \
+ANIMAOS_RS_MEMORY_EMBEDDINGS=local \
+ANTHROPIC_API_KEY=sk-ant-... \
+cargo run -p anima-daemon
+```
+
+### Postgres host development
+
+Use this when you need to test durable retry behavior or host-owned Postgres snapshots:
+
+```bash
+ANIMAOS_RS_PERSISTENCE_MODE=postgres \
+DATABASE_URL=postgres://user:pass@localhost/anima \
+ANTHROPIC_API_KEY=sk-ant-... \
+cargo run -p anima-daemon
+```
+
+## Daily Commands
+
+These are the commands you will use most often while working in this repo:
+
+```bash
+# list projects
+bun x nx show projects
+
+# build all
+bun run build
+
+# test all
+bun run test
+
+# typecheck all
+bun run typecheck
+
+# lint user code
+bun run lint
+
+# build contributor docs
+bun x nx run @animaOS-SWARM/contributor-docs:build --skipNxCache
+
+# build public docs
+bun x nx run @animaOS-SWARM/docs:build --skipNxCache
+
+# validate the Rust daemon
+bun x nx run rust-daemon:test --skipNxCache
+```
+
+## Before You Push
+
+If you changed the host or core crates:
+
+```bash
+bun x nx run rust-daemon:test --skipNxCache
+```
+
+If you changed contributor docs:
+
+```bash
+bun x nx run @animaOS-SWARM/contributor-docs:build --skipNxCache
+```
+
+If you changed public docs:
+
+```bash
+bun x nx run @animaOS-SWARM/docs:build --skipNxCache
+```
+
+If you changed multiple workspace areas and want a broader pass:
+
+```bash
+bun run affected:build
+bun run affected:test
+```
+
+## Windows Notes
+
+- A running daemon can keep `target/debug/anima-daemon.exe` locked.
+- If Rust daemon validation hits that lock, rerun with an isolated cargo target dir:
+
+```bash
+CI=1 CARGO_TARGET_DIR=target/validation-rust-daemon bun x nx run rust-daemon:test --skipNxCache
+```
+
+## Related Pages
+
+- [Development](/workflow/dev/) for workspace setup and reference commands.
+- [Testing](/workflow/testing/) for more focused validation paths.
+- [Rust Daemon Local Development](/hosts/rust-daemon/local/) for host-only development.
+- [Rust Daemon Staging Deployment](/hosts/rust-daemon/staging/) for online staging.

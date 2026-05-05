@@ -36,6 +36,7 @@ The reusable Rust runtime core lives under `packages/core-rust`, the current run
 ## Development
 
 See [docs/testing.md](docs/testing.md) for focused memory, daemon, SDK, playground, and provider-embedding validation commands.
+For the contributor-focused step-by-step repo bring-up, use [apps/contributor-docs/src/content/docs/workflow/playbook.mdx](apps/contributor-docs/src/content/docs/workflow/playbook.mdx).
 
 ```bash
 # Build all packages
@@ -51,8 +52,8 @@ bun run affected:test
 # Open the project graph
 bun run graph
 
-# Start the selected host and UI together
-bun dev --host rust
+# Start the default local workspace (same as `bun dev --host rust`)
+bun dev
 
 # Start the daemon only for local launch/chat workflows
 bun run daemon

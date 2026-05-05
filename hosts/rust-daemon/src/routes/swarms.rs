@@ -35,14 +35,15 @@ pub(crate) async fn handle_create_swarm(
         return Err(ApiError::bad_request(message));
     }
 
-    let snapshot = {
+    let (snapshot, persist_request) = {
         let mut guard = state.write().await;
         let snapshot = guard.register_swarm(coordinator, event_stream);
-        guard
-            .persist_control_plane()
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-        snapshot
+        (snapshot, guard.control_plane_persist_request())
     };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
     publish_swarm_event(
         &global_event_fanout,
         Some(&registered_event_stream),
@@ -110,17 +111,19 @@ pub(crate) async fn handle_run_swarm(
         return Err(ApiError::not_found());
     };
 
-    {
+    let persist_request = {
         let mut running_snapshot = coordinator.get_state();
         running_snapshot.status = SwarmStatus::Running;
         running_snapshot.started_at.get_or_insert_with(now_millis);
         running_snapshot.completed_at = None;
         let mut guard = state.write().await;
         guard.store_swarm_snapshot(running_snapshot);
-        guard
-            .persist_control_plane()
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-    }
+        guard.control_plane_persist_request()
+    };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     let running_swarm_id = swarm_id.to_string();
     let running_global_event_fanout = global_event_fanout.clone();
@@ -138,13 +141,15 @@ pub(crate) async fn handle_run_swarm(
         })
         .await;
     let snapshot = coordinator.get_state();
-    {
+    let persist_request = {
         let mut guard = state.write().await;
         guard.store_swarm_snapshot(snapshot.clone());
-        guard
-            .persist_control_plane()
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-    }
+        guard.control_plane_persist_request()
+    };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     publish_swarm_event(
         &global_event_fanout,

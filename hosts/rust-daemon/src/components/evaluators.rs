@@ -178,6 +178,7 @@ impl Evaluator for ReflectionMemoryEvaluator {
                 _ => None,
             };
             save_memory_manager(self.memory_store.as_ref(), &memory_guard)
+                .await
                 .map_err(|error| format!("failed to persist evaluated memory: {error}"))?;
             let embedded_memories = outcome
                 .memory

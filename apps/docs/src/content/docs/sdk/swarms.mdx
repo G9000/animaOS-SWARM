@@ -7,6 +7,10 @@ import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 A **swarm** is a coordinated group of agents that collaborate on a shared task. The swarm runtime manages turn-taking, message passing, and result synthesis according to a configurable strategy.
 
+## In This Section
+
+- [Event Streaming](/sdk/swarms/events/) covers the SSE stream, event payload shapes, monitoring patterns, and cancellation.
+
 ## Swarm Configuration
 
 Use the `swarm()` helper for typed autocompletion.
@@ -96,7 +100,7 @@ const run = await client.swarms.run('swarm-uuid-here', {
 The coordinator scopes that root key for manager and worker turns, and each agent derives deterministic tool-step keys from the scoped retry key plus the tool payload. Reuse only happens when the retried request repeats the same `retryKey` or `idempotencyKey`; fresh swarm runs should omit the key or use a new value.
 
 <Aside type="note">
-  This protects completed tool steps during explicit retries. With `ANIMAOS_RS_CONTROL_PLANE_FILE`, the Rust daemon also restores swarm registrations and latest snapshots after process restart, but interrupted in-flight runs are marked failed and should be retried intentionally.
+  This protects completed tool steps during explicit retries. With `ANIMAOS_RS_CONTROL_PLANE_FILE` or Postgres mode, the Rust daemon also restores swarm registrations and latest snapshots after process restart, but interrupted in-flight runs are marked failed and should be retried intentionally.
 </Aside>
 
 ### `SwarmRunResponse<T>`

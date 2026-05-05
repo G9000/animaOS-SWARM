@@ -9,6 +9,10 @@ import { Aside, Steps } from '@astrojs/starlight/components';
   This contributor documentation is actively being written. Sections may be incomplete, reorganized, or expanded.
 </Aside>
 
+<Aside type="tip" title="Want the End-to-End Path?">
+  Use [Local Playbook](/workflow/playbook/) if you want the shortest step-by-step path for running the whole repo locally. This page is the broader workspace reference.
+</Aside>
+
 ## Prerequisites
 
 - [Bun](https://bun.sh) (latest)
@@ -50,10 +54,13 @@ import { Aside, Steps } from '@astrojs/starlight/components';
 
 ## Running the Dev Environment
 
-The workspace dev launcher (`tools/workspace-dev`) starts the selected host plus dependent processes.
+The workspace dev launcher (`tools/workspace-dev`) starts the selected host plus the main browser and docs surfaces. `bun dev` defaults to the `rust` host, so `bun dev` and `bun dev --host rust` are equivalent for the normal workflow.
 
 ```bash
 # Start Rust host + web UI + docs + contributor docs + playground
+bun dev
+
+# Equivalent explicit form
 bun dev --host rust
 
 # Start only the Rust daemon

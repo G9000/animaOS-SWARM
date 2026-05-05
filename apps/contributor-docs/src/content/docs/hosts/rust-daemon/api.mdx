@@ -34,10 +34,10 @@ The daemon serves operational endpoints, `/api/*` application endpoints, and a S
 ```json
 {
   "status": "ready",
-  "controlPlaneDurability": "json",
-  "database": "connected",
-  "agents": 3,
-  "swarms": 1
+  "controlPlaneDurability": "postgres",
+  "persistenceMode": "postgres",
+  "database": "configured",
+  "issues": []
 }
 ```
 

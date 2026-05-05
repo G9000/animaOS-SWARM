@@ -96,7 +96,7 @@ packages/core-rust/
 
 1. **Zero I/O** — Core crates never open sockets, files, or database connections
 2. **Trait boundaries** — All external concerns are abstracted behind traits (`ModelAdapter`, `DatabaseAdapter`)
-3. **Host-owned snapshots** — `anima-memory` supports `snapshot()` / `replace_snapshot()`, and `anima-core` exposes `AgentRuntimeSnapshot` for inspection. The Rust daemon can restore registered agents and swarms from `ANIMAOS_RS_CONTROL_PLANE_FILE`, while full mid-turn resume remains host orchestration work
+3. **Host-owned snapshots** — `anima-memory` supports `snapshot()` / `replace_snapshot()`, and `anima-core` exposes `AgentRuntimeSnapshot` for inspection. The Rust daemon can restore registered agents and swarms from a JSON or Postgres host snapshot store, while full mid-turn resume remains host orchestration work
 4. **Pure algorithms** — BM25, cosine similarity, and temporal scoring are implemented from scratch with no external ML dependencies
 
 <Aside type="note">

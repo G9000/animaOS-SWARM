@@ -88,7 +88,7 @@ pub(super) async fn persist_swarm_message_relationship(
             return;
         }
 
-        if let Err(error) = save_memory_manager(memory_store.as_ref(), &memory_guard) {
+        if let Err(error) = save_memory_manager(memory_store.as_ref(), &memory_guard).await {
             warn!(
                 swarm_id = %swarm_id,
                 message_id = %message.id,

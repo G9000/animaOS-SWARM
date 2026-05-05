@@ -58,12 +58,12 @@ The host implements:
 
 3. **Initialize `tracing`**
    - Every HTTP request logged with method, URI, latency, `x-request-id`
-   - Daemon logs `ephemeral` or `json` control-plane durability
+   - Daemon logs `ephemeral`, `json`, or `postgres` control-plane durability
 
 4. **Persistence setup**
-   - optional `ANIMAOS_RS_CONTROL_PLANE_FILE`: restores registered agents/swarms and latest snapshots
+   - optional `ANIMAOS_RS_CONTROL_PLANE_FILE`: restores registered agents/swarms and latest snapshots from JSON
    - `memory` mode: no external DB, step logs are in process only
-   - `postgres` mode: connect to `DATABASE_URL`, run migrations, fail fast on error
+   - `postgres` mode: connect to `DATABASE_URL`, run migrations, store host snapshots in Postgres by default, fail fast on error
 
 5. **Inject `SqlxPostgresAdapter`** into shared daemon state
    - All new agents get step persistence automatically, including completed-tool reuse for retried requests that repeat the same metadata retry key
@@ -106,7 +106,8 @@ pub struct AppState {
 }
 ```
 
-Runtime state is in-memory by default. Set `ANIMAOS_RS_CONTROL_PLANE_FILE` to persist registered agents, registered swarms, latest snapshots, and swarm message history across restarts. Postgres persists step logs and can recover completed tool results for explicit retries that repeat the same metadata retry key; it does not resume an interrupted model turn by itself.
+Runtime state is in-memory by default. Set `ANIMAOS_RS_CONTROL_PLANE_FILE` or use Postgres mode to persist registered agents, registered swarms, latest snapshots, and swarm message history across restarts. Postgres persists step logs and can recover completed tool results for explicit retries that repeat the same metadata retry key; it does not resume an interrupted model turn by itself.
+In Postgres mode, the daemon also stores control-plane and memory snapshots in the `host_snapshots` table unless explicit JSON/SQLite snapshot env vars are set.
 
 ## Graceful Shutdown
 

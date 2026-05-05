@@ -4,7 +4,7 @@
 
 **Goal:** Make hosted swarms reliable enough for v1 without overclaiming full crash-safe orchestration.
 
-**V1 durability definition:** A swarm run in the Rust daemon can coordinate manager and worker agents, stream live events, persist swarm messages/memory relationships, write tool steps through the host database adapter, restore registered swarms and latest snapshots from `ANIMAOS_RS_CONTROL_PLANE_FILE`, and reuse completed tool steps when the client retries the same swarm task with an explicit `retryKey` or `idempotencyKey`.
+**V1 durability definition:** A swarm run in the Rust daemon can coordinate manager and worker agents, stream live events, persist swarm messages/memory relationships, write tool steps through the host database adapter, restore registered swarms and latest snapshots from a host-owned snapshot store, and reuse completed tool steps when the client retries the same swarm task with an explicit `retryKey` or `idempotencyKey`.
 
 **Non-goal for v1:** Resuming an in-flight swarm from the middle of a model turn after daemon process restart. Restored running snapshots are marked failed/interrupted so callers can retry intentionally.
 
@@ -48,7 +48,7 @@ The coordinator derives child keys from the root key, strategy scope, turn/deleg
 
 ## V1.1 Follow-up
 
-- [x] Persist registered swarm configs and latest state snapshots outside the in-memory daemon map through `ANIMAOS_RS_CONTROL_PLANE_FILE`.
+- [x] Persist registered swarm configs and latest state snapshots outside the in-memory daemon map through `ANIMAOS_RS_CONTROL_PLANE_FILE` or Postgres `host_snapshots`.
 - [x] Restore registered `SwarmCoordinator` instances from host-owned snapshots at startup.
 - [x] Add integration coverage that constructs a second daemon app from the same control-plane file and verifies restored agent/swarm IDs can run.
 - [ ] Persist enough live message bus state to restore in-flight inboxes and participants after restart.
