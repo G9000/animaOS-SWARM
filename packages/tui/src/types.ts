@@ -17,6 +17,11 @@ export interface MessageEntry {
   to: string
   content: string
   timestamp: number
+  /** Optional kind tag — `gap` is reserved for synthetic event-bus gap markers
+   * (e.g. when the daemon emits a `swarm:lagged` event because an SSE consumer
+   * fell behind the broadcast buffer). `system` and `agent` are the defaults.
+   */
+  kind?: "agent" | "system" | "gap"
 }
 
 /** A tool call row in the tool panel */
@@ -35,10 +40,14 @@ export interface ToolEntry {
 /** Aggregated swarm stats for the status bar */
 export interface SwarmStats {
   totalTokens: number
-  totalCost: number
+  /** Wall-clock seconds since the run started. Drives a live ticker while a
+   * task is running so the status bar doesn't freeze between events. */
   elapsed: number
   agentCount: number
   strategy: string
+  /** Number of `swarm:lagged` events observed during this run. Non-zero means
+   * the trace has gaps — surface in the status bar so users know to refresh. */
+  laggedEventCount: number
 }
 
 /** An agent's full profile — used for the agents panel and editing */

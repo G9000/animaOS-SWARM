@@ -11,6 +11,48 @@ use super::super::workspace::{
 
 const BASH_MAX_OUTPUT_CHARS: usize = 30_000;
 const BASH_MAX_OUTPUT_LINES: usize = 500;
+/// Hard cap on bytes captured per stream during process execution. Prevents a
+/// runaway subprocess from OOM-ing the daemon before `truncate_shell_output`
+/// runs at the end. Set comfortably above `BASH_MAX_OUTPUT_CHARS` so genuine
+/// long output still survives post-truncation.
+const BASH_MAX_CAPTURE_BYTES: usize = 256 * 1024;
+
+/// Environment variables that are safe and necessary to pass through to the
+/// shell tool subprocess. Anything not on this list — including LLM provider
+/// API keys, DATABASE_URL, etc. — is stripped via `Command::env_clear`.
+const SHELL_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "USERNAME",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SHELL",
+    "PWD",
+    "OLDPWD",
+    // Windows-specific
+    "SystemRoot",
+    "SystemDrive",
+    "ComSpec",
+    "PATHEXT",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+    "windir",
+    "OS",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in super::super) struct BashCommandResult {
@@ -40,13 +82,21 @@ pub(in super::super) fn execute_bash_command_from_root(
     )?;
     let (executable, flags) = resolve_shell_launcher()?;
 
-    let mut child = Command::new(&executable)
+    let mut builder = Command::new(&executable);
+    builder
         .args(&flags)
         .arg(command)
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .env_clear();
+    for name in SHELL_ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(name) {
+            builder.env(name, value);
+        }
+    }
+    let mut child = builder
         .spawn()
         .map_err(|error| format!("bash failed to start command: {error}"))?;
 
@@ -171,11 +221,14 @@ pub(in super::super) fn resolve_shell_launcher() -> Result<(String, Vec<String>)
 }
 
 fn shell_launcher_candidates() -> Vec<(String, Vec<String>)> {
+    // We always invoke with `-c` (non-login, non-interactive) so the shell does
+    // not source profile scripts — this keeps the env we curate via the
+    // `SHELL_ENV_ALLOWLIST` from being repopulated with operator secrets.
     if cfg!(windows) {
         windows_shell_candidates()
     } else if cfg!(target_os = "macos") {
         vec![
-            ("/bin/zsh".to_string(), vec!["-lc".to_string()]),
+            ("/bin/zsh".to_string(), vec!["-c".to_string()]),
             ("/bin/bash".to_string(), vec!["-c".to_string()]),
         ]
     } else {
@@ -219,16 +272,10 @@ fn windows_shell_candidates() -> Vec<(String, Vec<String>)> {
     candidates
 }
 
-fn shell_flags(shell: &str) -> Vec<String> {
-    let base = Path::new(shell)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    if matches!(base, "bash" | "zsh") {
-        vec!["-lc".to_string()]
-    } else {
-        vec!["-c".to_string()]
-    }
+fn shell_flags(_shell: &str) -> Vec<String> {
+    // Always non-login: we explicitly do NOT want the shell sourcing rc/profile
+    // files that would re-leak operator env into the subprocess.
+    vec!["-c".to_string()]
 }
 
 fn shell_candidate_exists(executable: &str) -> bool {
@@ -255,11 +302,21 @@ where
 {
     thread::spawn(move || {
         let mut local = String::new();
+        let mut truncated = false;
         let reader = BufReader::new(reader);
         for line in reader.lines() {
             let Ok(line) = line else {
                 break;
             };
+            if truncated {
+                continue;
+            }
+            let prefix_len = if stderr { "[stderr] ".len() } else { 0 };
+            if local.len() + prefix_len + line.len() + 1 > BASH_MAX_CAPTURE_BYTES {
+                local.push_str("\n[output capture limit reached; further bytes discarded]\n");
+                truncated = true;
+                continue;
+            }
             if stderr {
                 local.push_str("[stderr] ");
             }

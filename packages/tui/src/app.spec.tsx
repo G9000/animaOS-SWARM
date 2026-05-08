@@ -64,11 +64,10 @@ function mockEventLog(overrides: Partial<UseEventLogResult> = {}) {
     messages: [],
     tools: [],
     stats: {
-      totalTokens: 0,
-      totalCost: 0,
-      elapsed: 0,
+      totalTokens: 0,      elapsed: 0,
       agentCount: 0,
       strategy: 'round-robin',
+      laggedEventCount: 0,
     },
     done: false,
     result: null,
@@ -1728,11 +1727,10 @@ describe('App interactions', () => {
         },
       ],
       stats: {
-        totalTokens: 0,
-        totalCost: 0,
-        elapsed: 0,
+        totalTokens: 0,        elapsed: 0,
         agentCount: 2,
         strategy: 'round-robin',
+      laggedEventCount: 0,
       },
     });
 
@@ -2280,11 +2278,10 @@ describe('App interactions', () => {
   it('shows live session state with s while a task is running', async () => {
     mockEventLog({
       stats: {
-        totalTokens: 0,
-        totalCost: 0,
-        elapsed: 0,
+        totalTokens: 0,        elapsed: 0,
         agentCount: 1,
         strategy: 'round-robin',
+      laggedEventCount: 0,
       },
     });
     const deferred = createDeferredResult();

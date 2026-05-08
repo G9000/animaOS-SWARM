@@ -20,6 +20,7 @@ use crate::tools::DEFAULT_MAX_BACKGROUND_PROCESSES;
 pub(crate) type SharedDaemonState = Arc<RwLock<DaemonState>>;
 
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
+const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceMode {
@@ -43,6 +44,14 @@ pub struct DaemonConfig {
     pub persistence_mode: PersistenceMode,
     pub max_concurrent_runs: usize,
     pub max_background_processes: usize,
+    /// Postgres connection pool size when `persistence_mode` is `Postgres`.
+    /// Should comfortably exceed `max_concurrent_runs` to leave headroom for
+    /// background snapshot saves and step-log writes.
+    pub db_max_connections: u32,
+    /// Capacity of the in-process broadcast channels backing SSE event
+    /// streams. Lagged consumers receive a synthetic gap marker rather than
+    /// silent drops; this controls the burst buffer before that triggers.
+    pub event_buffer: usize,
 }
 
 impl Default for DaemonConfig {
@@ -53,16 +62,28 @@ impl Default for DaemonConfig {
             persistence_mode: PersistenceMode::Memory,
             max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
+            db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
+            event_buffer: DEFAULT_EVENT_BUFFER,
         }
     }
 }
 
+/// Builds a router wired to a [`DeterministicModelAdapter`] — the in-process
+/// mock model that just echoes the input.
+///
+/// **For tests and library embedding only.** This does NOT perform LLM calls.
+/// To run a real daemon that talks to providers, use [`serve`]. See also
+/// [`app_with_config`] / [`app_with_database`], which share the same caveat.
 pub fn app() -> Router {
     app_with_config(DaemonConfig::default())
 }
 
+/// Builds a router with the supplied [`DaemonConfig`].
+///
+/// **Test/embedding helper** — wires the deterministic mock model adapter.
+/// Use [`serve`] for a real daemon.
 pub fn app_with_config(config: DaemonConfig) -> Router {
-    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    let event_fanout = EventFanout::new(config.event_buffer);
     let state = Arc::new(RwLock::new(DaemonState::with_events_and_limits(
         event_fanout,
         config.max_background_processes,
@@ -70,13 +91,19 @@ pub fn app_with_config(config: DaemonConfig) -> Router {
     app_with_state(state, config)
 }
 
+/// Builds a router with a custom database adapter, default config, and the
+/// deterministic mock model adapter.
+///
+/// **Test/embedding helper** — does not run LLM calls. Use [`serve`] for
+/// production.
 pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
-    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    let config = DaemonConfig::default();
+    let event_fanout = EventFanout::new(config.event_buffer);
     let mut daemon_state =
-        DaemonState::with_events_and_limits(event_fanout, DEFAULT_MAX_BACKGROUND_PROCESSES);
+        DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
     daemon_state.set_database(db);
     let state = Arc::new(RwLock::new(daemon_state));
-    app_with_state(state, DaemonConfig::default())
+    app_with_state(state, config)
 }
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
@@ -84,17 +111,17 @@ pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> 
 }
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
-    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    let event_fanout = EventFanout::new(config.event_buffer);
     let state = Arc::new(RwLock::new(DaemonState::with_events_and_limits(
         event_fanout,
         config.max_background_processes,
     )));
-    configure_persistence(&state, config.persistence_mode).await?;
+    configure_persistence(&state, &config).await?;
     Ok(app_with_state(state, config))
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
-    let event_fanout = EventFanout::new(DEFAULT_EVENT_BUFFER);
+    let event_fanout = EventFanout::new(config.event_buffer);
     let state = Arc::new(RwLock::new(
         DaemonState::with_model_adapter_and_events_and_limits(
             Arc::new(RuntimeModelAdapter::from_env()),
@@ -103,7 +130,7 @@ pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()
         ),
     ));
 
-    configure_persistence(&state, config.persistence_mode).await?;
+    configure_persistence(&state, &config).await?;
 
     serve_with_state(listener, state, config).await
 }

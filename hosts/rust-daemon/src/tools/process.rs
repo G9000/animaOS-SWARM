@@ -49,8 +49,15 @@ pub(super) fn execute_bash(
             None => ".".to_string(),
         };
 
-        match execute_bash_command(&command, timeout_ms, &cwd) {
-            Ok(result) if result.status == "success" => TaskResult::success(
+        // execute_bash_command spawns a child + polls in a busy-loop on a
+        // worker thread; running it directly on a tokio worker would block the
+        // entire runtime. spawn_blocking moves it onto the blocking pool.
+        let result = tokio::task::spawn_blocking(move || {
+            execute_bash_command(&command, timeout_ms, &cwd)
+        })
+        .await;
+        match result {
+            Ok(Ok(result)) if result.status == "success" => TaskResult::success(
                 Content {
                     text: result.output,
                     attachments: None,
@@ -58,8 +65,9 @@ pub(super) fn execute_bash(
                 },
                 0,
             ),
-            Ok(result) => TaskResult::error(result.output, 0),
-            Err(error) => TaskResult::error(error, 0),
+            Ok(Ok(result)) => TaskResult::error(result.output, 0),
+            Ok(Err(error)) => TaskResult::error(error, 0),
+            Err(error) => TaskResult::error(format!("bash worker panicked: {error}"), 0),
         }
     })
 }

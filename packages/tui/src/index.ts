@@ -55,3 +55,10 @@ export {
   traceEntrySummary,
 } from './trace.js';
 export type { TraceEntry } from './trace.js';
+
+export {
+  COLOR_ENABLED_DEFAULT,
+  ColorContext,
+  maybeColor,
+  useColorEnabled,
+} from './colors.js';

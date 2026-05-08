@@ -6,6 +6,10 @@ import {
 
 const DAEMON_WARNING_POLL_MS = 5000;
 const DAEMON_RECOVERY_NOTICE_MS = 4000;
+/** Hard cap on how long a single `pollDaemonWarning` call may hang before we
+ * abandon it and re-arm the next poll. Without this, a hung HTTP call would
+ * permanently stall polling because the in-flight guard never clears. */
+const DAEMON_POLL_TIMEOUT_MS = 8000;
 const TASK_ENTRY_RESTORED_MESSAGE =
   'Task entry restored. Freeform tasks are available again.';
 
@@ -18,6 +22,9 @@ export interface UseDaemonStateOptions {
   preflightWarning?: string;
   pollDaemonWarning?: () => Promise<string | undefined>;
   showMessage: (message: string) => void;
+  /** Forwarded from `AppProps.onWarning`. Logged when a poll exceeds
+   * `DAEMON_POLL_TIMEOUT_MS` or when the injected callback rejects. */
+  onWarning?: (where: string, detail: unknown) => void;
 }
 
 export interface UseDaemonStateResult {
@@ -35,6 +42,7 @@ export function useDaemonState({
   preflightWarning,
   pollDaemonWarning,
   showMessage,
+  onWarning,
 }: UseDaemonStateOptions): UseDaemonStateResult {
   const [daemonWarning, setDaemonWarning] = useState<string | null>(
     preflightWarning ?? null
@@ -85,7 +93,35 @@ export function useDaemonState({
         return;
       }
 
-      const nextWarning = (await pollDaemonWarning()) ?? null;
+      // Race the user-supplied poll against a hard timeout. AbortController
+      // would be cleaner but the callback signature is opaque (no signal
+      // parameter), so we rely on Promise.race + a cleanup flag instead.
+      let timedOut = false;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      const timeoutPromise = new Promise<string | undefined>((resolve) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          resolve(undefined);
+        }, DAEMON_POLL_TIMEOUT_MS);
+      });
+      let pollResult: string | undefined;
+      try {
+        pollResult = await Promise.race([pollDaemonWarning(), timeoutPromise]);
+      } catch (error) {
+        onWarning?.('useDaemonState.pollDaemonWarning.rejected', error);
+        pollResult = undefined;
+      } finally {
+        if (timeoutHandle !== null) {
+          clearTimeout(timeoutHandle);
+        }
+      }
+      if (timedOut) {
+        onWarning?.('useDaemonState.pollDaemonWarning.timeout', {
+          source,
+          timeoutMs: DAEMON_POLL_TIMEOUT_MS,
+        });
+      }
+      const nextWarning = pollResult ?? null;
       const previousWarning = daemonWarningRef.current;
       daemonWarningRef.current = nextWarning;
       setDaemonWarning(nextWarning);
@@ -108,6 +144,7 @@ export function useDaemonState({
     },
     [
       clearDaemonRecoveryNotice,
+      onWarning,
       pollDaemonWarning,
       showDaemonRecoveryNotice,
       showMessage,
@@ -132,6 +169,12 @@ export function useDaemonState({
 
   useEffect(() => {
     if (!pollDaemonWarning) {
+      return;
+    }
+    // Skip background polling while a task is running. The in-flight task
+    // surfaces daemon errors through its own response, and a parallel poll
+    // would only race the task's own state transitions.
+    if (phase === 'running') {
       return;
     }
 
@@ -159,7 +202,7 @@ export function useDaemonState({
       disposed = true;
       clearInterval(interval);
     };
-  }, [pollDaemonWarning, syncDaemonWarning]);
+  }, [phase, pollDaemonWarning, syncDaemonWarning]);
 
   return {
     daemonWarning,

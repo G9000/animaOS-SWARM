@@ -15,6 +15,10 @@ export type EventType =
 	| "swarm:message"
 	| "swarm:completed"
 	| "swarm:stopped"
+	// Synthetic event the daemon emits when a SSE consumer falls behind the
+	// broadcast buffer. Payload: `{ missed: number }`. Surfaced by the TUI as
+	// a gap marker so users know the trace lost frames.
+	| "swarm:lagged"
 
 export interface Event<T = unknown> {
 	id: string

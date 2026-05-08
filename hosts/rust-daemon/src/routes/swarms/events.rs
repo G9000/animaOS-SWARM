@@ -19,7 +19,15 @@ pub(super) fn subscribe_swarm_events_response(
                     let event = Event::default().event(message.event).data(message.data);
                     return Some((Ok::<Event, Infallible>(event), subscriber));
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    // Surface the gap so the client can resync (refetch the
+                    // swarm state). Without this the consumer would silently
+                    // see a hole in the event sequence.
+                    let event = Event::default()
+                        .event("swarm:lagged")
+                        .data(format!("{{\"missed\":{missed}}}"));
+                    return Some((Ok::<Event, Infallible>(event), subscriber));
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
         }

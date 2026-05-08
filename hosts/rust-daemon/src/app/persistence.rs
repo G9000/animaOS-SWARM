@@ -7,7 +7,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::{info, warn};
 
-use super::{PersistenceMode, SharedDaemonState};
+use super::{DaemonConfig, PersistenceMode, SharedDaemonState};
 use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
 use crate::memory_embeddings::MemoryEmbeddingRuntime;
 use crate::memory_store::{load_memory_snapshot, MemoryStoreConfig};
@@ -16,9 +16,9 @@ use crate::state::{memory_query_expander_from_env, memory_text_analyzer_from_env
 
 pub(crate) async fn configure_persistence(
     state: &SharedDaemonState,
-    persistence_mode: PersistenceMode,
+    config: &DaemonConfig,
 ) -> io::Result<()> {
-    let postgres_pool = configure_database(state, persistence_mode).await?;
+    let postgres_pool = configure_database(state, config).await?;
     let memory_store = memory_store_from_env(postgres_pool.as_ref())?;
     let control_plane_store = control_plane_store_from_env(postgres_pool.as_ref())?;
 
@@ -30,9 +30,9 @@ pub(crate) async fn configure_persistence(
 
 async fn configure_database(
     state: &SharedDaemonState,
-    persistence_mode: PersistenceMode,
+    config: &DaemonConfig,
 ) -> io::Result<Option<PgPool>> {
-    match persistence_mode {
+    match config.persistence_mode {
         PersistenceMode::Memory => {
             if std::env::var_os("DATABASE_URL").is_some() {
                 warn!(
@@ -51,7 +51,7 @@ async fn configure_database(
                 )
             })?;
             let pool = PgPoolOptions::new()
-                .max_connections(10)
+                .max_connections(config.db_max_connections)
                 .connect(&database_url)
                 .await
                 .map_err(|error| {
@@ -93,7 +93,7 @@ async fn configure_control_plane_store(
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
     }
 
@@ -140,7 +140,7 @@ async fn configure_memory_store(
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
     }
 

@@ -311,7 +311,7 @@ impl DaemonState {
     ) -> Result<(SwarmCoordinator, EventFanout), String> {
         self.validate_swarm_tools(&config)?;
 
-        let event_stream = EventFanout::new(DEFAULT_EVENT_BUFFER);
+        let event_stream = EventFanout::new(self.event_fanout.capacity());
         let swarm_message_events = event_stream.clone();
         let global_message_events = self.event_fanout();
         let memory = Arc::clone(&self.memory);
@@ -371,7 +371,7 @@ impl DaemonState {
                 .get_or_insert_with(anima_core::primitives::now_millis);
         }
 
-        let event_stream = EventFanout::new(DEFAULT_EVENT_BUFFER);
+        let event_stream = EventFanout::new(self.event_fanout.capacity());
         let swarm_message_events = event_stream.clone();
         let global_message_events = self.event_fanout();
         let memory = Arc::clone(&self.memory);

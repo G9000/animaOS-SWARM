@@ -1,12 +1,135 @@
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall};
 use futures::future::BoxFuture;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, USER_AGENT};
+use reqwest::redirect;
+use reqwest::Url;
 use serde_json::{json, Value};
 
 use super::ToolExecutionContext;
+
+/// Hard cap on bytes streamed from a `web_fetch` response. Independent of the
+/// caller's `max_length`, which only governs character-count truncation of
+/// the decoded text and is applied AFTER the body is read. Without this, a
+/// hostile or runaway server can stream gigabytes before truncation.
+const WEB_FETCH_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Reusable HTTP clients. Building a fresh `reqwest::Client` per request
+/// allocates a new connection pool and re-initialises TLS state.
+static WEB_FETCH_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static EXA_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn web_fetch_client() -> Result<&'static reqwest::Client, String> {
+    if let Some(client) = WEB_FETCH_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .redirect(redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() > 10 {
+                return attempt.error("too many redirects");
+            }
+            match reject_ssrf_url(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(reason) => attempt.error(reason),
+            }
+        }))
+        .build()
+        .map_err(|error| format!("web_fetch client init failed: {error}"))?;
+    let _ = WEB_FETCH_CLIENT.set(client);
+    Ok(WEB_FETCH_CLIENT.get().expect("web_fetch client just installed"))
+}
+
+fn exa_client() -> Result<&'static reqwest::Client, String> {
+    if let Some(client) = EXA_CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|error| format!("exa_search client init failed: {error}"))?;
+    let _ = EXA_CLIENT.set(client);
+    Ok(EXA_CLIENT.get().expect("exa client just installed"))
+}
+
+/// Rejects URLs that would let the LLM-driven `web_fetch` tool reach into the
+/// daemon's network neighborhood: loopback, link-local cloud-metadata,
+/// RFC1918 private space, and similar. Only `http`/`https` are permitted.
+fn reject_ssrf_url(url: &Url) -> Result<(), String> {
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("web_fetch only supports http/https (got {scheme})"));
+    }
+    let Some(host) = url.host_str() else {
+        return Err("web_fetch URL has no host".into());
+    };
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return reject_ssrf_ip(ip);
+    }
+    // IPv6 literals come wrapped in `[...]` from `host_str` — try unwrapping
+    // and re-parsing.
+    if let Some(stripped) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if let Ok(ip) = stripped.parse::<IpAddr>() {
+            return reject_ssrf_ip(ip);
+        }
+    }
+    // Block obvious local names. Full DNS-resolution-based blocking is
+    // intentionally not done here — it adds latency and a DNS-rebinding
+    // window. Operators relying on this for hostile-LLM safety should also
+    // restrict outbound traffic at the network layer.
+    let lowered = host.to_ascii_lowercase();
+    if lowered == "localhost"
+        || lowered.ends_with(".localhost")
+        || lowered.ends_with(".local")
+        || lowered.ends_with(".internal")
+    {
+        return Err(format!("web_fetch refuses local hostname: {host}"));
+    }
+    Ok(())
+}
+
+fn reject_ssrf_ip(ip: IpAddr) -> Result<(), String> {
+    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+        return Err(format!("web_fetch refuses non-routable address: {ip}"));
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // RFC1918 private
+            let private = matches!(octets[0], 10)
+                || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 168);
+            // Link-local + cloud metadata (169.254.0.0/16)
+            let link_local = octets[0] == 169 && octets[1] == 254;
+            // Carrier-grade NAT (100.64.0.0/10)
+            let cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+            if private || link_local || cgnat {
+                return Err(format!("web_fetch refuses private address: {v4}"));
+            }
+            Ok(())
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            // Unique local fc00::/7
+            if segments[0] & 0xfe00 == 0xfc00 {
+                return Err(format!("web_fetch refuses private address: {v6}"));
+            }
+            // Link-local fe80::/10
+            if segments[0] & 0xffc0 == 0xfe80 {
+                return Err(format!("web_fetch refuses link-local address: {v6}"));
+            }
+            // IPv4-mapped IPv6 — re-check via the v4 form
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return reject_ssrf_ip(IpAddr::V4(v4));
+            }
+            Ok(())
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ExaSearchResultItem {
@@ -150,13 +273,12 @@ pub(super) fn execute_exa_search(
 }
 
 async fn fetch_web_text(url: &str, max_length: usize) -> Result<(String, String), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("web_fetch client init failed: {error}"))?;
+    let parsed = Url::parse(url).map_err(|error| format!("web_fetch invalid URL: {error}"))?;
+    reject_ssrf_url(&parsed)?;
 
+    let client = web_fetch_client()?;
     let response = client
-        .get(url)
+        .get(parsed)
         .header(USER_AGENT, "animaOS-SWARM/0.1")
         .header(ACCEPT, "text/html,application/json,text/plain,*/*")
         .send()
@@ -176,18 +298,17 @@ async fn fetch_web_text(url: &str, max_length: usize) -> Result<(String, String)
         .unwrap_or_default()
         .to_string();
 
+    let (raw_bytes, byte_truncated) = read_capped_bytes(response, WEB_FETCH_MAX_BYTES).await?;
+    let body = String::from_utf8_lossy(&raw_bytes).into_owned();
+
     let mut text = if content_type.contains("application/json") {
-        let json = response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|error| format!("web_fetch json parse failed: {error}"))?;
-        serde_json::to_string_pretty(&json)
-            .map_err(|error| format!("web_fetch json formatting failed: {error}"))?
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(json) => serde_json::to_string_pretty(&json)
+                .map_err(|error| format!("web_fetch json formatting failed: {error}"))?,
+            Err(error) => return Err(format!("web_fetch json parse failed: {error}")),
+        }
     } else {
-        response
-            .text()
-            .await
-            .map_err(|error| format!("web_fetch body read failed: {error}"))?
+        body
     };
 
     if content_type.contains("text/html") {
@@ -199,9 +320,33 @@ async fn fetch_web_text(url: &str, max_length: usize) -> Result<(String, String)
             "{}\n...[truncated]",
             text.chars().take(max_length).collect::<String>()
         );
+    } else if byte_truncated {
+        text.push_str("\n...[response exceeded byte limit; truncated]");
     }
 
     Ok((text, content_type))
+}
+
+async fn read_capped_bytes(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut buffer = Vec::with_capacity(response.content_length().unwrap_or(0).min(max_bytes as u64) as usize);
+    let mut truncated = false;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("web_fetch body read failed: {error}"))?
+    {
+        if buffer.len() + chunk.len() > max_bytes {
+            let remaining = max_bytes.saturating_sub(buffer.len());
+            buffer.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok((buffer, truncated))
 }
 
 async fn search_exa(
@@ -211,10 +356,7 @@ async fn search_exa(
     include_text: bool,
     max_characters: usize,
 ) -> Result<Vec<ExaSearchResultItem>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|error| format!("exa_search client init failed: {error}"))?;
+    let client = exa_client()?;
 
     let mut contents = serde_json::Map::new();
     contents.insert(

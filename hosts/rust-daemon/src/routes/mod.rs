@@ -244,6 +244,11 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         .merge(timed_routes)
         .merge(run_routes)
         .route("/api/swarms/{swarm_id}/events", get(swarm_events_entry))
+        // Auth gates everything mounted above this line; the middleware
+        // exempts health/readiness/metrics/docs by path. When
+        // ANIMAOS_RS_API_KEY is unset the daemon runs in trust-the-network
+        // mode (fine for 127.0.0.1 dev only).
+        .layer(axum::middleware::from_fn(self::http::enforce_api_key))
         .fallback(not_found_entry)
         .layer(request_middleware)
         .with_state(app_state)

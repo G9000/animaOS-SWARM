@@ -32,6 +32,14 @@ async fn main() -> io::Result<()> {
             "ANIMAOS_RS_MAX_BACKGROUND_PROCESSES",
             default_config.max_background_processes,
         )?,
+        db_max_connections: parse_env_u32(
+            "ANIMAOS_RS_DB_MAX_CONNECTIONS",
+            default_config.db_max_connections,
+        )?,
+        event_buffer: parse_env_usize(
+            "ANIMAOS_RS_EVENT_BUFFER",
+            default_config.event_buffer,
+        )?,
     };
 
     let listener = TcpListener::bind(bind_addr.as_str()).await?;
@@ -71,6 +79,31 @@ fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
     match std::env::var(name) {
         Ok(value) => {
             let parsed = value.parse::<usize>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer"),
+                )
+            })?;
+            if parsed == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer"),
+                ));
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("failed to read {name}: {error}"),
+        )),
+    }
+}
+
+fn parse_env_u32(name: &str, default: u32) -> io::Result<u32> {
+    match std::env::var(name) {
+        Ok(value) => {
+            let parsed = value.parse::<u32>().map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("{name} must be a positive integer"),

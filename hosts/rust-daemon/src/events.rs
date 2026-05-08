@@ -13,6 +13,7 @@ pub(crate) struct EventEnvelope {
 #[derive(Clone)]
 pub(crate) struct EventFanout {
     sender: broadcast::Sender<EventEnvelope>,
+    capacity: usize,
 }
 
 #[allow(dead_code)]
@@ -23,8 +24,15 @@ pub(crate) struct EventSubscriber {
 #[allow(dead_code)]
 impl EventFanout {
     pub(crate) fn new(capacity: usize) -> Self {
-        let (sender, _) = broadcast::channel(capacity);
-        Self { sender }
+        let (sender, _) = broadcast::channel(capacity.max(1));
+        Self { sender, capacity }
+    }
+
+    /// Channel buffer this fanout was constructed with. Used by per-swarm
+    /// fanouts so they inherit the daemon's configured event buffer rather
+    /// than the compile-time default.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub(crate) fn publish(&self, event: impl Into<String>, data: String) {

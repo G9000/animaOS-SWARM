@@ -47,6 +47,15 @@ export interface AppProps {
   preflightWarning?: string;
   /** Poll for daemon health warnings while the TUI is open */
   pollDaemonWarning?: () => Promise<string | undefined>;
+  /** Maximum number of prompt-history entries retained for the input bar's
+   * up/down recall and Ctrl+R search. Defaults to 100. */
+  maxPromptHistory?: number;
+  /** Maximum number of deleted saved-runs that can be queued for `/undo`.
+   * Defaults to 5. The oldest entry is dropped when this is exceeded. */
+  maxDeletedSavedRunUndos?: number;
+  /** Called for non-fatal diagnostic events that would otherwise be
+   * swallowed (malformed event payloads, hung daemon polls, etc.). */
+  onWarning?: (where: string, detail: unknown) => void;
 }
 
 type AppView = 'swarm' | 'agents' | 'history' | 'trace' | 'result';
@@ -69,8 +78,8 @@ type DeletedSavedRunState = {
   entry: ResultEntry;
   index: number;
 };
-const MAX_PROMPT_HISTORY = 100;
-const MAX_DELETED_SAVED_RUN_UNDOS = 5;
+const DEFAULT_MAX_PROMPT_HISTORY = 100;
+const DEFAULT_MAX_DELETED_SAVED_RUN_UNDOS = 5;
 const TASK_SUBMISSION_BLOCKED_MESSAGE =
   'Task submission is blocked while the daemon is down. Use /health to recheck.';
 const TASK_INPUT_COMMAND_ONLY_HINT =
@@ -151,7 +160,8 @@ function buildDeleteConfirmationCommand(label?: string): string {
 }
 
 function formatUndoQueueStatus(
-  deletedSavedRunStack: DeletedSavedRunState[]
+  deletedSavedRunStack: DeletedSavedRunState[],
+  undoLimit: number
 ): string {
   if (deletedSavedRunStack.length === 0) {
     return 'Undo queue empty. Delete a saved run first.';
@@ -171,7 +181,7 @@ function formatUndoQueueStatus(
     }.`,
     `Next restore ${nextLabel}.`,
     queueCount > 1 ? `Oldest queued ${oldestLabel}.` : null,
-    `Limit ${String(MAX_DELETED_SAVED_RUN_UNDOS)}.`,
+    `Limit ${String(undoLimit)}.`,
     'Open /resume and press u to restore.',
   ]
     .filter(Boolean)
@@ -388,26 +398,31 @@ export function App({
   onClearHistory,
   preflightWarning,
   pollDaemonWarning,
+  maxPromptHistory = DEFAULT_MAX_PROMPT_HISTORY,
+  maxDeletedSavedRunUndos = DEFAULT_MAX_DELETED_SAVED_RUN_UNDOS,
+  onWarning,
 }: AppProps): React.ReactElement {
   const { exit } = useApp();
+  const [phase, setPhase] = useState<'waiting' | 'running'>('waiting');
   const { agents, messages, tools, stats, done, result, error, reset } =
     useEventLog({
       eventBus,
       strategy,
+      isRunning: phase === 'running',
+      onWarning,
     });
   const resumeEntry = resumeLastResult
     ? initialResults[initialResults.length - 1]
     : undefined;
 
   const [view, setView] = useState<AppView>(resumeEntry ? 'result' : 'swarm');
-  const [phase, setPhase] = useState<'waiting' | 'running'>('waiting');
   const [currentTask, setCurrentTask] = useState(
     task ?? resumeEntry?.task ?? ''
   );
   const [resultLog, setResultLog] = useState<ResultEntry[]>(initialResults);
   const [historyMode, setHistoryMode] = useState<HistoryMode>('history');
   const [promptHistory, setPromptHistory] = useState<string[]>(
-    initialResults.map((entry) => entry.task).slice(-MAX_PROMPT_HISTORY)
+    initialResults.map((entry) => entry.task).slice(-maxPromptHistory)
   );
   const [resumeAssist, setResumeAssist] = useState<ResumeAssistState | null>(
     null
@@ -445,7 +460,7 @@ export function App({
       ? oldestUndoLabel
       : undefined;
   const undoQueueIsFull =
-    deletedSavedRunStack.length === MAX_DELETED_SAVED_RUN_UNDOS;
+    deletedSavedRunStack.length === maxDeletedSavedRunUndos;
   const displayedHistoryResults =
     historyMode === 'resume' ? sortResumeEntries(resultLog) : resultLog;
   const canExitOneShot =
@@ -472,6 +487,7 @@ export function App({
     preflightWarning,
     pollDaemonWarning,
     showMessage: showMsg,
+    onWarning,
   });
   const { swarmInputCommands, resultInputCommands, helpCommands } =
     buildAppInputCommands({
@@ -622,7 +638,7 @@ export function App({
         },
       ];
       const droppedUndoEntry =
-        nextDeletedSavedRunStack.length > MAX_DELETED_SAVED_RUN_UNDOS
+        nextDeletedSavedRunStack.length > maxDeletedSavedRunUndos
           ? nextDeletedSavedRunStack[0]
           : undefined;
 
@@ -630,7 +646,7 @@ export function App({
       setPendingDeleteCommand(null);
       setPendingDropOldestUndoCommand(null);
       setDeletedSavedRunStack(
-        nextDeletedSavedRunStack.slice(-MAX_DELETED_SAVED_RUN_UNDOS)
+        nextDeletedSavedRunStack.slice(-maxDeletedSavedRunUndos)
       );
       onHistoryUpdated?.(next);
 
@@ -738,7 +754,7 @@ export function App({
   );
 
   const rememberPrompt = useCallback((input: string) => {
-    setPromptHistory((prev) => [...prev, input].slice(-MAX_PROMPT_HISTORY));
+    setPromptHistory((prev) => [...prev, input].slice(-maxPromptHistory));
   }, []);
 
   const runTask = useCallback(
@@ -1055,7 +1071,9 @@ export function App({
           }
           break;
         case 'undo-status':
-          showMsg(formatUndoQueueStatus(deletedSavedRunStack));
+          showMsg(
+            formatUndoQueueStatus(deletedSavedRunStack, maxDeletedSavedRunUndos)
+          );
           break;
         case 'trace':
           if (!hasTrace) {

@@ -137,8 +137,28 @@ pub(crate) async fn handle_create_agency(
     let output_dir = output_dir.unwrap_or_else(|| agency_dir_slug(&agency.name));
     let target_dir = resolve_workspace_write_path(&canonical_root, &output_dir, "agency_create")
         .map_err(ApiError::bad_request)?;
-    let files =
-        materialize_agency_workspace(&canonical_root, &target_dir, overwrite, &agency, &seeds)?;
+    // materialize_agency_workspace is filesystem-heavy (creates a directory
+    // tree, writes several files). Run it on the blocking pool so it doesn't
+    // stall a tokio worker.
+    let files = {
+        let canonical_root = canonical_root.clone();
+        let target_dir = target_dir.clone();
+        let agency_for_fs = agency.clone();
+        let seeds_for_fs = seeds.clone();
+        tokio::task::spawn_blocking(move || {
+            materialize_agency_workspace(
+                &canonical_root,
+                &target_dir,
+                overwrite,
+                &agency_for_fs,
+                &seeds_for_fs,
+            )
+        })
+        .await
+        .map_err(|error| {
+            ApiError::bad_request(format!("agency materialize worker panicked: {error}"))
+        })??
+    };
     let output_dir =
         normalized_relative_path(&canonical_root, &target_dir).map_err(ApiError::bad_request)?;
     let seed_memory_count = seeds.iter().map(|seed| seed.entries.len() as u64).sum();

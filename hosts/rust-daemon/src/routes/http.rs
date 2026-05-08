@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use axum::body::to_bytes;
 use axum::extract::Request as AxumRequest;
 use axum::http::{header, HeaderValue, Request as HttpRequest, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -12,6 +13,83 @@ use tracing::error;
 use tracing::info_span;
 
 use super::ApiError;
+
+/// Optional API-key gate. Reads `ANIMAOS_RS_API_KEY` once on first call and
+/// caches the result for the process lifetime.
+///
+/// - If the env var is **unset or empty**, all requests pass through (default,
+///   matches prior behavior).
+/// - If the env var is set, every request must carry a matching credential in
+///   either `Authorization: Bearer <key>` or `X-Api-Key: <key>`. Health
+///   probes (`/health`, `/api/health`, `/ready`, `/api/ready`, `/metrics`,
+///   `/openapi.json`, `/docs`, `/docs/`) are exempt so external monitoring
+///   keeps working.
+pub(super) async fn enforce_api_key(
+    request: AxumRequest,
+    next: Next,
+) -> Result<AxumResponse, AxumResponse> {
+    use std::sync::OnceLock;
+    static EXPECTED_KEY: OnceLock<Option<String>> = OnceLock::new();
+    let expected = EXPECTED_KEY.get_or_init(|| {
+        std::env::var("ANIMAOS_RS_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let Some(expected) = expected.as_deref() else {
+        return Ok(next.run(request).await);
+    };
+
+    let path = request.uri().path();
+    if matches!(
+        path,
+        "/health"
+            | "/api/health"
+            | "/ready"
+            | "/api/ready"
+            | "/metrics"
+            | "/openapi.json"
+            | "/docs"
+            | "/docs/"
+    ) {
+        return Ok(next.run(request).await);
+    }
+
+    let presented = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .unwrap_or_default();
+
+    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+        Ok(next.run(request).await)
+    } else {
+        Err(json_response(
+            StatusCode::UNAUTHORIZED,
+            &super::contracts::ErrorBody {
+                error: "unauthorized".into(),
+            },
+        ))
+    }
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 const INTERNAL_SERVER_ERROR_JSON: &str = "{\"error\":\"internal server error\"}";
 
