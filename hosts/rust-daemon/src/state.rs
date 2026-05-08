@@ -5,7 +5,6 @@ mod swarm_tools;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anima_core::{
     AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentStatus, DatabaseAdapter, ModelAdapter,
@@ -367,7 +366,9 @@ impl DaemonState {
         snapshot.agent_ids.clear();
         if snapshot.status == anima_swarm::SwarmStatus::Running {
             snapshot.status = anima_swarm::SwarmStatus::Failed;
-            snapshot.completed_at.get_or_insert_with(now_millis);
+            snapshot
+                .completed_at
+                .get_or_insert_with(anima_core::primitives::now_millis);
         }
 
         let event_stream = EventFanout::new(DEFAULT_EVENT_BUFFER);
@@ -619,9 +620,3 @@ impl DaemonState {
     }
 }
 
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_millis()
-}

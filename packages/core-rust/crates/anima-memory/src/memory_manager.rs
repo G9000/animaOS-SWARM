@@ -4,7 +4,8 @@ mod types;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use anima_core::primitives::now_millis;
 
 pub use self::types::{
     AgentRelationship, AgentRelationshipOptions, Memory, MemoryEntity, MemoryEntityOptions,
@@ -283,7 +284,15 @@ impl MemoryManager {
                     candidate.temporal_score = candidate.temporal_score.max(temporal_score);
                 }
 
-                if fact.evidence_memory_ids.is_empty() {
+                // When a fact has no evidence pointers, fall back to scanning
+                // memories for textual mentions. This is O(memories × facts), so
+                // skip the fallback once the corpus passes a sane size threshold —
+                // by that point the lexical / vector indexes carry recall and
+                // this scan would dominate query latency.
+                const TEMPORAL_FALLBACK_MEMORY_LIMIT: usize = 5_000;
+                if fact.evidence_memory_ids.is_empty()
+                    && self.memories.len() <= TEMPORAL_FALLBACK_MEMORY_LIMIT
+                {
                     for memory in self.memories.values() {
                         if !memory_matches_search_options(memory, &opts.search) {
                             continue;
@@ -990,7 +999,7 @@ impl MemoryManager {
     pub fn apply_retention_at(
         &mut self,
         policy: MemoryRetentionPolicy,
-        now: u128,
+        now: u64,
     ) -> Result<MemoryRetentionReport, MemoryError> {
         if let Some(min_importance) = policy.min_importance {
             validate_importance(min_importance)?;
@@ -1717,17 +1726,17 @@ fn temporal_status_matches(
 }
 
 fn temporal_record_valid_at(
-    valid_from: Option<u128>,
-    valid_to: Option<u128>,
-    instant: u128,
+    valid_from: Option<u64>,
+    valid_to: Option<u64>,
+    instant: u64,
 ) -> bool {
     valid_from.is_none_or(|valid_from| valid_from <= instant)
         && valid_to.is_none_or(|valid_to| valid_to >= instant)
 }
 
 fn validate_temporal_range(
-    valid_from: Option<u128>,
-    valid_to: Option<u128>,
+    valid_from: Option<u64>,
+    valid_to: Option<u64>,
 ) -> Result<(), MemoryError> {
     if let (Some(valid_from), Some(valid_to)) = (valid_from, valid_to) {
         if valid_to < valid_from {
@@ -1889,13 +1898,6 @@ pub(super) fn validate_importance(importance: f64) -> Result<f64, MemoryError> {
     } else {
         Err(MemoryError::InvalidImportance)
     }
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock should be after unix epoch")
-        .as_millis()
 }
 
 fn next_memory_id() -> String {

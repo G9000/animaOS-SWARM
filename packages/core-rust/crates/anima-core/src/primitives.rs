@@ -1,13 +1,57 @@
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+
+/// Current Unix-epoch milliseconds as `u64`.
+///
+/// Saturates to `u64::MAX` if the system clock is before the Unix epoch
+/// (the only case where `SystemTime::duration_since` returns Err).
+pub fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Locks a `Mutex`, recovering the inner guard if the mutex is poisoned.
+///
+/// Production runtimes embed user-supplied callbacks (model adapters, tool
+/// handlers, agent factories) that may panic. A panic while holding one of
+/// the runtime's internal mutexes poisons the lock — and the rest of the
+/// runtime still has useful state. Recovering the guard via `into_inner()`
+/// keeps a single bad actor from cascade-failing the entire process.
+///
+/// **Caveat:** recovering a poisoned guard does not restore broken
+/// invariants. If the panic occurred mid-update (a counter incremented but
+/// the matching list push never happened, for example), the inner state may
+/// be inconsistent. Callers that hold a lock should keep their critical
+/// sections short and atomic so partial updates are unlikely; this helper
+/// trades "guaranteed cascade panic" for "best-effort continuation," not for
+/// "guaranteed correctness."
+pub fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Method-style alias for [`lock_recover`].
+pub trait LockRecover<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_recover(&self) -> MutexGuard<'_, T> {
+        lock_recover(self)
+    }
+}
 
 pub type UuidString = String;
 pub type AgentId = String;
 pub type RoomId = String;
 pub type MessageId = String;
-
-pub const HEALTH_OK_JSON: &str = "{\"status\":\"ok\"}";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DataValue {
@@ -61,7 +105,7 @@ pub struct Message {
     pub room_id: RoomId,
     pub content: Content,
     pub role: MessageRole,
-    pub created_at_ms: u128,
+    pub created_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,37 +123,16 @@ impl TaskStatus {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HealthStatus {
-    pub status: &'static str,
-}
-
-impl HealthStatus {
-    pub const fn ok() -> Self {
-        Self { status: "ok" }
-    }
-
-    pub const fn as_json(self) -> &'static str {
-        HEALTH_OK_JSON
-    }
-}
-
-impl Default for HealthStatus {
-    fn default() -> Self {
-        Self::ok()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskResult<T> {
     pub status: TaskStatus,
     pub data: Option<T>,
     pub error: Option<String>,
-    pub duration_ms: u128,
+    pub duration_ms: u64,
 }
 
 impl<T> TaskResult<T> {
-    pub fn success(data: T, duration_ms: u128) -> Self {
+    pub fn success(data: T, duration_ms: u64) -> Self {
         Self {
             status: TaskStatus::Success,
             data: Some(data),
@@ -118,7 +141,7 @@ impl<T> TaskResult<T> {
         }
     }
 
-    pub fn error(message: impl Into<String>, duration_ms: u128) -> Self {
+    pub fn error(message: impl Into<String>, duration_ms: u64) -> Self {
         Self {
             status: TaskStatus::Error,
             data: None,
@@ -130,13 +153,7 @@ impl<T> TaskResult<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HealthStatus, TaskResult, TaskStatus, HEALTH_OK_JSON};
-
-    #[test]
-    fn health_status_matches_existing_daemon_contract() {
-        assert_eq!(HealthStatus::ok().status, "ok");
-        assert_eq!(HealthStatus::ok().as_json(), HEALTH_OK_JSON);
-    }
+    use super::{TaskResult, TaskStatus};
 
     #[test]
     fn task_result_builders_set_expected_status() {

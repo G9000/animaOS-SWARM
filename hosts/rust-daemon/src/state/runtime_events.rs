@@ -73,7 +73,7 @@ fn runtime_event_payload(agent_id: &str, agent_name: &str, event: &EngineEvent) 
             "agentName": agent_name,
             "toolName": object_field_string(&event.data, "name").unwrap_or_default(),
             "status": object_field_string(&event.data, "status").unwrap_or("error"),
-            "durationMs": object_field_u128(&event.data, "durationMs").unwrap_or(0),
+            "durationMs": object_field_u64(&event.data, "durationMs").unwrap_or(0),
             "result": object_field_string(&event.data, "result"),
         })),
         EventType::AgentTokens => Some(json!({
@@ -107,10 +107,10 @@ fn object_field_string<'a>(value: &'a DataValue, key: &str) -> Option<&'a str> {
     }
 }
 
-fn object_field_u128(value: &DataValue, key: &str) -> Option<u128> {
+fn object_field_u64(value: &DataValue, key: &str) -> Option<u64> {
     match value {
         DataValue::Object(object) => match object.get(key) {
-            Some(DataValue::Number(value)) if *value >= 0.0 => Some(*value as u128),
+            Some(DataValue::Number(value)) if *value >= 0.0 => Some(*value as u64),
             _ => None,
         },
         _ => None,

@@ -249,7 +249,7 @@ pub struct TaskResult<T> {
     pub status: TaskStatus,      // Success | Error
     pub data: Option<T>,         // the Content on success
     pub error: Option<String>,   // error message on failure
-    pub duration_ms: u128,       // wall-clock time of the entire run
+    pub duration_ms: u64,        // wall-clock time of the entire run
 }
 ```
 

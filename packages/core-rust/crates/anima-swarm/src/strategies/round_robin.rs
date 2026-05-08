@@ -6,6 +6,7 @@ use futures::future::try_join_all;
 
 use crate::coordinator::CoordinatorAgentRef;
 use crate::coordinator::{CoordinatorDispatchContext, CoordinatorFuture};
+use crate::strategies::elapsed_ms;
 
 pub fn round_robin_strategy(
     ctx: CoordinatorDispatchContext,
@@ -16,7 +17,7 @@ pub fn round_robin_strategy(
         if max_turns == 0 {
             return TaskResult::error(
                 "Round-robin strategy requires at least one turn",
-                start.elapsed().as_millis(),
+                elapsed_ms(start),
             );
         }
 
@@ -37,11 +38,11 @@ pub fn round_robin_strategy(
         .await
         {
             Ok(agents) => agents,
-            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+            Err(error) => return TaskResult::error(error, elapsed_ms(start)),
         };
 
         let mut history = Vec::new();
-        let mut last_result = None;
+        let mut turn_errors: Vec<TurnError> = Vec::new();
 
         for turn in 0..max_turns {
             let agent = &agents[turn % agents.len()];
@@ -65,32 +66,38 @@ pub fn round_robin_strategy(
                     .map(|content| content.text.clone())
                     .unwrap_or_default()
             } else {
-                format!(
-                    "Error: {}",
-                    result.error.as_deref().unwrap_or("unknown error")
-                )
+                let error = result.error.as_deref().unwrap_or("unknown error");
+                turn_errors.push(TurnError {
+                    turn,
+                    speaker: agent.name.clone(),
+                    error: error.to_string(),
+                });
+                format!("Error: {error}")
             };
 
             history.push(HistoryEntry {
                 speaker: agent.name.clone(),
                 content: response_text,
             });
-            last_result = Some(result);
         }
 
-        let content = build_result_content(&history);
-        let duration_ms = start.elapsed().as_millis();
-        let final_status = last_result
-            .as_ref()
-            .map(|result| result.status)
-            .unwrap_or(TaskStatus::Success);
-        let final_error = last_result.as_ref().and_then(|result| result.error.clone());
+        let content = build_result_content(&history, &turn_errors);
+        let duration_ms = elapsed_ms(start);
 
-        TaskResult {
-            status: final_status,
-            data: Some(content),
-            error: final_error,
-            duration_ms,
+        if turn_errors.is_empty() {
+            TaskResult::success(content, duration_ms)
+        } else {
+            let summary = turn_errors
+                .iter()
+                .map(|entry| format!("[{}] {}", entry.speaker, entry.error))
+                .collect::<Vec<_>>()
+                .join("; ");
+            TaskResult {
+                status: TaskStatus::Error,
+                data: Some(content),
+                error: Some(summary),
+                duration_ms,
+            }
         }
     })
 }
@@ -103,6 +110,12 @@ struct RoundRobinAgent {
 struct HistoryEntry {
     speaker: String,
     content: String,
+}
+
+struct TurnError {
+    turn: usize,
+    speaker: String,
+    error: String,
 }
 
 fn build_follow_up_prompt(task: &str, history: &[HistoryEntry]) -> String {
@@ -122,7 +135,7 @@ fn build_follow_up_prompt(task: &str, history: &[HistoryEntry]) -> String {
     format!("Continue working on this task: {task}\n\nIt's your turn to contribute.{history_str}")
 }
 
-fn build_result_content(history: &[HistoryEntry]) -> Content {
+fn build_result_content(history: &[HistoryEntry], errors: &[TurnError]) -> Content {
     let text = history
         .iter()
         .map(|entry| format!("[{}]: {}", entry.speaker, entry.content))
@@ -144,6 +157,26 @@ fn build_result_content(history: &[HistoryEntry]) -> Content {
                 .collect(),
         ),
     );
+    if !errors.is_empty() {
+        metadata.insert(
+            "errors".into(),
+            DataValue::Array(
+                errors
+                    .iter()
+                    .map(|entry| {
+                        let mut record = BTreeMap::new();
+                        record.insert("turn".into(), DataValue::Number(entry.turn as f64));
+                        record.insert(
+                            "speaker".into(),
+                            DataValue::String(entry.speaker.clone()),
+                        );
+                        record.insert("error".into(), DataValue::String(entry.error.clone()));
+                        DataValue::Object(record)
+                    })
+                    .collect(),
+            ),
+        );
+    }
 
     Content {
         text,

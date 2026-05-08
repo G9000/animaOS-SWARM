@@ -61,7 +61,7 @@ pub(crate) struct TaskResultResponse {
     pub(crate) status: String,
     pub(crate) data: Option<ContentResponse>,
     pub(crate) error: Option<String>,
-    pub(crate) duration_ms: u128,
+    pub(crate) duration_ms: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
@@ -270,6 +270,19 @@ pub(in crate::routes::contracts) fn u64_value(
             "timeout" => "timeout must be a positive integer",
             _ => "field must be a positive integer",
         }),
+    }
+}
+
+pub(in crate::routes::contracts) fn usize_value(
+    value: Value,
+    _field: &'static str,
+) -> Result<usize, &'static str> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or("field must be a positive integer"),
+        _ => Err("field must be a positive integer"),
     }
 }
 

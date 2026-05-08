@@ -82,8 +82,8 @@ pub struct MemoryEntity {
     pub name: String,
     pub aliases: Vec<String>,
     pub summary: Option<String>,
-    pub created_at: u128,
-    pub updated_at: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -162,8 +162,8 @@ pub struct AgentRelationship {
     pub room_id: Option<String>,
     pub world_id: Option<String>,
     pub session_id: Option<String>,
-    pub created_at: u128,
-    pub updated_at: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -220,9 +220,9 @@ pub struct NewTemporalFact {
     pub object_id: Option<String>,
     pub object_name: Option<String>,
     pub value: Option<String>,
-    pub valid_from: Option<u128>,
-    pub valid_to: Option<u128>,
-    pub observed_at: Option<u128>,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub observed_at: Option<u64>,
     pub confidence: f64,
     pub evidence_memory_ids: Vec<String>,
     pub supersedes_fact_ids: Vec<String>,
@@ -244,9 +244,9 @@ pub struct TemporalFact {
     pub object_id: Option<String>,
     pub object_name: Option<String>,
     pub value: Option<String>,
-    pub valid_from: Option<u128>,
-    pub valid_to: Option<u128>,
-    pub observed_at: u128,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub observed_at: u64,
     pub confidence: f64,
     pub evidence_memory_ids: Vec<String>,
     pub supersedes_fact_ids: Vec<String>,
@@ -255,8 +255,8 @@ pub struct TemporalFact {
     pub room_id: Option<String>,
     pub world_id: Option<String>,
     pub session_id: Option<String>,
-    pub created_at: u128,
-    pub updated_at: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -267,7 +267,7 @@ pub struct TemporalFactOptions {
     pub object_kind: Option<RelationshipEndpointKind>,
     pub object_id: Option<String>,
     pub status: Option<TemporalRecordStatus>,
-    pub valid_at: Option<u128>,
+    pub valid_at: Option<u64>,
     pub include_inactive: bool,
     pub room_id: Option<String>,
     pub world_id: Option<String>,
@@ -288,9 +288,9 @@ pub struct NewTemporalRelationship {
     pub summary: Option<String>,
     pub strength: f64,
     pub confidence: f64,
-    pub valid_from: Option<u128>,
-    pub valid_to: Option<u128>,
-    pub observed_at: Option<u128>,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub observed_at: Option<u64>,
     pub evidence_memory_ids: Vec<String>,
     pub supersedes_relationship_ids: Vec<String>,
     pub status: Option<TemporalRecordStatus>,
@@ -313,9 +313,9 @@ pub struct TemporalRelationship {
     pub summary: Option<String>,
     pub strength: f64,
     pub confidence: f64,
-    pub valid_from: Option<u128>,
-    pub valid_to: Option<u128>,
-    pub observed_at: u128,
+    pub valid_from: Option<u64>,
+    pub valid_to: Option<u64>,
+    pub observed_at: u64,
     pub evidence_memory_ids: Vec<String>,
     pub supersedes_relationship_ids: Vec<String>,
     pub status: TemporalRecordStatus,
@@ -323,8 +323,8 @@ pub struct TemporalRelationship {
     pub room_id: Option<String>,
     pub world_id: Option<String>,
     pub session_id: Option<String>,
-    pub created_at: u128,
-    pub updated_at: u128,
+    pub created_at: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -335,7 +335,7 @@ pub struct TemporalRelationshipOptions {
     pub target_id: Option<String>,
     pub relationship_type: Option<String>,
     pub status: Option<TemporalRecordStatus>,
-    pub valid_at: Option<u128>,
+    pub valid_at: Option<u64>,
     pub include_inactive: bool,
     pub room_id: Option<String>,
     pub world_id: Option<String>,
@@ -367,7 +367,7 @@ pub struct Memory {
     pub memory_type: MemoryType,
     pub content: String,
     pub importance: f64,
-    pub created_at: u128,
+    pub created_at: u64,
     pub tags: Option<Vec<String>>,
     pub scope: MemoryScope,
     pub room_id: Option<String>,
@@ -383,7 +383,7 @@ pub struct MemorySearchResult {
     pub memory_type: MemoryType,
     pub content: String,
     pub importance: f64,
-    pub created_at: u128,
+    pub created_at: u64,
     pub tags: Option<Vec<String>>,
     pub score: f64,
     pub scope: MemoryScope,
@@ -521,10 +521,10 @@ pub struct MemoryEvidenceTrace {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MemoryRetentionPolicy {
-    pub max_age_millis: Option<u128>,
+    pub max_age_millis: Option<u64>,
     pub min_importance: Option<f64>,
     pub max_memories: Option<usize>,
-    pub decay_half_life_millis: Option<u128>,
+    pub decay_half_life_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

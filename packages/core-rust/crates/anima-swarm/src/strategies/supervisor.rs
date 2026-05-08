@@ -11,6 +11,7 @@ use crate::coordinator::{
     CoordinatorBatchDelegateFn, CoordinatorDelegateFn, CoordinatorDispatchContext,
     CoordinatorFuture,
 };
+use crate::strategies::elapsed_ms;
 use crate::types::SwarmDelegation;
 
 pub fn supervisor_strategy(
@@ -41,7 +42,7 @@ pub fn supervisor_strategy(
         .await
         {
             Ok(workers) => workers.into_iter().collect::<HashMap<_, _>>(),
-            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+            Err(error) => return TaskResult::error(error, elapsed_ms(start)),
         };
 
         let worker_refs = Arc::new(worker_refs);
@@ -223,6 +224,12 @@ pub fn supervisor_strategy(
             };
 
         let mut manager_config = ctx.manager_config().clone();
+        // The supervisor manager spends each tool turn on a delegation, so cap
+        // its tool-iteration budget at the swarm's `max_turns` setting.
+        let max_turns = ctx.max_turns().max(1);
+        let mut settings = manager_config.settings.take().unwrap_or_default();
+        settings.max_tool_iterations = Some(max_turns);
+        manager_config.settings = Some(settings);
         let delegate_tool = ToolDescriptor {
             name: "delegate_task".into(),
             description: format!(
@@ -266,13 +273,13 @@ pub fn supervisor_strategy(
             .await
         {
             Ok(manager) => manager,
-            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+            Err(error) => return TaskResult::error(error, elapsed_ms(start)),
         };
 
         let result = manager
             .run_content(ctx.scoped_task_content("supervisor:manager"))
             .await;
-        let duration_ms = start.elapsed().as_millis();
+        let duration_ms = elapsed_ms(start);
 
         TaskResult {
             status: result.status,

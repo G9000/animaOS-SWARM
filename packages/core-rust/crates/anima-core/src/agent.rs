@@ -31,6 +31,9 @@ pub struct AgentSettings {
     pub max_tokens: Option<u32>,
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
+    /// Cap on tool-calling turns inside a single `AgentRuntime::run` invocation.
+    /// Defaults to `runtime::MAX_TOOL_ITERATIONS` (8) when not set.
+    pub max_tool_iterations: Option<usize>,
     pub additional: BTreeMap<String, DataValue>,
 }
 
@@ -101,7 +104,7 @@ pub struct AgentState {
     pub name: String,
     pub status: AgentStatus,
     pub config: AgentConfig,
-    pub created_at_ms: u128,
+    pub created_at_ms: u64,
     pub token_usage: TokenUsage,
 }
 

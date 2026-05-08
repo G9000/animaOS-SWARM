@@ -5,6 +5,7 @@ pub mod model;
 pub mod persistence;
 pub mod primitives;
 pub mod runtime;
+mod runtime_serde;
 
 pub use agent::{
     AgentConfig, AgentSettings, AgentState, AgentStatus, PluginDescriptor, TokenUsage,
@@ -17,7 +18,7 @@ pub use model::{
 };
 pub use persistence::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
 pub use primitives::{
-    AgentId, Attachment, AttachmentType, Content, DataValue, HealthStatus, Message, MessageId,
-    MessageRole, RoomId, TaskResult, TaskStatus, UuidString, HEALTH_OK_JSON,
+    AgentId, Attachment, AttachmentType, Content, DataValue, LockRecover, Message, MessageId,
+    MessageRole, RoomId, TaskResult, TaskStatus, UuidString,
 };
 pub use runtime::{AgentRuntime, AgentRuntimeSnapshot};

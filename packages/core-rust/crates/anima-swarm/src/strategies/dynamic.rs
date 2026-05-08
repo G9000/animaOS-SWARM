@@ -3,10 +3,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anima_core::TaskStatus;
-use anima_core::{Content, DataValue, TaskResult, ToolDescriptor};
+use anima_core::{Content, DataValue, LockRecover, TaskResult, ToolDescriptor};
 use futures::future::try_join_all;
 
 use crate::coordinator::{CoordinatorDelegateFn, CoordinatorDispatchContext, CoordinatorFuture};
+use crate::strategies::elapsed_ms;
 
 #[derive(Clone)]
 struct HistoryEntry {
@@ -41,7 +42,7 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
         .await
         {
             Ok(workers) => workers.into_iter().collect::<BTreeMap<_, _>>(),
-            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+            Err(error) => return TaskResult::error(error, elapsed_ms(start)),
         };
 
         let worker_refs = Arc::new(worker_refs);
@@ -81,8 +82,7 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
 
                     let history_text = {
                         let history = chat_history
-                            .lock()
-                            .expect("dynamic history mutex should not be poisoned");
+                            .lock_recover();
                         if history.is_empty() {
                             String::new()
                         } else {
@@ -118,8 +118,7 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
                     };
 
                     chat_history
-                        .lock()
-                        .expect("dynamic history mutex should not be poisoned")
+                        .lock_recover()
                         .push(HistoryEntry {
                             speaker: agent_name,
                             content: response_text,
@@ -131,6 +130,12 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
         };
 
         let mut manager_config = ctx.manager_config().clone();
+        // The dynamic manager spends each tool turn on a `choose_speaker` call,
+        // so cap its tool-iteration budget at the swarm's `max_turns` setting.
+        let max_turns = ctx.max_turns().max(1);
+        let mut settings = manager_config.settings.take().unwrap_or_default();
+        settings.max_tool_iterations = Some(max_turns);
+        manager_config.settings = Some(settings);
         let choose_speaker_tool = ToolDescriptor {
             name: "choose_speaker".into(),
             description: format!(
@@ -158,13 +163,13 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
             .await
         {
             Ok(manager) => manager,
-            Err(error) => return TaskResult::error(error, start.elapsed().as_millis()),
+            Err(error) => return TaskResult::error(error, elapsed_ms(start)),
         };
 
         let result = manager
             .run_content(ctx.scoped_task_content("dynamic:manager"))
             .await;
-        let duration_ms = start.elapsed().as_millis();
+        let duration_ms = elapsed_ms(start);
 
         TaskResult {
             status: result.status,

@@ -14,8 +14,8 @@ pub(crate) struct SwarmStateResponse {
     pub(crate) messages: Vec<SwarmMessageResponse>,
     pub(crate) results: Vec<TaskResultResponse>,
     pub(crate) token_usage: TokenUsageResponse,
-    pub(crate) started_at: Option<u128>,
-    pub(crate) completed_at: Option<u128>,
+    pub(crate) started_at: Option<u64>,
+    pub(crate) completed_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -25,7 +25,7 @@ pub(crate) struct SwarmMessageResponse {
     pub(crate) from: String,
     pub(crate) to: String,
     pub(crate) content: ContentResponse,
-    pub(crate) timestamp: u128,
+    pub(crate) timestamp: u64,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]

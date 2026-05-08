@@ -43,12 +43,12 @@ impl EventType {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EngineEvent<T = DataValue> {
+pub struct EngineEvent {
     pub id: UuidString,
     pub event_type: EventType,
     pub agent_id: Option<String>,
     pub timestamp_ms: u64,
-    pub data: T,
+    pub data: DataValue,
 }
 
 #[cfg(test)]

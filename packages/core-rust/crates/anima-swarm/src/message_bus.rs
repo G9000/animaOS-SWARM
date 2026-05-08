@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use anima_core::primitives::now_millis;
 use anima_core::Content;
 
 use crate::types::{AgentMessage, SwarmMessageBus};
@@ -76,11 +76,9 @@ impl MessageBus {
     }
 
     fn next_message(&self, from: &str, to: &str, content: Content) -> AgentMessage {
+        let next = NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed);
         AgentMessage {
-            id: format!(
-                "swarm-msg-{}",
-                NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed) + 1
-            ),
+            id: format!("swarm-msg-{}-{next}", now_millis()),
             from: from.to_string(),
             to: to.to_string(),
             content,
@@ -118,9 +116,3 @@ impl SwarmMessageBus for MessageBus {
     }
 }
 
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_millis()
-}

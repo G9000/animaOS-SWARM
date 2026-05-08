@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anima_memory::{
     InMemoryVectorIndex, Memory, MemoryTextEmbedder, MemoryVectorError, MemoryVectorIndex,
@@ -815,7 +815,7 @@ impl SqliteMemoryEmbeddingStore {
                     model,
                     vector.len() as i64,
                     vector_json,
-                    now_millis().to_string(),
+                    anima_core::primitives::now_millis().to_string(),
                 ],
             )
             .map(|_| ())
@@ -1019,13 +1019,6 @@ fn stable_hash(value: &str) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
 }
 
 fn sqlite_error(error: rusqlite::Error) -> io::Error {

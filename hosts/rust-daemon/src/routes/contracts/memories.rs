@@ -29,7 +29,7 @@ pub(crate) struct MemoryResponse {
     pub(crate) memory_type: String,
     pub(crate) content: String,
     pub(crate) importance: f64,
-    pub(crate) created_at: u128,
+    pub(crate) created_at: u64,
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) scope: String,
     pub(crate) room_id: Option<String>,
@@ -47,7 +47,7 @@ pub(crate) struct MemorySearchResultResponse {
     pub(crate) memory_type: String,
     pub(crate) content: String,
     pub(crate) importance: f64,
-    pub(crate) created_at: u128,
+    pub(crate) created_at: u64,
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) score: f64,
     pub(crate) scope: String,
@@ -85,8 +85,8 @@ pub(crate) struct AgentRelationshipResponse {
     pub(crate) room_id: Option<String>,
     pub(crate) world_id: Option<String>,
     pub(crate) session_id: Option<String>,
-    pub(crate) created_at: u128,
-    pub(crate) updated_at: u128,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -102,8 +102,8 @@ pub(crate) struct MemoryEntityResponse {
     pub(crate) name: String,
     pub(crate) aliases: Vec<String>,
     pub(crate) summary: Option<String>,
-    pub(crate) created_at: u128,
-    pub(crate) updated_at: u128,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -282,10 +282,10 @@ pub(crate) struct MemoryEvaluationRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryRetentionRequest {
-    pub(crate) max_age_millis: Option<u128>,
+    pub(crate) max_age_millis: Option<u64>,
     pub(crate) min_importance: Option<f64>,
     pub(crate) max_memories: Option<usize>,
-    pub(crate) decay_half_life_millis: Option<u128>,
+    pub(crate) decay_half_life_millis: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, IntoParams, ToSchema, Default)]

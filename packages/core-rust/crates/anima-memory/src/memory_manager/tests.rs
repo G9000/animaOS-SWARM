@@ -138,15 +138,9 @@ fn add_assigns_unique_ids() {
 #[test]
 fn add_sets_created_at_to_now() {
     let mut manager = MemoryManager::new();
-    let before = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock should be after unix epoch")
-        .as_millis();
+    let before = anima_core::primitives::now_millis();
     let memory = add_memory(&mut manager, base(|_| {}));
-    let after = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock should be after unix epoch")
-        .as_millis();
+    let after = anima_core::primitives::now_millis();
 
     assert!(memory.created_at >= before);
     assert!(memory.created_at <= after);

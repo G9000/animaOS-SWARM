@@ -3,12 +3,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
 use tokio::sync::Mutex as AsyncMutex;
 
-use anima_core::{AgentConfig, Content, DataValue, TaskResult, TaskStatus, TokenUsage};
+use anima_core::primitives::now_millis;
+use anima_core::{
+    AgentConfig, Content, DataValue, LockRecover, TaskResult, TaskStatus, TokenUsage,
+};
 
 use crate::strategies::resolve_strategy;
 use crate::types::{AgentMessage, SwarmDelegation};
@@ -431,8 +433,7 @@ impl SwarmCoordinator {
             let mut pool = self
                 .inner
                 .pool
-                .lock()
-                .expect("coordinator pool mutex should not be poisoned");
+                .lock_recover();
             for (worker_name, agent_id) in &created_workers {
                 pool.insert(worker_name.clone(), agent_id.clone());
             }
@@ -487,8 +488,7 @@ impl SwarmCoordinator {
             let mut agents = self
                 .inner
                 .agents
-                .lock()
-                .expect("coordinator agents mutex should not be poisoned");
+                .lock_recover();
             let drained = agents
                 .drain()
                 .map(|(agent_id, agent)| {
@@ -498,8 +498,7 @@ impl SwarmCoordinator {
                 .collect::<Vec<_>>();
             self.inner
                 .pool
-                .lock()
-                .expect("coordinator pool mutex should not be poisoned")
+                .lock_recover()
                 .clear();
             drained
         };
@@ -508,8 +507,7 @@ impl SwarmCoordinator {
             let mut bus = self
                 .inner
                 .message_bus
-                .lock()
-                .expect("message bus mutex should not be poisoned");
+                .lock_recover();
             bus.clear();
         }
 
@@ -537,8 +535,7 @@ impl SwarmCoordinator {
 
         self.inner
             .state
-            .lock()
-            .expect("coordinator state mutex should not be poisoned")
+            .lock_recover()
             .clone()
     }
 
@@ -619,8 +616,7 @@ impl SwarmCoordinator {
         self.capture_message_history();
         self.inner
             .state
-            .lock()
-            .expect("coordinator state mutex should not be poisoned")
+            .lock_recover()
             .clone()
     }
 
@@ -677,14 +673,12 @@ impl SwarmCoordinator {
             let mut bus = self
                 .inner
                 .message_bus
-                .lock()
-                .expect("message bus mutex should not be poisoned");
+                .lock_recover();
             bus.register_agent(&agent_id);
         }
         self.inner
             .agents
-            .lock()
-            .expect("coordinator agents mutex should not be poisoned")
+            .lock_recover()
             .insert(
                 agent_id.clone(),
                 CoordinatorManagedAgent {
@@ -704,14 +698,12 @@ impl SwarmCoordinator {
         let pool_agent_id = self
             .inner
             .pool
-            .lock()
-            .expect("coordinator pool mutex should not be poisoned")
+            .lock_recover()
             .get(name)
             .cloned()?;
         self.inner
             .agents
-            .lock()
-            .expect("coordinator agents mutex should not be poisoned")
+            .lock_recover()
             .get(&pool_agent_id)
             .map(|agent| {
                 CoordinatorAgentRef::with_liveness(
@@ -725,8 +717,7 @@ impl SwarmCoordinator {
     fn reset_task_state(&self) {
         self.inner
             .message_bus
-            .lock()
-            .expect("message bus mutex should not be poisoned")
+            .lock_recover()
             .clear_inboxes();
 
         let messages = self.message_history();
@@ -738,8 +729,7 @@ impl SwarmCoordinator {
         let clear_hooks = self
             .inner
             .agents
-            .lock()
-            .expect("coordinator agents mutex should not be poisoned")
+            .lock_recover()
             .values()
             .map(|agent| agent.shell.clear_task_state.clone())
             .collect::<Vec<_>>();
@@ -753,8 +743,7 @@ impl SwarmCoordinator {
         let pooled_agent_ids = self
             .inner
             .pool
-            .lock()
-            .expect("coordinator pool mutex should not be poisoned")
+            .lock_recover()
             .values()
             .cloned()
             .collect::<HashSet<_>>();
@@ -763,8 +752,7 @@ impl SwarmCoordinator {
             let mut agents = self
                 .inner
                 .agents
-                .lock()
-                .expect("coordinator agents mutex should not be poisoned");
+                .lock_recover();
             let ephemeral_ids = agents
                 .keys()
                 .filter(|agent_id| !pooled_agent_ids.contains(*agent_id))
@@ -786,8 +774,7 @@ impl SwarmCoordinator {
         for (agent_id, agent) in ephemeral {
             self.inner
                 .message_bus
-                .lock()
-                .expect("message bus mutex should not be poisoned")
+                .lock_recover()
                 .unregister_agent(&agent_id);
             self.release_agent_slot(&agent_id);
             (agent.stop)().await;
@@ -798,8 +785,7 @@ impl SwarmCoordinator {
         let token_hooks = self
             .inner
             .agents
-            .lock()
-            .expect("coordinator agents mutex should not be poisoned")
+            .lock_recover()
             .values()
             .map(|agent| agent.shell.token_usage.clone())
             .collect::<Vec<_>>();
@@ -831,8 +817,7 @@ impl SwarmCoordinator {
     fn message_history(&self) -> Vec<AgentMessage> {
         self.inner
             .message_bus
-            .lock()
-            .expect("message bus mutex should not be poisoned")
+            .lock_recover()
             .get_all_messages()
     }
 
@@ -840,8 +825,7 @@ impl SwarmCoordinator {
         !self
             .inner
             .agents
-            .lock()
-            .expect("coordinator agents mutex should not be poisoned")
+            .lock_recover()
             .is_empty()
     }
 
@@ -854,8 +838,7 @@ impl SwarmCoordinator {
         let mut admitted = self
             .inner
             .admitted_agent_ids
-            .lock()
-            .expect("admission mutex should not be poisoned");
+            .lock_recover();
         if admitted.len() >= max_agents {
             return Err(format!("Max concurrent agents ({max_agents}) reached"));
         }
@@ -866,8 +849,7 @@ impl SwarmCoordinator {
     fn release_agent_slot(&self, agent_id: &str) {
         self.inner
             .admitted_agent_ids
-            .lock()
-            .expect("admission mutex should not be poisoned")
+            .lock_recover()
             .remove(agent_id);
     }
 
@@ -892,8 +874,7 @@ impl SwarmCoordinator {
                 }
                 let message = {
                     let mut message_bus = message_bus
-                        .lock()
-                        .expect("message bus mutex should not be poisoned");
+                        .lock_recover();
                     message_bus.send_message(&from_agent_id, &to_agent_id, content)
                 };
                 if let Some(message_events) = message_events {
@@ -925,8 +906,7 @@ impl SwarmCoordinator {
                 }
                 let message = {
                     let mut message_bus = message_bus
-                        .lock()
-                        .expect("message bus mutex should not be poisoned");
+                        .lock_recover();
                     message_bus.broadcast_message(&from_agent_id, content)
                 };
                 if let Some(message_events) = message_events {
@@ -953,8 +933,7 @@ impl SwarmCoordinator {
                     return Err(inactive_agent_error(&agent_id));
                 }
                 Ok(message_bus
-                    .lock()
-                    .expect("message bus mutex should not be poisoned")
+                    .lock_recover()
                     .get_messages(&agent_id))
             })
         })
@@ -978,8 +957,7 @@ impl SwarmCoordinator {
 
                 let mut participants = inner
                     .agents
-                    .lock()
-                    .expect("coordinator agents mutex should not be poisoned")
+                    .lock_recover()
                     .iter()
                     .map(|(agent_id, agent)| CoordinatorParticipant {
                         agent_id: agent_id.clone(),
@@ -996,8 +974,7 @@ impl SwarmCoordinator {
         let mut state = self
             .inner
             .state
-            .lock()
-            .expect("coordinator state mutex should not be poisoned");
+            .lock_recover();
         update(&mut state);
     }
 
@@ -1017,16 +994,14 @@ impl SwarmCoordinator {
 
         self.inner
             .pool
-            .lock()
-            .expect("coordinator pool mutex should not be poisoned")
+            .lock_recover()
             .retain(|name, _| !created_names.contains(name));
 
         let removed_agents = {
             let mut agents = self
                 .inner
                 .agents
-                .lock()
-                .expect("coordinator agents mutex should not be poisoned");
+                .lock_recover();
             created_ids
                 .iter()
                 .filter_map(|agent_id| {
@@ -1042,8 +1017,7 @@ impl SwarmCoordinator {
             let mut bus = self
                 .inner
                 .message_bus
-                .lock()
-                .expect("message bus mutex should not be poisoned");
+                .lock_recover();
             for agent_id in &created_ids {
                 bus.unregister_agent(agent_id);
             }
@@ -1053,8 +1027,7 @@ impl SwarmCoordinator {
             let agents = self
                 .inner
                 .agents
-                .lock()
-                .expect("coordinator agents mutex should not be poisoned");
+                .lock_recover();
             agents.is_empty()
         };
 
@@ -1194,14 +1167,8 @@ fn metadata_retry_key(metadata: &BTreeMap<String, DataValue>) -> Option<String> 
 }
 
 fn next_id(prefix: &str, counter: &AtomicU64) -> String {
-    format!("{}-{}", prefix, counter.fetch_add(1, Ordering::Relaxed) + 1)
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_millis()
+    let next = counter.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{}-{next}", now_millis())
 }
 
 fn inactive_agent_result(agent_id: &str) -> TaskResult<Content> {

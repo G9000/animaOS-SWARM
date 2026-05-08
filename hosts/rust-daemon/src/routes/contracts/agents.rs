@@ -10,7 +10,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::shared::{
     data_value_to_json, json_to_data_value, number_value, parse_usize, required_string, u32_value,
-    u64_value, ContentResponse, TaskResultResponse, TokenUsageResponse,
+    u64_value, usize_value, ContentResponse, TaskResultResponse, TokenUsageResponse,
 };
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -46,6 +46,8 @@ pub(crate) struct AgentSettingsResponse {
     pub(crate) timeout_ms: Option<u64>,
     #[serde(rename = "maxRetries")]
     pub(crate) max_retries: Option<u32>,
+    #[serde(rename = "maxToolIterations")]
+    pub(crate) max_tool_iterations: Option<usize>,
     pub(crate) additional: BTreeMap<String, Value>,
 }
 
@@ -74,7 +76,7 @@ pub(crate) struct AgentStateResponse {
     pub(crate) name: String,
     pub(crate) status: String,
     pub(crate) config: AgentConfigResponse,
-    pub(crate) created_at_ms: u128,
+    pub(crate) created_at_ms: u64,
     pub(crate) token_usage: TokenUsageResponse,
 }
 
@@ -96,7 +98,7 @@ pub(crate) struct AgentMessageResponse {
     pub(crate) room_id: String,
     pub(crate) content: ContentResponse,
     pub(crate) role: String,
-    pub(crate) created_at_ms: u128,
+    pub(crate) created_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -167,6 +169,8 @@ pub(crate) struct AgentSettingsRequest {
     pub(crate) timeout_ms: Option<Value>,
     #[serde(rename = "maxRetries")]
     pub(crate) max_retries: Option<Value>,
+    #[serde(rename = "maxToolIterations")]
+    pub(crate) max_tool_iterations: Option<Value>,
     #[serde(flatten)]
     pub(crate) additional: HashMap<String, Value>,
 }
@@ -325,6 +329,11 @@ impl AgentSettingsRequest {
             .take()
             .map(|value| u32_value(value, "maxRetries"))
             .transpose()?;
+        settings.max_tool_iterations = self
+            .max_tool_iterations
+            .take()
+            .map(|value| usize_value(value, "maxToolIterations"))
+            .transpose()?;
 
         settings.additional = self
             .additional
@@ -398,6 +407,7 @@ impl From<&AgentSettings> for AgentSettingsResponse {
             max_tokens: value.max_tokens,
             timeout_ms: value.timeout_ms,
             max_retries: value.max_retries,
+            max_tool_iterations: value.max_tool_iterations,
             additional: value
                 .additional
                 .iter()

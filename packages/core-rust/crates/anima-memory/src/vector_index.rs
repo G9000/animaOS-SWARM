@@ -155,7 +155,7 @@ fn normalize_embedding(
         }
         magnitude_squared += f64::from(*value) * f64::from(*value);
     }
-    if magnitude_squared <= f64::EPSILON {
+    if magnitude_squared < f64::EPSILON {
         return Err(MemoryVectorError::ZeroMagnitudeEmbedding);
     }
 

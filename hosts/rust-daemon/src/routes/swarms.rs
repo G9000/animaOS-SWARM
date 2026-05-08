@@ -1,7 +1,5 @@
 pub(super) mod events;
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use anima_swarm::SwarmStatus;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -114,7 +112,9 @@ pub(crate) async fn handle_run_swarm(
     let persist_request = {
         let mut running_snapshot = coordinator.get_state();
         running_snapshot.status = SwarmStatus::Running;
-        running_snapshot.started_at.get_or_insert_with(now_millis);
+        running_snapshot
+            .started_at
+            .get_or_insert_with(anima_core::primitives::now_millis);
         running_snapshot.completed_at = None;
         let mut guard = state.write().await;
         guard.store_swarm_snapshot(running_snapshot);
@@ -192,9 +192,3 @@ pub(crate) async fn handle_subscribe_swarm_events(
     subscribe_swarm_events_response(subscriber)
 }
 
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock should be after unix epoch")
-        .as_millis()
-}

@@ -1,7 +1,6 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anima_memory::{
     AgentRelationship, Memory, MemoryEntity, MemoryManager, MemoryManagerSnapshot, MemoryScope,
@@ -118,7 +117,7 @@ fn save_sqlite_snapshot(path: &Path, snapshot: &MemoryManagerSnapshot) -> io::Re
     conn.execute(
         "INSERT INTO memory_store_snapshots (id, payload, updated_at) VALUES (1, ?1, ?2)
          ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
-        params![payload, now_millis() as i64],
+        params![payload, anima_core::primitives::now_millis() as i64],
     )
     .map_err(sqlite_error)?;
     Ok(())
@@ -308,7 +307,7 @@ struct StoredMemory {
     memory_type: String,
     content: String,
     importance: f64,
-    created_at: u128,
+    created_at: u64,
     #[serde(default)]
     tags: Option<Vec<String>>,
     #[serde(default)]
@@ -374,8 +373,8 @@ struct StoredMemoryEntity {
     aliases: Vec<String>,
     #[serde(default)]
     summary: Option<String>,
-    created_at: u128,
-    updated_at: u128,
+    created_at: u64,
+    updated_at: u64,
 }
 
 impl From<&MemoryEntity> for StoredMemoryEntity {
@@ -431,8 +430,8 @@ struct StoredAgentRelationship {
     world_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-    created_at: u128,
-    updated_at: u128,
+    created_at: u64,
+    updated_at: u64,
 }
 
 impl From<&AgentRelationship> for StoredAgentRelationship {
@@ -502,10 +501,10 @@ struct StoredTemporalFact {
     #[serde(default)]
     value: Option<String>,
     #[serde(default)]
-    valid_from: Option<u128>,
+    valid_from: Option<u64>,
     #[serde(default)]
-    valid_to: Option<u128>,
-    observed_at: u128,
+    valid_to: Option<u64>,
+    observed_at: u64,
     confidence: f64,
     #[serde(default)]
     evidence_memory_ids: Vec<String>,
@@ -521,8 +520,8 @@ struct StoredTemporalFact {
     world_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-    created_at: u128,
-    updated_at: u128,
+    created_at: u64,
+    updated_at: u64,
 }
 
 impl From<&TemporalFact> for StoredTemporalFact {
@@ -603,10 +602,10 @@ struct StoredTemporalRelationship {
     strength: f64,
     confidence: f64,
     #[serde(default)]
-    valid_from: Option<u128>,
+    valid_from: Option<u64>,
     #[serde(default)]
-    valid_to: Option<u128>,
-    observed_at: u128,
+    valid_to: Option<u64>,
+    observed_at: u64,
     #[serde(default)]
     evidence_memory_ids: Vec<String>,
     #[serde(default)]
@@ -621,8 +620,8 @@ struct StoredTemporalRelationship {
     world_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
-    created_at: u128,
-    updated_at: u128,
+    created_at: u64,
+    updated_at: u64,
 }
 
 impl From<&TemporalRelationship> for StoredTemporalRelationship {
@@ -731,13 +730,6 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     Ok(())
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn serde_error(error: serde_json::Error) -> io::Error {

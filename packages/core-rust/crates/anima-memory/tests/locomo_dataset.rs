@@ -753,7 +753,7 @@ fn seed_temporal_facts(
                 value: Some(value.clone()),
                 valid_from: None,
                 valid_to: None,
-                observed_at: Some(turn_index as u128 + 1),
+                observed_at: Some(turn_index as u64 + 1),
                 confidence: 0.72,
                 evidence_memory_ids: vec![evidence_memory_id.clone()],
                 supersedes_fact_ids: Vec::new(),

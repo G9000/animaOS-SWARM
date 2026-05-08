@@ -179,9 +179,14 @@ fn is_generated_agent_id_for_name(agent_id: &str, name: &str) -> bool {
     let Some(suffix) = agent_id.strip_prefix(name) else {
         return false;
     };
+    // Generated IDs use either `{name}-{counter}` or `{name}-{millis}-{counter}`.
+    // Accept any suffix made up of one or more `-` separated digit groups.
+    let Some(suffix) = suffix.strip_prefix('-').filter(|value| !value.is_empty()) else {
+        return false;
+    };
     suffix
-        .strip_prefix('-')
-        .is_some_and(|value| !value.is_empty() && value.chars().all(|char| char.is_ascii_digit()))
+        .split('-')
+        .all(|segment| !segment.is_empty() && segment.chars().all(|char| char.is_ascii_digit()))
 }
 
 fn fallback_agent_name(agent_id: &str) -> String {

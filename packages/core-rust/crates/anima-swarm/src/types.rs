@@ -28,6 +28,13 @@ pub struct SwarmConfig {
     pub workers: Vec<AgentConfig>,
     pub max_concurrent_agents: Option<usize>,
     pub max_parallel_delegations: Option<usize>,
+    /// Strategy-specific turn cap. Interpretation differs per strategy:
+    /// - `RoundRobin`: total number of agent rotations executed.
+    /// - `Supervisor`: maximum delegations the manager may issue (each manager
+    ///   tool call is one delegation).
+    /// - `Dynamic`: maximum `choose_speaker` calls the manager may issue.
+    ///
+    /// Defaults to `workers.len() + 1` if unset.
     pub max_turns: Option<usize>,
     pub token_budget: Option<u64>,
 }
@@ -59,8 +66,8 @@ pub struct SwarmState {
     pub messages: Vec<AgentMessage>,
     pub results: Vec<TaskResult<Content>>,
     pub token_usage: TokenUsage,
-    pub started_at: Option<u128>,
-    pub completed_at: Option<u128>,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -69,7 +76,7 @@ pub struct AgentMessage {
     pub from: String,
     pub to: String,
     pub content: Content,
-    pub timestamp: u128,
+    pub timestamp: u64,
 }
 
 pub trait SwarmMessageBus {

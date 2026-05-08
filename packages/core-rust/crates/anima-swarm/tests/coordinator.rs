@@ -2201,8 +2201,10 @@ fn round_robin_strategy_records_error_turns_in_history() {
 
     let result = block_on(coordinator.dispatch("The actual task text"));
 
-    assert_eq!(result.status, TaskStatus::Success);
-    assert!(result.error.is_none());
+    // A failing turn should mark the swarm result as Error and surface the
+    // failure in `error`, while still preserving the full conversation in `data`.
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(result.error.as_deref(), Some("[manager] manager failed"));
     assert_eq!(
         result.data.as_ref().map(|content| content.text.as_str()),
         Some("[manager]: Error: manager failed\n\n[worker-a]: worker-a ok")

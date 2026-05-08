@@ -79,7 +79,7 @@ pub enum MemoryEvalCheck {
     RetentionDecay {
         name: String,
         policy: MemoryRetentionPolicy,
-        elapsed_millis: u128,
+        elapsed_millis: u64,
         decayed_content_contains: String,
         retained_content_contains: String,
     },
