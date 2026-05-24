@@ -3,15 +3,15 @@ import {
   agents, health, memories, providers as providerApi, swarms,
   type AgentSnapshot, type HealthResponse, type Memory,
   type ProviderResponse, type SwarmState, type SwarmStreamEvent, type TaskResult,
-} from './lib/api';
-import { getColors, DARK, MONO, SANS } from './design';
-import { NewAgentModal, NewSwarmModal, RunModal } from './Modals';
-import { ViewHome }         from './ViewHome';
-import { ViewFleet }        from './ViewFleet';
-import { ViewSwarms }       from './ViewSwarms';
-import { ViewMessages }     from './ViewMessages';
-import { ViewMemory }       from './ViewMemory';
-import { ViewAgentDetail }  from './ViewAgentDetail';
+} from '../lib/api';
+import { getColors, DARK, MONO, SANS } from '../design';
+import { NewAgentModal, NewSwarmModal, RunModal } from '../Modals';
+import { ViewHome }         from '../ViewHome';
+import { ViewFleet }        from '../ViewFleet';
+import { ViewSwarms }       from '../ViewSwarms';
+import { ViewMessages }     from '../ViewMessages';
+import { ViewMemory }       from '../ViewMemory';
+import { ViewAgentDetail }  from '../ViewAgentDetail';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 type View =
