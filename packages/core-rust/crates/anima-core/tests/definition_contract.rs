@@ -304,6 +304,13 @@ fn definition_deserialization_rejects_tampered_invariants() {
         .push(first_capability);
     assert!(serde_json::from_value::<anima_core::AgentDefinition>(duplicate_capability).is_err());
 
+    let mut reversed_capabilities = json.clone();
+    reversed_capabilities["resolved_capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(reversed_capabilities).is_err());
+
     let mut blank_digest = json.clone();
     blank_digest["resolved_capabilities"][0]["schema_digest"] = json!("");
     assert!(serde_json::from_value::<anima_core::AgentDefinition>(blank_digest).is_err());

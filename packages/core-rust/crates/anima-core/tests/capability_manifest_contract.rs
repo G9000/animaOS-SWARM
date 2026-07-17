@@ -221,6 +221,46 @@ fn profiles_reject_duplicate_capability_ids_transactionally_and_on_deserializati
 }
 
 #[test]
+fn profiles_require_nonblank_ids_and_nonzero_versions_transactionally_and_on_deserialization() {
+    let mut catalog = ManifestCatalog::default();
+    let snapshot = serde_json::to_string(&catalog).unwrap();
+    let blank_id = CapabilityProfile {
+        id: " ".into(),
+        version: 1,
+        label: "Research".into(),
+        description: "Invalid profile ID.".into(),
+        entries: vec![],
+    };
+    let zero_version = CapabilityProfile {
+        id: "research".into(),
+        version: 0,
+        label: "Research".into(),
+        description: "Invalid profile version.".into(),
+        entries: vec![],
+    };
+
+    assert!(matches!(
+        catalog.register_profile(blank_id.clone()),
+        Err(ManifestCatalogError::InvalidProfileId)
+    ));
+    assert!(matches!(
+        catalog.register_profile(zero_version.clone()),
+        Err(ManifestCatalogError::InvalidProfileVersion)
+    ));
+    assert_eq!(serde_json::to_string(&catalog).unwrap(), snapshot);
+    assert!(serde_json::from_value::<ManifestCatalog>(json!({
+        "manifests": [],
+        "profiles": [blank_id]
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<ManifestCatalog>(json!({
+        "manifests": [],
+        "profiles": [zero_version]
+    }))
+    .is_err());
+}
+
+#[test]
 fn catalog_rejects_duplicate_manifest_versions() {
     let mut catalog = ManifestCatalog::default();
     catalog

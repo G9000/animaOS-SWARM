@@ -101,6 +101,9 @@ pub struct AgentDefinitionDraft {
 }
 
 /// An immutable, self-contained definition suitable for durable storage and host consumption.
+///
+/// Resolved capabilities are canonically ordered by `capability_id`; deserialization rejects
+/// otherwise-valid snapshots with a noncanonical order so tampering is observable.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AgentDefinition {
     pub schema_version: u32,
@@ -196,6 +199,7 @@ pub enum DefinitionValidationError {
         id: String,
         revision: u32,
     },
+    NonCanonicalCapabilityOrder,
 }
 
 impl fmt::Display for DefinitionValidationError {
@@ -264,6 +268,12 @@ impl fmt::Display for DefinitionValidationError {
             }
             Self::DuplicateHostRequirement { id, revision } => {
                 write!(formatter, "host requirement {id}@{revision} is duplicated")
+            }
+            Self::NonCanonicalCapabilityOrder => {
+                write!(
+                    formatter,
+                    "resolved capabilities must be ordered by capability ID"
+                )
             }
         }
     }
@@ -515,7 +525,14 @@ fn validate_definition(definition: &AgentDefinition) -> Result<(), DefinitionVal
         return Err(DefinitionValidationError::InvalidApprovalPolicy);
     }
     let mut capability_ids = BTreeSet::new();
+    let mut previous_capability_id: Option<&str> = None;
     for capability in &definition.resolved_capabilities {
+        if previous_capability_id
+            .is_some_and(|previous| previous >= capability.capability_id.as_str())
+        {
+            return Err(DefinitionValidationError::NonCanonicalCapabilityOrder);
+        }
+        previous_capability_id = Some(&capability.capability_id);
         if capability.capability_id.trim().is_empty()
             || capability.manifest_version == 0
             || !capability_ids.insert(capability.capability_id.clone())

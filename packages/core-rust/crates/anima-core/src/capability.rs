@@ -98,6 +98,8 @@ pub enum ManifestCatalogError {
     InvalidManifestSchemaVersion,
     InvalidSchemaDigest,
     InvalidRuntimeCompatibility,
+    InvalidProfileId,
+    InvalidProfileVersion,
     DuplicateProfileCapabilityId { id: String },
 }
 
@@ -124,6 +126,8 @@ impl fmt::Display for ManifestCatalogError {
             Self::InvalidRuntimeCompatibility => {
                 write!(formatter, "runtime compatibility bounds are invalid")
             }
+            Self::InvalidProfileId => write!(formatter, "profile ID must not be blank"),
+            Self::InvalidProfileVersion => write!(formatter, "profile version must be nonzero"),
             Self::DuplicateProfileCapabilityId { id } => {
                 write!(formatter, "profile includes capability {id} more than once")
             }
@@ -202,6 +206,12 @@ impl ManifestCatalog {
         &mut self,
         mut profile: CapabilityProfile,
     ) -> Result<(), ManifestCatalogError> {
+        if profile.id.trim().is_empty() {
+            return Err(ManifestCatalogError::InvalidProfileId);
+        }
+        if profile.version == 0 {
+            return Err(ManifestCatalogError::InvalidProfileVersion);
+        }
         let mut capability_ids = std::collections::BTreeSet::new();
         for entry in &profile.entries {
             if !capability_ids.insert(entry.capability_id.clone()) {
