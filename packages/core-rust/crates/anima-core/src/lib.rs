@@ -14,8 +14,12 @@ pub use agent::{
     ToolDescriptor, ToolExample,
 };
 pub use capability::{
-    CapabilityKind, CapabilityManifest, CapabilityProfile, CapabilityProfileEntry, ManifestCatalog,
-    ManifestCatalogError, RecoveryMode, RiskLevel, RuntimeCompatibility,
+    CapabilityAttempt, CapabilityError, CapabilityErrorCode, CapabilityExecutionContext,
+    CapabilityExecutor, CapabilityKind, CapabilityManifest, CapabilityProfile,
+    CapabilityProfileEntry, CapabilityRegistry, CapabilityRegistryError, CapabilityResult,
+    LogicalInvocation, ManifestCatalog, ManifestCatalogError, ReconcileOutcome, RecoveryAction,
+    RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
+    CAPABILITY_INVOCATION_NAMESPACE,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use definition::{
