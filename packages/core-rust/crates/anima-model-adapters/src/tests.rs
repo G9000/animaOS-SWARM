@@ -1,0 +1,358 @@
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use anima_core::{
+    AgentConfig, AgentSettings, Content, DataValue, Message, MessageRole, ModelAdapter,
+    ModelGenerateRequest, ModelStopReason, ToolDescriptor,
+};
+use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+use serde_json::{json, Value};
+use tokio::net::TcpListener;
+
+use crate::{
+    provider_definitions, ProviderAdapterConfig, ProviderCredential, ProviderModelAdapter,
+};
+
+#[test]
+fn provider_definitions_expose_current_non_secret_metadata() {
+    let definitions = provider_definitions();
+    let ids: Vec<_> = definitions.iter().map(|definition| definition.id).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "openai",
+            "anthropic",
+            "google",
+            "ollama",
+            "groq",
+            "xai",
+            "openrouter",
+            "mistral",
+            "together",
+            "deepseek",
+            "fireworks",
+            "perplexity",
+            "moonshot"
+        ]
+    );
+    assert!(definitions
+        .iter()
+        .all(|definition| !definition.label.is_empty()));
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|definition| definition.id == "google")
+            .expect("google definition")
+            .aliases,
+        ["gemini"]
+    );
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|definition| definition.id == "xai")
+            .expect("xai definition")
+            .aliases,
+        ["grok"]
+    );
+    assert_eq!(
+        definitions
+            .iter()
+            .find(|definition| definition.id == "moonshot")
+            .expect("moonshot definition")
+            .aliases,
+        ["kimi"]
+    );
+}
+
+#[test]
+fn credential_debug_output_redacts_api_keys() {
+    let credential = ProviderCredential {
+        api_key: Some("do-not-expose".into()),
+        base_url: "https://example.test".into(),
+    };
+    assert!(!format!("{credential:?}").contains("do-not-expose"));
+}
+
+#[tokio::test]
+async fn aliases_resolve_to_their_canonical_provider_configuration() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(_body): Json<Value>| async move { openai_response("alias") }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("moonshot", Some("moon-key"), &format!("{base_url}/v1"))]);
+    let response = adapter
+        .generate(&agent_config("kimi", false), &request())
+        .await
+        .expect("alias should use canonical provider credentials");
+    assert_eq!(response.content.text, "alias");
+}
+
+#[tokio::test]
+async fn unknown_provider_is_rejected_clearly() {
+    let error = ProviderModelAdapter::new(ProviderAdapterConfig::default())
+        .generate(&agent_config("unknown", false), &request())
+        .await
+        .expect_err("unknown provider must fail");
+    assert!(error.contains("unknown model provider: unknown"), "{error}");
+}
+
+#[tokio::test]
+async fn key_required_provider_without_configured_key_is_rejected() {
+    let error = ProviderModelAdapter::new(ProviderAdapterConfig::default())
+        .generate(&agent_config("openai", false), &request())
+        .await
+        .expect_err("openai without key must fail");
+    assert!(error.contains("OPENAI_API_KEY"), "{error}");
+}
+
+#[tokio::test]
+async fn deterministic_and_test_are_host_owned_and_rejected() {
+    let adapter = ProviderModelAdapter::new(ProviderAdapterConfig::default());
+    for provider in ["deterministic", "test"] {
+        let error = adapter
+            .generate(&agent_config(provider, false), &request())
+            .await
+            .expect_err("host test provider must be rejected");
+        assert!(error.contains("unknown model provider"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn settings_cannot_override_host_supplied_credentials_or_base_url() {
+    let seen_auth = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let seen_auth = Arc::clone(&seen_auth);
+            move |headers: HeaderMap, Json(_body): Json<Value>| {
+                let seen_auth = Arc::clone(&seen_auth);
+                async move {
+                    seen_auth.lock().expect("mutex").push(
+                        headers
+                            .get("authorization")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                    openai_response("host config")
+                }
+            }
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("host-key"), &format!("{base_url}/v1"))]);
+    let mut config = agent_config("openai", false);
+    let mut settings = AgentSettings::default();
+    settings
+        .additional
+        .insert("apiKey".into(), DataValue::String("agent-key".into()));
+    settings.additional.insert(
+        "baseUrl".into(),
+        DataValue::String("http://127.0.0.1:1".into()),
+    );
+    config.settings = Some(settings);
+    let response = adapter
+        .generate(&config, &request())
+        .await
+        .expect("host config wins");
+    assert_eq!(response.content.text, "host config");
+    assert_eq!(
+        seen_auth.lock().expect("mutex").as_slice(),
+        ["Bearer host-key"]
+    );
+}
+
+#[tokio::test]
+async fn routes_openai_compatible_requests_and_tool_calls() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["tools"][0]["function"]["name"], "delegate_task");
+            Json(json!({"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"delegate_task","arguments":r#"{"task":"research"}"#}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":8,"completion_tokens":4,"total_tokens":12}}))
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let response = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))])
+        .generate(&agent_config("openai", true), &request())
+        .await
+        .expect("openai response");
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    assert_eq!(response.usage.total_tokens, 12);
+    assert_eq!(response.tool_calls.expect("tool")[0].name, "delegate_task");
+}
+
+#[tokio::test]
+async fn routes_anthropic_google_and_ollama_native_protocols() {
+    let anthropic = Router::new().route("/v1/messages", post(|Json(body): Json<Value>| async move {
+        assert!(body.get("system").is_some());
+        Json(json!({"content":[{"type":"text","text":"anthropic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}))
+    }));
+    let base_url = spawn_server(anthropic).await;
+    let response = adapter_with(&[("anthropic", Some("key"), &base_url)])
+        .generate(&agent_config("anthropic", false), &request())
+        .await
+        .expect("anthropic response");
+    assert_eq!(response.content.text, "anthropic");
+    assert_eq!(response.usage.total_tokens, 5);
+
+    let google = Router::new().route("/v1beta/models/gemini-2.0-flash:generateContent", post(|Json(body): Json<Value>| async move {
+        assert!(body.get("system_instruction").is_some());
+        Json(json!({"candidates":[{"content":{"role":"model","parts":[{"text":"google"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}}))
+    }));
+    let base_url = spawn_server(google).await;
+    let mut config = agent_config("google", false);
+    config.model = "gemini-2.0-flash".into();
+    let response = adapter_with(&[("google", Some("key"), &base_url)])
+        .generate(&config, &request())
+        .await
+        .expect("google response");
+    assert_eq!(response.content.text, "google");
+    assert_eq!(response.usage.total_tokens, 7);
+
+    let ollama = Router::new().route("/api/chat", post(|Json(body): Json<Value>| async move {
+        assert_eq!(body["stream"], false);
+        Json(json!({"message":{"role":"assistant","content":"ollama"},"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":7}))
+    }));
+    let base_url = spawn_server(ollama).await;
+    let response = adapter_with(&[("ollama", None, &base_url)])
+        .generate(&agent_config("ollama", false), &request())
+        .await
+        .expect("ollama works without key");
+    assert_eq!(response.content.text, "ollama");
+    assert_eq!(response.usage.total_tokens, 12);
+}
+
+#[tokio::test]
+async fn routes_anthropic_and_google_tool_calls() {
+    let anthropic = Router::new().route("/v1/messages", post(|Json(body): Json<Value>| async move {
+        assert_eq!(body["tools"][0]["name"], "delegate_task");
+        Json(json!({"content":[{"type":"tool_use","id":"toolu-1","name":"delegate_task","input":{"task":"research"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"output_tokens":3}}))
+    }));
+    let base_url = spawn_server(anthropic).await;
+    let response = adapter_with(&[("anthropic", Some("key"), &base_url)])
+        .generate(&agent_config("anthropic", true), &request())
+        .await
+        .expect("anthropic tool call");
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    assert_eq!(
+        response.tool_calls.expect("tool")[0].args.get("task"),
+        Some(&DataValue::String("research".into()))
+    );
+
+    let google = Router::new().route("/v1beta/models/gemini-2.0-flash:generateContent", post(|Json(body): Json<Value>| async move {
+        assert_eq!(body["tools"][0]["function_declarations"][0]["name"], "delegate_task");
+        Json(json!({"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"delegate_task","args":{"task":"research"}}}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}}))
+    }));
+    let base_url = spawn_server(google).await;
+    let mut config = agent_config("google", true);
+    config.model = "gemini-2.0-flash".into();
+    let response = adapter_with(&[("google", Some("key"), &base_url)])
+        .generate(&config, &request())
+        .await
+        .expect("google tool call");
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    assert_eq!(response.tool_calls.expect("tool")[0].name, "delegate_task");
+}
+
+#[tokio::test]
+async fn ollama_with_tools_uses_its_openai_compatible_endpoint() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer key")
+            );
+            assert_eq!(body["tools"][0]["function"]["name"], "delegate_task");
+            openai_response("ollama compatible")
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let response = adapter_with(&[("ollama", Some("key"), &format!("{base_url}/v1"))])
+        .generate(&agent_config("ollama", true), &request())
+        .await
+        .expect("ollama compatible response");
+    assert_eq!(response.content.text, "ollama compatible");
+}
+
+fn adapter_with(entries: &[(&str, Option<&str>, &str)]) -> ProviderModelAdapter {
+    let providers = entries
+        .iter()
+        .map(|(id, api_key, base_url)| {
+            (
+                (*id).into(),
+                ProviderCredential {
+                    api_key: api_key.map(str::to_owned),
+                    base_url: (*base_url).into(),
+                },
+            )
+        })
+        .collect();
+    ProviderModelAdapter::new(ProviderAdapterConfig { providers })
+}
+
+fn agent_config(provider: &str, tools: bool) -> AgentConfig {
+    AgentConfig {
+        name: "test".into(),
+        model: "gpt-4o-mini".into(),
+        bio: None,
+        lore: None,
+        knowledge: None,
+        topics: None,
+        adjectives: None,
+        style: None,
+        provider: Some(provider.into()),
+        system: None,
+        tools: tools.then(|| {
+            vec![ToolDescriptor {
+                name: "delegate_task".into(),
+                description: "Delegate work".into(),
+                parameters_schema: BTreeMap::from([(
+                    "type".into(),
+                    DataValue::String("object".into()),
+                )]),
+                examples: None,
+            }]
+        }),
+        plugins: None,
+        settings: None,
+    }
+}
+
+fn request() -> ModelGenerateRequest {
+    ModelGenerateRequest {
+        system: "System".into(),
+        messages: vec![Message {
+            id: "message".into(),
+            agent_id: "agent".into(),
+            room_id: "room".into(),
+            content: Content {
+                text: "Hello".into(),
+                attachments: None,
+                metadata: None,
+            },
+            role: MessageRole::User,
+            created_at_ms: 1,
+        }],
+        temperature: Some(0.2),
+        max_tokens: Some(512),
+    }
+}
+
+fn openai_response(content: &str) -> Json<Value> {
+    Json(
+        json!({"choices":[{"message":{"content":content},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}),
+    )
+}
+
+async fn spawn_server(app: Router) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://{address}")
+}

@@ -98,6 +98,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "anima-model-adapters"
+version = "0.1.0"
+dependencies = [
+ "anima-core",
+ "async-trait",
+ "axum",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "anima-swarm"
 version = "0.1.0"
 dependencies = [
