@@ -74,6 +74,7 @@ fn context(manifest: &CapabilityManifest, arguments: Value) -> CapabilityExecuti
         invocation.clone(),
         CapabilityAttempt::new(&invocation, 1),
     )
+    .unwrap()
 }
 
 #[derive(Clone)]
@@ -123,6 +124,34 @@ impl CapabilityExecutor for RecordingExecutor {
     }
 }
 
+struct SecretLeakingExecutor {
+    manifest: CapabilityManifest,
+    upstream_diagnostic: String,
+}
+
+#[async_trait]
+impl CapabilityExecutor for SecretLeakingExecutor {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    async fn execute(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<CapabilityResult, CapabilityError> {
+        assert!(!self.upstream_diagnostic.is_empty());
+        Err(CapabilityError::execution())
+    }
+
+    async fn reconcile(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<ReconcileOutcome, CapabilityError> {
+        assert!(!self.upstream_diagnostic.is_empty());
+        Err(CapabilityError::reconciliation())
+    }
+}
+
 #[tokio::test]
 async fn registry_uses_exact_executor_versions_without_latest_fallback() {
     let v1 = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
@@ -136,7 +165,7 @@ async fn registry_uses_exact_executor_versions_without_latest_fallback() {
         .execute(context(&v1, json!({ "query": "hello" })))
         .await
         .unwrap_err();
-    assert_eq!(error.code, CapabilityErrorCode::Unavailable);
+    assert_eq!(error.code(), CapabilityErrorCode::Unavailable);
     assert!(registry.executor("workspace.apply", 1).is_none());
     assert!(registry.executor("workspace.apply", 2).is_some());
 }
@@ -178,7 +207,7 @@ async fn registry_validates_input_before_entering_the_executor() {
         .execute(context(&manifest, json!({ "query": 3 })))
         .await
         .unwrap_err();
-    assert_eq!(error.code, CapabilityErrorCode::Validation);
+    assert_eq!(error.code(), CapabilityErrorCode::Validation);
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 }
 
@@ -194,7 +223,7 @@ async fn registry_validates_output_before_returning_a_persistable_result() {
         .execute(context(&manifest, json!({ "query": "hello" })))
         .await
         .unwrap_err();
-    assert_eq!(error.code, CapabilityErrorCode::OutputValidation);
+    assert_eq!(error.code(), CapabilityErrorCode::OutputValidation);
 }
 
 #[tokio::test]
@@ -206,9 +235,9 @@ async fn unavailable_exact_pinned_manifest_is_reported_safely() {
         .execute(context(&manifest, json!({ "query": "hello" })))
         .await
         .unwrap_err();
-    assert_eq!(error.code, CapabilityErrorCode::Unavailable);
-    assert!(!error.retryable);
-    assert!(!error.message.contains("token"));
+    assert_eq!(error.code(), CapabilityErrorCode::Unavailable);
+    assert!(!error.retryable());
+    assert!(!error.message().contains("token"));
 }
 
 #[test]
@@ -243,11 +272,11 @@ fn logical_invocations_are_stable_for_normalized_arguments_and_pinned_identity()
         json!({ "a": 1, "b": 2 }),
     );
 
-    assert_eq!(first.id, reordered.id);
-    assert_eq!(first.idempotency_key, reordered.idempotency_key);
-    assert_eq!(first.id.get_version_num(), 5);
-    assert_ne!(first.id, changed_arguments.id);
-    assert_ne!(first.id, changed_version.id);
+    assert_eq!(first.id(), reordered.id());
+    assert_eq!(first.idempotency_key(), reordered.idempotency_key());
+    assert_eq!(first.id().get_version_num(), 5);
+    assert_ne!(first.id(), changed_arguments.id());
+    assert_ne!(first.id(), changed_version.id());
 }
 
 #[test]
@@ -269,13 +298,13 @@ fn attempts_are_append_only_history_and_do_not_change_logical_identity_or_key() 
         json!({ "query": "hello" }),
     );
 
-    assert_ne!(first.id, retry.id);
-    assert_eq!(invocation.id, same_logical_retry.id);
+    assert_ne!(first.id(), retry.id());
+    assert_eq!(invocation.id(), same_logical_retry.id());
     assert_eq!(
-        invocation.idempotency_key,
-        same_logical_retry.idempotency_key
+        invocation.idempotency_key(),
+        same_logical_retry.idempotency_key()
     );
-    assert_eq!(first.logical_invocation_id, retry.logical_invocation_id);
+    assert_eq!(first.logical_invocation_id(), retry.logical_invocation_id());
 }
 
 #[tokio::test]
@@ -351,19 +380,46 @@ async fn reconcilers_return_all_portable_recovery_outcomes() {
 
 #[test]
 fn capability_errors_have_stable_safe_codes_without_upstream_diagnostics() {
-    for (code, retryable) in [
-        (CapabilityErrorCode::Validation, false),
-        (CapabilityErrorCode::Unavailable, false),
-        (CapabilityErrorCode::Timeout, true),
-        (CapabilityErrorCode::Cancelled, false),
-        (CapabilityErrorCode::Execution, true),
-        (CapabilityErrorCode::OutputValidation, false),
-        (CapabilityErrorCode::Reconciliation, true),
+    for (error, code, retryable) in [
+        (
+            CapabilityError::validation(),
+            CapabilityErrorCode::Validation,
+            false,
+        ),
+        (
+            CapabilityError::unavailable(),
+            CapabilityErrorCode::Unavailable,
+            false,
+        ),
+        (
+            CapabilityError::timeout(),
+            CapabilityErrorCode::Timeout,
+            true,
+        ),
+        (
+            CapabilityError::cancelled(),
+            CapabilityErrorCode::Cancelled,
+            false,
+        ),
+        (
+            CapabilityError::execution(),
+            CapabilityErrorCode::Execution,
+            true,
+        ),
+        (
+            CapabilityError::output_validation(),
+            CapabilityErrorCode::OutputValidation,
+            false,
+        ),
+        (
+            CapabilityError::reconciliation(),
+            CapabilityErrorCode::Reconciliation,
+            true,
+        ),
     ] {
-        let error = CapabilityError::new(code, "safe message", retryable);
         let serialized = serde_json::to_string(&error).unwrap();
-        assert_eq!(error.code, code);
-        assert_eq!(error.retryable, retryable);
+        assert_eq!(error.code(), code);
+        assert_eq!(error.retryable(), retryable);
         assert!(!serialized.contains("upstream-body"));
     }
 }
@@ -386,5 +442,88 @@ fn execution_context_is_serde_safe_and_never_contains_raw_credentials() {
         assert!(representation.contains("github-token"));
         assert!(!representation.contains("super-secret-access-token"));
         assert!(!representation.contains("credentials"));
+    }
+}
+
+#[tokio::test]
+async fn tampered_serialized_context_cannot_reuse_an_existing_logical_identity() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let mut registry = registry(vec![manifest.clone()]);
+    registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+    let original = context(&manifest, json!({ "query": "safe" }));
+    let mut serialized = serde_json::to_value(&original).unwrap();
+    serialized["invocation"]["normalized_arguments"] = json!({ "query": "tampered" });
+
+    assert!(serde_json::from_value::<CapabilityExecutionContext>(serialized).is_err());
+    let mut tampered_reference = serde_json::to_value(&original).unwrap();
+    tampered_reference["run_reference"] = json!("run:not-the-logical-run");
+    assert!(serde_json::from_value::<CapabilityExecutionContext>(tampered_reference).is_err());
+    assert!(registry.execute(original).await.is_ok());
+}
+
+#[test]
+fn logical_identity_seed_cannot_collide_when_fields_contain_old_delimiters() {
+    let run = Uuid::nil();
+    let first = LogicalInvocation::new(
+        run,
+        "step\u{1f}capability=other",
+        "workspace.apply",
+        1,
+        json!({ "query": "hello" }),
+    );
+    let second = LogicalInvocation::new(
+        run,
+        "step",
+        "other\u{1f}capability=workspace.apply",
+        1,
+        json!({ "query": "hello" }),
+    );
+
+    assert_ne!(first.id(), second.id());
+}
+
+#[tokio::test]
+async fn portable_errors_never_serialize_or_propagate_raw_upstream_secrets() {
+    const SECRET: &str = "super-secret-upstream-body";
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let mut registry = registry(vec![manifest.clone()]);
+    registry
+        .register_executor(Arc::new(SecretLeakingExecutor {
+            manifest: manifest.clone(),
+            upstream_diagnostic: SECRET.into(),
+        }))
+        .unwrap();
+    assert!(serde_json::from_value::<CapabilityError>(json!({
+        "code": "execution",
+        "message": SECRET,
+    }))
+    .is_err());
+
+    for error in [
+        CapabilityError::validation(),
+        CapabilityError::unavailable(),
+        CapabilityError::timeout(),
+        CapabilityError::cancelled(),
+        CapabilityError::execution(),
+        CapabilityError::output_validation(),
+        CapabilityError::reconciliation(),
+        registry
+            .execute(context(&manifest, json!({ "query": "hello" })))
+            .await
+            .unwrap_err(),
+        registry
+            .recover(context(&manifest, json!({ "query": "hello" })))
+            .await
+            .unwrap_err(),
+    ] {
+        for representation in [
+            serde_json::to_string(&error).unwrap(),
+            format!("{error:?}"),
+            error.to_string(),
+        ] {
+            assert!(!representation.contains(SECRET));
+        }
     }
 }

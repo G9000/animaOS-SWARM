@@ -14,11 +14,11 @@ pub use agent::{
     ToolDescriptor, ToolExample,
 };
 pub use capability::{
-    CapabilityAttempt, CapabilityError, CapabilityErrorCode, CapabilityExecutionContext,
-    CapabilityExecutor, CapabilityKind, CapabilityManifest, CapabilityProfile,
-    CapabilityProfileEntry, CapabilityRegistry, CapabilityRegistryError, CapabilityResult,
-    LogicalInvocation, ManifestCatalog, ManifestCatalogError, ReconcileOutcome, RecoveryAction,
-    RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
+    CapabilityAttempt, CapabilityContextError, CapabilityError, CapabilityErrorCode,
+    CapabilityExecutionContext, CapabilityExecutor, CapabilityKind, CapabilityManifest,
+    CapabilityProfile, CapabilityProfileEntry, CapabilityRegistry, CapabilityRegistryError,
+    CapabilityResult, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ReconcileOutcome,
+    RecoveryAction, RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
     CAPABILITY_INVOCATION_NAMESPACE,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
