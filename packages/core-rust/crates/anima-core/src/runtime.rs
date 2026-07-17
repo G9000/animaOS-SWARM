@@ -233,7 +233,15 @@ impl AgentRuntime {
     }
 
     pub async fn run(&mut self, input: Content) -> TaskResult<Content> {
-        self.run_with_tools(input, |_, _, tool_call| {
+        self.run_with_context(Vec::new(), input).await
+    }
+
+    pub async fn run_with_context(
+        &mut self,
+        history: Vec<Message>,
+        input: Content,
+    ) -> TaskResult<Content> {
+        self.run_with_context_and_tools(history, input, |_, _, tool_call| {
             let tool_name = tool_call.name.clone();
             async move { TaskResult::error(format!("Unknown tool: {tool_name}"), 0) }
         })
@@ -242,6 +250,20 @@ impl AgentRuntime {
 
     pub async fn run_with_tools<F, Fut>(
         &mut self,
+        input: Content,
+        execute_tool: F,
+    ) -> TaskResult<Content>
+    where
+        F: Fn(AgentState, Message, ToolCall) -> Fut,
+        Fut: Future<Output = TaskResult<Content>>,
+    {
+        self.run_with_context_and_tools(Vec::new(), input, execute_tool)
+            .await
+    }
+
+    pub async fn run_with_context_and_tools<F, Fut>(
+        &mut self,
+        history: Vec<Message>,
         input: Content,
         execute_tool: F,
     ) -> TaskResult<Content>
@@ -264,7 +286,8 @@ impl AgentRuntime {
                     .unwrap_or_else(|| TaskResult::error("provider context failed", duration_ms));
             }
         };
-        let mut conversation = vec![user_message.clone()];
+        let mut conversation = history;
+        conversation.push(user_message.clone());
         let mut iterations = 0;
         let mut evaluator_retries = 0;
         let max_tool_iterations = self

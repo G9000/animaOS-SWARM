@@ -20,7 +20,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 struct StaticModelAdapter;
+struct RecordingModelAdapter {
+    messages: Arc<Mutex<Vec<Message>>>,
+}
 struct ToolCallingModelAdapter;
+struct RecordingToolCallingModelAdapter {
+    messages: Arc<Mutex<Vec<Message>>>,
+}
 struct MultiToolCallingModelAdapter;
 struct ContextAwareModelAdapter;
 struct AsyncBoundaryModelAdapter;
@@ -86,6 +92,42 @@ impl ModelAdapter for StaticModelAdapter {
 }
 
 #[async_trait]
+impl ModelAdapter for RecordingModelAdapter {
+    fn provider(&self) -> &str {
+        "recording"
+    }
+
+    async fn generate(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        *self
+            .messages
+            .lock()
+            .expect("recording model mutex should not be poisoned") = request.messages.clone();
+
+        Ok(ModelGenerateResponse {
+            content: Content {
+                text: format!(
+                    "{} handled task: {}",
+                    config.name,
+                    request
+                        .messages
+                        .last()
+                        .map(|message| message.content.text.as_str())
+                        .unwrap_or_default()
+                ),
+                ..Content::default()
+            },
+            tool_calls: None,
+            usage: TokenUsage::default(),
+            stop_reason: ModelStopReason::End,
+        })
+    }
+}
+
+#[async_trait]
 impl ModelAdapter for ToolCallingModelAdapter {
     fn provider(&self) -> &str {
         "tool-calling"
@@ -96,6 +138,81 @@ impl ModelAdapter for ToolCallingModelAdapter {
         config: &AgentConfig,
         request: &ModelGenerateRequest,
     ) -> Result<ModelGenerateResponse, String> {
+        let tool_result = trailing_tool_messages(&request.messages)
+            .into_iter()
+            .map(render_tool_result_for_model)
+            .collect::<Vec<_>>();
+
+        if !tool_result.is_empty() {
+            return Ok(ModelGenerateResponse {
+                content: Content {
+                    text: format!(
+                        "{} used tool result: {}",
+                        config.name,
+                        tool_result.join("\n")
+                    ),
+                    attachments: None,
+                    metadata: None,
+                },
+                usage: TokenUsage {
+                    prompt_tokens: 2,
+                    completion_tokens: 3,
+                    total_tokens: 5,
+                },
+                stop_reason: ModelStopReason::End,
+                tool_calls: None,
+            });
+        }
+
+        let mut args = BTreeMap::new();
+        args.insert(
+            "query".into(),
+            crate::primitives::DataValue::String(
+                request
+                    .messages
+                    .last()
+                    .map(|message| message.content.text.clone())
+                    .unwrap_or_default(),
+            ),
+        );
+
+        Ok(ModelGenerateResponse {
+            content: Content {
+                text: "searching memories".into(),
+                attachments: None,
+                metadata: None,
+            },
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            stop_reason: ModelStopReason::ToolCall,
+            tool_calls: Some(vec![ToolCall {
+                id: "tool-1".into(),
+                name: "memory_search".into(),
+                args,
+            }]),
+        })
+    }
+}
+
+#[async_trait]
+impl ModelAdapter for RecordingToolCallingModelAdapter {
+    fn provider(&self) -> &str {
+        "recording-tool-calling"
+    }
+
+    async fn generate(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        *self
+            .messages
+            .lock()
+            .expect("recording tool model mutex should not be poisoned") = request.messages.clone();
+
         let tool_result = trailing_tool_messages(&request.messages)
             .into_iter()
             .map(render_tool_result_for_model)
@@ -689,6 +806,131 @@ fn tool_config() -> AgentConfig {
 
 fn runtime() -> AgentRuntime {
     AgentRuntime::new(config(), Arc::new(StaticModelAdapter))
+}
+
+fn host_message(id: &str, role: MessageRole, text: &str) -> Message {
+    Message {
+        id: id.into(),
+        agent_id: "host".into(),
+        room_id: "host-room".into(),
+        content: Content {
+            text: text.into(),
+            ..Content::default()
+        },
+        role,
+        created_at_ms: 42,
+    }
+}
+
+#[test]
+fn run_with_context_places_history_before_current_input() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = AgentRuntime::new(
+        config(),
+        Arc::new(RecordingModelAdapter {
+            messages: Arc::clone(&captured),
+        }),
+    );
+    let history = vec![
+        host_message("host-user", MessageRole::User, "My name is Leo"),
+        host_message("host-assistant", MessageRole::Assistant, "Nice to meet you"),
+    ];
+
+    let result = block_on(runtime.run_with_context(
+        history.clone(),
+        Content {
+            text: "What is my name?".into(),
+            ..Content::default()
+        },
+    ));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        captured
+            .lock()
+            .expect("recording model mutex should not be poisoned")
+            .as_slice(),
+        [
+            history[0].clone(),
+            history[1].clone(),
+            runtime.messages()[0].clone(),
+        ]
+    );
+    assert_eq!(runtime.messages().len(), 2);
+}
+
+#[test]
+fn run_remains_the_empty_context_compatibility_wrapper() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = AgentRuntime::new(
+        config(),
+        Arc::new(RecordingModelAdapter {
+            messages: Arc::clone(&captured),
+        }),
+    );
+
+    let result = block_on(runtime.run(Content {
+        text: "What is my name?".into(),
+        ..Content::default()
+    }));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        captured
+            .lock()
+            .expect("recording model mutex should not be poisoned")
+            .as_slice(),
+        [runtime.messages()[0].clone()]
+    );
+}
+
+#[test]
+fn run_with_context_and_tools_keeps_history_before_tool_loop_messages() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = AgentRuntime::new(
+        tool_config(),
+        Arc::new(RecordingToolCallingModelAdapter {
+            messages: Arc::clone(&captured),
+        }),
+    );
+    let history = vec![
+        host_message("host-user", MessageRole::User, "My name is Leo"),
+        host_message("host-assistant", MessageRole::Assistant, "Nice to meet you"),
+    ];
+
+    let result = block_on(runtime.run_with_context_and_tools(
+        history.clone(),
+        Content {
+            text: "What is my name?".into(),
+            ..Content::default()
+        },
+        |_, _, _| async move {
+            TaskResult::success(
+                Content {
+                    text: "Leo".into(),
+                    ..Content::default()
+                },
+                1,
+            )
+        },
+    ));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        captured
+            .lock()
+            .expect("recording tool model mutex should not be poisoned")
+            .as_slice(),
+        [
+            history[0].clone(),
+            history[1].clone(),
+            runtime.messages()[0].clone(),
+            runtime.messages()[1].clone(),
+            runtime.messages()[2].clone(),
+        ]
+    );
+    assert_eq!(runtime.messages()[1].role, MessageRole::Assistant);
+    assert_eq!(runtime.messages()[2].role, MessageRole::Tool);
 }
 
 #[test]
