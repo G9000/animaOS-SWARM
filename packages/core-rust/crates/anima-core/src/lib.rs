@@ -1,5 +1,7 @@
 pub mod agent;
+pub mod capability;
 pub mod components;
+pub mod definition;
 pub mod events;
 pub mod model;
 pub mod persistence;
@@ -11,7 +13,16 @@ pub use agent::{
     AgentConfig, AgentSettings, AgentState, AgentStatus, PluginDescriptor, TokenUsage,
     ToolDescriptor, ToolExample,
 };
+pub use capability::{
+    CapabilityKind, CapabilityManifest, CapabilityProfile, CapabilityProfileEntry, ManifestCatalog,
+    ManifestCatalogError, RecoveryMode, RiskLevel, RuntimeCompatibility,
+};
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
+pub use definition::{
+    AgentDefinition, AgentDefinitionDraft, CapabilityOverride, DefinitionPublisher,
+    DefinitionValidationError, HostRequirement, LifecyclePolicy, MemoryPolicy, ModelPolicy,
+    ProfileRef, ResolvedCapability, RuntimeLimits, SUPPORTED_DEFINITION_SCHEMA_VERSION,
+};
 pub use events::{EngineEvent, EventType};
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
