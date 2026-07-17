@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anima_core::{
     AgentConfig, Content, DataValue, Message, MessageRole, ModelGenerateRequest,
     ModelGenerateResponse, ModelStopReason, TokenUsage, ToolCall,
@@ -5,9 +7,11 @@ use anima_core::{
 use serde_json::{json, Map, Value};
 
 use super::common::{
-    data_value_to_json, json_value_to_data_map, required_data_string, tool_call_id,
-    tool_parameters_schema_json, value_to_u64,
+    data_value_to_json, json_value_to_data_map, json_value_to_data_value, required_data_string,
+    tool_call_id, tool_parameters_schema_json, value_to_u64,
 };
+
+const GOOGLE_RESPONSE_PARTS: &str = "googleResponseParts";
 
 pub(super) fn build_google_body(
     config: &AgentConfig,
@@ -52,11 +56,17 @@ fn build_google_contents(request: &ModelGenerateRequest) -> Result<Vec<Value>, S
                 "parts": [{ "text": message.content.text }],
             })),
             MessageRole::Assistant => {
-                let mut parts: Vec<Value> = Vec::new();
-                if !message.content.text.is_empty() {
-                    parts.push(json!({ "text": message.content.text }));
-                }
-                parts.extend(google_function_call_parts(message)?);
+                let parts = match preserved_google_response_parts(message)? {
+                    Some(parts) => parts,
+                    None => {
+                        let mut parts: Vec<Value> = Vec::new();
+                        if !message.content.text.is_empty() {
+                            parts.push(json!({ "text": message.content.text }));
+                        }
+                        parts.extend(google_function_call_parts(message)?);
+                        parts
+                    }
+                };
                 contents.push(json!({
                     "role": "model",
                     "parts": parts,
@@ -69,6 +79,19 @@ fn build_google_contents(request: &ModelGenerateRequest) -> Result<Vec<Value>, S
     }
 
     Ok(contents)
+}
+
+fn preserved_google_response_parts(message: &Message) -> Result<Option<Vec<Value>>, String> {
+    let Some(metadata) = message.content.metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(parts) = metadata.get(GOOGLE_RESPONSE_PARTS) else {
+        return Ok(None);
+    };
+    let DataValue::Array(parts) = parts else {
+        return Err("googleResponseParts metadata must be an array".to_string());
+    };
+    Ok(Some(parts.iter().map(data_value_to_json).collect()))
 }
 
 fn google_function_call_parts(message: &Message) -> Result<Vec<Value>, String> {
@@ -132,7 +155,7 @@ fn google_tool_response(message: &Message, prior_messages: &[Message]) -> Result
         .unwrap_or_else(|_| json!({ "result": message.content.text }));
 
     Ok(json!({
-        "role": "function",
+        "role": "user",
         "parts": [{
             "functionResponse": {
                 "name": name,
@@ -172,6 +195,7 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
         .get("content")
         .and_then(|content| content.get("parts"))
         .and_then(Value::as_array);
+    let raw_parts = parts.cloned().unwrap_or_default();
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -227,7 +251,15 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
         content: Content {
             text: text_parts.join(""),
             attachments: None,
-            metadata: None,
+            metadata: Some(BTreeMap::from([(
+                GOOGLE_RESPONSE_PARTS.into(),
+                DataValue::Array(
+                    raw_parts
+                        .iter()
+                        .map(json_value_to_data_value)
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            )])),
         },
         tool_calls: if tool_calls.is_empty() {
             None

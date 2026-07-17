@@ -109,7 +109,7 @@ pub(super) fn json_value_to_data_map(value: &Value) -> Result<BTreeMap<String, D
     }
 }
 
-fn json_value_to_data_value(value: &Value) -> Result<DataValue, String> {
+pub(super) fn json_value_to_data_value(value: &Value) -> Result<DataValue, String> {
     Ok(match value {
         Value::Null => DataValue::Null,
         Value::Bool(value) => DataValue::Bool(*value),

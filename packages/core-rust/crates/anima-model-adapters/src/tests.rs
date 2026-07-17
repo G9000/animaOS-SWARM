@@ -106,7 +106,15 @@ async fn aliases_resolve_to_their_canonical_provider_configuration() {
 async fn injected_reqwest_client_is_used_by_the_adapter() {
     let app = Router::new().route(
         "/v1/chat/completions",
-        post(|Json(_body): Json<Value>| async move { openai_response("injected client") }),
+        post(|headers: HeaderMap, Json(_body): Json<Value>| async move {
+            assert_eq!(
+                headers
+                    .get("x-anima-client")
+                    .and_then(|value| value.to_str().ok()),
+                Some("injected")
+            );
+            openai_response("injected client")
+        }),
     );
     let base_url = spawn_server(app).await;
     let config = ProviderAdapterConfig {
@@ -118,7 +126,16 @@ async fn injected_reqwest_client_is_used_by_the_adapter() {
             },
         )]),
     };
-    let adapter = ProviderModelAdapter::with_client(config, reqwest::Client::new());
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-anima-client",
+        reqwest::header::HeaderValue::from_static("injected"),
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .build()
+        .expect("custom client");
+    let adapter = ProviderModelAdapter::with_client(config, client);
 
     let response = adapter
         .generate(&agent_config("openai", false), &request())
@@ -399,6 +416,7 @@ fn google_native_tool_round_trip_preserves_call_ids_and_correlates_parallel_call
         contents[2]["parts"][0]["functionResponse"]["name"],
         "delegate_task"
     );
+    assert_eq!(contents[2]["role"], "user");
     assert_eq!(
         contents[2]["parts"][0]["functionResponse"]["id"],
         "google-call-a"
@@ -410,6 +428,151 @@ fn google_native_tool_round_trip_preserves_call_ids_and_correlates_parallel_call
     assert_eq!(
         contents[3]["parts"][0]["functionResponse"]["id"],
         "google-call-b"
+    );
+}
+
+#[test]
+fn google_response_parts_with_thought_signatures_are_preserved_for_replay() {
+    let signed_part = json!({
+        "functionCall": {
+            "id": "google-signed-call",
+            "name": "delegate_task",
+            "args": {"task": "research"}
+        },
+        "thoughtSignature": "opaque-provider-signature",
+        "futureProviderField": {"kept": true}
+    });
+    let response = crate::google::parse_google_response(&json!({
+        "candidates": [{"content": {"parts": [signed_part.clone()]}}]
+    }))
+    .expect("signed provider response should parse");
+    let parts = response
+        .content
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("googleResponseParts"))
+        .expect("raw Google parts should be retained in metadata");
+    assert_eq!(
+        crate::common::data_value_to_json(parts),
+        json!([signed_part])
+    );
+
+    let tool_call = response.tool_calls.expect("tool call").remove(0);
+    let mut metadata = response.content.metadata.expect("raw metadata");
+    metadata.insert(
+        "toolCalls".into(),
+        DataValue::Array(vec![DataValue::Object(BTreeMap::from([
+            ("id".into(), DataValue::String(tool_call.id.clone())),
+            ("name".into(), DataValue::String(tool_call.name.clone())),
+            ("args".into(), DataValue::Object(tool_call.args.clone())),
+        ]))]),
+    );
+    let mut follow_up = request();
+    follow_up.messages.push(Message {
+        id: "assistant-signed".into(),
+        agent_id: "agent".into(),
+        room_id: "room".into(),
+        content: Content {
+            text: String::new(),
+            attachments: None,
+            metadata: Some(metadata),
+        },
+        role: MessageRole::Assistant,
+        created_at_ms: 2,
+    });
+    let body = crate::google::build_google_body(&agent_config("google", true), &follow_up)
+        .expect("signed history should rebuild");
+    assert_eq!(
+        body["contents"][1]["parts"][0]["thoughtSignature"],
+        "opaque-provider-signature"
+    );
+    assert_eq!(
+        body["contents"][1]["parts"][0]["futureProviderField"],
+        json!({"kept": true})
+    );
+}
+
+#[tokio::test]
+async fn google_second_request_replays_signed_calls_then_user_function_results() {
+    let signed_part = json!({
+        "functionCall": {"id": "call-signed", "name": "delegate_task", "args": {"task": "research"}},
+        "thoughtSignature": "signature-from-google"
+    });
+    let signed_part_for_server = signed_part.clone();
+    let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let app = Router::new().route(
+        "/v1beta/models/gpt-4o-mini:generateContent",
+        post({
+            let seen = Arc::clone(&seen);
+            move |Json(body): Json<Value>| {
+                let seen = Arc::clone(&seen);
+                let signed_part = signed_part_for_server.clone();
+                async move {
+                    let request_number = {
+                        let mut requests = seen.lock().expect("seen requests");
+                        requests.push(body);
+                        requests.len()
+                    };
+                    if request_number == 1 {
+                        Json(json!({"candidates":[{"content":{"parts":[signed_part]}}]}))
+                    } else {
+                        Json(json!({"candidates":[{"content":{"parts":[{"text":"done"}]}}]}))
+                    }
+                }
+            }
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let config = agent_config("google", true);
+    let first = adapter
+        .generate(&config, &request())
+        .await
+        .expect("first signed call should parse");
+    let call = first.tool_calls.clone().expect("tool call").remove(0);
+    let mut metadata = first.content.metadata.clone().expect("raw Google metadata");
+    metadata.insert(
+        "toolCalls".into(),
+        DataValue::Array(vec![DataValue::Object(BTreeMap::from([
+            ("id".into(), DataValue::String(call.id.clone())),
+            ("name".into(), DataValue::String(call.name.clone())),
+            ("args".into(), DataValue::Object(call.args.clone())),
+        ]))]),
+    );
+    let mut second = request();
+    second.messages.extend([
+        Message {
+            id: "assistant-signed".into(),
+            agent_id: "agent".into(),
+            room_id: "room".into(),
+            content: Content {
+                text: first.content.text,
+                attachments: None,
+                metadata: Some(metadata),
+            },
+            role: MessageRole::Assistant,
+            created_at_ms: 2,
+        },
+        tool_message("call-signed", "completed"),
+    ]);
+    adapter
+        .generate(&config, &second)
+        .await
+        .expect("second request should succeed");
+
+    let requests = seen.lock().expect("seen requests");
+    assert_eq!(requests.len(), 2);
+    let contents = requests[1]["contents"].as_array().expect("second contents");
+    assert_eq!(contents[1]["role"], "model");
+    assert_eq!(contents[1]["parts"], json!([signed_part]));
+    assert_eq!(contents[2]["role"], "user");
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["name"],
+        "delegate_task"
+    );
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["id"],
+        "call-signed"
     );
 }
 
