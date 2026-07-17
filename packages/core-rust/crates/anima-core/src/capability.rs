@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 /// The broad role a capability plays for an agent.
@@ -118,6 +118,46 @@ impl std::error::Error for ManifestCatalogError {}
 pub struct ManifestCatalog {
     manifests: BTreeMap<(String, u32), CapabilityManifest>,
     profiles: BTreeMap<(String, u32), CapabilityProfile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ManifestCatalogSnapshot {
+    manifests: Vec<CapabilityManifest>,
+    profiles: Vec<CapabilityProfile>,
+}
+
+impl Serialize for ManifestCatalog {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ManifestCatalogSnapshot {
+            manifests: self.manifests.values().cloned().collect(),
+            profiles: self.profiles.values().cloned().collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManifestCatalog {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let snapshot = ManifestCatalogSnapshot::deserialize(deserializer)?;
+        let mut catalog = Self::default();
+        for manifest in snapshot.manifests {
+            catalog
+                .register_manifest(manifest)
+                .map_err(serde::de::Error::custom)?;
+        }
+        for profile in snapshot.profiles {
+            catalog
+                .register_profile(profile)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(catalog)
+    }
 }
 
 impl ManifestCatalog {

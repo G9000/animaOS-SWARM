@@ -120,7 +120,7 @@ pub struct AgentDefinition {
 }
 
 /// Errors produced while resolving and publishing agent definitions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DefinitionValidationError {
     UnsupportedSchemaVersion {
         schema_version: u32,
@@ -183,6 +183,11 @@ impl fmt::Display for DefinitionValidationError {
 impl std::error::Error for DefinitionValidationError {}
 
 /// Resolves drafts through a portable catalog and retains owned published snapshots.
+///
+/// This process-local service deliberately does not implement `Serialize`: its publication history
+/// and available host requirements are live process state. Portable data contracts are instead
+/// `AgentDefinitionDraft`, `AgentDefinition`, and `DefinitionValidationError`; the catalog stays an
+/// explicit argument to [`Self::publish`] so no live catalog reference is captured or persisted.
 #[derive(Clone, Debug, Default)]
 pub struct DefinitionPublisher {
     available_host_requirements: BTreeSet<HostRequirement>,

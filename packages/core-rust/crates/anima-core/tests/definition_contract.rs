@@ -172,6 +172,63 @@ fn publisher_applies_profile_capability_overrides_and_pins_the_effective_manifes
 }
 
 #[test]
+fn drafts_and_published_definitions_round_trip_through_serde_with_pins_intact() {
+    let mut catalog = catalog();
+    catalog
+        .register_manifest(manifest("knowledge.search", 2, CapabilityKind::Knowledge))
+        .unwrap();
+    let mut draft = draft(1);
+    draft.capability_overrides = vec![CapabilityOverride {
+        capability_id: "knowledge.search".into(),
+        manifest_version: 2,
+        configuration: json!({ "result_limit": 5 }),
+    }];
+
+    let restored_draft =
+        serde_json::from_str::<AgentDefinitionDraft>(&serde_json::to_string(&draft).unwrap())
+            .unwrap();
+    assert_eq!(restored_draft, draft);
+    let definition = publisher().publish(&catalog, restored_draft).unwrap();
+    let restored_definition = serde_json::from_str::<anima_core::AgentDefinition>(
+        &serde_json::to_string(&definition).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(restored_definition, definition);
+    assert_eq!(restored_definition.source_profile.profile_version, 1);
+    assert_eq!(
+        restored_definition.resolved_capabilities[0].schema_digest,
+        "sha256:knowledge.search:2"
+    );
+    assert_eq!(
+        restored_definition.resolved_capabilities[0]
+            .override_config
+            .as_ref()
+            .unwrap()
+            .manifest_version,
+        2
+    );
+    assert_eq!(
+        restored_definition.resolved_capabilities[0].approval_policy_revision,
+        3
+    );
+}
+
+#[test]
+fn definition_validation_errors_round_trip_through_serde() {
+    let error = DefinitionValidationError::MissingHostRequirement {
+        id: "workspace-host".into(),
+        revision: 1,
+    };
+
+    assert_eq!(
+        serde_json::from_str::<DefinitionValidationError>(&serde_json::to_string(&error).unwrap())
+            .unwrap(),
+        error
+    );
+}
+
+#[test]
 fn publisher_rejects_unknown_definition_schema_versions() {
     let catalog = catalog();
     let mut invalid = draft(1);
@@ -243,11 +300,19 @@ fn published_definitions_do_not_drift_when_later_profiles_are_registered() {
             }],
         })
         .unwrap();
+    catalog
+        .register_manifest(manifest("knowledge.search", 2, CapabilityKind::Knowledge))
+        .unwrap();
 
     let stored = publisher.definition("research-agent", 1).unwrap();
     assert_eq!(stored, &published);
     assert_eq!(stored.source_profile.profile_version, 1);
     assert_eq!(stored.resolved_capabilities.len(), 2);
+    assert_eq!(stored.resolved_capabilities[0].manifest_version, 1);
+    assert_eq!(
+        stored.resolved_capabilities[0].schema_digest,
+        "sha256:knowledge.search:1"
+    );
 }
 
 #[test]

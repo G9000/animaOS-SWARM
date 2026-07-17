@@ -62,6 +62,77 @@ fn manifests_and_profiles_round_trip_through_the_public_serde_contract() {
 }
 
 #[test]
+fn catalog_round_trips_through_a_stable_json_snapshot() {
+    let mut catalog = ManifestCatalog::default();
+    catalog
+        .register_manifest(manifest("workspace.write", 1))
+        .unwrap();
+    catalog
+        .register_manifest(manifest("knowledge.search", 1))
+        .unwrap();
+    catalog
+        .register_profile(CapabilityProfile {
+            id: "research".into(),
+            version: 1,
+            label: "Research".into(),
+            description: "Knowledge and workspace capabilities.".into(),
+            entries: vec![
+                CapabilityProfileEntry {
+                    capability_id: "workspace.write".into(),
+                    manifest_version: 1,
+                },
+                CapabilityProfileEntry {
+                    capability_id: "knowledge.search".into(),
+                    manifest_version: 1,
+                },
+            ],
+        })
+        .unwrap();
+
+    let json = serde_json::to_string(&catalog).unwrap();
+    let restored = serde_json::from_str::<ManifestCatalog>(&json).unwrap();
+
+    assert_eq!(serde_json::to_string(&restored).unwrap(), json);
+    assert_eq!(
+        restored
+            .profile("research", 1)
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.capability_id.as_str())
+            .collect::<Vec<_>>(),
+        ["knowledge.search", "workspace.write"]
+    );
+}
+
+#[test]
+fn catalog_deserialization_revalidates_duplicates_and_profile_manifest_references() {
+    let missing_manifest_snapshot = json!({
+        "manifests": [],
+        "profiles": [{
+            "id": "research",
+            "version": 1,
+            "label": "Research",
+            "description": "Knowledge lookup capabilities.",
+            "entries": [{
+                "capability_id": "knowledge.search",
+                "manifest_version": 1
+            }]
+        }]
+    });
+    let duplicate_manifest_snapshot = json!({
+        "manifests": [
+            manifest("knowledge.search", 1),
+            manifest("knowledge.search", 1)
+        ],
+        "profiles": []
+    });
+
+    assert!(serde_json::from_value::<ManifestCatalog>(missing_manifest_snapshot).is_err());
+    assert!(serde_json::from_value::<ManifestCatalog>(duplicate_manifest_snapshot).is_err());
+}
+
+#[test]
 fn catalog_rejects_duplicate_manifest_versions() {
     let mut catalog = ManifestCatalog::default();
     catalog
