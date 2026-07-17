@@ -133,6 +133,94 @@ fn catalog_deserialization_revalidates_duplicates_and_profile_manifest_reference
 }
 
 #[test]
+fn catalog_rejects_invalid_manifests_transactionally() {
+    let mut catalog = ManifestCatalog::default();
+    catalog
+        .register_manifest(manifest("knowledge.search", 1))
+        .unwrap();
+    let snapshot = serde_json::to_string(&catalog).unwrap();
+
+    let mut blank_id = manifest("knowledge.write", 1);
+    blank_id.id = " ".into();
+    assert!(matches!(
+        catalog.register_manifest(blank_id),
+        Err(ManifestCatalogError::InvalidManifestId)
+    ));
+
+    let mut zero_version = manifest("knowledge.write", 1);
+    zero_version.version = 0;
+    assert!(matches!(
+        catalog.register_manifest(zero_version),
+        Err(ManifestCatalogError::InvalidManifestVersion)
+    ));
+
+    let mut invalid_compatibility = manifest("knowledge.write", 1);
+    invalid_compatibility
+        .compatibility
+        .minimum_runtime_schema_version = 2;
+    invalid_compatibility
+        .compatibility
+        .maximum_runtime_schema_version = 1;
+    assert!(matches!(
+        catalog.register_manifest(invalid_compatibility),
+        Err(ManifestCatalogError::InvalidRuntimeCompatibility)
+    ));
+    assert_eq!(serde_json::to_string(&catalog).unwrap(), snapshot);
+}
+
+#[test]
+fn catalog_deserialization_rejects_malformed_manifests() {
+    let mut malformed = serde_json::to_value(manifest("knowledge.search", 1)).unwrap();
+    malformed["schema_digest"] = json!("");
+    malformed["compatibility"]["manifest_schema_version"] = json!(0);
+
+    assert!(serde_json::from_value::<ManifestCatalog>(json!({
+        "manifests": [malformed],
+        "profiles": []
+    }))
+    .is_err());
+}
+
+#[test]
+fn profiles_reject_duplicate_capability_ids_transactionally_and_on_deserialization() {
+    let mut catalog = ManifestCatalog::default();
+    catalog
+        .register_manifest(manifest("knowledge.search", 1))
+        .unwrap();
+    catalog
+        .register_manifest(manifest("knowledge.search", 2))
+        .unwrap();
+    let duplicate_profile = CapabilityProfile {
+        id: "research".into(),
+        version: 1,
+        label: "Research".into(),
+        description: "Duplicate capability IDs.".into(),
+        entries: vec![
+            CapabilityProfileEntry {
+                capability_id: "knowledge.search".into(),
+                manifest_version: 1,
+            },
+            CapabilityProfileEntry {
+                capability_id: "knowledge.search".into(),
+                manifest_version: 2,
+            },
+        ],
+    };
+    let snapshot = serde_json::to_string(&catalog).unwrap();
+
+    assert!(matches!(
+        catalog.register_profile(duplicate_profile.clone()),
+        Err(ManifestCatalogError::DuplicateProfileCapabilityId { .. })
+    ));
+    assert_eq!(serde_json::to_string(&catalog).unwrap(), snapshot);
+    assert!(serde_json::from_value::<ManifestCatalog>(json!({
+        "manifests": [manifest("knowledge.search", 1), manifest("knowledge.search", 2)],
+        "profiles": [duplicate_profile]
+    }))
+    .is_err());
+}
+
+#[test]
 fn catalog_rejects_duplicate_manifest_versions() {
     let mut catalog = ManifestCatalog::default();
     catalog

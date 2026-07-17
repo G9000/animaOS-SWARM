@@ -93,6 +93,12 @@ pub enum ManifestCatalogError {
     DuplicateManifest { id: String, version: u32 },
     DuplicateProfile { id: String, version: u32 },
     UnknownManifest { id: String, version: u32 },
+    InvalidManifestId,
+    InvalidManifestVersion,
+    InvalidManifestSchemaVersion,
+    InvalidSchemaDigest,
+    InvalidRuntimeCompatibility,
+    DuplicateProfileCapabilityId { id: String },
 }
 
 impl fmt::Display for ManifestCatalogError {
@@ -106,6 +112,20 @@ impl fmt::Display for ManifestCatalogError {
             }
             Self::UnknownManifest { id, version } => {
                 write!(formatter, "manifest {id}@{version} is not registered")
+            }
+            Self::InvalidManifestId => write!(formatter, "manifest ID must not be blank"),
+            Self::InvalidManifestVersion => write!(formatter, "manifest version must be nonzero"),
+            Self::InvalidManifestSchemaVersion => {
+                write!(formatter, "manifest schema version must be nonzero")
+            }
+            Self::InvalidSchemaDigest => {
+                write!(formatter, "manifest schema digest must not be blank")
+            }
+            Self::InvalidRuntimeCompatibility => {
+                write!(formatter, "runtime compatibility bounds are invalid")
+            }
+            Self::DuplicateProfileCapabilityId { id } => {
+                write!(formatter, "profile includes capability {id} more than once")
             }
         }
     }
@@ -165,6 +185,7 @@ impl ManifestCatalog {
         &mut self,
         manifest: CapabilityManifest,
     ) -> Result<(), ManifestCatalogError> {
+        validate_manifest(&manifest)?;
         let key = (manifest.id.clone(), manifest.version);
         if self.manifests.contains_key(&key) {
             return Err(ManifestCatalogError::DuplicateManifest {
@@ -181,6 +202,14 @@ impl ManifestCatalog {
         &mut self,
         mut profile: CapabilityProfile,
     ) -> Result<(), ManifestCatalogError> {
+        let mut capability_ids = std::collections::BTreeSet::new();
+        for entry in &profile.entries {
+            if !capability_ids.insert(entry.capability_id.clone()) {
+                return Err(ManifestCatalogError::DuplicateProfileCapabilityId {
+                    id: entry.capability_id.clone(),
+                });
+            }
+        }
         let key = (profile.id.clone(), profile.version);
         if self.profiles.contains_key(&key) {
             return Err(ManifestCatalogError::DuplicateProfile {
@@ -217,4 +246,27 @@ impl ManifestCatalog {
     pub fn profile(&self, id: &str, version: u32) -> Option<&CapabilityProfile> {
         self.profiles.get(&(id.to_owned(), version))
     }
+}
+
+fn validate_manifest(manifest: &CapabilityManifest) -> Result<(), ManifestCatalogError> {
+    if manifest.id.trim().is_empty() {
+        return Err(ManifestCatalogError::InvalidManifestId);
+    }
+    if manifest.version == 0 {
+        return Err(ManifestCatalogError::InvalidManifestVersion);
+    }
+    if manifest.compatibility.manifest_schema_version == 0 {
+        return Err(ManifestCatalogError::InvalidManifestSchemaVersion);
+    }
+    if manifest.schema_digest.trim().is_empty() {
+        return Err(ManifestCatalogError::InvalidSchemaDigest);
+    }
+    if manifest.compatibility.minimum_runtime_schema_version == 0
+        || manifest.compatibility.maximum_runtime_schema_version == 0
+        || manifest.compatibility.minimum_runtime_schema_version
+            > manifest.compatibility.maximum_runtime_schema_version
+    {
+        return Err(ManifestCatalogError::InvalidRuntimeCompatibility);
+    }
+    Ok(())
 }

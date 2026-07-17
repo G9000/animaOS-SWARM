@@ -16,6 +16,9 @@ pub struct ProfileRef {
 }
 
 /// A definition-local configuration override for a single exact manifest version.
+///
+/// Overrides that do not name a capability in the source profile intentionally add that capability
+/// to the resolved definition, provided the exact manifest version exists in the catalog.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityOverride {
     pub capability_id: String,
@@ -39,6 +42,7 @@ pub struct ModelPolicy {
     pub provider: String,
     pub model: String,
     pub credential_reference: Option<String>,
+    #[serde(with = "finite_option_f64")]
     pub temperature: Option<f64>,
 }
 
@@ -97,7 +101,7 @@ pub struct AgentDefinitionDraft {
 }
 
 /// An immutable, self-contained definition suitable for durable storage and host consumption.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AgentDefinition {
     pub schema_version: u32,
     pub id: String,
@@ -117,6 +121,28 @@ pub struct AgentDefinition {
     pub limits: RuntimeLimits,
     pub lifecycle: LifecyclePolicy,
     pub host_requirements: Vec<HostRequirement>,
+}
+
+#[derive(Deserialize)]
+struct AgentDefinitionWire {
+    schema_version: u32,
+    id: String,
+    version: u32,
+    name: String,
+    display_name: String,
+    description: String,
+    persona: String,
+    system: String,
+    model: ModelPolicy,
+    source_profile: ProfileRef,
+    resolved_capabilities: Vec<ResolvedCapability>,
+    memory: MemoryPolicy,
+    approval_policy_id: String,
+    approval_policy_revision: u32,
+    approval_restrictions: Vec<String>,
+    limits: RuntimeLimits,
+    lifecycle: LifecyclePolicy,
+    host_requirements: Vec<HostRequirement>,
 }
 
 /// Errors produced while resolving and publishing agent definitions.
@@ -144,6 +170,31 @@ pub enum DefinitionValidationError {
         id: String,
         previous_version: u32,
         attempted_version: u32,
+    },
+    InvalidTemperature,
+    InvalidDefinitionId,
+    InvalidDefinitionVersion,
+    InvalidProfileReference,
+    InvalidResolvedCapability {
+        id: String,
+    },
+    InvalidSchemaDigest {
+        id: String,
+    },
+    InconsistentOverride {
+        id: String,
+    },
+    InconsistentPolicyRevision {
+        id: String,
+    },
+    InvalidApprovalPolicy,
+    InvalidHostRequirement {
+        id: String,
+        revision: u32,
+    },
+    DuplicateHostRequirement {
+        id: String,
+        revision: u32,
     },
 }
 
@@ -176,11 +227,89 @@ impl fmt::Display for DefinitionValidationError {
                 formatter,
                 "definition {id} version {attempted_version} must exceed {previous_version}"
             ),
+            Self::InvalidTemperature => write!(formatter, "model temperature must be finite"),
+            Self::InvalidDefinitionId => write!(formatter, "definition ID must not be blank"),
+            Self::InvalidDefinitionVersion => {
+                write!(formatter, "definition version must be nonzero")
+            }
+            Self::InvalidProfileReference => {
+                write!(formatter, "profile ID and version must be present")
+            }
+            Self::InvalidResolvedCapability { id } => {
+                write!(formatter, "resolved capability {id:?} has invalid pins")
+            }
+            Self::InvalidSchemaDigest { id } => {
+                write!(
+                    formatter,
+                    "resolved capability {id:?} has a blank schema digest"
+                )
+            }
+            Self::InconsistentOverride { id } => {
+                write!(
+                    formatter,
+                    "override does not match resolved capability {id}"
+                )
+            }
+            Self::InconsistentPolicyRevision { id } => {
+                write!(
+                    formatter,
+                    "resolved capability {id} has an inconsistent policy revision"
+                )
+            }
+            Self::InvalidApprovalPolicy => {
+                write!(formatter, "approval policy ID and revision must be present")
+            }
+            Self::InvalidHostRequirement { id, revision } => {
+                write!(formatter, "host requirement {id}@{revision} is invalid")
+            }
+            Self::DuplicateHostRequirement { id, revision } => {
+                write!(formatter, "host requirement {id}@{revision} is duplicated")
+            }
         }
     }
 }
 
 impl std::error::Error for DefinitionValidationError {}
+
+impl AgentDefinition {
+    /// Validates the portable pins and policies stored in this already-resolved definition.
+    pub fn validate(&self) -> Result<(), DefinitionValidationError> {
+        validate_definition(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = AgentDefinitionWire::deserialize(deserializer)?;
+        let mut definition = Self {
+            schema_version: wire.schema_version,
+            id: wire.id,
+            version: wire.version,
+            name: wire.name,
+            display_name: wire.display_name,
+            description: wire.description,
+            persona: wire.persona,
+            system: wire.system,
+            model: wire.model,
+            source_profile: wire.source_profile,
+            resolved_capabilities: wire.resolved_capabilities,
+            memory: wire.memory,
+            approval_policy_id: wire.approval_policy_id,
+            approval_policy_revision: wire.approval_policy_revision,
+            approval_restrictions: wire.approval_restrictions,
+            limits: wire.limits,
+            lifecycle: wire.lifecycle,
+            host_requirements: wire.host_requirements,
+        };
+        canonicalize_host_requirements(&mut definition.host_requirements)
+            .map_err(serde::de::Error::custom)?;
+        definition.validate().map_err(serde::de::Error::custom)?;
+        Ok(definition)
+    }
+}
 
 /// Resolves drafts through a portable catalog and retains owned published snapshots.
 ///
@@ -206,8 +335,10 @@ impl DefinitionPublisher {
     pub fn publish(
         &mut self,
         catalog: &ManifestCatalog,
-        draft: AgentDefinitionDraft,
+        mut draft: AgentDefinitionDraft,
     ) -> Result<AgentDefinition, DefinitionValidationError> {
+        validate_draft(&draft)?;
+        canonicalize_host_requirements(&mut draft.host_requirements)?;
         if draft.schema_version != SUPPORTED_DEFINITION_SCHEMA_VERSION {
             return Err(DefinitionValidationError::UnsupportedSchemaVersion {
                 schema_version: draft.schema_version,
@@ -316,6 +447,7 @@ impl DefinitionPublisher {
             lifecycle: draft.lifecycle,
             host_requirements: draft.host_requirements,
         };
+        definition.validate()?;
         self.latest_versions
             .insert(definition.id.clone(), definition.version);
         self.definitions.insert(
@@ -327,5 +459,149 @@ impl DefinitionPublisher {
 
     pub fn definition(&self, id: &str, version: u32) -> Option<&AgentDefinition> {
         self.definitions.get(&(id.to_owned(), version))
+    }
+}
+
+fn validate_draft(draft: &AgentDefinitionDraft) -> Result<(), DefinitionValidationError> {
+    if draft
+        .model
+        .temperature
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err(DefinitionValidationError::InvalidTemperature);
+    }
+    if draft.id.trim().is_empty() {
+        return Err(DefinitionValidationError::InvalidDefinitionId);
+    }
+    if draft.version == 0 {
+        return Err(DefinitionValidationError::InvalidDefinitionVersion);
+    }
+    if draft.source_profile.profile_id.trim().is_empty()
+        || draft.source_profile.profile_version == 0
+    {
+        return Err(DefinitionValidationError::InvalidProfileReference);
+    }
+    if draft.approval_policy_id.trim().is_empty() || draft.approval_policy_revision == 0 {
+        return Err(DefinitionValidationError::InvalidApprovalPolicy);
+    }
+    Ok(())
+}
+
+fn validate_definition(definition: &AgentDefinition) -> Result<(), DefinitionValidationError> {
+    if definition.schema_version != SUPPORTED_DEFINITION_SCHEMA_VERSION {
+        return Err(DefinitionValidationError::UnsupportedSchemaVersion {
+            schema_version: definition.schema_version,
+        });
+    }
+    if definition
+        .model
+        .temperature
+        .is_some_and(|value| !value.is_finite())
+    {
+        return Err(DefinitionValidationError::InvalidTemperature);
+    }
+    if definition.id.trim().is_empty() {
+        return Err(DefinitionValidationError::InvalidDefinitionId);
+    }
+    if definition.version == 0 {
+        return Err(DefinitionValidationError::InvalidDefinitionVersion);
+    }
+    if definition.source_profile.profile_id.trim().is_empty()
+        || definition.source_profile.profile_version == 0
+    {
+        return Err(DefinitionValidationError::InvalidProfileReference);
+    }
+    if definition.approval_policy_id.trim().is_empty() || definition.approval_policy_revision == 0 {
+        return Err(DefinitionValidationError::InvalidApprovalPolicy);
+    }
+    let mut capability_ids = BTreeSet::new();
+    for capability in &definition.resolved_capabilities {
+        if capability.capability_id.trim().is_empty()
+            || capability.manifest_version == 0
+            || !capability_ids.insert(capability.capability_id.clone())
+        {
+            return Err(DefinitionValidationError::InvalidResolvedCapability {
+                id: capability.capability_id.clone(),
+            });
+        }
+        if capability.schema_digest.trim().is_empty() {
+            return Err(DefinitionValidationError::InvalidSchemaDigest {
+                id: capability.capability_id.clone(),
+            });
+        }
+        if capability.approval_policy_revision == 0
+            || capability.approval_policy_revision != definition.approval_policy_revision
+        {
+            return Err(DefinitionValidationError::InconsistentPolicyRevision {
+                id: capability.capability_id.clone(),
+            });
+        }
+        if let Some(override_config) = &capability.override_config {
+            if override_config.capability_id != capability.capability_id
+                || override_config.manifest_version != capability.manifest_version
+            {
+                return Err(DefinitionValidationError::InconsistentOverride {
+                    id: capability.capability_id.clone(),
+                });
+            }
+        }
+    }
+    validate_host_requirements(&definition.host_requirements)
+}
+
+fn canonicalize_host_requirements(
+    requirements: &mut Vec<HostRequirement>,
+) -> Result<(), DefinitionValidationError> {
+    validate_host_requirements(requirements)?;
+    requirements.sort();
+    Ok(())
+}
+
+fn validate_host_requirements(
+    requirements: &[HostRequirement],
+) -> Result<(), DefinitionValidationError> {
+    let mut unique = BTreeSet::new();
+    for requirement in requirements {
+        if requirement.id.trim().is_empty() || requirement.revision == 0 {
+            return Err(DefinitionValidationError::InvalidHostRequirement {
+                id: requirement.id.clone(),
+                revision: requirement.revision,
+            });
+        }
+        if !unique.insert(requirement.clone()) {
+            return Err(DefinitionValidationError::DuplicateHostRequirement {
+                id: requirement.id.clone(),
+                revision: requirement.revision,
+            });
+        }
+    }
+    Ok(())
+}
+
+mod finite_option_f64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) if value.is_finite() => serializer.serialize_some(value),
+            Some(_) => Err(serde::ser::Error::custom(
+                "model temperature must be finite",
+            )),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<f64>::deserialize(deserializer)?;
+        if value.is_some_and(|value| !value.is_finite()) {
+            return Err(serde::de::Error::custom("model temperature must be finite"));
+        }
+        Ok(value)
     }
 }

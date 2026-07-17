@@ -229,6 +229,150 @@ fn definition_validation_errors_round_trip_through_serde() {
 }
 
 #[test]
+fn publisher_rejects_non_finite_temperatures_without_mutating_state_or_json_corruption() {
+    for temperature in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let catalog = catalog();
+        let mut publisher = publisher();
+        let mut invalid = draft(1);
+        invalid.model.temperature = Some(temperature);
+
+        assert!(matches!(
+            publisher.publish(&catalog, invalid.clone()),
+            Err(DefinitionValidationError::InvalidTemperature)
+        ));
+        assert!(publisher.definition("research-agent", 1).is_none());
+        assert!(serde_json::to_string(&invalid).is_err());
+    }
+}
+
+#[test]
+fn publisher_canonicalizes_host_requirement_order_and_rejects_duplicates_transactionally() {
+    let catalog = catalog();
+    let primary = HostRequirement {
+        id: "workspace-host".into(),
+        revision: 1,
+    };
+    let secondary = HostRequirement {
+        id: "knowledge-host".into(),
+        revision: 2,
+    };
+    let mut first = draft(1);
+    first.host_requirements = vec![primary.clone(), secondary.clone()];
+    let mut second = draft(1);
+    second.host_requirements = vec![secondary.clone(), primary.clone()];
+    let first_definition = DefinitionPublisher::new(vec![primary.clone(), secondary.clone()])
+        .publish(&catalog, first)
+        .unwrap();
+    let second_definition = DefinitionPublisher::new(vec![primary.clone(), secondary.clone()])
+        .publish(&catalog, second)
+        .unwrap();
+
+    assert_eq!(
+        serde_json::to_string(&first_definition).unwrap(),
+        serde_json::to_string(&second_definition).unwrap()
+    );
+    assert_eq!(
+        first_definition.host_requirements,
+        vec![secondary.clone(), primary.clone()]
+    );
+
+    let mut publisher = DefinitionPublisher::new(vec![primary.clone()]);
+    let mut duplicate = draft(1);
+    duplicate.host_requirements = vec![primary.clone(), primary];
+    assert!(matches!(
+        publisher.publish(&catalog, duplicate),
+        Err(DefinitionValidationError::DuplicateHostRequirement { .. })
+    ));
+    assert!(publisher.definition("research-agent", 1).is_none());
+}
+
+#[test]
+fn definition_deserialization_rejects_tampered_invariants() {
+    let catalog = catalog();
+    let definition = publisher().publish(&catalog, draft(1)).unwrap();
+    let json = serde_json::to_value(definition).unwrap();
+
+    let mut unsupported_schema = json.clone();
+    unsupported_schema["schema_version"] = json!(999);
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(unsupported_schema).is_err());
+
+    let mut duplicate_capability = json.clone();
+    let first_capability = duplicate_capability["resolved_capabilities"][0].clone();
+    duplicate_capability["resolved_capabilities"]
+        .as_array_mut()
+        .unwrap()
+        .push(first_capability);
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(duplicate_capability).is_err());
+
+    let mut blank_digest = json.clone();
+    blank_digest["resolved_capabilities"][0]["schema_digest"] = json!("");
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(blank_digest).is_err());
+
+    let mut blank_capability_pin = json.clone();
+    blank_capability_pin["resolved_capabilities"][0]["capability_id"] = json!("");
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(blank_capability_pin).is_err());
+
+    let mut zero_manifest_pin = json.clone();
+    zero_manifest_pin["resolved_capabilities"][0]["manifest_version"] = json!(0);
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(zero_manifest_pin).is_err());
+
+    let mut inconsistent_override = json.clone();
+    inconsistent_override["resolved_capabilities"][0]["override_config"] = json!({
+        "capability_id": "different.capability",
+        "manifest_version": 2,
+        "configuration": {}
+    });
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(inconsistent_override).is_err());
+
+    let mut inconsistent_policy_revision = json.clone();
+    inconsistent_policy_revision["resolved_capabilities"][0]["approval_policy_revision"] = json!(0);
+    assert!(
+        serde_json::from_value::<anima_core::AgentDefinition>(inconsistent_policy_revision)
+            .is_err()
+    );
+
+    let mut invalid_host = json.clone();
+    invalid_host["host_requirements"] = json!([{ "id": "", "revision": 0 }]);
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(invalid_host).is_err());
+
+    let mut duplicate_host = json.clone();
+    let host = duplicate_host["host_requirements"][0].clone();
+    duplicate_host["host_requirements"] = json!([host.clone(), host]);
+    assert!(serde_json::from_value::<anima_core::AgentDefinition>(duplicate_host).is_err());
+
+    let non_finite_json = serde_json::to_string(&json)
+        .unwrap()
+        .replace("\"temperature\":0.2", "\"temperature\":1e999");
+    assert!(serde_json::from_str::<anima_core::AgentDefinition>(&non_finite_json).is_err());
+}
+
+#[test]
+fn overrides_absent_from_the_source_profile_intentionally_add_a_capability() {
+    let mut catalog = catalog();
+    catalog
+        .register_manifest(manifest(
+            "communication.notify",
+            1,
+            CapabilityKind::Communication,
+        ))
+        .unwrap();
+    let mut with_addition = draft(1);
+    with_addition.capability_overrides = vec![CapabilityOverride {
+        capability_id: "communication.notify".into(),
+        manifest_version: 1,
+        configuration: json!({ "channel": "updates" }),
+    }];
+
+    let definition = publisher().publish(&catalog, with_addition).unwrap();
+
+    assert_eq!(definition.resolved_capabilities.len(), 3);
+    assert_eq!(
+        definition.resolved_capabilities[0].capability_id,
+        "communication.notify"
+    );
+}
+
+#[test]
 fn publisher_rejects_unknown_definition_schema_versions() {
     let catalog = catalog();
     let mut invalid = draft(1);
