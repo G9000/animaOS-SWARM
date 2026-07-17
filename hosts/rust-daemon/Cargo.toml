@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 anima-core = { path = "../../packages/core-rust/crates/anima-core" }
+anima-model-adapters = { path = "../../packages/core-rust/crates/anima-model-adapters" }
 anima-memory = { path = "../../packages/core-rust/crates/anima-memory", features = ["locomo-eval"] }
 anima-swarm = { path = "../../packages/core-rust/crates/anima-swarm" }
 async-trait = "0.1"

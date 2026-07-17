@@ -64,6 +64,7 @@ version = "0.1.0"
 dependencies = [
  "anima-core",
  "anima-memory",
+ "anima-model-adapters",
  "anima-swarm",
  "async-trait",
  "axum",
