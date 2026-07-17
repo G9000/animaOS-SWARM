@@ -1,12 +1,19 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
+
+#[path = "capability/invocation.rs"]
+mod invocation;
+use invocation::{canonicalize_arguments, validate_argument_bounds};
+#[path = "capability/schema.rs"]
+mod schema;
+use schema::{compile_schema, validate_instance};
 
 /// The broad role a capability plays for an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +284,31 @@ impl ManifestCatalog {
 /// A stable namespace for durable capability invocation identities.
 pub const CAPABILITY_INVOCATION_NAMESPACE: Uuid =
     Uuid::from_u128(0x43a6_aa38_239d_5bf5_963d_45dc_8731_c2ef);
+pub const MAX_CAPABILITY_ARGUMENT_BYTES: usize = 64 * 1024;
+pub const MAX_CAPABILITY_ARGUMENT_DEPTH: usize = 64;
+pub const MAX_CAPABILITY_ARGUMENT_NODES: usize = 10_000;
+
+/// Errors raised before an argument value enters schema validation or an executor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalInvocationError {
+    ArgumentsTooLarge,
+    ArgumentsTooDeep,
+    ArgumentsTooManyNodes,
+    CanonicalizationFailed,
+}
+
+impl fmt::Display for LogicalInvocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ArgumentsTooLarge => "capability arguments exceed the byte limit",
+            Self::ArgumentsTooDeep => "capability arguments exceed the nesting limit",
+            Self::ArgumentsTooManyNodes => "capability arguments exceed the node limit",
+            Self::CanonicalizationFailed => "capability arguments cannot be canonicalized",
+        })
+    }
+}
+
+impl std::error::Error for LogicalInvocationError {}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct LogicalInvocationSeed {
@@ -301,14 +333,16 @@ impl LogicalInvocation {
         capability_id: impl Into<String>,
         manifest_version: u32,
         arguments: Value,
-    ) -> Self {
-        Self::from_seed(LogicalInvocationSeed {
+    ) -> Result<Self, LogicalInvocationError> {
+        validate_argument_bounds(&arguments)?;
+        let normalized_arguments = canonicalize_arguments(arguments)?;
+        Ok(Self::from_seed(LogicalInvocationSeed {
             run_id,
             logical_step_id: logical_step_id.into(),
             capability_id: capability_id.into(),
             manifest_version,
-            normalized_arguments: canonicalize_json(arguments),
-        })
+            normalized_arguments,
+        }))
     }
 
     pub fn id(&self) -> Uuid {
@@ -335,9 +369,25 @@ impl LogicalInvocation {
         &self.seed.normalized_arguments
     }
 
-    fn from_seed(mut seed: LogicalInvocationSeed) -> Self {
-        seed.normalized_arguments = canonicalize_json(seed.normalized_arguments);
-        let bytes = serde_json::to_vec(&seed).expect("logical invocation seeds must serialize");
+    fn from_seed(seed: LogicalInvocationSeed) -> Self {
+        #[derive(Serialize)]
+        struct VersionedSeed<'a> {
+            format: &'static str,
+            run_id: Uuid,
+            logical_step_id: &'a str,
+            capability_id: &'a str,
+            manifest_version: u32,
+            normalized_arguments: &'a Value,
+        }
+        let bytes = serde_jcs::to_vec(&VersionedSeed {
+            format: "anima-core.capability-invocation.v1",
+            run_id: seed.run_id,
+            logical_step_id: &seed.logical_step_id,
+            capability_id: &seed.capability_id,
+            manifest_version: seed.manifest_version,
+            normalized_arguments: &seed.normalized_arguments,
+        })
+        .expect("validated logical invocation seeds must canonicalize");
         Self {
             id: Uuid::new_v5(&CAPABILITY_INVOCATION_NAMESPACE, &bytes),
             seed,
@@ -359,14 +409,21 @@ impl<'de> Deserialize<'de> for LogicalInvocation {
     where
         D: Deserializer<'de>,
     {
-        Ok(Self::from_seed(LogicalInvocationSeed::deserialize(
-            deserializer,
-        )?))
+        let seed = LogicalInvocationSeed::deserialize(deserializer)?;
+        let invocation = Self::new(
+            seed.run_id,
+            seed.logical_step_id,
+            seed.capability_id,
+            seed.manifest_version,
+            seed.normalized_arguments,
+        )
+        .map_err(serde::de::Error::custom)?;
+        Ok(invocation)
     }
 }
 
 /// One append-only execution record for a logical invocation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CapabilityAttempt {
     id: Uuid,
     number: u32,
@@ -374,13 +431,19 @@ pub struct CapabilityAttempt {
 }
 
 impl CapabilityAttempt {
-    pub fn new(invocation: &LogicalInvocation, number: u32) -> Self {
-        let name = format!("attempt={}:number={number}", invocation.id());
-        Self {
-            id: Uuid::new_v5(&CAPABILITY_INVOCATION_NAMESPACE, name.as_bytes()),
+    pub fn new(
+        invocation: &LogicalInvocation,
+        number: u32,
+    ) -> Result<Self, CapabilityContextError> {
+        if number == 0 {
+            return Err(CapabilityContextError::InvalidAttemptNumber);
+        }
+        let id = attempt_id(invocation.id(), number);
+        Ok(Self {
+            id,
             number,
             logical_invocation_id: invocation.id(),
-        }
+        })
     }
 
     pub fn id(&self) -> Uuid {
@@ -396,19 +459,221 @@ impl CapabilityAttempt {
     }
 }
 
+#[derive(Deserialize)]
+struct CapabilityAttemptSnapshot {
+    id: Uuid,
+    number: u32,
+    logical_invocation_id: Uuid,
+}
+
+impl<'de> Deserialize<'de> for CapabilityAttempt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let snapshot = CapabilityAttemptSnapshot::deserialize(deserializer)?;
+        if snapshot.number == 0
+            || snapshot.id != attempt_id(snapshot.logical_invocation_id, snapshot.number)
+        {
+            return Err(serde::de::Error::custom(
+                CapabilityContextError::AttemptIdentityMismatch,
+            ));
+        }
+        Ok(Self {
+            id: snapshot.id,
+            number: snapshot.number,
+            logical_invocation_id: snapshot.logical_invocation_id,
+        })
+    }
+}
+
+fn attempt_id(logical_invocation_id: Uuid, number: u32) -> Uuid {
+    let name = format!("attempt={logical_invocation_id}:number={number}");
+    Uuid::new_v5(&CAPABILITY_INVOCATION_NAMESPACE, name.as_bytes())
+}
+
+/// A validated non-secret resource identifier such as `owner:42` or `workspace:primary`.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilityReferenceId(String);
+
+impl CapabilityReferenceId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, CapabilityContextError> {
+        let value = value.into();
+        let Some((kind, identifier)) = value.split_once(':') else {
+            return Err(CapabilityContextError::InvalidReference);
+        };
+        if kind.is_empty()
+            || kind.len() > 32
+            || identifier.is_empty()
+            || identifier.len() > 64
+            || !kind
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            || !identifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(CapabilityContextError::InvalidReference);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for CapabilityReferenceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapabilityReferenceId(REDACTED)")
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityReferenceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A declared secret name, never a secret value.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilitySecretReferenceId(String);
+
+impl CapabilitySecretReferenceId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, CapabilityContextError> {
+        let value = value.into();
+        let Some(name) = value.strip_prefix("secret:") else {
+            return Err(CapabilityContextError::InvalidSecretReference);
+        };
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(CapabilityContextError::InvalidSecretReference);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0
+            .strip_prefix("secret:")
+            .expect("validated secret reference prefix")
+    }
+}
+
+impl fmt::Debug for CapabilitySecretReferenceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapabilitySecretReferenceId(REDACTED)")
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilitySecretReferenceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Opaque resource references passed to an executor.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityExecutionReferences {
+    owner: Option<CapabilityReferenceId>,
+    agent: Option<CapabilityReferenceId>,
+    session: Option<CapabilityReferenceId>,
+    run: CapabilityReferenceId,
+    workspace: Option<CapabilityReferenceId>,
+    deadline: Option<CapabilityReferenceId>,
+    cancellation: Option<CapabilityReferenceId>,
+    secrets: Vec<CapabilitySecretReferenceId>,
+}
+
+impl CapabilityExecutionReferences {
+    fn for_run(run_id: Uuid) -> Self {
+        Self {
+            owner: None,
+            agent: None,
+            session: None,
+            run: CapabilityReferenceId::parse(format!("run:{run_id}")).expect("UUID run reference"),
+            workspace: None,
+            deadline: None,
+            cancellation: None,
+            secrets: Vec::new(),
+        }
+    }
+
+    pub fn with_owner(mut self, reference: CapabilityReferenceId) -> Self {
+        self.owner = Some(reference);
+        self
+    }
+
+    pub fn with_agent(mut self, reference: CapabilityReferenceId) -> Self {
+        self.agent = Some(reference);
+        self
+    }
+
+    pub fn with_session(mut self, reference: CapabilityReferenceId) -> Self {
+        self.session = Some(reference);
+        self
+    }
+
+    pub fn with_workspace(mut self, reference: CapabilityReferenceId) -> Self {
+        self.workspace = Some(reference);
+        self
+    }
+
+    pub fn with_deadline(mut self, reference: CapabilityReferenceId) -> Self {
+        self.deadline = Some(reference);
+        self
+    }
+
+    pub fn with_cancellation(mut self, reference: CapabilityReferenceId) -> Self {
+        self.cancellation = Some(reference);
+        self
+    }
+
+    pub fn with_secrets(mut self, references: Vec<CapabilitySecretReferenceId>) -> Self {
+        self.secrets = references;
+        self
+    }
+
+    fn secrets_are_declared_by(&self, manifest: &CapabilityManifest) -> bool {
+        self.secrets.iter().all(|reference| {
+            manifest
+                .secret_references
+                .iter()
+                .any(|declared| declared == reference.as_str())
+        })
+    }
+}
+
+impl fmt::Debug for CapabilityExecutionReferences {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapabilityExecutionReferences")
+            .field("owner_present", &self.owner.is_some())
+            .field("agent_present", &self.agent.is_some())
+            .field("session_present", &self.session.is_some())
+            .field("workspace_present", &self.workspace.is_some())
+            .field("deadline_present", &self.deadline.is_some())
+            .field("cancellation_present", &self.cancellation.is_some())
+            .field("secret_reference_count", &self.secrets.len())
+            .finish()
+    }
+}
+
 /// Portable references supplied to a host executor. No credential values are carried here.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CapabilityExecutionContext {
     invocation: LogicalInvocation,
     attempt: CapabilityAttempt,
-    pub owner_reference: Option<String>,
-    pub agent_reference: Option<String>,
-    pub session_reference: Option<String>,
-    pub run_reference: String,
-    pub workspace_reference: Option<String>,
-    pub deadline_reference: Option<String>,
-    pub cancellation_reference: Option<String>,
-    pub secret_references: Vec<String>,
+    references: CapabilityExecutionReferences,
 }
 
 impl CapabilityExecutionContext {
@@ -431,6 +696,15 @@ impl CapabilityExecutionContext {
         self.invocation.normalized_arguments()
     }
 
+    pub fn references(&self) -> &CapabilityExecutionReferences {
+        &self.references
+    }
+
+    pub fn with_references(mut self, references: CapabilityExecutionReferences) -> Self {
+        self.references = references;
+        self
+    }
+
     fn try_new(
         invocation: LogicalInvocation,
         attempt: CapabilityAttempt,
@@ -438,22 +712,14 @@ impl CapabilityExecutionContext {
         if attempt.number == 0 {
             return Err(CapabilityContextError::InvalidAttemptNumber);
         }
-        let expected_attempt = CapabilityAttempt::new(&invocation, attempt.number);
+        let expected_attempt = CapabilityAttempt::new(&invocation, attempt.number)?;
         if attempt.logical_invocation_id != invocation.id || attempt.id != expected_attempt.id {
             return Err(CapabilityContextError::AttemptIdentityMismatch);
         }
-        let run_reference = format!("run:{}", invocation.run_id());
         Ok(Self {
+            references: CapabilityExecutionReferences::for_run(invocation.run_id()),
             invocation,
             attempt,
-            owner_reference: None,
-            agent_reference: None,
-            session_reference: None,
-            run_reference,
-            workspace_reference: None,
-            deadline_reference: None,
-            cancellation_reference: None,
-            secret_references: Vec::new(),
         })
     }
 }
@@ -464,6 +730,8 @@ pub enum CapabilityContextError {
     InvalidAttemptNumber,
     AttemptIdentityMismatch,
     RunReferenceMismatch,
+    InvalidReference,
+    InvalidSecretReference,
 }
 
 impl fmt::Display for CapabilityContextError {
@@ -476,6 +744,8 @@ impl fmt::Display for CapabilityContextError {
             Self::RunReferenceMismatch => {
                 formatter.write_str("run reference does not match the logical invocation")
             }
+            Self::InvalidReference => formatter.write_str("reference ID is invalid"),
+            Self::InvalidSecretReference => formatter.write_str("secret reference ID is invalid"),
         }
     }
 }
@@ -486,28 +756,15 @@ impl std::error::Error for CapabilityContextError {}
 struct CapabilityExecutionContextSerialization<'a> {
     invocation: &'a LogicalInvocation,
     attempt: &'a CapabilityAttempt,
-    owner_reference: &'a Option<String>,
-    agent_reference: &'a Option<String>,
-    session_reference: &'a Option<String>,
-    run_reference: &'a String,
-    workspace_reference: &'a Option<String>,
-    deadline_reference: &'a Option<String>,
-    cancellation_reference: &'a Option<String>,
-    secret_references: &'a Vec<String>,
+    references: &'a CapabilityExecutionReferences,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CapabilityExecutionContextDeserialization {
     invocation: LogicalInvocation,
     attempt: CapabilityAttempt,
-    owner_reference: Option<String>,
-    agent_reference: Option<String>,
-    session_reference: Option<String>,
-    run_reference: String,
-    workspace_reference: Option<String>,
-    deadline_reference: Option<String>,
-    cancellation_reference: Option<String>,
-    secret_references: Vec<String>,
+    references: CapabilityExecutionReferences,
 }
 
 impl Serialize for CapabilityExecutionContext {
@@ -518,14 +775,7 @@ impl Serialize for CapabilityExecutionContext {
         CapabilityExecutionContextSerialization {
             invocation: &self.invocation,
             attempt: &self.attempt,
-            owner_reference: &self.owner_reference,
-            agent_reference: &self.agent_reference,
-            session_reference: &self.session_reference,
-            run_reference: &self.run_reference,
-            workspace_reference: &self.workspace_reference,
-            deadline_reference: &self.deadline_reference,
-            cancellation_reference: &self.cancellation_reference,
-            secret_references: &self.secret_references,
+            references: &self.references,
         }
         .serialize(serializer)
     }
@@ -539,19 +789,24 @@ impl<'de> Deserialize<'de> for CapabilityExecutionContext {
         let snapshot = CapabilityExecutionContextDeserialization::deserialize(deserializer)?;
         let mut context = Self::try_new(snapshot.invocation, snapshot.attempt)
             .map_err(serde::de::Error::custom)?;
-        if snapshot.run_reference != context.run_reference {
+        if snapshot.references.run != context.references.run {
             return Err(serde::de::Error::custom(
                 CapabilityContextError::RunReferenceMismatch,
             ));
         }
-        context.owner_reference = snapshot.owner_reference;
-        context.agent_reference = snapshot.agent_reference;
-        context.session_reference = snapshot.session_reference;
-        context.workspace_reference = snapshot.workspace_reference;
-        context.deadline_reference = snapshot.deadline_reference;
-        context.cancellation_reference = snapshot.cancellation_reference;
-        context.secret_references = snapshot.secret_references;
+        context.references = snapshot.references;
         Ok(context)
+    }
+}
+
+impl fmt::Debug for CapabilityExecutionContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapabilityExecutionContext")
+            .field("logical_invocation_id", &self.invocation.id())
+            .field("attempt_number", &self.attempt.number())
+            .field("references", &self.references)
+            .finish()
     }
 }
 
@@ -695,13 +950,22 @@ pub enum ReconcileOutcome {
 }
 
 /// The action a host recovery orchestrator must take next.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum RecoveryAction {
-    RetrySameKey { idempotency_key: String },
+    RetrySameKey {
+        idempotency_key: String,
+        authorization: CapabilityRetryAuthorization,
+    },
     Completed(CapabilityResult),
     Pending,
     AuthoritativeAbsence,
     RecoveryRequired,
+}
+
+/// An opaque, one-time registry authorization for a specific retry attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityRetryAuthorization {
+    nonce: Uuid,
 }
 
 /// A compact discriminator for recovery orchestration and public tests.
@@ -722,6 +986,13 @@ impl RecoveryAction {
             Self::Pending => RecoveryActionKind::Pending,
             Self::AuthoritativeAbsence => RecoveryActionKind::AuthoritativeAbsence,
             Self::RecoveryRequired => RecoveryActionKind::RecoveryRequired,
+        }
+    }
+
+    pub fn retry_authorization(&self) -> Option<&CapabilityRetryAuthorization> {
+        match self {
+            Self::RetrySameKey { authorization, .. } => Some(authorization),
+            _ => None,
         }
     }
 }
@@ -763,10 +1034,25 @@ impl fmt::Display for CapabilityRegistryError {
 impl std::error::Error for CapabilityRegistryError {}
 
 /// A host-agnostic pairing of the exact portable manifest catalog and host executors.
-#[derive(Clone)]
 pub struct CapabilityRegistry {
     catalog: ManifestCatalog,
-    executors: BTreeMap<(String, u32), Arc<dyn CapabilityExecutor>>,
+    executors: BTreeMap<(String, u32), RegisteredExecutor>,
+    retry_authorizations: Mutex<BTreeMap<Uuid, RetryAuthorizationRecord>>,
+}
+
+struct RegisteredExecutor {
+    executor: Arc<dyn CapabilityExecutor>,
+    input_validator: Arc<JSONSchema>,
+    output_validator: Arc<JSONSchema>,
+}
+
+#[derive(Clone)]
+struct RetryAuthorizationRecord {
+    logical_invocation_id: Uuid,
+    idempotency_key: String,
+    capability_id: String,
+    manifest_version: u32,
+    attempt_number: u32,
 }
 
 impl CapabilityRegistry {
@@ -774,6 +1060,7 @@ impl CapabilityRegistry {
         Self {
             catalog,
             executors: BTreeMap::new(),
+            retry_authorizations: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -782,7 +1069,9 @@ impl CapabilityRegistry {
     }
 
     pub fn executor(&self, id: &str, version: u32) -> Option<Arc<dyn CapabilityExecutor>> {
-        self.executors.get(&(id.to_owned(), version)).cloned()
+        self.executors
+            .get(&(id.to_owned(), version))
+            .map(|entry| entry.executor.clone())
     }
 
     pub fn register_executor(
@@ -797,9 +1086,7 @@ impl CapabilityRegistry {
                 version: key.1,
             });
         };
-        if registered_manifest.input_schema != executor_manifest.input_schema
-            || registered_manifest.output_schema != executor_manifest.output_schema
-        {
+        if registered_manifest != executor_manifest {
             return Err(CapabilityRegistryError::ManifestExecutorMismatch {
                 id: executor_manifest.id.clone(),
                 version: executor_manifest.version,
@@ -811,20 +1098,28 @@ impl CapabilityRegistry {
                 version: key.1,
             });
         }
-        compile_schema(&registered_manifest.input_schema).map_err(|_| {
+        let input_validator = compile_schema(&registered_manifest.input_schema).map_err(|_| {
             CapabilityRegistryError::InvalidInputSchema {
                 id: registered_manifest.id.clone(),
                 version: registered_manifest.version,
             }
         })?;
-        compile_schema(&registered_manifest.output_schema).map_err(|_| {
-            CapabilityRegistryError::InvalidOutputSchema {
-                id: registered_manifest.id.clone(),
-                version: registered_manifest.version,
-            }
-        })?;
+        let output_validator =
+            compile_schema(&registered_manifest.output_schema).map_err(|_| {
+                CapabilityRegistryError::InvalidOutputSchema {
+                    id: registered_manifest.id.clone(),
+                    version: registered_manifest.version,
+                }
+            })?;
 
-        self.executors.insert(key, executor);
+        self.executors.insert(
+            key,
+            RegisteredExecutor {
+                executor,
+                input_validator: Arc::new(input_validator),
+                output_validator: Arc::new(output_validator),
+            },
+        );
         Ok(())
     }
 
@@ -832,17 +1127,59 @@ impl CapabilityRegistry {
         &self,
         context: CapabilityExecutionContext,
     ) -> Result<CapabilityResult, CapabilityError> {
+        if context.attempt().number() != 1 {
+            return Err(CapabilityError::validation());
+        }
         let manifest = self.manifest_for_context(&context)?;
+        if !context.references().secrets_are_declared_by(manifest) {
+            return Err(CapabilityError::validation());
+        }
+        let entry = self.entry_for_context(&context)?;
         validate_instance(
-            &manifest.input_schema,
+            &entry.input_validator,
             context.normalized_arguments(),
             false,
         )?;
-        let executor = self
-            .executor(&manifest.id, manifest.version)
-            .ok_or_else(CapabilityError::unavailable)?;
+        let executor = entry.executor.clone();
         let mut result = executor.execute(context).await?;
-        validate_instance(&manifest.output_schema, &result.output, true)?;
+        validate_instance(&entry.output_validator, &result.output, true)?;
+        result.output = canonicalize_json(result.output);
+        Ok(result)
+    }
+
+    /// Executes a retry only when it presents a one-time authorization issued by `recover`.
+    pub async fn execute_retry(
+        &self,
+        context: CapabilityExecutionContext,
+        authorization: CapabilityRetryAuthorization,
+    ) -> Result<CapabilityResult, CapabilityError> {
+        let manifest = self.manifest_for_context(&context)?;
+        if !context.references().secrets_are_declared_by(manifest) {
+            return Err(CapabilityError::validation());
+        }
+        let entry = self.entry_for_context(&context)?;
+        let key = context.invocation().idempotency_key();
+        let record = self
+            .retry_authorizations
+            .lock()
+            .map_err(|_| CapabilityError::execution())?
+            .remove(&authorization.nonce)
+            .ok_or_else(CapabilityError::validation)?;
+        if record.logical_invocation_id != context.invocation().id()
+            || record.idempotency_key != key
+            || record.capability_id != context.invocation().capability_id()
+            || record.manifest_version != context.invocation().manifest_version()
+            || record.attempt_number != context.attempt().number()
+        {
+            return Err(CapabilityError::validation());
+        }
+        validate_instance(
+            &entry.input_validator,
+            context.normalized_arguments(),
+            false,
+        )?;
+        let mut result = entry.executor.execute(context).await?;
+        validate_instance(&entry.output_validator, &result.output, true)?;
         result.output = canonicalize_json(result.output);
         Ok(result)
     }
@@ -852,30 +1189,29 @@ impl CapabilityRegistry {
         context: CapabilityExecutionContext,
     ) -> Result<RecoveryAction, CapabilityError> {
         let manifest = self.manifest_for_context(&context)?;
+        if !context.references().secrets_are_declared_by(manifest) {
+            return Err(CapabilityError::validation());
+        }
         match manifest.recovery_mode {
             RecoveryMode::InherentlyIdempotent
             | RecoveryMode::KeyedIdempotent
-            | RecoveryMode::Retry => Ok(RecoveryAction::RetrySameKey {
-                idempotency_key: context.invocation().idempotency_key(),
-            }),
+            | RecoveryMode::Retry => self.authorize_retry(&context, manifest),
             RecoveryMode::Reconcilable | RecoveryMode::Compensate => {
+                let entry = self.entry_for_context(&context)?;
                 validate_instance(
-                    &manifest.input_schema,
+                    &entry.input_validator,
                     context.normalized_arguments(),
                     false,
                 )?;
-                let executor = self
-                    .executor(&manifest.id, manifest.version)
-                    .ok_or_else(CapabilityError::unavailable)?;
-                match executor.reconcile(context).await? {
+                match entry.executor.reconcile(context.clone()).await? {
                     ReconcileOutcome::Completed(mut result) => {
-                        validate_instance(&manifest.output_schema, &result.output, true)?;
+                        validate_instance(&entry.output_validator, &result.output, true)?;
                         result.output = canonicalize_json(result.output);
                         Ok(RecoveryAction::Completed(result))
                     }
                     ReconcileOutcome::Pending => Ok(RecoveryAction::Pending),
                     ReconcileOutcome::AuthoritativeAbsence => {
-                        Ok(RecoveryAction::AuthoritativeAbsence)
+                        self.authorize_retry(&context, manifest)
                     }
                     ReconcileOutcome::RecoveryRequired => Ok(RecoveryAction::RecoveryRequired),
                 }
@@ -896,45 +1232,56 @@ impl CapabilityRegistry {
         )
         .ok_or_else(CapabilityError::unavailable)
     }
-}
 
-fn compile_schema(schema: &Value) -> Result<JSONSchema, ()> {
-    JSONSchema::compile(schema).map_err(|_| ())
-}
+    fn entry_for_context(
+        &self,
+        context: &CapabilityExecutionContext,
+    ) -> Result<&RegisteredExecutor, CapabilityError> {
+        self.executors
+            .get(&(
+                context.invocation().capability_id().to_owned(),
+                context.invocation().manifest_version(),
+            ))
+            .ok_or_else(CapabilityError::unavailable)
+    }
 
-fn validate_instance(
-    schema: &Value,
-    instance: &Value,
-    output: bool,
-) -> Result<(), CapabilityError> {
-    let validator = compile_schema(schema).map_err(|_| {
-        if output {
-            CapabilityError::output_validation()
-        } else {
-            CapabilityError::validation()
+    fn authorize_retry(
+        &self,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+    ) -> Result<RecoveryAction, CapabilityError> {
+        let next_attempt = context
+            .attempt()
+            .number()
+            .checked_add(1)
+            .ok_or_else(CapabilityError::validation)?;
+        if next_attempt > manifest.max_retries.saturating_add(1) {
+            return Ok(RecoveryAction::RecoveryRequired);
         }
-    })?;
-    if validator.is_valid(instance) {
-        Ok(())
-    } else if output {
-        Err(CapabilityError::output_validation())
-    } else {
-        Err(CapabilityError::validation())
+        let nonce = Uuid::new_v4();
+        let idempotency_key = context.invocation().idempotency_key();
+        self.retry_authorizations
+            .lock()
+            .map_err(|_| CapabilityError::execution())?
+            .insert(
+                nonce,
+                RetryAuthorizationRecord {
+                    logical_invocation_id: context.invocation().id(),
+                    idempotency_key: idempotency_key.clone(),
+                    capability_id: context.invocation().capability_id().to_owned(),
+                    manifest_version: context.invocation().manifest_version(),
+                    attempt_number: next_attempt,
+                },
+            );
+        Ok(RecoveryAction::RetrySameKey {
+            idempotency_key,
+            authorization: CapabilityRetryAuthorization { nonce },
+        })
     }
 }
 
 fn canonicalize_json(value: Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
-        Value::Object(values) => {
-            let mut normalized = BTreeMap::new();
-            for (key, value) in values {
-                normalized.insert(key, canonicalize_json(value));
-            }
-            Value::Object(normalized.into_iter().collect())
-        }
-        scalar => scalar,
-    }
+    canonicalize_arguments(value).expect("executor JSON results must canonicalize")
 }
 
 fn validate_manifest(manifest: &CapabilityManifest) -> Result<(), ManifestCatalogError> {

@@ -15,11 +15,13 @@ pub use agent::{
 };
 pub use capability::{
     CapabilityAttempt, CapabilityContextError, CapabilityError, CapabilityErrorCode,
-    CapabilityExecutionContext, CapabilityExecutor, CapabilityKind, CapabilityManifest,
-    CapabilityProfile, CapabilityProfileEntry, CapabilityRegistry, CapabilityRegistryError,
-    CapabilityResult, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ReconcileOutcome,
-    RecoveryAction, RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
-    CAPABILITY_INVOCATION_NAMESPACE,
+    CapabilityExecutionContext, CapabilityExecutionReferences, CapabilityExecutor, CapabilityKind,
+    CapabilityManifest, CapabilityProfile, CapabilityProfileEntry, CapabilityReferenceId,
+    CapabilityRegistry, CapabilityRegistryError, CapabilityResult, CapabilityRetryAuthorization,
+    CapabilitySecretReferenceId, LogicalInvocation, LogicalInvocationError, ManifestCatalog,
+    ManifestCatalogError, ReconcileOutcome, RecoveryAction, RecoveryActionKind, RecoveryMode,
+    RiskLevel, RuntimeCompatibility, CAPABILITY_INVOCATION_NAMESPACE,
+    MAX_CAPABILITY_ARGUMENT_BYTES, MAX_CAPABILITY_ARGUMENT_DEPTH, MAX_CAPABILITY_ARGUMENT_NODES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use definition::{
