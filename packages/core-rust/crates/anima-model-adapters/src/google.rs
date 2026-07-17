@@ -7,11 +7,11 @@ use anima_core::{
 use serde_json::{json, Map, Value};
 
 use super::common::{
-    data_value_to_json, json_value_to_data_map, json_value_to_data_value, required_data_string,
-    tool_call_id, tool_parameters_schema_json, value_to_u64,
+    data_value_to_json, json_value_to_data_map, required_data_string, tool_call_id,
+    tool_parameters_schema_json, value_to_u64,
 };
 
-const GOOGLE_RESPONSE_PARTS: &str = "googleResponseParts";
+const GOOGLE_RESPONSE_PARTS_JSON: &str = "googleResponsePartsJson";
 
 pub(super) fn build_google_body(
     config: &AgentConfig,
@@ -85,13 +85,15 @@ fn preserved_google_response_parts(message: &Message) -> Result<Option<Vec<Value
     let Some(metadata) = message.content.metadata.as_ref() else {
         return Ok(None);
     };
-    let Some(parts) = metadata.get(GOOGLE_RESPONSE_PARTS) else {
+    let Some(parts_json) = metadata.get(GOOGLE_RESPONSE_PARTS_JSON) else {
         return Ok(None);
     };
-    let DataValue::Array(parts) = parts else {
-        return Err("googleResponseParts metadata must be an array".to_string());
+    let DataValue::String(parts_json) = parts_json else {
+        return Err("googleResponsePartsJson metadata must be a JSON string".to_string());
     };
-    Ok(Some(parts.iter().map(data_value_to_json).collect()))
+    serde_json::from_str(parts_json)
+        .map(Some)
+        .map_err(|error| format!("invalid googleResponsePartsJson metadata: {error}"))
 }
 
 fn google_function_call_parts(message: &Message) -> Result<Vec<Value>, String> {
@@ -196,6 +198,8 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
         .and_then(|content| content.get("parts"))
         .and_then(Value::as_array);
     let raw_parts = parts.cloned().unwrap_or_default();
+    let raw_parts_json = serde_json::to_string(&raw_parts)
+        .map_err(|error| format!("failed to serialize Google response parts: {error}"))?;
 
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -252,13 +256,8 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
             text: text_parts.join(""),
             attachments: None,
             metadata: Some(BTreeMap::from([(
-                GOOGLE_RESPONSE_PARTS.into(),
-                DataValue::Array(
-                    raw_parts
-                        .iter()
-                        .map(json_value_to_data_value)
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
+                GOOGLE_RESPONSE_PARTS_JSON.into(),
+                DataValue::String(raw_parts_json),
             )])),
         },
         tool_calls: if tool_calls.is_empty() {

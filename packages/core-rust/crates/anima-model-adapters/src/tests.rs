@@ -450,10 +450,13 @@ fn google_response_parts_with_thought_signatures_are_preserved_for_replay() {
         .content
         .metadata
         .as_ref()
-        .and_then(|metadata| metadata.get("googleResponseParts"))
+        .and_then(|metadata| metadata.get("googleResponsePartsJson"))
         .expect("raw Google parts should be retained in metadata");
+    let DataValue::String(parts_json) = parts else {
+        panic!("raw Google parts should be stored as JSON text");
+    };
     assert_eq!(
-        crate::common::data_value_to_json(parts),
+        serde_json::from_str::<Value>(parts_json).expect("metadata JSON"),
         json!([signed_part])
     );
 
@@ -492,11 +495,40 @@ fn google_response_parts_with_thought_signatures_are_preserved_for_replay() {
     );
 }
 
+#[test]
+fn invalid_lossless_google_parts_metadata_fails_with_a_clear_error() {
+    let mut replay = request();
+    replay.messages.push(Message {
+        id: "assistant-invalid-parts".into(),
+        agent_id: "agent".into(),
+        room_id: "room".into(),
+        content: Content {
+            text: String::new(),
+            attachments: None,
+            metadata: Some(BTreeMap::from([(
+                "googleResponsePartsJson".into(),
+                DataValue::String("not valid JSON".into()),
+            )])),
+        },
+        role: MessageRole::Assistant,
+        created_at_ms: 2,
+    });
+
+    let error = crate::google::build_google_body(&agent_config("google", false), &replay)
+        .expect_err("invalid lossless metadata should not be replayed approximately");
+    assert!(error.contains("googleResponsePartsJson"), "{error}");
+}
+
 #[tokio::test]
 async fn google_second_request_replays_signed_calls_then_user_function_results() {
     let signed_part = json!({
-        "functionCall": {"id": "call-signed", "name": "delegate_task", "args": {"task": "research"}},
-        "thoughtSignature": "signature-from-google"
+        "functionCall": {
+            "id": "call-signed",
+            "name": "delegate_task",
+            "args": {"task": "research", "sequence": 9007199254740993u64}
+        },
+        "thoughtSignature": "signature-from-google",
+        "opaqueFutureField": {"structure": ["must", {"stay": "exact"}]}
     });
     let signed_part_for_server = signed_part.clone();
     let seen = Arc::new(Mutex::new(Vec::<Value>::new()));
