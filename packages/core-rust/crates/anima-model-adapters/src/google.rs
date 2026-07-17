@@ -44,7 +44,7 @@ pub(super) fn build_google_body(
 fn build_google_contents(request: &ModelGenerateRequest) -> Result<Vec<Value>, String> {
     let mut contents: Vec<Value> = Vec::new();
 
-    for message in &request.messages {
+    for (index, message) in request.messages.iter().enumerate() {
         match message.role {
             MessageRole::System => {}
             MessageRole::User => contents.push(json!({
@@ -63,18 +63,7 @@ fn build_google_contents(request: &ModelGenerateRequest) -> Result<Vec<Value>, S
                 }));
             }
             MessageRole::Tool => {
-                let call_id = tool_call_id(message);
-                let response_value: Value = serde_json::from_str(&message.content.text)
-                    .unwrap_or_else(|_| json!({ "result": message.content.text }));
-                contents.push(json!({
-                    "role": "function",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": call_id,
-                            "response": response_value,
-                        }
-                    }],
-                }));
+                contents.push(google_tool_response(message, &request.messages[..index])?);
             }
         }
     }
@@ -96,6 +85,7 @@ fn google_function_call_parts(message: &Message) -> Result<Vec<Value>, String> {
             let DataValue::Object(tool_call) = tool_call else {
                 return Err("toolCall entries must be objects".to_string());
             };
+            let id = required_data_string(tool_call, "id")?;
             let name = required_data_string(tool_call, "name")?;
             let args = match tool_call.get("args") {
                 Some(DataValue::Object(args)) => {
@@ -105,12 +95,52 @@ fn google_function_call_parts(message: &Message) -> Result<Vec<Value>, String> {
             };
             Ok(json!({
                 "functionCall": {
+                    "id": id,
                     "name": name,
                     "args": args,
                 }
             }))
         })
         .collect()
+}
+
+fn google_tool_response(message: &Message, prior_messages: &[Message]) -> Result<Value, String> {
+    let call_id = tool_call_id(message);
+    let name = prior_messages
+        .iter()
+        .rev()
+        .filter(|message| message.role == MessageRole::Assistant)
+        .filter_map(|message| message.content.metadata.as_ref())
+        .filter_map(|metadata| metadata.get("toolCalls"))
+        .filter_map(|calls| match calls {
+            DataValue::Array(calls) => Some(calls),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|call| match call {
+            DataValue::Object(call)
+                if call.get("id") == Some(&DataValue::String(call_id.clone())) =>
+            {
+                required_data_string(call, "name").ok()
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!("Google tool result does not match a prior assistant call: {call_id}")
+        })?;
+    let response_value: Value = serde_json::from_str(&message.content.text)
+        .unwrap_or_else(|_| json!({ "result": message.content.text }));
+
+    Ok(json!({
+        "role": "function",
+        "parts": [{
+            "functionResponse": {
+                "name": name,
+                "id": call_id,
+                "response": response_value,
+            }
+        }],
+    }))
 }
 
 fn build_google_tools(config: &AgentConfig) -> Result<Option<Vec<Value>>, String> {
@@ -160,7 +190,12 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
                 let empty_obj = Value::Object(Map::new());
                 let args_value = function_call.get("args").unwrap_or(&empty_obj);
                 let args = json_value_to_data_map(args_value)?;
-                let id = format!("call_{name}");
+                let id = function_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{name}"));
                 tool_calls.push(ToolCall { id, name, args });
             }
         }

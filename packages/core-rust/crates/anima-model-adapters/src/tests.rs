@@ -5,7 +5,12 @@ use anima_core::{
     AgentConfig, AgentSettings, Content, DataValue, Message, MessageRole, ModelAdapter,
     ModelGenerateRequest, ModelStopReason, ToolDescriptor,
 };
-use axum::{extract::Json, http::HeaderMap, routing::post, Router};
+use axum::{
+    extract::Json,
+    http::{HeaderMap, Uri},
+    routing::post,
+    Router,
+};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
@@ -65,6 +70,15 @@ fn provider_definitions_expose_current_non_secret_metadata() {
 }
 
 #[test]
+fn routing_resolves_the_single_public_provider_catalog() {
+    for definition in provider_definitions() {
+        let resolved = crate::catalog::resolve_provider(definition.id)
+            .expect("every public provider should be routable");
+        assert!(std::ptr::eq(resolved.definition, definition));
+    }
+}
+
+#[test]
 fn credential_debug_output_redacts_api_keys() {
     let credential = ProviderCredential {
         api_key: Some("do-not-expose".into()),
@@ -86,6 +100,31 @@ async fn aliases_resolve_to_their_canonical_provider_configuration() {
         .await
         .expect("alias should use canonical provider credentials");
     assert_eq!(response.content.text, "alias");
+}
+
+#[tokio::test]
+async fn injected_reqwest_client_is_used_by_the_adapter() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(_body): Json<Value>| async move { openai_response("injected client") }),
+    );
+    let base_url = spawn_server(app).await;
+    let config = ProviderAdapterConfig {
+        providers: BTreeMap::from([(
+            "openai".into(),
+            ProviderCredential {
+                api_key: Some("key".into()),
+                base_url: format!("{base_url}/v1"),
+            },
+        )]),
+    };
+    let adapter = ProviderModelAdapter::with_client(config, reqwest::Client::new());
+
+    let response = adapter
+        .generate(&agent_config("openai", false), &request())
+        .await
+        .expect("injected client should make the request");
+    assert_eq!(response.content.text, "injected client");
 }
 
 #[tokio::test]
@@ -196,8 +235,10 @@ async fn routes_anthropic_google_and_ollama_native_protocols() {
     assert_eq!(response.content.text, "anthropic");
     assert_eq!(response.usage.total_tokens, 5);
 
-    let google = Router::new().route("/v1beta/models/gemini-2.0-flash:generateContent", post(|Json(body): Json<Value>| async move {
+    let google = Router::new().route("/v1beta/models/gemini-2.0-flash:generateContent", post(|headers: HeaderMap, uri: Uri, Json(body): Json<Value>| async move {
         assert!(body.get("system_instruction").is_some());
+        assert_eq!(headers.get("x-goog-api-key").and_then(|value| value.to_str().ok()), Some("key"));
+        assert!(uri.query().is_none());
         Json(json!({"candidates":[{"content":{"role":"model","parts":[{"text":"google"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}}))
     }));
     let base_url = spawn_server(google).await;
@@ -221,6 +262,48 @@ async fn routes_anthropic_google_and_ollama_native_protocols() {
         .expect("ollama works without key");
     assert_eq!(response.content.text, "ollama");
     assert_eq!(response.usage.total_tokens, 12);
+}
+
+#[tokio::test]
+async fn google_transport_errors_do_not_expose_host_credentials_or_query_urls() {
+    let conspicuous_key = "google-key-must-never-appear";
+    let adapter = adapter_with(&[("google", Some(conspicuous_key), "http://127.0.0.1:9")]);
+    let error = adapter
+        .generate(&agent_config("google", false), &request())
+        .await
+        .expect_err("unreachable google endpoint should fail");
+
+    assert!(
+        !error.contains(conspicuous_key),
+        "credential leaked: {error}"
+    );
+    assert!(!error.contains("?key="), "query credential leaked: {error}");
+}
+
+#[tokio::test]
+async fn upstream_error_bodies_are_bounded_and_redacted() {
+    let key = "configured-secret-must-not-leak";
+    let body = format!("provider echoed {key}: {}", "x".repeat(2_000));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let body = body.clone();
+            async move { (axum::http::StatusCode::BAD_REQUEST, body) }
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let error = adapter_with(&[("openai", Some(key), &format!("{base_url}/v1"))])
+        .generate(&agent_config("openai", false), &request())
+        .await
+        .expect_err("upstream error should surface safely");
+
+    assert!(error.contains("OpenAI API error (400)"), "{error}");
+    assert!(error.contains("[REDACTED]"), "{error}");
+    assert!(!error.contains(key), "credential leaked: {error}");
+    assert!(
+        error.chars().count() <= 1_100,
+        "error was not bounded: {error}"
+    );
 }
 
 #[tokio::test]
@@ -253,6 +336,81 @@ async fn routes_anthropic_and_google_tool_calls() {
         .expect("google tool call");
     assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
     assert_eq!(response.tool_calls.expect("tool")[0].name, "delegate_task");
+}
+
+#[test]
+fn google_native_tool_round_trip_preserves_call_ids_and_correlates_parallel_calls() {
+    let parsed = crate::google::parse_google_response(&json!({
+        "candidates": [{
+            "content": { "parts": [
+                {"functionCall": {"id": "google-call-a", "name": "delegate_task", "args": {"task": "research"}}},
+                {"functionCall": {"id": "google-call-b", "name": "delegate_task", "args": {"task": "review"}}}
+            ]}
+        }]
+    }))
+    .expect("provider function calls should parse");
+    let calls = parsed.tool_calls.expect("two tool calls");
+    assert_eq!(calls[0].id, "google-call-a");
+    assert_eq!(calls[1].id, "google-call-b");
+
+    let mut request = request();
+    let tool_calls = calls
+        .iter()
+        .map(|call| {
+            DataValue::Object(BTreeMap::from([
+                ("id".into(), DataValue::String(call.id.clone())),
+                ("name".into(), DataValue::String(call.name.clone())),
+                ("args".into(), DataValue::Object(call.args.clone())),
+            ]))
+        })
+        .collect();
+    request.messages.extend([
+        Message {
+            id: "assistant-call".into(),
+            agent_id: "agent".into(),
+            room_id: "room".into(),
+            content: Content {
+                text: String::new(),
+                attachments: None,
+                metadata: Some(BTreeMap::from([(
+                    "toolCalls".into(),
+                    DataValue::Array(tool_calls),
+                )])),
+            },
+            role: MessageRole::Assistant,
+            created_at_ms: 2,
+        },
+        tool_message("google-call-a", "first result"),
+        tool_message("google-call-b", "second result"),
+    ]);
+
+    let body = crate::google::build_google_body(&agent_config("google", true), &request)
+        .expect("follow-up request should build");
+    let contents = body["contents"].as_array().expect("contents");
+    assert_eq!(
+        contents[1]["parts"][0]["functionCall"]["id"],
+        "google-call-a"
+    );
+    assert_eq!(
+        contents[1]["parts"][1]["functionCall"]["id"],
+        "google-call-b"
+    );
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["name"],
+        "delegate_task"
+    );
+    assert_eq!(
+        contents[2]["parts"][0]["functionResponse"]["id"],
+        "google-call-a"
+    );
+    assert_eq!(
+        contents[3]["parts"][0]["functionResponse"]["name"],
+        "delegate_task"
+    );
+    assert_eq!(
+        contents[3]["parts"][0]["functionResponse"]["id"],
+        "google-call-b"
+    );
 }
 
 #[tokio::test]
@@ -339,6 +497,24 @@ fn request() -> ModelGenerateRequest {
         }],
         temperature: Some(0.2),
         max_tokens: Some(512),
+    }
+}
+
+fn tool_message(call_id: &str, text: &str) -> Message {
+    Message {
+        id: format!("tool-{call_id}"),
+        agent_id: "agent".into(),
+        room_id: "room".into(),
+        content: Content {
+            text: text.into(),
+            attachments: None,
+            metadata: Some(BTreeMap::from([(
+                "toolCallId".into(),
+                DataValue::String(call_id.into()),
+            )])),
+        },
+        role: MessageRole::Tool,
+        created_at_ms: 3,
     }
 }
 

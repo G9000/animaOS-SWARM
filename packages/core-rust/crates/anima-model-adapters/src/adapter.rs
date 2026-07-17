@@ -19,10 +19,11 @@ pub struct ProviderModelAdapter {
 
 impl ProviderModelAdapter {
     pub fn new(config: ProviderAdapterConfig) -> Self {
-        Self {
-            client: Client::new(),
-            config,
-        }
+        Self::with_client(config, Client::new())
+    }
+
+    pub fn with_client(config: ProviderAdapterConfig, client: Client) -> Self {
+        Self { client, config }
     }
 
     fn credential_for(&self, provider: &str, default_base_url: &str) -> ProviderCredential {
@@ -65,8 +66,9 @@ impl ProviderModelAdapter {
             .json(&build_anthropic_body(config, request)?)
             .send()
             .await
-            .map_err(|error| format!("Anthropic request failed: {error}"))?;
-        let payload = response_payload(response, "Anthropic").await?;
+            .map_err(|error| transport_error("Anthropic", "request", error))?;
+        let payload =
+            response_payload(response, "Anthropic", credential.api_key.as_deref()).await?;
         parse_anthropic_response(&payload)
     }
 
@@ -78,20 +80,20 @@ impl ProviderModelAdapter {
     ) -> Result<ModelGenerateResponse, String> {
         let api_key = self.key_required(&credential, "GOOGLE_API_KEY", "google")?;
         let endpoint = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
+            "{}/v1beta/models/{}:generateContent",
             credential.base_url.trim_end_matches('/'),
-            config.model,
-            api_key
+            config.model
         );
         let response = self
             .client
             .post(endpoint)
             .header("content-type", "application/json")
+            .header("x-goog-api-key", api_key)
             .json(&build_google_body(config, request)?)
             .send()
             .await
-            .map_err(|error| format!("Google request failed: {error}"))?;
-        let payload = response_payload(response, "Google").await?;
+            .map_err(|error| transport_error("Google", "request", error))?;
+        let payload = response_payload(response, "Google", credential.api_key.as_deref()).await?;
         parse_google_response(&payload)
     }
 
@@ -114,8 +116,8 @@ impl ProviderModelAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|error| format!("{provider_name} request failed: {error}"))?;
-        let payload = response_payload(response, provider_name).await?;
+            .map_err(|error| transport_error(provider_name, "request", error))?;
+        let payload = response_payload(response, provider_name, api_key).await?;
         parse_openai_compatible_response(&payload, provider_name)
     }
 
@@ -140,8 +142,8 @@ impl ProviderModelAdapter {
         let response = builder
             .send()
             .await
-            .map_err(|error| format!("Ollama request failed: {error}"))?;
-        let payload = response_payload(response, "Ollama").await?;
+            .map_err(|error| transport_error("Ollama", "request", error))?;
+        let payload = response_payload(response, "Ollama", credential.api_key.as_deref()).await?;
         parse_ollama_response(&payload)
     }
 }
@@ -205,20 +207,33 @@ impl ModelAdapter for ProviderModelAdapter {
 async fn response_payload(
     response: reqwest::Response,
     provider: &str,
+    api_key: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     let status = response.status();
     let text = response
         .text()
         .await
-        .map_err(|error| format!("{provider} response read failed: {error}"))?;
+        .map_err(|error| transport_error(provider, "response read", error))?;
     if !status.is_success() {
         return Err(format!(
-            "{provider} API error ({}): {text}",
-            status.as_u16()
+            "{provider} API error ({}): {}",
+            status.as_u16(),
+            sanitize_upstream_body(&text, api_key)
         ));
     }
     serde_json::from_str(&text)
         .map_err(|error| format!("{provider} response parse failed: {error}"))
+}
+
+fn sanitize_upstream_body(body: &str, api_key: Option<&str>) -> String {
+    let redacted = api_key
+        .filter(|key| !key.is_empty())
+        .map_or_else(|| body.to_owned(), |key| body.replace(key, "[REDACTED]"));
+    redacted.chars().take(1_024).collect()
+}
+
+fn transport_error(provider: &str, operation: &str, error: reqwest::Error) -> String {
+    format!("{provider} {operation} failed: {}", error.without_url())
 }
 
 fn join_base_url(base_url: &str, path: &str) -> String {
