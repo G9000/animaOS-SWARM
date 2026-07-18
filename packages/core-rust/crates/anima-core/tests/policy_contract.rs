@@ -1,8 +1,8 @@
 use anima_core::{
     ApprovalDecision, ApprovalValidity, AutonomyGrant, CapabilityKind, CapabilityManifest,
-    CapabilityReferenceId, GrantConsumption, GrantScope, GrantStatus, LogicalInvocation,
-    PolicyContext, PolicyDecision, PolicyEngine, PolicyEvaluation, PolicyReason, PolicyReasonCode,
-    PolicyRestrictions, PolicyValidationError, RiskLevel, RuntimeCompatibility,
+    CapabilityReferenceId, GrantConsumption, GrantEffect, GrantScope, GrantStatus,
+    LogicalInvocation, PolicyContext, PolicyDecision, PolicyEngine, PolicyEvaluation, PolicyReason,
+    PolicyReasonCode, PolicyRestrictions, PolicyValidationError, RiskLevel, RuntimeCompatibility,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -95,6 +95,21 @@ fn grant(context: &PolicyContext, maximum_risk: RiskLevel) -> AutonomyGrant {
         500,
         Some(2_000),
         Some(1),
+    )
+    .unwrap()
+}
+
+fn approval_grant(context: &PolicyContext, maximum_risk: RiskLevel) -> AutonomyGrant {
+    AutonomyGrant::new_with_effect(
+        "approval-grant",
+        1,
+        GrantStatus::Active,
+        scope(context),
+        maximum_risk,
+        500,
+        Some(2_000),
+        Some(1),
+        GrantEffect::ApprovalRequired,
     )
     .unwrap()
 }
@@ -576,7 +591,7 @@ fn nil_resource_references_are_rejected_on_construction_validation_and_serde() {
 }
 
 #[test]
-fn matching_grants_cannot_be_reused_as_approval_bindings() {
+fn auto_allow_grants_make_approval_requests_unnecessary() {
     let context = context(
         RiskLevel::High,
         invocation(json!({ "path": "reports/a.md" })),
@@ -584,6 +599,106 @@ fn matching_grants_cannot_be_reused_as_approval_bindings() {
     );
     let grant = grant(&context, RiskLevel::High);
     assert!(PolicyEngine::approval_request(&context, Some(&grant)).is_err());
+}
+
+#[test]
+fn approval_required_grants_bind_critical_approvals_and_fail_closed_after_change() {
+    let context = context(
+        RiskLevel::Critical,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let approval_grant = approval_grant(&context, RiskLevel::Critical);
+    let encoded_grant = serde_json::to_value(&approval_grant).unwrap();
+    assert_eq!(encoded_grant["effect"], json!("approval_required"));
+    assert_eq!(
+        serde_json::from_value::<AutonomyGrant>(encoded_grant)
+            .unwrap()
+            .effect,
+        GrantEffect::ApprovalRequired
+    );
+    let evaluation = PolicyEngine::evaluate(&context, &[approval_grant.clone()]).unwrap();
+    assert!(matches!(
+        evaluation.decision,
+        PolicyDecision::RequireApproval(_)
+    ));
+    assert_eq!(
+        evaluation.decision.reason().grant_id.as_deref(),
+        Some("approval-grant")
+    );
+    assert_eq!(evaluation.decision.reason().grant_revision, Some(1));
+
+    let request = PolicyEngine::approval_request(&context, Some(&approval_grant)).unwrap();
+    assert_eq!(request.grant_id.as_deref(), Some("approval-grant"));
+    let approval = ApprovalDecision::new_approved(request, 1_000).unwrap();
+    assert!(matches!(
+        PolicyEngine::evaluate_with_approval(&context, &[approval_grant.clone()], Some(&approval))
+            .unwrap()
+            .decision,
+        PolicyDecision::Allow(_)
+    ));
+
+    let mut revoked = approval_grant.clone();
+    revoked.status = GrantStatus::Revoked;
+    assert!(matches!(
+        PolicyEngine::evaluate_with_approval(&context, &[revoked], Some(&approval))
+            .unwrap()
+            .decision,
+        PolicyDecision::Deny(_)
+    ));
+
+    let mut expired = approval_grant.clone();
+    expired.valid_until_ms = Some(999);
+    assert!(matches!(
+        PolicyEngine::evaluate_with_approval(&context, &[expired], Some(&approval))
+            .unwrap()
+            .decision,
+        PolicyDecision::Deny(_)
+    ));
+
+    let mut revised = approval_grant.clone();
+    revised.revision = 2;
+    assert!(matches!(
+        PolicyEngine::evaluate_with_approval(&context, &[revised], Some(&approval))
+            .unwrap()
+            .decision,
+        PolicyDecision::RequireApproval(_)
+    ));
+
+    let mut nonmatching = approval_grant.clone();
+    nonmatching.scope.canonical_argument_digest = Some(Uuid::from_u128(99));
+    assert!(PolicyEngine::approval_request(&context, Some(&nonmatching)).is_err());
+
+    let auto_allow = grant(&context, RiskLevel::Critical);
+    let mut legacy_auto_allow = serde_json::to_value(&auto_allow).unwrap();
+    legacy_auto_allow.as_object_mut().unwrap().remove("effect");
+    assert_eq!(
+        serde_json::from_value::<AutonomyGrant>(legacy_auto_allow)
+            .unwrap()
+            .effect,
+        GrantEffect::AutoAllow
+    );
+    assert!(matches!(
+        PolicyEngine::evaluate(&context, &[auto_allow.clone()])
+            .unwrap()
+            .decision,
+        PolicyDecision::Allow(_)
+    ));
+    assert!(PolicyEngine::approval_request(&context, Some(&auto_allow)).is_err());
+
+    let mut lexically_later_required = approval_grant;
+    lexically_later_required.id = "z-required".into();
+    let mut lexically_earlier_auto = grant(&context, RiskLevel::Critical);
+    lexically_earlier_auto.id = "a-auto".into();
+    assert!(matches!(
+        PolicyEngine::evaluate(
+            &context,
+            &[lexically_earlier_auto, lexically_later_required]
+        )
+        .unwrap()
+        .decision,
+        PolicyDecision::RequireApproval(_)
+    ));
 }
 
 #[test]

@@ -39,8 +39,9 @@ pub use model::{
 pub use persistence::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
 pub use policy::{
     ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity, AutonomyGrant,
-    GrantConsumption, GrantScope, GrantStatus, PolicyContext, PolicyDecision, PolicyEngine,
-    PolicyEvaluation, PolicyReason, PolicyReasonCode, PolicyRestrictions, PolicyValidationError,
+    GrantConsumption, GrantEffect, GrantScope, GrantStatus, PolicyContext, PolicyDecision,
+    PolicyEngine, PolicyEvaluation, PolicyReason, PolicyReasonCode, PolicyRestrictions,
+    PolicyValidationError,
 };
 pub use primitives::{
     AgentId, Attachment, AttachmentType, Content, DataValue, LockRecover, Message, MessageId,

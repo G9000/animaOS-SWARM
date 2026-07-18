@@ -603,12 +603,24 @@ pub enum GrantStatus {
     Revoked,
 }
 
+/// How a matching autonomy grant changes policy evaluation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantEffect {
+    /// The grant directly permits the action within its exact scope.
+    #[default]
+    AutoAllow,
+    /// The grant permits the action only after a bound owner approval.
+    ApprovalRequired,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutonomyGrant {
     pub id: String,
     pub revision: u32,
     pub status: GrantStatus,
+    pub effect: GrantEffect,
     pub scope: GrantScope,
     pub maximum_risk: RiskLevel,
     pub valid_from_ms: i64,
@@ -624,6 +636,7 @@ impl fmt::Debug for AutonomyGrant {
             .field("id", &"REDACTED")
             .field("revision", &self.revision)
             .field("status", &self.status)
+            .field("effect", &self.effect)
             .field("scope", &self.scope)
             .field("maximum_risk", &self.maximum_risk)
             .field("valid_from_ms", &self.valid_from_ms)
@@ -645,10 +658,36 @@ impl AutonomyGrant {
         valid_until_ms: Option<i64>,
         remaining_uses: Option<u32>,
     ) -> Result<Self, PolicyValidationError> {
+        Self::new_with_effect(
+            id,
+            revision,
+            status,
+            scope,
+            maximum_risk,
+            valid_from_ms,
+            valid_until_ms,
+            remaining_uses,
+            GrantEffect::AutoAllow,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_effect(
+        id: impl Into<String>,
+        revision: u32,
+        status: GrantStatus,
+        scope: GrantScope,
+        maximum_risk: RiskLevel,
+        valid_from_ms: i64,
+        valid_until_ms: Option<i64>,
+        remaining_uses: Option<u32>,
+        effect: GrantEffect,
+    ) -> Result<Self, PolicyValidationError> {
         let grant = Self {
             id: id.into(),
             revision,
             status,
+            effect,
             scope,
             maximum_risk,
             valid_from_ms,
@@ -684,7 +723,7 @@ impl<'de> Deserialize<'de> for AutonomyGrant {
         D: Deserializer<'de>,
     {
         let wire = AutonomyGrantWire::deserialize(deserializer)?;
-        Self::new(
+        Self::new_with_effect(
             wire.id,
             wire.revision,
             wire.status,
@@ -693,6 +732,7 @@ impl<'de> Deserialize<'de> for AutonomyGrant {
             wire.valid_from_ms,
             wire.valid_until_ms,
             wire.remaining_uses,
+            wire.effect,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -704,6 +744,8 @@ struct AutonomyGrantWire {
     id: String,
     revision: u32,
     status: GrantStatus,
+    #[serde(default)]
+    effect: GrantEffect,
     scope: GrantScope,
     maximum_risk: RiskLevel,
     valid_from_ms: i64,
@@ -1208,28 +1250,45 @@ impl PolicyEngine {
         context.validate_evaluation_input()?;
         let effective_risk = context.effective_risk();
         if let Some(grant) = select_grant(context, grants) {
-            let reason_code = if requires_exact_argument_scope(context) {
-                PolicyReasonCode::AllowedByExactGrantOverride
-            } else {
-                PolicyReasonCode::AllowedByGrant
-            };
-            let decision = PolicyDecision::Allow(reason(
-                reason_code,
-                effective_risk,
-                context.policy_revision,
-                Some(grant),
-            ));
-            let consumption = grant
-                .remaining_uses
-                .map(|_| {
-                    GrantConsumption::new(
-                        grant.id.clone(),
-                        grant.revision,
-                        context.logical_invocation_id,
-                    )
-                })
-                .transpose()?;
-            return PolicyEvaluation::new(decision, consumption);
+            if grant.effect == GrantEffect::ApprovalRequired
+                && (context.restrictions.deny
+                    || effective_risk == RiskLevel::Critical
+                    || risk_rank(effective_risk) >= risk_rank(RiskLevel::Medium))
+            {
+                return PolicyEvaluation::new(
+                    PolicyDecision::RequireApproval(reason(
+                        PolicyReasonCode::ApprovalRequired,
+                        effective_risk,
+                        context.policy_revision,
+                        Some(grant),
+                    )),
+                    None,
+                );
+            }
+            if grant.effect == GrantEffect::AutoAllow {
+                let reason_code = if requires_exact_argument_scope(context) {
+                    PolicyReasonCode::AllowedByExactGrantOverride
+                } else {
+                    PolicyReasonCode::AllowedByGrant
+                };
+                let decision = PolicyDecision::Allow(reason(
+                    reason_code,
+                    effective_risk,
+                    context.policy_revision,
+                    Some(grant),
+                ));
+                let consumption = grant
+                    .remaining_uses
+                    .map(|_| {
+                        GrantConsumption::new(
+                            grant.id.clone(),
+                            grant.revision,
+                            context.logical_invocation_id,
+                        )
+                    })
+                    .transpose()?;
+                return PolicyEvaluation::new(decision, consumption);
+            }
         }
         let decision = if context.restrictions.deny {
             PolicyDecision::Deny(reason(
@@ -1435,6 +1494,7 @@ impl PolicyEngine {
                 if grants.iter().any(|grant| {
                     grant.id == *id
                         && grant.revision == revision
+                        && grant.effect == GrantEffect::ApprovalRequired
                         && Self::grant_matches(grant, context)
                 }) =>
             {
@@ -1446,9 +1506,10 @@ impl PolicyEngine {
 }
 
 /// Matching grants are sorted by a total narrowness order. Argument-bound scopes and lower risk
-/// ceilings come first. Within otherwise equivalent scopes, the smallest remaining-use count,
-/// earliest finite expiry, and latest valid-from time win; stable lexical ID and highest revision
-/// make every residual tie deterministic. Input order is ignored.
+/// ceilings come first. Otherwise-equal approval-required grants outrank auto-allow grants, then
+/// the smallest remaining-use count, earliest finite expiry, and latest valid-from time win;
+/// stable lexical ID and highest revision make every residual tie deterministic. Input order is
+/// ignored.
 fn select_grant<'a>(
     context: &PolicyContext,
     grants: &'a [AutonomyGrant],
@@ -1460,6 +1521,7 @@ fn select_grant<'a>(
             (
                 grant.scope.canonical_argument_digest.is_none(),
                 risk_rank(grant.maximum_risk),
+                grant.effect != GrantEffect::ApprovalRequired,
                 grant.remaining_uses.is_none(),
                 grant.remaining_uses.unwrap_or(u32::MAX),
                 grant.valid_until_ms.is_none(),
