@@ -267,6 +267,7 @@ fn approval_resume_requires_the_exact_pending_request_command_and_live_claim() {
     let request = PolicyEngine::approval_request(&context, None).unwrap();
     let decision = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
     let claim = ApprovalResumeClaim::new(&request, &decision, &context, &[]).unwrap();
+    assert!(claim.grant_consumption_snapshot().is_none());
     let waiting = Run::queued(id(1), id(2), "writer", 3)
         .unwrap()
         .transition(RunState::Running, None)
@@ -329,6 +330,36 @@ fn approval_resume_claim_binds_live_grant_and_consumption_proposal() {
         claim.grant_consumption(),
         Some(&GrantConsumption::new("approval-grant", 1, context.logical_invocation_id).unwrap())
     );
+    assert_eq!(
+        claim.grant_consumption_snapshot().unwrap().remaining_uses(),
+        1
+    );
+
+    let mut uncounted = grant.clone();
+    uncounted.remaining_uses = None;
+    assert!(
+        ApprovalResumeClaim::new_with_grants(&request, &decision, &context, &[uncounted]).is_err()
+    );
+    let mut inflated = grant.clone();
+    inflated.remaining_uses = Some(2);
+    assert!(
+        ApprovalResumeClaim::new_with_grants(&request, &decision, &context, &[inflated]).is_err()
+    );
+    let mut uncounted_grant = grant.clone();
+    uncounted_grant.remaining_uses = None;
+    let uncounted_request =
+        PolicyEngine::approval_request(&context, Some(&uncounted_grant)).unwrap();
+    let uncounted_decision =
+        ApprovalDecision::new_approved(uncounted_request.clone(), 1_000).unwrap();
+    let uncounted_claim = ApprovalResumeClaim::new_with_grants(
+        &uncounted_request,
+        &uncounted_decision,
+        &context,
+        &[uncounted_grant],
+    )
+    .unwrap();
+    assert!(uncounted_claim.grant_consumption().is_none());
+    assert!(uncounted_claim.grant_consumption_snapshot().is_none());
 
     assert!(ApprovalResumeClaim::new(&request, &decision, &context, &[]).is_err());
     let mut revoked = grant.clone();

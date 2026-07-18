@@ -17,9 +17,9 @@ pub use memory_store::InMemoryExecutionStore;
 pub use state::{
     ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, Budget,
     BudgetDecision, CommandOutcome, CommandReceipt, ExecutionError, ExecutionErrorCode,
-    ExecutionLease, RecoveryTerminalOutcome, RecoveryTerminalResolution, Run, RunPauseReason,
-    RunState, RuntimeCommand, RuntimeCommandKind, Session, SessionConcurrencyPolicy, Step,
-    StepKind, Usage,
+    ExecutionLease, GrantConsumptionSnapshot, RecoveryTerminalOutcome, RecoveryTerminalResolution,
+    Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, Session,
+    SessionConcurrencyPolicy, Step, StepKind, Usage,
 };
 pub use store::{
     assert_execution_store_conformance, ApprovalGrantMutation, CreateRun, DurableResultMutation,

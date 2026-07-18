@@ -898,6 +898,7 @@ pub struct ApprovalRequest {
     pub policy_revision: u32,
     pub grant_id: Option<String>,
     pub grant_revision: Option<u32>,
+    pub grant_remaining_uses: Option<u32>,
     pub requested_at_ms: i64,
     pub expires_at_ms: i64,
 }
@@ -924,6 +925,7 @@ impl fmt::Debug for ApprovalRequest {
             .field("policy_revision", &self.policy_revision)
             .field("grant_id", &self.grant_id.as_ref().map(|_| "REDACTED"))
             .field("grant_revision", &self.grant_revision)
+            .field("grant_remaining_uses", &self.grant_remaining_uses)
             .field("requested_at_ms", &self.requested_at_ms)
             .field("expires_at_ms", &self.expires_at_ms)
             .finish()
@@ -974,12 +976,18 @@ impl ApprovalRequest {
         {
             return Err(PolicyValidationError::InconsistentApprovalBinding);
         }
-        match (&self.grant_id, self.grant_revision) {
-            (Some(id), Some(revision)) if revision > 0 => {
+        match (
+            &self.grant_id,
+            self.grant_revision,
+            self.grant_remaining_uses,
+        ) {
+            (Some(id), Some(revision), remaining_uses)
+                if revision > 0 && remaining_uses.is_none_or(|uses| uses > 0) =>
+            {
                 validate_policy_identifier("grant_id", id)?;
                 Ok(())
             }
-            (None, None) => Ok(()),
+            (None, None, None) => Ok(()),
             _ => Err(PolicyValidationError::InconsistentApprovalBinding),
         }
     }
@@ -1017,6 +1025,7 @@ struct ApprovalRequestWire {
     policy_revision: u32,
     grant_id: Option<String>,
     grant_revision: Option<u32>,
+    grant_remaining_uses: Option<u32>,
     requested_at_ms: i64,
     expires_at_ms: i64,
 }
@@ -1042,6 +1051,7 @@ impl ApprovalRequestWire {
             policy_revision: self.policy_revision,
             grant_id: self.grant_id,
             grant_revision: self.grant_revision,
+            grant_remaining_uses: self.grant_remaining_uses,
             requested_at_ms: self.requested_at_ms,
             expires_at_ms: self.expires_at_ms,
         }
@@ -1420,6 +1430,7 @@ impl PolicyEngine {
             policy_revision: context.policy_revision,
             grant_id: grant.map(|grant| grant.id.clone()),
             grant_revision: grant.map(|grant| grant.revision),
+            grant_remaining_uses: grant.and_then(|grant| grant.remaining_uses),
             requested_at_ms: context.now_ms,
             expires_at_ms,
         };
@@ -1525,7 +1536,8 @@ impl PolicyEngine {
             (Some(id), Some(revision)) => match validated_grant_by_identity(grants, id, revision) {
                 Ok(Some(grant))
                     if grant.effect == GrantEffect::ApprovalRequired
-                        && Self::grant_matches(grant, context) =>
+                        && Self::grant_matches(grant, context)
+                        && grant.remaining_uses == request.grant_remaining_uses =>
                 {
                     ApprovalValidity::Valid
                 }

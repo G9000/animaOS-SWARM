@@ -479,7 +479,7 @@ impl Run {
         )?;
         Ok(ApprovalResumeOutcome {
             run,
-            grant_consumption: claim.grant_consumption,
+            grant_consumption: claim.grant_consumption().cloned(),
         })
     }
 
@@ -511,7 +511,7 @@ impl Run {
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
                 }
-                claim.grant_consumption.clone()
+                claim.grant_consumption().cloned()
             }
             RunState::Paused if self.pause_reason == Some(RunPauseReason::RecoveryRequired) => {
                 let (Some(expected), Some(command_binding), Some(claim)) = (
@@ -875,15 +875,51 @@ pub struct ApprovalResumeBinding {
     decision: ApprovalDecision,
 }
 
+/// Exact counted-grant state validated with an approval claim and consumed by the store via CAS.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantConsumptionSnapshot {
+    consumption: GrantConsumption,
+    remaining_uses: u32,
+}
+
+impl GrantConsumptionSnapshot {
+    fn new(consumption: GrantConsumption, remaining_uses: u32) -> Result<Self, ExecutionError> {
+        if remaining_uses == 0 {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        Ok(Self {
+            consumption,
+            remaining_uses,
+        })
+    }
+
+    pub fn consumption(&self) -> &GrantConsumption {
+        &self.consumption
+    }
+
+    pub fn remaining_uses(&self) -> u32 {
+        self.remaining_uses
+    }
+}
+
 /// A live policy validation prerequisite. Hosts recreate it against current policy context.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalResumeClaim {
     binding: ApprovalResumeBinding,
-    grant_consumption: Option<GrantConsumption>,
+    grant_consumption_snapshot: Option<GrantConsumptionSnapshot>,
 }
 
 impl ApprovalResumeClaim {
     pub fn new(
+        pending: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        context: &PolicyContext,
+        grants: &[AutonomyGrant],
+    ) -> Result<Self, ExecutionError> {
+        Self::new_with_grants(pending, decision, context, grants)
+    }
+
+    pub fn new_with_grants(
         pending: &ApprovalRequest,
         decision: &ApprovalDecision,
         context: &PolicyContext,
@@ -901,11 +937,25 @@ impl ApprovalResumeClaim {
         if evaluation.decision.kind() != PolicyReasonCode::AllowedByApproval {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
+        let grant_consumption_snapshot = match evaluation.consumption {
+            Some(consumption) => {
+                let remaining_uses = grants
+                    .iter()
+                    .find(|grant| {
+                        grant.id == consumption.grant_id
+                            && grant.revision == consumption.grant_revision
+                    })
+                    .and_then(|grant| grant.remaining_uses)
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
+                Some(GrantConsumptionSnapshot::new(consumption, remaining_uses)?)
+            }
+            None => None,
+        };
         Ok(Self {
             binding: ApprovalResumeBinding {
                 decision: decision.clone(),
             },
-            grant_consumption: evaluation.consumption,
+            grant_consumption_snapshot,
         })
     }
 
@@ -913,7 +963,12 @@ impl ApprovalResumeClaim {
         &self.binding
     }
     pub fn grant_consumption(&self) -> Option<&GrantConsumption> {
-        self.grant_consumption.as_ref()
+        self.grant_consumption_snapshot
+            .as_ref()
+            .map(GrantConsumptionSnapshot::consumption)
+    }
+    pub fn grant_consumption_snapshot(&self) -> Option<&GrantConsumptionSnapshot> {
+        self.grant_consumption_snapshot.as_ref()
     }
 }
 

@@ -132,7 +132,7 @@ fn approval_resume_parts(
         waiting,
         target,
         command,
-        ApprovalGrantMutation::from_claim(claim, Some(1)).unwrap(),
+        ApprovalGrantMutation::from_claim(claim),
     )
 }
 
@@ -141,6 +141,7 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
     let store = InMemoryExecutionStore::default();
     let session = Session::new(id(60), "writer", 3, SessionConcurrencyPolicy::Serial).unwrap();
     let (waiting, target, command, approval) = approval_resume_parts(&session, id(63));
+    assert_eq!(approval.remaining_uses(), Some(1));
     store
         .create_run(CreateRun::new(
             session.clone(),

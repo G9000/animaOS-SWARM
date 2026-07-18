@@ -37,12 +37,13 @@ pub use definition::{
 };
 pub use events::{EngineEvent, EventType};
 pub use execution::{
-    assert_execution_store_conformance, ApprovalGrantMutation, ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome,
-    Attempt, AttemptRecordState, Budget, BudgetDecision, CheckpointCursor, CheckpointV1,
-    CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord, CreateRun,
-    DefinitionPin, DurableResultMutation, ExecutionCommit, ExecutionCommitOutcome, ExecutionError,
-    ExecutionErrorCode, ExecutionLease, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreErrorCode, ExecutionStoreFactory, InMemoryExecutionStore, InvocationAttemptRecord, LiveRuntimeEvent,
+    assert_execution_store_conformance, ApprovalGrantMutation, ApprovalResumeBinding,
+    ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, AttemptRecordState, Budget,
+    BudgetDecision, CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome,
+    CommandReceipt, CompletedInvocationRecord, CreateRun, DefinitionPin, DurableResultMutation,
+    ExecutionCommit, ExecutionCommitOutcome, ExecutionError, ExecutionErrorCode, ExecutionLease,
+    ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode, ExecutionStoreFactory,
+    GrantConsumptionSnapshot, InMemoryExecutionStore, InvocationAttemptRecord, LiveRuntimeEvent,
     ManifestPin, OpaqueReference, PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord,
     RecoveryRecord, RecoveryTerminalOutcome, RecoveryTerminalResolution, Run, RunPauseReason,
     RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent, RuntimeEventKind, SafeEventPayload,

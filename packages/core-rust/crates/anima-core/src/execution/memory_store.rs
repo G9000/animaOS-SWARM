@@ -37,7 +37,7 @@ struct State {
     receipts: BTreeMap<Uuid, CommandReceipt>,
     outcomes: BTreeMap<Uuid, ExecutionCommitOutcome>,
     grant_consumptions: BTreeSet<(String, u32, Uuid)>,
-    grant_use_counts: BTreeMap<(String, u32), u32>,
+    grant_remaining_uses: BTreeMap<(String, u32), u32>,
 }
 
 /// In-process reference adapter. It clones no externally visible state until validation succeeds.
@@ -292,6 +292,12 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ));
             }
             if let Some(consumption) = approval.grant_consumption() {
+                let snapshot = approval
+                    .claim()
+                    .grant_consumption_snapshot()
+                    .ok_or_else(|| {
+                        ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest)
+                    })?;
                 let key = (
                     consumption.grant_id.clone(),
                     consumption.grant_revision,
@@ -303,14 +309,16 @@ impl ExecutionStore for InMemoryExecutionStore {
                     ));
                 }
                 let grant_key = (consumption.grant_id.clone(), consumption.grant_revision);
-                let used = next.grant_use_counts.get(&grant_key).copied().unwrap_or(0);
-                if approval.remaining_uses().is_some_and(|limit| used >= limit) {
+                let remaining = next
+                    .grant_remaining_uses
+                    .entry(grant_key)
+                    .or_insert(snapshot.remaining_uses());
+                if *remaining != snapshot.remaining_uses() || *remaining == 0 {
                     return Err(ExecutionStoreError::new(
                         ExecutionStoreErrorCode::GrantAlreadyConsumed,
                     ));
                 }
-                next.grant_use_counts
-                    .insert(grant_key, used.saturating_add(1));
+                *remaining = remaining.saturating_sub(1);
             }
         }
         for step in commit.steps() {
