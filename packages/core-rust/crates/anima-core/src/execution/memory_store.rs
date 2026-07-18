@@ -101,7 +101,7 @@ impl ExecutionStore for InMemoryExecutionStore {
                         ExecutionStoreErrorCode::VersionConflict,
                     ));
                 }
-                current.revoked()
+                current.as_revoked()
             }
         };
         state
@@ -691,19 +691,32 @@ impl ExecutionStore for InMemoryExecutionStore {
     async fn replay_events(
         &self,
         run_id: Uuid,
-        after_sequence: u64,
-    ) -> Result<Vec<RuntimeEvent>, ExecutionStoreError> {
+        page: super::StoreReadPage,
+    ) -> Result<super::EventReplayPage, ExecutionStoreError> {
         let state = self.state.lock().await;
         let aggregate = state
             .runs
             .get(&run_id)
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
-        Ok(aggregate
+        let take = usize::try_from(page.limit())
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
+        let mut events = aggregate
             .events
             .iter()
-            .filter(|event| event.sequence() > after_sequence)
+            .filter(|event| event.sequence() > page.offset())
+            .take(take)
             .cloned()
-            .collect())
+            .collect::<Vec<_>>();
+        let has_more = events.len() > usize::try_from(page.limit()).unwrap_or(usize::MAX);
+        if has_more {
+            events.pop();
+        }
+        let next_after_sequence = has_more
+            .then(|| events.last().map(RuntimeEvent::sequence))
+            .flatten();
+        super::EventReplayPage::new(events, next_after_sequence)
     }
 }
 

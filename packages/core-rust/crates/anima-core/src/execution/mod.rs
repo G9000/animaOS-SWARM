@@ -24,9 +24,9 @@ pub use state::{
 };
 pub use store::{
     assert_execution_store_conformance, ApprovalGrantMutation, AuthoritativeGrantChange,
-    AuthoritativeGrantState, AuthoritativeGrantStatus, CreateRun, DurableResultMutation,
-    ExecutionCommit, ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreErrorCode, ExecutionStoreFactory, StoreReadPage, StoredRun, MAX_COMMIT_ATTEMPTS,
-    MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS, MAX_COMMIT_RESULTS, MAX_COMMIT_STEPS,
-    MAX_STORE_READ_PAGE_SIZE,
+    AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus, CreateRun,
+    DurableResultMutation, EventReplayPage, ExecutionCommit, ExecutionCommitOutcome,
+    ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode, ExecutionStoreFactory,
+    StoreReadPage, StoredRun, MAX_COMMIT_ATTEMPTS, MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS,
+    MAX_COMMIT_RESULTS, MAX_COMMIT_STEPS, MAX_STORE_READ_PAGE_SIZE,
 };

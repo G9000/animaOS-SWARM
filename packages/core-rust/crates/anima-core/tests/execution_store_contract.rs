@@ -1,15 +1,16 @@
 use anima_core::{
     assert_execution_store_conformance, ApprovalDecision, ApprovalGrantMutation,
-    ApprovalResumeClaim, AttemptRecordState, AuthoritativeGrantChange, AuthoritativeGrantState,
-    AuthoritativeGrantStatus, AutonomyGrant, Budget, CapabilityKind, CapabilityManifest,
-    CapabilityReferenceId, CheckpointCursor, CheckpointV1Builder, CompletedInvocationRecord,
-    CreateRun, DefinitionPin, DurableCapabilityResult, DurableCapabilityStatus,
-    DurableResultMutation, ExecutionCommit, ExecutionStep, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreErrorCode, ExecutionStoreFactory, GrantEffect, GrantScope, GrantStatus,
-    InMemoryExecutionStore, InvocationAttemptRecord, LogicalInvocation, ManifestPin,
-    OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run,
-    RunState, RuntimeCommand, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session,
-    SessionConcurrencyPolicy, StoreReadPage, Usage, MAX_COMMIT_EVENTS,
+    ApprovalResumeClaim, AttemptRecordState, AuthoritativeGrantChange,
+    AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus, AutonomyGrant,
+    Budget, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointCursor,
+    CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin,
+    DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
+    ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
+    ExecutionStoreFactory, GrantEffect, GrantScope, GrantStatus, InMemoryExecutionStore,
+    InvocationAttemptRecord, LogicalInvocation, ManifestPin, OpaqueReference, PolicyContext,
+    PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run, RunState, RuntimeCommand,
+    RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session, SessionConcurrencyPolicy,
+    StoreReadPage, Usage, MAX_COMMIT_EVENTS,
 };
 use uuid::Uuid;
 
@@ -58,17 +59,22 @@ async fn authoritative_grant_state_uses_trusted_create_update_and_revoke_cas() {
     let upgraded = AuthoritativeGrantState::active("grant-cas", 2, Some(3)).unwrap();
     assert_eq!(
         store
-            .apply_authoritative_grant(AuthoritativeGrantChange::update(1, upgraded.clone()))
+            .apply_authoritative_grant(
+                AuthoritativeGrantChange::update(1, upgraded.clone()).unwrap(),
+            )
             .await
             .unwrap(),
         upgraded
     );
     assert_eq!(
         store
-            .apply_authoritative_grant(AuthoritativeGrantChange::update(
-                1,
-                AuthoritativeGrantState::active("grant-cas", 3, Some(4)).unwrap(),
-            ))
+            .apply_authoritative_grant(
+                AuthoritativeGrantChange::update(
+                    1,
+                    AuthoritativeGrantState::active("grant-cas", 3, Some(4)).unwrap(),
+                )
+                .unwrap(),
+            )
             .await
             .unwrap_err()
             .code(),
@@ -84,6 +90,46 @@ async fn authoritative_grant_state_uses_trusted_create_update_and_revoke_cas() {
         store.load_authoritative_grant("grant-cas").await.unwrap(),
         Some(revoked)
     );
+}
+
+#[test]
+fn external_adapters_can_exhaustively_inspect_validated_grant_changes() {
+    fn inspect(change: &AuthoritativeGrantChange) -> (&str, Option<u32>, Option<u32>) {
+        match change.kind() {
+            AuthoritativeGrantChangeKind::Create(state) => {
+                (state.grant_id(), None, Some(state.revision()))
+            }
+            AuthoritativeGrantChangeKind::Update {
+                expected_revision,
+                state,
+            } => (
+                state.grant_id(),
+                Some(*expected_revision),
+                Some(state.revision()),
+            ),
+            AuthoritativeGrantChangeKind::Revoke {
+                grant_id,
+                expected_revision,
+            } => (grant_id, Some(*expected_revision), None),
+        }
+    }
+
+    let create = AuthoritativeGrantChange::create(
+        AuthoritativeGrantState::active("external-grant", 1, Some(2)).unwrap(),
+    );
+    let update = AuthoritativeGrantChange::update(
+        1,
+        AuthoritativeGrantState::active("external-grant", 2, Some(1)).unwrap(),
+    )
+    .unwrap();
+    let revoke = AuthoritativeGrantChange::revoke("external-grant", 2).unwrap();
+    let revoked = AuthoritativeGrantState::revoked("external-grant", 3, Some(1)).unwrap();
+
+    assert_eq!(inspect(&create), ("external-grant", None, Some(1)));
+    assert_eq!(inspect(&update), ("external-grant", Some(1), Some(2)));
+    assert_eq!(inspect(&revoke), ("external-grant", Some(2), None));
+    assert_eq!(revoked.status(), AuthoritativeGrantStatus::Revoked);
+    assert!(AuthoritativeGrantChange::update(0, revoked).is_err());
 }
 
 fn approval_resume_parts(
@@ -824,9 +870,10 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
         &queued
     );
     assert!(store
-        .replay_events(queued.id(), 0)
+        .replay_events(queued.id(), StoreReadPage::new(0, 256).unwrap())
         .await
         .unwrap()
+        .events()
         .is_empty());
 
     let event = RuntimeEvent::new(
@@ -1182,23 +1229,34 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
         ExecutionStep::new(queued.id(), "page-b", anima_core::StepKind::Capability).unwrap(),
         ExecutionStep::new(queued.id(), "page-c", anima_core::StepKind::Capability).unwrap(),
     ];
-    let event = RuntimeEvent::new(
-        id(114),
-        owner,
-        session.id(),
-        queued.id(),
-        1,
-        1,
+    let events = [
         RuntimeEventKind::RunStarted,
-    )
-    .unwrap();
+        RuntimeEventKind::StepStarted,
+        RuntimeEventKind::StepCompleted,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(offset, kind)| {
+        let sequence = u64::try_from(offset).unwrap() + 1;
+        RuntimeEvent::new(
+            id(114 + u128::try_from(offset).unwrap()),
+            owner,
+            session.id(),
+            queued.id(),
+            sequence,
+            sequence,
+            kind,
+        )
+        .unwrap()
+    })
+    .collect::<Vec<_>>();
     store
         .commit_execution(ExecutionCommit::new(
             created.run_version(),
             0,
             lease,
             RuntimeCommand::start(id(115), session.id(), queued.id()).unwrap(),
-            vec![event],
+            events.clone(),
             steps.clone(),
             vec![],
             vec![],
@@ -1222,6 +1280,22 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
         steps[2..]
     );
     assert!(StoreReadPage::new(0, 0).is_err());
+    let first_events = store
+        .replay_events(queued.id(), StoreReadPage::new(0, 2).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first_events.events(), &events[..2]);
+    assert_eq!(first_events.next_after_sequence(), Some(2));
+    let last_events = store
+        .replay_events(
+            queued.id(),
+            StoreReadPage::new(first_events.next_after_sequence().unwrap(), 2).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(last_events.events(), &events[2..]);
+    assert_eq!(last_events.next_after_sequence(), None);
+    assert!(StoreReadPage::new(0, anima_core::MAX_STORE_READ_PAGE_SIZE + 1).is_err());
 }
 
 #[tokio::test]
@@ -1292,8 +1366,12 @@ async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() 
         .await
         .unwrap();
     assert_eq!(
-        store.replay_events(queued.id(), 0).await.unwrap(),
-        vec![event]
+        store
+            .replay_events(queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .await
+            .unwrap()
+            .events(),
+        &[event]
     );
 }
 
