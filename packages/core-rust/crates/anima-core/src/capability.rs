@@ -1,9 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use jsonschema::JSONSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
@@ -124,6 +122,7 @@ pub enum ManifestCatalogError {
     InvalidManifestSchemaVersion,
     InvalidSchemaDigest,
     InvalidSecretReferenceName,
+    TooManySecretReferences,
     InvalidRuntimeCompatibility,
     InvalidProfileId,
     InvalidProfileVersion,
@@ -152,6 +151,9 @@ impl fmt::Display for ManifestCatalogError {
             }
             Self::InvalidSecretReferenceName => {
                 write!(formatter, "manifest secret reference names are invalid")
+            }
+            Self::TooManySecretReferences => {
+                write!(formatter, "manifest has too many secret references")
             }
             Self::InvalidRuntimeCompatibility => {
                 write!(formatter, "runtime compatibility bounds are invalid")
@@ -295,6 +297,7 @@ pub const MAX_CAPABILITY_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_CAPABILITY_ARGUMENT_DEPTH: usize = 64;
 pub const MAX_CAPABILITY_ARGUMENT_NODES: usize = 10_000;
 pub const MAX_CAPABILITY_ID_BYTES: usize = 256;
+pub const MAX_CAPABILITY_SECRET_REFERENCES: usize = (u16::MAX as usize) + 1;
 
 /// Errors raised before an argument value enters schema validation or an executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -629,6 +632,12 @@ impl CapabilityExecutionReferences {
     }
     pub fn workspace(&self) -> Option<&CapabilityReferenceId> {
         self.workspace.as_ref()
+    }
+    pub fn deadline(&self) -> Option<&CapabilityReferenceId> {
+        self.deadline.as_ref()
+    }
+    pub fn cancellation(&self) -> Option<&CapabilityReferenceId> {
+        self.cancellation.as_ref()
     }
     pub fn secret_handles(&self) -> &[CapabilitySecretReferenceId] {
         &self.secrets
@@ -1034,459 +1043,14 @@ impl fmt::Display for CapabilityRegistryError {
 
 impl std::error::Error for CapabilityRegistryError {}
 
-/// A host-agnostic pairing of the exact portable manifest catalog and host executors.
-pub struct CapabilityRegistry {
-    catalog: ManifestCatalog,
-    executors: BTreeMap<(String, u32), RegisteredExecutor>,
-    lineage: Arc<dyn CapabilityLineageStore>,
-}
-
-struct RegisteredExecutor {
-    executor: Arc<dyn CapabilityExecutor>,
-    input_validator: Arc<JSONSchema>,
-    output_validator: Arc<JSONSchema>,
-}
-
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub enum CapabilityAttemptLineageState {
-    Executed,
-    RetryAuthorized { authorization_id: Uuid },
-    RetryInFlight,
-    Completed(CapabilityResult),
-    Pending,
-    AuthoritativeAbsence,
-    RecoveryRequired,
-}
-
-impl fmt::Debug for CapabilityAttemptLineageState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Executed => formatter.write_str("Executed"),
-            Self::RetryAuthorized { .. } => formatter.write_str("RetryAuthorized(REDACTED)"),
-            Self::RetryInFlight => formatter.write_str("RetryInFlight"),
-            Self::Completed(result) => formatter.debug_tuple("Completed").field(result).finish(),
-            Self::Pending => formatter.write_str("Pending"),
-            Self::AuthoritativeAbsence => formatter.write_str("AuthoritativeAbsence"),
-            Self::RecoveryRequired => formatter.write_str("RecoveryRequired"),
-        }
-    }
-}
-
-/// A host may implement this with durable compare-and-swap storage.
-pub trait CapabilityLineageStore: Send + Sync {
-    fn load(
-        &self,
-        logical_invocation_id: Uuid,
-        attempt_number: u32,
-    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError>;
-
-    fn compare_exchange(
-        &self,
-        logical_invocation_id: Uuid,
-        attempt_number: u32,
-        current: Option<&CapabilityAttemptLineageState>,
-        new: CapabilityAttemptLineageState,
-    ) -> Result<bool, CapabilityError>;
-
-    fn set(
-        &self,
-        logical_invocation_id: Uuid,
-        attempt_number: u32,
-        state: CapabilityAttemptLineageState,
-    ) -> Result<(), CapabilityError>;
-}
-
-#[derive(Default)]
-struct InMemoryCapabilityLineageStore {
-    states: Mutex<BTreeMap<(Uuid, u32), CapabilityAttemptLineageState>>,
-}
-
-impl CapabilityLineageStore for InMemoryCapabilityLineageStore {
-    fn load(
-        &self,
-        logical_invocation_id: Uuid,
-        attempt_number: u32,
-    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
-        Ok(self
-            .states
-            .lock()
-            .map_err(|_| CapabilityError::execution())?
-            .get(&(logical_invocation_id, attempt_number))
-            .cloned())
-    }
-
-    fn compare_exchange(
-        &self,
-        logical_invocation_id: Uuid,
-        attempt_number: u32,
-        current: Option<&CapabilityAttemptLineageState>,
-        new: CapabilityAttemptLineageState,
-    ) -> Result<bool, CapabilityError> {
-        let mut states = self
-            .states
-            .lock()
-            .map_err(|_| CapabilityError::execution())?;
-        if states.get(&(logical_invocation_id, attempt_number)) != current {
-            return Ok(false);
-        }
-        states.insert((logical_invocation_id, attempt_number), new);
-        Ok(true)
-    }
-
-    fn set(
-        &self,
-        logical_invocation_id: Uuid,
-        attempt_number: u32,
-        state: CapabilityAttemptLineageState,
-    ) -> Result<(), CapabilityError> {
-        self.states
-            .lock()
-            .map_err(|_| CapabilityError::execution())?
-            .insert((logical_invocation_id, attempt_number), state);
-        Ok(())
-    }
-}
-
-impl CapabilityRegistry {
-    pub fn new(catalog: ManifestCatalog) -> Self {
-        Self::with_lineage_store(catalog, Arc::new(InMemoryCapabilityLineageStore::default()))
-    }
-
-    pub fn with_lineage_store(
-        catalog: ManifestCatalog,
-        lineage: Arc<dyn CapabilityLineageStore>,
-    ) -> Self {
-        Self {
-            catalog,
-            executors: BTreeMap::new(),
-            lineage,
-        }
-    }
-
-    pub fn manifest(&self, id: &str, version: u32) -> Option<&CapabilityManifest> {
-        self.catalog.manifest(id, version)
-    }
-
-    pub fn executor(&self, id: &str, version: u32) -> Option<Arc<dyn CapabilityExecutor>> {
-        self.executors
-            .get(&(id.to_owned(), version))
-            .map(|entry| entry.executor.clone())
-    }
-
-    pub fn register_executor(
-        &mut self,
-        executor: Arc<dyn CapabilityExecutor>,
-    ) -> Result<(), CapabilityRegistryError> {
-        let executor_manifest = executor.manifest();
-        let key = (executor_manifest.id.clone(), executor_manifest.version);
-        let Some(registered_manifest) = self.catalog.manifest(&key.0, key.1) else {
-            return Err(CapabilityRegistryError::ManifestExecutorMismatch {
-                id: key.0,
-                version: key.1,
-            });
-        };
-        if registered_manifest != executor_manifest {
-            return Err(CapabilityRegistryError::ManifestExecutorMismatch {
-                id: executor_manifest.id.clone(),
-                version: executor_manifest.version,
-            });
-        }
-        if self.executors.contains_key(&key) {
-            return Err(CapabilityRegistryError::DuplicateExecutor {
-                id: key.0,
-                version: key.1,
-            });
-        }
-        let input_validator = compile_schema(&registered_manifest.input_schema).map_err(|_| {
-            CapabilityRegistryError::InvalidInputSchema {
-                id: registered_manifest.id.clone(),
-                version: registered_manifest.version,
-            }
-        })?;
-        let output_validator =
-            compile_schema(&registered_manifest.output_schema).map_err(|_| {
-                CapabilityRegistryError::InvalidOutputSchema {
-                    id: registered_manifest.id.clone(),
-                    version: registered_manifest.version,
-                }
-            })?;
-
-        self.executors.insert(
-            key,
-            RegisteredExecutor {
-                executor,
-                input_validator: Arc::new(input_validator),
-                output_validator: Arc::new(output_validator),
-            },
-        );
-        Ok(())
-    }
-
-    pub async fn execute(
-        &self,
-        context: CapabilityExecutionContext,
-    ) -> Result<CapabilityResult, CapabilityError> {
-        if context.attempt().number() != 1 {
-            return Err(CapabilityError::validation());
-        }
-        let manifest = self.manifest_for_context(&context)?;
-        self.validate_context(&context, manifest)?;
-        let entry = self.entry_for_context(&context)?;
-        validate_instance(
-            &entry.input_validator,
-            context.normalized_arguments(),
-            false,
-        )?;
-        let lineage_key = (context.invocation().id(), 1);
-        if !self.lineage.compare_exchange(
-            lineage_key.0,
-            lineage_key.1,
-            None,
-            CapabilityAttemptLineageState::Executed,
-        )? {
-            return Err(CapabilityError::validation());
-        }
-        let executor = entry.executor.clone();
-        let mut result = executor.execute(context).await?;
-        validate_argument_bounds(&result.output)
-            .map_err(|_| CapabilityError::output_validation())?;
-        validate_instance(&entry.output_validator, &result.output, true)?;
-        result.output = canonicalize_json(result.output)?;
-        Ok(result)
-    }
-
-    /// Executes a retry only when it presents a one-time authorization issued by `recover`.
-    pub async fn execute_retry(
-        &self,
-        context: CapabilityExecutionContext,
-        authorization: CapabilityRetryAuthorization,
-    ) -> Result<CapabilityResult, CapabilityError> {
-        let manifest = self.manifest_for_context(&context)?;
-        self.validate_context(&context, manifest)?;
-        let entry = self.entry_for_context(&context)?;
-        validate_instance(
-            &entry.input_validator,
-            context.normalized_arguments(),
-            false,
-        )?;
-        let lineage_key = (context.invocation().id(), context.attempt().number());
-        let authorized = CapabilityAttemptLineageState::RetryAuthorized {
-            authorization_id: authorization.nonce,
-        };
-        if !self.lineage.compare_exchange(
-            lineage_key.0,
-            lineage_key.1,
-            Some(&authorized),
-            CapabilityAttemptLineageState::RetryInFlight,
-        )? {
-            return Err(CapabilityError::validation());
-        }
-        let mut result = entry.executor.execute(context).await?;
-        validate_argument_bounds(&result.output)
-            .map_err(|_| CapabilityError::output_validation())?;
-        validate_instance(&entry.output_validator, &result.output, true)?;
-        result.output = canonicalize_json(result.output)?;
-        Ok(result)
-    }
-
-    pub async fn recover(
-        &self,
-        context: CapabilityExecutionContext,
-    ) -> Result<RecoveryAction, CapabilityError> {
-        let manifest = self.manifest_for_context(&context)?;
-        self.validate_context(&context, manifest)?;
-        if self
-            .lineage
-            .load(context.invocation().id(), context.attempt().number())?
-            == Some(CapabilityAttemptLineageState::AuthoritativeAbsence)
-        {
-            return self.authorize_retry(&context, manifest);
-        }
-        if let Some(action) = self.cached_recovery_action(&context)? {
-            return Ok(action);
-        }
-        match manifest.recovery_mode {
-            RecoveryMode::InherentlyIdempotent
-            | RecoveryMode::KeyedIdempotent
-            | RecoveryMode::Retry => self.authorize_retry(&context, manifest),
-            RecoveryMode::Reconcilable | RecoveryMode::Compensate => {
-                let entry = self.entry_for_context(&context)?;
-                validate_instance(
-                    &entry.input_validator,
-                    context.normalized_arguments(),
-                    false,
-                )?;
-                match entry.executor.reconcile(context.clone()).await? {
-                    ReconcileOutcome::Completed(mut result) => {
-                        validate_argument_bounds(&result.output)
-                            .map_err(|_| CapabilityError::output_validation())?;
-                        validate_instance(&entry.output_validator, &result.output, true)?;
-                        result.output = canonicalize_json(result.output)?;
-                        self.set_lineage_state(
-                            &context,
-                            CapabilityAttemptLineageState::Completed(result.clone()),
-                        )?;
-                        Ok(RecoveryAction::Completed(result))
-                    }
-                    ReconcileOutcome::Pending => {
-                        self.set_lineage_state(&context, CapabilityAttemptLineageState::Pending)?;
-                        Ok(RecoveryAction::Pending)
-                    }
-                    ReconcileOutcome::AuthoritativeAbsence => {
-                        self.set_lineage_state(
-                            &context,
-                            CapabilityAttemptLineageState::AuthoritativeAbsence,
-                        )?;
-                        self.authorize_retry(&context, manifest)
-                    }
-                    ReconcileOutcome::RecoveryRequired => {
-                        self.set_lineage_state(
-                            &context,
-                            CapabilityAttemptLineageState::RecoveryRequired,
-                        )?;
-                        Ok(RecoveryAction::RecoveryRequired)
-                    }
-                }
-            }
-            RecoveryMode::NonRetryable | RecoveryMode::None | RecoveryMode::Manual => {
-                self.set_lineage_state(&context, CapabilityAttemptLineageState::RecoveryRequired)?;
-                Ok(RecoveryAction::RecoveryRequired)
-            }
-        }
-    }
-
-    fn validate_context(
-        &self,
-        context: &CapabilityExecutionContext,
-        manifest: &CapabilityManifest,
-    ) -> Result<(), CapabilityError> {
-        if context.references().run().handle() != context.invocation().run_id()
-            || !context.references().secrets_are_declared_by(manifest)
-        {
-            return Err(CapabilityError::validation());
-        }
-        Ok(())
-    }
-
-    fn cached_recovery_action(
-        &self,
-        context: &CapabilityExecutionContext,
-    ) -> Result<Option<RecoveryAction>, CapabilityError> {
-        let key = (context.invocation().id(), context.attempt().number());
-        match self.lineage.load(key.0, key.1)? {
-            Some(CapabilityAttemptLineageState::Executed)
-            | Some(CapabilityAttemptLineageState::RetryInFlight)
-            | Some(CapabilityAttemptLineageState::Pending)
-            | Some(CapabilityAttemptLineageState::AuthoritativeAbsence) => Ok(None),
-            Some(CapabilityAttemptLineageState::Completed(result)) => {
-                Ok(Some(RecoveryAction::Completed(result)))
-            }
-            Some(CapabilityAttemptLineageState::RecoveryRequired) => {
-                Ok(Some(RecoveryAction::RecoveryRequired))
-            }
-            None | Some(CapabilityAttemptLineageState::RetryAuthorized { .. }) => {
-                Err(CapabilityError::validation())
-            }
-        }
-    }
-
-    fn set_lineage_state(
-        &self,
-        context: &CapabilityExecutionContext,
-        state: CapabilityAttemptLineageState,
-    ) -> Result<(), CapabilityError> {
-        self.lineage
-            .set(context.invocation().id(), context.attempt().number(), state)
-    }
-
-    fn manifest_for_context(
-        &self,
-        context: &CapabilityExecutionContext,
-    ) -> Result<&CapabilityManifest, CapabilityError> {
-        self.manifest(
-            context.invocation().capability_id(),
-            context.invocation().manifest_version(),
-        )
-        .ok_or_else(CapabilityError::unavailable)
-    }
-
-    fn entry_for_context(
-        &self,
-        context: &CapabilityExecutionContext,
-    ) -> Result<&RegisteredExecutor, CapabilityError> {
-        self.executors
-            .get(&(
-                context.invocation().capability_id().to_owned(),
-                context.invocation().manifest_version(),
-            ))
-            .ok_or_else(CapabilityError::unavailable)
-    }
-
-    fn authorize_retry(
-        &self,
-        context: &CapabilityExecutionContext,
-        manifest: &CapabilityManifest,
-    ) -> Result<RecoveryAction, CapabilityError> {
-        let next_attempt = context
-            .attempt()
-            .number()
-            .checked_add(1)
-            .ok_or_else(CapabilityError::validation)?;
-        if next_attempt > manifest.max_retries.saturating_add(1) {
-            return Ok(RecoveryAction::RecoveryRequired);
-        }
-        let current_key = (context.invocation().id(), context.attempt().number());
-        let next_key = (context.invocation().id(), next_attempt);
-        let current_state = self.lineage.load(current_key.0, current_key.1)?;
-        if !matches!(
-            current_state,
-            Some(CapabilityAttemptLineageState::Executed)
-                | Some(CapabilityAttemptLineageState::RetryInFlight)
-                | Some(CapabilityAttemptLineageState::AuthoritativeAbsence)
-        ) {
-            return Err(CapabilityError::validation());
-        }
-        if let Some(CapabilityAttemptLineageState::RetryAuthorized { authorization_id }) =
-            self.lineage.load(next_key.0, next_key.1)?
-        {
-            return Ok(RecoveryAction::RetrySameKey {
-                idempotency_key: context.invocation().idempotency_key(),
-                authorization: CapabilityRetryAuthorization {
-                    nonce: authorization_id,
-                },
-            });
-        }
-        if self.lineage.load(next_key.0, next_key.1)?.is_some() {
-            return Ok(RecoveryAction::RecoveryRequired);
-        }
-        let nonce = Uuid::new_v4();
-        let idempotency_key = context.invocation().idempotency_key();
-        if !self.lineage.compare_exchange(
-            next_key.0,
-            next_key.1,
-            None,
-            CapabilityAttemptLineageState::RetryAuthorized {
-                authorization_id: nonce,
-            },
-        )? {
-            if let Some(CapabilityAttemptLineageState::RetryAuthorized { authorization_id }) =
-                self.lineage.load(next_key.0, next_key.1)?
-            {
-                return Ok(RecoveryAction::RetrySameKey {
-                    idempotency_key,
-                    authorization: CapabilityRetryAuthorization {
-                        nonce: authorization_id,
-                    },
-                });
-            }
-            return Ok(RecoveryAction::RecoveryRequired);
-        }
-        Ok(RecoveryAction::RetrySameKey {
-            idempotency_key,
-            authorization: CapabilityRetryAuthorization { nonce },
-        })
-    }
-}
+#[path = "capability/lineage.rs"]
+mod lineage;
+pub use lineage::{
+    CapabilityAttemptLineageState, CapabilityLineageStore, CAPABILITY_EXECUTION_LEASE_MS,
+};
+#[path = "capability/registry.rs"]
+mod registry;
+pub use registry::CapabilityRegistry;
 
 fn canonicalize_json(value: Value) -> Result<Value, CapabilityError> {
     canonicalize_arguments(value).map_err(|_| CapabilityError::output_validation())

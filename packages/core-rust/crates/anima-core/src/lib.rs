@@ -23,7 +23,7 @@ pub use capability::{
     ManifestCatalogError, ReconcileOutcome, RecoveryAction, RecoveryActionKind, RecoveryMode,
     RiskLevel, RuntimeCompatibility, CAPABILITY_INVOCATION_NAMESPACE,
     MAX_CAPABILITY_ARGUMENT_BYTES, MAX_CAPABILITY_ARGUMENT_DEPTH, MAX_CAPABILITY_ARGUMENT_NODES,
-    MAX_CAPABILITY_ID_BYTES,
+    MAX_CAPABILITY_ID_BYTES, MAX_CAPABILITY_SECRET_REFERENCES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use definition::{

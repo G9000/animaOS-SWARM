@@ -1,9 +1,12 @@
 use std::collections::BTreeSet;
 
-use super::{CapabilityManifest, ManifestCatalogError};
+use super::{
+    CapabilityManifest, ManifestCatalogError, MAX_CAPABILITY_ID_BYTES,
+    MAX_CAPABILITY_SECRET_REFERENCES,
+};
 
 pub(super) fn validate_manifest(manifest: &CapabilityManifest) -> Result<(), ManifestCatalogError> {
-    if manifest.id.trim().is_empty() {
+    if manifest.id.trim().is_empty() || manifest.id.len() > MAX_CAPABILITY_ID_BYTES {
         return Err(ManifestCatalogError::InvalidManifestId);
     }
     if manifest.version == 0 {
@@ -21,6 +24,9 @@ pub(super) fn validate_manifest(manifest: &CapabilityManifest) -> Result<(), Man
             > manifest.compatibility.maximum_runtime_schema_version
     {
         return Err(ManifestCatalogError::InvalidRuntimeCompatibility);
+    }
+    if manifest.secret_references.len() > MAX_CAPABILITY_SECRET_REFERENCES {
+        return Err(ManifestCatalogError::TooManySecretReferences);
     }
     let mut secret_names = BTreeSet::new();
     for name in &manifest.secret_references {

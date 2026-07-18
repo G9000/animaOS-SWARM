@@ -13,6 +13,7 @@ use anima_core::{
     RiskLevel, RuntimeCompatibility,
 };
 use async_trait::async_trait;
+use futures::channel::oneshot;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -70,8 +71,9 @@ struct TestLineageStore {
     states: Mutex<BTreeMap<(Uuid, u32), CapabilityAttemptLineageState>>,
 }
 
+#[async_trait]
 impl CapabilityLineageStore for TestLineageStore {
-    fn load(
+    async fn load(
         &self,
         invocation_id: Uuid,
         attempt_number: u32,
@@ -84,32 +86,19 @@ impl CapabilityLineageStore for TestLineageStore {
             .cloned())
     }
 
-    fn compare_exchange(
+    async fn compare_exchange(
         &self,
         invocation_id: Uuid,
         attempt_number: u32,
-        current: Option<&CapabilityAttemptLineageState>,
+        current: Option<CapabilityAttemptLineageState>,
         new: CapabilityAttemptLineageState,
     ) -> Result<bool, CapabilityError> {
         let mut states = self.states.lock().unwrap();
-        if states.get(&(invocation_id, attempt_number)) != current {
+        if states.get(&(invocation_id, attempt_number)) != current.as_ref() {
             return Ok(false);
         }
         states.insert((invocation_id, attempt_number), new);
         Ok(true)
-    }
-
-    fn set(
-        &self,
-        invocation_id: Uuid,
-        attempt_number: u32,
-        state: CapabilityAttemptLineageState,
-    ) -> Result<(), CapabilityError> {
-        self.states
-            .lock()
-            .unwrap()
-            .insert((invocation_id, attempt_number), state);
-        Ok(())
     }
 }
 
@@ -154,6 +143,7 @@ struct RecordingExecutor {
     manifest: CapabilityManifest,
     execute_result: CapabilityResult,
     reconcile_result: ReconcileOutcome,
+    failures_remaining: Arc<AtomicUsize>,
     executions: Arc<AtomicUsize>,
     reconciliations: Arc<AtomicUsize>,
     contexts: Arc<Mutex<Vec<CapabilityExecutionContext>>>,
@@ -165,10 +155,17 @@ impl RecordingExecutor {
             manifest,
             execute_result: CapabilityResult::new(json!({ "ok": true })),
             reconcile_result: ReconcileOutcome::Pending,
+            failures_remaining: Arc::new(AtomicUsize::new(0)),
             executions: Arc::new(AtomicUsize::new(0)),
             reconciliations: Arc::new(AtomicUsize::new(0)),
             contexts: Arc::new(Mutex::new(vec![])),
         }
+    }
+
+    fn failing_once(manifest: CapabilityManifest) -> Self {
+        let executor = Self::new(manifest);
+        executor.failures_remaining.store(1, Ordering::SeqCst);
+        executor
     }
 }
 
@@ -184,6 +181,15 @@ impl CapabilityExecutor for RecordingExecutor {
     ) -> Result<CapabilityResult, CapabilityError> {
         self.executions.fetch_add(1, Ordering::SeqCst);
         self.contexts.lock().unwrap().push(context);
+        if self
+            .failures_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(CapabilityError::execution());
+        }
         Ok(self.execute_result.clone())
     }
 
@@ -199,6 +205,125 @@ impl CapabilityExecutor for RecordingExecutor {
 struct SecretLeakingExecutor {
     manifest: CapabilityManifest,
     upstream_diagnostic: String,
+}
+
+struct BarrierExecutor {
+    manifest: CapabilityManifest,
+    execute_entered: Mutex<Option<oneshot::Sender<()>>>,
+    execute_release: Mutex<Option<oneshot::Receiver<()>>>,
+    reconcile_result: ReconcileOutcome,
+    reconciliations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl CapabilityExecutor for BarrierExecutor {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    async fn execute(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<CapabilityResult, CapabilityError> {
+        if let Some(entered) = self.execute_entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let release = self.execute_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Ok(CapabilityResult::new(json!({ "ok": true })))
+    }
+
+    async fn reconcile(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<ReconcileOutcome, CapabilityError> {
+        self.reconciliations.fetch_add(1, Ordering::SeqCst);
+        Ok(self.reconcile_result.clone())
+    }
+}
+
+struct ConflictingReconcileExecutor {
+    manifest: CapabilityManifest,
+    reconcile_entered: Mutex<Option<oneshot::Sender<()>>>,
+    reconcile_release: Mutex<Option<oneshot::Receiver<()>>>,
+    reconciliations: Arc<AtomicUsize>,
+}
+
+struct RetryBarrierExecutor {
+    manifest: CapabilityManifest,
+    executions: AtomicUsize,
+    retry_entered: Mutex<Option<oneshot::Sender<()>>>,
+    retry_release: Mutex<Option<oneshot::Receiver<()>>>,
+    reconciliations: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl CapabilityExecutor for RetryBarrierExecutor {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    async fn execute(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<CapabilityResult, CapabilityError> {
+        if self.executions.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(CapabilityError::execution());
+        }
+        if let Some(entered) = self.retry_entered.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let release = self.retry_release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        Ok(CapabilityResult::new(json!({ "ok": true })))
+    }
+
+    async fn reconcile(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<ReconcileOutcome, CapabilityError> {
+        self.reconciliations.fetch_add(1, Ordering::SeqCst);
+        Ok(ReconcileOutcome::RecoveryRequired)
+    }
+}
+
+#[async_trait]
+impl CapabilityExecutor for ConflictingReconcileExecutor {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    async fn execute(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<CapabilityResult, CapabilityError> {
+        Err(CapabilityError::execution())
+    }
+
+    async fn reconcile(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<ReconcileOutcome, CapabilityError> {
+        let call = self.reconciliations.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            if let Some(entered) = self.reconcile_entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let release = self.reconcile_release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+            Ok(ReconcileOutcome::Completed(CapabilityResult::new(
+                json!({ "ok": true }),
+            )))
+        } else {
+            Ok(ReconcileOutcome::RecoveryRequired)
+        }
+    }
 }
 
 #[async_trait]
@@ -327,7 +452,7 @@ async fn output_preflight_bounds_execution_and_reconciliation_without_panics() {
 
     let mut reconcile_manifest = manifest("workspace.reconcile", 1, RecoveryMode::Reconcilable);
     reconcile_manifest.output_schema = json!({});
-    let mut reconcile_executor = RecordingExecutor::new(reconcile_manifest.clone());
+    let mut reconcile_executor = RecordingExecutor::failing_once(reconcile_manifest.clone());
     reconcile_executor.reconcile_result =
         ReconcileOutcome::Completed(CapabilityResult::new(oversized));
     let mut reconcile_registry = registry(vec![reconcile_manifest.clone()]);
@@ -335,7 +460,10 @@ async fn output_preflight_bounds_execution_and_reconciliation_without_panics() {
         .register_executor(Arc::new(reconcile_executor))
         .unwrap();
     let initial = context(&reconcile_manifest, json!({ "query": "hello" }));
-    reconcile_registry.execute(initial.clone()).await.unwrap();
+    reconcile_registry
+        .execute(initial.clone())
+        .await
+        .unwrap_err();
     assert_eq!(
         reconcile_registry
             .recover(initial)
@@ -460,13 +588,13 @@ async fn recovery_decides_retry_reconcile_or_manual_without_automatic_execution(
 
     for (mode, calls_reconciler, expected) in modes {
         let manifest = manifest("workspace.apply", 1, mode);
-        let executor = RecordingExecutor::new(manifest.clone());
+        let executor = RecordingExecutor::failing_once(manifest.clone());
         let reconciliations = executor.reconciliations.clone();
         let mut registry = registry(vec![manifest.clone()]);
         registry.register_executor(Arc::new(executor)).unwrap();
 
         let initial = context(&manifest, json!({ "query": "hello" }));
-        registry.execute(initial.clone()).await.unwrap();
+        registry.execute(initial.clone()).await.unwrap_err();
         let action = registry.recover(initial).await.unwrap();
         assert_eq!(action.kind(), expected);
         assert_eq!(reconciliations.load(Ordering::SeqCst) > 0, calls_reconciler);
@@ -491,12 +619,12 @@ async fn reconcilers_return_all_portable_recovery_outcomes() {
             RecoveryActionKind::RecoveryRequired,
         ),
     ] {
-        let mut executor = RecordingExecutor::new(manifest.clone());
+        let mut executor = RecordingExecutor::failing_once(manifest.clone());
         executor.reconcile_result = outcome;
         let mut registry = registry(vec![manifest.clone()]);
         registry.register_executor(Arc::new(executor)).unwrap();
         let initial = context(&manifest, json!({ "query": "hello" }));
-        registry.execute(initial.clone()).await.unwrap();
+        registry.execute(initial.clone()).await.unwrap_err();
         let action = registry.recover(initial).await.unwrap();
         assert_eq!(action.kind(), expected);
     }
@@ -573,6 +701,14 @@ fn execution_context_is_serde_safe_and_never_contains_raw_credentials() {
         assert!(!representation.contains("super-secret-access-token"));
         assert!(!representation.contains("credentials"));
     }
+    assert_eq!(
+        context.references().deadline().unwrap().handle(),
+        Uuid::from_u128(5)
+    );
+    assert_eq!(
+        context.references().cancellation().unwrap().handle(),
+        Uuid::from_u128(6)
+    );
 }
 
 #[tokio::test]
@@ -692,10 +828,10 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
     manifest.max_retries = 1;
     let mut registry = registry(vec![manifest.clone()]);
     registry
-        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .register_executor(Arc::new(RecordingExecutor::failing_once(manifest.clone())))
         .unwrap();
     let initial = context(&manifest, json!({ "query": "hello" }));
-    registry.execute(initial.clone()).await.unwrap();
+    registry.execute(initial.clone()).await.unwrap_err();
 
     let action = registry.recover(initial).await.unwrap();
     let authorization = action.retry_authorization().unwrap().clone();
@@ -712,6 +848,35 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
             .code(),
         CapabilityErrorCode::Validation
     );
+    assert_eq!(
+        registry.recover(retry).await.unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+}
+
+#[tokio::test]
+async fn retry_budget_blocks_authorization_after_an_uncertain_final_attempt() {
+    let mut manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    manifest.max_retries = 1;
+    let executor = RecordingExecutor::new(manifest.clone());
+    executor.failures_remaining.store(2, Ordering::SeqCst);
+    let mut registry = registry(vec![manifest.clone()]);
+    registry.register_executor(Arc::new(executor)).unwrap();
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    registry.execute(initial.clone()).await.unwrap_err();
+    let authorization = registry
+        .recover(initial)
+        .await
+        .unwrap()
+        .retry_authorization()
+        .unwrap()
+        .clone();
+    let retry = context_for_attempt(&manifest, json!({ "query": "hello" }), 2);
+    registry
+        .execute_retry(retry.clone(), authorization)
+        .await
+        .unwrap_err();
+
     assert_eq!(
         registry.recover(retry).await.unwrap().kind(),
         RecoveryActionKind::RecoveryRequired
@@ -742,15 +907,147 @@ async fn recovery_requires_a_known_executed_attempt() {
 }
 
 #[tokio::test]
+async fn recovery_racing_active_execution_returns_pending_without_reconciliation() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let reconciliations = Arc::new(AtomicUsize::new(0));
+    let executor = BarrierExecutor {
+        manifest: manifest.clone(),
+        execute_entered: Mutex::new(Some(entered_tx)),
+        execute_release: Mutex::new(Some(release_rx)),
+        reconcile_result: ReconcileOutcome::RecoveryRequired,
+        reconciliations: reconciliations.clone(),
+    };
+    let mut mutable_registry = registry(vec![manifest.clone()]);
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    let execution_registry = registry.clone();
+    let execution_context = initial.clone();
+    let execution =
+        tokio::spawn(async move { execution_registry.execute(execution_context).await });
+    entered_rx.await.unwrap();
+
+    assert_eq!(
+        registry.recover(initial.clone()).await.unwrap().kind(),
+        RecoveryActionKind::Pending
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+    release_tx.send(()).unwrap();
+    execution.await.unwrap().unwrap();
+    assert_eq!(
+        registry.recover(initial).await.unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+}
+
+#[tokio::test]
+async fn recovery_racing_active_retry_returns_pending_without_reconciliation() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let reconciliations = Arc::new(AtomicUsize::new(0));
+    let executor = RetryBarrierExecutor {
+        manifest: manifest.clone(),
+        executions: AtomicUsize::new(0),
+        retry_entered: Mutex::new(Some(entered_tx)),
+        retry_release: Mutex::new(Some(release_rx)),
+        reconciliations: reconciliations.clone(),
+    };
+    let mut mutable_registry = registry(vec![manifest.clone()]);
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    registry.execute(initial.clone()).await.unwrap_err();
+    let authorization = registry
+        .recover(initial)
+        .await
+        .unwrap()
+        .retry_authorization()
+        .unwrap()
+        .clone();
+    let retry = context_for_attempt(&manifest, json!({ "query": "hello" }), 2);
+    let retry_registry = registry.clone();
+    let retry_context = retry.clone();
+    let execution = tokio::spawn(async move {
+        retry_registry
+            .execute_retry(retry_context, authorization)
+            .await
+    });
+    entered_rx.await.unwrap();
+
+    assert_eq!(
+        registry.recover(retry.clone()).await.unwrap().kind(),
+        RecoveryActionKind::Pending
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+    release_tx.send(()).unwrap();
+    execution.await.unwrap().unwrap();
+    assert_eq!(
+        registry.recover(retry).await.unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+}
+
+#[tokio::test]
+async fn concurrent_reconciliation_is_single_winner_and_terminal_monotonic() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let reconciliations = Arc::new(AtomicUsize::new(0));
+    let executor = ConflictingReconcileExecutor {
+        manifest: manifest.clone(),
+        reconcile_entered: Mutex::new(Some(entered_tx)),
+        reconcile_release: Mutex::new(Some(release_rx)),
+        reconciliations: reconciliations.clone(),
+    };
+    let mut mutable_registry = registry(vec![manifest.clone()]);
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    assert_eq!(
+        registry.execute(initial.clone()).await.unwrap_err().code(),
+        CapabilityErrorCode::Execution
+    );
+    let recovery_registry = registry.clone();
+    let recovery_context = initial.clone();
+    let first = tokio::spawn(async move { recovery_registry.recover(recovery_context).await });
+    entered_rx.await.unwrap();
+
+    assert_eq!(
+        registry.recover(initial.clone()).await.unwrap().kind(),
+        RecoveryActionKind::Pending
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        first.await.unwrap().unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+    assert_eq!(
+        registry.recover(initial).await.unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn concurrent_recovery_returns_one_redacted_authorization() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
     let mut mutable_registry = registry(vec![manifest.clone()]);
     mutable_registry
-        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .register_executor(Arc::new(RecordingExecutor::failing_once(manifest.clone())))
         .unwrap();
     let registry = Arc::new(mutable_registry);
     let initial = context(&manifest, json!({ "query": "hello" }));
-    registry.execute(initial.clone()).await.unwrap();
+    registry.execute(initial.clone()).await.unwrap_err();
 
     let (first, second) =
         futures::join!(registry.recover(initial.clone()), registry.recover(initial));
@@ -766,13 +1063,13 @@ async fn concurrent_recovery_returns_one_redacted_authorization() {
 #[tokio::test]
 async fn duplicate_authoritative_absence_recovery_reuses_the_same_token() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
-    let mut executor = RecordingExecutor::new(manifest.clone());
+    let mut executor = RecordingExecutor::failing_once(manifest.clone());
     executor.reconcile_result = ReconcileOutcome::AuthoritativeAbsence;
     let reconciliations = executor.reconciliations.clone();
     let mut registry = registry(vec![manifest.clone()]);
     registry.register_executor(Arc::new(executor)).unwrap();
     let initial = context(&manifest, json!({ "query": "hello" }));
-    registry.execute(initial.clone()).await.unwrap();
+    registry.execute(initial.clone()).await.unwrap_err();
 
     let first = registry.recover(initial.clone()).await.unwrap();
     let second = registry.recover(initial).await.unwrap();
@@ -788,10 +1085,10 @@ async fn durable_lineage_store_preserves_retry_authorization_across_registries()
     first_catalog.register_manifest(manifest.clone()).unwrap();
     let mut first_registry = CapabilityRegistry::with_lineage_store(first_catalog, store.clone());
     first_registry
-        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .register_executor(Arc::new(RecordingExecutor::failing_once(manifest.clone())))
         .unwrap();
     let initial = context(&manifest, json!({ "query": "hello" }));
-    first_registry.execute(initial.clone()).await.unwrap();
+    first_registry.execute(initial.clone()).await.unwrap_err();
     let first_action = first_registry.recover(initial.clone()).await.unwrap();
 
     let mut second_catalog = ManifestCatalog::default();
@@ -812,9 +1109,66 @@ async fn durable_lineage_store_preserves_retry_authorization_across_registries()
 }
 
 #[tokio::test]
+async fn durable_lineage_store_returns_cached_completion_after_registry_restart() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let store = Arc::new(TestLineageStore::default());
+    let mut first_catalog = ManifestCatalog::default();
+    first_catalog.register_manifest(manifest.clone()).unwrap();
+    let mut first_registry = CapabilityRegistry::with_lineage_store(first_catalog, store.clone());
+    first_registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    let completed = first_registry.execute(initial.clone()).await.unwrap();
+
+    let mut second_catalog = ManifestCatalog::default();
+    second_catalog.register_manifest(manifest.clone()).unwrap();
+    let second_executor = RecordingExecutor::new(manifest.clone());
+    let reconciliations = second_executor.reconciliations.clone();
+    let mut second_registry = CapabilityRegistry::with_lineage_store(second_catalog, store);
+    second_registry
+        .register_executor(Arc::new(second_executor))
+        .unwrap();
+
+    assert_eq!(
+        second_registry.recover(initial).await.unwrap(),
+        anima_core::RecoveryAction::Completed(completed)
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn expired_execution_lease_can_be_fenced_and_reconciled() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let store = Arc::new(TestLineageStore::default());
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    store.states.lock().unwrap().insert(
+        (initial.invocation().id(), initial.attempt().number()),
+        CapabilityAttemptLineageState::Executing {
+            fence: Uuid::new_v4(),
+            lease_expires_at_ms: 0,
+        },
+    );
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut executor = RecordingExecutor::new(manifest.clone());
+    executor.reconcile_result =
+        ReconcileOutcome::Completed(CapabilityResult::new(json!({ "ok": true })));
+    let reconciliations = executor.reconciliations.clone();
+    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store);
+    registry.register_executor(Arc::new(executor)).unwrap();
+
+    assert_eq!(
+        registry.recover(initial).await.unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn concurrent_retry_consumption_has_exactly_one_winner() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
-    let executor = RecordingExecutor::new(manifest.clone());
+    let executor = RecordingExecutor::failing_once(manifest.clone());
     let executions = executor.executions.clone();
     let mut mutable_registry = registry(vec![manifest.clone()]);
     mutable_registry
@@ -822,7 +1176,7 @@ async fn concurrent_retry_consumption_has_exactly_one_winner() {
         .unwrap();
     let registry = Arc::new(mutable_registry);
     let initial = context(&manifest, json!({ "query": "hello" }));
-    registry.execute(initial.clone()).await.unwrap();
+    registry.execute(initial.clone()).await.unwrap_err();
     let authorization = registry
         .recover(initial)
         .await
@@ -845,10 +1199,10 @@ async fn recovery_authorizations_cannot_be_used_for_another_invocation() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
     let mut registry = registry(vec![manifest.clone()]);
     registry
-        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .register_executor(Arc::new(RecordingExecutor::failing_once(manifest.clone())))
         .unwrap();
     let initial = context(&manifest, json!({ "query": "one" }));
-    registry.execute(initial.clone()).await.unwrap();
+    registry.execute(initial.clone()).await.unwrap_err();
     let authorization = registry
         .recover(initial)
         .await
@@ -1007,6 +1361,31 @@ fn catalog_rejects_invalid_or_duplicate_secret_declaration_names() {
             ManifestCatalogError::InvalidSecretReferenceName
         );
     }
+}
+
+#[test]
+fn catalog_caps_manifest_ids_and_index_addressable_secret_declarations() {
+    let mut oversized_id = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    oversized_id.id = "x".repeat(anima_core::MAX_CAPABILITY_ID_BYTES + 1);
+    let mut catalog = ManifestCatalog::default();
+    assert_eq!(
+        catalog.register_manifest(oversized_id.clone()).unwrap_err(),
+        ManifestCatalogError::InvalidManifestId
+    );
+    assert!(serde_json::from_value::<ManifestCatalog>(json!({
+        "manifests": [oversized_id],
+        "profiles": []
+    }))
+    .is_err());
+
+    let mut too_many_secrets = manifest("workspace.secrets", 1, RecoveryMode::KeyedIdempotent);
+    too_many_secrets.secret_references = (0..=anima_core::MAX_CAPABILITY_SECRET_REFERENCES)
+        .map(|index| format!("secret-{index}"))
+        .collect();
+    assert_eq!(
+        catalog.register_manifest(too_many_secrets).unwrap_err(),
+        ManifestCatalogError::TooManySecretReferences
+    );
 }
 
 #[test]
