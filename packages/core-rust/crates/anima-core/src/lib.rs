@@ -28,6 +28,7 @@ pub use capability::{
     RecoveryResumeBinding, RiskLevel, RuntimeCompatibility, ValidatedRecoveryResume,
     CAPABILITY_INVOCATION_NAMESPACE, MAX_CAPABILITY_ARGUMENT_BYTES, MAX_CAPABILITY_ARGUMENT_DEPTH,
     MAX_CAPABILITY_ARGUMENT_NODES, MAX_CAPABILITY_ID_BYTES, MAX_CAPABILITY_SECRET_REFERENCES,
+    MAX_DURABLE_RESULT_SIZE_BYTES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use definition::{
@@ -38,16 +39,20 @@ pub use definition::{
 pub use events::{EngineEvent, EventType};
 pub use execution::{
     assert_execution_store_conformance, ApprovalGrantMutation, ApprovalResumeBinding,
-    ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, AttemptRecordState, Budget,
+    ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, AttemptRecordState,
+    AuthoritativeGrantChange, AuthoritativeGrantState, AuthoritativeGrantStatus, Budget,
     BudgetDecision, CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome,
     CommandReceipt, CompletedInvocationRecord, CreateRun, DefinitionPin, DurableResultMutation,
     ExecutionCommit, ExecutionCommitOutcome, ExecutionError, ExecutionErrorCode, ExecutionLease,
-    ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode, ExecutionStoreFactory,
-    GrantConsumptionSnapshot, InMemoryExecutionStore, InvocationAttemptRecord, LiveRuntimeEvent,
-    ManifestPin, OpaqueReference, PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord,
-    RecoveryRecord, RecoveryTerminalOutcome, RecoveryTerminalResolution, Run, RunPauseReason,
-    RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent, RuntimeEventKind, SafeEventPayload,
-    Session, SessionConcurrencyPolicy, StepKind, StoredRun, UncertainInvocationRecord, Usage,
+    ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
+    ExecutionStoreFactory, GrantConsumptionSnapshot, InMemoryExecutionStore,
+    InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin, OpaqueReference, PendingApprovalRecord,
+    RecoveryPauseReason, RecoveryPauseRecord, RecoveryRecord, RecoveryTerminalOutcome,
+    RecoveryTerminalResolution, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind,
+    RuntimeEvent, RuntimeEventKind, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind,
+    StoreReadPage, StoredRun, UncertainInvocationRecord, Usage, MAX_COMMIT_ATTEMPTS,
+    MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS, MAX_COMMIT_RESULTS, MAX_COMMIT_STEPS,
+    MAX_STORE_READ_PAGE_SIZE,
 };
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,

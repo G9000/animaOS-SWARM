@@ -8,6 +8,7 @@ use futures::future::{select, Either};
 use futures::lock::Mutex;
 use futures_timer::Delay;
 use jsonschema::JSONSchema;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::lineage::InMemoryCapabilityLineageStore;
@@ -926,7 +927,7 @@ fn durable_result(
 ) -> Result<DurableCapabilityResult, CapabilityError> {
     let bytes =
         serde_jcs::to_vec(&result.output).map_err(|_| CapabilityError::output_validation())?;
-    let digest = Uuid::new_v5(&CAPABILITY_RESULT_NAMESPACE, &bytes);
+    let digest = Sha256::digest(&bytes);
     let result_ref = Uuid::new_v5(
         &CAPABILITY_RESULT_NAMESPACE,
         format!(
@@ -940,7 +941,7 @@ fn durable_result(
         u64::try_from(bytes.len()).map_err(|_| CapabilityError::output_validation())?;
     DurableCapabilityResult::new(
         CapabilityReferenceId::new(result_ref),
-        format!("jcs-v1:{digest}"),
+        format!("jcs-v1:{digest:x}"),
         manifest.schema_digest.clone(),
         size_bytes,
         DurableCapabilityStatus::Completed,
@@ -992,7 +993,7 @@ mod result_recorder_tests {
             supports_streaming: false,
             supports_artifacts: false,
             supports_citations: false,
-            schema_digest: "sha256:test-record".into(),
+            schema_digest: format!("sha256:{}", "0".repeat(64)),
             compatibility: RuntimeCompatibility {
                 minimum_runtime_schema_version: 1,
                 maximum_runtime_schema_version: 1,

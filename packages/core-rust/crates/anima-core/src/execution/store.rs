@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
 use uuid::Uuid;
@@ -17,9 +18,210 @@ use crate::{
     ProfileRef, RecoveryMode, RiskLevel, RuntimeCompatibility, RuntimeLimits,
 };
 
+const MAX_GRANT_ID_BYTES: usize = 256;
+pub const MAX_COMMIT_EVENTS: usize = 256;
+pub const MAX_COMMIT_STEPS: usize = 128;
+pub const MAX_COMMIT_ATTEMPTS: usize = 256;
+pub const MAX_COMMIT_RESULTS: usize = 128;
+pub const MAX_COMMIT_BATCH_ITEMS: usize = 512;
+pub const MAX_STORE_READ_PAGE_SIZE: u32 = 256;
+const MAX_COMMIT_CHECKPOINT_BYTES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreReadPage {
+    offset: u64,
+    limit: u32,
+}
+
+impl StoreReadPage {
+    pub fn new(offset: u64, limit: u32) -> Result<Self, ExecutionStoreError> {
+        if limit == 0 || limit > MAX_STORE_READ_PAGE_SIZE {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::BoundsExceeded,
+            ));
+        }
+        Ok(Self { offset, limit })
+    }
+
+    pub fn offset(self) -> u64 {
+        self.offset
+    }
+
+    pub fn limit(self) -> u32 {
+        self.limit
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoritativeGrantStatus {
+    Active,
+    Revoked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritativeGrantState {
+    grant_id: String,
+    revision: u32,
+    status: AuthoritativeGrantStatus,
+    remaining_uses: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoritativeGrantStateWire {
+    grant_id: String,
+    revision: u32,
+    status: AuthoritativeGrantStatus,
+    remaining_uses: Option<u32>,
+}
+
+impl AuthoritativeGrantState {
+    pub fn active(
+        grant_id: impl Into<String>,
+        revision: u32,
+        remaining_uses: Option<u32>,
+    ) -> Result<Self, ExecutionStoreError> {
+        Self::new(
+            grant_id.into(),
+            revision,
+            AuthoritativeGrantStatus::Active,
+            remaining_uses,
+        )
+    }
+
+    fn new(
+        grant_id: String,
+        revision: u32,
+        status: AuthoritativeGrantStatus,
+        remaining_uses: Option<u32>,
+    ) -> Result<Self, ExecutionStoreError> {
+        if grant_id.is_empty()
+            || grant_id.len() > MAX_GRANT_ID_BYTES
+            || grant_id.chars().any(char::is_whitespace)
+            || revision == 0
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self {
+            grant_id,
+            revision,
+            status,
+            remaining_uses,
+        })
+    }
+
+    pub fn grant_id(&self) -> &str {
+        &self.grant_id
+    }
+
+    pub fn revision(&self) -> u32 {
+        self.revision
+    }
+
+    pub fn status(&self) -> AuthoritativeGrantStatus {
+        self.status
+    }
+
+    pub fn remaining_uses(&self) -> Option<u32> {
+        self.remaining_uses
+    }
+
+    pub(crate) fn revoked(&self) -> Self {
+        let mut revoked = self.clone();
+        revoked.status = AuthoritativeGrantStatus::Revoked;
+        revoked
+    }
+
+    pub(crate) fn consume_one(&mut self) -> Result<(), ExecutionStoreError> {
+        let remaining = self
+            .remaining_uses
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
+        self.remaining_uses = Some(remaining.checked_sub(1).ok_or_else(|| {
+            ExecutionStoreError::new(ExecutionStoreErrorCode::GrantAlreadyConsumed)
+        })?);
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthoritativeGrantState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = AuthoritativeGrantStateWire::deserialize(deserializer)?;
+        Self::new(
+            wire.grant_id,
+            wire.revision,
+            wire.status,
+            wire.remaining_uses,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthoritativeGrantChange {
+    kind: AuthoritativeGrantChangeKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AuthoritativeGrantChangeKind {
+    Create(AuthoritativeGrantState),
+    Update {
+        expected_revision: u32,
+        state: AuthoritativeGrantState,
+    },
+    Revoke {
+        grant_id: String,
+        expected_revision: u32,
+    },
+}
+
+impl AuthoritativeGrantChange {
+    pub fn create(state: AuthoritativeGrantState) -> Self {
+        Self {
+            kind: AuthoritativeGrantChangeKind::Create(state),
+        }
+    }
+
+    pub fn update(expected_revision: u32, state: AuthoritativeGrantState) -> Self {
+        Self {
+            kind: AuthoritativeGrantChangeKind::Update {
+                expected_revision,
+                state,
+            },
+        }
+    }
+
+    pub fn revoke(
+        grant_id: impl Into<String>,
+        expected_revision: u32,
+    ) -> Result<Self, ExecutionStoreError> {
+        let grant_id = grant_id.into();
+        AuthoritativeGrantState::new(
+            grant_id.clone(),
+            expected_revision,
+            AuthoritativeGrantStatus::Active,
+            None,
+        )?;
+        Ok(Self {
+            kind: AuthoritativeGrantChangeKind::Revoke {
+                grant_id,
+                expected_revision,
+            },
+        })
+    }
+
+    pub(crate) fn kind(&self) -> &AuthoritativeGrantChangeKind {
+        &self.kind
+    }
+}
+
 /// Input for atomically creating a durable run and claiming its session when required.
 #[derive(Clone, Debug)]
 pub struct CreateRun {
+    owner_id: Uuid,
     session: Session,
     run: Run,
     expected_session_version: u64,
@@ -27,18 +229,24 @@ pub struct CreateRun {
 }
 
 impl CreateRun {
-    pub fn new(
+    pub fn new_for_owner(
+        owner_id: Uuid,
         session: Session,
         run: Run,
         expected_session_version: u64,
         concurrency_policy: SessionConcurrencyPolicy,
     ) -> Self {
         Self {
+            owner_id,
             session,
             run,
             expected_session_version,
             concurrency_policy,
         }
+    }
+
+    pub fn owner_id(&self) -> Uuid {
+        self.owner_id
     }
 
     pub fn session(&self) -> &Session {
@@ -90,6 +298,18 @@ impl ApprovalGrantMutation {
         self.claim
             .grant_consumption_snapshot()
             .map(|snapshot| snapshot.remaining_uses())
+    }
+
+    pub fn grant_id(&self) -> Option<&str> {
+        self.claim.grant_id()
+    }
+
+    pub fn grant_revision(&self) -> Option<u32> {
+        self.claim.grant_revision()
+    }
+
+    pub fn grant_remaining_uses(&self) -> Option<u32> {
+        self.claim.grant_remaining_uses()
     }
 }
 
@@ -207,6 +427,36 @@ impl ExecutionCommit {
     pub fn target_run(&self) -> &Run {
         &self.target_run
     }
+
+    pub fn validate_bounds(&self) -> Result<(), ExecutionStoreError> {
+        if self.events.len() > MAX_COMMIT_EVENTS
+            || self.steps.len() > MAX_COMMIT_STEPS
+            || self.attempts.len() > MAX_COMMIT_ATTEMPTS
+            || self.results.len() > MAX_COMMIT_RESULTS
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::BoundsExceeded,
+            ));
+        }
+        let total = self
+            .events
+            .len()
+            .checked_add(self.steps.len())
+            .and_then(|value| value.checked_add(self.attempts.len()))
+            .and_then(|value| value.checked_add(self.results.len()))
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
+        if total > MAX_COMMIT_BATCH_ITEMS
+            || self.checkpoint.as_ref().is_some_and(|checkpoint| {
+                serde_jcs::to_vec(checkpoint)
+                    .map_or(true, |bytes| bytes.len() > MAX_COMMIT_CHECKPOINT_BYTES)
+            })
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::BoundsExceeded,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +524,11 @@ pub enum ExecutionStoreErrorCode {
     EventConflict,
     CheckpointConflict,
     GrantAlreadyConsumed,
+    GrantConflict,
+    LineageConflict,
+    HistoryConflict,
+    BoundsExceeded,
+    ArithmeticOverflow,
     ResultConflict,
     InvalidRequest,
 }
@@ -315,6 +570,19 @@ impl fmt::Display for ExecutionStoreError {
                 "execution checkpoint did not match commit"
             }
             ExecutionStoreErrorCode::GrantAlreadyConsumed => "autonomy grant was already consumed",
+            ExecutionStoreErrorCode::GrantConflict => {
+                "autonomy grant authority is missing, stale, or revoked"
+            }
+            ExecutionStoreErrorCode::LineageConflict => {
+                "durable result does not match completed invocation lineage"
+            }
+            ExecutionStoreErrorCode::HistoryConflict => {
+                "execution history key conflicts with its persisted value"
+            }
+            ExecutionStoreErrorCode::BoundsExceeded => "execution store batch or page is too large",
+            ExecutionStoreErrorCode::ArithmeticOverflow => {
+                "execution store version arithmetic overflowed"
+            }
             ExecutionStoreErrorCode::ResultConflict => "durable invocation result conflicts",
             ExecutionStoreErrorCode::InvalidRequest => "execution store request is invalid",
         })
@@ -326,6 +594,16 @@ impl std::error::Error for ExecutionStoreError {}
 /// Adapter port for durable execution state. Each operation is atomic.
 #[async_trait]
 pub trait ExecutionStore: Send + Sync {
+    async fn apply_authoritative_grant(
+        &self,
+        change: AuthoritativeGrantChange,
+    ) -> Result<AuthoritativeGrantState, ExecutionStoreError>;
+
+    async fn load_authoritative_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<AuthoritativeGrantState>, ExecutionStoreError>;
+
     async fn create_run(&self, request: CreateRun) -> Result<StoredRun, ExecutionStoreError>;
 
     /// Acquires a new fence only if no current lease is active under adapter-authoritative time.
@@ -355,11 +633,16 @@ pub trait ExecutionStore: Send + Sync {
         run_id: Uuid,
     ) -> Result<Option<(u64, CheckpointV1)>, ExecutionStoreError>;
 
-    async fn load_steps(&self, run_id: Uuid) -> Result<Vec<Step>, ExecutionStoreError>;
-
-    async fn load_attempts(
+    async fn load_steps_page(
         &self,
         run_id: Uuid,
+        page: StoreReadPage,
+    ) -> Result<Vec<Step>, ExecutionStoreError>;
+
+    async fn load_attempts_page(
+        &self,
+        run_id: Uuid,
+        page: StoreReadPage,
     ) -> Result<Vec<InvocationAttemptRecord>, ExecutionStoreError>;
 
     async fn load_durable_result(
@@ -389,6 +672,7 @@ where
 {
     let store = factory.create_execution_store().await?;
     let session_id = Uuid::from_u128(0xfeed);
+    let owner_id = Uuid::from_u128(0x000f_eed5);
     let session = Session::new(
         session_id,
         "execution-store-contract",
@@ -397,14 +681,15 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let run = Run::queued(
-        Uuid::from_u128(0xfeed_1),
+        Uuid::from_u128(0x000f_eed1),
         session_id,
         "execution-store-contract",
         1,
     )
     .map_err(ExecutionStoreError::from)?;
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            owner_id,
             session.clone(),
             run.clone(),
             0,
@@ -412,14 +697,15 @@ where
         ))
         .await?;
     let conflicting = Run::queued(
-        Uuid::from_u128(0xfeed_2),
+        Uuid::from_u128(0x000f_eed2),
         session_id,
         "execution-store-contract",
         1,
     )
     .map_err(ExecutionStoreError::from)?;
     match store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            owner_id,
             session,
             conflicting,
             1,
@@ -452,12 +738,12 @@ where
     let running = run
         .transition(RunState::Running, None)
         .map_err(ExecutionStoreError::from)?;
-    let command = RuntimeCommand::start(Uuid::from_u128(0xfeed_3), session_id, run.id())
+    let command = RuntimeCommand::start(Uuid::from_u128(0x000f_eed3), session_id, run.id())
         .map_err(ExecutionStoreError::from)?;
     let gap = vec![
         RuntimeEvent::new(
-            Uuid::from_u128(0xfeed_4),
-            Uuid::from_u128(0xfeed_5),
+            Uuid::from_u128(0x000f_eed4),
+            Uuid::from_u128(0x000f_eed5),
             session_id,
             run.id(),
             1,
@@ -466,8 +752,8 @@ where
         )
         .map_err(ExecutionStoreError::from)?,
         RuntimeEvent::new(
-            Uuid::from_u128(0xfeed_8),
-            Uuid::from_u128(0xfeed_5),
+            Uuid::from_u128(0x000f_eed8),
+            Uuid::from_u128(0x000f_eed5),
             session_id,
             run.id(),
             2,
@@ -498,8 +784,8 @@ where
     }
     let events = vec![
         RuntimeEvent::new(
-            Uuid::from_u128(0xfeed_6),
-            Uuid::from_u128(0xfeed_5),
+            Uuid::from_u128(0x000f_eed6),
+            Uuid::from_u128(0x000f_eed5),
             session_id,
             run.id(),
             1,
@@ -508,8 +794,8 @@ where
         )
         .map_err(ExecutionStoreError::from)?,
         RuntimeEvent::new(
-            Uuid::from_u128(0xfeed_7),
-            Uuid::from_u128(0xfeed_5),
+            Uuid::from_u128(0x000f_eed7),
+            Uuid::from_u128(0x000f_eed5),
             session_id,
             run.id(),
             2,
@@ -550,6 +836,11 @@ where
         Usage::default(),
     )
     .state(RunState::Running, None)
+    .attempts(vec![attempt.clone()])
+    .cursor(Some(
+        super::CheckpointCursor::new(invocation.id(), 1, "execution-store-step")
+            .map_err(ExecutionStoreError::from)?,
+    ))
     .build()
     .map_err(ExecutionStoreError::from)?;
     let commit = ExecutionCommit::new(
@@ -568,8 +859,14 @@ where
     let outcome = store.commit_execution(commit.clone()).await?;
     if store.replay_events(run.id(), 0).await? != events
         || store.load_checkpoint(run.id()).await? != Some((1, checkpoint))
-        || store.load_steps(run.id()).await? != vec![step]
-        || store.load_attempts(run.id()).await? != vec![attempt]
+        || store
+            .load_steps_page(run.id(), StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?)
+            .await?
+            != vec![step]
+        || store
+            .load_attempts_page(run.id(), StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?)
+            .await?
+            != vec![attempt]
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -579,8 +876,8 @@ where
         .transition(RunState::Paused, Some(super::RunPauseReason::Requested))
         .map_err(ExecutionStoreError::from)?;
     let paused_event = RuntimeEvent::new(
-        Uuid::from_u128(0xfeed_b),
-        Uuid::from_u128(0xfeed_5),
+        Uuid::from_u128(0x000f_eedb),
+        Uuid::from_u128(0x000f_eed5),
         session_id,
         run.id(),
         3,
@@ -593,7 +890,7 @@ where
             created.run_version(),
             1,
             lease.clone(),
-            RuntimeCommand::pause(Uuid::from_u128(0xfeed_9), session_id, run.id())
+            RuntimeCommand::pause(Uuid::from_u128(0x000f_eed9), session_id, run.id())
                 .map_err(ExecutionStoreError::from)?,
             vec![paused_event.clone()],
             vec![],
@@ -616,7 +913,7 @@ where
             outcome.stored_run().run_version(),
             0,
             lease.clone(),
-            RuntimeCommand::pause(Uuid::from_u128(0xfeed_a), session_id, run.id())
+            RuntimeCommand::pause(Uuid::from_u128(0x000f_eeda), session_id, run.id())
                 .map_err(ExecutionStoreError::from)?,
             vec![paused_event.clone()],
             vec![],
@@ -652,7 +949,7 @@ where
             outcome.stored_run().run_version(),
             1,
             lease,
-            RuntimeCommand::pause(Uuid::from_u128(0xfeed_c), session_id, run.id())
+            RuntimeCommand::pause(Uuid::from_u128(0x000f_eedc), session_id, run.id())
                 .map_err(ExecutionStoreError::from)?,
             vec![paused_event.clone()],
             vec![],
@@ -670,12 +967,19 @@ where
                 .chain(std::iter::once(paused_event))
                 .collect::<Vec<_>>()
         || paused_outcome.stored_run().run_version()
-            != outcome.stored_run().run_version().saturating_add(1)
+            != outcome
+                .stored_run()
+                .run_version()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
+                })?
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
     }
+    assert_authoritative_grant_cas_contract(factory).await?;
     assert_concurrent_session_contract(factory).await?;
     assert_stale_cas_contract(factory).await?;
     assert_lease_reclamation_contract(factory).await?;
@@ -685,6 +989,64 @@ where
     assert_atomic_failure_contract(factory).await?;
     assert_counted_grant_contract(factory).await?;
     assert_durable_result_contract(factory).await
+}
+
+async fn assert_authoritative_grant_cas_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let grant_id = "execution-store-authoritative-grant";
+    let created = AuthoritativeGrantState::active(grant_id, 1, Some(2))?;
+    if store
+        .apply_authoritative_grant(AuthoritativeGrantChange::create(created.clone()))
+        .await?
+        != created
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    match store
+        .apply_authoritative_grant(AuthoritativeGrantChange::create(created))
+        .await
+    {
+        Err(error) if error.code() == ExecutionStoreErrorCode::VersionConflict => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    }
+    let upgraded = AuthoritativeGrantState::active(grant_id, 2, Some(3))?;
+    store
+        .apply_authoritative_grant(AuthoritativeGrantChange::update(1, upgraded.clone()))
+        .await?;
+    match store
+        .apply_authoritative_grant(AuthoritativeGrantChange::update(
+            1,
+            AuthoritativeGrantState::active(grant_id, 3, Some(4))?,
+        ))
+        .await
+    {
+        Err(error) if error.code() == ExecutionStoreErrorCode::VersionConflict => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    }
+    let revoked = store
+        .apply_authoritative_grant(AuthoritativeGrantChange::revoke(grant_id, 2)?)
+        .await?;
+    if revoked.status() != AuthoritativeGrantStatus::Revoked
+        || store.load_authoritative_grant(grant_id).await? != Some(revoked)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
 }
 
 fn conformance_definition(allows_concurrent_sessions: bool) -> AgentDefinition {
@@ -768,7 +1130,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let one = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            session.id(),
             session.clone(),
             first,
             0,
@@ -776,14 +1139,20 @@ where
         ))
         .await?;
     let two = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            session.id(),
             session,
             second,
             one.session_version(),
             SessionConcurrencyPolicy::Concurrent,
         ))
         .await?;
-    if two.session_version() != one.session_version().saturating_add(1) {
+    if two.session_version()
+        != one
+            .session_version()
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?
+    {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
@@ -817,7 +1186,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            session.id(),
             session.clone(),
             first.clone(),
             0,
@@ -825,7 +1195,8 @@ where
         ))
         .await?;
     let stale = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            session.id(),
             session,
             second.clone(),
             0,
@@ -865,7 +1236,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0x1e_a3),
             session.clone(),
             queued.clone(),
             0,
@@ -873,9 +1245,9 @@ where
         ))
         .await?;
     let expired = store
-        .acquire_lease(queued.id(), created.run_version(), 1)
+        .acquire_lease(queued.id(), created.run_version(), 100)
         .await?;
-    futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
+    futures_timer::Delay::new(std::time::Duration::from_millis(250)).await;
     if !matches!(
         store.renew_lease(expired.clone(), 1_000).await,
         Err(error) if error.code() == ExecutionStoreErrorCode::LeaseExpired
@@ -977,7 +1349,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0x5e_13),
             session.clone(),
             first.clone(),
             0,
@@ -1033,7 +1406,7 @@ where
             running_outcome.stored_run().run_version(),
             0,
             store.renew_lease(lease, 1_000).await?,
-            RuntimeCommand::cancel(Uuid::from_u128(0x5e_16), session.id(), first.id())
+            RuntimeCommand::cancel(Uuid::from_u128(0x005e_0016), session.id(), first.id())
                 .map_err(ExecutionStoreError::from)?,
             vec![cancelled_event],
             vec![],
@@ -1051,7 +1424,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let next_stored = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0x5e_13),
             session,
             next.clone(),
             terminal.stored_run().session_version(),
@@ -1071,7 +1445,13 @@ where
             .map(StoredRun::run)
             != Some(&next)
         || next_stored.session_version()
-            != terminal.stored_run().session_version().saturating_add(1)
+            != terminal
+                .stored_run()
+                .session_version()
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
+                })?
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -1111,7 +1491,8 @@ where
         ));
     }
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0xa9_14),
             session.clone(),
             waiting.clone(),
             0,
@@ -1143,6 +1524,19 @@ where
         Some(approval),
         target.clone(),
     );
+    match store.commit_execution(commit.clone()).await {
+        Err(error) if error.code() == ExecutionStoreErrorCode::GrantConflict => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    }
+    store
+        .apply_authoritative_grant(AuthoritativeGrantChange::create(
+            AuthoritativeGrantState::active(grant.id, grant.revision, None)?,
+        ))
+        .await?;
     let outcome = store.commit_execution(commit.clone()).await?;
     if store.commit_execution(commit).await? != outcome
         || store.load_run(run_id).await?.as_ref().map(StoredRun::run) != Some(&target)
@@ -1175,7 +1569,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0xcc_14),
             session.clone(),
             queued.clone(),
             0,
@@ -1276,7 +1671,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0xaf_14),
             session.clone(),
             queued.clone(),
             0,
@@ -1313,8 +1709,8 @@ where
     ))?;
     let result = conformance_value(DurableCapabilityResult::new(
         result_reference.clone(),
-        "jcs-v1:atomic-baseline",
-        "sha256:execution-store-atomic",
+        format!("jcs-v1:{}", "a".repeat(64)),
+        format!("sha256:{}", "c".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -1381,7 +1777,7 @@ where
     .build()
     .map_err(ExecutionStoreError::from)?;
     let candidate_event = RuntimeEvent::new(
-        Uuid::from_u128(0xaf_16),
+        Uuid::from_u128(0x00af_0016),
         Uuid::from_u128(0xaf_14),
         session.id(),
         queued.id(),
@@ -1392,8 +1788,8 @@ where
     .map_err(ExecutionStoreError::from)?;
     let conflicting_result = conformance_value(DurableCapabilityResult::new(
         result_reference,
-        "jcs-v1:atomic-conflict",
-        "sha256:execution-store-atomic",
+        format!("jcs-v1:{}", "b".repeat(64)),
+        format!("sha256:{}", "c".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -1403,7 +1799,7 @@ where
                 baseline.stored_run().run_version(),
                 0,
                 store.renew_lease(lease, 1_000).await?,
-                RuntimeCommand::start(Uuid::from_u128(0xaf_17), session.id(), queued.id())
+                RuntimeCommand::advance(Uuid::from_u128(0xaf_17), session.id(), queued.id())
                     .map_err(ExecutionStoreError::from)?,
                 vec![candidate_event],
                 vec![candidate_step],
@@ -1420,8 +1816,20 @@ where
         Err(error) if error.code() == ExecutionStoreErrorCode::ResultConflict
     ) || store.load_run(queued.id()).await?.as_ref() != Some(baseline.stored_run())
         || store.load_checkpoint(queued.id()).await?.is_some()
-        || !store.load_steps(queued.id()).await?.is_empty()
-        || store.load_attempts(queued.id()).await? != vec![baseline_attempt]
+        || !store
+            .load_steps_page(
+                queued.id(),
+                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            .is_empty()
+        || store
+            .load_attempts_page(
+                queued.id(),
+                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            != vec![baseline_attempt]
         || store.replay_events(queued.id(), 0).await? != vec![baseline_event]
         || store
             .load_durable_result(queued.id(), invocation.id())
@@ -1538,7 +1946,7 @@ fn conformance_approval_resume(
         &request,
         &decision,
         context,
-        &[grant.clone()],
+        std::slice::from_ref(grant),
     ))?;
     let expected_consumption = grant
         .remaining_uses
@@ -1597,6 +2005,15 @@ where
     let (first_invocation, first_context) = conformance_policy_context(Uuid::from_u128(0xc0_21))?;
     let (second_invocation, second_context) = conformance_policy_context(Uuid::from_u128(0xc0_22))?;
     let grant = conformance_counted_grant(&first_context)?;
+    store
+        .apply_authoritative_grant(AuthoritativeGrantChange::create(
+            AuthoritativeGrantState::active(
+                grant.id.clone(),
+                grant.revision,
+                grant.remaining_uses,
+            )?,
+        ))
+        .await?;
     let request = conformance_value(PolicyEngine::approval_request(&first_context, Some(&grant)))?;
     let decision = conformance_value(ApprovalDecision::new_approved(request.clone(), 1_000))?;
     let mut uncounted_substitution = grant.clone();
@@ -1668,7 +2085,8 @@ where
         ));
     }
     let first_created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0xc0_27),
             session.clone(),
             first_waiting.clone(),
             0,
@@ -1676,7 +2094,8 @@ where
         ))
         .await?;
     let second_created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0xc0_27),
             session.clone(),
             second_waiting.clone(),
             first_created.session_version(),
@@ -1701,7 +2120,7 @@ where
     .map_err(ExecutionStoreError::from)?;
     let second_event = RuntimeEvent::new(
         Uuid::from_u128(0xc0_26),
-        Uuid::from_u128(0xc0_28),
+        Uuid::from_u128(0xc0_27),
         session.id(),
         second_waiting.id(),
         1,
@@ -1738,14 +2157,10 @@ where
         store.commit_execution(second_commit.clone())
     );
     let (winning_commit, original_outcome, losing_waiting) = match (first_result, second_result) {
-        (Ok(outcome), Err(error))
-            if error.code() == ExecutionStoreErrorCode::GrantAlreadyConsumed =>
-        {
+        (Ok(outcome), Err(error)) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
             (first_commit, outcome, second_waiting)
         }
-        (Err(error), Ok(outcome))
-            if error.code() == ExecutionStoreErrorCode::GrantAlreadyConsumed =>
-        {
+        (Err(error), Ok(outcome)) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
             (second_commit, outcome, first_waiting)
         }
         _ => {
@@ -1793,7 +2208,8 @@ where
     )
     .map_err(ExecutionStoreError::from)?;
     let created = store
-        .create_run(CreateRun::new(
+        .create_run(CreateRun::new_for_owner(
+            Uuid::from_u128(0xd0_14),
             session.clone(),
             queued.clone(),
             0,
@@ -1824,14 +2240,28 @@ where
     let completed = conformance_value(CompletedInvocationRecord::new(
         invocation.binding(),
         1,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        conformance_value(OpaqueReference::new(result_reference.handle()))?,
+    ))?;
+    let cross_run_invocation = conformance_value(LogicalInvocation::new(
+        Uuid::from_u128(0xd0_20),
+        "cross-run-result-step",
+        "workspace.write",
+        1,
+        serde_json::json!({"path": "other.txt"}),
+    ))?;
+    let cross_run_completed = conformance_value(CompletedInvocationRecord::new(
+        cross_run_invocation.binding(),
+        1,
         manifest,
         RecoveryMode::KeyedIdempotent,
         conformance_value(OpaqueReference::new(result_reference.handle()))?,
     ))?;
     let result = conformance_value(DurableCapabilityResult::new(
         result_reference.clone(),
-        "jcs-v1:execution-store-result",
-        "sha256:execution-store-result",
+        format!("jcs-v1:{}", "d".repeat(64)),
+        format!("sha256:{}", "e".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -1851,6 +2281,43 @@ where
         RuntimeEventKind::RunStarted,
     )
     .map_err(ExecutionStoreError::from)?;
+    for (command_id, completed_without_lineage, attempts) in [
+        (Uuid::from_u128(0xd0_21), completed.clone(), vec![]),
+        (
+            Uuid::from_u128(0xd0_22),
+            cross_run_completed,
+            vec![attempt.clone()],
+        ),
+    ] {
+        let rejected = store
+            .commit_execution(ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(command_id, session.id(), queued.id())
+                    .map_err(ExecutionStoreError::from)?,
+                vec![first_event.clone()],
+                vec![],
+                attempts,
+                vec![DurableResultMutation::new(
+                    completed_without_lineage,
+                    result.clone(),
+                )],
+                None,
+                running.clone(),
+            ))
+            .await;
+        if !matches!(
+            rejected,
+            Err(error) if error.code() == ExecutionStoreErrorCode::LineageConflict
+        ) || store.load_run(queued.id()).await?.as_ref() != Some(&created)
+            || !store.replay_events(queued.id(), 0).await?.is_empty()
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+    }
     let first_outcome = store
         .commit_execution(ExecutionCommit::new(
             created.run_version(),
@@ -1881,7 +2348,7 @@ where
     }
     let renewed = store.renew_lease(lease, 1_000).await?;
     let second_event = RuntimeEvent::new(
-        Uuid::from_u128(0xd0_16),
+        Uuid::from_u128(0x00d0_0016),
         Uuid::from_u128(0xd0_14),
         session.id(),
         queued.id(),
@@ -1894,7 +2361,7 @@ where
         first_outcome.stored_run().run_version(),
         0,
         renewed.clone(),
-        RuntimeCommand::start(Uuid::from_u128(0xd0_17), session.id(), queued.id())
+        RuntimeCommand::advance(Uuid::from_u128(0xd0_17), session.id(), queued.id())
             .map_err(ExecutionStoreError::from)?,
         vec![second_event],
         vec![],
@@ -1913,7 +2380,13 @@ where
             .await?
             .as_ref()
             != Some(&result)
-        || store.load_attempts(queued.id()).await? != vec![attempt]
+        || store
+            .load_attempts_page(
+                queued.id(),
+                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            != vec![attempt]
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -1922,8 +2395,8 @@ where
     let before_conflict = store.load_run(queued.id()).await?;
     let conflicting_result = conformance_value(DurableCapabilityResult::new(
         result_reference,
-        "jcs-v1:conflicting-execution-store-result",
-        "sha256:execution-store-result",
+        format!("jcs-v1:{}", "f".repeat(64)),
+        format!("sha256:{}", "e".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -1942,7 +2415,7 @@ where
             identical_outcome.stored_run().run_version(),
             0,
             store.renew_lease(renewed, 1_000).await?,
-            RuntimeCommand::start(Uuid::from_u128(0xd0_19), session.id(), queued.id())
+            RuntimeCommand::advance(Uuid::from_u128(0xd0_19), session.id(), queued.id())
                 .map_err(ExecutionStoreError::from)?,
             vec![conflicting_event],
             vec![],

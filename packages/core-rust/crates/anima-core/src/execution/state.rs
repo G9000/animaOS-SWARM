@@ -862,6 +862,7 @@ impl<'de> Deserialize<'de> for ExecutionLease {
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeCommandKind {
     Start,
+    Advance,
     Pause,
     Resume,
     Cancel,
@@ -970,12 +971,24 @@ impl ApprovalResumeClaim {
     pub fn grant_consumption_snapshot(&self) -> Option<&GrantConsumptionSnapshot> {
         self.grant_consumption_snapshot.as_ref()
     }
+    pub fn grant_id(&self) -> Option<&str> {
+        self.binding.decision.request.grant_id.as_deref()
+    }
+    pub fn grant_revision(&self) -> Option<u32> {
+        self.binding.decision.request.grant_revision
+    }
+    pub fn grant_remaining_uses(&self) -> Option<u32> {
+        self.binding.decision.request.grant_remaining_uses
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RuntimeCommandPayload {
     Start {
+        run_id: Uuid,
+    },
+    Advance {
         run_id: Uuid,
     },
     Pause {
@@ -998,6 +1011,7 @@ impl RuntimeCommandPayload {
     fn kind(&self) -> RuntimeCommandKind {
         match self {
             Self::Start { .. } => RuntimeCommandKind::Start,
+            Self::Advance { .. } => RuntimeCommandKind::Advance,
             Self::Pause { .. } => RuntimeCommandKind::Pause,
             Self::Resume { .. } => RuntimeCommandKind::Resume,
             Self::Cancel { .. } => RuntimeCommandKind::Cancel,
@@ -1007,6 +1021,7 @@ impl RuntimeCommandPayload {
     fn run_id(&self) -> Uuid {
         match self {
             Self::Start { run_id }
+            | Self::Advance { run_id }
             | Self::Pause { run_id }
             | Self::Resume { run_id, .. }
             | Self::Cancel { run_id }
@@ -1015,7 +1030,10 @@ impl RuntimeCommandPayload {
     }
     fn validate(&self) -> Result<(), ExecutionError> {
         let ids = match self {
-            Self::Start { run_id } | Self::Pause { run_id } | Self::Cancel { run_id } => {
+            Self::Start { run_id }
+            | Self::Advance { run_id }
+            | Self::Pause { run_id }
+            | Self::Cancel { run_id } => {
                 vec![*run_id]
             }
             Self::Retry {
@@ -1069,6 +1087,9 @@ impl RuntimeCommand {
     }
     pub fn start(id: Uuid, session_id: Uuid, run_id: Uuid) -> Result<Self, ExecutionError> {
         Self::new(id, session_id, RuntimeCommandPayload::Start { run_id })
+    }
+    pub fn advance(id: Uuid, session_id: Uuid, run_id: Uuid) -> Result<Self, ExecutionError> {
+        Self::new(id, session_id, RuntimeCommandPayload::Advance { run_id })
     }
     pub fn pause(id: Uuid, session_id: Uuid, run_id: Uuid) -> Result<Self, ExecutionError> {
         Self::new(id, session_id, RuntimeCommandPayload::Pause { run_id })
@@ -1157,6 +1178,15 @@ impl RuntimeCommand {
     }
     pub fn payload_digest(&self) -> Uuid {
         self.digest()
+    }
+    pub fn retry_invocation_id(&self) -> Option<Uuid> {
+        match &self.payload {
+            RuntimeCommandPayload::Retry {
+                logical_invocation_id,
+                ..
+            } => Some(*logical_invocation_id),
+            _ => None,
+        }
     }
     fn resume_parts(
         &self,

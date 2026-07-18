@@ -11,11 +11,11 @@ use anima_core::{
     CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId,
     CapabilityReferenceValidator, CapabilityRegistry, CapabilityRegistryError, CapabilityResult,
     CapabilityResultRecorder, CapabilitySecretReferenceId, CheckpointV1, CheckpointV1Builder,
-    DefinitionPin, DurableCapabilityResult, ExecutionFence, InvocationAttemptRecord,
-    LogicalInvocation, ManifestCatalog, ManifestCatalogError, ManifestPin, ReconcileOutcome,
-    RecoveryActionKind, RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord, RiskLevel, Run,
-    RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility, UncertainInvocationRecord,
-    Usage,
+    DefinitionPin, DurableCapabilityResult, DurableCapabilityStatus, ExecutionFence,
+    InvocationAttemptRecord, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ManifestPin,
+    ReconcileOutcome, RecoveryActionKind, RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord,
+    RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility,
+    UncertainInvocationRecord, Usage, MAX_DURABLE_RESULT_SIZE_BYTES,
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -55,7 +55,7 @@ fn manifest(id: &str, version: u32, recovery_mode: RecoveryMode) -> CapabilityMa
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: format!("sha256:{id}:{version}"),
+        schema_digest: format!("sha256:{}", "0".repeat(64)),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
@@ -70,6 +70,59 @@ fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
         catalog.register_manifest(manifest).unwrap();
     }
     CapabilityRegistry::new(catalog)
+}
+
+#[test]
+fn durable_result_digests_are_canonical_bounded_and_secret_free() {
+    let reference = CapabilityReferenceId::new(Uuid::from_u128(0xd1));
+    let content_digest = format!("jcs-v1:{}", "a".repeat(64));
+    let schema_digest = format!("sha256:{}", "b".repeat(64));
+    let valid = DurableCapabilityResult::new(
+        reference.clone(),
+        content_digest.clone(),
+        schema_digest.clone(),
+        MAX_DURABLE_RESULT_SIZE_BYTES,
+        DurableCapabilityStatus::Completed,
+    )
+    .unwrap();
+    assert_eq!(valid.content_digest(), content_digest);
+    assert_eq!(valid.schema_digest(), schema_digest);
+
+    for malformed in [
+        "jcs-v1:short".to_owned(),
+        format!("jcs-v1:{}", "A".repeat(64)),
+        format!("jcs-v1:{}", "g".repeat(64)),
+        format!("jcs-v1:{}secret", "a".repeat(64)),
+    ] {
+        assert!(DurableCapabilityResult::new(
+            reference.clone(),
+            malformed,
+            format!("sha256:{}", "b".repeat(64)),
+            1,
+            DurableCapabilityStatus::Completed,
+        )
+        .is_err());
+    }
+    assert!(DurableCapabilityResult::new(
+        reference.clone(),
+        format!("jcs-v1:{}", "a".repeat(64)),
+        "sha256:raw-secret-value",
+        1,
+        DurableCapabilityStatus::Completed,
+    )
+    .is_err());
+    assert!(DurableCapabilityResult::new(
+        reference,
+        format!("jcs-v1:{}", "a".repeat(64)),
+        format!("sha256:{}", "b".repeat(64)),
+        MAX_DURABLE_RESULT_SIZE_BYTES + 1,
+        DurableCapabilityStatus::Completed,
+    )
+    .is_err());
+
+    let mut tampered = serde_json::to_value(valid).unwrap();
+    tampered["content_digest"] = json!("jcs-v1:secret");
+    assert!(serde_json::from_value::<DurableCapabilityResult>(tampered).is_err());
 }
 
 struct RejectingResultRecorder;

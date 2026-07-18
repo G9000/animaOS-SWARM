@@ -1145,6 +1145,8 @@ pub enum DurableCapabilityStatus {
     Adopted,
 }
 
+pub const MAX_DURABLE_RESULT_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DurableCapabilityResult {
@@ -1186,11 +1188,10 @@ impl DurableCapabilityResult {
 
     fn validate(&self) -> Result<(), CapabilityError> {
         if self.result_ref.handle().is_nil()
-            || !self.content_digest.starts_with("jcs-v1:")
-            || self.content_digest.len() <= "jcs-v1:".len()
-            || !self.schema_digest.starts_with("sha256:")
-            || self.schema_digest.len() <= "sha256:".len()
+            || !canonical_prefixed_sha256(&self.content_digest, "jcs-v1:")
+            || !canonical_prefixed_sha256(&self.schema_digest, "sha256:")
             || self.size_bytes == 0
+            || self.size_bytes > MAX_DURABLE_RESULT_SIZE_BYTES
         {
             return Err(CapabilityError::validation());
         }
@@ -1212,6 +1213,14 @@ impl DurableCapabilityResult {
     pub fn status(&self) -> DurableCapabilityStatus {
         self.status
     }
+}
+
+fn canonical_prefixed_sha256(value: &str, prefix: &str) -> bool {
+    value.len() == prefix.len() + 64
+        && value.starts_with(prefix)
+        && value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl fmt::Debug for DurableCapabilityResult {
