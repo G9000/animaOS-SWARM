@@ -8,8 +8,8 @@ use uuid::Uuid;
 use super::checkpoint::{DefinitionPin, OpaqueReference, RecoveryPauseRecord, RecoveryRecord};
 use crate::{
     AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity,
-    AutonomyGrant, GrantConsumption, GrantEffect, GrantStatus, PolicyContext, PolicyEngine,
-    PolicyReasonCode, RecoveryResumeBinding, RiskLevel, ValidatedRecoveryResume,
+    AutonomyGrant, GrantConsumption, GrantEffect, GrantScope, GrantStatus, PolicyContext,
+    PolicyEngine, PolicyReasonCode, RecoveryResumeBinding, RiskLevel, ValidatedRecoveryResume,
     CAPABILITY_INVOCATION_NAMESPACE, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
 
@@ -968,6 +968,18 @@ pub struct GrantAuthorityBinding {
     remaining_uses: Option<u32>,
 }
 
+#[derive(Serialize)]
+struct ImmutableGrantAuthority<'a> {
+    id: &'a str,
+    revision: u32,
+    status: GrantStatus,
+    effect: GrantEffect,
+    scope: &'a GrantScope,
+    maximum_risk: RiskLevel,
+    valid_from_ms: i64,
+    valid_until_ms: Option<i64>,
+}
+
 impl GrantAuthorityBinding {
     pub fn from_grant(grant: &AutonomyGrant) -> Result<Self, ExecutionError> {
         let canonical = serde_jcs::to_vec(grant)
@@ -977,11 +989,22 @@ impl GrantAuthorityBinding {
         if &validated != grant {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
+        let immutable_authority = serde_jcs::to_vec(&ImmutableGrantAuthority {
+            id: &grant.id,
+            revision: grant.revision,
+            status: grant.status,
+            effect: grant.effect,
+            scope: &grant.scope,
+            maximum_risk: grant.maximum_risk,
+            valid_from_ms: grant.valid_from_ms,
+            valid_until_ms: grant.valid_until_ms,
+        })
+        .map_err(|_| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
         let scope = serde_jcs::to_vec(&grant.scope)
             .map_err(|_| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
         Ok(Self {
             authority_key: GrantAuthorityKey::from_grant_id(&grant.id),
-            full_grant_digest: sha256_labelled("sha256:", &canonical),
+            full_grant_digest: sha256_labelled("sha256:", &immutable_authority),
             scope_digest: sha256_labelled("sha256:", &scope),
             revision: grant.revision,
             status: grant.status,

@@ -539,7 +539,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         let mut patch = build_commit_patch(&state, owner_id, &commit, self.clock.now_ms())?;
         patch.checkpoint = match commit.into_checkpoint_mutation() {
             CheckpointMutation::Unchanged => patch.checkpoint,
-            CheckpointMutation::Replace(checkpoint) => Some(Arc::new(checkpoint)),
+            CheckpointMutation::Replace(checkpoint) => Some(Arc::from(checkpoint)),
             CheckpointMutation::Clear => None,
         };
         let outcome = ExecutionCommitOutcome::new_shared(

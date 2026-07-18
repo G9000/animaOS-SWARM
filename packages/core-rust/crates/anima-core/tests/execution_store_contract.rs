@@ -235,7 +235,7 @@ fn authority_fixture(raw_id: &str, revision: u32, remaining_uses: Option<u32>) -
 }
 
 #[test]
-fn authoritative_grants_are_owner_scoped_opaque_and_bind_the_full_grant() {
+fn authoritative_grants_are_owner_scoped_opaque_and_bind_immutable_authority() {
     let owner = id(0x900);
     let grant = AutonomyGrant::new_with_effect(
         "raw-grant-id-must-never-persist",
@@ -279,6 +279,35 @@ fn authoritative_grants_are_owner_scoped_opaque_and_bind_the_full_grant() {
     let changed = AuthoritativeGrantState::from_grant(owner, &changed_scope).unwrap();
     assert_eq!(state.authority_key(), changed.authority_key());
     assert_ne!(state.full_grant_digest(), changed.full_grant_digest());
+}
+
+#[test]
+fn counted_grant_authority_digest_is_stable_while_live_count_bindings_advance() {
+    let owner = id(0x901);
+    let mut live_grant = authority_fixture("multi-use-grant", 1, Some(3));
+    let initial_binding = GrantAuthorityBinding::from_grant(&live_grant).unwrap();
+    let initial = AuthoritativeGrantState::from_grant(owner, &live_grant).unwrap();
+
+    live_grant.remaining_uses = Some(2);
+    let second_binding = GrantAuthorityBinding::from_grant(&live_grant).unwrap();
+    assert_eq!(
+        initial_binding.full_grant_digest(),
+        second_binding.full_grant_digest()
+    );
+    assert_ne!(initial_binding, second_binding);
+
+    let after_first = initial.consume(&initial_binding, 1_000).unwrap();
+    assert_eq!(after_first.remaining_uses(), Some(2));
+    after_first
+        .validate_binding(&second_binding, 1_000)
+        .unwrap();
+    assert_eq!(
+        after_first
+            .validate_binding(&initial_binding, 1_000)
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::GrantConflict
+    );
 }
 
 fn approval_resume_parts(

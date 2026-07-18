@@ -256,6 +256,7 @@ impl AuthoritativeGrantState {
     pub fn authority_key_encoded(&self) -> &str {
         self.authority_key.as_str()
     }
+    /// Digest of immutable grant authority fields; the live use count is bound separately.
     pub fn full_grant_digest(&self) -> &str {
         &self.full_grant_digest
     }
@@ -611,7 +612,7 @@ pub enum CheckpointMutation {
     /// Retain the current checkpoint only when the post-commit aggregate is still identical to it.
     Unchanged,
     /// Replace the current checkpoint with an exact snapshot of the post-commit aggregate.
-    Replace(CheckpointV1),
+    Replace(Box<CheckpointV1>),
     /// Invalidate any current checkpoint while advancing the checkpoint generation.
     Clear,
 }
@@ -676,7 +677,7 @@ impl ExecutionCommit {
     }
 
     pub fn with_checkpoint(mut self, checkpoint: CheckpointV1) -> Self {
-        self.checkpoint = CheckpointMutation::Replace(checkpoint);
+        self.checkpoint = CheckpointMutation::Replace(Box::new(checkpoint));
         self
     }
 
@@ -723,7 +724,7 @@ impl ExecutionCommit {
 
     pub fn checkpoint(&self) -> Option<&CheckpointV1> {
         match &self.checkpoint {
-            CheckpointMutation::Replace(checkpoint) => Some(checkpoint),
+            CheckpointMutation::Replace(checkpoint) => Some(checkpoint.as_ref()),
             CheckpointMutation::Unchanged | CheckpointMutation::Clear => None,
         }
     }
@@ -1488,6 +1489,7 @@ where
     assert_command_conflict_contract(factory).await?;
     assert_atomic_failure_contract(factory).await?;
     assert_counted_grant_contract(factory).await?;
+    assert_multi_use_counted_grant_contract(factory).await?;
     assert_counted_grant_revoke_race_contract(factory).await?;
     assert_durable_result_contract(factory).await
 }
@@ -3302,13 +3304,15 @@ where
         )?;
         let (created, lease) = create_waiting_run(
             &store,
-            owner_id,
-            &session,
-            &waiting,
-            0,
-            SessionConcurrencyPolicy::Serial,
-            Uuid::from_u128(0xb0_70 + mutation * 2),
-            Uuid::from_u128(0xb0_71 + mutation * 2),
+            WaitingRunSetup {
+                owner_id,
+                session: &session,
+                waiting: &waiting,
+                expected_session_version: 0,
+                concurrency_policy: SessionConcurrencyPolicy::Serial,
+                start_command_id: Uuid::from_u128(0xb0_70 + mutation * 2),
+                approval_command_id: Uuid::from_u128(0xb0_71 + mutation * 2),
+            },
         )
         .await?;
         let event = RuntimeEvent::new(
@@ -3345,16 +3349,29 @@ where
     Ok(())
 }
 
-async fn create_waiting_run<S: ExecutionStore>(
-    store: &S,
+struct WaitingRunSetup<'a> {
     owner_id: Uuid,
-    session: &Session,
-    waiting: &Run,
+    session: &'a Session,
+    waiting: &'a Run,
     expected_session_version: u64,
     concurrency_policy: SessionConcurrencyPolicy,
     start_command_id: Uuid,
     approval_command_id: Uuid,
+}
+
+async fn create_waiting_run<S: ExecutionStore>(
+    store: &S,
+    setup: WaitingRunSetup<'_>,
 ) -> Result<(StoredRun, ExecutionLease), ExecutionStoreError> {
+    let WaitingRunSetup {
+        owner_id,
+        session,
+        waiting,
+        expected_session_version,
+        concurrency_policy,
+        start_command_id,
+        approval_command_id,
+    } = setup;
     let queued = Run::queued(
         waiting.id(),
         waiting.session_id(),
@@ -3908,13 +3925,15 @@ where
     }
     let (created, lease) = create_waiting_run(
         &store,
-        owner_id,
-        &session,
-        &waiting,
-        0,
-        SessionConcurrencyPolicy::Serial,
-        Uuid::from_u128(0xa9_15),
-        Uuid::from_u128(0x00a9_0016),
+        WaitingRunSetup {
+            owner_id,
+            session: &session,
+            waiting: &waiting,
+            expected_session_version: 0,
+            concurrency_policy: SessionConcurrencyPolicy::Serial,
+            start_command_id: Uuid::from_u128(0xa9_15),
+            approval_command_id: Uuid::from_u128(0x00a9_0016),
+        },
     )
     .await?;
     let event = RuntimeEvent::new(
@@ -4362,6 +4381,13 @@ fn conformance_policy_context(
 fn conformance_counted_grant(
     context: &PolicyContext,
 ) -> Result<AutonomyGrant, ExecutionStoreError> {
+    conformance_counted_grant_with_uses(context, 1)
+}
+
+fn conformance_counted_grant_with_uses(
+    context: &PolicyContext,
+    remaining_uses: u32,
+) -> Result<AutonomyGrant, ExecutionStoreError> {
     conformance_value(AutonomyGrant::new_with_effect(
         "execution-store-counted-grant",
         1,
@@ -4380,7 +4406,7 @@ fn conformance_counted_grant(
         RiskLevel::High,
         500,
         Some(2_000_000),
-        Some(1),
+        Some(remaining_uses),
         GrantEffect::ApprovalRequired,
     ))
 }
@@ -4539,24 +4565,28 @@ where
     }
     let (first_created, first_lease) = create_waiting_run(
         &store,
-        owner_id,
-        &session,
-        &first_waiting,
-        0,
-        SessionConcurrencyPolicy::Concurrent,
-        Uuid::from_u128(0xc0_28),
-        Uuid::from_u128(0xc0_29),
+        WaitingRunSetup {
+            owner_id,
+            session: &session,
+            waiting: &first_waiting,
+            expected_session_version: 0,
+            concurrency_policy: SessionConcurrencyPolicy::Concurrent,
+            start_command_id: Uuid::from_u128(0xc0_28),
+            approval_command_id: Uuid::from_u128(0xc0_29),
+        },
     )
     .await?;
     let (second_created, second_lease) = create_waiting_run(
         &store,
-        owner_id,
-        &session,
-        &second_waiting,
-        first_created.session_version(),
-        SessionConcurrencyPolicy::Concurrent,
-        Uuid::from_u128(0xc0_2a),
-        Uuid::from_u128(0xc0_2b),
+        WaitingRunSetup {
+            owner_id,
+            session: &session,
+            waiting: &second_waiting,
+            expected_session_version: first_created.session_version(),
+            concurrency_policy: SessionConcurrencyPolicy::Concurrent,
+            start_command_id: Uuid::from_u128(0xc0_2a),
+            approval_command_id: Uuid::from_u128(0xc0_2b),
+        },
     )
     .await?;
     let first_event = RuntimeEvent::new(
@@ -4648,6 +4678,217 @@ where
     Ok(())
 }
 
+async fn prepare_counted_grant_commit<S: ExecutionStore>(
+    store: &S,
+    owner_id: Uuid,
+    session: &Session,
+    expected_session_version: u64,
+    seed: u128,
+    grant: &AutonomyGrant,
+) -> Result<(ExecutionCommit, Run, u64), ExecutionStoreError> {
+    let run_id = Uuid::from_u128(seed);
+    let (invocation, context) = conformance_policy_context(run_id)?;
+    let (waiting, target, command, approval) = conformance_approval_resume(
+        session,
+        run_id,
+        Uuid::from_u128(seed + 1),
+        &invocation,
+        &context,
+        grant,
+    )?;
+    let (created, lease) = create_waiting_run(
+        store,
+        WaitingRunSetup {
+            owner_id,
+            session,
+            waiting: &waiting,
+            expected_session_version,
+            concurrency_policy: SessionConcurrencyPolicy::Concurrent,
+            start_command_id: Uuid::from_u128(seed + 2),
+            approval_command_id: Uuid::from_u128(seed + 3),
+        },
+    )
+    .await?;
+    let event = RuntimeEvent::new(
+        Uuid::from_u128(seed + 4),
+        owner_id,
+        session.id(),
+        run_id,
+        1,
+        1,
+        RuntimeEventKind::RunResumed,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    Ok((
+        ExecutionCommit::new(
+            created.run_version(),
+            0,
+            lease,
+            command,
+            vec![event],
+            vec![],
+            vec![],
+            vec![],
+            Some(approval),
+            target,
+        ),
+        waiting,
+        created.session_version(),
+    ))
+}
+
+async fn assert_multi_use_counted_grant_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let owner_id = Uuid::from_u128(0xc0_50);
+    let session = conformance_value(Session::new_for_definition(
+        Uuid::from_u128(0xc0_51),
+        &conformance_definition(true),
+        SessionConcurrencyPolicy::Concurrent,
+    ))?;
+    let (_, first_context) = conformance_policy_context(Uuid::from_u128(0xc0_60))?;
+    let grant_with_three = conformance_counted_grant_with_uses(&first_context, 3)?;
+    let authority = AuthoritativeGrantState::from_grant(owner_id, &grant_with_three)?;
+    store
+        .apply_authoritative_grant(
+            owner_id,
+            AuthoritativeGrantChange::create(authority.clone()),
+        )
+        .await?;
+
+    let (first, _, first_session_version) =
+        prepare_counted_grant_commit(&store, owner_id, &session, 0, 0xc0_60, &grant_with_three)
+            .await?;
+    let (stale, stale_waiting, stale_session_version) = prepare_counted_grant_commit(
+        &store,
+        owner_id,
+        &session,
+        first_session_version,
+        0xc0_70,
+        &grant_with_three,
+    )
+    .await?;
+    let first_outcome = store.commit_execution(owner_id, first.clone()).await?;
+    if first_outcome.grant_consumption().is_none()
+        || store
+            .load_authoritative_grant(owner_id, authority.authority_key())
+            .await?
+            .and_then(|state| state.remaining_uses())
+            != Some(2)
+        || !matches!(
+            store.commit_execution(owner_id, stale).await,
+            Err(error) if error.code() == ExecutionStoreErrorCode::GrantConflict
+        )
+        || store
+            .load_run(owner_id, stale_waiting.id())
+            .await?
+            .as_ref()
+            .map(StoredRun::run)
+            != Some(&stale_waiting)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+
+    let mut grant_with_two = grant_with_three.clone();
+    grant_with_two.remaining_uses = Some(2);
+    let (second, _, second_session_version) = prepare_counted_grant_commit(
+        &store,
+        owner_id,
+        &session,
+        stale_session_version,
+        0xc0_80,
+        &grant_with_two,
+    )
+    .await?;
+    let second_outcome = store.commit_execution(owner_id, second.clone()).await?;
+    if second_outcome.grant_consumption().is_none()
+        || store
+            .load_authoritative_grant(owner_id, authority.authority_key())
+            .await?
+            .and_then(|state| state.remaining_uses())
+            != Some(1)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+
+    let mut grant_with_one = grant_with_three.clone();
+    grant_with_one.remaining_uses = Some(1);
+    let (third, _, third_session_version) = prepare_counted_grant_commit(
+        &store,
+        owner_id,
+        &session,
+        second_session_version,
+        0xc0_90,
+        &grant_with_one,
+    )
+    .await?;
+    let (fourth, fourth_waiting, _) = prepare_counted_grant_commit(
+        &store,
+        owner_id,
+        &session,
+        third_session_version,
+        0xc0_a0,
+        &grant_with_one,
+    )
+    .await?;
+    let consumption_ids = [
+        first
+            .approval()
+            .and_then(ApprovalGrantMutation::grant_consumption)
+            .map(|consumption| consumption.logical_invocation_id),
+        second
+            .approval()
+            .and_then(ApprovalGrantMutation::grant_consumption)
+            .map(|consumption| consumption.logical_invocation_id),
+        third
+            .approval()
+            .and_then(ApprovalGrantMutation::grant_consumption)
+            .map(|consumption| consumption.logical_invocation_id),
+    ];
+    if consumption_ids.iter().any(Option::is_none)
+        || consumption_ids[0] == consumption_ids[1]
+        || consumption_ids[0] == consumption_ids[2]
+        || consumption_ids[1] == consumption_ids[2]
+        || first.command().id() == second.command().id()
+        || first.command().id() == third.command().id()
+        || second.command().id() == third.command().id()
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let third_outcome = store.commit_execution(owner_id, third).await?;
+    if third_outcome.grant_consumption().is_none()
+        || store
+            .load_authoritative_grant(owner_id, authority.authority_key())
+            .await?
+            .and_then(|state| state.remaining_uses())
+            != Some(0)
+        || !matches!(
+            store.commit_execution(owner_id, fourth).await,
+            Err(error) if error.code() == ExecutionStoreErrorCode::GrantConflict
+        )
+        || store
+            .load_run(owner_id, fourth_waiting.id())
+            .await?
+            .as_ref()
+            .map(StoredRun::run)
+            != Some(&fourth_waiting)
+        || store.commit_execution(owner_id, first).await? != first_outcome
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
 async fn assert_counted_grant_revoke_race_contract<F>(
     factory: &F,
 ) -> Result<(), ExecutionStoreError>
@@ -4681,13 +4922,15 @@ where
     )?;
     let (created, lease) = create_waiting_run(
         &store,
-        owner_id,
-        &session,
-        &waiting,
-        0,
-        SessionConcurrencyPolicy::Concurrent,
-        Uuid::from_u128(0xc0_33),
-        Uuid::from_u128(0xc0_34),
+        WaitingRunSetup {
+            owner_id,
+            session: &session,
+            waiting: &waiting,
+            expected_session_version: 0,
+            concurrency_policy: SessionConcurrencyPolicy::Concurrent,
+            start_command_id: Uuid::from_u128(0xc0_33),
+            approval_command_id: Uuid::from_u128(0xc0_34),
+        },
     )
     .await?;
     let event = RuntimeEvent::new(
