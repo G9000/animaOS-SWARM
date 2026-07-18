@@ -1,7 +1,8 @@
 use anima_core::{
     ApprovalDecision, ApprovalValidity, AutonomyGrant, CapabilityKind, CapabilityManifest,
-    GrantScope, GrantStatus, LogicalInvocation, PolicyContext, PolicyDecision, PolicyEngine,
-    PolicyReasonCode, PolicyRestrictions, RiskLevel, RuntimeCompatibility,
+    GrantConsumption, GrantScope, GrantStatus, LogicalInvocation, PolicyContext, PolicyDecision,
+    PolicyEngine, PolicyEvaluation, PolicyReason, PolicyReasonCode, PolicyRestrictions, RiskLevel,
+    RuntimeCompatibility,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -390,7 +391,11 @@ fn policy_records_round_trip_and_do_not_serialize_arguments_or_credentials() {
     assert!(!encoded.contains("super-secret"));
     assert!(!format!("{context:?}").contains("super-secret"));
     let restored: (PolicyContext, AutonomyGrant) = serde_json::from_str(&encoded).unwrap();
-    assert_eq!(restored.0, context);
+    assert_eq!(
+        serde_json::to_string(&restored.0).unwrap(),
+        serde_json::to_string(&context).unwrap()
+    );
+    assert!(PolicyEngine::evaluate(&restored.0, &[]).is_err());
 }
 
 #[test]
@@ -422,4 +427,109 @@ fn malformed_policy_records_are_rejected_during_construction_and_deserialization
         "remaining_uses": 0
     });
     assert!(serde_json::from_value::<AutonomyGrant>(malformed).is_err());
+}
+
+#[test]
+fn deserialized_policy_context_requires_exact_manifest_and_invocation_provenance() {
+    let invocation = invocation(json!({ "path": "reports/a.md" }));
+    let manifest = manifest(RiskLevel::High, 1);
+    let original = PolicyContext::new(
+        "owner-1",
+        "actor-1",
+        "writer-agent",
+        1,
+        "workspace-1",
+        "reports/a.md",
+        &manifest,
+        &invocation,
+        1,
+        Default::default(),
+        1_000,
+    )
+    .unwrap();
+    let mut restored: PolicyContext =
+        serde_json::from_value(serde_json::to_value(&original).unwrap()).unwrap();
+    assert!(PolicyEngine::evaluate(&restored, &[]).is_err());
+    restored.verify_against(&manifest, &invocation).unwrap();
+    assert!(matches!(
+        PolicyEngine::evaluate(&restored, &[]).unwrap().decision,
+        PolicyDecision::RequireApproval(_)
+    ));
+
+    let mut lower_risk = serde_json::to_value(&original).unwrap();
+    lower_risk["manifest_risk"] = json!("Low");
+    let mut lower_risk: PolicyContext = serde_json::from_value(lower_risk).unwrap();
+    assert!(lower_risk.verify_against(&manifest, &invocation).is_err());
+
+    let mut substituted_digest = serde_json::to_value(&original).unwrap();
+    substituted_digest["canonical_argument_digest"] = json!(Uuid::from_u128(99));
+    let mut substituted_digest: PolicyContext = serde_json::from_value(substituted_digest).unwrap();
+    assert!(substituted_digest
+        .verify_against(&manifest, &invocation)
+        .is_err());
+}
+
+#[test]
+fn supplied_nonmatching_grant_cannot_be_silently_downgraded_to_unbound_approval() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let mut revoked = grant(&context, RiskLevel::High);
+    revoked.status = GrantStatus::Revoked;
+    assert!(PolicyEngine::approval_request(&context, Some(&revoked)).is_err());
+}
+
+#[test]
+fn same_id_grant_revisions_are_ranked_deterministically_after_id() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let mut revision_one = grant(&context, RiskLevel::High);
+    revision_one.id = "same-id".into();
+    let mut revision_two = revision_one.clone();
+    revision_two.revision = 2;
+    let first =
+        PolicyEngine::evaluate(&context, &[revision_one.clone(), revision_two.clone()]).unwrap();
+    let second = PolicyEngine::evaluate(&context, &[revision_two, revision_one]).unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.consumption.unwrap().grant_revision, 2);
+}
+
+#[test]
+fn audit_records_are_validated_on_construction_and_serde_round_trip() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let evaluation = PolicyEngine::evaluate(&context, &[grant(&context, RiskLevel::High)]).unwrap();
+    let encoded = serde_json::to_string(&evaluation).unwrap();
+    assert_eq!(
+        serde_json::from_str::<PolicyEvaluation>(&encoded).unwrap(),
+        evaluation
+    );
+
+    let mut invalid_consumption = serde_json::to_value(&evaluation).unwrap();
+    invalid_consumption["consumption"]["logical_invocation_id"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<PolicyEvaluation>(invalid_consumption).is_err());
+    assert!(serde_json::from_value::<GrantConsumption>(json!({
+        "grant_id": " ", "grant_revision": 0, "logical_invocation_id": Uuid::nil()
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<PolicyReason>(json!({
+        "code": "allowed_by_grant", "effective_risk": "High", "policy_revision": 0,
+        "grant_id": " ", "grant_revision": 0
+    }))
+    .is_err());
+    assert!(serde_json::from_value::<PolicyDecision>(json!({
+        "RequireApproval": {
+            "code": "allowed_by_default", "effective_risk": "High", "policy_revision": 1,
+            "grant_id": null, "grant_revision": null
+        }
+    }))
+    .is_err());
 }

@@ -40,6 +40,21 @@ pub struct PolicyContext {
     pub restrictions: PolicyRestrictions,
     /// Unix milliseconds supplied by the host; policy evaluation does not read a clock.
     pub now_ms: i64,
+    #[serde(skip)]
+    provenance: Option<PolicyInputSnapshot>,
+}
+
+/// An in-memory provenance pin made only after exact manifest/invocation validation.
+/// It is intentionally omitted from JSON: a deserialized context must be re-verified before use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PolicyInputSnapshot {
+    manifest_id: String,
+    manifest_version: u32,
+    manifest_risk: RiskLevel,
+    run_id: Uuid,
+    logical_step_id: String,
+    logical_invocation_id: Uuid,
+    canonical_argument_digest: Uuid,
 }
 
 impl PolicyContext {
@@ -57,7 +72,7 @@ impl PolicyContext {
         restrictions: PolicyRestrictions,
         now_ms: i64,
     ) -> Result<Self, PolicyValidationError> {
-        let context = Self {
+        let mut context = Self {
             owner_id: owner_id.into(),
             actor_id: actor_id.into(),
             agent_definition_id: agent_definition_id.into(),
@@ -74,8 +89,9 @@ impl PolicyContext {
             policy_revision,
             restrictions,
             now_ms,
+            provenance: None,
         };
-        context.validate_with_invocation(manifest, invocation)?;
+        context.verify_against(manifest, invocation)?;
         Ok(context)
     }
 
@@ -113,8 +129,9 @@ impl PolicyContext {
         Ok(())
     }
 
-    fn validate_with_invocation(
-        &self,
+    /// Re-establishes the nonserialized provenance pin after loading a policy context.
+    pub fn verify_against(
+        &mut self,
         manifest: &CapabilityManifest,
         invocation: &LogicalInvocation,
     ) -> Result<(), PolicyValidationError> {
@@ -123,8 +140,46 @@ impl PolicyContext {
             || manifest.version != invocation.manifest_version()
             || self.capability_id != manifest.id
             || self.manifest_version != manifest.version
+            || self.manifest_risk != manifest.risk_level
         {
-            return Err(PolicyValidationError::InvocationManifestMismatch);
+            return Err(PolicyValidationError::ContextManifestMismatch);
+        }
+        if self.run_id != invocation.run_id()
+            || self.logical_step_id != invocation.logical_step_id()
+            || self.logical_invocation_id != invocation.id()
+            || self.canonical_argument_digest != invocation.canonical_argument_digest()
+        {
+            return Err(PolicyValidationError::ContextInvocationMismatch);
+        }
+        self.provenance = Some(PolicyInputSnapshot {
+            manifest_id: manifest.id.clone(),
+            manifest_version: manifest.version,
+            manifest_risk: manifest.risk_level,
+            run_id: invocation.run_id(),
+            logical_step_id: invocation.logical_step_id().to_owned(),
+            logical_invocation_id: invocation.id(),
+            canonical_argument_digest: invocation.canonical_argument_digest(),
+        });
+        Ok(())
+    }
+
+    fn validate_evaluation_input(&self) -> Result<(), PolicyValidationError> {
+        self.validate()?;
+        let Some(snapshot) = &self.provenance else {
+            return Err(PolicyValidationError::UnverifiedPolicyContext);
+        };
+        if snapshot.manifest_id != self.capability_id
+            || snapshot.manifest_version != self.manifest_version
+            || snapshot.manifest_risk != self.manifest_risk
+        {
+            return Err(PolicyValidationError::ContextManifestMismatch);
+        }
+        if snapshot.run_id != self.run_id
+            || snapshot.logical_step_id != self.logical_step_id
+            || snapshot.logical_invocation_id != self.logical_invocation_id
+            || snapshot.canonical_argument_digest != self.canonical_argument_digest
+        {
+            return Err(PolicyValidationError::ContextInvocationMismatch);
         }
         Ok(())
     }
@@ -181,6 +236,7 @@ impl PolicyContextWire {
             policy_revision: self.policy_revision,
             restrictions: self.restrictions,
             now_ms: self.now_ms,
+            provenance: None,
         }
     }
 }
@@ -196,7 +252,7 @@ pub enum PolicyReasonCode {
     AllowedByApproval,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyReason {
     pub code: PolicyReasonCode,
@@ -206,7 +262,79 @@ pub struct PolicyReason {
     pub grant_revision: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl PolicyReason {
+    pub fn new(
+        code: PolicyReasonCode,
+        effective_risk: RiskLevel,
+        policy_revision: u32,
+        grant_id: Option<String>,
+        grant_revision: Option<u32>,
+    ) -> Result<Self, PolicyValidationError> {
+        let reason = Self {
+            code,
+            effective_risk,
+            policy_revision,
+            grant_id,
+            grant_revision,
+        };
+        reason.validate()?;
+        Ok(reason)
+    }
+
+    fn validate(&self) -> Result<(), PolicyValidationError> {
+        if self.effective_risk == RiskLevel::None || self.policy_revision == 0 {
+            return Err(PolicyValidationError::InconsistentAuditRecord);
+        }
+        let has_grant = match (&self.grant_id, self.grant_revision) {
+            (Some(id), Some(revision)) if !id.trim().is_empty() && revision > 0 => true,
+            (None, None) => false,
+            _ => return Err(PolicyValidationError::InconsistentAuditRecord),
+        };
+        match self.code {
+            PolicyReasonCode::AllowedByGrant if !has_grant => {
+                Err(PolicyValidationError::InconsistentAuditRecord)
+            }
+            PolicyReasonCode::AllowedByDefault
+            | PolicyReasonCode::DeniedByDefault
+            | PolicyReasonCode::DeniedByRestriction
+            | PolicyReasonCode::AllowedByApproval
+                if has_grant =>
+            {
+                Err(PolicyValidationError::InconsistentAuditRecord)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PolicyReasonWire::deserialize(deserializer)?;
+        Self::new(
+            wire.code,
+            wire.effective_risk,
+            wire.policy_revision,
+            wire.grant_id,
+            wire.grant_revision,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyReasonWire {
+    code: PolicyReasonCode,
+    effective_risk: RiskLevel,
+    policy_revision: u32,
+    grant_id: Option<String>,
+    grant_revision: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PolicyDecision {
     Allow(PolicyReason),
     RequireApproval(PolicyReason),
@@ -214,6 +342,24 @@ pub enum PolicyDecision {
 }
 
 impl PolicyDecision {
+    pub fn allow(reason: PolicyReason) -> Result<Self, PolicyValidationError> {
+        let decision = Self::Allow(reason);
+        decision.validate()?;
+        Ok(decision)
+    }
+
+    pub fn require_approval(reason: PolicyReason) -> Result<Self, PolicyValidationError> {
+        let decision = Self::RequireApproval(reason);
+        decision.validate()?;
+        Ok(decision)
+    }
+
+    pub fn deny(reason: PolicyReason) -> Result<Self, PolicyValidationError> {
+        let decision = Self::Deny(reason);
+        decision.validate()?;
+        Ok(decision)
+    }
+
     pub fn reason(&self) -> &PolicyReason {
         match self {
             Self::Allow(reason) | Self::RequireApproval(reason) | Self::Deny(reason) => reason,
@@ -223,6 +369,62 @@ impl PolicyDecision {
     /// The stable reason code, useful for safe audits and metrics.
     pub fn kind(&self) -> PolicyReasonCode {
         self.reason().code
+    }
+
+    fn validate(&self) -> Result<(), PolicyValidationError> {
+        self.reason().validate()?;
+        match self {
+            Self::Allow(reason)
+                if matches!(
+                    reason.code,
+                    PolicyReasonCode::AllowedByDefault
+                        | PolicyReasonCode::AllowedByGrant
+                        | PolicyReasonCode::AllowedByApproval
+                ) =>
+            {
+                Ok(())
+            }
+            Self::RequireApproval(reason) if reason.code == PolicyReasonCode::ApprovalRequired => {
+                Ok(())
+            }
+            Self::Deny(reason)
+                if matches!(
+                    reason.code,
+                    PolicyReasonCode::DeniedByDefault | PolicyReasonCode::DeniedByRestriction
+                ) =>
+            {
+                Ok(())
+            }
+            _ => Err(PolicyValidationError::InconsistentAuditRecord),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyDecision {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let decision = PolicyDecisionWire::deserialize(deserializer)?.into_decision();
+        decision.validate().map_err(serde::de::Error::custom)?;
+        Ok(decision)
+    }
+}
+
+#[derive(Deserialize)]
+enum PolicyDecisionWire {
+    Allow(PolicyReason),
+    RequireApproval(PolicyReason),
+    Deny(PolicyReason),
+}
+
+impl PolicyDecisionWire {
+    fn into_decision(self) -> PolicyDecision {
+        match self {
+            Self::Allow(reason) => PolicyDecision::Allow(reason),
+            Self::RequireApproval(reason) => PolicyDecision::RequireApproval(reason),
+            Self::Deny(reason) => PolicyDecision::Deny(reason),
+        }
     }
 }
 
@@ -350,7 +552,7 @@ struct AutonomyGrantWire {
     remaining_uses: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantConsumption {
     pub grant_id: String,
@@ -358,11 +560,103 @@ pub struct GrantConsumption {
     pub logical_invocation_id: Uuid,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl GrantConsumption {
+    pub fn new(
+        grant_id: impl Into<String>,
+        grant_revision: u32,
+        logical_invocation_id: Uuid,
+    ) -> Result<Self, PolicyValidationError> {
+        let consumption = Self {
+            grant_id: grant_id.into(),
+            grant_revision,
+            logical_invocation_id,
+        };
+        consumption.validate()?;
+        Ok(consumption)
+    }
+
+    fn validate(&self) -> Result<(), PolicyValidationError> {
+        validate_id("grant_id", &self.grant_id)?;
+        if self.grant_revision == 0 {
+            return Err(PolicyValidationError::InvalidVersion);
+        }
+        if self.logical_invocation_id.is_nil() {
+            return Err(PolicyValidationError::InvalidNilIdentifier);
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for GrantConsumption {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = GrantConsumptionWire::deserialize(deserializer)?;
+        Self::new(
+            wire.grant_id,
+            wire.grant_revision,
+            wire.logical_invocation_id,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantConsumptionWire {
+    grant_id: String,
+    grant_revision: u32,
+    logical_invocation_id: Uuid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyEvaluation {
     pub decision: PolicyDecision,
     pub consumption: Option<GrantConsumption>,
+}
+
+impl PolicyEvaluation {
+    pub fn new(
+        decision: PolicyDecision,
+        consumption: Option<GrantConsumption>,
+    ) -> Result<Self, PolicyValidationError> {
+        decision.validate()?;
+        if let Some(consumption) = &consumption {
+            consumption.validate()?;
+            let PolicyDecision::Allow(reason) = &decision else {
+                return Err(PolicyValidationError::InconsistentAuditRecord);
+            };
+            if reason.code != PolicyReasonCode::AllowedByGrant
+                || reason.grant_id.as_deref() != Some(consumption.grant_id.as_str())
+                || reason.grant_revision != Some(consumption.grant_revision)
+            {
+                return Err(PolicyValidationError::InconsistentAuditRecord);
+            }
+        }
+        Ok(Self {
+            decision,
+            consumption,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for PolicyEvaluation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PolicyEvaluationWire::deserialize(deserializer)?;
+        Self::new(wire.decision, wire.consumption).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyEvaluationWire {
+    decision: PolicyDecision,
+    consumption: Option<GrantConsumption>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -386,6 +680,7 @@ pub struct ApprovalRequest {
 
 impl ApprovalRequest {
     fn validate(&self) -> Result<(), PolicyValidationError> {
+        self.reason.validate()?;
         for (field, value) in [
             ("owner_id", &self.owner_id),
             ("actor_id", &self.actor_id),
@@ -550,10 +845,15 @@ pub enum PolicyValidationError {
     BlankIdentifier { field: &'static str },
     InvalidVersion,
     InvalidRiskConstraint,
-    InvocationManifestMismatch,
+    UnverifiedPolicyContext,
+    ContextManifestMismatch,
+    ContextInvocationMismatch,
     InvalidValidityWindow,
     InconsistentApprovalBinding,
     InvalidApprovalTime,
+    SuppliedGrantDoesNotMatch,
+    InvalidNilIdentifier,
+    InconsistentAuditRecord,
 }
 
 impl fmt::Display for PolicyValidationError {
@@ -564,8 +864,14 @@ impl fmt::Display for PolicyValidationError {
             Self::InvalidRiskConstraint => {
                 formatter.write_str("policy risk constraints are invalid")
             }
-            Self::InvocationManifestMismatch => {
-                formatter.write_str("invocation does not match manifest")
+            Self::UnverifiedPolicyContext => {
+                formatter.write_str("policy context has no verified input provenance")
+            }
+            Self::ContextManifestMismatch => {
+                formatter.write_str("policy context does not match its pinned manifest")
+            }
+            Self::ContextInvocationMismatch => {
+                formatter.write_str("policy context does not match its logical invocation")
             }
             Self::InvalidValidityWindow => formatter.write_str("policy validity window is invalid"),
             Self::InconsistentApprovalBinding => {
@@ -573,6 +879,13 @@ impl fmt::Display for PolicyValidationError {
             }
             Self::InvalidApprovalTime => {
                 formatter.write_str("approval decision is outside its request window")
+            }
+            Self::SuppliedGrantDoesNotMatch => {
+                formatter.write_str("supplied autonomy grant does not match the policy context")
+            }
+            Self::InvalidNilIdentifier => formatter.write_str("policy identifier must not be nil"),
+            Self::InconsistentAuditRecord => {
+                formatter.write_str("policy audit record is inconsistent")
             }
         }
     }
@@ -587,22 +900,26 @@ impl PolicyEngine {
         context: &PolicyContext,
         grants: &[AutonomyGrant],
     ) -> Result<PolicyEvaluation, PolicyValidationError> {
-        context.validate()?;
+        context.validate_evaluation_input()?;
         let effective_risk = context.effective_risk();
         if let Some(grant) = select_grant(context, grants) {
-            return Ok(PolicyEvaluation {
-                decision: PolicyDecision::Allow(reason(
-                    PolicyReasonCode::AllowedByGrant,
-                    effective_risk,
-                    context.policy_revision,
-                    Some(grant),
-                )),
-                consumption: grant.remaining_uses.map(|_| GrantConsumption {
-                    grant_id: grant.id.clone(),
-                    grant_revision: grant.revision,
-                    logical_invocation_id: context.logical_invocation_id,
-                }),
-            });
+            let decision = PolicyDecision::Allow(reason(
+                PolicyReasonCode::AllowedByGrant,
+                effective_risk,
+                context.policy_revision,
+                Some(grant),
+            ));
+            let consumption = grant
+                .remaining_uses
+                .map(|_| {
+                    GrantConsumption::new(
+                        grant.id.clone(),
+                        grant.revision,
+                        context.logical_invocation_id,
+                    )
+                })
+                .transpose()?;
+            return PolicyEvaluation::new(decision, consumption);
         }
         let decision = if context.restrictions.deny {
             PolicyDecision::Deny(reason(
@@ -633,10 +950,7 @@ impl PolicyEngine {
                 None,
             ))
         };
-        Ok(PolicyEvaluation {
-            decision,
-            consumption: None,
-        })
+        PolicyEvaluation::new(decision, None)
     }
 
     pub fn evaluate_with_approval(
@@ -653,15 +967,15 @@ impl PolicyEngine {
         };
         if Self::validate_approval_with_grants(approval, context, grants) == ApprovalValidity::Valid
         {
-            return Ok(PolicyEvaluation {
-                decision: PolicyDecision::Allow(reason(
+            return PolicyEvaluation::new(
+                PolicyDecision::Allow(reason(
                     PolicyReasonCode::AllowedByApproval,
                     context.effective_risk(),
                     context.policy_revision,
                     None,
                 )),
-                consumption: None,
-            });
+                None,
+            );
         }
         Ok(initial)
     }
@@ -670,8 +984,10 @@ impl PolicyEngine {
         context: &PolicyContext,
         grant: Option<&AutonomyGrant>,
     ) -> Result<ApprovalRequest, PolicyValidationError> {
-        context.validate()?;
-        let grant = grant.filter(|grant| Self::grant_matches(grant, context));
+        context.validate_evaluation_input()?;
+        if grant.is_some_and(|grant| !Self::grant_matches(grant, context)) {
+            return Err(PolicyValidationError::SuppliedGrantDoesNotMatch);
+        }
         let request = ApprovalRequest {
             owner_id: context.owner_id.clone(),
             actor_id: context.actor_id.clone(),
@@ -705,7 +1021,8 @@ impl PolicyEngine {
     }
 
     pub fn grant_matches(grant: &AutonomyGrant, context: &PolicyContext) -> bool {
-        grant.validate().is_ok()
+        context.validate_evaluation_input().is_ok()
+            && grant.validate().is_ok()
             && grant.status == GrantStatus::Active
             && grant.scope.owner_id == context.owner_id
             && grant.scope.actor_id == context.actor_id
@@ -782,7 +1099,8 @@ impl PolicyEngine {
 }
 
 /// Matching grants are sorted by narrowness: argument-bound scopes first, then lower maximum
-/// risk, then finite-use grants, then a stable lexical grant ID tie-break. Input order is ignored.
+/// risk, then finite-use grants, then a stable lexical grant ID and highest revision tie-break.
+/// Input order is ignored.
 fn select_grant<'a>(
     context: &PolicyContext,
     grants: &'a [AutonomyGrant],
@@ -797,6 +1115,7 @@ fn select_grant<'a>(
                 grant.remaining_uses.is_none(),
                 Reverse(grant.valid_from_ms),
                 &grant.id,
+                Reverse(grant.revision),
             )
         })
 }
@@ -813,13 +1132,14 @@ fn reason(
     policy_revision: u32,
     grant: Option<&AutonomyGrant>,
 ) -> PolicyReason {
-    PolicyReason {
+    PolicyReason::new(
         code,
         effective_risk,
         policy_revision,
-        grant_id: grant.map(|grant| grant.id.clone()),
-        grant_revision: grant.map(|grant| grant.revision),
-    }
+        grant.map(|grant| grant.id.clone()),
+        grant.map(|grant| grant.revision),
+    )
+    .expect("policy engine only emits validated audit reasons")
 }
 
 fn validate_id(field: &'static str, value: &str) -> Result<(), PolicyValidationError> {
