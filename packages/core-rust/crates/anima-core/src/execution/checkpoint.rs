@@ -15,12 +15,19 @@ use crate::{
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DefinitionPin {
     pub schema_version: u32,
     pub id: String,
     pub version: u32,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DefinitionPinWire {
+    schema_version: u32,
+    id: String,
+    version: u32,
 }
 impl DefinitionPin {
     pub fn new(
@@ -53,12 +60,25 @@ impl DefinitionPin {
         valid_version(self.version)
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for DefinitionPin {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = DefinitionPinWire::deserialize(d)?;
+        Self::new(w.schema_version, w.id, w.version).map_err(serde::de::Error::custom)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestPin {
     pub id: String,
     pub version: u32,
     pub schema_digest: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestPinWire {
+    id: String,
+    version: u32,
+    schema_digest: String,
 }
 impl ManifestPin {
     pub fn new(
@@ -96,14 +116,27 @@ impl ManifestPin {
         Ok(())
     }
 }
+impl<'de> Deserialize<'de> for ManifestPin {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = ManifestPinWire::deserialize(d)?;
+        Self::new(w.id, w.version, w.schema_digest).map_err(serde::de::Error::custom)
+    }
+}
 const MAX_DIGEST_BYTES: usize = 256;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryRecord {
     pub logical_invocation_id: Uuid,
     pub mode: RunPauseReason,
     pub recovery_key: Option<Uuid>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryRecordWire {
+    logical_invocation_id: Uuid,
+    mode: RunPauseReason,
+    recovery_key: Option<Uuid>,
 }
 impl RecoveryRecord {
     fn validate(&self) -> Result<(), ExecutionError> {
@@ -115,6 +148,18 @@ impl RecoveryRecord {
             valid_uuid(key)?;
         }
         Ok(())
+    }
+}
+impl<'de> Deserialize<'de> for RecoveryRecord {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = RecoveryRecordWire::deserialize(d)?;
+        let value = Self {
+            logical_invocation_id: w.logical_invocation_id,
+            mode: w.mode,
+            recovery_key: w.recovery_key,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 

@@ -91,7 +91,7 @@ impl Session {
 impl<'de> Deserialize<'de> for Session {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = SessionWire::deserialize(d)?;
-        Self::new_inner(w.id, w.definition_id, w.definition_version, w.concurrency)
+        Self::new(w.id, w.definition_id, w.definition_version, w.concurrency)
             .map_err(serde::de::Error::custom)
     }
 }
@@ -386,8 +386,9 @@ impl<'de> Deserialize<'de> for Step {
         let w = StepWire::deserialize(d)?;
         let mut step =
             Self::new(w.run_id, w.logical_step_id, w.kind).map_err(serde::de::Error::custom)?;
+        let invocation = w.attempts.first().map(Attempt::logical_invocation_id);
         for (i, a) in w.attempts.iter().enumerate() {
-            if a.number != (i as u32) + 1 {
+            if a.number != (i as u32) + 1 || invocation != Some(a.logical_invocation_id()) {
                 return Err(serde::de::Error::custom(ExecutionError::new(
                     ExecutionErrorCode::InvalidAttempt,
                 )));
@@ -460,12 +461,19 @@ fn attempt_uuid(invocation: Uuid, number: u32) -> Uuid {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionLease {
     pub run_id: Uuid,
     pub fence: Uuid,
     pub expires_at_ms: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionLeaseWire {
+    run_id: Uuid,
+    fence: Uuid,
+    expires_at_ms: u64,
 }
 impl ExecutionLease {
     pub fn validate(&self) -> Result<(), ExecutionError> {
@@ -475,6 +483,18 @@ impl ExecutionLease {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidIdentifier));
         }
         Ok(())
+    }
+}
+impl<'de> Deserialize<'de> for ExecutionLease {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = ExecutionLeaseWire::deserialize(d)?;
+        let value = Self {
+            run_id: w.run_id,
+            fence: w.fence,
+            expires_at_ms: w.expires_at_ms,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 
@@ -646,9 +666,16 @@ pub enum CommandOutcome {
     Accepted,
     Rejected,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandReceipt {
+    command_id: Uuid,
+    payload_digest: Uuid,
+    outcome: CommandOutcome,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandReceiptWire {
     command_id: Uuid,
     payload_digest: Uuid,
     outcome: CommandOutcome,
@@ -666,6 +693,18 @@ impl CommandReceipt {
             return Err(ExecutionError::new(ExecutionErrorCode::CommandConflict));
         }
         Ok(self.outcome)
+    }
+}
+impl<'de> Deserialize<'de> for CommandReceipt {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = CommandReceiptWire::deserialize(d)?;
+        valid_uuid(w.command_id).map_err(serde::de::Error::custom)?;
+        valid_uuid(w.payload_digest).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            command_id: w.command_id,
+            payload_digest: w.payload_digest,
+            outcome: w.outcome,
+        })
     }
 }
 
@@ -823,6 +862,7 @@ impl Budget {
     }
     pub fn evaluate(&self, usage: &Usage) -> Result<BudgetDecision, ExecutionError> {
         self.validate()?;
+        usage.validate()?;
         let pairs = [
             (usage.wall_time_ms, self.max_wall_time_ms),
             (usage.turns, self.max_turns),
