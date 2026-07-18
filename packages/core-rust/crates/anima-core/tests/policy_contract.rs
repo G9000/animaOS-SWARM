@@ -631,11 +631,22 @@ fn approval_required_grants_bind_critical_approvals_and_fail_closed_after_change
     let request = PolicyEngine::approval_request(&context, Some(&approval_grant)).unwrap();
     assert_eq!(request.grant_id.as_deref(), Some("approval-grant"));
     let approval = ApprovalDecision::new_approved(request, 1_000).unwrap();
-    assert!(matches!(
+    let approved =
         PolicyEngine::evaluate_with_approval(&context, &[approval_grant.clone()], Some(&approval))
+            .unwrap();
+    assert!(matches!(approved.decision, PolicyDecision::Allow(_)));
+    assert_eq!(
+        approved.consumption,
+        Some(GrantConsumption::new("approval-grant", 1, context.logical_invocation_id).unwrap())
+    );
+
+    let mut exhausted = approval_grant.clone();
+    exhausted.remaining_uses = Some(0);
+    assert!(matches!(
+        PolicyEngine::evaluate_with_approval(&context, &[exhausted], Some(&approval))
             .unwrap()
             .decision,
-        PolicyDecision::Allow(_)
+        PolicyDecision::Deny(_)
     ));
 
     let mut revoked = approval_grant.clone();
@@ -699,6 +710,23 @@ fn approval_required_grants_bind_critical_approvals_and_fail_closed_after_change
         .decision,
         PolicyDecision::RequireApproval(_)
     ));
+
+    let unbound_context = self::context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let unbound = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&unbound_context, None).unwrap(),
+        1_000,
+    )
+    .unwrap();
+    assert_eq!(
+        PolicyEngine::evaluate_with_approval(&unbound_context, &[], Some(&unbound))
+            .unwrap()
+            .consumption,
+        None
+    );
 }
 
 #[test]

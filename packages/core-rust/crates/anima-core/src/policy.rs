@@ -347,7 +347,6 @@ impl PolicyReason {
             PolicyReasonCode::AllowedByDefault
             | PolicyReasonCode::DeniedByDefault
             | PolicyReasonCode::DeniedByRestriction
-            | PolicyReasonCode::AllowedByApproval
                 if has_grant =>
             {
                 Err(PolicyValidationError::InconsistentAuditRecord)
@@ -755,6 +754,8 @@ struct AutonomyGrantWire {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
+/// A deterministic host-applied proposal emitted only for count-scoped grants. Uncounted grants
+/// deliberately produce no consumption proposal.
 pub struct GrantConsumption {
     pub grant_id: String,
     pub grant_revision: u32,
@@ -842,7 +843,9 @@ impl PolicyEvaluation {
             };
             if !matches!(
                 reason.code,
-                PolicyReasonCode::AllowedByGrant | PolicyReasonCode::AllowedByExactGrantOverride
+                PolicyReasonCode::AllowedByGrant
+                    | PolicyReasonCode::AllowedByExactGrantOverride
+                    | PolicyReasonCode::AllowedByApproval
             ) || reason.grant_id.as_deref() != Some(consumption.grant_id.as_str())
                 || reason.grant_revision != Some(consumption.grant_revision)
             {
@@ -1336,14 +1339,38 @@ impl PolicyEngine {
         };
         if Self::validate_approval_with_grants(approval, context, grants) == ApprovalValidity::Valid
         {
+            let bound_grant = match (
+                approval.request.grant_id.as_deref(),
+                approval.request.grant_revision,
+            ) {
+                (Some(id), Some(revision)) => grants.iter().find(|grant| {
+                    grant.id == id
+                        && grant.revision == revision
+                        && grant.effect == GrantEffect::ApprovalRequired
+                        && Self::grant_matches(grant, context)
+                }),
+                (None, None) => None,
+                _ => return Ok(initial),
+            };
+            let consumption = bound_grant
+                .and_then(|grant| {
+                    grant.remaining_uses.map(|_| {
+                        GrantConsumption::new(
+                            grant.id.clone(),
+                            grant.revision,
+                            context.logical_invocation_id,
+                        )
+                    })
+                })
+                .transpose()?;
             return PolicyEvaluation::new(
                 PolicyDecision::Allow(reason(
                     PolicyReasonCode::AllowedByApproval,
                     context.effective_risk(),
                     context.policy_revision,
-                    None,
+                    bound_grant,
                 )),
-                None,
+                consumption,
             );
         }
         Ok(initial)
