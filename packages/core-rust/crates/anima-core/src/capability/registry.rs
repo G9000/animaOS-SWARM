@@ -442,6 +442,31 @@ impl CapabilityRegistry {
         }
     }
 
+    /// Imports a store-authoritative dispatch commit into capability lineage before recovery.
+    ///
+    /// This is deliberately narrower than a generic lineage mutation: only an exact validated
+    /// first attempt may establish `Uncertain` from absence, and any existing Task 2 lineage is
+    /// preserved. It closes the crash window between the engine's durable dispatch commit and
+    /// executor entry without minting a new logical invocation identity.
+    pub async fn recover_dispatched(
+        &self,
+        context: CapabilityExecutionContext,
+    ) -> Result<RecoveryAction, CapabilityError> {
+        if context.attempt().number() != 1 {
+            return Err(CapabilityError::validation());
+        }
+        let manifest = self.manifest_for_context(&context)?;
+        self.validate_context(&context, manifest).await?;
+        let key = (context.invocation().id(), context.attempt().number());
+        if self.lineage.load(key.0, key.1).await?.is_none() {
+            let _ = self
+                .lineage
+                .compare_exchange(key.0, key.1, None, CapabilityAttemptLineageState::Uncertain)
+                .await?;
+        }
+        self.recover(context).await
+    }
+
     async fn validate_context(
         &self,
         context: &CapabilityExecutionContext,

@@ -1054,7 +1054,7 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
 }
 
 #[tokio::test]
-async fn execution_step_and_attempt_history_is_append_only() {
+async fn execution_history_only_allows_dispatching_to_terminal_attempt_transitions() {
     let store = InMemoryExecutionStore::default();
     let owner_id = id(73);
     let session = Session::new(id(70), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
@@ -1087,10 +1087,10 @@ async fn execution_step_and_attempt_history_is_append_only() {
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();
-    let pending = InvocationAttemptRecord::new(
+    let dispatching = InvocationAttemptRecord::new(
         invocation.binding(),
         1,
-        AttemptRecordState::Pending,
+        AttemptRecordState::Dispatching,
         manifest.clone(),
         RecoveryMode::KeyedIdempotent,
     )
@@ -1122,7 +1122,7 @@ async fn execution_step_and_attempt_history_is_append_only() {
                 RuntimeCommand::start(id(74), session.id(), queued.id()).unwrap(),
                 vec![event],
                 vec![step.clone()],
-                vec![pending.clone()],
+                vec![],
                 vec![],
                 None,
                 running.clone(),
@@ -1138,10 +1138,10 @@ async fn execution_step_and_attempt_history_is_append_only() {
                 2,
                 0,
                 lease.clone(),
-                RuntimeCommand::record_progress(id(75), session.id(), queued.id()).unwrap(),
+                RuntimeCommand::prepare_dispatch(id(75), session.id(), queued.id()).unwrap(),
                 vec![],
                 vec![step.clone()],
-                vec![pending.clone()],
+                vec![dispatching.clone()],
                 vec![],
                 None,
                 running.clone(),
@@ -1174,10 +1174,53 @@ async fn execution_step_and_attempt_history_is_append_only() {
             .code(),
         ExecutionStoreErrorCode::HistoryConflict
     );
-    let conflicting_attempt = InvocationAttemptRecord::new(
+    let completed_attempt = InvocationAttemptRecord::new(
         invocation.binding(),
         1,
         AttemptRecordState::Completed,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let result_ref = CapabilityReferenceId::new(id(78));
+    let completed = CompletedInvocationRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        OpaqueReference::new(result_ref.handle()).unwrap(),
+    )
+    .unwrap();
+    let durable = DurableCapabilityResult::new(
+        result_ref,
+        format!("jcs-v1:{}", "7".repeat(64)),
+        manifest.schema_digest(),
+        1,
+        DurableCapabilityStatus::Completed,
+    );
+    store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                3,
+                0,
+                lease.clone(),
+                RuntimeCommand::record_progress(id(77), session.id(), queued.id()).unwrap(),
+                vec![],
+                vec![],
+                vec![completed_attempt.clone()],
+                vec![DurableResultMutation::new(completed, durable.unwrap())],
+                None,
+                running.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let invalid_rewrite = InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        AttemptRecordState::Pending,
         manifest,
         RecoveryMode::KeyedIdempotent,
     )
@@ -1187,22 +1230,22 @@ async fn execution_step_and_attempt_history_is_append_only() {
             .commit_execution(
                 owner_id,
                 ExecutionCommit::new(
-                    3,
+                    4,
                     0,
                     lease,
-                    RuntimeCommand::record_progress(id(77), session.id(), queued.id()).unwrap(),
+                    RuntimeCommand::record_progress(id(79), session.id(), queued.id()).unwrap(),
                     vec![],
                     vec![],
-                    vec![conflicting_attempt],
+                    vec![invalid_rewrite],
                     vec![],
                     None,
                     running,
-                )
+                ),
             )
             .await
             .unwrap_err()
             .code(),
-        ExecutionStoreErrorCode::HistoryConflict
+        ExecutionStoreErrorCode::HistoryConflict,
     );
     assert_eq!(
         store
@@ -1218,7 +1261,7 @@ async fn execution_step_and_attempt_history_is_append_only() {
             .await
             .unwrap()
             .into_items(),
-        vec![pending]
+        vec![completed_attempt]
     );
 }
 

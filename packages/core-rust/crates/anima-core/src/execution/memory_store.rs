@@ -785,6 +785,7 @@ fn build_commit_patch(
         commit.target_run(),
         commit.command(),
         commit.approval(),
+        commit.dispatch_grant(),
         commit.attempts(),
     ) {
         return Err(ExecutionStoreError::new(
@@ -841,6 +842,11 @@ fn build_commit_patch(
         }
     }
 
+    if commit.approval().is_some() && commit.dispatch_grant().is_some() {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
     let mut authoritative_grant_update = None;
     let mut grant_consumption_key = None;
     if let Some(approval) = commit.approval() {
@@ -927,6 +933,52 @@ fn build_commit_patch(
             }
         }
     }
+    if let Some(dispatch) = commit.dispatch_grant() {
+        let attempt = commit
+            .attempts()
+            .iter()
+            .find(|attempt| attempt.state() == super::AttemptRecordState::Dispatching)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
+        if commit.command().kind() != super::RuntimeCommandKind::PrepareDispatch
+            || !dispatch.matches_attempt(owner_id, attempt)
+            || commit
+                .attempts()
+                .iter()
+                .filter(|attempt| attempt.state() == super::AttemptRecordState::Dispatching)
+                .count()
+                != 1
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantConflict,
+            ));
+        }
+        let binding = dispatch.authority_binding();
+        let authoritative = state
+            .authoritative_grants
+            .get(&(owner_id, binding.authority_key().as_str().to_owned()))
+            .cloned()
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
+        if authoritative.remaining_uses() != Some(dispatch.remaining_uses())
+            || !binding.matches_consumption(dispatch.consumption())
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantConflict,
+            ));
+        }
+        let key = (
+            owner_id,
+            binding.authority_key().as_str().to_owned(),
+            dispatch.consumption().grant_revision,
+            dispatch.consumption().logical_invocation_id,
+        );
+        if state.grant_consumptions.contains(&key) {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantAlreadyConsumed,
+            ));
+        }
+        authoritative_grant_update = Some(authoritative.consume(binding, now_ms)?);
+        grant_consumption_key = Some(key);
+    }
 
     let mut step_patches = BTreeMap::new();
     let mut next_step_sequence = aggregate.next_step_sequence;
@@ -962,6 +1014,8 @@ fn build_commit_patch(
     }
 
     let mut attempt_patches = BTreeMap::new();
+    let mut attempt_transition_keys = BTreeSet::new();
+    let mut new_attempt_count = 0usize;
     let mut next_attempt_sequence = aggregate.next_attempt_sequence;
     let mut attempts_fingerprint = aggregate.attempts_fingerprint;
     for attempt in commit.attempts() {
@@ -971,8 +1025,39 @@ fn build_commit_patch(
             ));
         }
         let key = (attempt.invocation().id(), attempt.attempt_number());
+        let existing_sequence = aggregate
+            .attempt_order
+            .iter()
+            .find_map(|(sequence, stored_key)| (stored_key == &key).then_some(*sequence));
         match aggregate.attempts.get(&key) {
             Some(existing) if existing == attempt => continue,
+            Some(existing)
+                if matches!(
+                    (existing.state(), attempt.state()),
+                    (
+                        super::AttemptRecordState::Dispatching,
+                        super::AttemptRecordState::Completed | super::AttemptRecordState::Uncertain
+                    ) | (
+                        super::AttemptRecordState::Pending,
+                        super::AttemptRecordState::Dispatching
+                    )
+                ) && existing.invocation() == attempt.invocation()
+                    && existing.manifest() == attempt.manifest()
+                    && existing.recovery_mode() == attempt.recovery_mode() =>
+            {
+                let sequence = existing_sequence.ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict)
+                })?;
+                attempts_fingerprint
+                    .include(existing)
+                    .map_err(ExecutionStoreError::from)?;
+                attempts_fingerprint
+                    .include(attempt)
+                    .map_err(ExecutionStoreError::from)?;
+                attempt_transition_keys.insert(key);
+                attempt_patches.insert(key, (sequence, attempt.clone()));
+                continue;
+            }
             Some(_) => {
                 return Err(ExecutionStoreError::new(
                     ExecutionStoreErrorCode::HistoryConflict,
@@ -996,6 +1081,9 @@ fn build_commit_patch(
         attempts_fingerprint
             .include(attempt)
             .map_err(ExecutionStoreError::from)?;
+        new_attempt_count = new_attempt_count
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
         attempt_patches.insert(key, (sequence, attempt.clone()));
     }
 
@@ -1055,11 +1143,74 @@ fn build_commit_patch(
         result_patches.insert(key, value);
     }
 
+    for key in &attempt_transition_keys {
+        let attempt = attempt_patches
+            .get(key)
+            .map(|(_, attempt)| attempt)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict))?;
+        match attempt.state() {
+            super::AttemptRecordState::Completed => {
+                if !result_patches
+                    .get(&attempt.invocation().id())
+                    .is_some_and(|stored| {
+                        stored.completed.invocation() == attempt.invocation()
+                            && stored.completed.attempt_number() == attempt.attempt_number()
+                            && stored.completed.manifest() == attempt.manifest()
+                            && stored.completed.recovery_mode() == attempt.recovery_mode()
+                    })
+                {
+                    return Err(ExecutionStoreError::new(
+                        ExecutionStoreErrorCode::LineageConflict,
+                    ));
+                }
+            }
+            super::AttemptRecordState::Uncertain => {
+                let exact_recovery = commit.command().recovery_record().is_some_and(|recovery| {
+                    let pause = recovery.pause();
+                    pause.invocation() == attempt.invocation()
+                        && pause.attempt_number() == attempt.attempt_number()
+                        && pause.manifest() == attempt.manifest()
+                        && pause.manifest().recovery_mode() == attempt.recovery_mode()
+                });
+                if !exact_recovery {
+                    return Err(ExecutionStoreError::new(
+                        ExecutionStoreErrorCode::LineageConflict,
+                    ));
+                }
+            }
+            super::AttemptRecordState::Dispatching => {
+                let pending = aggregate.stored.run().pending_approval();
+                let exact_resume = commit.command().kind()
+                    == super::RuntimeCommandKind::ResumeApproval
+                    && commit.approval().is_some()
+                    && aggregate.stored.run().state() == RunState::WaitingForApproval
+                    && commit.target_run().state() == RunState::Running
+                    && pending.is_some_and(|request| {
+                        request.logical_invocation_id == attempt.invocation().id()
+                            && request.canonical_argument_digest
+                                == attempt.invocation().canonical_argument_digest()
+                            && request.capability_id == attempt.invocation().capability_id()
+                            && request.manifest_version == attempt.invocation().manifest_version()
+                    });
+                if !exact_resume {
+                    return Err(ExecutionStoreError::new(
+                        ExecutionStoreErrorCode::LineageConflict,
+                    ));
+                }
+            }
+            _ => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::HistoryConflict,
+                ));
+            }
+        }
+    }
+
     if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
         let expected_attempts = aggregate
             .attempts
             .len()
-            .checked_add(attempt_patches.len())
+            .checked_add(new_attempt_count)
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
         let expected_completed = aggregate
             .results
@@ -1155,6 +1306,11 @@ fn build_commit_patch(
     let grant_consumption = commit
         .approval()
         .and_then(|approval| approval.grant_consumption())
+        .or_else(|| {
+            commit
+                .dispatch_grant()
+                .map(|dispatch| dispatch.consumption())
+        })
         .cloned();
     Ok(CommitPatch {
         stored,
@@ -1243,6 +1399,7 @@ fn valid_command_transition(
     target: &super::Run,
     command: &super::RuntimeCommand,
     approval: Option<&super::ApprovalGrantMutation>,
+    dispatch_grant: Option<&super::DispatchGrantMutation>,
     attempts: &[super::InvocationAttemptRecord],
 ) -> bool {
     if current.id() != target.id()
@@ -1255,6 +1412,16 @@ fn valid_command_transition(
     {
         return false;
     }
+    if attempts
+        .iter()
+        .any(|attempt| attempt.state() == super::AttemptRecordState::Dispatching)
+        && !matches!(
+            command.kind(),
+            super::RuntimeCommandKind::PrepareDispatch | super::RuntimeCommandKind::ResumeApproval
+        )
+    {
+        return false;
+    }
     match command.kind() {
         super::RuntimeCommandKind::Start => {
             approval.is_none()
@@ -1262,7 +1429,23 @@ fn valid_command_transition(
                 && target.state() == RunState::Running
         }
         super::RuntimeCommandKind::RecordProgress => {
-            approval.is_none() && current.state() == RunState::Running && current == target
+            approval.is_none()
+                && dispatch_grant.is_none()
+                && attempts
+                    .iter()
+                    .all(|attempt| attempt.state() != super::AttemptRecordState::Dispatching)
+                && current.state() == RunState::Running
+                && current == target
+        }
+        super::RuntimeCommandKind::PrepareDispatch => {
+            approval.is_none()
+                && attempts
+                    .iter()
+                    .filter(|attempt| attempt.state() == super::AttemptRecordState::Dispatching)
+                    .count()
+                    == 1
+                && current.state() == RunState::Running
+                && current == target
         }
         super::RuntimeCommandKind::RequestApproval => {
             approval.is_none()

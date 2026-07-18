@@ -23,6 +23,7 @@ pub enum RuntimeEventKind {
     CapabilityProposed,
     CapabilityApproved,
     CapabilityDenied,
+    InvocationDispatchPrepared,
     CapabilityStarted,
     CapabilityCompleted,
     CapabilityFailed,

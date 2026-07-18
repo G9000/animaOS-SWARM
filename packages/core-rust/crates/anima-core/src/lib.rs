@@ -2,6 +2,7 @@ pub mod agent;
 pub mod capability;
 pub mod components;
 pub mod definition;
+pub mod engine;
 pub mod events;
 pub mod execution;
 pub mod model;
@@ -37,6 +38,12 @@ pub use definition::{
     DefinitionValidationError, HostRequirement, LifecyclePolicy, MemoryPolicy, ModelPolicy,
     ProfileRef, ResolvedCapability, RuntimeLimits, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
+pub use engine::{
+    CurrentPolicyResolution, CurrentPolicyResolver, DefinitionResolver, DurableAgentEngine,
+    DurableEngineConfig, EngineBoundaryAction, EngineCapabilityResult, EngineCapabilityRuntime,
+    EngineControlSignal, EngineCrashInjector, EngineCrashPoint, EngineError, EngineErrorCode,
+    EngineLiveEvent, EngineLiveEventSink, EnginePolicyRequest, EngineRunOutcome,
+};
 pub use events::{EngineEvent, EventType};
 pub use execution::{
     assert_execution_store_conformance, ApprovalGrantMutation, ApprovalResumeBinding,
@@ -44,9 +51,9 @@ pub use execution::{
     AuthoritativeGrantChange, AuthoritativeGrantChangeKind, AuthoritativeGrantState,
     AuthoritativeGrantStatus, Budget, BudgetDecision, CheckpointCursor, CheckpointMutation,
     CheckpointV1, CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord,
-    CreateRun, DefinitionPin, DurableResultMutation, EventReplayPage, ExecutionClock,
-    ExecutionCommit, ExecutionCommitOutcome, ExecutionError, ExecutionErrorCode, ExecutionLease,
-    ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
+    CreateRun, DefinitionPin, DispatchGrantMutation, DurableResultMutation, EventReplayPage,
+    ExecutionClock, ExecutionCommit, ExecutionCommitOutcome, ExecutionError, ExecutionErrorCode,
+    ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
     ExecutionStoreFactory, GrantAuthorityBinding, GrantAuthorityKey, GrantConsumptionSnapshot,
     InMemoryExecutionStore, InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin,
     ManualExecutionClock, OpaqueReference, PendingApprovalRecord, RecoveryPauseReason,

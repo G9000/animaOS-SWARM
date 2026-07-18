@@ -16,9 +16,9 @@ use crate::{
     AgentDefinition, ApprovalDecision, AutonomyGrant, CapabilityKind, CapabilityManifest,
     CapabilityReferenceId, DurableCapabilityResult, DurableCapabilityStatus, GrantConsumption,
     GrantEffect, GrantScope, GrantStatus, LifecyclePolicy, LogicalInvocation, ManifestPin,
-    MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions,
-    ProfileRef, RecoveryMode, RecoveryResumeBinding, RiskLevel, RuntimeCompatibility,
-    RuntimeLimits,
+    MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext, PolicyEngine, PolicyEvaluation,
+    PolicyRestrictions, ProfileRef, RecoveryMode, RecoveryResumeBinding, RiskLevel,
+    RuntimeCompatibility, RuntimeLimits,
 };
 
 pub const MAX_COMMIT_EVENTS: usize = 256;
@@ -566,6 +566,113 @@ pub struct ApprovalGrantMutation {
     claim: ApprovalResumeClaim,
 }
 
+/// Exact counted AutoAllow authority consumed atomically with one dispatch-preparation commit.
+#[derive(Clone)]
+pub struct DispatchGrantMutation {
+    owner_id: Uuid,
+    run_id: Uuid,
+    logical_invocation_id: Uuid,
+    capability_id: String,
+    canonical_argument_digest: Uuid,
+    policy_revision: u32,
+    consumption: GrantConsumption,
+    authority_binding: GrantAuthorityBinding,
+    remaining_uses: u32,
+}
+
+impl DispatchGrantMutation {
+    pub fn from_current_policy(
+        owner_id: Uuid,
+        context: &PolicyContext,
+        grants: &[AutonomyGrant],
+        evaluation: &PolicyEvaluation,
+    ) -> Result<Option<Self>, ExecutionStoreError> {
+        let Some(consumption) = evaluation.consumption.as_ref() else {
+            return Ok(None);
+        };
+        if owner_id.is_nil()
+            || context.owner_id != owner_id.to_string()
+            || context.run_id.is_nil()
+            || context.logical_invocation_id != consumption.logical_invocation_id
+            || context.canonical_argument_digest.is_nil()
+            || context.policy_revision == 0
+            || PolicyEngine::evaluate(context, grants).ok().as_ref() != Some(evaluation)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantConflict,
+            ));
+        }
+        let grant = grants
+            .iter()
+            .find(|grant| {
+                grant.id == consumption.grant_id && grant.revision == consumption.grant_revision
+            })
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
+        if grant.effect != GrantEffect::AutoAllow {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantConflict,
+            ));
+        }
+        let remaining_uses = grant
+            .remaining_uses
+            .filter(|remaining| *remaining > 0)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
+        let authority_binding =
+            GrantAuthorityBinding::from_grant(grant).map_err(ExecutionStoreError::from)?;
+        if !authority_binding.matches_consumption(consumption) {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantConflict,
+            ));
+        }
+        Ok(Some(Self {
+            owner_id,
+            run_id: context.run_id,
+            logical_invocation_id: context.logical_invocation_id,
+            capability_id: context.capability_id.clone(),
+            canonical_argument_digest: context.canonical_argument_digest,
+            policy_revision: context.policy_revision,
+            consumption: consumption.clone(),
+            authority_binding,
+            remaining_uses,
+        }))
+    }
+
+    pub fn consumption(&self) -> &GrantConsumption {
+        &self.consumption
+    }
+    pub fn authority_binding(&self) -> &GrantAuthorityBinding {
+        &self.authority_binding
+    }
+    pub fn remaining_uses(&self) -> u32 {
+        self.remaining_uses
+    }
+    pub fn matches_attempt(&self, owner_id: Uuid, attempt: &InvocationAttemptRecord) -> bool {
+        self.owner_id == owner_id
+            && self.run_id == attempt.invocation().run_id()
+            && self.logical_invocation_id == attempt.invocation().id()
+            && self.capability_id == attempt.invocation().capability_id()
+            && self.canonical_argument_digest == attempt.invocation().canonical_argument_digest()
+            && self.policy_revision > 0
+    }
+}
+
+impl fmt::Debug for DispatchGrantMutation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DispatchGrantMutation")
+            .field("owner_id", &"REDACTED")
+            .field("run_id", &self.run_id)
+            .field("logical_invocation_id", &self.logical_invocation_id)
+            .field("capability_id", &"REDACTED")
+            .field("canonical_argument_digest", &self.canonical_argument_digest)
+            .field("policy_revision", &self.policy_revision)
+            .field("consumption", &self.consumption)
+            .field("authority_binding", &"REDACTED")
+            .field("remaining_uses", &self.remaining_uses)
+            .finish()
+    }
+}
+
 impl ApprovalGrantMutation {
     /// Preserves Task 4's validated approval claim and its exact consumption as one commit input.
     pub fn from_claim(claim: ApprovalResumeClaim) -> Self {
@@ -643,6 +750,7 @@ pub struct ExecutionCommit {
     attempts: Vec<InvocationAttemptRecord>,
     results: Vec<DurableResultMutation>,
     approval: Option<ApprovalGrantMutation>,
+    dispatch_grant: Option<DispatchGrantMutation>,
     checkpoint: CheckpointMutation,
     target_run: Run,
 }
@@ -671,6 +779,7 @@ impl ExecutionCommit {
             attempts,
             results,
             approval,
+            dispatch_grant: None,
             checkpoint: CheckpointMutation::Clear,
             target_run,
         }
@@ -678,6 +787,11 @@ impl ExecutionCommit {
 
     pub fn with_checkpoint(mut self, checkpoint: CheckpointV1) -> Self {
         self.checkpoint = CheckpointMutation::Replace(Box::new(checkpoint));
+        self
+    }
+
+    pub fn with_dispatch_grant(mut self, mutation: DispatchGrantMutation) -> Self {
+        self.dispatch_grant = Some(mutation);
         self
     }
 
@@ -720,6 +834,10 @@ impl ExecutionCommit {
 
     pub fn approval(&self) -> Option<&ApprovalGrantMutation> {
         self.approval.as_ref()
+    }
+
+    pub fn dispatch_grant(&self) -> Option<&DispatchGrantMutation> {
+        self.dispatch_grant.as_ref()
     }
 
     pub fn checkpoint(&self) -> Option<&CheckpointV1> {
@@ -1488,10 +1606,356 @@ where
     assert_uncounted_approval_commit_contract(factory).await?;
     assert_command_conflict_contract(factory).await?;
     assert_atomic_failure_contract(factory).await?;
+    assert_dispatching_attempt_transition_contract(factory).await?;
+    assert_auto_allow_dispatch_grant_contract(factory).await?;
+    assert_policy_denied_transition_contract(factory).await?;
     assert_counted_grant_contract(factory).await?;
     assert_multi_use_counted_grant_contract(factory).await?;
     assert_counted_grant_revoke_race_contract(factory).await?;
     assert_durable_result_contract(factory).await
+}
+
+async fn assert_dispatching_attempt_transition_contract<F>(
+    factory: &F,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let (store, owner_id, session, queued, started, lease) =
+        create_running_run(factory, 0xd1_00).await?;
+    let invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "dispatching-transition",
+        "workspace.write",
+        1,
+        serde_json::json!({"path": "dispatching.txt"}),
+    ))?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        format!("sha256:{}", "d".repeat(64)),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let dispatching = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        super::AttemptRecordState::Dispatching,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let bypass = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::record_progress(
+                    Uuid::from_u128(0xd1_05),
+                    session.id(),
+                    queued.id(),
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![dispatching.clone()],
+                vec![],
+                None,
+                started.stored_run().run().clone(),
+            ),
+        )
+        .await;
+    if !matches!(
+        bypass,
+        Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest
+    ) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let prepared = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::prepare_dispatch(
+                    Uuid::from_u128(0xd1_08),
+                    session.id(),
+                    queued.id(),
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![dispatching],
+                vec![],
+                None,
+                started.stored_run().run().clone(),
+            ),
+        )
+        .await?;
+    let completed_attempt = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        super::AttemptRecordState::Completed,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let result_reference = CapabilityReferenceId::new(Uuid::from_u128(0xd1_06));
+    let completed = conformance_value(CompletedInvocationRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        conformance_value(OpaqueReference::new(result_reference.handle()))?,
+    ))?;
+    let durable = conformance_value(DurableCapabilityResult::new(
+        result_reference,
+        format!("jcs-v1:{}", "e".repeat(64)),
+        manifest.schema_digest(),
+        1,
+        DurableCapabilityStatus::Completed,
+    ))?;
+    let command =
+        RuntimeCommand::record_progress(Uuid::from_u128(0xd1_07), session.id(), queued.id())
+            .map_err(ExecutionStoreError::from)?;
+    let completed_commit = ExecutionCommit::new(
+        prepared.stored_run().run_version(),
+        prepared.checkpoint_version(),
+        lease,
+        command,
+        vec![],
+        vec![],
+        vec![completed_attempt.clone()],
+        vec![DurableResultMutation::new(completed, durable.clone())],
+        None,
+        prepared.stored_run().run().clone(),
+    );
+    let completed_outcome = store
+        .commit_execution(owner_id, completed_commit.clone())
+        .await?;
+    if store.commit_execution(owner_id, completed_commit).await? != completed_outcome
+        || store
+            .load_attempts_page(
+                owner_id,
+                queued.id(),
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            .items()
+            != [completed_attempt]
+        || store
+            .load_durable_result(owner_id, queued.id(), invocation.id())
+            .await?
+            .as_ref()
+            != Some(&durable)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_auto_allow_dispatch_grant_contract<F>(
+    factory: &F,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let (store, owner_id, session, queued, started, lease) =
+        create_running_run(factory, 0xd2_00).await?;
+    let manifest = conformance_capability_manifest();
+    let invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "auto-allow-dispatch",
+        manifest.id.clone(),
+        manifest.version,
+        serde_json::json!({"path": "contract.txt"}),
+    ))?;
+    let context = conformance_value(PolicyContext::new(
+        owner_id.to_string(),
+        "contract-actor",
+        session.definition().id(),
+        session.definition().version(),
+        "contract-workspace",
+        CapabilityReferenceId::new(queued.id()),
+        &manifest,
+        &invocation,
+        1,
+        PolicyRestrictions::default(),
+        1_000,
+    ))?;
+    let grant = conformance_value(AutonomyGrant::new(
+        "dispatch-auto-allow",
+        1,
+        GrantStatus::Active,
+        conformance_value(GrantScope::new(
+            context.owner_id.clone(),
+            context.actor_id.clone(),
+            context.agent_definition_id.clone(),
+            context.agent_definition_version,
+            context.workspace_id.clone(),
+            context.resource_boundary.clone(),
+            context.capability_id.clone(),
+            context.manifest_version,
+            Some(context.canonical_argument_digest),
+        ))?,
+        RiskLevel::Critical,
+        500,
+        Some(2_000_000),
+        Some(1),
+    ))?;
+    let evaluation = conformance_value(PolicyEngine::evaluate(
+        &context,
+        std::slice::from_ref(&grant),
+    ))?;
+    let mutation = DispatchGrantMutation::from_current_policy(
+        owner_id,
+        &context,
+        std::slice::from_ref(&grant),
+        &evaluation,
+    )?
+    .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
+    let authority = AuthoritativeGrantState::from_grant(owner_id, &grant)?;
+    store
+        .apply_authoritative_grant(
+            owner_id,
+            AuthoritativeGrantChange::create(authority.clone()),
+        )
+        .await?;
+    let attempt = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        super::AttemptRecordState::Dispatching,
+        conformance_value(ManifestPin::from_manifest(&manifest))?,
+        manifest.recovery_mode,
+    ))?;
+    let event = RuntimeEvent::new(
+        Uuid::from_u128(0xd2_10),
+        owner_id,
+        session.id(),
+        queued.id(),
+        1,
+        1,
+        RuntimeEventKind::InvocationDispatchPrepared,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let commit = ExecutionCommit::new(
+        started.stored_run().run_version(),
+        started.checkpoint_version(),
+        lease,
+        RuntimeCommand::prepare_dispatch(Uuid::from_u128(0xd2_11), session.id(), queued.id())
+            .map_err(ExecutionStoreError::from)?,
+        vec![event],
+        vec![conformance_value(Step::new(
+            queued.id(),
+            "auto-allow-dispatch",
+            StepKind::Capability,
+        ))?],
+        vec![attempt],
+        vec![],
+        None,
+        started.stored_run().run().clone(),
+    )
+    .with_dispatch_grant(mutation);
+    let outcome = store.commit_execution(owner_id, commit.clone()).await?;
+    if outcome.grant_consumption() != evaluation.consumption.as_ref()
+        || store.commit_execution(owner_id, commit).await? != outcome
+        || store
+            .load_authoritative_grant(owner_id, authority.authority_key())
+            .await?
+            .and_then(|state| state.remaining_uses())
+            != Some(0)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_policy_denied_transition_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let owner_id = Uuid::from_u128(0xd3_01);
+    let session = conformance_value(Session::new_for_definition(
+        Uuid::from_u128(0xd3_02),
+        &conformance_definition(false),
+        SessionConcurrencyPolicy::Serial,
+    ))?;
+    let run_id = Uuid::from_u128(0xd3_03);
+    let (_, context) = conformance_policy_context(run_id)?;
+    let request = conformance_value(PolicyEngine::approval_request(&context, None))?;
+    let queued = conformance_value(Run::queued(
+        run_id,
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    ))?;
+    let running = conformance_value(queued.transition(RunState::Running, None))?;
+    let waiting = conformance_value(running.wait_for_approval(request))?;
+    let (created, lease) = create_waiting_run(
+        &store,
+        WaitingRunSetup {
+            owner_id,
+            session: &session,
+            waiting: &waiting,
+            expected_session_version: 0,
+            concurrency_policy: SessionConcurrencyPolicy::Serial,
+            start_command_id: Uuid::from_u128(0xd3_04),
+            approval_command_id: Uuid::from_u128(0xd3_05),
+        },
+    )
+    .await?;
+    let denied = conformance_value(
+        waiting.transition(RunState::Paused, Some(super::RunPauseReason::PolicyDenied)),
+    )?;
+    let event = RuntimeEvent::new(
+        Uuid::from_u128(0xd3_06),
+        owner_id,
+        session.id(),
+        run_id,
+        1,
+        1,
+        RuntimeEventKind::CapabilityDenied,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let outcome = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease,
+                RuntimeCommand::pause(
+                    Uuid::from_u128(0xd3_07),
+                    session.id(),
+                    run_id,
+                    super::RunPauseReason::PolicyDenied,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![event],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                denied.clone(),
+            ),
+        )
+        .await?;
+    if outcome.stored_run().run() != &denied
+        || outcome.stored_run().run().pending_approval().is_some()
+        || outcome.stored_run().run().pause_reason() != Some(super::RunPauseReason::PolicyDenied)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
 }
 
 async fn replay_all_events<S: ExecutionStore + ?Sized>(

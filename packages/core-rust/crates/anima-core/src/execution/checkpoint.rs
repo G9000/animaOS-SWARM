@@ -200,6 +200,7 @@ impl<'de> Deserialize<'de> for OpaqueReference {
 #[serde(rename_all = "snake_case")]
 pub enum AttemptRecordState {
     Pending,
+    Dispatching,
     Completed,
     Uncertain,
 }
@@ -1008,12 +1009,17 @@ impl CheckpointV1 {
                 _ => {}
             }
         }
-        let pending: Vec<_> = self
+        let active: Vec<_> = self
             .attempts
             .iter()
-            .filter(|a| a.state == AttemptRecordState::Pending)
+            .filter(|a| {
+                matches!(
+                    a.state,
+                    AttemptRecordState::Pending | AttemptRecordState::Dispatching
+                )
+            })
             .collect();
-        if pending.len() > 1 {
+        if active.len() > 1 {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
         if self.state == RunState::RecoveryRequired
@@ -1047,7 +1053,7 @@ impl CheckpointV1 {
                         && a.attempt_number > current.attempt_number
                 })
             })
-            || pending.first().is_some_and(|a| cursor_attempt != Some(*a))
+            || active.first().is_some_and(|a| cursor_attempt != Some(*a))
             || self.state == RunState::Queued
                 && (!self.attempts.is_empty() || self.cursor.is_some())
             || matches!(
@@ -1064,8 +1070,17 @@ impl CheckpointV1 {
                 && self.cursor.is_none()
             || self.state == RunState::RecoveryRequired
                 && cursor_attempt.is_none_or(|a| a.state != AttemptRecordState::Uncertain)
-            || matches!(self.state, RunState::Running | RunState::WaitingForApproval)
+            || self.state == RunState::WaitingForApproval
                 && cursor_attempt.is_some_and(|a| a.state != AttemptRecordState::Pending)
+            || self.state == RunState::Running
+                && cursor_attempt.is_some_and(|a| {
+                    !matches!(
+                        a.state,
+                        AttemptRecordState::Pending
+                            | AttemptRecordState::Dispatching
+                            | AttemptRecordState::Completed
+                    )
+                })
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }

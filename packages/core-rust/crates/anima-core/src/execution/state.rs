@@ -203,6 +203,7 @@ pub enum RunPauseReason {
     RecoveryRequired,
     HostShutdown,
     Policy,
+    PolicyDenied,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -469,6 +470,9 @@ impl Run {
             RunState::RecoveryRequired => {
                 Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired))
             }
+            RunState::Paused if self.pause_reason == Some(RunPauseReason::PolicyDenied) => {
+                Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))
+            }
             RunState::Paused => Self::from_parts(
                 self.id,
                 self.session_id,
@@ -666,6 +670,7 @@ fn legal_transition(from: RunState, to: RunState) -> bool {
                     | RunState::Failed
                     | RunState::Cancelled
             )
+            | (RunState::WaitingForApproval, RunState::Paused)
     )
 }
 
@@ -892,6 +897,7 @@ impl<'de> Deserialize<'de> for ExecutionLease {
 pub enum RuntimeCommandKind {
     Start,
     RecordProgress,
+    PrepareDispatch,
     RequestApproval,
     RequireRecovery,
     Pause,
@@ -1266,6 +1272,9 @@ enum RuntimeCommandPayload {
     RecordProgress {
         run_id: Uuid,
     },
+    PrepareDispatch {
+        run_id: Uuid,
+    },
     RequestApproval {
         run_id: Uuid,
         request: ApprovalRequest,
@@ -1301,6 +1310,7 @@ impl RuntimeCommandPayload {
         match self {
             Self::Start { .. } => RuntimeCommandKind::Start,
             Self::RecordProgress { .. } => RuntimeCommandKind::RecordProgress,
+            Self::PrepareDispatch { .. } => RuntimeCommandKind::PrepareDispatch,
             Self::RequestApproval { .. } => RuntimeCommandKind::RequestApproval,
             Self::RequireRecovery { .. } => RuntimeCommandKind::RequireRecovery,
             Self::Pause { .. } => RuntimeCommandKind::Pause,
@@ -1315,6 +1325,7 @@ impl RuntimeCommandPayload {
         match self {
             Self::Start { run_id }
             | Self::RecordProgress { run_id }
+            | Self::PrepareDispatch { run_id }
             | Self::RequestApproval { run_id, .. }
             | Self::RequireRecovery { run_id, .. }
             | Self::Pause { run_id, .. }
@@ -1398,6 +1409,17 @@ impl RuntimeCommand {
             id,
             session_id,
             RuntimeCommandPayload::RecordProgress { run_id },
+        )
+    }
+    pub fn prepare_dispatch(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::PrepareDispatch { run_id },
         )
     }
     pub fn require_recovery(
