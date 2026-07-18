@@ -919,7 +919,9 @@ impl ApprovalDecision {
         {
             return Err(PolicyValidationError::InconsistentApprovalBinding);
         }
-        if self.decided_at_ms < 0 || self.decided_at_ms > self.request.expires_at_ms {
+        if self.decided_at_ms < self.request.requested_at_ms
+            || self.decided_at_ms >= self.request.expires_at_ms
+        {
             return Err(PolicyValidationError::InvalidApprovalTime);
         }
         Ok(())
@@ -1176,6 +1178,9 @@ impl PolicyEngine {
         }
         if approval.kind != ApprovalDecisionKind::Approve {
             return ApprovalValidity::InvalidDecision;
+        }
+        if context.now_ms < approval.decided_at_ms {
+            return ApprovalValidity::InvalidBinding;
         }
         if context.now_ms >= approval.request.expires_at_ms {
             return ApprovalValidity::Expired;

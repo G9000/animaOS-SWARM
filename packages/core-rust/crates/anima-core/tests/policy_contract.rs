@@ -231,7 +231,7 @@ fn approvals_bind_every_action_identity_and_their_reason_revision() {
     );
     let approval = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&original, None).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     let mut changed_actor = original.clone();
@@ -287,7 +287,7 @@ fn grant_bound_approval_is_invalidated_when_the_grant_is_revoked() {
     let grant = grant(&context, RiskLevel::High);
     let approval = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&context, Some(&grant)).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     assert!(matches!(
@@ -315,7 +315,7 @@ fn approval_is_exact_and_changed_arguments_invalidate_it() {
     );
     let approval = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&original, None).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     assert_eq!(
@@ -343,7 +343,7 @@ fn policy_revision_reuses_exact_approval_only_when_current_policy_still_requires
     );
     let approval = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&original, None).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     let mut revised = original.clone();
@@ -544,7 +544,7 @@ fn mutated_approval_and_unverified_context_fail_closed() {
     );
     let mut approval = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&context, None).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     approval.request.expires_at_ms = 0;
@@ -561,7 +561,7 @@ fn mutated_approval_and_unverified_context_fail_closed() {
 
     let mut extended = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&context, None).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     extended.request.expires_at_ms += 1;
@@ -572,7 +572,7 @@ fn mutated_approval_and_unverified_context_fail_closed() {
 
     let mut approval = ApprovalDecision::new_approved(
         PolicyEngine::approval_request(&context, None).unwrap(),
-        900,
+        1_000,
     )
     .unwrap();
     approval.request.reason.policy_revision = 2;
@@ -590,6 +590,49 @@ fn mutated_approval_and_unverified_context_fail_closed() {
     let mut malformed = serde_json::to_value(&approval).unwrap();
     malformed["request"]["run_id"] = json!(Uuid::nil());
     assert!(serde_json::from_value::<ApprovalDecision>(malformed).is_err());
+}
+
+#[test]
+fn approval_decision_window_is_exact_and_future_decisions_do_not_authorize() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let request = PolicyEngine::approval_request(&context, None).unwrap();
+
+    assert!(ApprovalDecision::new_approved(request.clone(), 999).is_err());
+    assert!(ApprovalDecision::new_approved(request.clone(), request.expires_at_ms).is_err());
+
+    let future = ApprovalDecision::new_approved(request.clone(), 1_001).unwrap();
+    assert_eq!(
+        PolicyEngine::validate_approval(&future, &context),
+        ApprovalValidity::InvalidBinding
+    );
+
+    let exact = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
+    assert_eq!(
+        PolicyEngine::validate_approval(&exact, &context),
+        ApprovalValidity::Valid
+    );
+
+    let mut mutated = exact.clone();
+    mutated.decided_at_ms = 999;
+    assert_eq!(
+        PolicyEngine::validate_approval(&mutated, &context),
+        ApprovalValidity::InvalidBinding
+    );
+
+    let mut serialized = serde_json::to_value(&exact).unwrap();
+    serialized["decided_at_ms"] = json!(request.expires_at_ms);
+    assert!(serde_json::from_value::<ApprovalDecision>(serialized).is_err());
+
+    let mut expiry = context.clone();
+    expiry.now_ms = request.expires_at_ms;
+    assert_eq!(
+        PolicyEngine::validate_approval(&exact, &expiry),
+        ApprovalValidity::Expired
+    );
 }
 
 #[test]
