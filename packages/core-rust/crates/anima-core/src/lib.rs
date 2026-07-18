@@ -37,14 +37,16 @@ pub use definition::{
 };
 pub use events::{EngineEvent, EventType};
 pub use execution::{
-    ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, AttemptRecordState,
-    Budget, BudgetDecision, CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome,
-    CommandReceipt, CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionErrorCode,
-    ExecutionLease, InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin, OpaqueReference,
-    PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord, RecoveryRecord,
-    RecoveryTerminalOutcome, RecoveryTerminalResolution, Run, RunPauseReason, RunState,
-    RuntimeCommand, RuntimeCommandKind, RuntimeEvent, RuntimeEventKind, SafeEventPayload, Session,
-    SessionConcurrencyPolicy, StepKind, UncertainInvocationRecord, Usage,
+    ApprovalGrantMutation, ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome,
+    Attempt, AttemptRecordState, Budget, BudgetDecision, CheckpointCursor, CheckpointV1,
+    CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord, CreateRun,
+    DefinitionPin, DurableResultMutation, ExecutionCommit, ExecutionCommitOutcome, ExecutionError,
+    ExecutionErrorCode, ExecutionLease, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreErrorCode, InMemoryExecutionStore, InvocationAttemptRecord, LiveRuntimeEvent,
+    ManifestPin, OpaqueReference, PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord,
+    RecoveryRecord, RecoveryTerminalOutcome, RecoveryTerminalResolution, Run, RunPauseReason,
+    RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent, RuntimeEventKind, SafeEventPayload,
+    Session, SessionConcurrencyPolicy, StepKind, StoredRun, UncertainInvocationRecord, Usage,
 };
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
