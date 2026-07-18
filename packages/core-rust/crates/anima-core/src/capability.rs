@@ -383,6 +383,10 @@ impl LogicalInvocation {
         self.seed.run_id
     }
 
+    pub fn logical_step_id(&self) -> &str {
+        &self.seed.logical_step_id
+    }
+
     pub fn capability_id(&self) -> &str {
         &self.seed.capability_id
     }
@@ -393,6 +397,16 @@ impl LogicalInvocation {
 
     pub fn normalized_arguments(&self) -> &Value {
         &self.seed.normalized_arguments
+    }
+
+    /// A stable, non-reversible binding for the already JCS-normalized argument value.
+    ///
+    /// This is intentionally separate from `id()`: policy records can bind an exact action's
+    /// arguments without serializing the argument document itself.
+    pub fn canonical_argument_digest(&self) -> Uuid {
+        let bytes = serde_jcs::to_vec(&self.seed.normalized_arguments)
+            .expect("normalized JSON values are always canonicalizable");
+        Uuid::new_v5(&CAPABILITY_INVOCATION_NAMESPACE, &bytes)
     }
 
     fn from_seed(seed: LogicalInvocationSeed) -> Result<Self, LogicalInvocationError> {

@@ -5,6 +5,7 @@ pub mod definition;
 pub mod events;
 pub mod model;
 pub mod persistence;
+pub mod policy;
 pub mod primitives;
 pub mod runtime;
 mod runtime_serde;
@@ -36,6 +37,11 @@ pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
 };
 pub use persistence::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
+pub use policy::{
+    ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity, AutonomyGrant,
+    GrantConsumption, GrantScope, GrantStatus, PolicyContext, PolicyDecision, PolicyEngine,
+    PolicyEvaluation, PolicyReason, PolicyReasonCode, PolicyRestrictions, PolicyValidationError,
+};
 pub use primitives::{
     AgentId, Attachment, AttachmentType, Content, DataValue, LockRecover, Message, MessageId,
     MessageRole, RoomId, TaskResult, TaskStatus, UuidString,
