@@ -1250,9 +1250,11 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
     )
     .unwrap();
     assert!(paused.apply_resume_command(&resume, None, None).is_err());
-    assert!(paused
+    let resumed = paused
         .apply_resume_command(&resume, None, Some(&live_claim))
-        .is_ok());
+        .unwrap();
+    assert_eq!(resumed.run().state(), RunState::Running);
+    assert_eq!(resumed.grant_consumption(), None);
     let uncertain_attempt = InvocationAttemptRecord::new(
         retry.invocation().binding(),
         1,

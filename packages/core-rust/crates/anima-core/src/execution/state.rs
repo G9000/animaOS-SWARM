@@ -231,9 +231,9 @@ impl Deref for RecoveryTerminalOutcome {
     }
 }
 
-/// A validated approval resume and the counted-grant consumption that the host must commit
-/// atomically with the resumed run state.
-#[must_use = "persist grant_consumption atomically with the resumed run state"]
+/// A validated resume and any counted-grant consumption that the host must commit atomically
+/// with the resumed run state.
+#[must_use = "persist the resumed run and any grant_consumption atomically"]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalResumeOutcome {
     run: Run,
@@ -488,14 +488,14 @@ impl Run {
         command: &RuntimeCommand,
         approval_claim: Option<&ApprovalResumeClaim>,
         recovery_claim: Option<&ValidatedRecoveryResume>,
-    ) -> Result<Self, ExecutionError> {
+    ) -> Result<ApprovalResumeOutcome, ExecutionError> {
         let Some((run_id, approval_binding, recovery_binding)) = command.resume_parts() else {
             return Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition));
         };
         if command.session_id != self.session_id || run_id != self.id {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
-        match self.state {
+        let grant_consumption = match self.state {
             RunState::WaitingForApproval => {
                 let (Some(expected), Some(command_binding), Some(claim)) = (
                     self.pending_approval.as_ref(),
@@ -511,6 +511,7 @@ impl Run {
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
                 }
+                claim.grant_consumption.clone()
             }
             RunState::Paused if self.pause_reason == Some(RunPauseReason::RecoveryRequired) => {
                 let (Some(expected), Some(command_binding), Some(claim)) = (
@@ -527,6 +528,7 @@ impl Run {
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired));
                 }
+                None
             }
             RunState::Paused => {
                 if approval_binding.is_some()
@@ -536,10 +538,11 @@ impl Run {
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
                 }
+                None
             }
             _ => return Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition)),
-        }
-        Self::from_parts(
+        };
+        let run = Self::from_parts(
             self.id,
             self.session_id,
             self.definition_id.clone(),
@@ -548,7 +551,11 @@ impl Run {
             None,
             None,
             None,
-        )
+        )?;
+        Ok(ApprovalResumeOutcome {
+            run,
+            grant_consumption,
+        })
     }
 
     pub fn resolve_recovery_terminal(

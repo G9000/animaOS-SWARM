@@ -343,6 +343,58 @@ fn approval_resume_claim_binds_live_grant_and_consumption_proposal() {
 }
 
 #[test]
+fn approval_resume_command_surfaces_counted_grant_consumption() {
+    let context = approval_context(json!({ "path": "a.md" }));
+    let scope = GrantScope::new(
+        context.owner_id.clone(),
+        context.actor_id.clone(),
+        context.agent_definition_id.clone(),
+        context.agent_definition_version,
+        context.workspace_id.clone(),
+        context.resource_boundary.clone(),
+        context.capability_id.clone(),
+        context.manifest_version,
+        Some(context.canonical_argument_digest),
+    )
+    .unwrap();
+    let grant = AutonomyGrant::new_with_effect(
+        "approval-grant",
+        1,
+        GrantStatus::Active,
+        scope,
+        RiskLevel::High,
+        500,
+        Some(2_000),
+        Some(1),
+        GrantEffect::ApprovalRequired,
+    )
+    .unwrap();
+    let request = PolicyEngine::approval_request(&context, Some(&grant)).unwrap();
+    let decision = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
+    let claim = ApprovalResumeClaim::new(&request, &decision, &context, &[grant]).unwrap();
+    let waiting = Run::queued(id(1), id(2), "writer", 3)
+        .unwrap()
+        .transition(RunState::Running, None)
+        .unwrap()
+        .wait_for_approval(request)
+        .unwrap();
+    let command =
+        RuntimeCommand::resume_with_approval(id(50), id(2), id(1), claim.binding().clone())
+            .unwrap();
+
+    let outcome = waiting
+        .apply_resume_command(&command, Some(&claim), None)
+        .unwrap();
+    let expected =
+        GrantConsumption::new("approval-grant", 1, context.logical_invocation_id).unwrap();
+    assert_eq!(outcome.run().state(), RunState::Running);
+    assert_eq!(outcome.grant_consumption(), Some(&expected));
+    let (resumed, consumption) = outcome.into_parts();
+    assert_eq!(resumed.state(), RunState::Running);
+    assert_eq!(consumption, Some(expected));
+}
+
+#[test]
 fn approval_resume_shortcut_returns_the_counted_grant_consumption() {
     let context = approval_context(json!({ "path": "a.md" }));
     let scope = GrantScope::new(
