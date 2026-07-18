@@ -1,13 +1,65 @@
 use anima_core::execution::Step;
 use anima_core::{
-    Budget, BudgetDecision, CheckpointV1, CommandOutcome, CommandReceipt, ExecutionErrorCode,
-    ManifestPin, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent,
-    RuntimeEventKind, Session, SessionConcurrencyPolicy, StepKind, Usage,
+    ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, Budget, BudgetDecision,
+    CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointV1, CheckpointV1Builder,
+    CommandOutcome, CommandReceipt, CompletedInvocationRecord, DefinitionPin, ExecutionErrorCode,
+    InvocationAttemptRecord, LogicalInvocation, ManifestPin, OpaqueReference, PolicyContext,
+    PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run, RunPauseReason, RunState,
+    RuntimeCommand, RuntimeCommandKind, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind,
+    Session, SessionConcurrencyPolicy, StepKind, Usage,
 };
+use serde_json::json;
 use uuid::Uuid;
 
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
+}
+
+fn approval_context(arguments: serde_json::Value) -> PolicyContext {
+    let manifest = CapabilityManifest {
+        id: "workspace.write".into(),
+        version: 1,
+        kind: CapabilityKind::Workspace,
+        label: "Write".into(),
+        description: "Writes a workspace file".into(),
+        input_schema: json!({ "type": "object" }),
+        output_schema: json!({ "type": "object" }),
+        side_effects: true,
+        risk_level: RiskLevel::High,
+        host_permissions: vec![],
+        secret_references: vec![],
+        environment_requirements: vec![],
+        timeout_ms: 1_000,
+        cancellation_supported: true,
+        max_retries: 0,
+        idempotent: false,
+        recovery_mode: RecoveryMode::NonRetryable,
+        supports_streaming: false,
+        supports_artifacts: false,
+        supports_citations: false,
+        schema_digest: "sha256:workspace.write:1".into(),
+        compatibility: RuntimeCompatibility {
+            minimum_runtime_schema_version: 1,
+            maximum_runtime_schema_version: 1,
+            manifest_schema_version: 1,
+        },
+    };
+    let invocation =
+        LogicalInvocation::new(id(1), "write", "workspace.write", 1, arguments).unwrap();
+    PolicyContext::new(
+        "owner",
+        "actor",
+        "writer",
+        3,
+        "workspace",
+        CapabilityReferenceId::new(id(99)),
+        &manifest,
+        &invocation,
+        1,
+        PolicyRestrictions::default(),
+        1_000,
+    )
+    .unwrap()
 }
 
 #[test]
@@ -15,7 +67,6 @@ fn run_transitions_are_explicit_and_terminal_states_are_immutable() {
     let run = Run::queued(id(1), id(2), "writer", 3).unwrap();
     let running = run.transition(RunState::Running, None).unwrap();
     for target in [
-        RunState::WaitingForApproval,
         RunState::Paused,
         RunState::Completed,
         RunState::Failed,
@@ -40,21 +91,19 @@ fn run_transitions_are_explicit_and_terminal_states_are_immutable() {
 }
 
 #[test]
-fn resume_requires_approval_or_recovery_and_control_applies_at_safe_boundary() {
+fn arbitrary_uuid_resume_claims_are_rejected_and_control_applies_at_safe_boundary() {
     let running = Run::queued(id(1), id(2), "writer", 3)
         .unwrap()
         .transition(RunState::Running, None)
         .unwrap();
+    let context = approval_context(json!({ "path": "a.md" }));
     let waiting = running
-        .transition(RunState::WaitingForApproval, None)
+        .wait_for_approval(PolicyEngine::approval_request(&context, None).unwrap())
         .unwrap();
     assert!(waiting.resume(None, None).is_err());
-    assert!(waiting.resume_with_claim(id(10), id(11)).is_ok());
-    let recovery = running
-        .transition(RunState::Paused, Some(RunPauseReason::RecoveryRequired))
-        .unwrap();
-    assert!(recovery.resume(None, None).is_err());
-    assert!(recovery.resume_with_recovery(id(12)).is_ok());
+    assert!(waiting.resume(Some((id(10), id(11))), None).is_err());
+    assert!(waiting.resume_with_claim(id(10), id(11)).is_err());
+    assert!(running.resume_with_recovery(id(12)).is_err());
     assert_eq!(
         running
             .request_pause_or_cancel(false, true, false)
@@ -76,6 +125,40 @@ fn resume_requires_approval_or_recovery_and_control_applies_at_safe_boundary() {
             .state(),
         RunState::Cancelled
     );
+}
+
+#[test]
+fn approval_resume_requires_the_exact_pending_request_command_and_live_claim() {
+    let context = approval_context(json!({ "path": "a.md" }));
+    let request = PolicyEngine::approval_request(&context, None).unwrap();
+    let decision = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
+    let claim = ApprovalResumeClaim::new(&request, &decision, &context).unwrap();
+    let waiting = Run::queued(id(1), id(2), "writer", 3)
+        .unwrap()
+        .transition(RunState::Running, None)
+        .unwrap()
+        .wait_for_approval(request.clone())
+        .unwrap();
+    let command =
+        RuntimeCommand::resume_with_approval(id(50), id(2), id(1), claim.binding().clone())
+            .unwrap();
+
+    assert!(waiting
+        .apply_resume_command(&command, Some(&claim), None)
+        .is_ok());
+    assert!(waiting.apply_resume_command(&command, None, None).is_err());
+
+    let other_context = approval_context(json!({ "path": "b.md" }));
+    let other_request = PolicyEngine::approval_request(&other_context, None).unwrap();
+    let other_decision = ApprovalDecision::new_approved(other_request.clone(), 1_000).unwrap();
+    let other_claim =
+        ApprovalResumeClaim::new(&other_request, &other_decision, &other_context).unwrap();
+    let other_command =
+        RuntimeCommand::resume_with_approval(id(51), id(2), id(1), other_claim.binding().clone())
+            .unwrap();
+    assert!(waiting
+        .apply_resume_command(&other_command, Some(&other_claim), None)
+        .is_err());
 }
 
 #[test]
@@ -148,6 +231,108 @@ fn checkpoints_round_trip_and_fail_closed_for_mismatch_or_secrets() {
     value["runtime_schema_version"] = serde_json::json!(99);
     assert!(serde_json::from_value::<CheckpointV1>(value).is_err());
     assert!(ManifestPin::new("cap", 1, "token-value").is_err());
+}
+
+#[test]
+fn full_checkpoints_round_trip_and_reject_tampered_records() {
+    let invocation = LogicalInvocation::new(
+        id(2),
+        "cap-step",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let manifest = ManifestPin::new("workspace.write", 1, "sha256:abc").unwrap();
+    let attempt = InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        AttemptRecordState::Completed,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let completed = CompletedInvocationRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        OpaqueReference::new(id(200)).unwrap(),
+    )
+    .unwrap();
+    let checkpoint = CheckpointV1Builder::new(
+        id(1),
+        id(2),
+        DefinitionPin::new(1, "writer", 3).unwrap(),
+        4,
+        vec![manifest],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::Running, None)
+    .cursor_step_id(Some("cap-step".into()))
+    .attempts(vec![attempt])
+    .completed_invocations(vec![completed])
+    .message_context_refs(vec![OpaqueReference::new(id(201)).unwrap()])
+    .model_context_refs(vec![OpaqueReference::new(id(202)).unwrap()])
+    .memory_refs(vec![OpaqueReference::new(id(203)).unwrap()])
+    .artifact_refs(vec![OpaqueReference::new(id(204)).unwrap()])
+    .build()
+    .unwrap();
+
+    let encoded = serde_json::to_value(&checkpoint).unwrap();
+    let restored: CheckpointV1 = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(restored, checkpoint);
+    assert_eq!(restored.attempts().len(), 1);
+    assert_eq!(restored.completed_invocations().len(), 1);
+    assert_eq!(restored.message_context_refs().len(), 1);
+
+    let mut raw_result = encoded.clone();
+    raw_result["completed_invocations"][0]["result_ref"] = json!("raw executor body");
+    assert!(serde_json::from_value::<CheckpointV1>(raw_result).is_err());
+    let mut mismatched_attempt = encoded;
+    mismatched_attempt["completed_invocations"][0]["attempt_number"] = json!(2);
+    assert!(serde_json::from_value::<CheckpointV1>(mismatched_attempt).is_err());
+}
+
+#[test]
+fn standalone_checkpoint_records_and_canonical_order_fail_closed() {
+    let invocation = LogicalInvocation::new(
+        id(2),
+        "cap-step",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let manifest = ManifestPin::new("workspace.write", 1, "sha256:abc").unwrap();
+    let record = InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        AttemptRecordState::Completed,
+        manifest,
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let mut standalone = serde_json::to_value(record).unwrap();
+    standalone["attempt_number"] = json!(0);
+    assert!(serde_json::from_value::<InvocationAttemptRecord>(standalone).is_err());
+
+    let checkpoint = CheckpointV1::new_minimal(
+        id(1),
+        id(2),
+        "writer",
+        3,
+        4,
+        vec![
+            ManifestPin::new("a", 1, "sha256:aa").unwrap(),
+            ManifestPin::new("b", 1, "sha256:bb").unwrap(),
+        ],
+    )
+    .unwrap();
+    let mut reversed = serde_json::to_value(checkpoint).unwrap();
+    reversed["manifests"].as_array_mut().unwrap().reverse();
+    assert!(serde_json::from_value::<CheckpointV1>(reversed).is_err());
 }
 
 #[test]

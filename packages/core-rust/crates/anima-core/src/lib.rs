@@ -2,8 +2,8 @@ pub mod agent;
 pub mod capability;
 pub mod components;
 pub mod definition;
-pub mod execution;
 pub mod events;
+pub mod execution;
 pub mod model;
 pub mod persistence;
 pub mod policy;
@@ -22,10 +22,11 @@ pub use capability::{
     CapabilityManifest, CapabilityProfile, CapabilityProfileEntry, CapabilityReferenceId,
     CapabilityRegistry, CapabilityRegistryError, CapabilityResult, CapabilityRetryAuthorization,
     CapabilitySecretReferenceId, ExecutionFence, ExecutionFencingToken, LogicalInvocation,
-    LogicalInvocationError, ManifestCatalog, ManifestCatalogError, ReconcileOutcome,
-    RecoveryAction, RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
-    CAPABILITY_INVOCATION_NAMESPACE, MAX_CAPABILITY_ARGUMENT_BYTES, MAX_CAPABILITY_ARGUMENT_DEPTH,
-    MAX_CAPABILITY_ARGUMENT_NODES, MAX_CAPABILITY_ID_BYTES, MAX_CAPABILITY_SECRET_REFERENCES,
+    LogicalInvocationBinding, LogicalInvocationError, ManifestCatalog, ManifestCatalogError,
+    ReconcileOutcome, RecoveryAction, RecoveryActionKind, RecoveryMode, RecoveryResumeBinding,
+    RiskLevel, RuntimeCompatibility, ValidatedRecoveryResume, CAPABILITY_INVOCATION_NAMESPACE,
+    MAX_CAPABILITY_ARGUMENT_BYTES, MAX_CAPABILITY_ARGUMENT_DEPTH, MAX_CAPABILITY_ARGUMENT_NODES,
+    MAX_CAPABILITY_ID_BYTES, MAX_CAPABILITY_SECRET_REFERENCES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use definition::{
@@ -33,14 +34,16 @@ pub use definition::{
     DefinitionValidationError, HostRequirement, LifecyclePolicy, MemoryPolicy, ModelPolicy,
     ProfileRef, ResolvedCapability, RuntimeLimits, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
-pub use execution::{
-    Attempt, Budget, BudgetDecision, CheckpointV1, CommandOutcome, CommandReceipt,
-    DefinitionPin, ExecutionError, ExecutionErrorCode, ExecutionLease, ManifestPin, Run,
-    RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent,
-    RuntimeEventKind, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind, Usage,
-    RecoveryRecord, LiveRuntimeEvent,
-};
 pub use events::{EngineEvent, EventType};
+pub use execution::{
+    ApprovalResumeBinding, ApprovalResumeClaim, Attempt, AttemptRecordState, Budget,
+    BudgetDecision, CheckpointV1, CheckpointV1Builder, CommandOutcome, CommandReceipt,
+    CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionErrorCode, ExecutionLease,
+    InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin, OpaqueReference, PendingApprovalRecord,
+    RecoveryRecord, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind,
+    RuntimeEvent, RuntimeEventKind, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind,
+    UncertainInvocationRecord, Usage,
+};
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
 };

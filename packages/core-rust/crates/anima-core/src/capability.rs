@@ -302,6 +302,8 @@ pub const MAX_CAPABILITY_ARGUMENT_DEPTH: usize = 64;
 pub const MAX_CAPABILITY_ARGUMENT_NODES: usize = 10_000;
 pub const MAX_CAPABILITY_ID_BYTES: usize = 256;
 pub const MAX_CAPABILITY_SECRET_REFERENCES: usize = (u16::MAX as usize) + 1;
+const RECOVERY_RESUME_BINDING_NAMESPACE: Uuid =
+    Uuid::from_u128(0x9e12_2517_19cb_5f46_a51c_9620_1dc5_4208);
 
 /// Errors raised before an argument value enters schema validation or an executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,6 +345,87 @@ pub struct LogicalInvocation {
     seed: LogicalInvocationSeed,
 }
 
+/// Safe durable identity for a logical invocation without its raw argument document.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogicalInvocationBinding {
+    id: Uuid,
+    run_id: Uuid,
+    logical_step_id: String,
+    capability_id: String,
+    manifest_version: u32,
+    canonical_argument_digest: Uuid,
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogicalInvocationBindingWire {
+    id: Uuid,
+    run_id: Uuid,
+    logical_step_id: String,
+    capability_id: String,
+    manifest_version: u32,
+    canonical_argument_digest: Uuid,
+    idempotency_key: String,
+}
+
+impl LogicalInvocationBinding {
+    fn validate(&self) -> Result<(), LogicalInvocationError> {
+        if self.id.is_nil()
+            || self.run_id.is_nil()
+            || self.canonical_argument_digest.is_nil()
+            || self.logical_step_id.trim().is_empty()
+            || self.capability_id.trim().is_empty()
+            || self.logical_step_id.len() > MAX_CAPABILITY_ID_BYTES
+            || self.capability_id.len() > MAX_CAPABILITY_ID_BYTES
+            || self.manifest_version == 0
+            || self.idempotency_key != format!("anima-core:{}", self.id)
+        {
+            return Err(LogicalInvocationError::IdentifierTooLarge);
+        }
+        Ok(())
+    }
+    pub fn id(&self) -> Uuid {
+        self.id
+    }
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    pub fn logical_step_id(&self) -> &str {
+        &self.logical_step_id
+    }
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+    pub fn manifest_version(&self) -> u32 {
+        self.manifest_version
+    }
+    pub fn canonical_argument_digest(&self) -> Uuid {
+        self.canonical_argument_digest
+    }
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+}
+
+impl<'de> Deserialize<'de> for LogicalInvocationBinding {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = LogicalInvocationBindingWire::deserialize(deserializer)?;
+        let value = Self {
+            id: wire.id,
+            run_id: wire.run_id,
+            logical_step_id: wire.logical_step_id,
+            capability_id: wire.capability_id,
+            manifest_version: wire.manifest_version,
+            canonical_argument_digest: wire.canonical_argument_digest,
+            idempotency_key: wire.idempotency_key,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 impl LogicalInvocation {
     pub fn new(
         run_id: Uuid,
@@ -373,6 +456,18 @@ impl LogicalInvocation {
 
     pub fn id(&self) -> Uuid {
         self.id
+    }
+
+    pub fn binding(&self) -> LogicalInvocationBinding {
+        LogicalInvocationBinding {
+            id: self.id,
+            run_id: self.seed.run_id,
+            logical_step_id: self.seed.logical_step_id.clone(),
+            capability_id: self.seed.capability_id.clone(),
+            manifest_version: self.seed.manifest_version,
+            canonical_argument_digest: self.canonical_argument_digest(),
+            idempotency_key: self.idempotency_key(),
+        }
     }
 
     pub fn idempotency_key(&self) -> String {
@@ -1130,10 +1225,235 @@ pub enum RecoveryAction {
     RecoveryRequired,
 }
 
+/// A portable, non-authorizing snapshot of one exact retry authorization.
+///
+/// The opaque identity is a one-way binding. It is not the bearer nonce consumed by
+/// `CapabilityRegistry::execute_retry`, so restoring this value cannot authorize execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryResumeBinding {
+    logical_invocation_id: Uuid,
+    run_id: Uuid,
+    logical_step_id: String,
+    capability_id: String,
+    canonical_argument_digest: Uuid,
+    completed_attempt_number: u32,
+    retry_attempt_number: u32,
+    manifest_id: String,
+    manifest_version: u32,
+    manifest_digest: String,
+    recovery_mode: RecoveryMode,
+    idempotency_key: String,
+    authorization_identity: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryResumeBindingWire {
+    logical_invocation_id: Uuid,
+    run_id: Uuid,
+    logical_step_id: String,
+    capability_id: String,
+    canonical_argument_digest: Uuid,
+    completed_attempt_number: u32,
+    retry_attempt_number: u32,
+    manifest_id: String,
+    manifest_version: u32,
+    manifest_digest: String,
+    recovery_mode: RecoveryMode,
+    idempotency_key: String,
+    authorization_identity: Uuid,
+}
+
+impl RecoveryResumeBinding {
+    fn new(
+        nonce: Uuid,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+    ) -> Result<Self, CapabilityError> {
+        let completed_attempt_number = context.attempt().number();
+        let retry_attempt_number = completed_attempt_number
+            .checked_add(1)
+            .ok_or_else(CapabilityError::validation)?;
+        let logical_invocation_id = context.invocation().id();
+        let name = format!(
+            "{logical_invocation_id}:{completed_attempt_number}:{retry_attempt_number}:{}:{}:{}:{nonce}",
+            manifest.id, manifest.version, manifest.schema_digest
+        );
+        let value = Self {
+            logical_invocation_id,
+            run_id: context.invocation().run_id(),
+            logical_step_id: context.invocation().logical_step_id().to_owned(),
+            capability_id: context.invocation().capability_id().to_owned(),
+            canonical_argument_digest: context.invocation().canonical_argument_digest(),
+            completed_attempt_number,
+            retry_attempt_number,
+            manifest_id: manifest.id.clone(),
+            manifest_version: manifest.version,
+            manifest_digest: manifest.schema_digest.clone(),
+            recovery_mode: manifest.recovery_mode,
+            idempotency_key: context.invocation().idempotency_key(),
+            authorization_identity: Uuid::new_v5(
+                &RECOVERY_RESUME_BINDING_NAMESPACE,
+                name.as_bytes(),
+            ),
+        };
+        value
+            .validate()
+            .map_err(|_| CapabilityError::validation())?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), CapabilityContextError> {
+        if self.logical_invocation_id.is_nil()
+            || self.run_id.is_nil()
+            || self.canonical_argument_digest.is_nil()
+            || self.authorization_identity.is_nil()
+            || self.completed_attempt_number == 0
+            || self.completed_attempt_number.checked_add(1) != Some(self.retry_attempt_number)
+            || self.manifest_id.trim().is_empty()
+            || self.manifest_id.len() > MAX_CAPABILITY_ID_BYTES
+            || self.logical_step_id.trim().is_empty()
+            || self.logical_step_id.len() > MAX_CAPABILITY_ID_BYTES
+            || self.capability_id != self.manifest_id
+            || self.manifest_version == 0
+            || !self.manifest_digest.starts_with("sha256:")
+            || self.manifest_digest.len() <= "sha256:".len()
+            || self.manifest_digest.len() > MAX_CAPABILITY_ARGUMENT_BYTES
+            || self.manifest_digest.chars().any(char::is_whitespace)
+            || self.idempotency_key != format!("anima-core:{}", self.logical_invocation_id)
+            || !matches!(
+                self.recovery_mode,
+                RecoveryMode::InherentlyIdempotent
+                    | RecoveryMode::KeyedIdempotent
+                    | RecoveryMode::Reconcilable
+                    | RecoveryMode::Retry
+            )
+        {
+            return Err(CapabilityContextError::InvalidReference);
+        }
+        Ok(())
+    }
+
+    pub fn logical_invocation_id(&self) -> Uuid {
+        self.logical_invocation_id
+    }
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    pub fn logical_step_id(&self) -> &str {
+        &self.logical_step_id
+    }
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+    pub fn canonical_argument_digest(&self) -> Uuid {
+        self.canonical_argument_digest
+    }
+    pub fn completed_attempt_number(&self) -> u32 {
+        self.completed_attempt_number
+    }
+    pub fn retry_attempt_number(&self) -> u32 {
+        self.retry_attempt_number
+    }
+    pub fn manifest_id(&self) -> &str {
+        &self.manifest_id
+    }
+    pub fn manifest_version(&self) -> u32 {
+        self.manifest_version
+    }
+    pub fn manifest_digest(&self) -> &str {
+        &self.manifest_digest
+    }
+    pub fn recovery_mode(&self) -> RecoveryMode {
+        self.recovery_mode
+    }
+    pub fn idempotency_key(&self) -> &str {
+        &self.idempotency_key
+    }
+}
+
+impl<'de> Deserialize<'de> for RecoveryResumeBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = RecoveryResumeBindingWire::deserialize(deserializer)?;
+        let value = Self {
+            logical_invocation_id: wire.logical_invocation_id,
+            run_id: wire.run_id,
+            logical_step_id: wire.logical_step_id,
+            capability_id: wire.capability_id,
+            canonical_argument_digest: wire.canonical_argument_digest,
+            completed_attempt_number: wire.completed_attempt_number,
+            retry_attempt_number: wire.retry_attempt_number,
+            manifest_id: wire.manifest_id,
+            manifest_version: wire.manifest_version,
+            manifest_digest: wire.manifest_digest,
+            recovery_mode: wire.recovery_mode,
+            idempotency_key: wire.idempotency_key,
+            authorization_identity: wire.authorization_identity,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 /// An opaque, one-time registry authorization for a specific retry attempt.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CapabilityRetryAuthorization {
     nonce: Uuid,
+    resume_binding: RecoveryResumeBinding,
+}
+
+impl CapabilityRetryAuthorization {
+    fn new(
+        nonce: Uuid,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+    ) -> Result<Self, CapabilityError> {
+        Ok(Self {
+            nonce,
+            resume_binding: RecoveryResumeBinding::new(nonce, context, manifest)?,
+        })
+    }
+
+    pub fn resume_binding(&self) -> RecoveryResumeBinding {
+        self.resume_binding.clone()
+    }
+
+    fn matches_resume(
+        &self,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+        binding: &RecoveryResumeBinding,
+    ) -> bool {
+        &self.resume_binding == binding
+            && binding.logical_invocation_id == context.invocation().id()
+            && binding.run_id == context.invocation().run_id()
+            && binding.logical_step_id == context.invocation().logical_step_id()
+            && binding.capability_id == context.invocation().capability_id()
+            && binding.canonical_argument_digest == context.invocation().canonical_argument_digest()
+            && binding.retry_attempt_number == context.attempt().number()
+            && binding.manifest_id == manifest.id
+            && binding.manifest_version == manifest.version
+            && binding.manifest_digest == manifest.schema_digest
+            && binding.recovery_mode == manifest.recovery_mode
+            && binding.idempotency_key == context.invocation().idempotency_key()
+    }
+}
+
+/// A live, non-serializable proof that a durable recovery binding still has an exact retry
+/// authorization in the lineage store.
+#[derive(Debug)]
+pub struct ValidatedRecoveryResume {
+    binding: RecoveryResumeBinding,
+}
+
+impl ValidatedRecoveryResume {
+    pub fn binding(&self) -> &RecoveryResumeBinding {
+        &self.binding
+    }
 }
 
 impl fmt::Debug for CapabilityRetryAuthorization {

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::{
     ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity, PolicyContext,
-    PolicyEngine, CAPABILITY_INVOCATION_NAMESPACE,
+    PolicyEngine, RecoveryResumeBinding, ValidatedRecoveryResume, CAPABILITY_INVOCATION_NAMESPACE,
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -131,6 +131,8 @@ pub struct Run {
     definition_version: u32,
     state: RunState,
     pause_reason: Option<RunPauseReason>,
+    pending_approval: Option<ApprovalRequest>,
+    recovery_binding: Option<RecoveryResumeBinding>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +143,10 @@ struct RunWire {
     definition_version: u32,
     state: RunState,
     pause_reason: Option<RunPauseReason>,
+    #[serde(default)]
+    pending_approval: Option<ApprovalRequest>,
+    #[serde(default)]
+    recovery_binding: Option<RecoveryResumeBinding>,
 }
 impl Run {
     pub fn queued(
@@ -156,6 +162,8 @@ impl Run {
             definition_version,
             RunState::Queued,
             None,
+            None,
+            None,
         )
     }
     fn from_parts(
@@ -165,12 +173,26 @@ impl Run {
         definition_version: u32,
         state: RunState,
         pause_reason: Option<RunPauseReason>,
+        pending_approval: Option<ApprovalRequest>,
+        recovery_binding: Option<RecoveryResumeBinding>,
     ) -> Result<Self, ExecutionError> {
         valid_uuid(id)?;
         valid_uuid(session_id)?;
         valid_id(&definition_id)?;
         valid_version(definition_version)?;
         if (state == RunState::Paused) != pause_reason.is_some() {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidState));
+        }
+        if (state == RunState::WaitingForApproval) != pending_approval.is_some()
+            || (pause_reason == Some(RunPauseReason::RecoveryRequired))
+                != recovery_binding.is_some()
+            || pending_approval
+                .as_ref()
+                .is_some_and(|request| request.run_id != id)
+            || recovery_binding
+                .as_ref()
+                .is_some_and(|binding| binding.run_id() != id)
+        {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidState));
         }
         Ok(Self {
@@ -180,6 +202,8 @@ impl Run {
             definition_version,
             state,
             pause_reason,
+            pending_approval,
+            recovery_binding,
         })
     }
     pub fn id(&self) -> Uuid {
@@ -193,6 +217,12 @@ impl Run {
     }
     pub fn pause_reason(&self) -> Option<RunPauseReason> {
         self.pause_reason
+    }
+    pub fn pending_approval(&self) -> Option<&ApprovalRequest> {
+        self.pending_approval.as_ref()
+    }
+    pub fn recovery_binding(&self) -> Option<&RecoveryResumeBinding> {
+        self.recovery_binding.as_ref()
     }
     pub fn transition(
         &self,
@@ -208,6 +238,11 @@ impl Run {
         if target != RunState::Paused && pause_reason.is_some() {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidState));
         }
+        if target == RunState::WaitingForApproval
+            || pause_reason == Some(RunPauseReason::RecoveryRequired)
+        {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
         Self::from_parts(
             self.id,
             self.session_id,
@@ -215,28 +250,56 @@ impl Run {
             self.definition_version,
             target,
             pause_reason,
+            None,
+            None,
+        )
+    }
+
+    pub fn wait_for_approval(&self, request: ApprovalRequest) -> Result<Self, ExecutionError> {
+        if self.state != RunState::Running || request.run_id != self.id {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        Self::from_parts(
+            self.id,
+            self.session_id,
+            self.definition_id.clone(),
+            self.definition_version,
+            RunState::WaitingForApproval,
+            None,
+            Some(request),
+            None,
+        )
+    }
+
+    pub fn pause_for_recovery(
+        &self,
+        binding: RecoveryResumeBinding,
+    ) -> Result<Self, ExecutionError> {
+        if self.state != RunState::Running || binding.run_id() != self.id {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        Self::from_parts(
+            self.id,
+            self.session_id,
+            self.definition_id.clone(),
+            self.definition_version,
+            RunState::Paused,
+            Some(RunPauseReason::RecoveryRequired),
+            None,
+            Some(binding),
         )
     }
     pub fn resume(
         &self,
-        approval_claim: Option<(Uuid, Uuid)>,
-        recovery_key: Option<Uuid>,
+        _approval_claim: Option<(Uuid, Uuid)>,
+        _recovery_key: Option<Uuid>,
     ) -> Result<Self, ExecutionError> {
         match self.state {
             RunState::WaitingForApproval => {
-                let Some((request, decision)) = approval_claim else {
-                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
-                };
-                valid_uuid(request)?;
-                valid_uuid(decision)?;
-                self.transition(RunState::Running, None)
+                Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))
             }
             RunState::Paused if self.pause_reason == Some(RunPauseReason::RecoveryRequired) => {
-                let Some(key) = recovery_key else {
-                    return Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired));
-                };
-                valid_uuid(key)?;
-                self.transition(RunState::Running, None)
+                Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired))
             }
             RunState::Paused => self.transition(RunState::Running, None),
             _ => Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition)),
@@ -244,13 +307,13 @@ impl Run {
     }
     pub fn resume_with_claim(
         &self,
-        request_id: Uuid,
-        decision_id: Uuid,
+        _request_id: Uuid,
+        _decision_id: Uuid,
     ) -> Result<Self, ExecutionError> {
-        self.resume(Some((request_id, decision_id)), None)
+        Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))
     }
-    pub fn resume_with_recovery(&self, key: Uuid) -> Result<Self, ExecutionError> {
-        self.resume(None, Some(key))
+    pub fn resume_with_recovery(&self, _key: Uuid) -> Result<Self, ExecutionError> {
+        Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired))
     }
     pub fn resume_with_pending_approval(
         &self,
@@ -258,14 +321,90 @@ impl Run {
         decision: &ApprovalDecision,
         context: &PolicyContext,
     ) -> Result<Self, ExecutionError> {
-        if self.state != RunState::WaitingForApproval
-            || decision.kind != ApprovalDecisionKind::Approve
-            || decision.request != *pending
-            || PolicyEngine::validate_approval(decision, context) != ApprovalValidity::Valid
+        let claim = ApprovalResumeClaim::new(pending, decision, context)?;
+        if self.pending_approval.as_ref() != Some(pending)
+            || claim.binding.decision.request != *pending
         {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
-        self.transition(RunState::Running, None)
+        Self::from_parts(
+            self.id,
+            self.session_id,
+            self.definition_id.clone(),
+            self.definition_version,
+            RunState::Running,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn apply_resume_command(
+        &self,
+        command: &RuntimeCommand,
+        approval_claim: Option<&ApprovalResumeClaim>,
+        recovery_claim: Option<&ValidatedRecoveryResume>,
+    ) -> Result<Self, ExecutionError> {
+        let Some((run_id, approval_binding, recovery_binding)) = command.resume_parts() else {
+            return Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition));
+        };
+        if command.session_id != self.session_id || run_id != self.id {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        match self.state {
+            RunState::WaitingForApproval => {
+                let (Some(expected), Some(command_binding), Some(claim)) = (
+                    self.pending_approval.as_ref(),
+                    approval_binding,
+                    approval_claim,
+                ) else {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                };
+                if recovery_binding.is_some()
+                    || recovery_claim.is_some()
+                    || claim.binding() != command_binding
+                    || &claim.binding().decision.request != expected
+                {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
+            }
+            RunState::Paused if self.pause_reason == Some(RunPauseReason::RecoveryRequired) => {
+                let (Some(expected), Some(command_binding), Some(claim)) = (
+                    self.recovery_binding.as_ref(),
+                    recovery_binding,
+                    recovery_claim,
+                ) else {
+                    return Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired));
+                };
+                if approval_binding.is_some()
+                    || approval_claim.is_some()
+                    || claim.binding() != command_binding
+                    || command_binding != expected
+                {
+                    return Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired));
+                }
+            }
+            RunState::Paused => {
+                if approval_binding.is_some()
+                    || recovery_binding.is_some()
+                    || approval_claim.is_some()
+                    || recovery_claim.is_some()
+                {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
+            }
+            _ => return Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition)),
+        }
+        Self::from_parts(
+            self.id,
+            self.session_id,
+            self.definition_id.clone(),
+            self.definition_version,
+            RunState::Running,
+            None,
+            None,
+            None,
+        )
     }
     /// A host records control intent while work is active, then calls this at a safe boundary.
     pub fn request_pause_or_cancel(
@@ -296,6 +435,8 @@ impl<'de> Deserialize<'de> for Run {
             w.definition_version,
             w.state,
             w.pause_reason,
+            w.pending_approval,
+            w.recovery_binding,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -507,6 +648,44 @@ pub enum RuntimeCommandKind {
     Cancel,
     Retry,
 }
+
+/// Durable, non-authorizing intent for one exact validated approval decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalResumeBinding {
+    decision: ApprovalDecision,
+}
+
+/// A live policy validation prerequisite. Hosts recreate it against current policy context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalResumeClaim {
+    binding: ApprovalResumeBinding,
+}
+
+impl ApprovalResumeClaim {
+    pub fn new(
+        pending: &ApprovalRequest,
+        decision: &ApprovalDecision,
+        context: &PolicyContext,
+    ) -> Result<Self, ExecutionError> {
+        if decision.kind != ApprovalDecisionKind::Approve
+            || decision.request != *pending
+            || PolicyEngine::validate_approval(decision, context) != ApprovalValidity::Valid
+        {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        Ok(Self {
+            binding: ApprovalResumeBinding {
+                decision: decision.clone(),
+            },
+        })
+    }
+
+    pub fn binding(&self) -> &ApprovalResumeBinding {
+        &self.binding
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RuntimeCommandPayload {
@@ -518,9 +697,8 @@ enum RuntimeCommandPayload {
     },
     Resume {
         run_id: Uuid,
-        approval_request_id: Option<Uuid>,
-        approval_decision_id: Option<Uuid>,
-        recovery_key: Option<Uuid>,
+        approval_binding: Option<ApprovalResumeBinding>,
+        recovery_binding: Option<RecoveryResumeBinding>,
     },
     Cancel {
         run_id: Uuid,
@@ -551,18 +729,13 @@ impl RuntimeCommandPayload {
             } => vec![*run_id, *logical_invocation_id],
             Self::Resume {
                 run_id,
-                approval_request_id,
-                approval_decision_id,
-                recovery_key,
+                approval_binding,
+                recovery_binding,
             } => {
-                if approval_request_id.is_some() != approval_decision_id.is_some() {
+                if approval_binding.is_some() && recovery_binding.is_some() {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
                 }
-                let mut v = vec![*run_id];
-                v.extend(approval_request_id);
-                v.extend(approval_decision_id);
-                v.extend(recovery_key);
-                v
+                vec![*run_id]
             }
         };
         for id in ids {
@@ -615,15 +788,48 @@ impl RuntimeCommand {
         claim: Option<(Uuid, Uuid)>,
         recovery_key: Option<Uuid>,
     ) -> Result<Self, ExecutionError> {
-        let (a, b) = claim.map_or((None, None), |(a, b)| (Some(a), Some(b)));
+        if claim.is_some() || recovery_key.is_some() {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
         Self::new(
             id,
             session_id,
             RuntimeCommandPayload::Resume {
                 run_id,
-                approval_request_id: a,
-                approval_decision_id: b,
-                recovery_key,
+                approval_binding: None,
+                recovery_binding: None,
+            },
+        )
+    }
+    pub fn resume_with_approval(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        approval_binding: ApprovalResumeBinding,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::Resume {
+                run_id,
+                approval_binding: Some(approval_binding),
+                recovery_binding: None,
+            },
+        )
+    }
+    pub fn resume_with_recovery_binding(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        recovery_binding: RecoveryResumeBinding,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::Resume {
+                run_id,
+                approval_binding: None,
+                recovery_binding: Some(recovery_binding),
             },
         )
     }
@@ -647,6 +853,26 @@ impl RuntimeCommand {
     }
     pub fn kind(&self) -> RuntimeCommandKind {
         self.payload.kind()
+    }
+    fn resume_parts(
+        &self,
+    ) -> Option<(
+        Uuid,
+        Option<&ApprovalResumeBinding>,
+        Option<&RecoveryResumeBinding>,
+    )> {
+        match &self.payload {
+            RuntimeCommandPayload::Resume {
+                run_id,
+                approval_binding,
+                recovery_binding,
+            } => Some((
+                *run_id,
+                approval_binding.as_ref(),
+                recovery_binding.as_ref(),
+            )),
+            _ => None,
+        }
     }
     fn digest(&self) -> Uuid {
         let bytes = serde_jcs::to_vec(&(self.session_id, &self.payload))
@@ -812,6 +1038,23 @@ pub struct Budget {
     pub max_artifact_bytes: Option<u64>,
     pub max_download_bytes: Option<u64>,
     pub require_approval_at_percent: Option<u8>,
+}
+impl Default for Budget {
+    fn default() -> Self {
+        Self {
+            max_wall_time_ms: None,
+            max_turns: None,
+            max_capability_steps: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
+            max_total_tokens: None,
+            max_estimated_cost_micros: None,
+            max_concurrent_runs: None,
+            max_artifact_bytes: None,
+            max_download_bytes: None,
+            require_approval_at_percent: None,
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

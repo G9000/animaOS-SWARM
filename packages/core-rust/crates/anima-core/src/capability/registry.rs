@@ -167,6 +167,9 @@ impl CapabilityRegistry {
     ) -> Result<CapabilityResult, CapabilityError> {
         let manifest = self.manifest_for_context(&context)?;
         self.validate_context(&context, manifest)?;
+        if !authorization.matches_resume(&context, manifest, &authorization.resume_binding) {
+            return Err(CapabilityError::validation());
+        }
         let entry = self.entry_for_context(&context)?;
         validate_instance(
             &entry.input_validator,
@@ -218,6 +221,35 @@ impl CapabilityRegistry {
         }
         self.finish_execution(lineage_key, executing, execution, entry)
             .await
+    }
+
+    /// Validates a durable resume binding against both the live bearer authorization and the
+    /// current durable lineage state. This does not consume or recreate retry authority.
+    pub async fn validate_recovery_resume(
+        &self,
+        retry_context: &CapabilityExecutionContext,
+        authorization: &CapabilityRetryAuthorization,
+        binding: &RecoveryResumeBinding,
+    ) -> Result<ValidatedRecoveryResume, CapabilityError> {
+        let manifest = self.manifest_for_context(retry_context)?;
+        self.validate_context(retry_context, manifest)?;
+        if !authorization.matches_resume(retry_context, manifest, binding) {
+            return Err(CapabilityError::validation());
+        }
+        match self
+            .lineage
+            .load(binding.logical_invocation_id, binding.retry_attempt_number)
+            .await?
+        {
+            Some(CapabilityAttemptLineageState::RetryAuthorized { authorization_id })
+                if authorization_id == authorization.nonce =>
+            {
+                Ok(ValidatedRecoveryResume {
+                    binding: binding.clone(),
+                })
+            }
+            _ => Err(CapabilityError::validation()),
+        }
     }
 
     pub async fn recover(
@@ -658,9 +690,11 @@ impl CapabilityRegistry {
         {
             return Ok(RecoveryAction::RetrySameKey {
                 idempotency_key: context.invocation().idempotency_key(),
-                authorization: CapabilityRetryAuthorization {
-                    nonce: authorization_id,
-                },
+                authorization: CapabilityRetryAuthorization::new(
+                    authorization_id,
+                    context,
+                    manifest,
+                )?,
             });
         }
         if self.lineage.load(next_key.0, next_key.1).await?.is_some() {
@@ -685,16 +719,18 @@ impl CapabilityRegistry {
             {
                 return Ok(RecoveryAction::RetrySameKey {
                     idempotency_key,
-                    authorization: CapabilityRetryAuthorization {
-                        nonce: authorization_id,
-                    },
+                    authorization: CapabilityRetryAuthorization::new(
+                        authorization_id,
+                        context,
+                        manifest,
+                    )?,
                 });
             }
             return Ok(RecoveryAction::RecoveryRequired);
         }
         Ok(RecoveryAction::RetrySameKey {
             idempotency_key,
-            authorization: CapabilityRetryAuthorization { nonce },
+            authorization: CapabilityRetryAuthorization::new(nonce, context, manifest)?,
         })
     }
 }

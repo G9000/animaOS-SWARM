@@ -5,12 +5,15 @@ use std::sync::{
 };
 
 use anima_core::{
-    CapabilityAttempt, CapabilityAttemptLineageState, CapabilityContextError, CapabilityError,
-    CapabilityErrorCode, CapabilityExecutionContext, CapabilityExecutor, CapabilityKind,
-    CapabilityLeaseKind, CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId,
-    CapabilityRegistry, CapabilityRegistryError, CapabilityResult, CapabilitySecretReferenceId,
-    ExecutionFence, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ReconcileOutcome,
-    RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
+    AttemptRecordState, Budget, CapabilityAttempt, CapabilityAttemptLineageState,
+    CapabilityContextError, CapabilityError, CapabilityErrorCode, CapabilityExecutionContext,
+    CapabilityExecutor, CapabilityKind, CapabilityLeaseKind, CapabilityLineageStore,
+    CapabilityManifest, CapabilityReferenceId, CapabilityRegistry, CapabilityRegistryError,
+    CapabilityResult, CapabilitySecretReferenceId, CheckpointV1, CheckpointV1Builder,
+    DefinitionPin, ExecutionFence, InvocationAttemptRecord, LogicalInvocation, ManifestCatalog,
+    ManifestCatalogError, ManifestPin, ReconcileOutcome, RecoveryActionKind, RecoveryMode,
+    RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility,
+    UncertainInvocationRecord, Usage,
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -1053,10 +1056,87 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
     let action = registry.recover(initial).await.unwrap();
     let authorization = action.retry_authorization().unwrap().clone();
     let retry = context_for_attempt(&manifest, json!({ "query": "hello" }), 2);
+    let binding = authorization.resume_binding();
+    assert_eq!(binding.logical_invocation_id(), retry.invocation().id());
+    assert_eq!(binding.completed_attempt_number(), 1);
+    assert_eq!(binding.retry_attempt_number(), 2);
+    assert_eq!(binding.manifest_id(), manifest.id);
+    assert_eq!(binding.manifest_version(), manifest.version);
+    assert_eq!(binding.manifest_digest(), manifest.schema_digest);
+    assert_eq!(binding.recovery_mode(), RecoveryMode::KeyedIdempotent);
+    assert_eq!(
+        binding.idempotency_key(),
+        retry.invocation().idempotency_key()
+    );
+    let live_claim = registry
+        .validate_recovery_resume(&retry, &authorization, &binding)
+        .await
+        .unwrap();
+    let paused = Run::queued(binding.run_id(), Uuid::from_u128(500), "writer", 1)
+        .unwrap()
+        .transition(RunState::Running, None)
+        .unwrap()
+        .pause_for_recovery(binding.clone())
+        .unwrap();
+    let resume = RuntimeCommand::resume_with_recovery_binding(
+        Uuid::from_u128(501),
+        Uuid::from_u128(500),
+        binding.run_id(),
+        binding.clone(),
+    )
+    .unwrap();
+    assert!(paused.apply_resume_command(&resume, None, None).is_err());
+    assert!(paused
+        .apply_resume_command(&resume, None, Some(&live_claim))
+        .is_ok());
+    let manifest_pin =
+        ManifestPin::new(&manifest.id, manifest.version, &manifest.schema_digest).unwrap();
+    let uncertain_attempt = InvocationAttemptRecord::new(
+        retry.invocation().binding(),
+        1,
+        AttemptRecordState::Uncertain,
+        manifest_pin.clone(),
+        manifest.recovery_mode,
+    )
+    .unwrap();
+    let uncertain = UncertainInvocationRecord::new(
+        retry.invocation().binding(),
+        1,
+        manifest_pin.clone(),
+        manifest.recovery_mode,
+        Some(binding.clone()),
+    )
+    .unwrap();
+    let checkpoint = CheckpointV1Builder::new(
+        Uuid::from_u128(500),
+        binding.run_id(),
+        DefinitionPin::new(1, "writer", 1).unwrap(),
+        1,
+        vec![manifest_pin],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::Paused, Some(RunPauseReason::RecoveryRequired))
+    .cursor_step_id(Some("step-7".into()))
+    .attempts(vec![uncertain_attempt])
+    .uncertain_invocations(vec![uncertain])
+    .build()
+    .unwrap();
+    assert!(
+        serde_json::from_value::<CheckpointV1>(serde_json::to_value(checkpoint).unwrap()).is_ok()
+    );
+    let mut forged = serde_json::to_value(&binding).unwrap();
+    forged["completed_attempt_number"] = json!(2);
+    assert!(serde_json::from_value::<anima_core::RecoveryResumeBinding>(forged).is_err());
+
     registry
         .execute_retry(retry.clone(), authorization.clone())
         .await
         .unwrap();
+    assert!(registry
+        .validate_recovery_resume(&retry, &authorization, &binding)
+        .await
+        .is_err());
     assert_eq!(
         registry
             .execute_retry(retry.clone(), authorization)
