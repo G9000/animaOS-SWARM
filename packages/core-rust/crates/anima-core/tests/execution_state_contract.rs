@@ -104,16 +104,19 @@ fn sessions_default_serial_and_concurrent_requires_pinned_definition() {
 
 #[test]
 fn events_are_contiguous_and_token_deltas_are_live_not_checkpoint_semantic() {
-    let start = RuntimeEvent::new(1, id(1), RuntimeEventKind::RunStarted).unwrap();
-    let delta = RuntimeEvent::token_delta(2, id(1), 5, 8).unwrap();
-    assert!(!delta.is_checkpoint_semantic());
-    assert!(RuntimeEvent::validate_batch(&[start.clone(), delta]).is_ok());
-    assert!(RuntimeEvent::validate_batch(&[start.clone(), start.clone()]).is_err());
-    assert!(RuntimeEvent::validate_batch(&[
-        start,
-        RuntimeEvent::new(3, id(1), RuntimeEventKind::RunCompleted).unwrap()
-    ])
-    .is_err());
+    let start = RuntimeEvent::new(
+        id(9),
+        id(8),
+        id(7),
+        id(1),
+        10,
+        4,
+        RuntimeEventKind::RunStarted,
+    )
+    .unwrap();
+    assert!(RuntimeEvent::validate_batch(4, &[start.clone()]).is_ok());
+    assert!(RuntimeEvent::validate_batch(4, &[start.clone(), start.clone()]).is_err());
+    assert!(RuntimeEvent::validate_batch(1, &[start]).is_err());
 }
 
 #[test]

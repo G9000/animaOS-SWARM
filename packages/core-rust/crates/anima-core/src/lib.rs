@@ -38,6 +38,7 @@ pub use execution::{
     DefinitionPin, ExecutionError, ExecutionErrorCode, ExecutionLease, ManifestPin, Run,
     RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent,
     RuntimeEventKind, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind, Usage,
+    RecoveryRecord, LiveRuntimeEvent,
 };
 pub use events::{EngineEvent, EventType};
 pub use model::{

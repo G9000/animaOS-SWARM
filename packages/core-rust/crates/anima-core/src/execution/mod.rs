@@ -4,8 +4,8 @@ mod checkpoint;
 mod event;
 mod state;
 
-pub use checkpoint::{CheckpointV1, DefinitionPin, ManifestPin};
-pub use event::{RuntimeEvent, RuntimeEventKind, SafeEventPayload};
+pub use checkpoint::{CheckpointV1, DefinitionPin, ManifestPin, RecoveryRecord};
+pub use event::{LiveRuntimeEvent, RuntimeEvent, RuntimeEventKind, SafeEventPayload};
 pub use state::{
     Attempt, Budget, BudgetDecision, CommandOutcome, CommandReceipt, ExecutionError,
     ExecutionErrorCode, ExecutionLease, Run, RunPauseReason, RunState, RuntimeCommand,
