@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 fn manifest(id: &str, version: u32, recovery_mode: RecoveryMode) -> CapabilityManifest {
-    CapabilityManifest {
+    CapabilityManifest::new(anima_core::CapabilityManifestInput {
         id: id.into(),
         version,
         kind: CapabilityKind::Automation,
@@ -55,13 +55,13 @@ fn manifest(id: &str, version: u32, recovery_mode: RecoveryMode) -> CapabilityMa
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: format!("sha256:{}", "0".repeat(64)),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    }
+    })
+    .unwrap()
 }
 
 fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
@@ -70,6 +70,24 @@ fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
         catalog.register_manifest(manifest).unwrap();
     }
     CapabilityRegistry::new(catalog)
+}
+
+#[tokio::test]
+async fn canonical_manifest_digest_survives_executor_completion_into_a_durable_result() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let mut registry = registry(vec![manifest.clone()]);
+    registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+
+    assert_eq!(
+        registry
+            .execute(context(&manifest, json!({ "query": "hello" })))
+            .await
+            .unwrap()
+            .output,
+        json!({ "ok": true })
+    );
 }
 
 #[test]
@@ -791,8 +809,9 @@ async fn registry_validates_output_before_returning_a_persistable_result() {
 #[tokio::test]
 async fn output_preflight_bounds_execution_and_reconciliation_without_panics() {
     let oversized = Value::String("x".repeat(anima_core::MAX_CAPABILITY_ARGUMENT_BYTES + 1));
-    let mut execution_manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
-    execution_manifest.output_schema = json!({});
+    let execution_manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent)
+        .with_schemas(json!({ "type": "object" }), json!({}))
+        .unwrap();
     let mut execution_executor = RecordingExecutor::new(execution_manifest.clone());
     execution_executor.execute_result = CapabilityResult::new(oversized.clone());
     let mut execution_registry = registry(vec![execution_manifest.clone()]);
@@ -808,8 +827,9 @@ async fn output_preflight_bounds_execution_and_reconciliation_without_panics() {
         CapabilityErrorCode::OutputValidation
     );
 
-    let mut reconcile_manifest = manifest("workspace.reconcile", 1, RecoveryMode::Reconcilable);
-    reconcile_manifest.output_schema = json!({});
+    let reconcile_manifest = manifest("workspace.reconcile", 1, RecoveryMode::Reconcilable)
+        .with_schemas(json!({ "type": "object" }), json!({}))
+        .unwrap();
     let mut reconcile_executor = RecordingExecutor::failing_once(reconcile_manifest.clone());
     reconcile_executor.reconcile_result =
         ReconcileOutcome::Completed(CapabilityResult::new(oversized));
@@ -1265,7 +1285,7 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
     assert_eq!(binding.retry_attempt_number(), 2);
     assert_eq!(binding.manifest_id(), manifest.id);
     assert_eq!(binding.manifest_version(), manifest.version);
-    assert_eq!(binding.manifest_digest(), manifest.schema_digest);
+    assert_eq!(binding.manifest_digest(), manifest.schema_digest());
     assert_eq!(binding.recovery_mode(), RecoveryMode::KeyedIdempotent);
     assert_eq!(
         binding.idempotency_key(),
@@ -1278,7 +1298,7 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
     let manifest_pin = ManifestPin::new_with_recovery_mode(
         &manifest.id,
         manifest.version,
-        &manifest.schema_digest,
+        manifest.schema_digest(),
         manifest.recovery_mode,
     )
     .unwrap();
@@ -2101,8 +2121,9 @@ async fn expanded_reference_scopes_require_host_attestation_and_reject_same_run_
 
 #[tokio::test]
 async fn durable_lineage_records_only_opaque_result_metadata() {
-    let mut manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
-    manifest.output_schema = json!({});
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable)
+        .with_schemas(json!({ "type": "object" }), json!({}))
+        .unwrap();
     let secret = "sk-secret-output-must-not-persist";
     let mut executor = RecordingExecutor::new(manifest.clone());
     executor.execute_result = CapabilityResult::new(json!({ "ok": true, "secret": secret }));
@@ -2289,21 +2310,29 @@ fn catalog_caps_manifest_ids_and_index_addressable_secret_declarations() {
 
 #[test]
 fn registration_accepts_only_draft7_or_2020_12_schemas() {
-    let mut unsupported = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
-    unsupported.input_schema["$schema"] = json!("http://json-schema.org/draft-06/schema#");
+    let unsupported = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent)
+        .with_schemas(
+            json!({ "$schema": "http://json-schema.org/draft-06/schema#" }),
+            json!({ "type": "object" }),
+        )
+        .unwrap();
     let mut unsupported_registry = registry(vec![unsupported.clone()]);
     assert!(matches!(
         unsupported_registry.register_executor(Arc::new(RecordingExecutor::new(unsupported))),
         Err(CapabilityRegistryError::InvalidInputSchema { .. })
     ));
 
-    let mut modern = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
-    modern.output_schema = json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "array",
-        "prefixItems": [{ "type": "string" }],
-        "items": false
-    });
+    let modern = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent)
+        .with_schemas(
+            json!({ "type": "object" }),
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "array",
+                "prefixItems": [{ "type": "string" }],
+                "items": false
+            }),
+        )
+        .unwrap();
     let mut modern_registry = registry(vec![modern.clone()]);
     modern_registry
         .register_executor(Arc::new(RecordingExecutor::new(modern)))

@@ -5,7 +5,7 @@ use anima_core::{
 use serde_json::json;
 
 fn manifest(id: &str, version: u32) -> CapabilityManifest {
-    CapabilityManifest {
+    CapabilityManifest::new(anima_core::CapabilityManifestInput {
         id: id.into(),
         version,
         kind: CapabilityKind::Knowledge,
@@ -26,13 +26,47 @@ fn manifest(id: &str, version: u32) -> CapabilityManifest {
         supports_streaming: true,
         supports_artifacts: false,
         supports_citations: true,
-        schema_digest: format!("sha256:{id}:{version}"),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    }
+    })
+    .unwrap()
+}
+
+fn manifest_with_schemas(
+    input_schema: serde_json::Value,
+    output_schema: serde_json::Value,
+) -> CapabilityManifest {
+    CapabilityManifest::new(anima_core::CapabilityManifestInput {
+        id: "workspace.write".into(),
+        version: 1,
+        kind: CapabilityKind::Workspace,
+        label: "Write".into(),
+        description: "Writes a workspace file".into(),
+        input_schema,
+        output_schema,
+        side_effects: true,
+        risk_level: RiskLevel::High,
+        host_permissions: vec![],
+        secret_references: vec![],
+        environment_requirements: vec![],
+        timeout_ms: 1_000,
+        cancellation_supported: true,
+        max_retries: 0,
+        idempotent: false,
+        recovery_mode: RecoveryMode::NonRetryable,
+        supports_streaming: false,
+        supports_artifacts: false,
+        supports_citations: false,
+        compatibility: RuntimeCompatibility {
+            minimum_runtime_schema_version: 1,
+            maximum_runtime_schema_version: 1,
+            manifest_schema_version: 1,
+        },
+    })
+    .unwrap()
 }
 
 #[test]
@@ -179,6 +213,47 @@ fn catalog_deserialization_rejects_malformed_manifests() {
         "profiles": []
     }))
     .is_err());
+}
+
+#[test]
+fn catalog_rejects_a_legacy_arbitrary_schema_digest_before_execution() {
+    let legacy = serde_json::from_value::<CapabilityManifest>({
+        let mut wire = serde_json::to_value(manifest("workspace.write", 1)).unwrap();
+        wire["schema_digest"] = json!("sha256:legacy-contract-name");
+        wire
+    });
+
+    assert!(matches!(legacy, Err(_)));
+}
+
+#[test]
+fn schema_digest_is_deterministic_for_equivalent_json_object_order() {
+    let first = manifest_with_schemas(
+        json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+        json!({"type": "object", "required": ["ok"]}),
+    );
+    let second = manifest_with_schemas(
+        json!({"properties": {"query": {"type": "string"}}, "type": "object"}),
+        json!({"required": ["ok"], "type": "object"}),
+    );
+
+    assert_eq!(first.schema_digest(), second.schema_digest());
+}
+
+#[test]
+fn manifest_wire_rejects_a_schema_digest_that_does_not_match_its_schema_pair() {
+    let mut wire = serde_json::to_value(manifest("workspace.write", 1)).unwrap();
+    wire["schema_digest"] = json!(format!("sha256:{}", "a".repeat(64)));
+
+    assert!(serde_json::from_value::<CapabilityManifest>(wire).is_err());
+}
+
+#[test]
+fn manifest_wire_rejects_unknown_fields() {
+    let mut wire = serde_json::to_value(manifest("workspace.write", 1)).unwrap();
+    wire["unknown"] = json!("must not be accepted");
+
+    assert!(serde_json::from_value::<CapabilityManifest>(wire).is_err());
 }
 
 #[test]

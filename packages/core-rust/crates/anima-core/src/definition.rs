@@ -432,7 +432,7 @@ impl DefinitionPublisher {
             resolved_capabilities.push(ResolvedCapability {
                 capability_id,
                 manifest_version,
-                schema_digest: manifest.schema_digest.clone(),
+                schema_digest: manifest.schema_digest().to_owned(),
                 override_config,
                 approval_policy_revision: draft.approval_policy_revision,
             });

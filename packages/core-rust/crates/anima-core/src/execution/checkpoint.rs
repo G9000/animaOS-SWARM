@@ -117,7 +117,7 @@ impl ManifestPin {
         Self::new_with_recovery_mode(
             value.id.clone(),
             value.version,
-            value.schema_digest.clone(),
+            value.schema_digest().to_owned(),
             value.recovery_mode,
         )
     }

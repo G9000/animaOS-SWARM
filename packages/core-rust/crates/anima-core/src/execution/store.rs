@@ -3146,7 +3146,7 @@ fn conformance_value<T, E>(result: Result<T, E>) -> Result<T, ExecutionStoreErro
 }
 
 fn conformance_capability_manifest() -> CapabilityManifest {
-    CapabilityManifest {
+    CapabilityManifest::new(crate::CapabilityManifestInput {
         id: "workspace.write".into(),
         version: 1,
         kind: CapabilityKind::Workspace,
@@ -3167,13 +3167,13 @@ fn conformance_capability_manifest() -> CapabilityManifest {
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: "sha256:execution-store-contract:1".into(),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    }
+    })
+    .expect("execution-store conformance manifest must be valid")
 }
 
 fn conformance_policy_context(

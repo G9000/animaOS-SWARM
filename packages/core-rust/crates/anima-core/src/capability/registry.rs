@@ -942,7 +942,7 @@ fn durable_result(
     DurableCapabilityResult::new(
         CapabilityReferenceId::new(result_ref),
         format!("jcs-v1:{digest:x}"),
-        manifest.schema_digest.clone(),
+        manifest.schema_digest().to_owned(),
         size_bytes,
         DurableCapabilityStatus::Completed,
     )
@@ -972,7 +972,7 @@ mod result_recorder_tests {
     use serde_json::json;
 
     fn manifest() -> CapabilityManifest {
-        CapabilityManifest {
+        CapabilityManifest::new(CapabilityManifestInput {
             id: "test.record".into(),
             version: 1,
             kind: CapabilityKind::Automation,
@@ -993,13 +993,13 @@ mod result_recorder_tests {
             supports_streaming: false,
             supports_artifacts: false,
             supports_citations: false,
-            schema_digest: format!("sha256:{}", "0".repeat(64)),
             compatibility: RuntimeCompatibility {
                 minimum_runtime_schema_version: 1,
                 maximum_runtime_schema_version: 1,
                 manifest_schema_version: 1,
             },
-        }
+        })
+        .unwrap()
     }
 
     #[tokio::test]

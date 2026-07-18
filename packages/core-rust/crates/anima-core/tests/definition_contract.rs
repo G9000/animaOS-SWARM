@@ -7,7 +7,7 @@ use anima_core::{
 use serde_json::json;
 
 fn manifest(id: &str, version: u32, kind: CapabilityKind) -> CapabilityManifest {
-    CapabilityManifest {
+    CapabilityManifest::new(anima_core::CapabilityManifestInput {
         id: id.into(),
         version,
         kind,
@@ -28,13 +28,13 @@ fn manifest(id: &str, version: u32, kind: CapabilityKind) -> CapabilityManifest 
         supports_streaming: false,
         supports_artifacts: true,
         supports_citations: true,
-        schema_digest: format!("sha256:{id}:{version}"),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    }
+    })
+    .unwrap()
 }
 
 fn draft(profile_version: u32) -> AgentDefinitionDraft {
@@ -137,7 +137,7 @@ fn publisher_creates_a_pinned_knowledge_workspace_definition_in_deterministic_or
     assert_eq!(definition.resolved_capabilities[0].manifest_version, 1);
     assert_eq!(
         definition.resolved_capabilities[0].schema_digest,
-        "sha256:knowledge.search:1"
+        "sha256:87c0a3d0e079dd7ad8d9a0056198ce5f6311cba8cdb21fe6b84972f82434c74f"
     );
     assert_eq!(definition.resolved_capabilities[0].override_config, None);
     assert_eq!(
@@ -164,7 +164,10 @@ fn publisher_applies_profile_capability_overrides_and_pins_the_effective_manifes
 
     assert_eq!(capability.capability_id, "knowledge.search");
     assert_eq!(capability.manifest_version, 2);
-    assert_eq!(capability.schema_digest, "sha256:knowledge.search:2");
+    assert_eq!(
+        capability.schema_digest,
+        "sha256:87c0a3d0e079dd7ad8d9a0056198ce5f6311cba8cdb21fe6b84972f82434c74f"
+    );
     assert_eq!(
         capability.override_config.as_ref().unwrap().configuration,
         json!({ "result_limit": 5 })
@@ -199,7 +202,7 @@ fn drafts_and_published_definitions_round_trip_through_serde_with_pins_intact() 
     assert_eq!(restored_definition.source_profile.profile_version, 1);
     assert_eq!(
         restored_definition.resolved_capabilities[0].schema_digest,
-        "sha256:knowledge.search:2"
+        "sha256:87c0a3d0e079dd7ad8d9a0056198ce5f6311cba8cdb21fe6b84972f82434c74f"
     );
     assert_eq!(
         restored_definition.resolved_capabilities[0]
@@ -484,7 +487,7 @@ fn published_definitions_do_not_drift_when_later_profiles_are_registered() {
     assert_eq!(stored.resolved_capabilities[0].manifest_version, 1);
     assert_eq!(
         stored.resolved_capabilities[0].schema_digest,
-        "sha256:knowledge.search:1"
+        "sha256:87c0a3d0e079dd7ad8d9a0056198ce5f6311cba8cdb21fe6b84972f82434c74f"
     );
 }
 

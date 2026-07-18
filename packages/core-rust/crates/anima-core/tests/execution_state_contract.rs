@@ -69,7 +69,7 @@ fn session_definition(
 }
 
 fn approval_manifest(capability_id: &str, manifest_version: u32) -> CapabilityManifest {
-    CapabilityManifest {
+    CapabilityManifest::new(anima_core::CapabilityManifestInput {
         id: capability_id.into(),
         version: manifest_version,
         kind: CapabilityKind::Workspace,
@@ -90,13 +90,13 @@ fn approval_manifest(capability_id: &str, manifest_version: u32) -> CapabilityMa
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: format!("sha256:{capability_id}:{manifest_version}"),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    }
+    })
+    .unwrap()
 }
 
 fn approval_context_for(
@@ -850,7 +850,7 @@ fn pending_checkpoint_approval_must_match_the_active_invocation_identity() {
     definition.resolved_capabilities = vec![ResolvedCapability {
         capability_id: manifest.id.clone(),
         manifest_version: manifest.version,
-        schema_digest: manifest.schema_digest.clone(),
+        schema_digest: manifest.schema_digest().to_owned(),
         override_config: None,
         approval_policy_revision: 1,
     }];

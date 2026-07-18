@@ -238,7 +238,7 @@ fn approval_resume_parts(
     ApprovalGrantMutation,
     AutonomyGrant,
 ) {
-    let manifest = CapabilityManifest {
+    let manifest = CapabilityManifest::new(anima_core::CapabilityManifestInput {
         id: "workspace.write".into(),
         version: 1,
         kind: CapabilityKind::Workspace,
@@ -259,13 +259,13 @@ fn approval_resume_parts(
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: "sha256:workspace.write:1".into(),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    };
+    })
+    .unwrap();
     let invocation = LogicalInvocation::new(
         run_id,
         "write",

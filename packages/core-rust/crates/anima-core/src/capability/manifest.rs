@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::{
-    CapabilityManifest, ManifestCatalogError, MAX_CAPABILITY_ID_BYTES,
+    schema_digest_for, CapabilityManifest, ManifestCatalogError, MAX_CAPABILITY_ID_BYTES,
     MAX_CAPABILITY_SECRET_REFERENCES,
 };
 
@@ -15,7 +15,10 @@ pub(super) fn validate_manifest(manifest: &CapabilityManifest) -> Result<(), Man
     if manifest.compatibility.manifest_schema_version == 0 {
         return Err(ManifestCatalogError::InvalidManifestSchemaVersion);
     }
-    if manifest.schema_digest.trim().is_empty() {
+    if schema_digest_for(&manifest.input_schema, &manifest.output_schema)
+        .map(|digest| digest != manifest.schema_digest())
+        .unwrap_or(true)
+    {
         return Err(ManifestCatalogError::InvalidSchemaDigest);
     }
     if manifest.compatibility.minimum_runtime_schema_version == 0

@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 fn manifest(risk_level: RiskLevel, version: u32) -> CapabilityManifest {
-    CapabilityManifest {
+    CapabilityManifest::new(anima_core::CapabilityManifestInput {
         id: "workspace.write".into(),
         version,
         kind: CapabilityKind::Workspace,
@@ -29,13 +29,13 @@ fn manifest(risk_level: RiskLevel, version: u32) -> CapabilityManifest {
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: format!("sha256:workspace.write:{version}"),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    }
+    })
+    .unwrap()
 }
 
 fn invocation(arguments: serde_json::Value) -> LogicalInvocation {

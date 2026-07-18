@@ -8,6 +8,7 @@ use std::sync::{
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[path = "capability/invocation.rs"]
@@ -72,7 +73,8 @@ pub struct RuntimeCompatibility {
 /// A portable, host-independent description of an agent capability.
 ///
 /// Secret-related fields carry reference names only; this vocabulary never stores secret values.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilityManifest {
     pub id: String,
     pub version: u32,
@@ -94,8 +96,172 @@ pub struct CapabilityManifest {
     pub supports_streaming: bool,
     pub supports_artifacts: bool,
     pub supports_citations: bool,
-    pub schema_digest: String,
+    schema_digest: String,
     pub compatibility: RuntimeCompatibility,
+}
+
+/// Capability-manifest fields supplied by a local author. The schema digest is intentionally
+/// absent: it is derived from the canonical input/output schema pair at construction time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapabilityManifestInput {
+    pub id: String,
+    pub version: u32,
+    pub kind: CapabilityKind,
+    pub label: String,
+    pub description: String,
+    pub input_schema: Value,
+    pub output_schema: Value,
+    pub side_effects: bool,
+    pub risk_level: RiskLevel,
+    pub host_permissions: Vec<String>,
+    pub secret_references: Vec<String>,
+    pub environment_requirements: Vec<String>,
+    pub timeout_ms: u64,
+    pub cancellation_supported: bool,
+    pub max_retries: u32,
+    pub idempotent: bool,
+    pub recovery_mode: RecoveryMode,
+    pub supports_streaming: bool,
+    pub supports_artifacts: bool,
+    pub supports_citations: bool,
+    pub compatibility: RuntimeCompatibility,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CapabilityManifestWire {
+    id: String,
+    version: u32,
+    kind: CapabilityKind,
+    label: String,
+    description: String,
+    input_schema: Value,
+    output_schema: Value,
+    side_effects: bool,
+    risk_level: RiskLevel,
+    host_permissions: Vec<String>,
+    secret_references: Vec<String>,
+    environment_requirements: Vec<String>,
+    timeout_ms: u64,
+    cancellation_supported: bool,
+    max_retries: u32,
+    idempotent: bool,
+    recovery_mode: RecoveryMode,
+    supports_streaming: bool,
+    supports_artifacts: bool,
+    supports_citations: bool,
+    schema_digest: String,
+    compatibility: RuntimeCompatibility,
+}
+
+pub const MAX_CAPABILITY_SCHEMA_PAIR_BYTES: usize = 64 * 1024;
+
+impl CapabilityManifest {
+    pub fn new(input: CapabilityManifestInput) -> Result<Self, ManifestCatalogError> {
+        let schema_digest = schema_digest_for(&input.input_schema, &input.output_schema)?;
+        let manifest = Self {
+            id: input.id,
+            version: input.version,
+            kind: input.kind,
+            label: input.label,
+            description: input.description,
+            input_schema: input.input_schema,
+            output_schema: input.output_schema,
+            side_effects: input.side_effects,
+            risk_level: input.risk_level,
+            host_permissions: input.host_permissions,
+            secret_references: input.secret_references,
+            environment_requirements: input.environment_requirements,
+            timeout_ms: input.timeout_ms,
+            cancellation_supported: input.cancellation_supported,
+            max_retries: input.max_retries,
+            idempotent: input.idempotent,
+            recovery_mode: input.recovery_mode,
+            supports_streaming: input.supports_streaming,
+            supports_artifacts: input.supports_artifacts,
+            supports_citations: input.supports_citations,
+            schema_digest,
+            compatibility: input.compatibility,
+        };
+        validate_manifest(&manifest)?;
+        Ok(manifest)
+    }
+
+    pub fn schema_digest(&self) -> &str {
+        &self.schema_digest
+    }
+
+    pub fn with_schemas(
+        mut self,
+        input_schema: Value,
+        output_schema: Value,
+    ) -> Result<Self, ManifestCatalogError> {
+        self.input_schema = input_schema;
+        self.output_schema = output_schema;
+        self.schema_digest = schema_digest_for(&self.input_schema, &self.output_schema)?;
+        validate_manifest(&self)?;
+        Ok(self)
+    }
+}
+
+#[derive(Serialize)]
+struct SchemaPair<'a> {
+    input_schema: &'a Value,
+    output_schema: &'a Value,
+}
+
+pub(crate) fn schema_digest_for(
+    input_schema: &Value,
+    output_schema: &Value,
+) -> Result<String, ManifestCatalogError> {
+    let bytes = serde_jcs::to_vec(&SchemaPair {
+        input_schema,
+        output_schema,
+    })
+    .map_err(|_| ManifestCatalogError::InvalidSchemaDigest)?;
+    if bytes.len() > MAX_CAPABILITY_SCHEMA_PAIR_BYTES {
+        return Err(ManifestCatalogError::InvalidSchemaDigest);
+    }
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+impl<'de> Deserialize<'de> for CapabilityManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CapabilityManifestWire::deserialize(deserializer)?;
+        let manifest = Self::new(CapabilityManifestInput {
+            id: wire.id,
+            version: wire.version,
+            kind: wire.kind,
+            label: wire.label,
+            description: wire.description,
+            input_schema: wire.input_schema,
+            output_schema: wire.output_schema,
+            side_effects: wire.side_effects,
+            risk_level: wire.risk_level,
+            host_permissions: wire.host_permissions,
+            secret_references: wire.secret_references,
+            environment_requirements: wire.environment_requirements,
+            timeout_ms: wire.timeout_ms,
+            cancellation_supported: wire.cancellation_supported,
+            max_retries: wire.max_retries,
+            idempotent: wire.idempotent,
+            recovery_mode: wire.recovery_mode,
+            supports_streaming: wire.supports_streaming,
+            supports_artifacts: wire.supports_artifacts,
+            supports_citations: wire.supports_citations,
+            compatibility: wire.compatibility,
+        })
+        .map_err(serde::de::Error::custom)?;
+        if !canonical_prefixed_sha256(&wire.schema_digest, "sha256:")
+            || wire.schema_digest != manifest.schema_digest
+        {
+            return Err(serde::de::Error::custom("invalid manifest schema digest"));
+        }
+        Ok(manifest)
+    }
 }
 
 /// A versioned reference to a manifest included in a capability profile.
@@ -1481,7 +1647,9 @@ impl RecoveryResumeBinding {
         let logical_invocation_id = context.invocation().id();
         let name = format!(
             "{logical_invocation_id}:{completed_attempt_number}:{retry_attempt_number}:{}:{}:{}:{nonce}",
-            manifest.id, manifest.version, manifest.schema_digest
+            manifest.id,
+            manifest.version,
+            manifest.schema_digest()
         );
         let value = Self {
             logical_invocation_id,
@@ -1493,7 +1661,7 @@ impl RecoveryResumeBinding {
             retry_attempt_number,
             manifest_id: manifest.id.clone(),
             manifest_version: manifest.version,
-            manifest_digest: manifest.schema_digest.clone(),
+            manifest_digest: manifest.schema_digest().to_owned(),
             recovery_mode: manifest.recovery_mode,
             idempotency_key: context.invocation().idempotency_key(),
             authorization_identity: Uuid::new_v5(
@@ -1640,7 +1808,7 @@ impl CapabilityRetryAuthorization {
             && binding.retry_attempt_number == context.attempt().number()
             && binding.manifest_id == manifest.id
             && binding.manifest_version == manifest.version
-            && binding.manifest_digest == manifest.schema_digest
+            && binding.manifest_digest == manifest.schema_digest()
             && binding.recovery_mode == manifest.recovery_mode
             && binding.idempotency_key == context.invocation().idempotency_key()
     }
