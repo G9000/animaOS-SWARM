@@ -2,6 +2,7 @@ pub mod agent;
 pub mod capability;
 pub mod components;
 pub mod definition;
+pub mod execution;
 pub mod events;
 pub mod model;
 pub mod persistence;
@@ -31,6 +32,12 @@ pub use definition::{
     AgentDefinition, AgentDefinitionDraft, CapabilityOverride, DefinitionPublisher,
     DefinitionValidationError, HostRequirement, LifecyclePolicy, MemoryPolicy, ModelPolicy,
     ProfileRef, ResolvedCapability, RuntimeLimits, SUPPORTED_DEFINITION_SCHEMA_VERSION,
+};
+pub use execution::{
+    Attempt, Budget, BudgetDecision, CheckpointV1, CommandOutcome, CommandReceipt,
+    DefinitionPin, ExecutionError, ExecutionErrorCode, ExecutionLease, ManifestPin, Run,
+    RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, RuntimeEvent,
+    RuntimeEventKind, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind, Usage,
 };
 pub use events::{EngineEvent, EventType};
 pub use model::{
