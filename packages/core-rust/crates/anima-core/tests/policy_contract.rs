@@ -71,17 +71,18 @@ fn context(
 }
 
 fn scope(context: &PolicyContext) -> GrantScope {
-    GrantScope {
-        owner_id: context.owner_id.clone(),
-        actor_id: context.actor_id.clone(),
-        agent_definition_id: context.agent_definition_id.clone(),
-        agent_definition_version: context.agent_definition_version,
-        workspace_id: context.workspace_id.clone(),
-        resource_boundary: context.resource_boundary.clone(),
-        capability_id: context.capability_id.clone(),
-        manifest_version: context.manifest_version,
-        canonical_argument_digest: Some(context.canonical_argument_digest),
-    }
+    GrantScope::new(
+        context.owner_id.clone(),
+        context.actor_id.clone(),
+        context.agent_definition_id.clone(),
+        context.agent_definition_version,
+        context.workspace_id.clone(),
+        context.resource_boundary.clone(),
+        context.capability_id.clone(),
+        context.manifest_version,
+        Some(context.canonical_argument_digest),
+    )
+    .unwrap()
 }
 
 fn grant(context: &PolicyContext, maximum_risk: RiskLevel) -> AutonomyGrant {
@@ -252,19 +253,19 @@ fn approvals_bind_every_action_identity_and_their_reason_revision() {
     );
     assert_eq!(
         PolicyEngine::validate_approval(&approval, &changed_run),
-        ApprovalValidity::InvalidRun
+        ApprovalValidity::InvalidBinding
     );
     assert_eq!(
         PolicyEngine::validate_approval(&approval, &changed_step),
-        ApprovalValidity::InvalidStep
+        ApprovalValidity::InvalidBinding
     );
     assert_eq!(
         PolicyEngine::validate_approval(&approval, &changed_invocation),
-        ApprovalValidity::InvalidInvocation
+        ApprovalValidity::InvalidBinding
     );
     assert_eq!(
         PolicyEngine::validate_approval(&approval, &changed_manifest),
-        ApprovalValidity::InvalidManifest
+        ApprovalValidity::InvalidBinding
     );
     assert_eq!(
         PolicyEngine::validate_approval(&approval, &expired),
@@ -532,4 +533,85 @@ fn audit_records_are_validated_on_construction_and_serde_round_trip() {
         }
     }))
     .is_err());
+}
+
+#[test]
+fn mutated_approval_and_unverified_context_fail_closed() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let mut approval = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&context, None).unwrap(),
+        900,
+    )
+    .unwrap();
+    approval.request.expires_at_ms = 0;
+    assert_ne!(
+        PolicyEngine::validate_approval(&approval, &context),
+        ApprovalValidity::Valid
+    );
+    assert!(matches!(
+        PolicyEngine::evaluate_with_approval(&context, &[], Some(&approval))
+            .unwrap()
+            .decision,
+        PolicyDecision::RequireApproval(_)
+    ));
+
+    let mut extended = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&context, None).unwrap(),
+        900,
+    )
+    .unwrap();
+    extended.request.expires_at_ms += 1;
+    assert_ne!(
+        PolicyEngine::validate_approval(&extended, &context),
+        ApprovalValidity::Valid
+    );
+
+    let mut approval = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&context, None).unwrap(),
+        900,
+    )
+    .unwrap();
+    approval.request.reason.policy_revision = 2;
+    assert_ne!(
+        PolicyEngine::validate_approval(&approval, &context),
+        ApprovalValidity::Valid
+    );
+    let unverified: PolicyContext =
+        serde_json::from_value(serde_json::to_value(&context).unwrap()).unwrap();
+    assert_ne!(
+        PolicyEngine::validate_approval(&approval, &unverified),
+        ApprovalValidity::Valid
+    );
+
+    let mut malformed = serde_json::to_value(&approval).unwrap();
+    malformed["request"]["run_id"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<ApprovalDecision>(malformed).is_err());
+}
+
+#[test]
+fn grant_scope_rejects_invalid_direct_and_serialized_bindings() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    assert!(GrantScope::new(
+        " ",
+        context.actor_id.clone(),
+        context.agent_definition_id.clone(),
+        0,
+        context.workspace_id.clone(),
+        context.resource_boundary.clone(),
+        context.capability_id.clone(),
+        context.manifest_version,
+        Some(Uuid::nil()),
+    )
+    .is_err());
+    let mut malformed = serde_json::to_value(scope(&context)).unwrap();
+    malformed["canonical_argument_digest"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<GrantScope>(malformed).is_err());
 }
