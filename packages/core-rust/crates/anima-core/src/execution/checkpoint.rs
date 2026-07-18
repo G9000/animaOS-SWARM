@@ -568,13 +568,50 @@ impl PendingApprovalRecord {
         request: ApprovalRequest,
         decision: Option<ApprovalDecision>,
     ) -> Result<Self, ExecutionError> {
-        if decision
+        let value = Self { request, decision };
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> Result<(), ExecutionError> {
+        self.request
+            .validate()
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))?;
+        if let Some(decision) = &self.decision {
+            decision
+                .validate()
+                .map_err(|_| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))?;
+        }
+        if self
+            .decision
             .as_ref()
-            .is_some_and(|d| d.request != request || d.kind != ApprovalDecisionKind::Approve)
+            .is_some_and(|d| d.request != self.request || d.kind != ApprovalDecisionKind::Approve)
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
-        Ok(Self { request, decision })
+        Ok(())
+    }
+    fn validate_against(
+        &self,
+        definition: &DefinitionPin,
+        attempt: &InvocationAttemptRecord,
+    ) -> Result<(), ExecutionError> {
+        self.validate()?;
+        let request = &self.request;
+        let invocation = attempt.invocation();
+        if request.agent_definition_id != definition.id()
+            || request.agent_definition_version != definition.version()
+            || request.run_id != invocation.run_id()
+            || request.logical_step_id != invocation.logical_step_id()
+            || request.logical_invocation_id != invocation.id()
+            || request.capability_id != invocation.capability_id()
+            || request.manifest_version != invocation.manifest_version()
+            || request.capability_id != attempt.manifest().id()
+            || request.manifest_version != attempt.manifest().version()
+            || request.canonical_argument_digest != invocation.canonical_argument_digest()
+        {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        }
+        Ok(())
     }
     pub fn request(&self) -> &ApprovalRequest {
         &self.request
@@ -821,10 +858,6 @@ impl CheckpointV1 {
         }
         if (self.state == RunState::Paused) != self.pause_reason.is_some()
             || (self.state == RunState::WaitingForApproval) != self.pending_approval.is_some()
-            || self
-                .pending_approval
-                .as_ref()
-                .is_some_and(|p| p.request.run_id != self.run_id)
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
@@ -990,6 +1023,13 @@ impl CheckpointV1 {
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
+        if let Some(approval) = &self.pending_approval {
+            approval.validate_against(
+                &self.definition,
+                cursor_attempt
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))?,
+            )?;
+        }
         self.budget.validate()?;
         self.usage.validate()?;
         Ok(())
@@ -1004,6 +1044,22 @@ impl CheckpointV1 {
             return Err(ExecutionError::new(
                 ExecutionErrorCode::IncompatibleCheckpoint,
             ));
+        }
+        if let Some(approval) = &self.pending_approval {
+            let request = approval.request();
+            let capability = definition.resolved_capabilities.iter().find(|capability| {
+                capability.capability_id == request.capability_id
+                    && capability.manifest_version == request.manifest_version
+            });
+            if request.policy_revision != definition.approval_policy_revision
+                || capability.is_none_or(|capability| {
+                    capability.approval_policy_revision != request.policy_revision
+                })
+            {
+                return Err(ExecutionError::new(
+                    ExecutionErrorCode::IncompatibleCheckpoint,
+                ));
+            }
         }
         let mut expected = Vec::new();
         for cap in &definition.resolved_capabilities {

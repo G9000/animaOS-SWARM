@@ -1,15 +1,16 @@
 use anima_core::execution::Step;
 use anima_core::{
     AgentDefinition, ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, Budget,
-    BudgetDecision, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointV1,
-    CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord, DefinitionPin,
-    ExecutionErrorCode, ExecutionLease, InvocationAttemptRecord, LifecyclePolicy,
-    LogicalInvocation, ManifestPin, MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext,
-    PolicyEngine, PolicyRestrictions, ProfileRef, RecoveryMode, RecoveryPauseReason,
-    RecoveryPauseRecord, RecoveryTerminalResolution, RiskLevel, Run, RunPauseReason, RunState,
-    RuntimeCommand, RuntimeCommandKind, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind,
-    RuntimeLimits, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind,
-    UncertainInvocationRecord, Usage,
+    BudgetDecision, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointCursor,
+    CheckpointV1, CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord,
+    DefinitionPin, ExecutionErrorCode, ExecutionLease, InvocationAttemptRecord, LifecyclePolicy,
+    LogicalInvocation, ManifestCatalog, ManifestPin, MemoryPolicy, ModelPolicy, OpaqueReference,
+    PendingApprovalRecord, PolicyContext, PolicyEngine, PolicyRestrictions, ProfileRef,
+    RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord, RecoveryTerminalResolution,
+    ResolvedCapability, RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand,
+    RuntimeCommandKind, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, RuntimeLimits,
+    SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind, UncertainInvocationRecord,
+    Usage,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -66,10 +67,10 @@ fn session_definition(
     }
 }
 
-fn approval_context(arguments: serde_json::Value) -> PolicyContext {
-    let manifest = CapabilityManifest {
-        id: "workspace.write".into(),
-        version: 1,
+fn approval_manifest(capability_id: &str, manifest_version: u32) -> CapabilityManifest {
+    CapabilityManifest {
+        id: capability_id.into(),
+        version: manifest_version,
         kind: CapabilityKind::Workspace,
         label: "Write".into(),
         description: "Writes a workspace file".into(),
@@ -88,15 +89,19 @@ fn approval_context(arguments: serde_json::Value) -> PolicyContext {
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
-        schema_digest: "sha256:workspace.write:1".into(),
+        schema_digest: format!("sha256:{capability_id}:{manifest_version}"),
         compatibility: RuntimeCompatibility {
             minimum_runtime_schema_version: 1,
             maximum_runtime_schema_version: 1,
             manifest_schema_version: 1,
         },
-    };
-    let invocation =
-        LogicalInvocation::new(id(1), "write", "workspace.write", 1, arguments).unwrap();
+    }
+}
+
+fn approval_context_for(
+    manifest: &CapabilityManifest,
+    invocation: &LogicalInvocation,
+) -> PolicyContext {
     PolicyContext::new(
         "owner",
         "actor",
@@ -104,13 +109,20 @@ fn approval_context(arguments: serde_json::Value) -> PolicyContext {
         3,
         "workspace",
         CapabilityReferenceId::new(id(99)),
-        &manifest,
-        &invocation,
+        manifest,
+        invocation,
         1,
         PolicyRestrictions::default(),
         1_000,
     )
     .unwrap()
+}
+
+fn approval_context(arguments: serde_json::Value) -> PolicyContext {
+    let manifest = approval_manifest("workspace.write", 1);
+    let invocation =
+        LogicalInvocation::new(id(1), "write", "workspace.write", 1, arguments).unwrap();
+    approval_context_for(&manifest, &invocation)
 }
 
 #[test]
@@ -460,6 +472,145 @@ fn full_checkpoints_round_trip_and_reject_tampered_records() {
     let mut mismatched_attempt = encoded;
     mismatched_attempt["completed_invocations"][0]["attempt_number"] = json!(2);
     assert!(serde_json::from_value::<CheckpointV1>(mismatched_attempt).is_err());
+}
+
+#[test]
+fn pending_checkpoint_approval_must_match_the_active_invocation_identity() {
+    let manifest = approval_manifest("workspace.write", 1);
+    let invocation = LogicalInvocation::new(
+        id(2),
+        "approval-step",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let request =
+        PolicyEngine::approval_request(&approval_context_for(&manifest, &invocation), None)
+            .unwrap();
+    let manifest_pin = ManifestPin::from_manifest(&manifest).unwrap();
+    let attempt = InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        AttemptRecordState::Pending,
+        manifest_pin.clone(),
+        manifest.recovery_mode,
+    )
+    .unwrap();
+    let build = |request| {
+        CheckpointV1Builder::new(
+            id(1),
+            invocation.run_id(),
+            DefinitionPin::new(1, "writer", 3).unwrap(),
+            1,
+            vec![manifest_pin.clone()],
+            Budget::default(),
+            Usage::default(),
+        )
+        .state(RunState::WaitingForApproval, None)
+        .cursor(Some(
+            CheckpointCursor::new(invocation.id(), 1, invocation.logical_step_id()).unwrap(),
+        ))
+        .attempts(vec![attempt.clone()])
+        .pending_approval(Some(PendingApprovalRecord::new(request, None)?))
+        .build()
+    };
+
+    let checkpoint = build(request.clone()).unwrap();
+
+    let mut definition = session_definition("writer", 3, false);
+    definition.resolved_capabilities = vec![ResolvedCapability {
+        capability_id: manifest.id.clone(),
+        manifest_version: manifest.version,
+        schema_digest: manifest.schema_digest.clone(),
+        override_config: None,
+        approval_policy_revision: 1,
+    }];
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    assert!(checkpoint.assert_compatible(&definition, &catalog).is_ok());
+    let mut changed_policy = definition.clone();
+    changed_policy.approval_policy_revision = 2;
+    changed_policy.resolved_capabilities[0].approval_policy_revision = 2;
+    assert!(checkpoint
+        .assert_compatible(&changed_policy, &catalog)
+        .is_err());
+
+    let mut wrong_invocation = request.clone();
+    wrong_invocation.logical_invocation_id = id(999);
+    assert!(build(wrong_invocation).is_err());
+
+    let other_step = LogicalInvocation::new(
+        invocation.run_id(),
+        "other-step",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let other_step_request =
+        PolicyEngine::approval_request(&approval_context_for(&manifest, &other_step), None)
+            .unwrap();
+    assert!(build(other_step_request).is_err());
+
+    let other_arguments = LogicalInvocation::new(
+        invocation.run_id(),
+        invocation.logical_step_id(),
+        "workspace.write",
+        1,
+        json!({ "path": "b.md" }),
+    )
+    .unwrap();
+    let other_arguments_request =
+        PolicyEngine::approval_request(&approval_context_for(&manifest, &other_arguments), None)
+            .unwrap();
+    assert!(build(other_arguments_request).is_err());
+
+    let other_manifest = approval_manifest("workspace.delete", 2);
+    let other_capability = LogicalInvocation::new(
+        invocation.run_id(),
+        invocation.logical_step_id(),
+        &other_manifest.id,
+        other_manifest.version,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let other_manifest_request = PolicyEngine::approval_request(
+        &approval_context_for(&other_manifest, &other_capability),
+        None,
+    )
+    .unwrap();
+    assert!(build(other_manifest_request).is_err());
+
+    let mut wrong_definition = request.clone();
+    wrong_definition.agent_definition_id = "other-writer".into();
+    assert!(build(wrong_definition).is_err());
+    let mut wrong_definition_version = request.clone();
+    wrong_definition_version.agent_definition_version = 4;
+    assert!(build(wrong_definition_version).is_err());
+
+    let mut invalid_policy_binding = request.clone();
+    invalid_policy_binding.policy_revision = 2;
+    assert!(PendingApprovalRecord::new(invalid_policy_binding, None).is_err());
+
+    let encoded = serde_json::to_value(checkpoint).unwrap();
+    for (field, value) in [
+        ("agent_definition_id", json!("other-writer")),
+        ("agent_definition_version", json!(4)),
+        ("run_id", json!(id(77))),
+        ("logical_step_id", json!("other-step")),
+        ("logical_invocation_id", json!(id(999))),
+        ("capability_id", json!("workspace.delete")),
+        ("manifest_version", json!(2)),
+        ("canonical_argument_digest", json!(id(998))),
+    ] {
+        let mut tampered = encoded.clone();
+        tampered["pending_approval"]["request"][field] = value;
+        assert!(
+            serde_json::from_value::<CheckpointV1>(tampered).is_err(),
+            "tampered approval field {field} was accepted"
+        );
+    }
 }
 
 #[test]

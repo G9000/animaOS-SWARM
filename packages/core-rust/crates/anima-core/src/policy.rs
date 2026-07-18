@@ -931,7 +931,7 @@ impl fmt::Debug for ApprovalRequest {
 }
 
 impl ApprovalRequest {
-    fn validate(&self) -> Result<(), PolicyValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), PolicyValidationError> {
         self.reason.validate()?;
         for (field, value) in [
             ("owner_id", &self.owner_id),
@@ -1116,7 +1116,7 @@ impl ApprovalDecision {
         Ok(decision)
     }
 
-    fn validate(&self) -> Result<(), PolicyValidationError> {
+    pub(crate) fn validate(&self) -> Result<(), PolicyValidationError> {
         self.request.validate()?;
         let Some(binding) = &self.binding else {
             return Err(PolicyValidationError::InconsistentApprovalBinding);
