@@ -89,27 +89,37 @@ impl CapabilityResultRecorder for RejectingResultRecorder {
 
 #[derive(Default)]
 struct StableRepeatedResultRecorder {
-    records: Mutex<BTreeMap<(Uuid, u32), DurableCapabilityResult>>,
+    records: Mutex<BTreeMap<Uuid, (DurableCapabilityResult, CapabilityResult)>>,
     calls: AtomicUsize,
+}
+
+impl StableRepeatedResultRecorder {
+    fn resolve(&self, result_ref: &CapabilityReferenceId) -> Option<CapabilityResult> {
+        self.records
+            .lock()
+            .unwrap()
+            .get(&result_ref.handle())
+            .map(|(_, result)| result.clone())
+    }
 }
 
 #[async_trait]
 impl CapabilityResultRecorder for StableRepeatedResultRecorder {
     async fn record(
         &self,
-        context: &CapabilityExecutionContext,
+        _context: &CapabilityExecutionContext,
         _manifest: &CapabilityManifest,
-        _result: &CapabilityResult,
+        result: &CapabilityResult,
         durable: &DurableCapabilityResult,
     ) -> Result<(), CapabilityError> {
-        let key = (context.invocation().id(), context.attempt().number());
+        let key = durable.result_ref().handle();
         let mut records = self.records.lock().unwrap();
-        if let Some(recorded) = records.get(&key) {
-            if recorded != durable {
+        if let Some((recorded, recorded_result)) = records.get(&key) {
+            if recorded != durable || recorded_result != result {
                 return Err(CapabilityError::validation());
             }
         } else {
-            records.insert(key, durable.clone());
+            records.insert(key, (durable.clone(), result.clone()));
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -1782,12 +1792,8 @@ async fn durable_lineage_store_returns_cached_completion_after_registry_restart(
     );
     assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
     assert_eq!(
-        results
-            .records
-            .lock()
-            .unwrap()
-            .get(&(initial.invocation().id(), initial.attempt().number())),
-        Some(&completed)
+        results.resolve(completed.result_ref()),
+        Some(CapabilityResult::new(json!({ "ok": true })))
     );
 }
 
