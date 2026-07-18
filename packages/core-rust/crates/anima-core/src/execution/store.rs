@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
 
@@ -16,9 +17,9 @@ use crate::{
     AgentDefinition, ApprovalDecision, AutonomyGrant, CapabilityKind, CapabilityManifest,
     CapabilityReferenceId, DurableCapabilityResult, DurableCapabilityStatus, GrantConsumption,
     GrantEffect, GrantScope, GrantStatus, LifecyclePolicy, LogicalInvocation, ManifestPin,
-    MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext, PolicyEngine, PolicyEvaluation,
-    PolicyRestrictions, ProfileRef, RecoveryMode, RecoveryResumeBinding, RiskLevel,
-    RuntimeCompatibility, RuntimeLimits,
+    MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext, PolicyDecision, PolicyEngine,
+    PolicyEvaluation, PolicyRestrictions, ProfileRef, RecoveryMode, RecoveryResumeBinding,
+    RiskLevel, RuntimeCompatibility, RuntimeLimits,
 };
 
 pub const MAX_COMMIT_EVENTS: usize = 256;
@@ -503,6 +504,338 @@ impl AuthoritativeGrantChange {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoritativePolicyStatus {
+    Active,
+    Revoked,
+}
+
+/// Store-authoritative high-water mark for one owner's pinned definition policy.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoritativePolicyState {
+    owner_id: Uuid,
+    agent_definition_id: String,
+    agent_definition_version: u32,
+    revision: u32,
+    status: AuthoritativePolicyStatus,
+    valid_until_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoritativePolicyStateWire {
+    owner_id: Uuid,
+    agent_definition_id: String,
+    agent_definition_version: u32,
+    revision: u32,
+    status: AuthoritativePolicyStatus,
+    valid_until_ms: Option<u64>,
+}
+
+impl AuthoritativePolicyState {
+    pub fn active(
+        owner_id: Uuid,
+        agent_definition_id: impl Into<String>,
+        agent_definition_version: u32,
+        revision: u32,
+        valid_until_ms: Option<u64>,
+    ) -> Result<Self, ExecutionStoreError> {
+        let value = Self {
+            owner_id,
+            agent_definition_id: agent_definition_id.into(),
+            agent_definition_version,
+            revision,
+            status: AuthoritativePolicyStatus::Active,
+            valid_until_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ExecutionStoreError> {
+        if self.owner_id.is_nil()
+            || self.agent_definition_id.trim().is_empty()
+            || self.agent_definition_id.len() > crate::MAX_CAPABILITY_ID_BYTES
+            || self.agent_definition_version == 0
+            || self.revision == 0
+            || self.valid_until_ms == Some(0)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn owner_id(&self) -> Uuid {
+        self.owner_id
+    }
+    pub fn agent_definition_id(&self) -> &str {
+        &self.agent_definition_id
+    }
+    pub fn agent_definition_version(&self) -> u32 {
+        self.agent_definition_version
+    }
+    pub fn revision(&self) -> u32 {
+        self.revision
+    }
+    pub fn status(&self) -> AuthoritativePolicyStatus {
+        self.status
+    }
+    pub fn valid_until_ms(&self) -> Option<u64> {
+        self.valid_until_ms
+    }
+
+    fn key(&self) -> (String, u32) {
+        (
+            self.agent_definition_id.clone(),
+            self.agent_definition_version,
+        )
+    }
+
+    fn revoked(&self) -> Self {
+        let mut value = self.clone();
+        value.status = AuthoritativePolicyStatus::Revoked;
+        value
+    }
+
+    pub(super) fn validates(&self, guard: &DispatchPolicyGuard, now_ms: u64) -> bool {
+        self.owner_id == guard.owner_id
+            && self.agent_definition_id == guard.agent_definition_id
+            && self.agent_definition_version == guard.agent_definition_version
+            && self.revision == guard.policy_revision
+            && self.status == AuthoritativePolicyStatus::Active
+            && self.valid_until_ms.is_none_or(|until| now_ms < until)
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthoritativePolicyState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = AuthoritativePolicyStateWire::deserialize(deserializer)?;
+        let value = Self {
+            owner_id: wire.owner_id,
+            agent_definition_id: wire.agent_definition_id,
+            agent_definition_version: wire.agent_definition_version,
+            revision: wire.revision,
+            status: wire.status,
+            valid_until_ms: wire.valid_until_ms,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
+impl fmt::Debug for AuthoritativePolicyState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthoritativePolicyState")
+            .field("owner_id", &"REDACTED")
+            .field("agent_definition_id", &"REDACTED")
+            .field("agent_definition_version", &self.agent_definition_version)
+            .field("revision", &self.revision)
+            .field("status", &self.status)
+            .field("valid_until_ms", &self.valid_until_ms)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthoritativePolicyChange {
+    Create(AuthoritativePolicyState),
+    Update {
+        expected_revision: u32,
+        state: AuthoritativePolicyState,
+    },
+    Revoke {
+        agent_definition_id: String,
+        agent_definition_version: u32,
+        expected_revision: u32,
+    },
+}
+
+impl AuthoritativePolicyChange {
+    pub fn create(state: AuthoritativePolicyState) -> Self {
+        Self::Create(state)
+    }
+
+    pub fn update(
+        expected_revision: u32,
+        state: AuthoritativePolicyState,
+    ) -> Result<Self, ExecutionStoreError> {
+        if expected_revision == 0 || state.revision <= expected_revision {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self::Update {
+            expected_revision,
+            state,
+        })
+    }
+
+    pub fn revoke(
+        agent_definition_id: impl Into<String>,
+        agent_definition_version: u32,
+        expected_revision: u32,
+    ) -> Result<Self, ExecutionStoreError> {
+        let agent_definition_id = agent_definition_id.into();
+        if agent_definition_id.trim().is_empty()
+            || agent_definition_version == 0
+            || expected_revision == 0
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self::Revoke {
+            agent_definition_id,
+            agent_definition_version,
+            expected_revision,
+        })
+    }
+
+    pub fn key(&self) -> (String, u32) {
+        match self {
+            Self::Create(state) | Self::Update { state, .. } => state.key(),
+            Self::Revoke {
+                agent_definition_id,
+                agent_definition_version,
+                ..
+            } => (agent_definition_id.clone(), *agent_definition_version),
+        }
+    }
+
+    pub fn apply_to(
+        &self,
+        current: Option<&AuthoritativePolicyState>,
+    ) -> Result<AuthoritativePolicyState, ExecutionStoreError> {
+        match (self, current) {
+            (Self::Create(next), None) => Ok(next.clone()),
+            (Self::Create(_), Some(_)) => Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::VersionConflict,
+            )),
+            (
+                Self::Update {
+                    expected_revision,
+                    state: next,
+                },
+                Some(current),
+            ) if current.owner_id == next.owner_id
+                && current.key() == next.key()
+                && current.revision == *expected_revision
+                && next.revision > current.revision =>
+            {
+                Ok(next.clone())
+            }
+            (
+                Self::Revoke {
+                    agent_definition_id,
+                    agent_definition_version,
+                    expected_revision,
+                },
+                Some(current),
+            ) if current.agent_definition_id == *agent_definition_id
+                && current.agent_definition_version == *agent_definition_version
+                && current.revision == *expected_revision =>
+            {
+                Ok(current.revoked())
+            }
+            _ => Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::VersionConflict,
+            )),
+        }
+    }
+}
+
+/// Opaque exact-policy proof required on every external dispatch preparation.
+#[derive(Clone)]
+pub struct DispatchPolicyGuard {
+    owner_id: Uuid,
+    run_id: Uuid,
+    agent_definition_id: String,
+    agent_definition_version: u32,
+    logical_invocation_id: Uuid,
+    capability_id: String,
+    manifest_version: u32,
+    canonical_argument_digest: Uuid,
+    policy_revision: u32,
+    decision_digest: String,
+}
+
+impl DispatchPolicyGuard {
+    pub fn from_current_policy(
+        owner_id: Uuid,
+        context: &PolicyContext,
+        grants: &[AutonomyGrant],
+        approval: Option<&ApprovalDecision>,
+        evaluation: &PolicyEvaluation,
+    ) -> Result<Self, ExecutionStoreError> {
+        if owner_id.is_nil()
+            || context.owner_id != owner_id.to_string()
+            || !matches!(evaluation.decision, PolicyDecision::Allow(_))
+            || PolicyEngine::evaluate_with_approval(context, grants, approval)
+                .ok()
+                .as_ref()
+                != Some(evaluation)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::PolicyConflict,
+            ));
+        }
+        let digest = serde_jcs::to_vec(evaluation)
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::PolicyConflict))?;
+        Ok(Self {
+            owner_id,
+            run_id: context.run_id,
+            agent_definition_id: context.agent_definition_id.clone(),
+            agent_definition_version: context.agent_definition_version,
+            logical_invocation_id: context.logical_invocation_id,
+            capability_id: context.capability_id.clone(),
+            manifest_version: context.manifest_version,
+            canonical_argument_digest: context.canonical_argument_digest,
+            policy_revision: context.policy_revision,
+            decision_digest: format!("sha256:{:x}", Sha256::digest(digest)),
+        })
+    }
+
+    pub fn policy_revision(&self) -> u32 {
+        self.policy_revision
+    }
+
+    pub(super) fn agent_definition_id(&self) -> &str {
+        &self.agent_definition_id
+    }
+
+    pub(super) fn agent_definition_version(&self) -> u32 {
+        self.agent_definition_version
+    }
+
+    pub fn matches_attempt(&self, owner_id: Uuid, attempt: &InvocationAttemptRecord) -> bool {
+        self.owner_id == owner_id
+            && self.run_id == attempt.invocation().run_id()
+            && self.logical_invocation_id == attempt.invocation().id()
+            && self.capability_id == attempt.invocation().capability_id()
+            && self.manifest_version == attempt.invocation().manifest_version()
+            && self.canonical_argument_digest == attempt.invocation().canonical_argument_digest()
+            && !self.decision_digest.is_empty()
+    }
+}
+
+impl fmt::Debug for DispatchPolicyGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DispatchPolicyGuard")
+            .field("owner_id", &"REDACTED")
+            .field("run_id", &self.run_id)
+            .field("logical_invocation_id", &self.logical_invocation_id)
+            .field("policy_revision", &self.policy_revision)
+            .field("decision_digest", &"REDACTED")
+            .finish()
+    }
+}
+
 /// Input for atomically creating a durable run and claiming its session when required.
 #[derive(Clone, Debug)]
 pub struct CreateRun {
@@ -750,6 +1083,7 @@ pub struct ExecutionCommit {
     attempts: Vec<InvocationAttemptRecord>,
     results: Vec<DurableResultMutation>,
     approval: Option<ApprovalGrantMutation>,
+    policy_guard: Option<DispatchPolicyGuard>,
     dispatch_grant: Option<DispatchGrantMutation>,
     checkpoint: CheckpointMutation,
     target_run: Run,
@@ -779,6 +1113,7 @@ impl ExecutionCommit {
             attempts,
             results,
             approval,
+            policy_guard: None,
             dispatch_grant: None,
             checkpoint: CheckpointMutation::Clear,
             target_run,
@@ -792,6 +1127,11 @@ impl ExecutionCommit {
 
     pub fn with_dispatch_grant(mut self, mutation: DispatchGrantMutation) -> Self {
         self.dispatch_grant = Some(mutation);
+        self
+    }
+
+    pub fn with_policy_guard(mut self, guard: DispatchPolicyGuard) -> Self {
+        self.policy_guard = Some(guard);
         self
     }
 
@@ -838,6 +1178,10 @@ impl ExecutionCommit {
 
     pub fn dispatch_grant(&self) -> Option<&DispatchGrantMutation> {
         self.dispatch_grant.as_ref()
+    }
+
+    pub fn policy_guard(&self) -> Option<&DispatchPolicyGuard> {
+        self.policy_guard.as_ref()
     }
 
     pub fn checkpoint(&self) -> Option<&CheckpointV1> {
@@ -1002,6 +1346,7 @@ pub enum ExecutionStoreErrorCode {
     CheckpointConflict,
     GrantAlreadyConsumed,
     GrantConflict,
+    PolicyConflict,
     LineageConflict,
     HistoryConflict,
     BoundsExceeded,
@@ -1050,6 +1395,9 @@ impl fmt::Display for ExecutionStoreError {
             ExecutionStoreErrorCode::GrantConflict => {
                 "autonomy grant authority is missing, stale, or revoked"
             }
+            ExecutionStoreErrorCode::PolicyConflict => {
+                "policy authority is missing, stale, expired, or revoked"
+            }
             ExecutionStoreErrorCode::LineageConflict => {
                 "durable result does not match completed invocation lineage"
             }
@@ -1071,6 +1419,19 @@ impl std::error::Error for ExecutionStoreError {}
 /// Adapter port for durable execution state. Each operation is atomic.
 #[async_trait]
 pub trait ExecutionStore: Send + Sync {
+    async fn apply_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        change: AuthoritativePolicyChange,
+    ) -> Result<AuthoritativePolicyState, ExecutionStoreError>;
+
+    async fn load_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        agent_definition_id: &str,
+        agent_definition_version: u32,
+    ) -> Result<Option<AuthoritativePolicyState>, ExecutionStoreError>;
+
     async fn apply_authoritative_grant(
         &self,
         owner_id: Uuid,
@@ -1153,8 +1514,14 @@ pub trait ExecutionStore: Send + Sync {
     ) -> Result<EventReplayPage, ExecutionStoreError>;
 }
 
+#[async_trait]
 pub trait ExecutionClock: Send + Sync {
     fn now_ms(&self) -> u64;
+
+    async fn wait_until_ms(&self, deadline_ms: u64) {
+        let delay_ms = deadline_ms.saturating_sub(self.now_ms());
+        super::clock::wait_for_wall_clock_ms(delay_ms).await;
+    }
 }
 
 #[async_trait]
@@ -1198,6 +1565,18 @@ where
                 0,
                 SessionConcurrencyPolicy::Serial,
             ),
+        )
+        .await?;
+    store
+        .apply_authoritative_policy(
+            owner_id,
+            AuthoritativePolicyChange::create(AuthoritativePolicyState::active(
+                owner_id,
+                session.definition().id(),
+                session.definition().version(),
+                1,
+                None,
+            )?),
         )
         .await?;
     let conflicting = Run::queued(
@@ -1606,13 +1985,102 @@ where
     assert_uncounted_approval_commit_contract(factory).await?;
     assert_command_conflict_contract(factory).await?;
     assert_atomic_failure_contract(factory).await?;
+    assert_authoritative_policy_contract(factory).await?;
     assert_dispatching_attempt_transition_contract(factory).await?;
+    assert_retry_attempt_lineage_contract(factory).await?;
     assert_auto_allow_dispatch_grant_contract(factory).await?;
     assert_policy_denied_transition_contract(factory).await?;
     assert_counted_grant_contract(factory).await?;
     assert_multi_use_counted_grant_contract(factory).await?;
     assert_counted_grant_revoke_race_contract(factory).await?;
     assert_durable_result_contract(factory).await
+}
+
+async fn assert_authoritative_policy_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let owner_id = Uuid::from_u128(0xd0_01);
+    let first = AuthoritativePolicyState::active(owner_id, "policy-contract", 1, 1, None)?;
+    if store
+        .apply_authoritative_policy(owner_id, AuthoritativePolicyChange::create(first.clone()))
+        .await?
+        != first
+        || store
+            .load_authoritative_policy(owner_id, "policy-contract", 1)
+            .await?
+            .as_ref()
+            != Some(&first)
+        || store
+            .load_authoritative_policy(Uuid::from_u128(0xd0_02), "policy-contract", 1)
+            .await?
+            .is_some()
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    if !matches!(
+        store
+            .apply_authoritative_policy(
+                owner_id,
+                AuthoritativePolicyChange::create(first.clone())
+            )
+            .await,
+        Err(error) if error.code() == ExecutionStoreErrorCode::VersionConflict
+    ) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let second = AuthoritativePolicyState::active(owner_id, "policy-contract", 1, 2, None)?;
+    let stale_high = AuthoritativePolicyState::active(owner_id, "policy-contract", 1, 10, None)?;
+    if !matches!(
+        store
+            .apply_authoritative_policy(
+                owner_id,
+                AuthoritativePolicyChange::update(9, stale_high)?
+            )
+            .await,
+        Err(error) if error.code() == ExecutionStoreErrorCode::VersionConflict
+    ) || store
+        .apply_authoritative_policy(
+            owner_id,
+            AuthoritativePolicyChange::update(1, second.clone())?,
+        )
+        .await?
+        != second
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let revoked = store
+        .apply_authoritative_policy(
+            owner_id,
+            AuthoritativePolicyChange::revoke("policy-contract", 1, 2)?,
+        )
+        .await?;
+    if revoked.status() != AuthoritativePolicyStatus::Revoked || revoked.revision() != 2 {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let third = AuthoritativePolicyState::active(owner_id, "policy-contract", 1, 3, None)?;
+    if store
+        .apply_authoritative_policy(
+            owner_id,
+            AuthoritativePolicyChange::update(2, third.clone())?,
+        )
+        .await?
+        != third
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
 }
 
 async fn assert_dispatching_attempt_transition_contract<F>(
@@ -1692,7 +2160,12 @@ where
                 vec![],
                 None,
                 started.stored_run().run().clone(),
-            ),
+            )
+            .with_policy_guard(conformance_dispatch_guard(
+                owner_id,
+                &session,
+                &invocation,
+            )?),
         )
         .await?;
     let completed_attempt = conformance_value(InvocationAttemptRecord::new(
@@ -1751,6 +2224,167 @@ where
             .as_ref()
             != Some(&durable)
     {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_retry_attempt_lineage_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let (store, owner_id, session, queued, started, lease) =
+        create_running_run(factory, 0xd1_40).await?;
+    let invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "retry-lineage",
+        "workspace.write",
+        1,
+        serde_json::json!({"path": "retry-lineage.txt"}),
+    ))?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        format!("sha256:{}", "f".repeat(64)),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let first_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
+        &invocation,
+        1,
+        super::AttemptRecordState::Dispatching,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let first = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::prepare_dispatch(
+                    Uuid::from_u128(0xd1_45),
+                    session.id(),
+                    queued.id(),
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![first_dispatching],
+                vec![],
+                None,
+                started.stored_run().run().clone(),
+            )
+            .with_policy_guard(conformance_dispatch_guard(
+                owner_id,
+                &session,
+                &invocation,
+            )?),
+        )
+        .await?;
+    let first_uncertain = conformance_value(InvocationAttemptRecord::new_durable(
+        &invocation,
+        1,
+        super::AttemptRecordState::Uncertain,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let second_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
+        &invocation,
+        2,
+        super::AttemptRecordState::Dispatching,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let pause = conformance_value(super::RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        super::RecoveryPauseReason::AuthoritativeAbsence,
+    ))?;
+    let recovery = conformance_value(super::RecoveryRecord::new_with_pause(pause, None))?;
+    let second = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                first.stored_run().run_version(),
+                first.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::prepare_recovery_dispatch(
+                    Uuid::from_u128(0xd1_46),
+                    session.id(),
+                    queued.id(),
+                    recovery,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![first_uncertain.clone(), second_dispatching],
+                vec![],
+                None,
+                first.stored_run().run().clone(),
+            )
+            .with_policy_guard(conformance_dispatch_guard(
+                owner_id,
+                &session,
+                &invocation,
+            )?),
+        )
+        .await?;
+    let second_completed = conformance_value(InvocationAttemptRecord::new_durable(
+        &invocation,
+        2,
+        super::AttemptRecordState::Completed,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let result_reference = CapabilityReferenceId::new(Uuid::from_u128(0xd1_47));
+    let completed = conformance_value(CompletedInvocationRecord::new(
+        invocation.binding(),
+        2,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        conformance_value(OpaqueReference::new(result_reference.handle()))?,
+    ))?;
+    let durable = conformance_value(DurableCapabilityResult::new(
+        result_reference,
+        format!("jcs-v1:{}", "1".repeat(64)),
+        manifest.schema_digest(),
+        1,
+        DurableCapabilityStatus::Completed,
+    ))?;
+    store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                second.stored_run().run_version(),
+                second.checkpoint_version(),
+                lease,
+                RuntimeCommand::record_progress(
+                    Uuid::from_u128(0xd1_48),
+                    session.id(),
+                    queued.id(),
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![second_completed.clone()],
+                vec![DurableResultMutation::new(completed, durable)],
+                None,
+                second.stored_run().run().clone(),
+            ),
+        )
+        .await?;
+    let attempts = store
+        .load_attempts_page(
+            owner_id,
+            queued.id(),
+            StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+        )
+        .await?;
+    if attempts.items() != [first_uncertain, second_completed] {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
@@ -1818,6 +2452,13 @@ where
         &evaluation,
     )?
     .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
+    let policy_guard = DispatchPolicyGuard::from_current_policy(
+        owner_id,
+        &context,
+        std::slice::from_ref(&grant),
+        None,
+        &evaluation,
+    )?;
     let authority = AuthoritativeGrantState::from_grant(owner_id, &grant)?;
     store
         .apply_authoritative_grant(
@@ -1859,6 +2500,7 @@ where
         None,
         started.stored_run().run().clone(),
     )
+    .with_policy_guard(policy_guard)
     .with_dispatch_grant(mutation);
     let outcome = store.commit_execution(owner_id, commit.clone()).await?;
     if outcome.grant_consumption() != evaluation.consumption.as_ref()
@@ -2037,6 +2679,18 @@ where
                 0,
                 SessionConcurrencyPolicy::Serial,
             ),
+        )
+        .await?;
+    store
+        .apply_authoritative_policy(
+            owner_id,
+            AuthoritativePolicyChange::create(AuthoritativePolicyState::active(
+                owner_id,
+                session.definition().id(),
+                session.definition().version(),
+                1,
+                None,
+            )?),
         )
         .await?;
     let lease = store
@@ -4813,6 +5467,58 @@ fn conformance_capability_manifest() -> CapabilityManifest {
         },
     })
     .expect("execution-store conformance manifest must be valid")
+}
+
+fn conformance_dispatch_guard(
+    owner_id: Uuid,
+    session: &Session,
+    invocation: &LogicalInvocation,
+) -> Result<DispatchPolicyGuard, ExecutionStoreError> {
+    let manifest = conformance_capability_manifest();
+    let context = conformance_value(PolicyContext::new(
+        owner_id.to_string(),
+        "contract-actor",
+        session.definition().id(),
+        session.definition().version(),
+        "contract-workspace",
+        CapabilityReferenceId::new(invocation.run_id()),
+        &manifest,
+        invocation,
+        1,
+        PolicyRestrictions::default(),
+        1_000,
+    ))?;
+    let grant = conformance_value(AutonomyGrant::new(
+        format!("dispatch-guard-{}", invocation.logical_step_id()),
+        1,
+        GrantStatus::Active,
+        conformance_value(GrantScope::new(
+            context.owner_id.clone(),
+            context.actor_id.clone(),
+            context.agent_definition_id.clone(),
+            context.agent_definition_version,
+            context.workspace_id.clone(),
+            context.resource_boundary.clone(),
+            context.capability_id.clone(),
+            context.manifest_version,
+            Some(context.canonical_argument_digest),
+        ))?,
+        RiskLevel::Critical,
+        0,
+        None,
+        None,
+    ))?;
+    let evaluation = conformance_value(PolicyEngine::evaluate(
+        &context,
+        std::slice::from_ref(&grant),
+    ))?;
+    DispatchPolicyGuard::from_current_policy(
+        owner_id,
+        &context,
+        std::slice::from_ref(&grant),
+        None,
+        &evaluation,
+    )
 }
 
 fn conformance_policy_context(

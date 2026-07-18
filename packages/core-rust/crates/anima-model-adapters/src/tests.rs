@@ -75,7 +75,12 @@ async fn openai_compatible_stream_normalizes_ordered_deltas_and_final_response()
         post(|| async {
             (
                 [("content-type", "text/event-stream")],
-                "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello \"}}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_\",\"type\":\"function\",\"function\":{\"name\":\"workspace.\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"world\",\"tool_calls\":[{\"index\":0,\"id\":\"123\",\"function\":{\"name\":\"write\",\"arguments\":\"\\\"note.txt\\\",\\\"content\\\":\\\"ok\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":5,\"total_tokens\":12}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
             )
         }),
     );
@@ -91,8 +96,21 @@ async fn openai_compatible_stream_normalizes_ordered_deltas_and_final_response()
     let frames = sink.0.lock().unwrap().clone();
     assert_eq!(frames[0], ModelStreamFrame::TextDelta("hello ".into()));
     assert_eq!(frames[1], ModelStreamFrame::TextDelta("world".into()));
-    assert!(
-        matches!(&frames[2], ModelStreamFrame::Final(response) if response.content.text == "hello world")
+    let ModelStreamFrame::Final(response) = &frames[2] else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.content.text, "hello world");
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    assert_eq!(response.usage.prompt_tokens, 7);
+    assert_eq!(response.usage.completion_tokens, 5);
+    assert_eq!(response.usage.total_tokens, 12);
+    let calls = response.tool_calls.as_ref().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_123");
+    assert_eq!(calls[0].name, "workspace.write");
+    assert_eq!(
+        calls[0].args.get("path"),
+        Some(&DataValue::String("note.txt".into()))
     );
 }
 
@@ -103,7 +121,17 @@ async fn anthropic_stream_normalizes_ordered_deltas_and_final_response() {
         post(|| async {
             (
                 [("content-type", "text/event-stream")],
-                "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi \"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"there\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi \"}}\n\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_7\",\"name\":\"workspace.write\",\"input\":{}}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"note\"}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\".txt\\\",\\\"content\\\":\\\"ok\\\"}\"}}\n\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"there\"}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":4}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                ),
             )
         }),
     );
@@ -119,9 +147,52 @@ async fn anthropic_stream_normalizes_ordered_deltas_and_final_response() {
     let frames = sink.0.lock().unwrap().clone();
     assert_eq!(frames[0], ModelStreamFrame::TextDelta("hi ".into()));
     assert_eq!(frames[1], ModelStreamFrame::TextDelta("there".into()));
-    assert!(
-        matches!(&frames[2], ModelStreamFrame::Final(response) if response.content.text == "hi there")
+    let ModelStreamFrame::Final(response) = &frames[2] else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.content.text, "hi there");
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    assert_eq!(response.usage.prompt_tokens, 9);
+    assert_eq!(response.usage.completion_tokens, 4);
+    assert_eq!(response.usage.total_tokens, 13);
+    let calls = response.tool_calls.as_ref().unwrap();
+    assert_eq!(calls[0].id, "tool_7");
+    assert_eq!(calls[0].name, "workspace.write");
+    assert_eq!(
+        calls[0].args.get("path"),
+        Some(&DataValue::String("note.txt".into()))
     );
+}
+
+#[tokio::test]
+async fn streamed_tool_calls_fail_closed_on_conflicting_or_malformed_chunks() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"workspace.write\",\"arguments\":\"{bad\"}}]}}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+
+    let error = adapter
+        .stream(
+            &agent_config("openai", false),
+            &request(),
+            &FrameSink(Mutex::new(Vec::new())),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.contains("provider stream tool call invalid"));
+    assert!(!error.contains("{bad"));
 }
 
 #[tokio::test]

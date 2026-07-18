@@ -1,7 +1,10 @@
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::future::{select, Either};
+use futures::lock::Mutex as AsyncMutex;
 use uuid::Uuid;
 
 use crate::{
@@ -9,12 +12,12 @@ use crate::{
     ApprovalResumeClaim, AutonomyGrant, Budget, CapabilityAttempt, CapabilityError,
     CapabilityExecutionContext, CapabilityManifest, CapabilityResult, CapabilityRetryAuthorization,
     CheckpointCursor, CheckpointV1, CheckpointV1Builder, CompletedInvocationRecord, Content,
-    DefinitionPin, DispatchGrantMutation, DurableCapabilityResult, DurableResultMutation,
-    ExecutionClock, ExecutionStep, ExecutionStore, InvocationAttemptRecord, LogicalInvocation,
-    ManifestPin, Message, MessageRole, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse,
-    ModelStreamFrame, ModelStreamSink, OpaqueReference, PendingApprovalRecord, PolicyContext,
-    PolicyDecision, PolicyEngine, RecoveryAction, Run, RunState, RuntimeCommand, RuntimeEvent,
-    RuntimeEventKind, StepKind, ToolCall, Usage,
+    DefinitionPin, DispatchGrantMutation, DispatchPolicyGuard, DurableCapabilityResult,
+    DurableResultMutation, ExecutionClock, ExecutionStep, ExecutionStore, InvocationAttemptRecord,
+    LogicalInvocation, ManifestPin, Message, MessageRole, ModelAdapter, ModelGenerateRequest,
+    ModelGenerateResponse, ModelStreamFrame, ModelStreamSink, OpaqueReference,
+    PendingApprovalRecord, PolicyContext, PolicyDecision, PolicyEngine, RecoveryAction, Run,
+    RunState, RuntimeCommand, RuntimeEvent, RuntimeEventKind, StepKind, ToolCall, Usage,
 };
 
 const ENGINE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x8d6d_9262_9e34_5b79_8ff0_89c1_240c_b241);
@@ -510,8 +513,10 @@ where
         } else if !checkpoint_was_loaded {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
-        let mut reconstructing_approval = current.run().state() == RunState::WaitingForApproval;
-        if current.run().state() != RunState::Running && !reconstructing_approval {
+        if !matches!(
+            current.run().state(),
+            RunState::Running | RunState::WaitingForApproval | RunState::RecoveryRequired
+        ) {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
         match signal.at_boundary() {
@@ -528,19 +533,65 @@ where
             }
         }
 
+        if current.run().state() == RunState::RecoveryRequired {
+            return Ok(EngineRunOutcome::RecoveryRequired);
+        }
         let mut messages = Vec::new();
+        if let Some(active) = checkpoint.attempts().iter().find(|attempt| {
+            matches!(
+                attempt.state(),
+                crate::AttemptRecordState::Pending
+                    | crate::AttemptRecordState::Dispatching
+                    | crate::AttemptRecordState::Uncertain
+            )
+        }) {
+            let invocation = active
+                .durable_invocation()
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
+                .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
+            let tool_call = tool_call_from_invocation(&invocation)?;
+            let executed = self
+                .execute_capability(
+                    owner_id,
+                    &definition,
+                    current,
+                    lease,
+                    checkpoint_version,
+                    checkpoint,
+                    tool_call,
+                )
+                .await?;
+            current = executed.0;
+            lease = executed.1;
+            checkpoint_version = executed.2;
+            checkpoint = executed.3;
+            messages.push(executed.4);
+            match current.run().state() {
+                RunState::WaitingForApproval => return Ok(EngineRunOutcome::WaitingForApproval),
+                RunState::RecoveryRequired => return Ok(EngineRunOutcome::RecoveryRequired),
+                RunState::Paused
+                    if current.run().pause_reason()
+                        == Some(crate::RunPauseReason::PolicyDenied) =>
+                {
+                    return Ok(EngineRunOutcome::Denied)
+                }
+                RunState::Running => {}
+                _ => return Err(EngineError::new(EngineErrorCode::InvalidState)),
+            }
+        } else if current.run().state() == RunState::WaitingForApproval {
+            return Err(EngineError::new(EngineErrorCode::InvalidState));
+        }
         let response = loop {
-            if !reconstructing_approval
-                && checkpoint
-                    .budget()
-                    .max_turns()
-                    .is_some_and(|maximum| checkpoint.usage().turns() >= maximum)
+            if checkpoint
+                .budget()
+                .max_turns()
+                .is_some_and(|maximum| checkpoint.usage().turns() >= maximum)
             {
                 return self
                     .pause_for_budget(owner_id, current, lease, checkpoint_version, &checkpoint)
                     .await;
             }
-            if !reconstructing_approval {
+            {
                 let started_sequence = checkpoint.last_durable_event_sequence() + 1;
                 let started_event = self.event(
                     owner_id,
@@ -591,25 +642,28 @@ where
                 live: self.live.as_ref(),
                 final_response: Mutex::new(None),
             };
-            self.model
-                .stream(
-                    &agent_config(&definition),
-                    &ModelGenerateRequest {
-                        system: definition.system.clone(),
-                        messages: messages.clone(),
-                        temperature: definition.model.temperature,
-                        max_tokens: None,
-                    },
-                    &collector,
+            let model_request = ModelGenerateRequest {
+                system: definition.system.clone(),
+                messages: messages.clone(),
+                temperature: definition.model.temperature,
+                max_tokens: None,
+            };
+            let (stream_result, renewed) = self
+                .await_with_lease_heartbeat(
+                    owner_id,
+                    lease,
+                    self.model
+                        .stream(&agent_config(&definition), &model_request, &collector),
                 )
-                .await
-                .map_err(|_| EngineError::new(EngineErrorCode::Model))?;
+                .await?;
+            lease = renewed;
+            stream_result.map_err(|_| EngineError::new(EngineErrorCode::Model))?;
             let response = collector
                 .final_response
                 .into_inner()
                 .map_err(|_| EngineError::new(EngineErrorCode::Model))?
                 .ok_or_else(|| EngineError::new(EngineErrorCode::Model))?;
-            if !reconstructing_approval {
+            {
                 let usage = checkpoint
                     .usage()
                     .checked_add(&Usage {
@@ -667,9 +721,6 @@ where
 
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
             if tool_calls.is_empty() {
-                if reconstructing_approval {
-                    return Err(EngineError::new(EngineErrorCode::InvalidState));
-                }
                 break response;
             }
             for tool_call in tool_calls {
@@ -689,7 +740,6 @@ where
                 checkpoint_version = executed.2;
                 checkpoint = executed.3;
                 messages.push(executed.4);
-                reconstructing_approval = false;
                 match current.run().state() {
                     RunState::WaitingForApproval => {
                         return Ok(EngineRunOutcome::WaitingForApproval)
@@ -803,63 +853,21 @@ where
             arguments,
         )
         .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-        if checkpoint.attempts().iter().any(|attempt| {
-            attempt.invocation().id() == invocation.id()
-                && attempt.attempt_number() == 1
-                && attempt.state() == crate::AttemptRecordState::Dispatching
-        }) {
-            let attempt = CapabilityAttempt::new(&invocation, 1)
-                .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-            let context = CapabilityExecutionContext::for_attempt(invocation.clone(), attempt)
-                .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-            let recovery = self
-                .capabilities
-                .recover_dispatched(context)
-                .await
-                .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-            let result = match recovery {
-                RecoveryAction::Completed(durable) => EngineCapabilityResult {
-                    output: CapabilityResult::new(serde_json::json!({
-                        "durable_result_ref": durable.result_ref().handle()
-                    })),
-                    durable,
-                },
-                RecoveryAction::RetrySameKey { authorization, .. } => {
-                    let retry = CapabilityAttempt::new(&invocation, 2)
-                        .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-                    let retry_context =
-                        CapabilityExecutionContext::for_attempt(invocation.clone(), retry)
-                            .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-                    self.capabilities
-                        .execute_retry(retry_context, authorization)
-                        .await
-                        .map_err(|_| EngineError::new(EngineErrorCode::Capability))?
-                }
-                other => {
-                    return self
-                        .commit_recovery_required(
-                            owner_id,
-                            definition,
-                            current,
-                            lease,
-                            checkpoint_version,
-                            checkpoint,
-                            invocation,
-                            tool_call,
-                            manifest,
-                            other,
-                        )
-                        .await
-                }
-            };
-            let step = ExecutionStep::new(
-                current.run().id(),
-                tool_call.id.clone(),
-                StepKind::Capability,
-            )
-            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+        let recovery_attempt_number = checkpoint
+            .attempts()
+            .iter()
+            .find(|attempt| {
+                attempt.invocation().id() == invocation.id()
+                    && matches!(
+                        attempt.state(),
+                        crate::AttemptRecordState::Dispatching
+                            | crate::AttemptRecordState::Uncertain
+                    )
+            })
+            .map(InvocationAttemptRecord::attempt_number);
+        if let Some(attempt_number) = recovery_attempt_number {
             return self
-                .commit_capability_result(
+                .recover_checkpointed_capability(
                     owner_id,
                     definition,
                     current,
@@ -869,8 +877,7 @@ where
                     invocation,
                     tool_call,
                     manifest,
-                    step,
-                    result,
+                    attempt_number,
                 )
                 .await;
         }
@@ -885,6 +892,19 @@ where
         let first_evaluation =
             PolicyEngine::evaluate_with_approval(first.context(), first.grants(), first.approval())
                 .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
+        if !policy_context_matches(first.context(), definition, &invocation) {
+            return self
+                .commit_policy_denied(
+                    owner_id,
+                    definition,
+                    current,
+                    lease,
+                    checkpoint_version,
+                    checkpoint,
+                    invocation,
+                )
+                .await;
+        }
         if current.run().state() == RunState::WaitingForApproval
             && !matches!(first_evaluation.decision, PolicyDecision::Allow(_))
         {
@@ -937,8 +957,8 @@ where
         ) {
             let approval_request = PolicyEngine::approval_request(first.context(), None)
                 .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
-            let pending = InvocationAttemptRecord::new(
-                invocation.binding(),
+            let pending = InvocationAttemptRecord::new_durable(
+                &invocation,
                 1,
                 crate::AttemptRecordState::Pending,
                 ManifestPin::from_manifest(&manifest)
@@ -1064,12 +1084,18 @@ where
             current_policy.approval(),
         )
         .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
-        if current_policy.context().logical_invocation_id != invocation.id()
-            || current_policy.context().canonical_argument_digest
-                != invocation.canonical_argument_digest()
-            || current_policy.context().policy_revision != definition.approval_policy_revision
-        {
-            return Err(EngineError::new(EngineErrorCode::Policy));
+        if !policy_context_matches(current_policy.context(), definition, &invocation) {
+            return self
+                .commit_policy_denied(
+                    owner_id,
+                    definition,
+                    current,
+                    lease,
+                    checkpoint_version,
+                    checkpoint,
+                    invocation,
+                )
+                .await;
         }
         if !matches!(current_evaluation.decision, PolicyDecision::Allow(_)) {
             return self
@@ -1084,6 +1110,14 @@ where
                 )
                 .await;
         }
+        let policy_guard = DispatchPolicyGuard::from_current_policy(
+            owner_id,
+            current_policy.context(),
+            current_policy.grants(),
+            current_policy.approval(),
+            &current_evaluation,
+        )
+        .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
         let dispatch_grant = if current.run().state() == RunState::Running {
             DispatchGrantMutation::from_current_policy(
                 owner_id,
@@ -1133,8 +1167,8 @@ where
         };
         let manifest_pin = ManifestPin::from_manifest(&manifest)
             .map_err(|_| EngineError::new(EngineErrorCode::ManifestUnavailable))?;
-        let dispatching = InvocationAttemptRecord::new(
-            invocation.binding(),
+        let dispatching = InvocationAttemptRecord::new_durable(
+            &invocation,
             1,
             crate::AttemptRecordState::Dispatching,
             manifest_pin.clone(),
@@ -1236,15 +1270,37 @@ where
             approval_mutation,
             target,
         )
-        .with_checkpoint(dispatch_checkpoint.clone());
+        .with_checkpoint(dispatch_checkpoint.clone())
+        .with_policy_guard(policy_guard);
         if let Some(dispatch_grant) = dispatch_grant {
             dispatch_commit = dispatch_commit.with_dispatch_grant(dispatch_grant);
         }
-        let prepared = self
-            .store
-            .commit_execution(owner_id, dispatch_commit)
-            .await
-            .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
+        let prepared = match self.store.commit_execution(owner_id, dispatch_commit).await {
+            Ok(prepared) => prepared,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    crate::ExecutionStoreErrorCode::PolicyConflict
+                        | crate::ExecutionStoreErrorCode::GrantConflict
+                        | crate::ExecutionStoreErrorCode::GrantAlreadyConsumed
+                        | crate::ExecutionStoreErrorCode::VersionConflict
+                        | crate::ExecutionStoreErrorCode::CheckpointConflict
+                ) =>
+            {
+                return self
+                    .commit_policy_denied(
+                        owner_id,
+                        definition,
+                        current,
+                        lease,
+                        checkpoint_version,
+                        checkpoint,
+                        invocation,
+                    )
+                    .await
+            }
+            Err(_) => return Err(EngineError::new(EngineErrorCode::Store)),
+        };
         for (offset, kind) in dispatch_kinds.into_iter().enumerate() {
             self.emit_semantic(
                 current.run().id(),
@@ -1264,11 +1320,10 @@ where
             .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
         let context = CapabilityExecutionContext::for_attempt(invocation.clone(), attempt)
             .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
-        let result = self
-            .capabilities
-            .execute(context)
-            .await
-            .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+        let (result, renewed) = self
+            .await_with_lease_heartbeat(owner_id, renewed, self.capabilities.execute(context))
+            .await?;
+        let result = result.map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
         if self
             .crash
             .should_crash(EngineCrashPoint::AfterExecutorBeforeResultCommit)
@@ -1285,10 +1340,340 @@ where
             invocation,
             tool_call,
             manifest,
+            1,
             step,
             result,
         )
         .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn recover_checkpointed_capability(
+        &self,
+        owner_id: Uuid,
+        definition: &AgentDefinition,
+        current: crate::StoredRun,
+        lease: crate::ExecutionLease,
+        checkpoint_version: u64,
+        checkpoint: CheckpointV1,
+        invocation: LogicalInvocation,
+        tool_call: ToolCall,
+        manifest: CapabilityManifest,
+        attempt_number: u32,
+    ) -> Result<
+        (
+            crate::StoredRun,
+            crate::ExecutionLease,
+            u64,
+            CheckpointV1,
+            Message,
+        ),
+        EngineError,
+    > {
+        let lease = self.renew(owner_id, lease).await?;
+        let attempt = CapabilityAttempt::new(&invocation, attempt_number)
+            .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+        let context = CapabilityExecutionContext::for_attempt(invocation.clone(), attempt)
+            .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+        let (recovery, lease) = self
+            .await_with_lease_heartbeat(
+                owner_id,
+                lease,
+                self.capabilities.recover_dispatched(context),
+            )
+            .await?;
+        let recovery = recovery.map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+        let step = ExecutionStep::new(
+            current.run().id(),
+            tool_call.id.clone(),
+            StepKind::Capability,
+        )
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+        match recovery {
+            RecoveryAction::Completed(durable) => {
+                self.commit_capability_result(
+                    owner_id,
+                    definition,
+                    current,
+                    lease,
+                    checkpoint_version,
+                    checkpoint,
+                    invocation,
+                    tool_call,
+                    manifest,
+                    attempt_number,
+                    step,
+                    EngineCapabilityResult {
+                        output: CapabilityResult::new(serde_json::json!({
+                            "durable_result_ref": durable.result_ref().handle()
+                        })),
+                        durable,
+                    },
+                )
+                .await
+            }
+            RecoveryAction::RetrySameKey { authorization, .. } => {
+                let retry_attempt_number = authorization.resume_binding().retry_attempt_number();
+                if retry_attempt_number != attempt_number.saturating_add(1) {
+                    return Err(EngineError::new(EngineErrorCode::Capability));
+                }
+                let request = EnginePolicyRequest {
+                    owner_id,
+                    definition: definition.clone(),
+                    manifest: manifest.clone(),
+                    invocation: invocation.clone(),
+                    pending_approval: current.run().pending_approval().cloned(),
+                };
+                let current_policy = self.policy.resolve(request).await?;
+                let evaluation = PolicyEngine::evaluate_with_approval(
+                    current_policy.context(),
+                    current_policy.grants(),
+                    current_policy.approval(),
+                )
+                .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
+                if !policy_context_matches(current_policy.context(), definition, &invocation)
+                    || !matches!(evaluation.decision, PolicyDecision::Allow(_))
+                {
+                    return self
+                        .commit_policy_denied(
+                            owner_id,
+                            definition,
+                            current,
+                            lease,
+                            checkpoint_version,
+                            checkpoint,
+                            invocation,
+                        )
+                        .await;
+                }
+                let policy_guard = DispatchPolicyGuard::from_current_policy(
+                    owner_id,
+                    current_policy.context(),
+                    current_policy.grants(),
+                    current_policy.approval(),
+                    &evaluation,
+                )
+                .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
+                let dispatch_grant = DispatchGrantMutation::from_current_policy(
+                    owner_id,
+                    current_policy.context(),
+                    current_policy.grants(),
+                    &evaluation,
+                )
+                .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
+                let manifest_pin = ManifestPin::from_manifest(&manifest)
+                    .map_err(|_| EngineError::new(EngineErrorCode::ManifestUnavailable))?;
+                let recovery_pause = crate::RecoveryPauseRecord::new(
+                    invocation.binding(),
+                    attempt_number,
+                    manifest_pin.clone(),
+                    crate::RecoveryPauseReason::AuthoritativeAbsence,
+                )
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+                let recovery_record =
+                    crate::RecoveryRecord::new_with_pause(recovery_pause, None)
+                        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+                let uncertain = InvocationAttemptRecord::new_durable(
+                    &invocation,
+                    attempt_number,
+                    crate::AttemptRecordState::Uncertain,
+                    manifest_pin.clone(),
+                    manifest.recovery_mode,
+                )
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+                let dispatching = InvocationAttemptRecord::new_durable(
+                    &invocation,
+                    retry_attempt_number,
+                    crate::AttemptRecordState::Dispatching,
+                    manifest_pin,
+                    manifest.recovery_mode,
+                )
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+                let first_sequence = checkpoint.last_durable_event_sequence() + 1;
+                let kinds = [
+                    RuntimeEventKind::CapabilityFailed,
+                    RuntimeEventKind::PolicyEvaluated,
+                    RuntimeEventKind::InvocationDispatchPrepared,
+                ];
+                let events = kinds
+                    .into_iter()
+                    .enumerate()
+                    .map(|(offset, kind)| {
+                        self.event(
+                            owner_id,
+                            current.run(),
+                            first_sequence + u64::try_from(offset).unwrap_or(0),
+                            kind,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let dispatch_sequence = first_sequence + 2;
+                let mut attempts = checkpoint.attempts().to_vec();
+                let existing = attempts
+                    .iter_mut()
+                    .find(|attempt| {
+                        attempt.invocation().id() == invocation.id()
+                            && attempt.attempt_number() == attempt_number
+                    })
+                    .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
+                *existing = uncertain.clone();
+                attempts.push(dispatching.clone());
+                let mut uncertain_invocations = checkpoint.uncertain_invocations().to_vec();
+                if !uncertain_invocations.iter().any(|record| {
+                    record.invocation().id() == invocation.id()
+                        && record.attempt_number() == attempt_number
+                }) {
+                    uncertain_invocations.push(recovery_record.clone());
+                }
+                let retry_checkpoint = CheckpointV1Builder::new(
+                    checkpoint.session_id(),
+                    checkpoint.run_id(),
+                    checkpoint.definition().clone(),
+                    dispatch_sequence,
+                    checkpoint.manifests().to_vec(),
+                    checkpoint.budget().clone(),
+                    checkpoint.usage().clone(),
+                )
+                .state(RunState::Running, None)
+                .attempts(attempts)
+                .completed_invocations(checkpoint.completed_invocations().to_vec())
+                .uncertain_invocations(uncertain_invocations)
+                .pending_approval(None)
+                .message_context_refs(checkpoint.message_context_refs().to_vec())
+                .model_context_refs(checkpoint.model_context_refs().to_vec())
+                .memory_refs(checkpoint.memory_refs().to_vec())
+                .artifact_refs(checkpoint.artifact_refs().to_vec())
+                .cursor(Some(
+                    CheckpointCursor::new(
+                        invocation.id(),
+                        retry_attempt_number,
+                        tool_call.id.clone(),
+                    )
+                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                ))
+                .build()
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+                let mut commit = crate::ExecutionCommit::new(
+                    current.run_version(),
+                    checkpoint_version,
+                    lease.clone(),
+                    RuntimeCommand::prepare_recovery_dispatch(
+                        deterministic_id(
+                            current.run().id(),
+                            "recovery-dispatch",
+                            dispatch_sequence,
+                        ),
+                        current.run().session_id(),
+                        current.run().id(),
+                        recovery_record,
+                    )
+                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                    events,
+                    vec![],
+                    vec![uncertain, dispatching],
+                    vec![],
+                    None,
+                    current.run().clone(),
+                )
+                .with_checkpoint(retry_checkpoint.clone())
+                .with_policy_guard(policy_guard);
+                if let Some(dispatch_grant) = dispatch_grant {
+                    commit = commit.with_dispatch_grant(dispatch_grant);
+                }
+                let prepared = match self.store.commit_execution(owner_id, commit).await {
+                    Ok(prepared) => prepared,
+                    Err(error)
+                        if matches!(
+                            error.code(),
+                            crate::ExecutionStoreErrorCode::PolicyConflict
+                                | crate::ExecutionStoreErrorCode::GrantConflict
+                                | crate::ExecutionStoreErrorCode::GrantAlreadyConsumed
+                                | crate::ExecutionStoreErrorCode::VersionConflict
+                                | crate::ExecutionStoreErrorCode::CheckpointConflict
+                        ) =>
+                    {
+                        return self
+                            .commit_policy_denied(
+                                owner_id,
+                                definition,
+                                current,
+                                lease,
+                                checkpoint_version,
+                                checkpoint,
+                                invocation,
+                            )
+                            .await
+                    }
+                    Err(_) => return Err(EngineError::new(EngineErrorCode::Store)),
+                };
+                for (offset, kind) in kinds.into_iter().enumerate() {
+                    self.emit_semantic(
+                        current.run().id(),
+                        first_sequence + u64::try_from(offset).unwrap_or(0),
+                        kind,
+                    )
+                    .await;
+                }
+                if self
+                    .crash
+                    .should_crash(EngineCrashPoint::AfterDispatchCommitBeforeExecutor)
+                {
+                    return Err(EngineError::new(EngineErrorCode::CrashInjected));
+                }
+                let lease = self.renew(owner_id, lease).await?;
+                let retry = CapabilityAttempt::new(&invocation, retry_attempt_number)
+                    .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+                let retry_context =
+                    CapabilityExecutionContext::for_attempt(invocation.clone(), retry)
+                        .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+                let (result, lease) = self
+                    .await_with_lease_heartbeat(
+                        owner_id,
+                        lease,
+                        self.capabilities
+                            .execute_retry(retry_context, authorization),
+                    )
+                    .await?;
+                let result = result.map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
+                if self
+                    .crash
+                    .should_crash(EngineCrashPoint::AfterExecutorBeforeResultCommit)
+                {
+                    return Err(EngineError::new(EngineErrorCode::CrashInjected));
+                }
+                self.commit_capability_result(
+                    owner_id,
+                    definition,
+                    prepared.stored_run().clone(),
+                    lease,
+                    prepared.checkpoint_version(),
+                    retry_checkpoint,
+                    invocation,
+                    tool_call,
+                    manifest,
+                    retry_attempt_number,
+                    step,
+                    result,
+                )
+                .await
+            }
+            other => {
+                self.commit_recovery_required(
+                    owner_id,
+                    definition,
+                    current,
+                    lease,
+                    checkpoint_version,
+                    checkpoint,
+                    invocation,
+                    tool_call,
+                    manifest,
+                    attempt_number,
+                    other,
+                )
+                .await
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1303,6 +1688,7 @@ where
         invocation: LogicalInvocation,
         tool_call: ToolCall,
         manifest: CapabilityManifest,
+        attempt_number: u32,
         action: RecoveryAction,
     ) -> Result<
         (
@@ -1328,14 +1714,18 @@ where
         };
         let manifest_pin = ManifestPin::from_manifest(&manifest)
             .map_err(|_| EngineError::new(EngineErrorCode::ManifestUnavailable))?;
-        let pause =
-            crate::RecoveryPauseRecord::new(invocation.binding(), 1, manifest_pin.clone(), reason)
-                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+        let pause = crate::RecoveryPauseRecord::new(
+            invocation.binding(),
+            attempt_number,
+            manifest_pin.clone(),
+            reason,
+        )
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
         let recovery = crate::RecoveryRecord::new_with_pause(pause.clone(), None)
             .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
-        let uncertain = InvocationAttemptRecord::new(
-            invocation.binding(),
-            1,
+        let uncertain = InvocationAttemptRecord::new_durable(
+            &invocation,
+            attempt_number,
             crate::AttemptRecordState::Uncertain,
             manifest_pin,
             manifest.recovery_mode,
@@ -1356,7 +1746,8 @@ where
         let existing = attempts
             .iter_mut()
             .find(|attempt| {
-                attempt.invocation().id() == invocation.id() && attempt.attempt_number() == 1
+                attempt.invocation().id() == invocation.id()
+                    && attempt.attempt_number() == attempt_number
             })
             .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
         *existing = uncertain.clone();
@@ -1380,7 +1771,7 @@ where
         .memory_refs(checkpoint.memory_refs().to_vec())
         .artifact_refs(checkpoint.artifact_refs().to_vec())
         .cursor(Some(
-            CheckpointCursor::new(invocation.id(), 1, tool_call.id.clone())
+            CheckpointCursor::new(invocation.id(), attempt_number, tool_call.id.clone())
                 .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
         ))
         .build()
@@ -1485,6 +1876,45 @@ where
             })
             .collect::<Result<Vec<_>, _>>()?;
         let last_sequence = first_sequence + 2;
+        let mut attempts = checkpoint.attempts().to_vec();
+        let mut uncertain_invocations = checkpoint.uncertain_invocations().to_vec();
+        let mut attempt_mutations = vec![];
+        let mut denial_recovery = None;
+        if let Some(existing) = attempts.iter_mut().find(|attempt| {
+            attempt.invocation().id() == invocation.id()
+                && attempt.state() == crate::AttemptRecordState::Dispatching
+        }) {
+            let durable_invocation = existing
+                .durable_invocation()
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
+                .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
+            let uncertain = InvocationAttemptRecord::new_durable(
+                &durable_invocation,
+                existing.attempt_number(),
+                crate::AttemptRecordState::Uncertain,
+                existing.manifest().clone(),
+                existing.recovery_mode(),
+            )
+            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            let pause = crate::RecoveryPauseRecord::new(
+                uncertain.invocation().clone(),
+                uncertain.attempt_number(),
+                uncertain.manifest().clone(),
+                crate::RecoveryPauseReason::AuthoritativeAbsence,
+            )
+            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            let recovery = crate::RecoveryRecord::new_with_pause(pause, None)
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            *existing = uncertain.clone();
+            attempt_mutations.push(uncertain);
+            if !uncertain_invocations.iter().any(|record| {
+                record.invocation().id() == recovery.invocation().id()
+                    && record.attempt_number() == recovery.attempt_number()
+            }) {
+                uncertain_invocations.push(recovery.clone());
+            }
+            denial_recovery = Some(recovery);
+        }
         let denied_checkpoint = CheckpointV1Builder::new(
             checkpoint.session_id(),
             checkpoint.run_id(),
@@ -1495,9 +1925,9 @@ where
             checkpoint.usage().clone(),
         )
         .state(RunState::Paused, Some(crate::RunPauseReason::PolicyDenied))
-        .attempts(checkpoint.attempts().to_vec())
+        .attempts(attempts)
         .completed_invocations(checkpoint.completed_invocations().to_vec())
-        .uncertain_invocations(checkpoint.uncertain_invocations().to_vec())
+        .uncertain_invocations(uncertain_invocations)
         .pending_approval(None)
         .message_context_refs(checkpoint.message_context_refs().to_vec())
         .model_context_refs(checkpoint.model_context_refs().to_vec())
@@ -1505,6 +1935,23 @@ where
         .artifact_refs(checkpoint.artifact_refs().to_vec())
         .cursor(checkpoint.cursor().cloned())
         .build()
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+        let command = if let Some(recovery) = denial_recovery {
+            RuntimeCommand::pause_with_recovery(
+                deterministic_id(current.run().id(), "policy-denied", last_sequence),
+                current.run().session_id(),
+                current.run().id(),
+                crate::RunPauseReason::PolicyDenied,
+                recovery,
+            )
+        } else {
+            RuntimeCommand::pause(
+                deterministic_id(current.run().id(), "policy-denied", last_sequence),
+                current.run().session_id(),
+                current.run().id(),
+                crate::RunPauseReason::PolicyDenied,
+            )
+        }
         .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
         let committed = self
             .store
@@ -1514,16 +1961,10 @@ where
                     current.run_version(),
                     checkpoint_version,
                     lease.clone(),
-                    RuntimeCommand::pause(
-                        deterministic_id(current.run().id(), "policy-denied", last_sequence),
-                        current.run().session_id(),
-                        current.run().id(),
-                        crate::RunPauseReason::PolicyDenied,
-                    )
-                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                    command,
                     events,
                     vec![],
-                    vec![],
+                    attempt_mutations,
                     vec![],
                     None,
                     target,
@@ -1569,6 +2010,7 @@ where
         invocation: LogicalInvocation,
         tool_call: ToolCall,
         manifest: CapabilityManifest,
+        attempt_number: u32,
         step: ExecutionStep,
         result: EngineCapabilityResult,
     ) -> Result<
@@ -1583,9 +2025,9 @@ where
     > {
         let manifest_pin = ManifestPin::from_manifest(&manifest)
             .map_err(|_| EngineError::new(EngineErrorCode::ManifestUnavailable))?;
-        let completed_attempt = InvocationAttemptRecord::new(
-            invocation.binding(),
-            1,
+        let completed_attempt = InvocationAttemptRecord::new_durable(
+            &invocation,
+            attempt_number,
             crate::AttemptRecordState::Completed,
             manifest_pin.clone(),
             manifest.recovery_mode,
@@ -1593,7 +2035,7 @@ where
         .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
         let completed = CompletedInvocationRecord::new(
             invocation.binding(),
-            1,
+            attempt_number,
             manifest_pin,
             manifest.recovery_mode,
             OpaqueReference::new(result.durable.result_ref().handle())
@@ -1621,7 +2063,8 @@ where
         let stored_attempt = completed_attempts
             .iter_mut()
             .find(|attempt| {
-                attempt.invocation().id() == invocation.id() && attempt.attempt_number() == 1
+                attempt.invocation().id() == invocation.id()
+                    && attempt.attempt_number() == attempt_number
             })
             .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
         *stored_attempt = completed_attempt.clone();
@@ -1641,7 +2084,7 @@ where
             completed_attempts,
             completed_invocations,
             Some(
-                CheckpointCursor::new(invocation.id(), 1, tool_call.id.clone())
+                CheckpointCursor::new(invocation.id(), attempt_number, tool_call.id.clone())
                     .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
             ),
         )?;
@@ -1705,6 +2148,44 @@ where
             completed_checkpoint,
             message,
         ))
+    }
+
+    async fn await_with_lease_heartbeat<T, F>(
+        &self,
+        owner_id: Uuid,
+        lease: crate::ExecutionLease,
+        operation: F,
+    ) -> Result<(T, crate::ExecutionLease), EngineError>
+    where
+        F: Future<Output = T>,
+    {
+        let lease = Arc::new(AsyncMutex::new(lease));
+        let heartbeat_lease = lease.clone();
+        let engine = self;
+        let heartbeat = async move {
+            loop {
+                let current = heartbeat_lease.lock().await.clone();
+                let renew_at_ms = current
+                    .expires_at_ms()
+                    .saturating_sub(engine.config.lease_duration_ms.saturating_div(2).max(1));
+                engine.clock.wait_until_ms(renew_at_ms).await;
+                let current = heartbeat_lease.lock().await.clone();
+                let renewed = engine.renew(owner_id, current).await?;
+                *heartbeat_lease.lock().await = renewed;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), EngineError>(())
+        };
+        match select(Box::pin(operation), Box::pin(heartbeat)).await {
+            Either::Left((output, _heartbeat)) => {
+                let latest = lease.lock().await.clone();
+                Ok((output, latest))
+            }
+            Either::Right((heartbeat_result, _operation)) => {
+                heartbeat_result?;
+                Err(EngineError::new(EngineErrorCode::Store))
+            }
+        }
     }
 
     async fn renew(
@@ -2063,6 +2544,64 @@ fn deterministic_id(run_id: Uuid, label: &str, sequence: u64) -> Uuid {
         &ENGINE_ID_NAMESPACE,
         format!("{run_id}:{label}:{sequence}").as_bytes(),
     )
+}
+
+fn tool_call_from_invocation(invocation: &LogicalInvocation) -> Result<ToolCall, EngineError> {
+    let arguments = invocation
+        .normalized_arguments()
+        .as_object()
+        .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
+    let args = arguments
+        .iter()
+        .map(|(key, value)| {
+            json_to_data_value(value)
+                .map(|value| (key.clone(), value))
+                .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ToolCall {
+        id: invocation.logical_step_id().to_owned(),
+        name: invocation.capability_id().to_owned(),
+        args,
+    })
+}
+
+fn policy_context_matches(
+    context: &PolicyContext,
+    definition: &AgentDefinition,
+    invocation: &LogicalInvocation,
+) -> bool {
+    context.agent_definition_id == definition.id
+        && context.agent_definition_version == definition.version
+        && context.run_id == invocation.run_id()
+        && context.logical_step_id == invocation.logical_step_id()
+        && context.logical_invocation_id == invocation.id()
+        && context.capability_id == invocation.capability_id()
+        && context.manifest_version == invocation.manifest_version()
+        && context.canonical_argument_digest == invocation.canonical_argument_digest()
+        && context.policy_revision == definition.approval_policy_revision
+}
+
+fn json_to_data_value(value: &serde_json::Value) -> Option<crate::DataValue> {
+    match value {
+        serde_json::Value::Null => Some(crate::DataValue::Null),
+        serde_json::Value::Bool(value) => Some(crate::DataValue::Bool(*value)),
+        serde_json::Value::Number(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(crate::DataValue::Number),
+        serde_json::Value::String(value) => Some(crate::DataValue::String(value.clone())),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(json_to_data_value)
+            .collect::<Option<Vec<_>>>()
+            .map(crate::DataValue::Array),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| json_to_data_value(value).map(|value| (key.clone(), value)))
+            .collect::<Option<std::collections::BTreeMap<_, _>>>()
+            .map(crate::DataValue::Object),
+    }
 }
 
 fn agent_config(definition: &AgentDefinition) -> AgentConfig {

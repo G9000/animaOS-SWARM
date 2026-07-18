@@ -445,24 +445,39 @@ impl CapabilityRegistry {
     /// Imports a store-authoritative dispatch commit into capability lineage before recovery.
     ///
     /// This is deliberately narrower than a generic lineage mutation: only an exact validated
-    /// first attempt may establish `Uncertain` from absence, and any existing Task 2 lineage is
-    /// preserved. It closes the crash window between the engine's durable dispatch commit and
-    /// executor entry without minting a new logical invocation identity.
+    /// first attempt may establish `Uncertain` from absence. A later attempt may only be imported
+    /// by consuming the exact `RetryAuthorized` lineage created by recovery. It closes the crash
+    /// window between the engine's durable dispatch commit and executor entry without minting a
+    /// new logical invocation or retry authority.
     pub async fn recover_dispatched(
         &self,
         context: CapabilityExecutionContext,
     ) -> Result<RecoveryAction, CapabilityError> {
-        if context.attempt().number() != 1 {
-            return Err(CapabilityError::validation());
-        }
         let manifest = self.manifest_for_context(&context)?;
         self.validate_context(&context, manifest).await?;
         let key = (context.invocation().id(), context.attempt().number());
-        if self.lineage.load(key.0, key.1).await?.is_none() {
-            let _ = self
-                .lineage
-                .compare_exchange(key.0, key.1, None, CapabilityAttemptLineageState::Uncertain)
-                .await?;
+        match self.lineage.load(key.0, key.1).await? {
+            None if key.1 == 1 => {
+                let _ = self
+                    .lineage
+                    .compare_exchange(key.0, key.1, None, CapabilityAttemptLineageState::Uncertain)
+                    .await?;
+            }
+            None => return Err(CapabilityError::validation()),
+            Some(authorized @ CapabilityAttemptLineageState::RetryAuthorized { .. })
+                if key.1 > 1 =>
+            {
+                let _ = self
+                    .lineage
+                    .compare_exchange(
+                        key.0,
+                        key.1,
+                        Some(authorized),
+                        CapabilityAttemptLineageState::Uncertain,
+                    )
+                    .await?;
+            }
+            Some(_) => {}
         }
         self.recover(context).await
     }

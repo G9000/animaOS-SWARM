@@ -1274,6 +1274,8 @@ enum RuntimeCommandPayload {
     },
     PrepareDispatch {
         run_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<Box<RecoveryRecord>>,
     },
     RequestApproval {
         run_id: Uuid,
@@ -1286,6 +1288,8 @@ enum RuntimeCommandPayload {
     Pause {
         run_id: Uuid,
         reason: RunPauseReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<Box<RecoveryRecord>>,
     },
     ResumeApproval {
         run_id: Uuid,
@@ -1325,7 +1329,7 @@ impl RuntimeCommandPayload {
         match self {
             Self::Start { run_id }
             | Self::RecordProgress { run_id }
-            | Self::PrepareDispatch { run_id }
+            | Self::PrepareDispatch { run_id, .. }
             | Self::RequestApproval { run_id, .. }
             | Self::RequireRecovery { run_id, .. }
             | Self::Pause { run_id, .. }
@@ -1349,8 +1353,28 @@ impl RuntimeCommandPayload {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
                 }
             }
-            Self::Pause { reason, .. } if *reason == RunPauseReason::RecoveryRequired => {
-                return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+            Self::PrepareDispatch {
+                run_id,
+                recovery: Some(recovery),
+            } => {
+                if recovery.invocation().run_id() != *run_id {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
+            }
+            Self::Pause {
+                run_id,
+                reason,
+                recovery,
+            } => {
+                if *reason == RunPauseReason::RecoveryRequired {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
+                if recovery
+                    .as_ref()
+                    .is_some_and(|record| record.invocation().run_id() != *run_id)
+                {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
             }
             _ => {}
         }
@@ -1419,7 +1443,25 @@ impl RuntimeCommand {
         Self::new(
             id,
             session_id,
-            RuntimeCommandPayload::PrepareDispatch { run_id },
+            RuntimeCommandPayload::PrepareDispatch {
+                run_id,
+                recovery: None,
+            },
+        )
+    }
+    pub fn prepare_recovery_dispatch(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        recovery: RecoveryRecord,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::PrepareDispatch {
+                run_id,
+                recovery: Some(Box::new(recovery)),
+            },
         )
     }
     pub fn require_recovery(
@@ -1443,7 +1485,28 @@ impl RuntimeCommand {
         Self::new(
             id,
             session_id,
-            RuntimeCommandPayload::Pause { run_id, reason },
+            RuntimeCommandPayload::Pause {
+                run_id,
+                reason,
+                recovery: None,
+            },
+        )
+    }
+    pub fn pause_with_recovery(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        reason: RunPauseReason,
+        recovery: RecoveryRecord,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::Pause {
+                run_id,
+                reason,
+                recovery: Some(Box::new(recovery)),
+            },
         )
     }
     pub fn resume_approval(
@@ -1519,6 +1582,14 @@ impl RuntimeCommand {
     pub fn recovery_record(&self) -> Option<&RecoveryRecord> {
         match &self.payload {
             RuntimeCommandPayload::RequireRecovery { recovery, .. } => Some(recovery),
+            RuntimeCommandPayload::PrepareDispatch {
+                recovery: Some(recovery),
+                ..
+            } => Some(recovery),
+            RuntimeCommandPayload::Pause {
+                recovery: Some(recovery),
+                ..
+            } => Some(recovery),
             _ => None,
         }
     }

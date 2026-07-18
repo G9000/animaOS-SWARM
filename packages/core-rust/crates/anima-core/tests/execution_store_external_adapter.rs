@@ -1,9 +1,10 @@
 use anima_core::{
     assert_execution_store_conformance, AuthoritativeGrantChange, AuthoritativeGrantState,
-    CheckpointV1, CreateRun, DurableCapabilityResult, EventReplayPage, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreFactory, GrantAuthorityKey, InMemoryExecutionStore, InvocationAttemptRecord,
-    ManualExecutionClock, StoreHistoryPage, StoreReadPage, StoredRun,
+    AuthoritativePolicyChange, AuthoritativePolicyState, CheckpointV1, CreateRun,
+    DurableCapabilityResult, EventReplayPage, ExecutionCommit, ExecutionCommitOutcome,
+    ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreFactory,
+    GrantAuthorityKey, InMemoryExecutionStore, InvocationAttemptRecord, ManualExecutionClock,
+    StoreHistoryPage, StoreReadPage, StoredRun,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -18,6 +19,27 @@ struct PublicApiDelegatingAdapter {
 
 #[async_trait::async_trait]
 impl ExecutionStore for PublicApiDelegatingAdapter {
+    async fn apply_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        change: AuthoritativePolicyChange,
+    ) -> Result<AuthoritativePolicyState, ExecutionStoreError> {
+        self.reference
+            .apply_authoritative_policy(owner_id, change)
+            .await
+    }
+
+    async fn load_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        agent_definition_id: &str,
+        agent_definition_version: u32,
+    ) -> Result<Option<AuthoritativePolicyState>, ExecutionStoreError> {
+        self.reference
+            .load_authoritative_policy(owner_id, agent_definition_id, agent_definition_version)
+            .await
+    }
+
     async fn apply_authoritative_grant(
         &self,
         owner_id: Uuid,

@@ -1,9 +1,10 @@
 use anima_core::{
     assert_execution_store_conformance, ApprovalDecision, ApprovalGrantMutation,
     ApprovalResumeClaim, AttemptRecordState, AuthoritativeGrantChange,
-    AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus, AutonomyGrant,
-    Budget, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointCursor,
-    CheckpointMutation, CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin,
+    AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus,
+    AuthoritativePolicyChange, AuthoritativePolicyState, AutonomyGrant, Budget, CapabilityKind,
+    CapabilityManifest, CapabilityReferenceId, CheckpointCursor, CheckpointMutation,
+    CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin, DispatchPolicyGuard,
     DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
     ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
     ExecutionStoreFactory, GrantAuthorityBinding, GrantEffect, GrantScope, GrantStatus,
@@ -17,6 +18,57 @@ use uuid::Uuid;
 
 fn id(value: u128) -> Uuid {
     Uuid::from_u128(value)
+}
+
+fn dispatch_policy_guard(
+    owner_id: Uuid,
+    session: &Session,
+    invocation: &LogicalInvocation,
+) -> DispatchPolicyGuard {
+    let manifest = CapabilityManifest::new(anima_core::CapabilityManifestInput {
+        id: invocation.capability_id().into(),
+        version: invocation.manifest_version(),
+        kind: CapabilityKind::Workspace,
+        label: "Write".into(),
+        description: "Writes a workspace file".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: serde_json::json!({"type": "object"}),
+        side_effects: true,
+        risk_level: RiskLevel::Low,
+        host_permissions: vec![],
+        secret_references: vec![],
+        environment_requirements: vec![],
+        timeout_ms: 1_000,
+        cancellation_supported: true,
+        max_retries: 0,
+        idempotent: true,
+        recovery_mode: RecoveryMode::KeyedIdempotent,
+        supports_streaming: false,
+        supports_artifacts: false,
+        supports_citations: false,
+        compatibility: RuntimeCompatibility {
+            minimum_runtime_schema_version: 1,
+            maximum_runtime_schema_version: 1,
+            manifest_schema_version: 1,
+        },
+    })
+    .unwrap();
+    let context = PolicyContext::new(
+        owner_id.to_string(),
+        "actor",
+        session.definition().id(),
+        session.definition().version(),
+        "workspace",
+        CapabilityReferenceId::new(invocation.run_id()),
+        &manifest,
+        invocation,
+        1,
+        PolicyRestrictions::default(),
+        1_000,
+    )
+    .unwrap();
+    let evaluation = PolicyEngine::evaluate(&context, &[]).unwrap();
+    DispatchPolicyGuard::from_current_policy(owner_id, &context, &[], None, &evaluation).unwrap()
 }
 
 #[derive(Default)]
@@ -279,6 +331,29 @@ fn authoritative_grants_are_owner_scoped_opaque_and_bind_immutable_authority() {
     let changed = AuthoritativeGrantState::from_grant(owner, &changed_scope).unwrap();
     assert_eq!(state.authority_key(), changed.authority_key());
     assert_ne!(state.full_grant_digest(), changed.full_grant_digest());
+}
+
+#[test]
+fn authoritative_policy_state_revalidates_serde_and_redacts_debug() {
+    let owner = id(0x905);
+    let state =
+        AuthoritativePolicyState::active(owner, "private-policy", 3, 7, Some(9_000)).unwrap();
+    let encoded = serde_json::to_string(&state).unwrap();
+    let decoded: AuthoritativePolicyState = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, state);
+    assert!(!format!("{state:?}").contains("private-policy"));
+    assert!(
+        serde_json::from_value::<AuthoritativePolicyState>(serde_json::json!({
+            "owner_id": Uuid::nil(),
+            "agent_definition_id": "",
+            "agent_definition_version": 0,
+            "revision": 0,
+            "status": "active",
+            "valid_until_ms": 0
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -1072,6 +1147,22 @@ async fn execution_history_only_allows_dispatching_to_terminal_attempt_transitio
         )
         .await
         .unwrap();
+    store
+        .apply_authoritative_policy(
+            owner_id,
+            AuthoritativePolicyChange::create(
+                AuthoritativePolicyState::active(
+                    owner_id,
+                    session.definition().id(),
+                    session.definition().version(),
+                    1,
+                    None,
+                )
+                .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
     let invocation = LogicalInvocation::new(
         queued.id(),
         "append-only",
@@ -1145,7 +1236,8 @@ async fn execution_history_only_allows_dispatching_to_terminal_attempt_transitio
                 vec![],
                 None,
                 running.clone(),
-            ),
+            )
+            .with_policy_guard(dispatch_policy_guard(owner_id, &session, &invocation)),
         )
         .await
         .unwrap();

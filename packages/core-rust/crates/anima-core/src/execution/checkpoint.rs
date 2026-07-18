@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -10,8 +11,8 @@ use super::state::{
 };
 use crate::{
     AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, CapabilityManifest,
-    LogicalInvocationBinding, ManifestCatalog, RecoveryMode, RecoveryResumeBinding,
-    SUPPORTED_DEFINITION_SCHEMA_VERSION,
+    LogicalInvocation, LogicalInvocationBinding, ManifestCatalog, RecoveryMode,
+    RecoveryResumeBinding, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -262,6 +263,8 @@ impl<'de> Deserialize<'de> for CheckpointCursor {
 #[serde(deny_unknown_fields)]
 pub struct InvocationAttemptRecord {
     invocation: LogicalInvocationBinding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normalized_arguments: Option<Value>,
     attempt_number: u32,
     state: AttemptRecordState,
     manifest: ManifestPin,
@@ -271,6 +274,8 @@ pub struct InvocationAttemptRecord {
 #[serde(deny_unknown_fields)]
 struct InvocationAttemptRecordWire {
     invocation: LogicalInvocationBinding,
+    #[serde(default)]
+    normalized_arguments: Option<Value>,
     attempt_number: u32,
     state: AttemptRecordState,
     manifest: ManifestPin,
@@ -286,6 +291,25 @@ impl InvocationAttemptRecord {
     ) -> Result<Self, ExecutionError> {
         let value = Self {
             invocation,
+            normalized_arguments: None,
+            attempt_number,
+            state,
+            manifest,
+            recovery_mode,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn new_durable(
+        invocation: &LogicalInvocation,
+        attempt_number: u32,
+        state: AttemptRecordState,
+        manifest: ManifestPin,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self, ExecutionError> {
+        let value = Self {
+            invocation: invocation.binding(),
+            normalized_arguments: Some(invocation.normalized_arguments().clone()),
             attempt_number,
             state,
             manifest,
@@ -301,6 +325,19 @@ impl InvocationAttemptRecord {
             || self.recovery_mode != self.manifest.recovery_mode()
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        }
+        if let Some(arguments) = &self.normalized_arguments {
+            let reconstructed = LogicalInvocation::new(
+                self.invocation.run_id(),
+                self.invocation.logical_step_id(),
+                self.invocation.capability_id(),
+                self.invocation.manifest_version(),
+                arguments.clone(),
+            )
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))?;
+            if reconstructed.binding() != self.invocation {
+                return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+            }
         }
         Ok(())
     }
@@ -319,18 +356,35 @@ impl InvocationAttemptRecord {
     pub fn recovery_mode(&self) -> RecoveryMode {
         self.recovery_mode
     }
+    pub fn durable_invocation(&self) -> Result<Option<LogicalInvocation>, ExecutionError> {
+        self.normalized_arguments
+            .as_ref()
+            .map(|arguments| {
+                LogicalInvocation::new(
+                    self.invocation.run_id(),
+                    self.invocation.logical_step_id(),
+                    self.invocation.capability_id(),
+                    self.invocation.manifest_version(),
+                    arguments.clone(),
+                )
+                .map_err(|_| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))
+            })
+            .transpose()
+    }
 }
 impl<'de> Deserialize<'de> for InvocationAttemptRecord {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = InvocationAttemptRecordWire::deserialize(d)?;
-        Self::new(
-            w.invocation,
-            w.attempt_number,
-            w.state,
-            w.manifest,
-            w.recovery_mode,
-        )
-        .map_err(serde::de::Error::custom)
+        let value = Self {
+            invocation: w.invocation,
+            normalized_arguments: w.normalized_arguments,
+            attempt_number: w.attempt_number,
+            state: w.state,
+            manifest: w.manifest,
+            recovery_mode: w.recovery_mode,
+        };
+        value.validate().map_err(serde::de::Error::custom)?;
+        Ok(value)
     }
 }
 

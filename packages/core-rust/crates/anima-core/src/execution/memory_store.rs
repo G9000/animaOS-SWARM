@@ -1,3 +1,4 @@
+use futures::task::AtomicWaker;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{Excluded, Included};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,10 +11,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    AuthoritativeGrantChange, AuthoritativeGrantState, CheckpointMutation, CreateRun,
-    ExecutionClock, ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStore,
-    ExecutionStoreError, ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy,
-    StoredRun,
+    AuthoritativeGrantChange, AuthoritativeGrantState, AuthoritativePolicyChange,
+    AuthoritativePolicyState, CheckpointMutation, CreateRun, ExecutionClock, ExecutionCommit,
+    ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy, StoredRun,
 };
 use crate::{CommandReceipt, DurableCapabilityResult, RunState};
 
@@ -56,6 +57,7 @@ struct State {
     receipts: BTreeMap<(Uuid, Uuid), CommandReceipt>,
     outcomes: BTreeMap<(Uuid, Uuid), ExecutionCommitOutcome>,
     authoritative_grants: BTreeMap<(Uuid, String), AuthoritativeGrantState>,
+    authoritative_policies: BTreeMap<(Uuid, String, u32), AuthoritativePolicyState>,
     grant_consumptions: BTreeSet<(Uuid, String, u32, Uuid)>,
 }
 
@@ -106,6 +108,7 @@ impl InMemoryExecutionStore {
 #[derive(Debug, Default)]
 struct SystemExecutionClock;
 
+#[async_trait]
 impl ExecutionClock for SystemExecutionClock {
     fn now_ms(&self) -> u64 {
         SystemTime::now()
@@ -115,25 +118,32 @@ impl ExecutionClock for SystemExecutionClock {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ManualExecutionClock {
     now_ms: Arc<AtomicU64>,
+    waker: Arc<AtomicWaker>,
 }
 
 impl ManualExecutionClock {
     pub fn new(now_ms: u64) -> Self {
         Self {
             now_ms: Arc::new(AtomicU64::new(now_ms)),
+            waker: Arc::new(AtomicWaker::new()),
         }
     }
 
     pub fn advance_ms(&self, duration_ms: u64) -> Result<(), ExecutionStoreError> {
-        self.now_ms
+        let advanced = self
+            .now_ms
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
                 now.checked_add(duration_ms)
             })
             .map(|_| ())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow));
+        if advanced.is_ok() {
+            self.waker.wake();
+        }
+        advanced
     }
 }
 
@@ -143,9 +153,25 @@ impl Default for ManualExecutionClock {
     }
 }
 
+#[async_trait]
 impl ExecutionClock for ManualExecutionClock {
     fn now_ms(&self) -> u64 {
         self.now_ms.load(Ordering::SeqCst)
+    }
+
+    async fn wait_until_ms(&self, deadline_ms: u64) {
+        futures::future::poll_fn(|context| {
+            if self.now_ms() >= deadline_ms {
+                return std::task::Poll::Ready(());
+            }
+            self.waker.register(context.waker());
+            if self.now_ms() >= deadline_ms {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
     }
 }
 
@@ -289,6 +315,48 @@ fn hex_value(value: u8) -> Option<u8> {
 
 #[async_trait]
 impl ExecutionStore for InMemoryExecutionStore {
+    async fn apply_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        change: AuthoritativePolicyChange,
+    ) -> Result<AuthoritativePolicyState, ExecutionStoreError> {
+        if owner_id.is_nil() {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        let (definition_id, definition_version) = change.key();
+        let key = (owner_id, definition_id, definition_version);
+        let mut state = self.state.lock().await;
+        let next = change.apply_to(state.authoritative_policies.get(&key))?;
+        if next.owner_id() != owner_id {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        state.authoritative_policies.insert(key, next.clone());
+        Ok(next)
+    }
+
+    async fn load_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        agent_definition_id: &str,
+        agent_definition_version: u32,
+    ) -> Result<Option<AuthoritativePolicyState>, ExecutionStoreError> {
+        Ok(self
+            .state
+            .lock()
+            .await
+            .authoritative_policies
+            .get(&(
+                owner_id,
+                agent_definition_id.to_owned(),
+                agent_definition_version,
+            ))
+            .cloned())
+    }
+
     async fn apply_authoritative_grant(
         &self,
         owner_id: Uuid,
@@ -791,6 +859,35 @@ fn build_commit_patch(
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
+    }
+
+    let dispatching_attempts = commit
+        .attempts()
+        .iter()
+        .filter(|attempt| attempt.state() == super::AttemptRecordState::Dispatching)
+        .collect::<Vec<_>>();
+    match (dispatching_attempts.as_slice(), commit.policy_guard()) {
+        ([attempt], Some(guard)) if guard.matches_attempt(owner_id, attempt) => {
+            let authority = state
+                .authoritative_policies
+                .get(&(
+                    owner_id,
+                    guard.agent_definition_id().to_owned(),
+                    guard.agent_definition_version(),
+                ))
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::PolicyConflict))?;
+            if !authority.validates(guard, now_ms) {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::PolicyConflict,
+                ));
+            }
+        }
+        ([], None) => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::PolicyConflict,
+            ))
+        }
     }
 
     let current_event_count = u64::try_from(aggregate.events.len())
