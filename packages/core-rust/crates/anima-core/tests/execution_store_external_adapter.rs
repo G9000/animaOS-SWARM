@@ -1,192 +1,150 @@
-use std::collections::BTreeMap;
-
 use anima_core::{
-    AuthoritativeGrantChange, AuthoritativeGrantChangeKind, AuthoritativeGrantState, CheckpointV1,
-    CreateRun, DurableCapabilityResult, EventReplayPage, ExecutionCommit, ExecutionCommitOutcome,
-    ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
-    InMemoryExecutionStore, InvocationAttemptRecord, StoreReadPage, StoredRun,
+    assert_execution_store_conformance, AuthoritativeGrantChange, AuthoritativeGrantState,
+    CheckpointV1, CreateRun, DurableCapabilityResult, EventReplayPage, ExecutionCommit,
+    ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreFactory, GrantAuthorityKey, InMemoryExecutionStore, InvocationAttemptRecord,
+    StoreReadPage, StoredRun,
 };
-use futures::lock::Mutex;
 use uuid::Uuid;
 
+/// A separately compiled adapter demonstrates that the complete scoped port is implementable
+/// without access to crate-private authority material.
 #[derive(Default)]
 struct ExternalStyleAdapter {
-    runs: InMemoryExecutionStore,
-    grants: Mutex<BTreeMap<String, AuthoritativeGrantState>>,
+    durable: InMemoryExecutionStore,
 }
 
 #[async_trait::async_trait]
 impl ExecutionStore for ExternalStyleAdapter {
     async fn apply_authoritative_grant(
         &self,
+        owner_id: Uuid,
         change: AuthoritativeGrantChange,
     ) -> Result<AuthoritativeGrantState, ExecutionStoreError> {
-        let mut grants = self.grants.lock().await;
-        let next = match change.kind() {
-            AuthoritativeGrantChangeKind::Create(state) => {
-                if grants.contains_key(state.grant_id()) {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::VersionConflict,
-                    ));
-                }
-                state.clone()
-            }
-            AuthoritativeGrantChangeKind::Update {
-                expected_revision,
-                state,
-            } => {
-                let current = grants.get(state.grant_id()).ok_or_else(|| {
-                    ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
-                })?;
-                if current.revision() != *expected_revision {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::VersionConflict,
-                    ));
-                }
-                state.clone()
-            }
-            AuthoritativeGrantChangeKind::Revoke {
-                grant_id,
-                expected_revision,
-            } => {
-                let current = grants.get(grant_id).ok_or_else(|| {
-                    ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
-                })?;
-                if current.revision() != *expected_revision {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::VersionConflict,
-                    ));
-                }
-                AuthoritativeGrantState::revoked(
-                    grant_id,
-                    current.revision(),
-                    current.remaining_uses(),
-                )?
-            }
-        };
-        grants.insert(next.grant_id().to_owned(), next.clone());
-        Ok(next)
+        self.durable
+            .apply_authoritative_grant(owner_id, change)
+            .await
     }
 
     async fn load_authoritative_grant(
         &self,
-        grant_id: &str,
+        owner_id: Uuid,
+        authority_key: &GrantAuthorityKey,
     ) -> Result<Option<AuthoritativeGrantState>, ExecutionStoreError> {
-        Ok(self.grants.lock().await.get(grant_id).cloned())
+        self.durable
+            .load_authoritative_grant(owner_id, authority_key)
+            .await
     }
 
-    async fn create_run(&self, request: CreateRun) -> Result<StoredRun, ExecutionStoreError> {
-        self.runs.create_run(request).await
+    async fn create_run(
+        &self,
+        owner_id: Uuid,
+        request: CreateRun,
+    ) -> Result<StoredRun, ExecutionStoreError> {
+        self.durable.create_run(owner_id, request).await
     }
 
     async fn acquire_lease(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         expected_run_version: u64,
         duration_ms: u64,
     ) -> Result<ExecutionLease, ExecutionStoreError> {
-        self.runs
-            .acquire_lease(run_id, expected_run_version, duration_ms)
+        self.durable
+            .acquire_lease(owner_id, run_id, expected_run_version, duration_ms)
             .await
     }
 
     async fn renew_lease(
         &self,
+        owner_id: Uuid,
         lease: ExecutionLease,
         duration_ms: u64,
     ) -> Result<ExecutionLease, ExecutionStoreError> {
-        self.runs.renew_lease(lease, duration_ms).await
+        self.durable.renew_lease(owner_id, lease, duration_ms).await
     }
 
     async fn commit_execution(
         &self,
+        owner_id: Uuid,
         commit: ExecutionCommit,
     ) -> Result<ExecutionCommitOutcome, ExecutionStoreError> {
-        self.runs.commit_execution(commit).await
+        self.durable.commit_execution(owner_id, commit).await
     }
 
-    async fn load_run(&self, run_id: Uuid) -> Result<Option<StoredRun>, ExecutionStoreError> {
-        self.runs.load_run(run_id).await
+    async fn load_run(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<StoredRun>, ExecutionStoreError> {
+        self.durable.load_run(owner_id, run_id).await
     }
 
     async fn load_checkpoint(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
     ) -> Result<Option<(u64, CheckpointV1)>, ExecutionStoreError> {
-        self.runs.load_checkpoint(run_id).await
+        self.durable.load_checkpoint(owner_id, run_id).await
     }
 
     async fn load_steps_page(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
     ) -> Result<Vec<ExecutionStep>, ExecutionStoreError> {
-        self.runs.load_steps_page(run_id, page).await
+        self.durable.load_steps_page(owner_id, run_id, page).await
     }
 
     async fn load_attempts_page(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
     ) -> Result<Vec<InvocationAttemptRecord>, ExecutionStoreError> {
-        self.runs.load_attempts_page(run_id, page).await
+        self.durable
+            .load_attempts_page(owner_id, run_id, page)
+            .await
     }
 
     async fn load_durable_result(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         logical_invocation_id: Uuid,
     ) -> Result<Option<DurableCapabilityResult>, ExecutionStoreError> {
-        self.runs
-            .load_durable_result(run_id, logical_invocation_id)
+        self.durable
+            .load_durable_result(owner_id, run_id, logical_invocation_id)
             .await
     }
 
     async fn replay_events(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
     ) -> Result<EventReplayPage, ExecutionStoreError> {
-        self.runs.replay_events(run_id, page).await
+        self.durable.replay_events(owner_id, run_id, page).await
+    }
+}
+
+#[derive(Default)]
+struct ExternalStyleAdapterFactory;
+
+#[async_trait::async_trait]
+impl ExecutionStoreFactory for ExternalStyleAdapterFactory {
+    type Store = ExternalStyleAdapter;
+
+    async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError> {
+        Ok(ExternalStyleAdapter::default())
     }
 }
 
 #[tokio::test]
-async fn external_adapter_can_implement_the_complete_public_grant_port() {
-    let adapter = ExternalStyleAdapter::default();
-    let created = adapter
-        .apply_authoritative_grant(AuthoritativeGrantChange::create(
-            AuthoritativeGrantState::active("external-adapter-grant", 1, Some(2)).unwrap(),
-        ))
+async fn external_adapter_runs_the_full_scoped_public_conformance_suite() {
+    assert_execution_store_conformance(&ExternalStyleAdapterFactory)
         .await
         .unwrap();
-    let upgraded = adapter
-        .apply_authoritative_grant(
-            AuthoritativeGrantChange::update(
-                created.revision(),
-                AuthoritativeGrantState::active("external-adapter-grant", 2, Some(1)).unwrap(),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-    let revoked = adapter
-        .apply_authoritative_grant(
-            AuthoritativeGrantChange::revoke("external-adapter-grant", upgraded.revision())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(
-        revoked.status(),
-        anima_core::AuthoritativeGrantStatus::Revoked
-    );
-    assert_eq!(
-        adapter
-            .load_authoritative_grant("external-adapter-grant")
-            .await
-            .unwrap(),
-        Some(revoked)
-    );
 }

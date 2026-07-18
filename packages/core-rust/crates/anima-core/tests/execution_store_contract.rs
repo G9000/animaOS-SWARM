@@ -39,27 +39,31 @@ async fn public_adapter_conformance_suite_runs_against_memory_store() {
 #[tokio::test]
 async fn authoritative_grant_state_uses_trusted_create_update_and_revoke_cas() {
     let store = InMemoryExecutionStore::default();
-    let created = AuthoritativeGrantState::active("grant-cas", 1, Some(2)).unwrap();
+    let owner_id = id(0x8f0);
+    let created_grant = authority_fixture("grant-cas", 1, Some(2));
+    let created = AuthoritativeGrantState::from_grant(owner_id, &created_grant).unwrap();
     assert_eq!(
         store
-            .apply_authoritative_grant(AuthoritativeGrantChange::create(created.clone()))
+            .apply_authoritative_grant(owner_id, AuthoritativeGrantChange::create(created.clone()),)
             .await
             .unwrap(),
         created
     );
     assert_eq!(
         store
-            .apply_authoritative_grant(AuthoritativeGrantChange::create(created))
+            .apply_authoritative_grant(owner_id, AuthoritativeGrantChange::create(created))
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::VersionConflict
     );
 
-    let upgraded = AuthoritativeGrantState::active("grant-cas", 2, Some(3)).unwrap();
+    let upgraded_grant = authority_fixture("grant-cas", 2, Some(3));
+    let upgraded = AuthoritativeGrantState::from_grant(owner_id, &upgraded_grant).unwrap();
     assert_eq!(
         store
             .apply_authoritative_grant(
+                owner_id,
                 AuthoritativeGrantChange::update(1, upgraded.clone()).unwrap(),
             )
             .await
@@ -69,9 +73,14 @@ async fn authoritative_grant_state_uses_trusted_create_update_and_revoke_cas() {
     assert_eq!(
         store
             .apply_authoritative_grant(
+                owner_id,
                 AuthoritativeGrantChange::update(
                     1,
-                    AuthoritativeGrantState::active("grant-cas", 3, Some(4)).unwrap(),
+                    AuthoritativeGrantState::from_grant(
+                        owner_id,
+                        &authority_fixture("grant-cas", 3, Some(4)),
+                    )
+                    .unwrap(),
                 )
                 .unwrap(),
             )
@@ -82,12 +91,18 @@ async fn authoritative_grant_state_uses_trusted_create_update_and_revoke_cas() {
     );
 
     let revoked = store
-        .apply_authoritative_grant(AuthoritativeGrantChange::revoke("grant-cas", 2).unwrap())
+        .apply_authoritative_grant(
+            owner_id,
+            AuthoritativeGrantChange::revoke(upgraded.authority_key().clone(), 2).unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(revoked.status(), AuthoritativeGrantStatus::Revoked);
     assert_eq!(
-        store.load_authoritative_grant("grant-cas").await.unwrap(),
+        store
+            .load_authoritative_grant(owner_id, upgraded.authority_key())
+            .await
+            .unwrap(),
         Some(revoked)
     );
 }
@@ -97,45 +112,132 @@ fn external_adapters_can_exhaustively_inspect_validated_grant_changes() {
     fn inspect(change: &AuthoritativeGrantChange) -> (&str, Option<u32>, Option<u32>) {
         match change.kind() {
             AuthoritativeGrantChangeKind::Create(state) => {
-                (state.grant_id(), None, Some(state.revision()))
+                (state.authority_key_encoded(), None, Some(state.revision()))
             }
             AuthoritativeGrantChangeKind::Update {
                 expected_revision,
                 state,
             } => (
-                state.grant_id(),
+                state.authority_key_encoded(),
                 Some(*expected_revision),
                 Some(state.revision()),
             ),
             AuthoritativeGrantChangeKind::Revoke {
-                grant_id,
+                authority_key,
                 expected_revision,
-            } => (grant_id, Some(*expected_revision), None),
+            } => (authority_key.as_str(), Some(*expected_revision), None),
         }
     }
 
+    let owner_id = id(0x8f1);
     let create = AuthoritativeGrantChange::create(
-        AuthoritativeGrantState::active("external-grant", 1, Some(2)).unwrap(),
+        AuthoritativeGrantState::from_grant(
+            owner_id,
+            &authority_fixture("external-grant", 1, Some(2)),
+        )
+        .unwrap(),
     );
     let update = AuthoritativeGrantChange::update(
         1,
-        AuthoritativeGrantState::active("external-grant", 2, Some(1)).unwrap(),
+        AuthoritativeGrantState::from_grant(
+            owner_id,
+            &authority_fixture("external-grant", 2, Some(1)),
+        )
+        .unwrap(),
     )
     .unwrap();
-    let revoke = AuthoritativeGrantChange::revoke("external-grant", 2).unwrap();
-    let revoked = AuthoritativeGrantState::revoked("external-grant", 3, Some(1)).unwrap();
+    let revoke = AuthoritativeGrantChange::revoke(update.authority_key().clone(), 2).unwrap();
 
-    assert_eq!(inspect(&create), ("external-grant", None, Some(1)));
-    assert_eq!(inspect(&update), ("external-grant", Some(1), Some(2)));
-    assert_eq!(inspect(&revoke), ("external-grant", Some(2), None));
-    assert_eq!(revoked.status(), AuthoritativeGrantStatus::Revoked);
-    assert!(AuthoritativeGrantChange::update(0, revoked).is_err());
+    assert_eq!(inspect(&create).1, None);
+    assert_eq!(inspect(&update).1, Some(1));
+    assert_eq!(inspect(&revoke).1, Some(2));
+    assert_eq!(inspect(&create).0, inspect(&update).0);
+    assert_eq!(inspect(&update).0, inspect(&revoke).0);
+}
+
+fn authority_fixture(raw_id: &str, revision: u32, remaining_uses: Option<u32>) -> AutonomyGrant {
+    AutonomyGrant::new_with_effect(
+        raw_id,
+        revision,
+        GrantStatus::Active,
+        GrantScope::new(
+            "authority-owner",
+            "authority-actor",
+            "authority-agent",
+            1,
+            "authority-workspace",
+            CapabilityReferenceId::new(id(0x8f2)),
+            "workspace.write",
+            1,
+            None,
+        )
+        .unwrap(),
+        RiskLevel::High,
+        1,
+        Some(10_000),
+        remaining_uses,
+        GrantEffect::ApprovalRequired,
+    )
+    .unwrap()
+}
+
+#[test]
+fn authoritative_grants_are_owner_scoped_opaque_and_bind_the_full_grant() {
+    let owner = id(0x900);
+    let grant = AutonomyGrant::new_with_effect(
+        "raw-grant-id-must-never-persist",
+        7,
+        GrantStatus::Active,
+        GrantScope::new(
+            "policy-owner",
+            "actor",
+            "writer",
+            3,
+            "workspace",
+            CapabilityReferenceId::new(id(0x901)),
+            "workspace.write",
+            1,
+            Some(id(0x902)),
+        )
+        .unwrap(),
+        RiskLevel::Critical,
+        500,
+        Some(2_000),
+        Some(2),
+        GrantEffect::ApprovalRequired,
+    )
+    .unwrap();
+    let state = AuthoritativeGrantState::from_grant(owner, &grant).unwrap();
+    let encoded = serde_json::to_string(&state).unwrap();
+    let debug = format!("{state:?}");
+
+    assert_eq!(state.owner_id(), owner);
+    assert_eq!(state.revision(), grant.revision);
+    assert_eq!(state.remaining_uses(), grant.remaining_uses);
+    assert_eq!(state.effect(), grant.effect);
+    assert_eq!(state.maximum_risk(), grant.maximum_risk);
+    assert!(!state.authority_key().as_str().contains(&grant.id));
+    assert!(!state.full_grant_digest().contains(&grant.id));
+    assert!(!encoded.contains(&grant.id));
+    assert!(!debug.contains(&grant.id));
+
+    let mut changed_scope = grant.clone();
+    changed_scope.scope.workspace_id = "other-workspace".into();
+    let changed = AuthoritativeGrantState::from_grant(owner, &changed_scope).unwrap();
+    assert_eq!(state.authority_key(), changed.authority_key());
+    assert_ne!(state.full_grant_digest(), changed.full_grant_digest());
 }
 
 fn approval_resume_parts(
     session: &Session,
     run_id: Uuid,
-) -> (Run, Run, RuntimeCommand, ApprovalGrantMutation) {
+) -> (
+    Run,
+    Run,
+    RuntimeCommand,
+    ApprovalGrantMutation,
+    AutonomyGrant,
+) {
     let manifest = CapabilityManifest {
         id: "workspace.write".into(),
         version: 1,
@@ -211,7 +313,9 @@ fn approval_resume_parts(
     .unwrap();
     let request = PolicyEngine::approval_request(&context, Some(&grant)).unwrap();
     let decision = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
-    let claim = ApprovalResumeClaim::new(&request, &decision, &context, &[grant]).unwrap();
+    let claim =
+        ApprovalResumeClaim::new(&request, &decision, &context, std::slice::from_ref(&grant))
+            .unwrap();
     let waiting = Run::queued(run_id, session.id(), "writer", 3)
         .unwrap()
         .transition(RunState::Running, None)
@@ -231,27 +335,35 @@ fn approval_resume_parts(
         target,
         command,
         ApprovalGrantMutation::from_claim(claim),
+        grant,
     )
 }
 
 #[tokio::test]
 async fn validated_approval_claim_and_grant_consumption_commit_once_with_command_replay() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(65);
     let session = Session::new(id(60), "writer", 3, SessionConcurrencyPolicy::Serial).unwrap();
-    let (waiting, target, command, approval) = approval_resume_parts(&session, id(63));
+    let (waiting, target, command, approval, grant) = approval_resume_parts(&session, id(63));
     assert_eq!(approval.remaining_uses(), Some(1));
-    let consumption = approval.grant_consumption().unwrap().clone();
+    assert!(approval.grant_consumption().is_some());
     store
-        .create_run(CreateRun::new_for_owner(
-            id(65),
-            session.clone(),
-            waiting,
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(65),
+                session.clone(),
+                waiting,
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
-    let lease = store.acquire_lease(id(63), 1, 1_000).await.unwrap();
+    let lease = store
+        .acquire_lease(owner_id, id(63), 1, 1_000)
+        .await
+        .unwrap();
     let event = RuntimeEvent::new(
         id(64),
         id(65),
@@ -276,43 +388,51 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
     );
     assert_eq!(
         store
-            .commit_execution(commit.clone())
+            .commit_execution(owner_id, commit.clone())
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::GrantConflict
     );
     store
-        .apply_authoritative_grant(AuthoritativeGrantChange::create(
-            AuthoritativeGrantState::active(
-                consumption.grant_id,
-                consumption.grant_revision,
-                Some(1),
-            )
-            .unwrap(),
-        ))
+        .apply_authoritative_grant(
+            owner_id,
+            AuthoritativeGrantChange::create(
+                AuthoritativeGrantState::from_grant(owner_id, &grant).unwrap(),
+            ),
+        )
         .await
         .unwrap();
-    store.commit_execution(commit.clone()).await.unwrap();
-    store.commit_execution(commit).await.unwrap();
+    store
+        .commit_execution(owner_id, commit.clone())
+        .await
+        .unwrap();
+    store.commit_execution(owner_id, commit).await.unwrap();
 }
 
 #[tokio::test]
 async fn terminal_commit_releases_the_serial_session_claim() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(44);
     let session = Session::new(id(40), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(41), session.id(), "writer", 1).unwrap();
     store
-        .create_run(CreateRun::new_for_owner(
-            id(44),
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(44),
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
-    let lease = store.acquire_lease(queued.id(), 1, 1_000).await.unwrap();
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), 1, 1_000)
+        .await
+        .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
     let started = RuntimeEvent::new(
         id(43),
@@ -325,18 +445,21 @@ async fn terminal_commit_releases_the_serial_session_claim() {
     )
     .unwrap();
     store
-        .commit_execution(ExecutionCommit::new(
-            1,
-            0,
-            lease.clone(),
-            RuntimeCommand::start(id(42), session.id(), queued.id()).unwrap(),
-            vec![started],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            running.clone(),
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                1,
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(42), session.id(), queued.id()).unwrap(),
+                vec![started],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
         .await
         .unwrap();
     let cancelled = running.transition(RunState::Cancelled, None).unwrap();
@@ -351,29 +474,35 @@ async fn terminal_commit_releases_the_serial_session_claim() {
     )
     .unwrap();
     store
-        .commit_execution(ExecutionCommit::new(
-            2,
-            0,
-            store.renew_lease(lease, 1_000).await.unwrap(),
-            RuntimeCommand::cancel(id(47), session.id(), queued.id()).unwrap(),
-            vec![cancelled_event],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            cancelled,
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                2,
+                0,
+                store.renew_lease(owner_id, lease, 1_000).await.unwrap(),
+                RuntimeCommand::cancel(id(47), session.id(), queued.id()).unwrap(),
+                vec![cancelled_event],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                cancelled,
+            ),
+        )
         .await
         .unwrap();
 
     store
-        .create_run(CreateRun::new_for_owner(
-            id(44),
-            session.clone(),
-            Run::queued(id(48), session.id(), "writer", 1).unwrap(),
-            2,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(44),
+                session.clone(),
+                Run::queued(id(48), session.id(), "writer", 1).unwrap(),
+                2,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
 }
@@ -382,20 +511,24 @@ async fn terminal_commit_releases_the_serial_session_claim() {
 async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
     let store = InMemoryExecutionStore::default();
     let owner = id(80);
+    let owner_id = owner;
     let session = Session::new(id(81), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(82), session.id(), "writer", 1).unwrap();
     let created = store
-        .create_run(CreateRun::new_for_owner(
-            owner,
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner,
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
     let lease = store
-        .acquire_lease(queued.id(), created.run_version(), 1_000)
+        .acquire_lease(owner_id, queued.id(), created.run_version(), 1_000)
         .await
         .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
@@ -410,18 +543,21 @@ async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
     )
     .unwrap();
     let running_outcome = store
-        .commit_execution(ExecutionCommit::new(
-            created.run_version(),
-            0,
-            lease.clone(),
-            RuntimeCommand::start(id(84), session.id(), queued.id()).unwrap(),
-            vec![started],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            running.clone(),
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(84), session.id(), queued.id()).unwrap(),
+                vec![started],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
         .await
         .unwrap();
     let cancelled = running.transition(RunState::Cancelled, None).unwrap();
@@ -436,38 +572,44 @@ async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
     )
     .unwrap();
     let terminal = store
-        .commit_execution(ExecutionCommit::new(
-            running_outcome.stored_run().run_version(),
-            0,
-            store.renew_lease(lease, 1_000).await.unwrap(),
-            RuntimeCommand::cancel(id(86), session.id(), queued.id()).unwrap(),
-            vec![cancelled_event],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            cancelled,
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                running_outcome.stored_run().run_version(),
+                0,
+                store.renew_lease(owner_id, lease, 1_000).await.unwrap(),
+                RuntimeCommand::cancel(id(86), session.id(), queued.id()).unwrap(),
+                vec![cancelled_event],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                cancelled,
+            ),
+        )
         .await
         .unwrap();
 
     let wrong_owner_run = Run::queued(id(87), session.id(), "writer", 1).unwrap();
     assert_eq!(
         store
-            .create_run(CreateRun::new_for_owner(
-                id(88),
-                session.clone(),
-                wrong_owner_run.clone(),
-                terminal.stored_run().session_version(),
-                SessionConcurrencyPolicy::Serial,
-            ))
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    id(88),
+                    session.clone(),
+                    wrong_owner_run.clone(),
+                    terminal.stored_run().session_version(),
+                    SessionConcurrencyPolicy::Serial,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::InvalidRequest
     );
     assert!(store
-        .load_run(wrong_owner_run.id())
+        .load_run(owner_id, wrong_owner_run.id())
         .await
         .unwrap()
         .is_none());
@@ -477,19 +619,26 @@ async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
     let changed_run = Run::queued(id(89), changed_session.id(), "writer", 2).unwrap();
     assert_eq!(
         store
-            .create_run(CreateRun::new_for_owner(
-                owner,
-                changed_session,
-                changed_run.clone(),
-                terminal.stored_run().session_version(),
-                SessionConcurrencyPolicy::Serial,
-            ))
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    owner,
+                    changed_session,
+                    changed_run.clone(),
+                    terminal.stored_run().session_version(),
+                    SessionConcurrencyPolicy::Serial,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::InvalidRequest
     );
-    assert!(store.load_run(changed_run.id()).await.unwrap().is_none());
+    assert!(store
+        .load_run(owner_id, changed_run.id())
+        .await
+        .unwrap()
+        .is_none());
 
     let terminal_session =
         Session::new(id(90), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
@@ -501,13 +650,16 @@ async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
         .unwrap();
     assert_eq!(
         store
-            .create_run(CreateRun::new_for_owner(
-                owner,
-                terminal_session,
-                terminal_run,
-                0,
-                SessionConcurrencyPolicy::Serial,
-            ))
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    owner,
+                    terminal_session,
+                    terminal_run,
+                    0,
+                    SessionConcurrencyPolicy::Serial,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -518,16 +670,20 @@ async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
 #[tokio::test]
 async fn logical_invocation_results_accept_identical_replays_and_reject_conflicts() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(54);
     let session = Session::new(id(50), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(51), session.id(), "writer", 1).unwrap();
     let created = store
-        .create_run(CreateRun::new_for_owner(
-            id(54),
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(54),
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
     let invocation = LogicalInvocation::new(
@@ -570,7 +726,10 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
     )
     .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
-    let lease = store.acquire_lease(queued.id(), 1, 1_000).await.unwrap();
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), 1, 1_000)
+        .await
+        .unwrap();
     let first_event = RuntimeEvent::new(
         id(53),
         id(54),
@@ -598,38 +757,48 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
     );
     assert_eq!(
         store
-            .commit_execution(missing_attempt)
+            .commit_execution(owner_id, missing_attempt)
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::LineageConflict
     );
-    assert_eq!(store.load_run(queued.id()).await.unwrap().unwrap(), created);
+    assert_eq!(
+        store
+            .load_run(owner_id, queued.id())
+            .await
+            .unwrap()
+            .unwrap(),
+        created
+    );
     assert!(store
-        .load_durable_result(queued.id(), invocation.id())
+        .load_durable_result(owner_id, queued.id(), invocation.id())
         .await
         .unwrap()
         .is_none());
     store
-        .commit_execution(ExecutionCommit::new(
-            1,
-            0,
-            lease.clone(),
-            RuntimeCommand::start(id(55), session.id(), queued.id()).unwrap(),
-            vec![first_event],
-            vec![],
-            vec![attempt.clone()],
-            vec![DurableResultMutation::new(
-                completed.clone(),
-                result.clone(),
-            )],
-            None,
-            running.clone(),
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                1,
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(55), session.id(), queued.id()).unwrap(),
+                vec![first_event],
+                vec![],
+                vec![attempt.clone()],
+                vec![DurableResultMutation::new(
+                    completed.clone(),
+                    result.clone(),
+                )],
+                None,
+                running.clone(),
+            ),
+        )
         .await
         .unwrap();
 
-    let renewed = store.renew_lease(lease, 1_000).await.unwrap();
+    let renewed = store.renew_lease(owner_id, lease, 1_000).await.unwrap();
     let conflicting_result = DurableCapabilityResult::new(
         CapabilityReferenceId::new(id(52)),
         format!("jcs-v1:{}", "3".repeat(64)),
@@ -650,18 +819,21 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
     .unwrap();
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                2,
-                0,
-                renewed,
-                RuntimeCommand::advance(id(57), session.id(), queued.id()).unwrap(),
-                vec![second_event],
-                vec![],
-                vec![attempt],
-                vec![DurableResultMutation::new(completed, conflicting_result)],
-                None,
-                running,
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    2,
+                    0,
+                    renewed,
+                    RuntimeCommand::advance(id(57), session.id(), queued.id()).unwrap(),
+                    vec![second_event],
+                    vec![],
+                    vec![attempt],
+                    vec![DurableResultMutation::new(completed, conflicting_result)],
+                    None,
+                    running,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -672,16 +844,20 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
 #[tokio::test]
 async fn execution_step_and_attempt_history_is_append_only() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(73);
     let session = Session::new(id(70), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(71), session.id(), "writer", 1).unwrap();
     store
-        .create_run(CreateRun::new_for_owner(
-            id(73),
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(73),
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
     let invocation = LogicalInvocation::new(
@@ -710,7 +886,10 @@ async fn execution_step_and_attempt_history_is_append_only() {
     let step =
         ExecutionStep::new(queued.id(), "append-only", anima_core::StepKind::Capability).unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
-    let lease = store.acquire_lease(queued.id(), 1, 1_000).await.unwrap();
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), 1, 1_000)
+        .await
+        .unwrap();
     let event = RuntimeEvent::new(
         id(72),
         id(73),
@@ -722,34 +901,40 @@ async fn execution_step_and_attempt_history_is_append_only() {
     )
     .unwrap();
     store
-        .commit_execution(ExecutionCommit::new(
-            1,
-            0,
-            lease.clone(),
-            RuntimeCommand::start(id(74), session.id(), queued.id()).unwrap(),
-            vec![event],
-            vec![step.clone()],
-            vec![pending.clone()],
-            vec![],
-            None,
-            running.clone(),
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                1,
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(74), session.id(), queued.id()).unwrap(),
+                vec![event],
+                vec![step.clone()],
+                vec![pending.clone()],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
         .await
         .unwrap();
 
     store
-        .commit_execution(ExecutionCommit::new(
-            2,
-            0,
-            lease.clone(),
-            RuntimeCommand::advance(id(75), session.id(), queued.id()).unwrap(),
-            vec![],
-            vec![step.clone()],
-            vec![pending.clone()],
-            vec![],
-            None,
-            running.clone(),
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                2,
+                0,
+                lease.clone(),
+                RuntimeCommand::advance(id(75), session.id(), queued.id()).unwrap(),
+                vec![],
+                vec![step.clone()],
+                vec![pending.clone()],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
         .await
         .unwrap();
 
@@ -757,18 +942,21 @@ async fn execution_step_and_attempt_history_is_append_only() {
         ExecutionStep::new(queued.id(), "append-only", anima_core::StepKind::Policy).unwrap();
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                3,
-                0,
-                lease.clone(),
-                RuntimeCommand::advance(id(76), session.id(), queued.id()).unwrap(),
-                vec![],
-                vec![conflicting_step],
-                vec![],
-                vec![],
-                None,
-                running.clone(),
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    3,
+                    0,
+                    lease.clone(),
+                    RuntimeCommand::advance(id(76), session.id(), queued.id()).unwrap(),
+                    vec![],
+                    vec![conflicting_step],
+                    vec![],
+                    vec![],
+                    None,
+                    running.clone(),
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -784,18 +972,21 @@ async fn execution_step_and_attempt_history_is_append_only() {
     .unwrap();
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                3,
-                0,
-                lease,
-                RuntimeCommand::advance(id(77), session.id(), queued.id()).unwrap(),
-                vec![],
-                vec![],
-                vec![conflicting_attempt],
-                vec![],
-                None,
-                running,
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    3,
+                    0,
+                    lease,
+                    RuntimeCommand::advance(id(77), session.id(), queued.id()).unwrap(),
+                    vec![],
+                    vec![],
+                    vec![conflicting_attempt],
+                    vec![],
+                    None,
+                    running,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -803,14 +994,14 @@ async fn execution_step_and_attempt_history_is_append_only() {
     );
     assert_eq!(
         store
-            .load_steps_page(queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .load_steps_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
             .await
             .unwrap(),
         vec![step]
     );
     assert_eq!(
         store
-            .load_attempts_page(queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .load_attempts_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
             .await
             .unwrap(),
         vec![pending]
@@ -820,19 +1011,26 @@ async fn execution_step_and_attempt_history_is_append_only() {
 #[tokio::test]
 async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(24);
     let session = Session::new(id(20), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(21), session.id(), "writer", 1).unwrap();
     store
-        .create_run(CreateRun::new_for_owner(
-            id(24),
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(24),
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
-    let lease = store.acquire_lease(queued.id(), 1, 1_000).await.unwrap();
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), 1, 1_000)
+        .await
+        .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
     let command = RuntimeCommand::start(id(22), session.id(), queued.id()).unwrap();
     let invalid = RuntimeEvent::new(
@@ -848,29 +1046,37 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
 
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                1,
-                0,
-                lease.clone(),
-                command.clone(),
-                vec![invalid],
-                vec![],
-                vec![],
-                vec![],
-                None,
-                running.clone(),
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    1,
+                    0,
+                    lease.clone(),
+                    command.clone(),
+                    vec![invalid],
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    running.clone(),
+                )
+            )
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::EventConflict
     );
     assert_eq!(
-        store.load_run(queued.id()).await.unwrap().unwrap().run(),
+        store
+            .load_run(owner_id, queued.id())
+            .await
+            .unwrap()
+            .unwrap()
+            .run(),
         &queued
     );
     assert!(store
-        .replay_events(queued.id(), StoreReadPage::new(0, 256).unwrap())
+        .replay_events(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
         .await
         .unwrap()
         .events()
@@ -930,6 +1136,7 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
     assert_eq!(
         store
             .commit_execution(
+                owner_id,
                 ExecutionCommit::new(
                     1,
                     0,
@@ -950,12 +1157,12 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
         ExecutionStoreErrorCode::CheckpointConflict
     );
     assert!(store
-        .load_steps_page(queued.id(), StoreReadPage::new(0, 256).unwrap())
+        .load_steps_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
         .await
         .unwrap()
         .is_empty());
     assert!(store
-        .load_attempts_page(queued.id(), StoreReadPage::new(0, 256).unwrap())
+        .load_attempts_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
         .await
         .unwrap()
         .is_empty());
@@ -977,6 +1184,7 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
     .unwrap();
     store
         .commit_execution(
+            owner_id,
             ExecutionCommit::new(
                 1,
                 0,
@@ -998,19 +1206,26 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
 #[tokio::test]
 async fn command_replay_is_idempotent_but_conflicting_payload_is_rejected() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(34);
     let session = Session::new(id(30), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(31), session.id(), "writer", 1).unwrap();
     store
-        .create_run(CreateRun::new_for_owner(
-            id(34),
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(34),
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
-    let lease = store.acquire_lease(queued.id(), 1, 1_000).await.unwrap();
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), 1, 1_000)
+        .await
+        .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
     let command = RuntimeCommand::start(id(32), session.id(), queued.id()).unwrap();
     let event = RuntimeEvent::new(
@@ -1035,24 +1250,30 @@ async fn command_replay_is_idempotent_but_conflicting_payload_is_rejected() {
         None,
         running.clone(),
     );
-    store.commit_execution(commit.clone()).await.unwrap();
-    store.commit_execution(commit).await.unwrap();
+    store
+        .commit_execution(owner_id, commit.clone())
+        .await
+        .unwrap();
+    store.commit_execution(owner_id, commit).await.unwrap();
 
     let conflicting = RuntimeCommand::cancel(command.id(), session.id(), queued.id()).unwrap();
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                2,
-                0,
-                lease,
-                conflicting,
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                None,
-                running,
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    2,
+                    0,
+                    lease,
+                    conflicting,
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    running,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -1064,20 +1285,24 @@ async fn command_replay_is_idempotent_but_conflicting_payload_is_rejected() {
 async fn commands_bind_session_kind_and_exact_run_transition() {
     let store = InMemoryExecutionStore::default();
     let owner = id(100);
+    let owner_id = owner;
     let session = Session::new(id(101), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(102), session.id(), "writer", 1).unwrap();
     let created = store
-        .create_run(CreateRun::new_for_owner(
-            owner,
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner,
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
     let lease = store
-        .acquire_lease(queued.id(), created.run_version(), 1_000)
+        .acquire_lease(owner_id, queued.id(), created.run_version(), 1_000)
         .await
         .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
@@ -1097,18 +1322,21 @@ async fn commands_bind_session_kind_and_exact_run_transition() {
     ] {
         assert_eq!(
             store
-                .commit_execution(ExecutionCommit::new(
-                    created.run_version(),
-                    0,
-                    lease.clone(),
-                    command,
-                    vec![event.clone()],
-                    vec![],
-                    vec![],
-                    vec![],
-                    None,
-                    running.clone(),
-                ))
+                .commit_execution(
+                    owner_id,
+                    ExecutionCommit::new(
+                        created.run_version(),
+                        0,
+                        lease.clone(),
+                        command,
+                        vec![event.clone()],
+                        vec![],
+                        vec![],
+                        vec![],
+                        None,
+                        running.clone(),
+                    )
+                )
                 .await
                 .unwrap_err()
                 .code(),
@@ -1116,50 +1344,59 @@ async fn commands_bind_session_kind_and_exact_run_transition() {
         );
     }
     let started = store
-        .commit_execution(ExecutionCommit::new(
-            created.run_version(),
-            0,
-            lease.clone(),
-            RuntimeCommand::start(id(106), session.id(), queued.id()).unwrap(),
-            vec![event],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            running.clone(),
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(106), session.id(), queued.id()).unwrap(),
+                vec![event],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
         .await
         .unwrap();
     let advanced = store
-        .commit_execution(ExecutionCommit::new(
-            started.stored_run().run_version(),
-            0,
-            lease.clone(),
-            RuntimeCommand::advance(id(107), session.id(), queued.id()).unwrap(),
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            running.clone(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(advanced.stored_run().run(), &running);
-    assert_eq!(
-        store
-            .commit_execution(ExecutionCommit::new(
-                advanced.stored_run().run_version(),
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
                 0,
-                lease,
-                RuntimeCommand::start(id(108), session.id(), queued.id()).unwrap(),
+                lease.clone(),
+                RuntimeCommand::advance(id(107), session.id(), queued.id()).unwrap(),
                 vec![],
                 vec![],
                 vec![],
                 vec![],
                 None,
-                running,
-            ))
+                running.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(advanced.stored_run().run(), &running);
+    assert_eq!(
+        store
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    advanced.stored_run().run_version(),
+                    0,
+                    lease,
+                    RuntimeCommand::start(id(108), session.id(), queued.id()).unwrap(),
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    running,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -1171,20 +1408,24 @@ async fn commands_bind_session_kind_and_exact_run_transition() {
 async fn commit_batches_are_bounded_and_history_reads_are_paged() {
     let store = InMemoryExecutionStore::default();
     let owner = id(110);
+    let owner_id = owner;
     let session = Session::new(id(111), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(112), session.id(), "writer", 1).unwrap();
     let created = store
-        .create_run(CreateRun::new_for_owner(
-            owner,
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner,
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
     let lease = store
-        .acquire_lease(queued.id(), created.run_version(), 1_000)
+        .acquire_lease(owner_id, queued.id(), created.run_version(), 1_000)
         .await
         .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
@@ -1205,24 +1446,34 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
         .collect();
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                created.run_version(),
-                0,
-                lease.clone(),
-                RuntimeCommand::start(id(113), session.id(), queued.id()).unwrap(),
-                oversized_events,
-                vec![],
-                vec![],
-                vec![],
-                None,
-                running.clone(),
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    created.run_version(),
+                    0,
+                    lease.clone(),
+                    RuntimeCommand::start(id(113), session.id(), queued.id()).unwrap(),
+                    oversized_events,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    running.clone(),
+                )
+            )
             .await
             .unwrap_err()
             .code(),
         ExecutionStoreErrorCode::BoundsExceeded
     );
-    assert_eq!(store.load_run(queued.id()).await.unwrap().unwrap(), created);
+    assert_eq!(
+        store
+            .load_run(owner_id, queued.id())
+            .await
+            .unwrap()
+            .unwrap(),
+        created
+    );
 
     let steps = vec![
         ExecutionStep::new(queued.id(), "page-a", anima_core::StepKind::Capability).unwrap(),
@@ -1251,43 +1502,47 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
     })
     .collect::<Vec<_>>();
     store
-        .commit_execution(ExecutionCommit::new(
-            created.run_version(),
-            0,
-            lease,
-            RuntimeCommand::start(id(115), session.id(), queued.id()).unwrap(),
-            events.clone(),
-            steps.clone(),
-            vec![],
-            vec![],
-            None,
-            running,
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease,
+                RuntimeCommand::start(id(115), session.id(), queued.id()).unwrap(),
+                events.clone(),
+                steps.clone(),
+                vec![],
+                vec![],
+                None,
+                running,
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(
         store
-            .load_steps_page(queued.id(), StoreReadPage::new(0, 2).unwrap())
+            .load_steps_page(owner_id, queued.id(), StoreReadPage::new(0, 2).unwrap())
             .await
             .unwrap(),
         steps[..2]
     );
     assert_eq!(
         store
-            .load_steps_page(queued.id(), StoreReadPage::new(2, 2).unwrap())
+            .load_steps_page(owner_id, queued.id(), StoreReadPage::new(2, 2).unwrap())
             .await
             .unwrap(),
         steps[2..]
     );
     assert!(StoreReadPage::new(0, 0).is_err());
     let first_events = store
-        .replay_events(queued.id(), StoreReadPage::new(0, 2).unwrap())
+        .replay_events(owner_id, queued.id(), StoreReadPage::new(0, 2).unwrap())
         .await
         .unwrap();
     assert_eq!(first_events.events(), &events[..2]);
     assert_eq!(first_events.next_after_sequence(), Some(2));
     let last_events = store
         .replay_events(
+            owner_id,
             queued.id(),
             StoreReadPage::new(first_events.next_after_sequence().unwrap(), 2).unwrap(),
         )
@@ -1301,22 +1556,32 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
 #[tokio::test]
 async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() {
     let store = InMemoryExecutionStore::default();
+    let owner_id = id(13);
     let session = Session::new(id(10), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(11), session.id(), "writer", 1).unwrap();
     store
-        .create_run(CreateRun::new_for_owner(
-            id(13),
-            session.clone(),
-            queued.clone(),
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(13),
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
 
-    let stale = store.acquire_lease(queued.id(), 1, 100).await.unwrap();
+    let stale = store
+        .acquire_lease(owner_id, queued.id(), 1, 100)
+        .await
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(250));
-    let current = store.acquire_lease(queued.id(), 1, 1_000).await.unwrap();
+    let current = store
+        .acquire_lease(owner_id, queued.id(), 1, 1_000)
+        .await
+        .unwrap();
     let running = queued.transition(RunState::Running, None).unwrap();
     let event = RuntimeEvent::new(
         id(12),
@@ -1332,18 +1597,21 @@ async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() 
 
     assert_eq!(
         store
-            .commit_execution(ExecutionCommit::new(
-                1,
-                0,
-                stale,
-                command.clone(),
-                vec![event.clone()],
-                vec![],
-                vec![],
-                vec![],
-                None,
-                running.clone(),
-            ))
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    1,
+                    0,
+                    stale,
+                    command.clone(),
+                    vec![event.clone()],
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    running.clone(),
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -1351,23 +1619,26 @@ async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() 
     );
 
     store
-        .commit_execution(ExecutionCommit::new(
-            1,
-            0,
-            current,
-            command,
-            vec![event.clone()],
-            vec![],
-            vec![],
-            vec![],
-            None,
-            running,
-        ))
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                1,
+                0,
+                current,
+                command,
+                vec![event.clone()],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running,
+            ),
+        )
         .await
         .unwrap();
     assert_eq!(
         store
-            .replay_events(queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .replay_events(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
             .await
             .unwrap()
             .events(),
@@ -1377,30 +1648,37 @@ async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() 
 
 /// Reusable adapter conformance case: serial sessions hold one nonterminal run claim.
 pub async fn serial_session_claim_contract<S: ExecutionStore>(store: &S) {
+    let owner_id = id(5);
     let session = Session::new(id(1), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let first = Run::queued(id(2), session.id(), "writer", 1).unwrap();
     let second = Run::queued(id(3), session.id(), "writer", 1).unwrap();
 
     store
-        .create_run(CreateRun::new_for_owner(
-            id(5),
-            session.clone(),
-            first,
-            0,
-            SessionConcurrencyPolicy::Serial,
-        ))
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                id(5),
+                session.clone(),
+                first,
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
         .await
         .unwrap();
 
     assert_eq!(
         store
-            .create_run(CreateRun::new_for_owner(
-                id(5),
-                session.clone(),
-                second,
-                1,
-                SessionConcurrencyPolicy::Serial,
-            ))
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    id(5),
+                    session.clone(),
+                    second,
+                    1,
+                    SessionConcurrencyPolicy::Serial,
+                )
+            )
             .await
             .unwrap_err()
             .code(),
@@ -1408,13 +1686,16 @@ pub async fn serial_session_claim_contract<S: ExecutionStore>(store: &S) {
     );
     assert_eq!(
         store
-            .create_run(CreateRun::new_for_owner(
-                id(5),
-                session,
-                Run::queued(id(4), id(1), "writer", 1).unwrap(),
-                0,
-                SessionConcurrencyPolicy::Serial,
-            ))
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    id(5),
+                    session,
+                    Run::queued(id(4), id(1), "writer", 1).unwrap(),
+                    0,
+                    SessionConcurrencyPolicy::Serial,
+                )
+            )
             .await
             .unwrap_err()
             .code(),

@@ -40,13 +40,13 @@ struct StoredDurableResult {
 
 #[derive(Clone, Default)]
 struct State {
-    sessions: BTreeMap<Uuid, StoredSession>,
-    runs: BTreeMap<Uuid, RunAggregate>,
-    serial_claims: BTreeMap<Uuid, Uuid>,
-    receipts: BTreeMap<Uuid, CommandReceipt>,
-    outcomes: BTreeMap<Uuid, ExecutionCommitOutcome>,
-    authoritative_grants: BTreeMap<String, AuthoritativeGrantState>,
-    grant_consumptions: BTreeSet<(String, u32, Uuid)>,
+    sessions: BTreeMap<(Uuid, Uuid), StoredSession>,
+    runs: BTreeMap<(Uuid, Uuid), RunAggregate>,
+    serial_claims: BTreeMap<(Uuid, Uuid), Uuid>,
+    receipts: BTreeMap<(Uuid, Uuid), CommandReceipt>,
+    outcomes: BTreeMap<(Uuid, Uuid), ExecutionCommitOutcome>,
+    authoritative_grants: BTreeMap<(Uuid, String), AuthoritativeGrantState>,
+    grant_consumptions: BTreeSet<(Uuid, String, u32, Uuid)>,
 }
 
 /// In-process reference adapter. It clones no externally visible state until validation succeeds.
@@ -59,12 +59,23 @@ pub struct InMemoryExecutionStore {
 impl ExecutionStore for InMemoryExecutionStore {
     async fn apply_authoritative_grant(
         &self,
+        owner_id: Uuid,
         change: AuthoritativeGrantChange,
     ) -> Result<AuthoritativeGrantState, ExecutionStoreError> {
+        if owner_id.is_nil()
+            || change
+                .new_state()
+                .is_some_and(|next| next.owner_id() != owner_id)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
         let mut state = self.state.lock().await;
         let next = match change.kind() {
             AuthoritativeGrantChangeKind::Create(next) => {
-                if state.authoritative_grants.contains_key(next.grant_id()) {
+                let key = (owner_id, next.authority_key_encoded().to_owned());
+                if state.authoritative_grants.contains_key(&key) {
                     return Err(ExecutionStoreError::new(
                         ExecutionStoreErrorCode::VersionConflict,
                     ));
@@ -77,7 +88,7 @@ impl ExecutionStore for InMemoryExecutionStore {
             } => {
                 let current = state
                     .authoritative_grants
-                    .get(next.grant_id())
+                    .get(&(owner_id, next.authority_key_encoded().to_owned()))
                     .ok_or_else(|| {
                         ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
                     })?;
@@ -90,12 +101,15 @@ impl ExecutionStore for InMemoryExecutionStore {
                 next.clone()
             }
             AuthoritativeGrantChangeKind::Revoke {
-                grant_id,
+                authority_key,
                 expected_revision,
             } => {
-                let current = state.authoritative_grants.get(grant_id).ok_or_else(|| {
-                    ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
-                })?;
+                let current = state
+                    .authoritative_grants
+                    .get(&(owner_id, authority_key.as_str().to_owned()))
+                    .ok_or_else(|| {
+                        ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
+                    })?;
                 if current.revision() != *expected_revision {
                     return Err(ExecutionStoreError::new(
                         ExecutionStoreErrorCode::VersionConflict,
@@ -104,28 +118,35 @@ impl ExecutionStore for InMemoryExecutionStore {
                 current.as_revoked()
             }
         };
-        state
-            .authoritative_grants
-            .insert(next.grant_id().to_owned(), next.clone());
+        state.authoritative_grants.insert(
+            (owner_id, next.authority_key_encoded().to_owned()),
+            next.clone(),
+        );
         Ok(next)
     }
 
     async fn load_authoritative_grant(
         &self,
-        grant_id: &str,
+        owner_id: Uuid,
+        authority_key: &super::GrantAuthorityKey,
     ) -> Result<Option<AuthoritativeGrantState>, ExecutionStoreError> {
         Ok(self
             .state
             .lock()
             .await
             .authoritative_grants
-            .get(grant_id)
+            .get(&(owner_id, authority_key.as_str().to_owned()))
             .cloned())
     }
 
-    async fn create_run(&self, request: CreateRun) -> Result<StoredRun, ExecutionStoreError> {
+    async fn create_run(
+        &self,
+        owner_id: Uuid,
+        request: CreateRun,
+    ) -> Result<StoredRun, ExecutionStoreError> {
         let session = request.session();
-        if request.owner_id().is_nil()
+        if owner_id.is_nil()
+            || request.owner_id() != owner_id
             || request.run().state().is_terminal()
             || request.run().session_id() != session.id()
             || request.run().definition_id() != session.definition().id()
@@ -138,13 +159,14 @@ impl ExecutionStore for InMemoryExecutionStore {
         }
 
         let mut state = self.state.lock().await;
-        if state.runs.contains_key(&request.run().id()) {
+        if state.runs.contains_key(&(owner_id, request.run().id())) {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::VersionConflict,
             ));
         }
 
-        let session_version = match state.sessions.get(&session.id()) {
+        let session_key = (owner_id, session.id());
+        let session_version = match state.sessions.get(&session_key) {
             Some(current)
                 if current.version == request.expected_session_version()
                     && current.owner_id == request.owner_id()
@@ -177,7 +199,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         };
 
         if request.concurrency_policy() == SessionConcurrencyPolicy::Serial
-            && state.serial_claims.contains_key(&session.id())
+            && state.serial_claims.contains_key(&session_key)
         {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::ActiveRunConflict,
@@ -185,7 +207,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         }
 
         state.sessions.insert(
-            session.id(),
+            session_key,
             StoredSession {
                 version: session_version,
                 owner_id: request.owner_id(),
@@ -194,11 +216,11 @@ impl ExecutionStore for InMemoryExecutionStore {
             },
         );
         if request.concurrency_policy() == SessionConcurrencyPolicy::Serial {
-            state.serial_claims.insert(session.id(), request.run().id());
+            state.serial_claims.insert(session_key, request.run().id());
         }
-        let stored = StoredRun::new(request.run().clone(), 1, session_version)?;
+        let stored = StoredRun::new(owner_id, request.run().clone(), 1, session_version)?;
         state.runs.insert(
-            request.run().id(),
+            (owner_id, request.run().id()),
             RunAggregate {
                 stored: stored.clone(),
                 lease: None,
@@ -214,6 +236,7 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn acquire_lease(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         expected_run_version: u64,
         duration_ms: u64,
@@ -226,7 +249,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         let mut state = self.state.lock().await;
         let aggregate = state
             .runs
-            .get_mut(&run_id)
+            .get_mut(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
         if aggregate.stored.run_version() != expected_run_version {
             return Err(ExecutionStoreError::new(
@@ -258,6 +281,7 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn renew_lease(
         &self,
+        owner_id: Uuid,
         lease: ExecutionLease,
         duration_ms: u64,
     ) -> Result<ExecutionLease, ExecutionStoreError> {
@@ -269,7 +293,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         let mut state = self.state.lock().await;
         let aggregate = state
             .runs
-            .get_mut(&lease.run_id())
+            .get_mut(&(owner_id, lease.run_id()))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
         if aggregate.lease.as_ref() != Some(&lease) {
             return Err(ExecutionStoreError::new(
@@ -292,6 +316,7 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn commit_execution(
         &self,
+        owner_id: Uuid,
         commit: ExecutionCommit,
     ) -> Result<ExecutionCommitOutcome, ExecutionStoreError> {
         commit.validate_bounds()?;
@@ -302,20 +327,21 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ExecutionStoreErrorCode::InvalidRequest,
             ));
         }
-        if let Some(receipt) = state.receipts.get(&commit.command().id()) {
+        let command_key = (owner_id, commit.command().id());
+        if let Some(receipt) = state.receipts.get(&command_key) {
             receipt
                 .replay(commit.command())
                 .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::CommandConflict))?;
             return state
                 .outcomes
-                .get(&commit.command().id())
+                .get(&command_key)
                 .cloned()
                 .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound));
         }
 
         let mut aggregate = state
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .cloned()
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
         if aggregate.stored.run_version() != commit.expected_run_version() {
@@ -363,7 +389,7 @@ impl ExecutionStore for InMemoryExecutionStore {
             .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::EventConflict))?;
         let owner_id = state
             .sessions
-            .get(&aggregate.stored.run().session_id())
+            .get(&(owner_id, aggregate.stored.run().session_id()))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
             .owner_id;
         if commit.events().iter().any(|event| {
@@ -411,15 +437,19 @@ impl ExecutionStore for InMemoryExecutionStore {
                 approval.grant_revision(),
                 approval.grant_remaining_uses(),
             ) {
-                (Some(grant_id), Some(grant_revision), claimed_remaining) => {
+                (Some(_grant_id), Some(grant_revision), claimed_remaining) => {
+                    let binding = approval.claim().grant_authority_binding().ok_or_else(|| {
+                        ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
+                    })?;
                     let mut authoritative = state
                         .authoritative_grants
-                        .get(grant_id)
+                        .get(&(owner_id, binding.authority_key().as_str().to_owned()))
                         .cloned()
                         .ok_or_else(|| {
                             ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
                         })?;
-                    if authoritative.status() != AuthoritativeGrantStatus::Active
+                    if authoritative.binding()? != *binding
+                        || authoritative.status() != AuthoritativeGrantStatus::Active
                         || authoritative.revision() != grant_revision
                         || authoritative.remaining_uses() != claimed_remaining
                     {
@@ -436,15 +466,15 @@ impl ExecutionStore for InMemoryExecutionStore {
                                     ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
                                 })?;
                             if snapshot.remaining_uses() != remaining
-                                || consumption.grant_id != grant_id
-                                || consumption.grant_revision != grant_revision
+                                || !binding.matches_consumption(consumption)
                             {
                                 return Err(ExecutionStoreError::new(
                                     ExecutionStoreErrorCode::GrantConflict,
                                 ));
                             }
                             let key = (
-                                consumption.grant_id.clone(),
+                                owner_id,
+                                binding.authority_key().as_str().to_owned(),
                                 consumption.grant_revision,
                                 consumption.logical_invocation_id,
                             );
@@ -541,6 +571,7 @@ impl ExecutionStore for InMemoryExecutionStore {
             aggregate.checkpoint = Some((next_checkpoint_version, checkpoint.clone()));
         }
         let mut stored = StoredRun::new(
+            owner_id,
             commit.target_run().clone(),
             aggregate
                 .stored
@@ -556,16 +587,21 @@ impl ExecutionStore for InMemoryExecutionStore {
         let mut release_serial_claim = false;
         if commit.target_run().state().is_terminal() {
             aggregate.lease = None;
-            if state.serial_claims.get(&commit.target_run().session_id()) == Some(&run_id) {
+            if state
+                .serial_claims
+                .get(&(owner_id, commit.target_run().session_id()))
+                == Some(&run_id)
+            {
                 let mut session = state
                     .sessions
-                    .get(&commit.target_run().session_id())
+                    .get(&(owner_id, commit.target_run().session_id()))
                     .cloned()
                     .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
                 session.version = session.version.checked_add(1).ok_or_else(|| {
                     ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
                 })?;
                 stored = StoredRun::new(
+                    owner_id,
                     commit.target_run().clone(),
                     stored.run_version(),
                     session.version,
@@ -578,9 +614,10 @@ impl ExecutionStore for InMemoryExecutionStore {
         let receipt =
             CommandReceipt::accepted(commit.command()).map_err(ExecutionStoreError::from)?;
         if let Some(authoritative) = authoritative_grant_update {
-            state
-                .authoritative_grants
-                .insert(authoritative.grant_id().to_owned(), authoritative);
+            state.authoritative_grants.insert(
+                (owner_id, authoritative.authority_key_encoded().to_owned()),
+                authoritative,
+            );
         }
         if let Some(key) = grant_consumption_key {
             state.grant_consumptions.insert(key);
@@ -588,42 +625,45 @@ impl ExecutionStore for InMemoryExecutionStore {
         if let Some(session) = session_update {
             state
                 .sessions
-                .insert(commit.target_run().session_id(), session);
+                .insert((owner_id, commit.target_run().session_id()), session);
         }
         if release_serial_claim {
             state
                 .serial_claims
-                .remove(&commit.target_run().session_id());
+                .remove(&(owner_id, commit.target_run().session_id()));
         }
-        state.runs.insert(run_id, aggregate);
-        state
-            .receipts
-            .insert(commit.command().id(), receipt.clone());
+        state.runs.insert((owner_id, run_id), aggregate);
+        state.receipts.insert(command_key, receipt.clone());
         state.outcomes.insert(
-            commit.command().id(),
+            command_key,
             ExecutionCommitOutcome::new(stored.clone(), receipt.clone()),
         );
         Ok(ExecutionCommitOutcome::new(stored, receipt))
     }
 
-    async fn load_run(&self, run_id: Uuid) -> Result<Option<StoredRun>, ExecutionStoreError> {
+    async fn load_run(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<StoredRun>, ExecutionStoreError> {
         Ok(self
             .state
             .lock()
             .await
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .map(|aggregate| aggregate.stored.clone()))
     }
 
     async fn load_checkpoint(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
     ) -> Result<Option<(u64, super::CheckpointV1)>, ExecutionStoreError> {
         let state = self.state.lock().await;
         Ok(state
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
             .checkpoint
             .clone())
@@ -631,6 +671,7 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn load_steps_page(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         page: super::StoreReadPage,
     ) -> Result<Vec<super::Step>, ExecutionStoreError> {
@@ -641,7 +682,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         let state = self.state.lock().await;
         Ok(state
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
             .steps
             .values()
@@ -653,6 +694,7 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn load_attempts_page(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         page: super::StoreReadPage,
     ) -> Result<Vec<super::InvocationAttemptRecord>, ExecutionStoreError> {
@@ -663,7 +705,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         let state = self.state.lock().await;
         Ok(state
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
             .attempts
             .values()
@@ -675,13 +717,14 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn load_durable_result(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         logical_invocation_id: Uuid,
     ) -> Result<Option<DurableCapabilityResult>, ExecutionStoreError> {
         let state = self.state.lock().await;
         Ok(state
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
             .results
             .get(&logical_invocation_id)
@@ -690,13 +733,14 @@ impl ExecutionStore for InMemoryExecutionStore {
 
     async fn replay_events(
         &self,
+        owner_id: Uuid,
         run_id: Uuid,
         page: super::StoreReadPage,
     ) -> Result<super::EventReplayPage, ExecutionStoreError> {
         let state = self.state.lock().await;
         let aggregate = state
             .runs
-            .get(&run_id)
+            .get(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
         let take = usize::try_from(page.limit())
             .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?

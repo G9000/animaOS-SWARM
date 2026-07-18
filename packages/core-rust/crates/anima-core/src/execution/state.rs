@@ -1,15 +1,16 @@
 use std::fmt;
 use std::ops::Deref;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::checkpoint::{DefinitionPin, OpaqueReference, RecoveryPauseRecord};
 use crate::{
     AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity,
-    AutonomyGrant, GrantConsumption, PolicyContext, PolicyEngine, PolicyReasonCode,
-    RecoveryResumeBinding, ValidatedRecoveryResume, CAPABILITY_INVOCATION_NAMESPACE,
-    SUPPORTED_DEFINITION_SCHEMA_VERSION,
+    AutonomyGrant, GrantConsumption, GrantEffect, GrantStatus, PolicyContext, PolicyEngine,
+    PolicyReasonCode, RecoveryResumeBinding, RiskLevel, ValidatedRecoveryResume,
+    CAPABILITY_INVOCATION_NAMESPACE, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -883,6 +884,192 @@ pub struct GrantConsumptionSnapshot {
     remaining_uses: u32,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrantAuthorityKey(String);
+
+impl GrantAuthorityKey {
+    fn from_grant_id(grant_id: &str) -> Self {
+        Self(sha256_labelled("gauth-v1:", grant_id.as_bytes()))
+    }
+
+    pub(crate) fn from_encoded(value: String) -> Result<Self, ExecutionError> {
+        if !canonical_sha256_label(&value, "gauth-v1:") {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidIdentifier));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for GrantAuthorityKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GrantAuthorityKey(REDACTED)")
+    }
+}
+
+impl Serialize for GrantAuthorityKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for GrantAuthorityKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::from_encoded(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrantAuthorityBinding {
+    authority_key: GrantAuthorityKey,
+    full_grant_digest: String,
+    scope_digest: String,
+    revision: u32,
+    status: GrantStatus,
+    effect: GrantEffect,
+    maximum_risk: RiskLevel,
+    valid_from_ms: i64,
+    valid_until_ms: Option<i64>,
+    remaining_uses: Option<u32>,
+}
+
+impl GrantAuthorityBinding {
+    pub fn from_grant(grant: &AutonomyGrant) -> Result<Self, ExecutionError> {
+        let canonical = serde_jcs::to_vec(grant)
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
+        let validated: AutonomyGrant = serde_json::from_slice(&canonical)
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
+        if &validated != grant {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        let scope = serde_jcs::to_vec(&grant.scope)
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
+        Ok(Self {
+            authority_key: GrantAuthorityKey::from_grant_id(&grant.id),
+            full_grant_digest: sha256_labelled("sha256:", &canonical),
+            scope_digest: sha256_labelled("sha256:", &scope),
+            revision: grant.revision,
+            status: grant.status,
+            effect: grant.effect,
+            maximum_risk: grant.maximum_risk,
+            valid_from_ms: grant.valid_from_ms,
+            valid_until_ms: grant.valid_until_ms,
+            remaining_uses: grant.remaining_uses,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_parts(
+        authority_key: String,
+        full_grant_digest: String,
+        scope_digest: String,
+        revision: u32,
+        status: GrantStatus,
+        effect: GrantEffect,
+        maximum_risk: RiskLevel,
+        valid_from_ms: i64,
+        valid_until_ms: Option<i64>,
+        remaining_uses: Option<u32>,
+    ) -> Result<Self, ExecutionError> {
+        if !canonical_sha256_label(&full_grant_digest, "sha256:")
+            || !canonical_sha256_label(&scope_digest, "sha256:")
+            || revision == 0
+            || valid_from_ms < 0
+            || valid_until_ms.is_some_and(|until| until < valid_from_ms)
+        {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidIdentifier));
+        }
+        Ok(Self {
+            authority_key: GrantAuthorityKey::from_encoded(authority_key)?,
+            full_grant_digest,
+            scope_digest,
+            revision,
+            status,
+            effect,
+            maximum_risk,
+            valid_from_ms,
+            valid_until_ms,
+            remaining_uses,
+        })
+    }
+
+    pub fn authority_key(&self) -> &GrantAuthorityKey {
+        &self.authority_key
+    }
+    pub fn full_grant_digest(&self) -> &str {
+        &self.full_grant_digest
+    }
+    pub fn scope_digest(&self) -> &str {
+        &self.scope_digest
+    }
+    pub fn revision(&self) -> u32 {
+        self.revision
+    }
+    pub fn status(&self) -> GrantStatus {
+        self.status
+    }
+    pub fn effect(&self) -> GrantEffect {
+        self.effect
+    }
+    pub fn maximum_risk(&self) -> RiskLevel {
+        self.maximum_risk
+    }
+    pub fn valid_from_ms(&self) -> i64 {
+        self.valid_from_ms
+    }
+    pub fn valid_until_ms(&self) -> Option<i64> {
+        self.valid_until_ms
+    }
+    pub fn remaining_uses(&self) -> Option<u32> {
+        self.remaining_uses
+    }
+
+    pub(crate) fn matches_consumption(&self, consumption: &GrantConsumption) -> bool {
+        self.authority_key == GrantAuthorityKey::from_grant_id(&consumption.grant_id)
+            && self.revision == consumption.grant_revision
+    }
+}
+
+impl fmt::Debug for GrantAuthorityBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrantAuthorityBinding")
+            .field("authority_key", &"REDACTED")
+            .field("full_grant_digest", &"REDACTED")
+            .field("scope_digest", &"REDACTED")
+            .field("revision", &self.revision)
+            .field("status", &self.status)
+            .field("effect", &self.effect)
+            .field("maximum_risk", &self.maximum_risk)
+            .field("valid_from_ms", &self.valid_from_ms)
+            .field("valid_until_ms", &self.valid_until_ms)
+            .field("remaining_uses", &self.remaining_uses)
+            .finish()
+    }
+}
+
+fn sha256_labelled(prefix: &str, bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut value = String::with_capacity(prefix.len() + 64);
+    value.push_str(prefix);
+    for byte in digest {
+        use std::fmt::Write;
+        let _ = write!(value, "{byte:02x}");
+    }
+    value
+}
+
+fn canonical_sha256_label(value: &str, prefix: &str) -> bool {
+    value.len() == prefix.len() + 64
+        && value.starts_with(prefix)
+        && value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl GrantConsumptionSnapshot {
     fn new(consumption: GrantConsumption, remaining_uses: u32) -> Result<Self, ExecutionError> {
         if remaining_uses == 0 {
@@ -904,10 +1091,11 @@ impl GrantConsumptionSnapshot {
 }
 
 /// A live policy validation prerequisite. Hosts recreate it against current policy context.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApprovalResumeClaim {
     binding: ApprovalResumeBinding,
     grant_consumption_snapshot: Option<GrantConsumptionSnapshot>,
+    grant_authority_binding: Option<GrantAuthorityBinding>,
 }
 
 impl ApprovalResumeClaim {
@@ -952,11 +1140,23 @@ impl ApprovalResumeClaim {
             }
             None => None,
         };
+        let grant_authority_binding = match (&pending.grant_id, pending.grant_revision) {
+            (Some(grant_id), Some(revision)) => {
+                let grant = grants
+                    .iter()
+                    .find(|grant| grant.id == *grant_id && grant.revision == revision)
+                    .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
+                Some(GrantAuthorityBinding::from_grant(grant)?)
+            }
+            (None, None) => None,
+            _ => return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite)),
+        };
         Ok(Self {
             binding: ApprovalResumeBinding {
                 decision: decision.clone(),
             },
             grant_consumption_snapshot,
+            grant_authority_binding,
         })
     }
 
@@ -979,6 +1179,26 @@ impl ApprovalResumeClaim {
     }
     pub fn grant_remaining_uses(&self) -> Option<u32> {
         self.binding.decision.request.grant_remaining_uses
+    }
+    pub fn grant_authority_binding(&self) -> Option<&GrantAuthorityBinding> {
+        self.grant_authority_binding.as_ref()
+    }
+}
+
+impl fmt::Debug for ApprovalResumeClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalResumeClaim")
+            .field("binding", &self.binding)
+            .field(
+                "grant_consumption_snapshot",
+                &self.grant_consumption_snapshot,
+            )
+            .field(
+                "grant_authority_binding",
+                &self.grant_authority_binding.as_ref().map(|_| "REDACTED"),
+            )
+            .finish()
     }
 }
 
