@@ -9,7 +9,10 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use crate::{CapabilityManifest, CapabilityReferenceId, LogicalInvocation, RiskLevel};
+use crate::{
+    CapabilityManifest, CapabilityReferenceId, LogicalInvocation, RiskLevel,
+    MAX_CAPABILITY_ID_BYTES,
+};
 
 const APPROVAL_WINDOW_MS: i64 = 300_000;
 const MAX_POLICY_IDENTIFIER_BYTES: usize = 128;
@@ -136,11 +139,12 @@ impl PolicyContext {
             ("actor_id", &self.actor_id),
             ("agent_definition_id", &self.agent_definition_id),
             ("workspace_id", &self.workspace_id),
-            ("capability_id", &self.capability_id),
-            ("logical_step_id", &self.logical_step_id),
         ] {
-            validate_id(field, value)?;
+            validate_policy_identifier(field, value)?;
         }
+        validate_task2_identifier("capability_id", &self.capability_id)?;
+        validate_task2_identifier("logical_step_id", &self.logical_step_id)?;
+        validate_resource_boundary(&self.resource_boundary)?;
         if self.agent_definition_version == 0
             || self.manifest_version == 0
             || self.policy_revision == 0
@@ -328,7 +332,7 @@ impl PolicyReason {
         }
         let has_grant = match (&self.grant_id, self.grant_revision) {
             (Some(id), Some(revision)) if revision > 0 => {
-                validate_id("grant_id", id)?;
+                validate_policy_identifier("grant_id", id)?;
                 true
             }
             (None, None) => false,
@@ -540,10 +544,11 @@ impl GrantScope {
             ("actor_id", &self.actor_id),
             ("agent_definition_id", &self.agent_definition_id),
             ("workspace_id", &self.workspace_id),
-            ("capability_id", &self.capability_id),
         ] {
-            validate_id(field, value)?;
+            validate_policy_identifier(field, value)?;
         }
+        validate_task2_identifier("capability_id", &self.capability_id)?;
+        validate_resource_boundary(&self.resource_boundary)?;
         if self.agent_definition_version == 0 || self.manifest_version == 0 {
             return Err(PolicyValidationError::InvalidVersion);
         }
@@ -655,7 +660,7 @@ impl AutonomyGrant {
     }
 
     fn validate(&self) -> Result<(), PolicyValidationError> {
-        validate_id("grant_id", &self.id)?;
+        validate_policy_identifier("grant_id", &self.id)?;
         if self.revision == 0 {
             return Err(PolicyValidationError::InvalidVersion);
         }
@@ -741,7 +746,7 @@ impl GrantConsumption {
     }
 
     fn validate(&self) -> Result<(), PolicyValidationError> {
-        validate_id("grant_id", &self.grant_id)?;
+        validate_policy_identifier("grant_id", &self.grant_id)?;
         if self.grant_revision == 0 {
             return Err(PolicyValidationError::InvalidVersion);
         }
@@ -887,11 +892,12 @@ impl ApprovalRequest {
             ("actor_id", &self.actor_id),
             ("agent_definition_id", &self.agent_definition_id),
             ("workspace_id", &self.workspace_id),
-            ("logical_step_id", &self.logical_step_id),
-            ("capability_id", &self.capability_id),
         ] {
-            validate_id(field, value)?;
+            validate_policy_identifier(field, value)?;
         }
+        validate_task2_identifier("logical_step_id", &self.logical_step_id)?;
+        validate_task2_identifier("capability_id", &self.capability_id)?;
+        validate_resource_boundary(&self.resource_boundary)?;
         if self.agent_definition_version == 0
             || self.manifest_version == 0
             || self.policy_revision == 0
@@ -924,7 +930,7 @@ impl ApprovalRequest {
         }
         match (&self.grant_id, self.grant_revision) {
             (Some(id), Some(revision)) if revision > 0 => {
-                validate_id("grant_id", id)?;
+                validate_policy_identifier("grant_id", id)?;
                 Ok(())
             }
             (None, None) => Ok(()),
@@ -1487,7 +1493,10 @@ fn reason(
     .expect("policy engine only emits validated audit reasons")
 }
 
-fn validate_id(field: &'static str, value: &str) -> Result<(), PolicyValidationError> {
+fn validate_policy_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), PolicyValidationError> {
     if value.trim().is_empty() {
         return Err(PolicyValidationError::BlankIdentifier { field });
     }
@@ -1500,23 +1509,28 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), PolicyValidationE
     {
         return Err(PolicyValidationError::InvalidIdentifierFormat { field });
     }
-    let lower = value.to_ascii_lowercase();
-    if lower.starts_with("sk-")
-        || lower.starts_with("ghp_")
-        || lower.starts_with("github_pat_")
-        || value.starts_with("AKIA")
-        || [
-            "secret",
-            "token",
-            "password",
-            "credential",
-            "bearer",
-            "api_key",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
-        return Err(PolicyValidationError::InvalidIdentifierFormat { field });
+    Ok(())
+}
+
+/// Task 2 accepts opaque capability and logical-step identifiers up to this shared bound.
+fn validate_task2_identifier(
+    field: &'static str,
+    value: &str,
+) -> Result<(), PolicyValidationError> {
+    if value.is_empty() {
+        return Err(PolicyValidationError::BlankIdentifier { field });
+    }
+    if value.len() > MAX_CAPABILITY_ID_BYTES {
+        return Err(PolicyValidationError::IdentifierTooLong { field });
+    }
+    Ok(())
+}
+
+fn validate_resource_boundary(
+    resource_boundary: &CapabilityReferenceId,
+) -> Result<(), PolicyValidationError> {
+    if resource_boundary.handle().is_nil() {
+        return Err(PolicyValidationError::InvalidNilIdentifier);
     }
     Ok(())
 }

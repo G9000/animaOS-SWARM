@@ -463,21 +463,33 @@ fn approval_requests_only_exist_for_current_approval_decisions_and_exact_windows
 }
 
 #[test]
-fn policy_identifiers_reject_credential_and_oversized_values_on_construction_and_serde() {
-    let result = PolicyContext::new(
-        "sk-live-token",
-        "actor-1",
-        "writer-agent",
+fn policy_identifiers_follow_task2_bounds_without_secret_word_sniffing() {
+    let capability_id = "c".repeat(256);
+    let logical_invocation = LogicalInvocation::new(
+        Uuid::from_u128(1),
+        "token.rotate",
+        capability_id.clone(),
         1,
-        "workspace-1",
+        json!({ "path": "reports/a.md" }),
+    )
+    .unwrap();
+    let mut capability = manifest(RiskLevel::High, 1);
+    capability.id = capability_id;
+    let valid_context = PolicyContext::new(
+        "owner-1",
+        "actor-1",
+        "credentials.audit",
+        1,
+        "token.rotate",
         CapabilityReferenceId::new(Uuid::from_u128(10)),
-        &manifest(RiskLevel::High, 1),
-        &invocation(json!({ "path": "reports/a.md" })),
+        &capability,
+        &logical_invocation,
         1,
         Default::default(),
         1_000,
-    );
-    assert!(result.is_err());
+    )
+    .unwrap();
+    assert_eq!(valid_context.capability_id.len(), 256);
 
     let original = context(
         RiskLevel::High,
@@ -503,6 +515,64 @@ fn policy_identifiers_reject_credential_and_oversized_values_on_construction_and
     );
     injected.owner_id = "sk-live-injected-token".into();
     assert!(!format!("{injected:?}").contains("sk-live-injected-token"));
+}
+
+#[test]
+fn nil_resource_references_are_rejected_on_construction_validation_and_serde() {
+    let original_invocation = invocation(json!({ "path": "reports/a.md" }));
+    assert!(PolicyContext::new(
+        "owner-1",
+        "actor-1",
+        "writer-agent",
+        1,
+        "workspace-1",
+        CapabilityReferenceId::new(Uuid::nil()),
+        &manifest(RiskLevel::High, 1),
+        &original_invocation,
+        1,
+        Default::default(),
+        1_000,
+    )
+    .is_err());
+
+    let original = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    assert!(GrantScope::new(
+        original.owner_id.clone(),
+        original.actor_id.clone(),
+        original.agent_definition_id.clone(),
+        original.agent_definition_version,
+        original.workspace_id.clone(),
+        CapabilityReferenceId::new(Uuid::nil()),
+        original.capability_id.clone(),
+        original.manifest_version,
+        Some(original.canonical_argument_digest),
+    )
+    .is_err());
+
+    let mut request = PolicyEngine::approval_request(&original, None).unwrap();
+    request.resource_boundary = CapabilityReferenceId::new(Uuid::nil());
+    assert!(ApprovalDecision::new_approved(request, 1_000).is_err());
+
+    let mut context_json = serde_json::to_value(&original).unwrap();
+    context_json["resource_boundary"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<PolicyContext>(context_json).is_err());
+
+    let mut scope_json = serde_json::to_value(scope(&original)).unwrap();
+    scope_json["resource_boundary"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<GrantScope>(scope_json).is_err());
+
+    let approval = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&original, None).unwrap(),
+        1_000,
+    )
+    .unwrap();
+    let mut approval_json = serde_json::to_value(approval).unwrap();
+    approval_json["request"]["resource_boundary"] = json!(Uuid::nil());
+    assert!(serde_json::from_value::<ApprovalDecision>(approval_json).is_err());
 }
 
 #[test]
