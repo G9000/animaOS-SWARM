@@ -9,7 +9,10 @@ use super::{
     InvocationAttemptRecord, Run, RunState, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
     Session, SessionConcurrencyPolicy, Step, Usage,
 };
-use crate::{DurableCapabilityResult, GrantConsumption};
+use crate::{
+    AgentDefinition, DurableCapabilityResult, GrantConsumption, LifecyclePolicy, MemoryPolicy,
+    ModelPolicy, ProfileRef, RuntimeLimits,
+};
 
 /// Input for atomically creating a durable run and claiming its session when required.
 #[derive(Clone, Debug)]
@@ -546,6 +549,110 @@ where
             .map(|(version, _)| version)
             != Some(1)
     {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    assert_concurrent_session_contract(factory).await
+}
+
+fn conformance_definition(allows_concurrent_sessions: bool) -> AgentDefinition {
+    AgentDefinition {
+        schema_version: 1,
+        id: "execution-store-concurrent".into(),
+        name: "contract".into(),
+        display_name: "contract".into(),
+        description: "contract".into(),
+        persona: "contract".into(),
+        system: "contract".into(),
+        version: 1,
+        model: ModelPolicy {
+            provider: "test".into(),
+            model: "test".into(),
+            credential_reference: None,
+            temperature: None,
+        },
+        source_profile: ProfileRef {
+            profile_id: "contract".into(),
+            profile_version: 1,
+        },
+        resolved_capabilities: vec![],
+        memory: MemoryPolicy {
+            enabled: false,
+            namespace: "contract".into(),
+            retention_days: None,
+        },
+        approval_policy_id: "contract".into(),
+        approval_policy_revision: 1,
+        approval_restrictions: vec![],
+        limits: RuntimeLimits {
+            max_turns: 1,
+            timeout_ms: 1,
+            max_concurrent_tasks: 1,
+        },
+        lifecycle: LifecyclePolicy {
+            auto_start: false,
+            restart_on_failure: false,
+            max_restarts: 0,
+            allows_concurrent_sessions,
+        },
+        host_requirements: vec![],
+    }
+}
+
+async fn assert_concurrent_session_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    if Session::new_for_definition(
+        Uuid::from_u128(0xc0),
+        &conformance_definition(false),
+        SessionConcurrencyPolicy::Concurrent,
+    )
+    .is_ok()
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let store = factory.create_execution_store().await?;
+    let session = Session::new_for_definition(
+        Uuid::from_u128(0xc1),
+        &conformance_definition(true),
+        SessionConcurrencyPolicy::Concurrent,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let first = Run::queued(
+        Uuid::from_u128(0xc2),
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let second = Run::queued(
+        Uuid::from_u128(0xc3),
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let one = store
+        .create_run(CreateRun::new(
+            session.clone(),
+            first,
+            0,
+            SessionConcurrencyPolicy::Concurrent,
+        ))
+        .await?;
+    let two = store
+        .create_run(CreateRun::new(
+            session,
+            second,
+            one.session_version(),
+            SessionConcurrencyPolicy::Concurrent,
+        ))
+        .await?;
+    if two.session_version() != one.session_version().saturating_add(1) {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
