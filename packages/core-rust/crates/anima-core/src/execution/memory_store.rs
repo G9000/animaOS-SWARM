@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Included};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
     store::AuthoritativeGrantChangeKind, AuthoritativeGrantChange, AuthoritativeGrantState,
-    AuthoritativeGrantStatus, CheckpointMutation, CreateRun, DurableResultMutation,
-    ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
+    AuthoritativeGrantStatus, CheckpointMutation, CreateRun, ExecutionClock, ExecutionCommit,
+    ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
     ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy, StoredRun,
 };
 use crate::{CommandReceipt, DurableCapabilityResult, RunState};
@@ -21,16 +25,21 @@ struct StoredSession {
     policy: SessionConcurrencyPolicy,
 }
 
-#[derive(Clone)]
 struct RunAggregate {
     stored: StoredRun,
     lease: Option<ExecutionLease>,
     checkpoint_version: u64,
-    checkpoint: Option<super::CheckpointV1>,
+    checkpoint: Option<Arc<super::CheckpointV1>>,
     events: Vec<RuntimeEvent>,
     steps: BTreeMap<String, super::Step>,
+    step_order: BTreeMap<u64, String>,
+    next_step_sequence: u64,
     attempts: BTreeMap<(Uuid, u32), super::InvocationAttemptRecord>,
+    attempt_order: BTreeMap<u64, (Uuid, u32)>,
+    next_attempt_sequence: u64,
+    attempts_fingerprint: super::checkpoint::HistoryFingerprint,
     results: BTreeMap<Uuid, StoredDurableResult>,
+    completed_fingerprint: super::checkpoint::HistoryFingerprint,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,7 +48,7 @@ struct StoredDurableResult {
     result: DurableCapabilityResult,
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct State {
     sessions: BTreeMap<(Uuid, Uuid), StoredSession>,
     runs: BTreeMap<(Uuid, Uuid), RunAggregate>,
@@ -50,10 +59,232 @@ struct State {
     grant_consumptions: BTreeSet<(Uuid, String, u32, Uuid)>,
 }
 
+struct CommitPatch {
+    stored: StoredRun,
+    lease: Option<ExecutionLease>,
+    checkpoint_version: u64,
+    checkpoint: Option<Arc<super::CheckpointV1>>,
+    events: Vec<RuntimeEvent>,
+    steps: Vec<(String, u64, super::Step)>,
+    next_step_sequence: u64,
+    attempts: Vec<((Uuid, u32), u64, super::InvocationAttemptRecord)>,
+    next_attempt_sequence: u64,
+    attempts_fingerprint: super::checkpoint::HistoryFingerprint,
+    results: Vec<(Uuid, StoredDurableResult)>,
+    completed_fingerprint: super::checkpoint::HistoryFingerprint,
+    authoritative_grant_update: Option<AuthoritativeGrantState>,
+    grant_consumption_key: Option<(Uuid, String, u32, Uuid)>,
+    session_update: Option<StoredSession>,
+    release_serial_claim: bool,
+    receipt: CommandReceipt,
+    grant_consumption: Option<crate::GrantConsumption>,
+}
+
 /// In-process reference adapter. It clones no externally visible state until validation succeeds.
-#[derive(Default)]
 pub struct InMemoryExecutionStore {
     state: Mutex<State>,
+    cursor_key: [u8; 16],
+    clock: Arc<dyn ExecutionClock>,
+}
+
+impl Default for InMemoryExecutionStore {
+    fn default() -> Self {
+        Self::with_clock(Arc::new(SystemExecutionClock))
+    }
+}
+
+impl InMemoryExecutionStore {
+    pub fn with_clock(clock: Arc<dyn ExecutionClock>) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            cursor_key: *Uuid::new_v4().as_bytes(),
+            clock,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SystemExecutionClock;
+
+impl ExecutionClock for SystemExecutionClock {
+    fn now_ms(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ManualExecutionClock {
+    now_ms: Arc<AtomicU64>,
+}
+
+impl ManualExecutionClock {
+    pub fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms: Arc::new(AtomicU64::new(now_ms)),
+        }
+    }
+
+    pub fn advance_ms(&self, duration_ms: u64) -> Result<(), ExecutionStoreError> {
+        self.now_ms
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |now| {
+                now.checked_add(duration_ms)
+            })
+            .map(|_| ())
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))
+    }
+}
+
+impl Default for ManualExecutionClock {
+    fn default() -> Self {
+        Self::new(1_000_000)
+    }
+}
+
+impl ExecutionClock for ManualExecutionClock {
+    fn now_ms(&self) -> u64 {
+        self.now_ms.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum HistoryCollection {
+    Events = 1,
+    Steps = 2,
+    Attempts = 3,
+}
+
+impl InMemoryExecutionStore {
+    fn read_window(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        collection: HistoryCollection,
+        current_snapshot: u64,
+        page: &super::StoreReadPage,
+    ) -> Result<(u64, u64), ExecutionStoreError> {
+        let Some(cursor) = page.cursor() else {
+            return Ok((current_snapshot, 0));
+        };
+        let (cursor_owner, cursor_run, cursor_collection, snapshot, last) =
+            self.decode_cursor(cursor)?;
+        if cursor_owner != owner_id
+            || cursor_run != run_id
+            || cursor_collection != collection
+            || snapshot > current_snapshot
+            || last >= snapshot
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok((snapshot, last))
+    }
+
+    fn write_cursor(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        collection: HistoryCollection,
+        snapshot: u64,
+        last: u64,
+    ) -> Result<super::StoreReadCursor, ExecutionStoreError> {
+        let mut payload = Vec::with_capacity(50);
+        payload.push(1);
+        payload.push(collection as u8);
+        payload.extend_from_slice(owner_id.as_bytes());
+        payload.extend_from_slice(run_id.as_bytes());
+        payload.extend_from_slice(&snapshot.to_be_bytes());
+        payload.extend_from_slice(&last.to_be_bytes());
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        hasher.update(self.cursor_key);
+        payload.extend_from_slice(&hasher.finalize());
+        super::StoreReadCursor::from_opaque(format!("sc1.{}", encode_hex(&payload)))
+    }
+
+    fn decode_cursor(
+        &self,
+        cursor: &super::StoreReadCursor,
+    ) -> Result<(Uuid, Uuid, HistoryCollection, u64, u64), ExecutionStoreError> {
+        let encoded = cursor
+            .as_str()
+            .strip_prefix("sc1.")
+            .ok_or_else(invalid_cursor)?;
+        let bytes = decode_hex(encoded).ok_or_else(invalid_cursor)?;
+        if bytes.len() != 82 || bytes[0] != 1 {
+            return Err(invalid_cursor());
+        }
+        let collection = match bytes[1] {
+            1 => HistoryCollection::Events,
+            2 => HistoryCollection::Steps,
+            3 => HistoryCollection::Attempts,
+            _ => return Err(invalid_cursor()),
+        };
+        let payload = &bytes[..50];
+        let mut hasher = Sha256::new();
+        hasher.update(payload);
+        hasher.update(self.cursor_key);
+        let expected = hasher.finalize();
+        if expected
+            .iter()
+            .zip(&bytes[50..])
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
+            != 0
+        {
+            return Err(invalid_cursor());
+        }
+        let owner_id = Uuid::from_slice(&bytes[2..18]).map_err(|_| invalid_cursor())?;
+        let run_id = Uuid::from_slice(&bytes[18..34]).map_err(|_| invalid_cursor())?;
+        let snapshot = u64::from_be_bytes(bytes[34..42].try_into().map_err(|_| invalid_cursor())?);
+        let last = u64::from_be_bytes(bytes[42..50].try_into().map_err(|_| invalid_cursor())?);
+        Ok((owner_id, run_id, collection, snapshot, last))
+    }
+}
+
+fn invalid_cursor() -> ExecutionStoreError {
+    ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest)
+}
+
+fn page_take(page: &super::StoreReadPage) -> Result<usize, ExecutionStoreError> {
+    usize::try_from(page.limit())
+        .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?
+        .checked_add(1)
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+        .collect()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -229,8 +460,14 @@ impl ExecutionStore for InMemoryExecutionStore {
                 checkpoint: None,
                 events: vec![],
                 steps: BTreeMap::new(),
+                step_order: BTreeMap::new(),
+                next_step_sequence: 1,
                 attempts: BTreeMap::new(),
+                attempt_order: BTreeMap::new(),
+                next_attempt_sequence: 1,
+                attempts_fingerprint: super::checkpoint::HistoryFingerprint::default(),
                 results: BTreeMap::new(),
+                completed_fingerprint: super::checkpoint::HistoryFingerprint::default(),
             },
         );
         Ok(stored)
@@ -263,16 +500,17 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ExecutionStoreErrorCode::InvalidRequest,
             ));
         }
+        let now_ms = self.clock.now_ms();
         if aggregate
             .lease
             .as_ref()
-            .is_some_and(|lease| lease.expires_at_ms() > now_ms())
+            .is_some_and(|lease| lease.expires_at_ms() > now_ms)
         {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::LeaseConflict,
             ));
         }
-        let expires_at_ms = now_ms()
+        let expires_at_ms = now_ms
             .checked_add(duration_ms)
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
         let lease = ExecutionLease::new(run_id, Uuid::new_v4(), expires_at_ms)
@@ -302,12 +540,13 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ExecutionStoreErrorCode::LeaseExpired,
             ));
         }
-        if lease.expires_at_ms() <= now_ms() {
+        let now_ms = self.clock.now_ms();
+        if lease.expires_at_ms() <= now_ms {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::LeaseExpired,
             ));
         }
-        let expires_at_ms = now_ms()
+        let expires_at_ms = now_ms
             .checked_add(duration_ms)
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
         let renewed = ExecutionLease::new(lease.run_id(), lease.fence(), expires_at_ms)
@@ -341,356 +580,22 @@ impl ExecutionStore for InMemoryExecutionStore {
                 .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound));
         }
 
-        let mut aggregate = state
-            .runs
-            .get(&(owner_id, run_id))
-            .cloned()
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
-        if aggregate.stored.run_version() != commit.expected_run_version() {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::VersionConflict,
-            ));
-        }
-        let checkpoint_version = aggregate.checkpoint_version;
-        if checkpoint_version != commit.expected_checkpoint_version() {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::CheckpointConflict,
-            ));
-        }
-        if aggregate.lease.as_ref() != Some(commit.lease())
-            || commit.lease().expires_at_ms() <= now_ms()
-        {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::LeaseExpired,
-            ));
-        }
-        if !valid_command_transition(
-            aggregate.stored.run(),
-            commit.target_run(),
-            commit.command(),
-            commit.approval(),
-            commit.attempts(),
-        ) {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::InvalidRequest,
-            ));
-        }
-        let first_sequence = u64::try_from(aggregate.events.len())
-            .ok()
-            .and_then(|sequence| sequence.checked_add(1))
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
-        let event_count = u64::try_from(commit.events().len())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
-        let last_sequence = first_sequence
-            .checked_add(event_count)
-            .and_then(|sequence| sequence.checked_sub(1))
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
-        RuntimeEvent::validate_batch(first_sequence, commit.events())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::EventConflict))?;
-        let owner_id = state
-            .sessions
-            .get(&(owner_id, aggregate.stored.run().session_id()))
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
-            .owner_id;
-        if commit.events().iter().any(|event| {
-            event.owner_id() != owner_id
-                || event.run_id() != run_id
-                || event.session_id() != aggregate.stored.run().session_id()
-        }) {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::EventConflict,
-            ));
-        }
-        if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
-            if checkpoint.run_id() != run_id
-                || checkpoint.session_id() != aggregate.stored.run().session_id()
-                || checkpoint.definition().id() != aggregate.stored.run().definition_id()
-                || checkpoint.definition().version() != aggregate.stored.run().definition_version()
-                || checkpoint.state() != commit.target_run().state()
-                || checkpoint.pause_reason() != commit.target_run().pause_reason()
-                || checkpoint
-                    .pending_approval()
-                    .map(|pending| pending.request())
-                    != commit.target_run().pending_approval()
-                || commit.target_run().state() == RunState::RecoveryRequired
-                    && !checkpoint.uncertain_invocations().iter().any(|record| {
-                        commit.target_run().recovery_pause() == Some(record.pause())
-                            && commit.target_run().recovery_binding() == record.recovery_binding()
-                    })
-                || checkpoint.last_durable_event_sequence() != last_sequence
-            {
-                return Err(ExecutionStoreError::new(
-                    ExecutionStoreErrorCode::CheckpointConflict,
-                ));
-            }
-            checkpoint.validate().map_err(|_| {
-                ExecutionStoreError::new(ExecutionStoreErrorCode::CheckpointConflict)
-            })?;
-        }
-        let mut authoritative_grant_update = None;
-        let mut grant_consumption_key = None;
-        if let Some(approval) = commit.approval() {
-            let resumed = aggregate
-                .stored
-                .run()
-                .apply_resume_command(commit.command(), Some(approval.claim()), None)
-                .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
-            if resumed.run() != commit.target_run()
-                || resumed.grant_consumption() != approval.grant_consumption()
-            {
-                return Err(ExecutionStoreError::new(
-                    ExecutionStoreErrorCode::InvalidRequest,
-                ));
-            }
-            match (
-                approval.grant_id(),
-                approval.grant_revision(),
-                approval.grant_remaining_uses(),
-            ) {
-                (Some(_grant_id), Some(grant_revision), claimed_remaining) => {
-                    let binding = approval.claim().grant_authority_binding().ok_or_else(|| {
-                        ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
-                    })?;
-                    let mut authoritative = state
-                        .authoritative_grants
-                        .get(&(owner_id, binding.authority_key().as_str().to_owned()))
-                        .cloned()
-                        .ok_or_else(|| {
-                            ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
-                        })?;
-                    if authoritative.binding()? != *binding
-                        || authoritative.status() != AuthoritativeGrantStatus::Active
-                        || authoritative.revision() != grant_revision
-                        || authoritative.remaining_uses() != claimed_remaining
-                    {
-                        return Err(ExecutionStoreError::new(
-                            ExecutionStoreErrorCode::GrantConflict,
-                        ));
-                    }
-                    match (approval.grant_consumption(), claimed_remaining) {
-                        (Some(consumption), Some(remaining)) => {
-                            let snapshot = approval
-                                .claim()
-                                .grant_consumption_snapshot()
-                                .ok_or_else(|| {
-                                    ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
-                                })?;
-                            if snapshot.remaining_uses() != remaining
-                                || !binding.matches_consumption(consumption)
-                            {
-                                return Err(ExecutionStoreError::new(
-                                    ExecutionStoreErrorCode::GrantConflict,
-                                ));
-                            }
-                            let key = (
-                                owner_id,
-                                binding.authority_key().as_str().to_owned(),
-                                consumption.grant_revision,
-                                consumption.logical_invocation_id,
-                            );
-                            if state.grant_consumptions.contains(&key) {
-                                return Err(ExecutionStoreError::new(
-                                    ExecutionStoreErrorCode::GrantAlreadyConsumed,
-                                ));
-                            }
-                            authoritative.consume_one()?;
-                            grant_consumption_key = Some(key);
-                        }
-                        (None, None) => {}
-                        _ => {
-                            return Err(ExecutionStoreError::new(
-                                ExecutionStoreErrorCode::GrantConflict,
-                            ))
-                        }
-                    }
-                    authoritative_grant_update = Some(authoritative);
-                }
-                (None, None, None) if approval.grant_consumption().is_none() => {}
-                _ => {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::GrantConflict,
-                    ))
-                }
-            }
-        }
-        for step in commit.steps() {
-            if step.run_id() != run_id {
-                return Err(ExecutionStoreError::new(
-                    ExecutionStoreErrorCode::InvalidRequest,
-                ));
-            }
-            match aggregate.steps.get(step.logical_step_id()) {
-                Some(existing) if existing == step => {}
-                Some(_) => {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::HistoryConflict,
-                    ))
-                }
-                None => {
-                    aggregate
-                        .steps
-                        .insert(step.logical_step_id().into(), step.clone());
-                }
-            }
-        }
-        for attempt in commit.attempts() {
-            if attempt.invocation().run_id() != run_id {
-                return Err(ExecutionStoreError::new(
-                    ExecutionStoreErrorCode::InvalidRequest,
-                ));
-            }
-            let key = (attempt.invocation().id(), attempt.attempt_number());
-            match aggregate.attempts.get(&key) {
-                Some(existing) if existing == attempt => {}
-                Some(_) => {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::HistoryConflict,
-                    ))
-                }
-                None => {
-                    aggregate.attempts.insert(key, attempt.clone());
-                }
-            }
-        }
-        for mutation in commit.results() {
-            insert_result(&mut aggregate, mutation)?;
-        }
-        if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
-            let attempts: Vec<_> = aggregate.attempts.values().cloned().collect();
-            let completed: Vec<_> = aggregate
-                .results
-                .values()
-                .map(|stored| stored.completed.clone())
-                .collect();
-            if checkpoint.attempts() != attempts
-                || checkpoint.completed_invocations() != completed
-                || checkpoint
-                    .cursor()
-                    .is_some_and(|cursor| !aggregate.steps.contains_key(cursor.logical_step_id()))
-            {
-                return Err(ExecutionStoreError::new(
-                    ExecutionStoreErrorCode::CheckpointConflict,
-                ));
-            }
-        }
-        let aggregate_changed = aggregate.stored.run() != commit.target_run()
-            || !commit.events().is_empty()
-            || aggregate.steps != state.runs[&(owner_id, run_id)].steps
-            || aggregate.attempts != state.runs[&(owner_id, run_id)].attempts
-            || aggregate.results != state.runs[&(owner_id, run_id)].results;
-        if aggregate_changed
-            && matches!(commit.checkpoint_mutation(), CheckpointMutation::Unchanged)
-        {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::CheckpointConflict,
-            ));
-        }
-        if commit.target_run().state().is_terminal()
-            && !matches!(commit.checkpoint_mutation(), CheckpointMutation::Clear)
-        {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::CheckpointConflict,
-            ));
-        }
-        aggregate.events.extend_from_slice(commit.events());
-        match commit.checkpoint_mutation() {
-            CheckpointMutation::Unchanged => {}
-            CheckpointMutation::Replace(checkpoint) => {
-                aggregate.checkpoint_version =
-                    checkpoint_version.checked_add(1).ok_or_else(|| {
-                        ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
-                    })?;
-                aggregate.checkpoint = Some(checkpoint.clone());
-            }
-            CheckpointMutation::Clear => {
-                if aggregate.checkpoint.is_some() {
-                    aggregate.checkpoint_version =
-                        checkpoint_version.checked_add(1).ok_or_else(|| {
-                            ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
-                        })?;
-                }
-                aggregate.checkpoint = None;
-            }
-        }
-        let mut stored = StoredRun::new(
-            owner_id,
-            commit.target_run().clone(),
-            aggregate
-                .stored
-                .run_version()
-                .checked_add(1)
-                .ok_or_else(|| {
-                    ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
-                })?,
-            aggregate.stored.session_version(),
-        )?;
-        aggregate.stored = stored.clone();
-        let mut session_update = None;
-        let mut release_serial_claim = false;
-        if commit.target_run().state().is_terminal() {
-            aggregate.lease = None;
-            if state
-                .serial_claims
-                .get(&(owner_id, commit.target_run().session_id()))
-                == Some(&run_id)
-            {
-                let mut session = state
-                    .sessions
-                    .get(&(owner_id, commit.target_run().session_id()))
-                    .cloned()
-                    .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
-                session.version = session.version.checked_add(1).ok_or_else(|| {
-                    ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
-                })?;
-                stored = StoredRun::new(
-                    owner_id,
-                    commit.target_run().clone(),
-                    stored.run_version(),
-                    session.version,
-                )?;
-                aggregate.stored = stored.clone();
-                session_update = Some(session);
-                release_serial_claim = true;
-            }
-        }
-        let receipt =
-            CommandReceipt::accepted(commit.command()).map_err(ExecutionStoreError::from)?;
-        if let Some(authoritative) = authoritative_grant_update {
-            state.authoritative_grants.insert(
-                (owner_id, authoritative.authority_key_encoded().to_owned()),
-                authoritative,
-            );
-        }
-        if let Some(key) = grant_consumption_key {
-            state.grant_consumptions.insert(key);
-        }
-        if let Some(session) = session_update {
-            state
-                .sessions
-                .insert((owner_id, commit.target_run().session_id()), session);
-        }
-        if release_serial_claim {
-            state
-                .serial_claims
-                .remove(&(owner_id, commit.target_run().session_id()));
-        }
-        let grant_consumption = commit
-            .approval()
-            .and_then(|approval| approval.grant_consumption())
-            .cloned();
-        let outcome = ExecutionCommitOutcome::new(
-            stored.clone(),
-            receipt.clone(),
-            aggregate.checkpoint_version,
-            aggregate.checkpoint.clone(),
-            grant_consumption,
+        let mut patch = build_commit_patch(&state, owner_id, &commit, self.clock.now_ms())?;
+        patch.checkpoint = match commit.into_checkpoint_mutation() {
+            CheckpointMutation::Unchanged => patch.checkpoint,
+            CheckpointMutation::Replace(checkpoint) => Some(Arc::new(checkpoint)),
+            CheckpointMutation::Clear => None,
+        };
+        let outcome = ExecutionCommitOutcome::new_shared(
+            patch.stored.clone(),
+            patch.receipt.clone(),
+            patch.checkpoint_version,
+            patch.checkpoint.clone(),
+            patch.grant_consumption.clone(),
         );
-        state.runs.insert((owner_id, run_id), aggregate);
-        state.receipts.insert(command_key, receipt);
-        state.outcomes.insert(command_key, outcome.clone());
+        apply_commit_patch(&mut state, owner_id, run_id, patch, outcome.clone());
         Ok(outcome)
     }
-
     async fn load_run(
         &self,
         owner_id: Uuid,
@@ -717,8 +622,8 @@ impl ExecutionStore for InMemoryExecutionStore {
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
         Ok(aggregate
             .checkpoint
-            .clone()
-            .map(|checkpoint| (aggregate.checkpoint_version, checkpoint)))
+            .as_ref()
+            .map(|checkpoint| (aggregate.checkpoint_version, checkpoint.as_ref().clone())))
     }
 
     async fn load_steps_page(
@@ -726,22 +631,47 @@ impl ExecutionStore for InMemoryExecutionStore {
         owner_id: Uuid,
         run_id: Uuid,
         page: super::StoreReadPage,
-    ) -> Result<Vec<super::Step>, ExecutionStoreError> {
-        let offset = usize::try_from(page.offset())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
-        let limit = usize::try_from(page.limit())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
+    ) -> Result<super::StoreHistoryPage<super::Step>, ExecutionStoreError> {
         let state = self.state.lock().await;
-        Ok(state
+        let aggregate = state
             .runs
             .get(&(owner_id, run_id))
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
-            .steps
-            .values()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect())
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+        let snapshot = aggregate
+            .step_order
+            .last_key_value()
+            .map_or(0, |(sequence, _)| *sequence);
+        let (snapshot, last) =
+            self.read_window(owner_id, run_id, HistoryCollection::Steps, snapshot, &page)?;
+        let take = page_take(&page)?;
+        let mut items = aggregate
+            .step_order
+            .range((Excluded(last), Included(snapshot)))
+            .take(take)
+            .map(|(_, key)| {
+                aggregate.steps.get(key).cloned().ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() > usize::try_from(page.limit()).unwrap_or(usize::MAX);
+        if has_more {
+            items.pop();
+        }
+        let next_cursor = if has_more {
+            let last = aggregate
+                .step_order
+                .range((Excluded(last), Included(snapshot)))
+                .nth(items.len().saturating_sub(1))
+                .map(|(sequence, _)| *sequence)
+                .ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict)
+                })?;
+            Some(self.write_cursor(owner_id, run_id, HistoryCollection::Steps, snapshot, last)?)
+        } else {
+            None
+        };
+        super::StoreHistoryPage::new(items, next_cursor)
     }
 
     async fn load_attempts_page(
@@ -749,22 +679,59 @@ impl ExecutionStore for InMemoryExecutionStore {
         owner_id: Uuid,
         run_id: Uuid,
         page: super::StoreReadPage,
-    ) -> Result<Vec<super::InvocationAttemptRecord>, ExecutionStoreError> {
-        let offset = usize::try_from(page.offset())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
-        let limit = usize::try_from(page.limit())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
+    ) -> Result<super::StoreHistoryPage<super::InvocationAttemptRecord>, ExecutionStoreError> {
         let state = self.state.lock().await;
-        Ok(state
+        let aggregate = state
             .runs
             .get(&(owner_id, run_id))
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
-            .attempts
-            .values()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect())
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+        let snapshot = aggregate
+            .attempt_order
+            .last_key_value()
+            .map_or(0, |(sequence, _)| *sequence);
+        let (snapshot, last) = self.read_window(
+            owner_id,
+            run_id,
+            HistoryCollection::Attempts,
+            snapshot,
+            &page,
+        )?;
+        let take = page_take(&page)?;
+        let mut page_entries = aggregate
+            .attempt_order
+            .range((Excluded(last), Included(snapshot)))
+            .take(take)
+            .collect::<Vec<_>>();
+        let has_more = page_entries.len() > usize::try_from(page.limit()).unwrap_or(usize::MAX);
+        if has_more {
+            page_entries.pop();
+        }
+        let next_cursor = if has_more {
+            let last = page_entries
+                .last()
+                .map(|(sequence, _)| **sequence)
+                .ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict)
+                })?;
+            Some(self.write_cursor(
+                owner_id,
+                run_id,
+                HistoryCollection::Attempts,
+                snapshot,
+                last,
+            )?)
+        } else {
+            None
+        };
+        let items = page_entries
+            .into_iter()
+            .map(|(_, key)| {
+                aggregate.attempts.get(key).cloned().ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        super::StoreHistoryPage::new(items, next_cursor)
     }
 
     async fn load_durable_result(
@@ -794,14 +761,22 @@ impl ExecutionStore for InMemoryExecutionStore {
             .runs
             .get(&(owner_id, run_id))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
-        let take = usize::try_from(page.limit())
-            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?
-            .checked_add(1)
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
-        let mut events = aggregate
-            .events
+        let current_snapshot = u64::try_from(aggregate.events.len())
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+        let (snapshot, last) = self.read_window(
+            owner_id,
+            run_id,
+            HistoryCollection::Events,
+            current_snapshot,
+            &page,
+        )?;
+        let start = usize::try_from(last)
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
+        let end = usize::try_from(snapshot)
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
+        let take = page_take(&page)?;
+        let mut events = aggregate.events[start..end]
             .iter()
-            .filter(|event| event.sequence() > page.offset())
             .take(take)
             .cloned()
             .collect::<Vec<_>>();
@@ -809,53 +784,502 @@ impl ExecutionStore for InMemoryExecutionStore {
         if has_more {
             events.pop();
         }
-        let next_after_sequence = has_more
-            .then(|| events.last().map(RuntimeEvent::sequence))
-            .flatten();
-        super::EventReplayPage::new(events, next_after_sequence)
+        let next_cursor = if has_more {
+            let last = events
+                .last()
+                .map(RuntimeEvent::sequence)
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::EventConflict))?;
+            Some(self.write_cursor(owner_id, run_id, HistoryCollection::Events, snapshot, last)?)
+        } else {
+            None
+        };
+        super::EventReplayPage::new(events, next_cursor)
     }
 }
 
-fn insert_result(
-    aggregate: &mut RunAggregate,
-    mutation: &DurableResultMutation,
-) -> Result<(), ExecutionStoreError> {
-    let completed = mutation.completed();
-    if completed.invocation().run_id() != aggregate.stored.run().id()
-        || completed.result_ref().value() != mutation.result().result_ref().handle()
-    {
+fn build_commit_patch(
+    state: &State,
+    owner_id: Uuid,
+    commit: &ExecutionCommit,
+    now_ms: u64,
+) -> Result<CommitPatch, ExecutionStoreError> {
+    let run_id = commit.lease().run_id();
+    let aggregate = state
+        .runs
+        .get(&(owner_id, run_id))
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+    if aggregate.stored.run_version() != commit.expected_run_version() {
         return Err(ExecutionStoreError::new(
-            ExecutionStoreErrorCode::LineageConflict,
+            ExecutionStoreErrorCode::VersionConflict,
         ));
     }
-    let key = completed.invocation().id();
-    let attempt = aggregate
-        .attempts
-        .get(&(key, completed.attempt_number()))
-        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::LineageConflict))?;
-    if attempt.invocation() != completed.invocation()
-        || attempt.state() != super::AttemptRecordState::Completed
-        || attempt.manifest() != completed.manifest()
-        || attempt.recovery_mode() != completed.recovery_mode()
-    {
+    if aggregate.checkpoint_version != commit.expected_checkpoint_version() {
         return Err(ExecutionStoreError::new(
-            ExecutionStoreErrorCode::LineageConflict,
+            ExecutionStoreErrorCode::CheckpointConflict,
         ));
     }
-    let value = StoredDurableResult {
-        completed: completed.clone(),
-        result: mutation.result().clone(),
-    };
-    match aggregate.results.get(&key) {
-        Some(existing) if existing == &value => Ok(()),
-        Some(_) => Err(ExecutionStoreError::new(
-            ExecutionStoreErrorCode::ResultConflict,
-        )),
-        None => {
-            aggregate.results.insert(key, value);
-            Ok(())
+    if aggregate.lease.as_ref() != Some(commit.lease()) || commit.lease().expires_at_ms() <= now_ms
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::LeaseExpired,
+        ));
+    }
+    if !valid_command_transition(
+        aggregate.stored.run(),
+        commit.target_run(),
+        commit.command(),
+        commit.approval(),
+        commit.attempts(),
+    ) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+
+    let current_event_count = u64::try_from(aggregate.events.len())
+        .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+    let first_sequence = current_event_count
+        .checked_add(1)
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+    let event_count = u64::try_from(commit.events().len())
+        .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+    let last_sequence = current_event_count
+        .checked_add(event_count)
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+    RuntimeEvent::validate_batch(first_sequence, commit.events())
+        .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::EventConflict))?;
+    let session = state
+        .sessions
+        .get(&(owner_id, aggregate.stored.run().session_id()))
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+    if commit.events().iter().any(|event| {
+        event.owner_id() != session.owner_id
+            || event.run_id() != run_id
+            || event.session_id() != aggregate.stored.run().session_id()
+    }) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::EventConflict,
+        ));
+    }
+    if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
+        if checkpoint.run_id() != run_id
+            || checkpoint.session_id() != aggregate.stored.run().session_id()
+            || checkpoint.definition().id() != aggregate.stored.run().definition_id()
+            || checkpoint.definition().version() != aggregate.stored.run().definition_version()
+            || checkpoint.state() != commit.target_run().state()
+            || checkpoint.pause_reason() != commit.target_run().pause_reason()
+            || checkpoint
+                .pending_approval()
+                .map(|pending| pending.request())
+                != commit.target_run().pending_approval()
+            || commit.target_run().state() == RunState::RecoveryRequired
+                && !checkpoint.uncertain_invocations().iter().any(|record| {
+                    commit.target_run().recovery_pause() == Some(record.pause())
+                        && commit.target_run().recovery_binding() == record.recovery_binding()
+                })
+            || checkpoint.last_durable_event_sequence() != last_sequence
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::CheckpointConflict,
+            ));
         }
     }
+
+    let mut authoritative_grant_update = None;
+    let mut grant_consumption_key = None;
+    if let Some(approval) = commit.approval() {
+        let resumed = aggregate
+            .stored
+            .run()
+            .apply_resume_command(commit.command(), Some(approval.claim()), None)
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
+        if resumed.run() != commit.target_run()
+            || resumed.grant_consumption() != approval.grant_consumption()
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        match (
+            approval.grant_id(),
+            approval.grant_revision(),
+            approval.grant_remaining_uses(),
+        ) {
+            (Some(_), Some(grant_revision), claimed_remaining) => {
+                let binding = approval.claim().grant_authority_binding().ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
+                })?;
+                let mut authoritative = state
+                    .authoritative_grants
+                    .get(&(owner_id, binding.authority_key().as_str().to_owned()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
+                    })?;
+                if authoritative.binding()? != *binding
+                    || authoritative.status() != AuthoritativeGrantStatus::Active
+                    || authoritative.revision() != grant_revision
+                    || authoritative.remaining_uses() != claimed_remaining
+                {
+                    return Err(ExecutionStoreError::new(
+                        ExecutionStoreErrorCode::GrantConflict,
+                    ));
+                }
+                match (approval.grant_consumption(), claimed_remaining) {
+                    (Some(consumption), Some(remaining)) => {
+                        let snapshot =
+                            approval
+                                .claim()
+                                .grant_consumption_snapshot()
+                                .ok_or_else(|| {
+                                    ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
+                                })?;
+                        if snapshot.remaining_uses() != remaining
+                            || !binding.matches_consumption(consumption)
+                        {
+                            return Err(ExecutionStoreError::new(
+                                ExecutionStoreErrorCode::GrantConflict,
+                            ));
+                        }
+                        let key = (
+                            owner_id,
+                            binding.authority_key().as_str().to_owned(),
+                            consumption.grant_revision,
+                            consumption.logical_invocation_id,
+                        );
+                        if state.grant_consumptions.contains(&key) {
+                            return Err(ExecutionStoreError::new(
+                                ExecutionStoreErrorCode::GrantAlreadyConsumed,
+                            ));
+                        }
+                        authoritative.consume_one()?;
+                        grant_consumption_key = Some(key);
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(ExecutionStoreError::new(
+                            ExecutionStoreErrorCode::GrantConflict,
+                        ))
+                    }
+                }
+                authoritative_grant_update = Some(authoritative);
+            }
+            (None, None, None) if approval.grant_consumption().is_none() => {}
+            _ => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::GrantConflict,
+                ))
+            }
+        }
+    }
+
+    let mut step_patches = BTreeMap::new();
+    let mut next_step_sequence = aggregate.next_step_sequence;
+    for step in commit.steps() {
+        if step.run_id() != run_id {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        match aggregate.steps.get(step.logical_step_id()) {
+            Some(existing) if existing == step => continue,
+            Some(_) => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::HistoryConflict,
+                ))
+            }
+            None => {}
+        }
+        match step_patches.get(step.logical_step_id()) {
+            Some((_, existing)) if existing == step => continue,
+            Some(_) => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::HistoryConflict,
+                ))
+            }
+            None => {}
+        }
+        let sequence = next_step_sequence;
+        next_step_sequence = next_step_sequence
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+        step_patches.insert(step.logical_step_id().to_owned(), (sequence, step.clone()));
+    }
+
+    let mut attempt_patches = BTreeMap::new();
+    let mut next_attempt_sequence = aggregate.next_attempt_sequence;
+    let mut attempts_fingerprint = aggregate.attempts_fingerprint;
+    for attempt in commit.attempts() {
+        if attempt.invocation().run_id() != run_id {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        let key = (attempt.invocation().id(), attempt.attempt_number());
+        match aggregate.attempts.get(&key) {
+            Some(existing) if existing == attempt => continue,
+            Some(_) => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::HistoryConflict,
+                ))
+            }
+            None => {}
+        }
+        match attempt_patches.get(&key) {
+            Some((_, existing)) if existing == attempt => continue,
+            Some(_) => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::HistoryConflict,
+                ))
+            }
+            None => {}
+        }
+        let sequence = next_attempt_sequence;
+        next_attempt_sequence = next_attempt_sequence
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+        attempts_fingerprint
+            .include(attempt)
+            .map_err(ExecutionStoreError::from)?;
+        attempt_patches.insert(key, (sequence, attempt.clone()));
+    }
+
+    let mut result_patches = BTreeMap::new();
+    let mut completed_fingerprint = aggregate.completed_fingerprint;
+    for mutation in commit.results() {
+        let completed = mutation.completed();
+        if completed.invocation().run_id() != run_id
+            || completed.result_ref().value() != mutation.result().result_ref().handle()
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::LineageConflict,
+            ));
+        }
+        let key = completed.invocation().id();
+        let attempt_key = (key, completed.attempt_number());
+        let attempt = attempt_patches
+            .get(&attempt_key)
+            .map(|(_, attempt)| attempt)
+            .or_else(|| aggregate.attempts.get(&attempt_key))
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::LineageConflict))?;
+        if attempt.invocation() != completed.invocation()
+            || attempt.state() != super::AttemptRecordState::Completed
+            || attempt.manifest() != completed.manifest()
+            || attempt.recovery_mode() != completed.recovery_mode()
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::LineageConflict,
+            ));
+        }
+        let value = StoredDurableResult {
+            completed: completed.clone(),
+            result: mutation.result().clone(),
+        };
+        match aggregate.results.get(&key) {
+            Some(existing) if existing == &value => continue,
+            Some(_) => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::ResultConflict,
+                ))
+            }
+            None => {}
+        }
+        match result_patches.get(&key) {
+            Some(existing) if existing == &value => continue,
+            Some(_) => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::ResultConflict,
+                ))
+            }
+            None => {}
+        }
+        completed_fingerprint
+            .include(completed)
+            .map_err(ExecutionStoreError::from)?;
+        result_patches.insert(key, value);
+    }
+
+    if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
+        let expected_attempts = aggregate
+            .attempts
+            .len()
+            .checked_add(attempt_patches.len())
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+        let expected_completed = aggregate
+            .results
+            .len()
+            .checked_add(result_patches.len())
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+        if checkpoint.attempts().len() != expected_attempts
+            || checkpoint.completed_invocations().len() != expected_completed
+            || checkpoint.attempts_fingerprint() != attempts_fingerprint
+            || checkpoint.completed_fingerprint() != completed_fingerprint
+            || checkpoint.cursor().is_some_and(|cursor| {
+                !aggregate.steps.contains_key(cursor.logical_step_id())
+                    && !step_patches.contains_key(cursor.logical_step_id())
+            })
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::CheckpointConflict,
+            ));
+        }
+    }
+
+    let aggregate_changed = aggregate.stored.run() != commit.target_run()
+        || !commit.events().is_empty()
+        || !step_patches.is_empty()
+        || !attempt_patches.is_empty()
+        || !result_patches.is_empty();
+    if aggregate_changed && matches!(commit.checkpoint_mutation(), CheckpointMutation::Unchanged) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::CheckpointConflict,
+        ));
+    }
+    if commit.target_run().state().is_terminal()
+        && !matches!(commit.checkpoint_mutation(), CheckpointMutation::Clear)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::CheckpointConflict,
+        ));
+    }
+
+    let checkpoint_version = match commit.checkpoint_mutation() {
+        CheckpointMutation::Unchanged => aggregate.checkpoint_version,
+        CheckpointMutation::Replace(_) => aggregate
+            .checkpoint_version
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?,
+        CheckpointMutation::Clear if aggregate.checkpoint.is_some() => aggregate
+            .checkpoint_version
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?,
+        CheckpointMutation::Clear => aggregate.checkpoint_version,
+    };
+    let checkpoint = match commit.checkpoint_mutation() {
+        CheckpointMutation::Unchanged => aggregate.checkpoint.clone(),
+        CheckpointMutation::Replace(_) => None,
+        CheckpointMutation::Clear => None,
+    };
+    let run_version = aggregate
+        .stored
+        .run_version()
+        .checked_add(1)
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+    let mut stored = StoredRun::new(
+        owner_id,
+        commit.target_run().clone(),
+        run_version,
+        aggregate.stored.session_version(),
+    )?;
+    let mut lease = aggregate.lease.clone();
+    let mut session_update = None;
+    let mut release_serial_claim = false;
+    if commit.target_run().state().is_terminal() {
+        lease = None;
+        if state
+            .serial_claims
+            .get(&(owner_id, commit.target_run().session_id()))
+            == Some(&run_id)
+        {
+            let mut session = session.clone();
+            session.version = session.version.checked_add(1).ok_or_else(|| {
+                ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
+            })?;
+            stored = StoredRun::new(
+                owner_id,
+                commit.target_run().clone(),
+                run_version,
+                session.version,
+            )?;
+            session_update = Some(session);
+            release_serial_claim = true;
+        }
+    }
+    let receipt = CommandReceipt::accepted(commit.command()).map_err(ExecutionStoreError::from)?;
+    let grant_consumption = commit
+        .approval()
+        .and_then(|approval| approval.grant_consumption())
+        .cloned();
+    Ok(CommitPatch {
+        stored,
+        lease,
+        checkpoint_version,
+        checkpoint,
+        events: commit.events().to_vec(),
+        steps: step_patches
+            .into_iter()
+            .map(|(key, (sequence, step))| (key, sequence, step))
+            .collect(),
+        next_step_sequence,
+        attempts: attempt_patches
+            .into_iter()
+            .map(|(key, (sequence, attempt))| (key, sequence, attempt))
+            .collect(),
+        next_attempt_sequence,
+        attempts_fingerprint,
+        results: result_patches.into_iter().collect(),
+        completed_fingerprint,
+        authoritative_grant_update,
+        grant_consumption_key,
+        session_update,
+        release_serial_claim,
+        receipt,
+        grant_consumption,
+    })
+}
+
+fn apply_commit_patch(
+    state: &mut State,
+    owner_id: Uuid,
+    run_id: Uuid,
+    patch: CommitPatch,
+    outcome: ExecutionCommitOutcome,
+) {
+    let command_key = (owner_id, patch.receipt.command_id());
+    let session_id = patch.stored.run().session_id();
+    {
+        let aggregate = state
+            .runs
+            .get_mut(&(owner_id, run_id))
+            .expect("validated run aggregate must remain present under the owner lock");
+        aggregate.stored = patch.stored;
+        aggregate.lease = patch.lease;
+        aggregate.checkpoint_version = patch.checkpoint_version;
+        aggregate.checkpoint = patch.checkpoint;
+        aggregate.events.extend(patch.events);
+        for (key, sequence, step) in patch.steps {
+            aggregate.step_order.insert(sequence, key.clone());
+            aggregate.steps.insert(key, step);
+        }
+        aggregate.next_step_sequence = patch.next_step_sequence;
+        for (key, sequence, attempt) in patch.attempts {
+            aggregate.attempt_order.insert(sequence, key);
+            aggregate.attempts.insert(key, attempt);
+        }
+        aggregate.next_attempt_sequence = patch.next_attempt_sequence;
+        aggregate.attempts_fingerprint = patch.attempts_fingerprint;
+        for (key, result) in patch.results {
+            aggregate.results.insert(key, result);
+        }
+        aggregate.completed_fingerprint = patch.completed_fingerprint;
+    }
+    if let Some(authoritative) = patch.authoritative_grant_update {
+        state.authoritative_grants.insert(
+            (owner_id, authoritative.authority_key_encoded().to_owned()),
+            authoritative,
+        );
+    }
+    if let Some(key) = patch.grant_consumption_key {
+        state.grant_consumptions.insert(key);
+    }
+    if let Some(session) = patch.session_update {
+        state.sessions.insert((owner_id, session_id), session);
+    }
+    if patch.release_serial_claim {
+        state.serial_claims.remove(&(owner_id, session_id));
+    }
+    state.receipts.insert(command_key, patch.receipt);
+    state.outcomes.insert(command_key, outcome);
 }
 
 fn valid_command_transition(
@@ -973,11 +1397,4 @@ fn valid_command_transition(
                 }
         }
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }

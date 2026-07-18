@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::state::{
@@ -16,6 +17,29 @@ use crate::{
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
 const MAX_DIGEST_BYTES: usize = 256;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct HistoryFingerprint([u8; 32]);
+
+impl HistoryFingerprint {
+    pub(super) fn include<T: Serialize>(&mut self, value: &T) -> Result<(), ExecutionError> {
+        let canonical = serde_jcs::to_vec(value)
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))?;
+        let digest = Sha256::digest(canonical);
+        for (slot, byte) in self.0.iter_mut().zip(digest) {
+            *slot ^= byte;
+        }
+        Ok(())
+    }
+
+    fn from_values<T: Serialize>(values: &[T]) -> Result<Self, ExecutionError> {
+        let mut fingerprint = Self::default();
+        for value in values {
+            fingerprint.include(value)?;
+        }
+        Ok(fingerprint)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -659,6 +683,10 @@ pub struct CheckpointV1 {
     usage: Usage,
     memory_refs: Vec<OpaqueReference>,
     artifact_refs: Vec<OpaqueReference>,
+    #[serde(skip)]
+    attempts_fingerprint: HistoryFingerprint,
+    #[serde(skip)]
+    completed_fingerprint: HistoryFingerprint,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -827,6 +855,8 @@ impl CheckpointV1 {
         .build()
     }
     fn from_wire(w: CheckpointWire) -> Result<Self, ExecutionError> {
+        let attempts_fingerprint = HistoryFingerprint::from_values(&w.attempts)?;
+        let completed_fingerprint = HistoryFingerprint::from_values(&w.completed_invocations)?;
         let value = Self {
             schema_version: w.schema_version,
             runtime_schema_version: w.runtime_schema_version,
@@ -848,6 +878,8 @@ impl CheckpointV1 {
             usage: w.usage,
             memory_refs: w.memory_refs,
             artifact_refs: w.artifact_refs,
+            attempts_fingerprint,
+            completed_fingerprint,
         };
         value.validate()?;
         Ok(value)
@@ -1128,6 +1160,12 @@ impl CheckpointV1 {
     }
     pub fn completed_invocations(&self) -> &[CompletedInvocationRecord] {
         &self.completed_invocations
+    }
+    pub(super) fn attempts_fingerprint(&self) -> HistoryFingerprint {
+        self.attempts_fingerprint
+    }
+    pub(super) fn completed_fingerprint(&self) -> HistoryFingerprint {
+        self.completed_fingerprint
     }
     pub fn uncertain_invocations(&self) -> &[UncertainInvocationRecord] {
         &self.uncertain_invocations

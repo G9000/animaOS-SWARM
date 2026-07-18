@@ -7,31 +7,41 @@ use anima_core::{
     DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
     ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
     ExecutionStoreFactory, GrantEffect, GrantScope, GrantStatus, InMemoryExecutionStore,
-    InvocationAttemptRecord, LogicalInvocation, ManifestPin, OpaqueReference, PolicyContext,
-    PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run, RunState, RuntimeCommand,
-    RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session, SessionConcurrencyPolicy,
-    StoreReadPage, Usage, MAX_COMMIT_EVENTS,
+    InvocationAttemptRecord, LogicalInvocation, ManifestPin, ManualExecutionClock, OpaqueReference,
+    PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run, RunState,
+    RuntimeCommand, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session,
+    SessionConcurrencyPolicy, StoreReadPage, Usage, MAX_COMMIT_EVENTS,
 };
+use std::sync::Arc;
 use uuid::Uuid;
 
 fn id(value: u128) -> Uuid {
     Uuid::from_u128(value)
 }
 
-struct MemoryFactory;
+#[derive(Default)]
+struct MemoryFactory {
+    clock: ManualExecutionClock,
+}
 
 #[async_trait::async_trait]
 impl ExecutionStoreFactory for MemoryFactory {
     type Store = InMemoryExecutionStore;
 
     async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError> {
-        Ok(InMemoryExecutionStore::default())
+        Ok(InMemoryExecutionStore::with_clock(Arc::new(
+            self.clock.clone(),
+        )))
+    }
+
+    fn advance_clock(&self, duration_ms: u64) -> Result<(), ExecutionStoreError> {
+        self.clock.advance_ms(duration_ms)
     }
 }
 
 #[tokio::test]
 async fn public_adapter_conformance_suite_runs_against_memory_store() {
-    assert_execution_store_conformance(&MemoryFactory)
+    assert_execution_store_conformance(&MemoryFactory::default())
         .await
         .unwrap();
 }
@@ -1077,16 +1087,18 @@ async fn execution_step_and_attempt_history_is_append_only() {
     );
     assert_eq!(
         store
-            .load_steps_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .load_steps_page(owner_id, queued.id(), StoreReadPage::first(256).unwrap())
             .await
-            .unwrap(),
+            .unwrap()
+            .into_items(),
         vec![step]
     );
     assert_eq!(
         store
-            .load_attempts_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .load_attempts_page(owner_id, queued.id(), StoreReadPage::first(256).unwrap())
             .await
-            .unwrap(),
+            .unwrap()
+            .into_items(),
         vec![pending]
     );
 }
@@ -1159,7 +1171,7 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
         &queued
     );
     assert!(store
-        .replay_events(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
+        .replay_events(owner_id, queued.id(), StoreReadPage::first(256).unwrap())
         .await
         .unwrap()
         .events()
@@ -1240,12 +1252,12 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
         ExecutionStoreErrorCode::CheckpointConflict
     );
     assert!(store
-        .load_steps_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
+        .load_steps_page(owner_id, queued.id(), StoreReadPage::first(256).unwrap())
         .await
         .unwrap()
         .is_empty());
     assert!(store
-        .load_attempts_page(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
+        .load_attempts_page(owner_id, queued.id(), StoreReadPage::first(256).unwrap())
         .await
         .unwrap()
         .is_empty());
@@ -1652,13 +1664,13 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
         .unwrap()
     })
     .collect::<Vec<_>>();
-    store
+    let first_commit = store
         .commit_execution(
             owner_id,
             ExecutionCommit::new(
                 created.run_version(),
                 0,
-                lease,
+                lease.clone(),
                 RuntimeCommand::start(id(115), session.id(), queued.id()).unwrap(),
                 events.clone(),
                 steps.clone(),
@@ -1670,43 +1682,68 @@ async fn commit_batches_are_bounded_and_history_reads_are_paged() {
         )
         .await
         .unwrap();
+    let first_steps = store
+        .load_steps_page(owner_id, queued.id(), StoreReadPage::first(2).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(first_steps.items(), &steps[..2]);
+    assert!(first_steps.next_cursor().is_some());
+    let inserted_between_pages =
+        ExecutionStep::new(queued.id(), "page-0", anima_core::StepKind::Capability).unwrap();
+    store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                first_commit.stored_run().run_version(),
+                0,
+                store.renew_lease(owner_id, lease, 1_000).await.unwrap(),
+                RuntimeCommand::record_progress(id(118), session.id(), queued.id()).unwrap(),
+                vec![],
+                vec![inserted_between_pages],
+                vec![],
+                vec![],
+                None,
+                first_commit.stored_run().run().clone(),
+            ),
+        )
+        .await
+        .unwrap();
     assert_eq!(
         store
-            .load_steps_page(owner_id, queued.id(), StoreReadPage::new(0, 2).unwrap())
+            .load_steps_page(
+                owner_id,
+                queued.id(),
+                StoreReadPage::after(first_steps.next_cursor().unwrap().clone(), 2).unwrap(),
+            )
             .await
-            .unwrap(),
-        steps[..2]
-    );
-    assert_eq!(
-        store
-            .load_steps_page(owner_id, queued.id(), StoreReadPage::new(2, 2).unwrap())
-            .await
-            .unwrap(),
+            .unwrap()
+            .into_items(),
         steps[2..]
     );
-    assert!(StoreReadPage::new(0, 0).is_err());
+    assert!(StoreReadPage::first(0).is_err());
     let first_events = store
-        .replay_events(owner_id, queued.id(), StoreReadPage::new(0, 2).unwrap())
+        .replay_events(owner_id, queued.id(), StoreReadPage::first(2).unwrap())
         .await
         .unwrap();
     assert_eq!(first_events.events(), &events[..2]);
-    assert_eq!(first_events.next_after_sequence(), Some(2));
+    assert!(first_events.next_cursor().is_some());
     let last_events = store
         .replay_events(
             owner_id,
             queued.id(),
-            StoreReadPage::new(first_events.next_after_sequence().unwrap(), 2).unwrap(),
+            StoreReadPage::after(first_events.next_cursor().unwrap().clone(), 2).unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(last_events.events(), &events[2..]);
-    assert_eq!(last_events.next_after_sequence(), None);
-    assert!(StoreReadPage::new(0, anima_core::MAX_STORE_READ_PAGE_SIZE + 1).is_err());
+    assert!(last_events.next_cursor().is_none());
+    assert!(StoreReadPage::first(anima_core::MAX_STORE_READ_PAGE_SIZE + 1).is_err());
 }
 
 #[tokio::test]
 async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() {
-    let store = InMemoryExecutionStore::default();
+    let clock = ManualExecutionClock::default();
+    let store = InMemoryExecutionStore::with_clock(Arc::new(clock.clone()));
     let owner_id = id(13);
     let session = Session::new(id(10), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
     let queued = Run::queued(id(11), session.id(), "writer", 1).unwrap();
@@ -1728,7 +1765,7 @@ async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() 
         .acquire_lease(owner_id, queued.id(), 1, 100)
         .await
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    clock.advance_ms(250).unwrap();
     let current = store
         .acquire_lease(owner_id, queued.id(), 1, 1_000)
         .await
@@ -1789,7 +1826,7 @@ async fn reclaimed_lease_fences_stale_execution_and_commits_contiguous_events() 
         .unwrap();
     assert_eq!(
         store
-            .replay_events(owner_id, queued.id(), StoreReadPage::new(0, 256).unwrap())
+            .replay_events(owner_id, queued.id(), StoreReadPage::first(256).unwrap())
             .await
             .unwrap()
             .events(),
@@ -1857,4 +1894,35 @@ pub async fn serial_session_claim_contract<S: ExecutionStore>(store: &S) {
 #[tokio::test]
 async fn serial_session_claims_exactly_one_nonterminal_run() {
     serial_session_claim_contract(&InMemoryExecutionStore::default()).await;
+}
+
+#[test]
+fn small_commits_are_structurally_bounded_to_a_mutation_patch() {
+    let source = include_str!("../src/execution/memory_store.rs").replace("\r\n", "\n");
+    let patch_builder = source
+        .split("fn build_commit_patch")
+        .nth(1)
+        .and_then(|tail| tail.split("fn apply_commit_patch").next())
+        .expect("bounded patch builder must remain inspectable");
+    assert!(
+        source.contains("struct CommitPatch"),
+        "commit application must build a bounded mutation patch"
+    );
+    assert!(
+        !source.contains("#[derive(Clone)]\nstruct RunAggregate"),
+        "the full run aggregate must not be clonable by commit application"
+    );
+    assert!(!patch_builder.contains(".values()"));
+    assert!(!patch_builder.contains("aggregate.events.iter()"));
+}
+
+#[test]
+fn lease_conformance_uses_a_manual_clock_without_wall_time_waits() {
+    let memory_store = include_str!("../src/execution/memory_store.rs");
+    let conformance = include_str!("../src/execution/store.rs");
+    let contract = include_str!("execution_store_contract.rs");
+    assert!(memory_store.contains("pub struct ManualExecutionClock"));
+    assert!(!conformance.contains("futures_timer::Delay"));
+    let wall_time_sleep = ["std::thread", "::sleep"].concat();
+    assert!(!contract.contains(&wall_time_sleep));
 }

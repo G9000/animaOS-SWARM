@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -26,48 +27,112 @@ pub const MAX_COMMIT_ATTEMPTS: usize = 256;
 pub const MAX_COMMIT_RESULTS: usize = 128;
 pub const MAX_COMMIT_BATCH_ITEMS: usize = 512;
 pub const MAX_STORE_READ_PAGE_SIZE: u32 = 256;
+pub const MAX_STORE_READ_CURSOR_BYTES: usize = 256;
 const MAX_COMMIT_CHECKPOINT_BYTES: usize = 1_048_576;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreReadCursor(String);
+
+impl StoreReadCursor {
+    pub fn from_opaque(value: impl Into<String>) -> Result<Self, ExecutionStoreError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_STORE_READ_CURSOR_BYTES || !value.is_ascii() {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::BoundsExceeded,
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoreReadPage {
-    offset: u64,
+    cursor: Option<StoreReadCursor>,
     limit: u32,
 }
 
 impl StoreReadPage {
-    pub fn new(offset: u64, limit: u32) -> Result<Self, ExecutionStoreError> {
+    pub fn new(cursor: Option<StoreReadCursor>, limit: u32) -> Result<Self, ExecutionStoreError> {
         if limit == 0 || limit > MAX_STORE_READ_PAGE_SIZE {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::BoundsExceeded,
             ));
         }
-        Ok(Self { offset, limit })
+        Ok(Self { cursor, limit })
     }
 
-    pub fn offset(self) -> u64 {
-        self.offset
+    pub fn first(limit: u32) -> Result<Self, ExecutionStoreError> {
+        Self::new(None, limit)
     }
 
-    pub fn limit(self) -> u32 {
+    pub fn after(cursor: StoreReadCursor, limit: u32) -> Result<Self, ExecutionStoreError> {
+        Self::new(Some(cursor), limit)
+    }
+
+    pub fn cursor(&self) -> Option<&StoreReadCursor> {
+        self.cursor.as_ref()
+    }
+
+    pub fn limit(&self) -> u32 {
         self.limit
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreHistoryPage<T> {
+    items: Vec<T>,
+    next_cursor: Option<StoreReadCursor>,
+}
+
+impl<T> StoreHistoryPage<T> {
+    pub fn new(
+        items: Vec<T>,
+        next_cursor: Option<StoreReadCursor>,
+    ) -> Result<Self, ExecutionStoreError> {
+        if items.len() > MAX_STORE_READ_PAGE_SIZE as usize
+            || items.is_empty() && next_cursor.is_some()
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::BoundsExceeded,
+            ));
+        }
+        Ok(Self { items, next_cursor })
+    }
+
+    pub fn items(&self) -> &[T] {
+        &self.items
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn into_items(self) -> Vec<T> {
+        self.items
+    }
+
+    pub fn next_cursor(&self) -> Option<&StoreReadCursor> {
+        self.next_cursor.as_ref()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventReplayPage {
     events: Vec<RuntimeEvent>,
-    next_after_sequence: Option<u64>,
+    next_cursor: Option<StoreReadCursor>,
 }
 
 impl EventReplayPage {
     pub fn new(
         events: Vec<RuntimeEvent>,
-        next_after_sequence: Option<u64>,
+        next_cursor: Option<StoreReadCursor>,
     ) -> Result<Self, ExecutionStoreError> {
         if events.len() > MAX_STORE_READ_PAGE_SIZE as usize
-            || events.is_empty() && next_after_sequence.is_some()
-            || next_after_sequence
-                .is_some_and(|cursor| events.last().map(RuntimeEvent::sequence) != Some(cursor))
+            || events.is_empty() && next_cursor.is_some()
         {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::BoundsExceeded,
@@ -79,7 +144,7 @@ impl EventReplayPage {
         }
         Ok(Self {
             events,
-            next_after_sequence,
+            next_cursor,
         })
     }
 
@@ -91,8 +156,8 @@ impl EventReplayPage {
         self.events
     }
 
-    pub fn next_after_sequence(&self) -> Option<u64> {
-        self.next_after_sequence
+    pub fn next_cursor(&self) -> Option<&StoreReadCursor> {
+        self.next_cursor.as_ref()
     }
 }
 
@@ -597,6 +662,10 @@ impl ExecutionCommit {
         &self.checkpoint
     }
 
+    pub(super) fn into_checkpoint_mutation(self) -> CheckpointMutation {
+        self.checkpoint
+    }
+
     pub fn target_run(&self) -> &Run {
         &self.target_run
     }
@@ -637,7 +706,7 @@ pub struct ExecutionCommitOutcome {
     stored_run: StoredRun,
     receipt: CommandReceipt,
     checkpoint_version: u64,
-    checkpoint: Option<CheckpointV1>,
+    checkpoint: Option<Arc<CheckpointV1>>,
     grant_consumption: Option<GrantConsumption>,
 }
 
@@ -647,6 +716,22 @@ impl ExecutionCommitOutcome {
         receipt: CommandReceipt,
         checkpoint_version: u64,
         checkpoint: Option<CheckpointV1>,
+        grant_consumption: Option<GrantConsumption>,
+    ) -> Self {
+        Self::new_shared(
+            stored_run,
+            receipt,
+            checkpoint_version,
+            checkpoint.map(Arc::new),
+            grant_consumption,
+        )
+    }
+
+    pub(super) fn new_shared(
+        stored_run: StoredRun,
+        receipt: CommandReceipt,
+        checkpoint_version: u64,
+        checkpoint: Option<Arc<CheckpointV1>>,
         grant_consumption: Option<GrantConsumption>,
     ) -> Self {
         Self {
@@ -671,7 +756,7 @@ impl ExecutionCommitOutcome {
     }
 
     pub fn checkpoint(&self) -> Option<&CheckpointV1> {
-        self.checkpoint.as_ref()
+        self.checkpoint.as_deref()
     }
 
     pub fn grant_consumption(&self) -> Option<&GrantConsumption> {
@@ -855,14 +940,14 @@ pub trait ExecutionStore: Send + Sync {
         owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
-    ) -> Result<Vec<Step>, ExecutionStoreError>;
+    ) -> Result<StoreHistoryPage<Step>, ExecutionStoreError>;
 
     async fn load_attempts_page(
         &self,
         owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
-    ) -> Result<Vec<InvocationAttemptRecord>, ExecutionStoreError>;
+    ) -> Result<StoreHistoryPage<InvocationAttemptRecord>, ExecutionStoreError>;
 
     async fn load_durable_result(
         &self,
@@ -879,11 +964,17 @@ pub trait ExecutionStore: Send + Sync {
     ) -> Result<EventReplayPage, ExecutionStoreError>;
 }
 
+pub trait ExecutionClock: Send + Sync {
+    fn now_ms(&self) -> u64;
+}
+
 #[async_trait]
 pub trait ExecutionStoreFactory: Send + Sync {
     type Store: ExecutionStore;
 
     async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError>;
+
+    fn advance_clock(&self, duration_ms: u64) -> Result<(), ExecutionStoreError>;
 }
 
 /// Runs portable adapter checks using only the public execution-store port.
@@ -1090,18 +1181,20 @@ where
             .load_steps_page(
                 owner_id,
                 run.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
-            != vec![step]
+            .items()
+            != [step]
         || store
             .load_attempts_page(
                 owner_id,
                 run.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
-            != vec![attempt]
+            .items()
+            != [attempt]
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -1284,14 +1377,14 @@ where
         ));
     }
     let first_event_page = store
-        .replay_events(owner_id, run.id(), StoreReadPage::new(0, 1)?)
+        .replay_events(owner_id, run.id(), StoreReadPage::first(1)?)
         .await?;
     let second_event_page = store
         .replay_events(
             owner_id,
             run.id(),
-            StoreReadPage::new(
-                first_event_page.next_after_sequence().ok_or_else(|| {
+            StoreReadPage::after(
+                first_event_page.next_cursor().cloned().ok_or_else(|| {
                     ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest)
                 })?,
                 1,
@@ -1299,9 +1392,9 @@ where
         )
         .await?;
     if first_event_page.events().len() != 1
-        || first_event_page.next_after_sequence() != Some(1)
+        || first_event_page.next_cursor().is_none()
         || second_event_page.events().len() != 1
-        || second_event_page.next_after_sequence() != Some(2)
+        || second_event_page.next_cursor().is_none()
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -1315,6 +1408,7 @@ where
     assert_portable_command_semantics_contract(factory).await?;
     assert_portable_lifecycle_transition_contract(factory).await?;
     assert_portable_append_only_history_contract(factory).await?;
+    assert_keyset_history_paging_contract(factory).await?;
     assert_portable_checkpoint_rollback_contract(factory).await?;
     assert_concurrent_session_contract(factory).await?;
     assert_stale_cas_contract(factory).await?;
@@ -1332,33 +1426,32 @@ async fn replay_all_events<S: ExecutionStore + ?Sized>(
     owner_id: Uuid,
     run_id: Uuid,
 ) -> Result<Vec<RuntimeEvent>, ExecutionStoreError> {
-    let mut after_sequence = 0;
+    let mut cursor = None;
+    let mut last_sequence = 0;
     let mut events = Vec::new();
     loop {
         let page = store
             .replay_events(
                 owner_id,
                 run_id,
-                StoreReadPage::new(after_sequence, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::new(cursor.take(), MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?;
         if page
             .events()
             .iter()
-            .any(|event| event.sequence() <= after_sequence)
+            .any(|event| event.sequence() <= last_sequence)
         {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::EventConflict,
             ));
         }
         events.extend_from_slice(page.events());
-        match page.next_after_sequence() {
-            Some(next) if next > after_sequence => after_sequence = next,
-            Some(_) => {
-                return Err(ExecutionStoreError::new(
-                    ExecutionStoreErrorCode::EventConflict,
-                ))
-            }
+        if let Some(last) = page.events().last() {
+            last_sequence = last.sequence();
+        }
+        match page.next_cursor() {
+            Some(next) => cursor = Some(next.clone()),
             None => return Ok(events),
         }
     }
@@ -2376,19 +2469,253 @@ where
             .load_steps_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
-            != vec![step]
+            .items()
+            != [step]
         || store
             .load_attempts_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
-            != vec![pending]
+            .items()
+            != [pending]
         || replay_all_events(&store, owner_id, queued.id()).await? != vec![event]
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_keyset_history_paging_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let owner_id = Uuid::from_u128(52_100);
+    let session = Session::new(
+        Uuid::from_u128(52_101),
+        "keyset-history",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let queued = Run::queued(
+        Uuid::from_u128(52_102),
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let created = store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner_id,
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
+        .await?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:keyset-history",
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let make_attempt = |value: u128, step: &str| -> Result<_, ExecutionStoreError> {
+        let invocation = conformance_value(LogicalInvocation::new(
+            queued.id(),
+            step,
+            "workspace.write",
+            1,
+            serde_json::json!({"value": value}),
+        ))?;
+        conformance_value(InvocationAttemptRecord::new(
+            invocation.binding(),
+            1,
+            super::AttemptRecordState::Pending,
+            manifest.clone(),
+            RecoveryMode::KeyedIdempotent,
+        ))
+    };
+    let first_steps = vec![
+        Step::new(queued.id(), "page-b", StepKind::Capability)
+            .map_err(ExecutionStoreError::from)?,
+        Step::new(queued.id(), "page-c", StepKind::Capability)
+            .map_err(ExecutionStoreError::from)?,
+    ];
+    let first_attempts = vec![make_attempt(1, "page-b")?, make_attempt(2, "page-c")?];
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), created.run_version(), 5_000)
+        .await?;
+    let running = queued
+        .transition(RunState::Running, None)
+        .map_err(ExecutionStoreError::from)?;
+    let baseline = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(Uuid::from_u128(52_103), session.id(), queued.id())
+                    .map_err(ExecutionStoreError::from)?,
+                vec![],
+                first_steps.clone(),
+                first_attempts.clone(),
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
+        .await?;
+    let step_page = store
+        .load_steps_page(owner_id, queued.id(), StoreReadPage::first(1)?)
+        .await?;
+    let attempt_page = store
+        .load_attempts_page(owner_id, queued.id(), StoreReadPage::first(1)?)
+        .await?;
+    let step_cursor = step_page
+        .next_cursor()
+        .cloned()
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
+    let attempt_cursor = attempt_page
+        .next_cursor()
+        .cloned()
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
+    if step_page.items() != &first_steps[..1] || attempt_page.items() != &first_attempts[..1] {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                baseline.stored_run().run_version(),
+                0,
+                store.renew_lease(owner_id, lease, 5_000).await?,
+                RuntimeCommand::record_progress(Uuid::from_u128(52_104), session.id(), queued.id())
+                    .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![Step::new(queued.id(), "page-a", StepKind::Capability)
+                    .map_err(ExecutionStoreError::from)?],
+                vec![make_attempt(3, "page-a")?],
+                vec![],
+                None,
+                running,
+            ),
+        )
+        .await?;
+    let remaining_steps = store
+        .load_steps_page(
+            owner_id,
+            queued.id(),
+            StoreReadPage::after(step_cursor.clone(), 2)?,
+        )
+        .await?;
+    let remaining_attempts = store
+        .load_attempts_page(
+            owner_id,
+            queued.id(),
+            StoreReadPage::after(attempt_cursor, 2)?,
+        )
+        .await?;
+    let other_owner = Uuid::from_u128(52_105);
+    store
+        .create_run(
+            other_owner,
+            CreateRun::new_for_owner(
+                other_owner,
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
+        .await?;
+    let other_session = Session::new(
+        Uuid::from_u128(52_106),
+        "keyset-history-other-run",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let other_run = Run::queued(
+        Uuid::from_u128(52_107),
+        other_session.id(),
+        other_session.definition().id(),
+        other_session.definition().version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner_id,
+                other_session,
+                other_run.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
+        .await?;
+    let malformed = StoreReadCursor::from_opaque("not-a-store-cursor")?;
+    if remaining_steps.items() != &first_steps[1..]
+        || remaining_steps.next_cursor().is_some()
+        || remaining_attempts.items() != &first_attempts[1..]
+        || remaining_attempts.next_cursor().is_some()
+        || !matches!(
+            store
+                .load_attempts_page(
+                    owner_id,
+                    queued.id(),
+                    StoreReadPage::after(step_cursor.clone(), 1)?,
+                )
+                .await,
+            Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest
+        )
+        || !matches!(
+            store
+                .load_steps_page(
+                    other_owner,
+                    queued.id(),
+                    StoreReadPage::after(step_cursor.clone(), 1)?,
+                )
+                .await,
+            Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest
+        )
+        || !matches!(
+            store
+                .load_steps_page(
+                    owner_id,
+                    other_run.id(),
+                    StoreReadPage::after(step_cursor, 1)?,
+                )
+                .await,
+            Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest
+        )
+        || !matches!(
+            store
+                .load_steps_page(
+                    owner_id,
+                    queued.id(),
+                    StoreReadPage::after(malformed, 1)?,
+                )
+                .await,
+            Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest
+        )
+        || StoreReadPage::first(0).is_ok()
+        || StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE + 1).is_ok()
+        || StoreReadCursor::from_opaque("x".repeat(MAX_STORE_READ_CURSOR_BYTES + 1)).is_ok()
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -2544,7 +2871,7 @@ where
             .load_steps_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
             .is_empty()
@@ -2552,7 +2879,7 @@ where
             .load_attempts_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
             .is_empty()
@@ -2759,12 +3086,12 @@ where
         Err(error) if error.code() == ExecutionStoreErrorCode::NotFound
     ) || !matches!(
         store
-            .load_steps_page(owner_b, queued.id(), StoreReadPage::new(0, 1)?)
+            .load_steps_page(owner_b, queued.id(), StoreReadPage::first(1)?)
             .await,
         Err(error) if error.code() == ExecutionStoreErrorCode::NotFound
     ) || !matches!(
         store
-            .load_attempts_page(owner_b, queued.id(), StoreReadPage::new(0, 1)?)
+            .load_attempts_page(owner_b, queued.id(), StoreReadPage::first(1)?)
             .await,
         Err(error) if error.code() == ExecutionStoreErrorCode::NotFound
     ) || !matches!(
@@ -2774,7 +3101,7 @@ where
         Err(error) if error.code() == ExecutionStoreErrorCode::NotFound
     ) || !matches!(
         store
-            .replay_events(owner_b, queued.id(), StoreReadPage::new(0, 1)?)
+            .replay_events(owner_b, queued.id(), StoreReadPage::first(1)?)
             .await,
         Err(error) if error.code() == ExecutionStoreErrorCode::NotFound
     ) {
@@ -3180,7 +3507,7 @@ where
     let expired = store
         .acquire_lease(owner_id, queued.id(), created.run_version(), 100)
         .await?;
-    futures_timer::Delay::new(std::time::Duration::from_millis(250)).await;
+    factory.advance_clock(250)?;
     if !matches!(
         store.renew_lease(owner_id, expired.clone(), 1_000).await,
         Err(error) if error.code() == ExecutionStoreErrorCode::LeaseExpired
@@ -3806,7 +4133,7 @@ where
             .load_steps_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
             .is_empty()
@@ -3814,10 +4141,11 @@ where
             .load_attempts_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
-            != vec![baseline_attempt]
+            .items()
+            != [baseline_attempt]
         || replay_all_events(&store, owner_id, queued.id()).await? != vec![baseline_event]
         || store
             .load_durable_result(owner_id, queued.id(), invocation.id())
@@ -4393,10 +4721,11 @@ where
             .load_attempts_page(
                 owner_id,
                 queued.id(),
-                StoreReadPage::new(0, MAX_STORE_READ_PAGE_SIZE)?,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
             )
             .await?
-            != vec![attempt]
+            .items()
+            != [attempt]
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,

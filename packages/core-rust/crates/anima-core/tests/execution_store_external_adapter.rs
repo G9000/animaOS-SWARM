@@ -3,13 +3,13 @@ use anima_core::{
     CheckpointV1, CreateRun, DurableCapabilityResult, EventReplayPage, ExecutionCommit,
     ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError,
     ExecutionStoreFactory, GrantAuthorityKey, InMemoryExecutionStore, InvocationAttemptRecord,
-    StoreReadPage, StoredRun,
+    ManualExecutionClock, StoreHistoryPage, StoreReadPage, StoredRun,
 };
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// A separately compiled adapter demonstrates that the complete scoped port is implementable
 /// without access to crate-private authority material.
-#[derive(Default)]
 struct ExternalStyleAdapter {
     durable: InMemoryExecutionStore,
 }
@@ -94,7 +94,7 @@ impl ExecutionStore for ExternalStyleAdapter {
         owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
-    ) -> Result<Vec<ExecutionStep>, ExecutionStoreError> {
+    ) -> Result<StoreHistoryPage<ExecutionStep>, ExecutionStoreError> {
         self.durable.load_steps_page(owner_id, run_id, page).await
     }
 
@@ -103,7 +103,7 @@ impl ExecutionStore for ExternalStyleAdapter {
         owner_id: Uuid,
         run_id: Uuid,
         page: StoreReadPage,
-    ) -> Result<Vec<InvocationAttemptRecord>, ExecutionStoreError> {
+    ) -> Result<StoreHistoryPage<InvocationAttemptRecord>, ExecutionStoreError> {
         self.durable
             .load_attempts_page(owner_id, run_id, page)
             .await
@@ -131,20 +131,28 @@ impl ExecutionStore for ExternalStyleAdapter {
 }
 
 #[derive(Default)]
-struct ExternalStyleAdapterFactory;
+struct ExternalStyleAdapterFactory {
+    clock: ManualExecutionClock,
+}
 
 #[async_trait::async_trait]
 impl ExecutionStoreFactory for ExternalStyleAdapterFactory {
     type Store = ExternalStyleAdapter;
 
     async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError> {
-        Ok(ExternalStyleAdapter::default())
+        Ok(ExternalStyleAdapter {
+            durable: InMemoryExecutionStore::with_clock(Arc::new(self.clock.clone())),
+        })
+    }
+
+    fn advance_clock(&self, duration_ms: u64) -> Result<(), ExecutionStoreError> {
+        self.clock.advance_ms(duration_ms)
     }
 }
 
 #[tokio::test]
 async fn external_adapter_runs_the_full_scoped_public_conformance_suite() {
-    assert_execution_store_conformance(&ExternalStyleAdapterFactory)
+    assert_execution_store_conformance(&ExternalStyleAdapterFactory::default())
         .await
         .unwrap();
 }

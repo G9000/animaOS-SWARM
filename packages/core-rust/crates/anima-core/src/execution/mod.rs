@@ -13,7 +13,7 @@ pub use checkpoint::{
     RecoveryRecord, UncertainInvocationRecord,
 };
 pub use event::{LiveRuntimeEvent, RuntimeEvent, RuntimeEventKind, SafeEventPayload};
-pub use memory_store::InMemoryExecutionStore;
+pub use memory_store::{InMemoryExecutionStore, ManualExecutionClock};
 pub use state::Step as ExecutionStep;
 pub use state::{
     ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, Budget,
@@ -25,8 +25,9 @@ pub use state::{
 pub use store::{
     assert_execution_store_conformance, ApprovalGrantMutation, AuthoritativeGrantChange,
     AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus,
-    CheckpointMutation, CreateRun, DurableResultMutation, EventReplayPage, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
-    ExecutionStoreFactory, StoreReadPage, StoredRun, MAX_COMMIT_ATTEMPTS, MAX_COMMIT_BATCH_ITEMS,
-    MAX_COMMIT_EVENTS, MAX_COMMIT_RESULTS, MAX_COMMIT_STEPS, MAX_STORE_READ_PAGE_SIZE,
+    CheckpointMutation, CreateRun, DurableResultMutation, EventReplayPage, ExecutionClock,
+    ExecutionCommit, ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreErrorCode, ExecutionStoreFactory, StoreHistoryPage, StoreReadCursor,
+    StoreReadPage, StoredRun, MAX_COMMIT_ATTEMPTS, MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS,
+    MAX_COMMIT_RESULTS, MAX_COMMIT_STEPS, MAX_STORE_READ_CURSOR_BYTES, MAX_STORE_READ_PAGE_SIZE,
 };
