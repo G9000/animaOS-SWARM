@@ -1,8 +1,8 @@
 use anima_core::{
     ApprovalDecision, ApprovalValidity, AutonomyGrant, CapabilityKind, CapabilityManifest,
-    GrantConsumption, GrantScope, GrantStatus, LogicalInvocation, PolicyContext, PolicyDecision,
-    PolicyEngine, PolicyEvaluation, PolicyReason, PolicyReasonCode, PolicyRestrictions, RiskLevel,
-    RuntimeCompatibility,
+    CapabilityReferenceId, GrantConsumption, GrantScope, GrantStatus, LogicalInvocation,
+    PolicyContext, PolicyDecision, PolicyEngine, PolicyEvaluation, PolicyReason, PolicyReasonCode,
+    PolicyRestrictions, PolicyValidationError, RiskLevel, RuntimeCompatibility,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -60,7 +60,7 @@ fn context(
         "writer-agent",
         1,
         "workspace-1",
-        "reports/a.md",
+        CapabilityReferenceId::new(Uuid::from_u128(10)),
         &manifest(risk, invocation.manifest_version()),
         &invocation,
         1,
@@ -175,7 +175,7 @@ fn grants_match_every_scope_boundary_and_lifetime_constraint() {
     let mut wrong_agent = exact.clone();
     wrong_agent.scope.agent_definition_version = 2;
     let mut wrong_resource = exact.clone();
-    wrong_resource.scope.resource_boundary = "reports/b.md".into();
+    wrong_resource.scope.resource_boundary = CapabilityReferenceId::new(Uuid::from_u128(11));
     let mut wrong_workspace = exact.clone();
     wrong_workspace.scope.workspace_id = "other".into();
     let mut wrong_capability = exact.clone();
@@ -278,32 +278,242 @@ fn approvals_bind_every_action_identity_and_their_reason_revision() {
 }
 
 #[test]
-fn grant_bound_approval_is_invalidated_when_the_grant_is_revoked() {
+fn approvals_cannot_be_replayed_across_definition_workspace_or_resource_scope() {
+    let original = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let approval = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&original, None).unwrap(),
+        1_000,
+    )
+    .unwrap();
+
+    let mut other_definition = original.clone();
+    other_definition.agent_definition_id = "other-agent".into();
+    let mut other_definition_version = original.clone();
+    other_definition_version.agent_definition_version = 2;
+    let mut other_workspace = original.clone();
+    other_workspace.workspace_id = "other-workspace".into();
+    let mut other_resource = original.clone();
+    other_resource.resource_boundary = CapabilityReferenceId::new(Uuid::from_u128(11));
+    let mut other_restrictions = original.clone();
+    other_restrictions.restrictions.deny = true;
+
+    for replay in [
+        other_definition,
+        other_definition_version,
+        other_workspace,
+        other_resource,
+        other_restrictions,
+    ] {
+        assert_ne!(
+            PolicyEngine::validate_approval(&approval, &replay),
+            ApprovalValidity::Valid
+        );
+    }
+
+    let mut serialized = serde_json::to_value(&approval).unwrap();
+    serialized["request"]["workspace_id"] = json!("other-workspace");
+    let restored: ApprovalDecision = serde_json::from_value(serialized).unwrap();
+    assert_eq!(
+        PolicyEngine::validate_approval(&restored, &original),
+        ApprovalValidity::InvalidWorkspace
+    );
+}
+
+#[test]
+fn critical_and_deny_overrides_require_an_argument_bound_grant() {
+    let critical = context(
+        RiskLevel::Critical,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let mut broad_critical = grant(&critical, RiskLevel::Critical);
+    broad_critical.scope.canonical_argument_digest = None;
+    assert!(matches!(
+        PolicyEngine::evaluate(&critical, &[broad_critical])
+            .unwrap()
+            .decision,
+        PolicyDecision::Deny(_)
+    ));
+    assert_eq!(
+        PolicyEngine::evaluate(&critical, &[grant(&critical, RiskLevel::Critical)])
+            .unwrap()
+            .decision
+            .kind(),
+        PolicyReasonCode::AllowedByExactGrantOverride
+    );
+
+    let denied = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        PolicyRestrictions {
+            minimum_risk: None,
+            deny: true,
+        },
+    );
+    let mut broad_deny = grant(&denied, RiskLevel::High);
+    broad_deny.scope.canonical_argument_digest = None;
+    assert!(matches!(
+        PolicyEngine::evaluate(&denied, &[broad_deny])
+            .unwrap()
+            .decision,
+        PolicyDecision::Deny(_)
+    ));
+}
+
+#[test]
+fn grants_prefer_lower_remaining_uses_then_earlier_expiry_independent_of_input_order() {
+    let context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let mut single_use = grant(&context, RiskLevel::High);
+    single_use.id = "z-single-use".into();
+    single_use.remaining_uses = Some(1);
+    single_use.valid_until_ms = Some(2_000);
+    let mut hundred_uses = grant(&context, RiskLevel::High);
+    hundred_uses.id = "a-hundred-uses".into();
+    hundred_uses.remaining_uses = Some(100);
+    hundred_uses.valid_until_ms = Some(1_100);
+    assert_eq!(
+        PolicyEngine::evaluate(&context, &[hundred_uses, single_use])
+            .unwrap()
+            .consumption
+            .unwrap()
+            .grant_id,
+        "z-single-use"
+    );
+
+    let mut imminent = grant(&context, RiskLevel::High);
+    imminent.id = "z-imminent".into();
+    imminent.remaining_uses = Some(1);
+    imminent.valid_until_ms = Some(1_100);
+    let mut long_lived = grant(&context, RiskLevel::High);
+    long_lived.id = "a-long-lived".into();
+    long_lived.remaining_uses = Some(1);
+    long_lived.valid_until_ms = Some(2_000);
+    assert_eq!(
+        PolicyEngine::evaluate(&context, &[long_lived, imminent])
+            .unwrap()
+            .consumption
+            .unwrap()
+            .grant_id,
+        "z-imminent"
+    );
+}
+
+#[test]
+fn approval_requests_only_exist_for_current_approval_decisions_and_exact_windows() {
+    let low = context(
+        RiskLevel::Low,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    assert!(PolicyEngine::approval_request(&low, None).is_err());
+
+    let critical = context(
+        RiskLevel::Critical,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    assert!(PolicyEngine::approval_request(&critical, None).is_err());
+
+    let restricted = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        PolicyRestrictions {
+            minimum_risk: None,
+            deny: true,
+        },
+    );
+    assert!(matches!(
+        PolicyEngine::approval_request(&restricted, None),
+        Err(PolicyValidationError::ApprovalNotRequired)
+    ));
+
+    let high = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    assert!(PolicyEngine::approval_request(&high, Some(&grant(&high, RiskLevel::High))).is_err());
+
+    let overflowing = PolicyContext::new(
+        "owner-1",
+        "actor-1",
+        "writer-agent",
+        1,
+        "workspace-1",
+        CapabilityReferenceId::new(Uuid::from_u128(10)),
+        &manifest(RiskLevel::High, 1),
+        &invocation(json!({ "path": "reports/a.md" })),
+        1,
+        Default::default(),
+        i64::MAX,
+    )
+    .unwrap();
+    assert!(matches!(
+        PolicyEngine::approval_request(&overflowing, None),
+        Err(PolicyValidationError::ApprovalWindowOverflow)
+    ));
+}
+
+#[test]
+fn policy_identifiers_reject_credential_and_oversized_values_on_construction_and_serde() {
+    let result = PolicyContext::new(
+        "sk-live-token",
+        "actor-1",
+        "writer-agent",
+        1,
+        "workspace-1",
+        CapabilityReferenceId::new(Uuid::from_u128(10)),
+        &manifest(RiskLevel::High, 1),
+        &invocation(json!({ "path": "reports/a.md" })),
+        1,
+        Default::default(),
+        1_000,
+    );
+    assert!(result.is_err());
+
+    let original = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let mut serialized = serde_json::to_value(original).unwrap();
+    serialized["owner_id"] = json!("x".repeat(129));
+    assert!(serde_json::from_value::<PolicyContext>(serialized).is_err());
+
+    let safe_context = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let debug = format!("{safe_context:?}");
+    assert!(!debug.contains(&Uuid::from_u128(10).to_string()));
+
+    let mut injected = context(
+        RiskLevel::High,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    injected.owner_id = "sk-live-injected-token".into();
+    assert!(!format!("{injected:?}").contains("sk-live-injected-token"));
+}
+
+#[test]
+fn matching_grants_cannot_be_reused_as_approval_bindings() {
     let context = context(
         RiskLevel::High,
         invocation(json!({ "path": "reports/a.md" })),
         Default::default(),
     );
     let grant = grant(&context, RiskLevel::High);
-    let approval = ApprovalDecision::new_approved(
-        PolicyEngine::approval_request(&context, Some(&grant)).unwrap(),
-        1_000,
-    )
-    .unwrap();
-    assert!(matches!(
-        PolicyEngine::evaluate_with_approval(&context, &[], Some(&approval))
-            .unwrap()
-            .decision,
-        PolicyDecision::RequireApproval(_)
-    ));
-    let mut revoked = grant;
-    revoked.status = GrantStatus::Revoked;
-    assert!(matches!(
-        PolicyEngine::evaluate_with_approval(&context, &[revoked], Some(&approval))
-            .unwrap()
-            .decision,
-        PolicyDecision::RequireApproval(_)
-    ));
+    assert!(PolicyEngine::approval_request(&context, Some(&grant)).is_err());
 }
 
 #[test]
@@ -440,7 +650,7 @@ fn deserialized_policy_context_requires_exact_manifest_and_invocation_provenance
         "writer-agent",
         1,
         "workspace-1",
-        "reports/a.md",
+        CapabilityReferenceId::new(Uuid::from_u128(10)),
         &manifest,
         &invocation,
         1,

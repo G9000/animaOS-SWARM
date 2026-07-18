@@ -9,9 +9,10 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use crate::{CapabilityManifest, LogicalInvocation, RiskLevel};
+use crate::{CapabilityManifest, CapabilityReferenceId, LogicalInvocation, RiskLevel};
 
 const APPROVAL_WINDOW_MS: i64 = 300_000;
+const MAX_POLICY_IDENTIFIER_BYTES: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -22,7 +23,7 @@ pub struct PolicyRestrictions {
     pub deny: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyContext {
     pub owner_id: String,
@@ -30,7 +31,7 @@ pub struct PolicyContext {
     pub agent_definition_id: String,
     pub agent_definition_version: u32,
     pub workspace_id: String,
-    pub resource_boundary: String,
+    pub resource_boundary: CapabilityReferenceId,
     pub capability_id: String,
     pub manifest_version: u32,
     pub manifest_risk: RiskLevel,
@@ -44,6 +45,30 @@ pub struct PolicyContext {
     pub now_ms: i64,
     #[serde(skip)]
     provenance: Option<PolicyInputSnapshot>,
+}
+
+impl fmt::Debug for PolicyContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PolicyContext")
+            .field("owner_id", &"REDACTED")
+            .field("actor_id", &"REDACTED")
+            .field("agent_definition_id", &"REDACTED")
+            .field("agent_definition_version", &self.agent_definition_version)
+            .field("workspace_id", &"REDACTED")
+            .field("resource_boundary", &self.resource_boundary)
+            .field("capability_id", &"REDACTED")
+            .field("manifest_version", &self.manifest_version)
+            .field("manifest_risk", &self.manifest_risk)
+            .field("run_id", &self.run_id)
+            .field("logical_step_id", &"REDACTED")
+            .field("logical_invocation_id", &self.logical_invocation_id)
+            .field("canonical_argument_digest", &self.canonical_argument_digest)
+            .field("policy_revision", &self.policy_revision)
+            .field("restrictions", &self.restrictions)
+            .field("now_ms", &self.now_ms)
+            .finish()
+    }
 }
 
 /// An in-memory provenance pin made only after exact manifest/invocation validation.
@@ -67,7 +92,7 @@ impl PolicyContext {
         agent_definition_id: impl Into<String>,
         agent_definition_version: u32,
         workspace_id: impl Into<String>,
-        resource_boundary: impl Into<String>,
+        resource_boundary: CapabilityReferenceId,
         manifest: &CapabilityManifest,
         invocation: &LogicalInvocation,
         policy_revision: u32,
@@ -80,7 +105,7 @@ impl PolicyContext {
             agent_definition_id: agent_definition_id.into(),
             agent_definition_version,
             workspace_id: workspace_id.into(),
-            resource_boundary: resource_boundary.into(),
+            resource_boundary,
             capability_id: manifest.id.clone(),
             manifest_version: manifest.version,
             manifest_risk: manifest.risk_level,
@@ -111,7 +136,6 @@ impl PolicyContext {
             ("actor_id", &self.actor_id),
             ("agent_definition_id", &self.agent_definition_id),
             ("workspace_id", &self.workspace_id),
-            ("resource_boundary", &self.resource_boundary),
             ("capability_id", &self.capability_id),
             ("logical_step_id", &self.logical_step_id),
         ] {
@@ -206,7 +230,7 @@ struct PolicyContextWire {
     agent_definition_id: String,
     agent_definition_version: u32,
     workspace_id: String,
-    resource_boundary: String,
+    resource_boundary: CapabilityReferenceId,
     capability_id: String,
     manifest_version: u32,
     manifest_risk: RiskLevel,
@@ -251,10 +275,12 @@ pub enum PolicyReasonCode {
     DeniedByDefault,
     DeniedByRestriction,
     AllowedByGrant,
+    /// An exact argument-bound grant overrode a Critical or explicitly denied action.
+    AllowedByExactGrantOverride,
     AllowedByApproval,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyReason {
     pub code: PolicyReasonCode,
@@ -262,6 +288,19 @@ pub struct PolicyReason {
     pub policy_revision: u32,
     pub grant_id: Option<String>,
     pub grant_revision: Option<u32>,
+}
+
+impl fmt::Debug for PolicyReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PolicyReason")
+            .field("code", &self.code)
+            .field("effective_risk", &self.effective_risk)
+            .field("policy_revision", &self.policy_revision)
+            .field("grant_id", &self.grant_id.as_ref().map(|_| "REDACTED"))
+            .field("grant_revision", &self.grant_revision)
+            .finish()
+    }
 }
 
 impl PolicyReason {
@@ -288,12 +327,17 @@ impl PolicyReason {
             return Err(PolicyValidationError::InconsistentAuditRecord);
         }
         let has_grant = match (&self.grant_id, self.grant_revision) {
-            (Some(id), Some(revision)) if !id.trim().is_empty() && revision > 0 => true,
+            (Some(id), Some(revision)) if revision > 0 => {
+                validate_id("grant_id", id)?;
+                true
+            }
             (None, None) => false,
             _ => return Err(PolicyValidationError::InconsistentAuditRecord),
         };
         match self.code {
-            PolicyReasonCode::AllowedByGrant if !has_grant => {
+            PolicyReasonCode::AllowedByGrant | PolicyReasonCode::AllowedByExactGrantOverride
+                if !has_grant =>
+            {
                 Err(PolicyValidationError::InconsistentAuditRecord)
             }
             PolicyReasonCode::AllowedByDefault
@@ -381,6 +425,7 @@ impl PolicyDecision {
                     reason.code,
                     PolicyReasonCode::AllowedByDefault
                         | PolicyReasonCode::AllowedByGrant
+                        | PolicyReasonCode::AllowedByExactGrantOverride
                         | PolicyReasonCode::AllowedByApproval
                 ) =>
             {
@@ -430,7 +475,7 @@ impl PolicyDecisionWire {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantScope {
     pub owner_id: String,
@@ -438,10 +483,27 @@ pub struct GrantScope {
     pub agent_definition_id: String,
     pub agent_definition_version: u32,
     pub workspace_id: String,
-    pub resource_boundary: String,
+    pub resource_boundary: CapabilityReferenceId,
     pub capability_id: String,
     pub manifest_version: u32,
     pub canonical_argument_digest: Option<Uuid>,
+}
+
+impl fmt::Debug for GrantScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrantScope")
+            .field("owner_id", &"REDACTED")
+            .field("actor_id", &"REDACTED")
+            .field("agent_definition_id", &"REDACTED")
+            .field("agent_definition_version", &self.agent_definition_version)
+            .field("workspace_id", &"REDACTED")
+            .field("resource_boundary", &self.resource_boundary)
+            .field("capability_id", &"REDACTED")
+            .field("manifest_version", &self.manifest_version)
+            .field("canonical_argument_digest", &self.canonical_argument_digest)
+            .finish()
+    }
 }
 
 impl GrantScope {
@@ -452,7 +514,7 @@ impl GrantScope {
         agent_definition_id: impl Into<String>,
         agent_definition_version: u32,
         workspace_id: impl Into<String>,
-        resource_boundary: impl Into<String>,
+        resource_boundary: CapabilityReferenceId,
         capability_id: impl Into<String>,
         manifest_version: u32,
         canonical_argument_digest: Option<Uuid>,
@@ -463,7 +525,7 @@ impl GrantScope {
             agent_definition_id: agent_definition_id.into(),
             agent_definition_version,
             workspace_id: workspace_id.into(),
-            resource_boundary: resource_boundary.into(),
+            resource_boundary,
             capability_id: capability_id.into(),
             manifest_version,
             canonical_argument_digest,
@@ -478,7 +540,6 @@ impl GrantScope {
             ("actor_id", &self.actor_id),
             ("agent_definition_id", &self.agent_definition_id),
             ("workspace_id", &self.workspace_id),
-            ("resource_boundary", &self.resource_boundary),
             ("capability_id", &self.capability_id),
         ] {
             validate_id(field, value)?;
@@ -525,7 +586,7 @@ struct GrantScopeWire {
     agent_definition_id: String,
     agent_definition_version: u32,
     workspace_id: String,
-    resource_boundary: String,
+    resource_boundary: CapabilityReferenceId,
     capability_id: String,
     manifest_version: u32,
     canonical_argument_digest: Option<Uuid>,
@@ -537,7 +598,7 @@ pub enum GrantStatus {
     Revoked,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutonomyGrant {
     pub id: String,
@@ -549,6 +610,22 @@ pub struct AutonomyGrant {
     pub valid_until_ms: Option<i64>,
     /// `Some(n)` is a remaining-use count observed by the caller. Evaluation never decrements it.
     pub remaining_uses: Option<u32>,
+}
+
+impl fmt::Debug for AutonomyGrant {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AutonomyGrant")
+            .field("id", &"REDACTED")
+            .field("revision", &self.revision)
+            .field("status", &self.status)
+            .field("scope", &self.scope)
+            .field("maximum_risk", &self.maximum_risk)
+            .field("valid_from_ms", &self.valid_from_ms)
+            .field("valid_until_ms", &self.valid_until_ms)
+            .field("remaining_uses", &self.remaining_uses)
+            .finish()
+    }
 }
 
 impl AutonomyGrant {
@@ -629,12 +706,23 @@ struct AutonomyGrantWire {
     remaining_uses: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantConsumption {
     pub grant_id: String,
     pub grant_revision: u32,
     pub logical_invocation_id: Uuid,
+}
+
+impl fmt::Debug for GrantConsumption {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GrantConsumption")
+            .field("grant_id", &"REDACTED")
+            .field("grant_revision", &self.grant_revision)
+            .field("logical_invocation_id", &self.logical_invocation_id)
+            .finish()
+    }
 }
 
 impl GrantConsumption {
@@ -705,8 +793,10 @@ impl PolicyEvaluation {
             let PolicyDecision::Allow(reason) = &decision else {
                 return Err(PolicyValidationError::InconsistentAuditRecord);
             };
-            if reason.code != PolicyReasonCode::AllowedByGrant
-                || reason.grant_id.as_deref() != Some(consumption.grant_id.as_str())
+            if !matches!(
+                reason.code,
+                PolicyReasonCode::AllowedByGrant | PolicyReasonCode::AllowedByExactGrantOverride
+            ) || reason.grant_id.as_deref() != Some(consumption.grant_id.as_str())
                 || reason.grant_revision != Some(consumption.grant_revision)
             {
                 return Err(PolicyValidationError::InconsistentAuditRecord);
@@ -736,11 +826,16 @@ struct PolicyEvaluationWire {
     consumption: Option<GrantConsumption>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub owner_id: String,
     pub actor_id: String,
+    pub agent_definition_id: String,
+    pub agent_definition_version: u32,
+    pub workspace_id: String,
+    pub resource_boundary: CapabilityReferenceId,
+    pub restrictions: PolicyRestrictions,
     pub run_id: Uuid,
     pub logical_step_id: String,
     pub logical_invocation_id: Uuid,
@@ -756,18 +851,51 @@ pub struct ApprovalRequest {
     pub expires_at_ms: i64,
 }
 
+impl fmt::Debug for ApprovalRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalRequest")
+            .field("owner_id", &"REDACTED")
+            .field("actor_id", &"REDACTED")
+            .field("agent_definition_id", &"REDACTED")
+            .field("agent_definition_version", &self.agent_definition_version)
+            .field("workspace_id", &"REDACTED")
+            .field("resource_boundary", &self.resource_boundary)
+            .field("restrictions", &self.restrictions)
+            .field("run_id", &self.run_id)
+            .field("logical_step_id", &"REDACTED")
+            .field("logical_invocation_id", &self.logical_invocation_id)
+            .field("capability_id", &"REDACTED")
+            .field("manifest_version", &self.manifest_version)
+            .field("canonical_argument_digest", &self.canonical_argument_digest)
+            .field("effective_risk", &self.effective_risk)
+            .field("reason", &self.reason)
+            .field("policy_revision", &self.policy_revision)
+            .field("grant_id", &self.grant_id.as_ref().map(|_| "REDACTED"))
+            .field("grant_revision", &self.grant_revision)
+            .field("requested_at_ms", &self.requested_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .finish()
+    }
+}
+
 impl ApprovalRequest {
     fn validate(&self) -> Result<(), PolicyValidationError> {
         self.reason.validate()?;
         for (field, value) in [
             ("owner_id", &self.owner_id),
             ("actor_id", &self.actor_id),
+            ("agent_definition_id", &self.agent_definition_id),
+            ("workspace_id", &self.workspace_id),
             ("logical_step_id", &self.logical_step_id),
             ("capability_id", &self.capability_id),
         ] {
             validate_id(field, value)?;
         }
-        if self.manifest_version == 0 || self.policy_revision == 0 {
+        if self.agent_definition_version == 0
+            || self.manifest_version == 0
+            || self.policy_revision == 0
+        {
             return Err(PolicyValidationError::InvalidVersion);
         }
         if self.run_id.is_nil()
@@ -777,11 +905,15 @@ impl ApprovalRequest {
             return Err(PolicyValidationError::InvalidNilIdentifier);
         }
         if self.requested_at_ms < 0
-            || self.expires_at_ms != self.requested_at_ms.saturating_add(APPROVAL_WINDOW_MS)
+            || self
+                .requested_at_ms
+                .checked_add(APPROVAL_WINDOW_MS)
+                .is_none_or(|expires_at_ms| self.expires_at_ms != expires_at_ms)
         {
             return Err(PolicyValidationError::InvalidApprovalTime);
         }
         if self.effective_risk == RiskLevel::None
+            || self.restrictions.minimum_risk == Some(RiskLevel::None)
             || self.reason.effective_risk != self.effective_risk
             || self.reason.policy_revision != self.policy_revision
             || self.reason.code != PolicyReasonCode::ApprovalRequired
@@ -791,7 +923,10 @@ impl ApprovalRequest {
             return Err(PolicyValidationError::InconsistentApprovalBinding);
         }
         match (&self.grant_id, self.grant_revision) {
-            (Some(id), Some(revision)) if !id.trim().is_empty() && revision > 0 => Ok(()),
+            (Some(id), Some(revision)) if revision > 0 => {
+                validate_id("grant_id", id)?;
+                Ok(())
+            }
             (None, None) => Ok(()),
             _ => Err(PolicyValidationError::InconsistentApprovalBinding),
         }
@@ -814,6 +949,11 @@ impl<'de> Deserialize<'de> for ApprovalRequest {
 struct ApprovalRequestWire {
     owner_id: String,
     actor_id: String,
+    agent_definition_id: String,
+    agent_definition_version: u32,
+    workspace_id: String,
+    resource_boundary: CapabilityReferenceId,
+    restrictions: PolicyRestrictions,
     run_id: Uuid,
     logical_step_id: String,
     logical_invocation_id: Uuid,
@@ -834,6 +974,11 @@ impl ApprovalRequestWire {
         ApprovalRequest {
             owner_id: self.owner_id,
             actor_id: self.actor_id,
+            agent_definition_id: self.agent_definition_id,
+            agent_definition_version: self.agent_definition_version,
+            workspace_id: self.workspace_id,
+            resource_boundary: self.resource_boundary,
+            restrictions: self.restrictions,
             run_id: self.run_id,
             logical_step_id: self.logical_step_id,
             logical_invocation_id: self.logical_invocation_id,
@@ -857,7 +1002,7 @@ pub enum ApprovalDecisionKind {
     Deny,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalDecision {
     pub request: ApprovalRequest,
@@ -865,6 +1010,17 @@ pub struct ApprovalDecision {
     pub decided_at_ms: i64,
     #[serde(skip)]
     binding: Option<ApprovalDecisionBinding>,
+}
+
+impl fmt::Debug for ApprovalDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ApprovalDecision")
+            .field("request", &self.request)
+            .field("kind", &self.kind)
+            .field("decided_at_ms", &self.decided_at_ms)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -953,6 +1109,10 @@ pub enum ApprovalValidity {
     InvalidDecision,
     InvalidOwner,
     InvalidActor,
+    InvalidDefinition,
+    InvalidWorkspace,
+    InvalidResource,
+    InvalidRestrictions,
     InvalidRun,
     InvalidStep,
     InvalidInvocation,
@@ -974,8 +1134,12 @@ pub enum PolicyValidationError {
     InvalidValidityWindow,
     InconsistentApprovalBinding,
     InvalidApprovalTime,
+    ApprovalWindowOverflow,
+    ApprovalNotRequired,
     SuppliedGrantDoesNotMatch,
     InvalidNilIdentifier,
+    InvalidIdentifierFormat { field: &'static str },
+    IdentifierTooLong { field: &'static str },
     InconsistentAuditRecord,
 }
 
@@ -1003,10 +1167,22 @@ impl fmt::Display for PolicyValidationError {
             Self::InvalidApprovalTime => {
                 formatter.write_str("approval decision is outside its request window")
             }
+            Self::ApprovalWindowOverflow => {
+                formatter.write_str("approval request window overflows the supplied timestamp")
+            }
+            Self::ApprovalNotRequired => {
+                formatter.write_str("approval requests require a current approval decision")
+            }
             Self::SuppliedGrantDoesNotMatch => {
                 formatter.write_str("supplied autonomy grant does not match the policy context")
             }
             Self::InvalidNilIdentifier => formatter.write_str("policy identifier must not be nil"),
+            Self::InvalidIdentifierFormat { field } => {
+                write!(formatter, "{field} is not a safe policy identifier")
+            }
+            Self::IdentifierTooLong { field } => {
+                write!(formatter, "{field} exceeds the policy identifier limit")
+            }
             Self::InconsistentAuditRecord => {
                 formatter.write_str("policy audit record is inconsistent")
             }
@@ -1026,8 +1202,13 @@ impl PolicyEngine {
         context.validate_evaluation_input()?;
         let effective_risk = context.effective_risk();
         if let Some(grant) = select_grant(context, grants) {
+            let reason_code = if requires_exact_argument_scope(context) {
+                PolicyReasonCode::AllowedByExactGrantOverride
+            } else {
+                PolicyReasonCode::AllowedByGrant
+            };
             let decision = PolicyDecision::Allow(reason(
-                PolicyReasonCode::AllowedByGrant,
+                reason_code,
                 effective_risk,
                 context.policy_revision,
                 Some(grant),
@@ -1111,9 +1292,25 @@ impl PolicyEngine {
         if grant.is_some_and(|grant| !Self::grant_matches(grant, context)) {
             return Err(PolicyValidationError::SuppliedGrantDoesNotMatch);
         }
+        let current_grants = grant.map_or(&[][..], std::slice::from_ref);
+        if !matches!(
+            Self::evaluate(context, current_grants)?.decision,
+            PolicyDecision::RequireApproval(_)
+        ) {
+            return Err(PolicyValidationError::ApprovalNotRequired);
+        }
+        let expires_at_ms = context
+            .now_ms
+            .checked_add(APPROVAL_WINDOW_MS)
+            .ok_or(PolicyValidationError::ApprovalWindowOverflow)?;
         let request = ApprovalRequest {
             owner_id: context.owner_id.clone(),
             actor_id: context.actor_id.clone(),
+            agent_definition_id: context.agent_definition_id.clone(),
+            agent_definition_version: context.agent_definition_version,
+            workspace_id: context.workspace_id.clone(),
+            resource_boundary: context.resource_boundary.clone(),
+            restrictions: context.restrictions.clone(),
             run_id: context.run_id,
             logical_step_id: context.logical_step_id.clone(),
             logical_invocation_id: context.logical_invocation_id,
@@ -1131,7 +1328,7 @@ impl PolicyEngine {
             grant_id: grant.map(|grant| grant.id.clone()),
             grant_revision: grant.map(|grant| grant.revision),
             requested_at_ms: context.now_ms,
-            expires_at_ms: context.now_ms.saturating_add(APPROVAL_WINDOW_MS),
+            expires_at_ms,
         };
         request.validate()?;
         Ok(request)
@@ -1156,10 +1353,10 @@ impl PolicyEngine {
             && grant.scope.resource_boundary == context.resource_boundary
             && grant.scope.capability_id == context.capability_id
             && grant.scope.manifest_version == context.manifest_version
-            && grant
-                .scope
-                .canonical_argument_digest
-                .is_none_or(|digest| digest == context.canonical_argument_digest)
+            && match grant.scope.canonical_argument_digest {
+                Some(digest) => digest == context.canonical_argument_digest,
+                None => !requires_exact_argument_scope(context),
+            }
             && risk_rank(grant.maximum_risk) >= risk_rank(context.effective_risk())
             && context.now_ms >= grant.valid_from_ms
             && grant
@@ -1191,6 +1388,20 @@ impl PolicyEngine {
         }
         if request.actor_id != context.actor_id {
             return ApprovalValidity::InvalidActor;
+        }
+        if request.agent_definition_id != context.agent_definition_id
+            || request.agent_definition_version != context.agent_definition_version
+        {
+            return ApprovalValidity::InvalidDefinition;
+        }
+        if request.workspace_id != context.workspace_id {
+            return ApprovalValidity::InvalidWorkspace;
+        }
+        if request.resource_boundary != context.resource_boundary {
+            return ApprovalValidity::InvalidResource;
+        }
+        if request.restrictions != context.restrictions {
+            return ApprovalValidity::InvalidRestrictions;
         }
         if request.run_id != context.run_id {
             return ApprovalValidity::InvalidRun;
@@ -1228,9 +1439,10 @@ impl PolicyEngine {
     }
 }
 
-/// Matching grants are sorted by narrowness: argument-bound scopes first, then lower maximum
-/// risk, then finite-use grants, then a stable lexical grant ID and highest revision tie-break.
-/// Input order is ignored.
+/// Matching grants are sorted by a total narrowness order. Argument-bound scopes and lower risk
+/// ceilings come first. Within otherwise equivalent scopes, the smallest remaining-use count,
+/// earliest finite expiry, and latest valid-from time win; stable lexical ID and highest revision
+/// make every residual tie deterministic. Input order is ignored.
 fn select_grant<'a>(
     context: &PolicyContext,
     grants: &'a [AutonomyGrant],
@@ -1243,6 +1455,9 @@ fn select_grant<'a>(
                 grant.scope.canonical_argument_digest.is_none(),
                 risk_rank(grant.maximum_risk),
                 grant.remaining_uses.is_none(),
+                grant.remaining_uses.unwrap_or(u32::MAX),
+                grant.valid_until_ms.is_none(),
+                grant.valid_until_ms.unwrap_or(i64::MAX),
                 Reverse(grant.valid_from_ms),
                 &grant.id,
                 Reverse(grant.revision),
@@ -1276,7 +1491,38 @@ fn validate_id(field: &'static str, value: &str) -> Result<(), PolicyValidationE
     if value.trim().is_empty() {
         return Err(PolicyValidationError::BlankIdentifier { field });
     }
+    if value.len() > MAX_POLICY_IDENTIFIER_BYTES {
+        return Err(PolicyValidationError::IdentifierTooLong { field });
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(PolicyValidationError::InvalidIdentifierFormat { field });
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("sk-")
+        || lower.starts_with("ghp_")
+        || lower.starts_with("github_pat_")
+        || value.starts_with("AKIA")
+        || [
+            "secret",
+            "token",
+            "password",
+            "credential",
+            "bearer",
+            "api_key",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Err(PolicyValidationError::InvalidIdentifierFormat { field });
+    }
     Ok(())
+}
+
+fn requires_exact_argument_scope(context: &PolicyContext) -> bool {
+    context.effective_risk() == RiskLevel::Critical || context.restrictions.deny
 }
 
 fn risk_rank(risk: RiskLevel) -> u8 {
