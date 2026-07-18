@@ -112,6 +112,17 @@ pub trait CapabilityLineageStore: Send + Sync {
         current: CapabilityAttemptLineageState,
         new: CapabilityAttemptLineageState,
     ) -> Result<bool, CapabilityError>;
+
+    /// Atomically validates an active effect fence against store-authoritative time. It must fail
+    /// closed for an expired lease, a superseded or terminal state, or a mismatched fence token.
+    /// This check never renews, extends, or recreates a lease.
+    async fn validate_effect_fence(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        expected_kind: CapabilityLeaseKind,
+        fence: Uuid,
+    ) -> Result<bool, CapabilityError>;
 }
 
 #[derive(Default)]
@@ -212,6 +223,23 @@ impl CapabilityLineageStore for InMemoryCapabilityLineageStore {
         }
         states.insert((logical_invocation_id, attempt_number), new);
         Ok(true)
+    }
+
+    async fn validate_effect_fence(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        expected_kind: CapabilityLeaseKind,
+        fence: Uuid,
+    ) -> Result<bool, CapabilityError> {
+        let states = self.states.lock().await;
+        let Some(state) = states.get(&(logical_invocation_id, attempt_number)) else {
+            return Ok(false);
+        };
+        let Some((active_kind, active_fence, lease_expires_at_ms)) = lease_parts(state) else {
+            return Ok(false);
+        };
+        Ok(active_kind == expected_kind && active_fence == fence && lease_expires_at_ms > now_ms())
     }
 }
 

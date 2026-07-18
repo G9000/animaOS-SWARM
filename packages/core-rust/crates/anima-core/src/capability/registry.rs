@@ -133,7 +133,14 @@ impl CapabilityRegistry {
         };
         let fence_token = lease_fence(&executing).ok_or_else(CapabilityError::execution)?;
         let executor = entry.executor.clone();
-        let execution_fence = ExecutionFence::new(fence_token);
+        let execution_fence = ExecutionFence::new(
+            fence_token,
+            lineage_key.0,
+            lineage_key.1,
+            CapabilityLeaseKind::Executing,
+            context.invocation().idempotency_key(),
+            self.lineage.clone(),
+        );
         let execution = executor.execute(context.with_execution_fence(execution_fence.clone()));
         let (execution, executing, heartbeat_error) = self
             .await_with_heartbeat(
@@ -185,7 +192,14 @@ impl CapabilityRegistry {
             return Err(CapabilityError::validation());
         };
         let fence_token = lease_fence(&executing).ok_or_else(CapabilityError::execution)?;
-        let execution_fence = ExecutionFence::new(fence_token);
+        let execution_fence = ExecutionFence::new(
+            fence_token,
+            lineage_key.0,
+            lineage_key.1,
+            CapabilityLeaseKind::RetryExecuting,
+            context.invocation().idempotency_key(),
+            self.lineage.clone(),
+        );
         let execution = entry
             .executor
             .execute(context.with_execution_fence(execution_fence.clone()));
@@ -454,7 +468,14 @@ impl CapabilityRegistry {
             return Ok(RecoveryAction::Pending);
         };
         let fence = lease_fence(&reconciling).ok_or_else(CapabilityError::execution)?;
-        let execution_fence = ExecutionFence::new(fence);
+        let execution_fence = ExecutionFence::new(
+            fence,
+            key.0,
+            key.1,
+            CapabilityLeaseKind::Reconciling,
+            context.invocation().idempotency_key(),
+            self.lineage.clone(),
+        );
         let reconciliation = entry.executor.reconcile(
             context
                 .clone()

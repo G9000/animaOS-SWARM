@@ -670,35 +670,97 @@ impl fmt::Debug for CapabilityExecutionReferences {
 }
 
 /// Portable references supplied to a host executor. No credential values are carried here.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExecutionFencingToken(Uuid);
+
+impl ExecutionFencingToken {
+    /// Opaque value to pass to destinations that support fencing.
+    pub fn destination_value(&self) -> String {
+        self.0.to_string()
+    }
+}
+
+impl fmt::Debug for ExecutionFencingToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExecutionFencingToken(REDACTED)")
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionFence {
     inner: Arc<ExecutionFenceState>,
 }
 
 struct ExecutionFenceState {
-    _token: Uuid,
+    token: ExecutionFencingToken,
+    logical_invocation_id: Uuid,
+    attempt_number: u32,
+    lease_kind: CapabilityLeaseKind,
+    idempotency_key: String,
+    lineage: Arc<dyn CapabilityLineageStore>,
     valid: AtomicBool,
     cancelled: AtomicBool,
 }
 
 impl ExecutionFence {
-    fn new(token: Uuid) -> Self {
+    fn new(
+        token: Uuid,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        lease_kind: CapabilityLeaseKind,
+        idempotency_key: String,
+        lineage: Arc<dyn CapabilityLineageStore>,
+    ) -> Self {
         Self {
             inner: Arc::new(ExecutionFenceState {
-                _token: token,
+                token: ExecutionFencingToken(token),
+                logical_invocation_id,
+                attempt_number,
+                lease_kind,
+                idempotency_key,
+                lineage,
                 valid: AtomicBool::new(true),
                 cancelled: AtomicBool::new(false),
             }),
         }
     }
 
-    /// Hosts must call this immediately before each irreversible external side effect.
-    pub fn ensure_valid(&self) -> Result<(), CapabilityError> {
-        if self.is_valid() {
-            Ok(())
-        } else {
-            Err(CapabilityError::cancelled())
+    /// Authoritatively validates this exact fence without renewing it. Hosts must await this
+    /// immediately before dispatching each irreversible external side effect.
+    pub async fn ensure_valid(&self) -> Result<(), CapabilityError> {
+        if !self.is_valid() {
+            return Err(CapabilityError::cancelled());
         }
+        match self
+            .inner
+            .lineage
+            .validate_effect_fence(
+                self.inner.logical_invocation_id,
+                self.inner.attempt_number,
+                self.inner.lease_kind,
+                self.inner.token.0,
+            )
+            .await
+        {
+            Ok(true) if self.is_valid() => Ok(()),
+            Ok(_) => {
+                self.cancel();
+                Err(CapabilityError::cancelled())
+            }
+            Err(error) => {
+                self.cancel();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn fencing_token(&self) -> &ExecutionFencingToken {
+        &self.inner.token
+    }
+
+    /// Stable key shared by every attempt of this logical invocation.
+    pub fn idempotency_key(&self) -> &str {
+        &self.inner.idempotency_key
     }
 
     pub fn is_valid(&self) -> bool {
@@ -727,7 +789,7 @@ impl fmt::Debug for ExecutionFence {
 
 impl PartialEq for ExecutionFence {
     fn eq(&self, other: &Self) -> bool {
-        self.inner._token == other.inner._token
+        self.inner.token == other.inner.token
     }
 }
 
@@ -1012,10 +1074,12 @@ impl std::error::Error for CapabilityError {}
 pub trait CapabilityExecutor: Send + Sync {
     fn manifest(&self) -> &CapabilityManifest;
 
-    /// Implementations must use `context.invocation().idempotency_key()` for every external
-    /// operation and validate `context.execution_fence()` immediately before each irreversible
-    /// side effect. The fence is cooperative protection, not a generic exactly-once guarantee for
-    /// external systems.
+    /// Before every irreversible side effect, implementations must await
+    /// `context.execution_fence().ensure_valid()` immediately before dispatch and pass both the
+    /// fence's opaque `fencing_token()` and its logical `idempotency_key()` to destinations that
+    /// support fencing or deduplication. If a destination supports neither, reconciliation must
+    /// not claim `AuthoritativeAbsence` until the prior operation is provably terminal; otherwise
+    /// it must return `RecoveryRequired`. The fence is not a generic exactly-once guarantee.
     async fn execute(
         &self,
         context: CapabilityExecutionContext,

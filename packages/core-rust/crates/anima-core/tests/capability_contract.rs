@@ -212,6 +212,45 @@ impl CapabilityLineageStore for TestLineageStore {
         states.insert((invocation_id, attempt_number), new);
         Ok(true)
     }
+
+    async fn validate_effect_fence(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+        expected_kind: CapabilityLeaseKind,
+        fence: Uuid,
+    ) -> Result<bool, CapabilityError> {
+        let states = self.states.lock().unwrap();
+        let Some(state) = states.get(&(invocation_id, attempt_number)) else {
+            return Ok(false);
+        };
+        let (active_kind, active_fence, lease_expires_at_ms) = match state {
+            CapabilityAttemptLineageState::Executing {
+                fence,
+                lease_expires_at_ms,
+            } => (CapabilityLeaseKind::Executing, *fence, *lease_expires_at_ms),
+            CapabilityAttemptLineageState::RetryExecuting {
+                fence,
+                lease_expires_at_ms,
+            } => (
+                CapabilityLeaseKind::RetryExecuting,
+                *fence,
+                *lease_expires_at_ms,
+            ),
+            CapabilityAttemptLineageState::Reconciling {
+                fence,
+                lease_expires_at_ms,
+            } => (
+                CapabilityLeaseKind::Reconciling,
+                *fence,
+                *lease_expires_at_ms,
+            ),
+            _ => return Ok(false),
+        };
+        Ok(active_kind == expected_kind
+            && active_fence == fence
+            && lease_expires_at_ms > self.authoritative_now_ms.load(Ordering::SeqCst))
+    }
 }
 
 fn context(manifest: &CapabilityManifest, arguments: Value) -> CapabilityExecutionContext {
@@ -228,6 +267,14 @@ fn context(manifest: &CapabilityManifest, arguments: Value) -> CapabilityExecuti
         CapabilityAttempt::new(&invocation, 1).unwrap(),
     )
     .unwrap()
+}
+
+async fn ensure_effect_fence(context: &CapabilityExecutionContext) -> Result<(), CapabilityError> {
+    context
+        .execution_fence()
+        .ok_or_else(CapabilityError::execution)?
+        .ensure_valid()
+        .await
 }
 
 fn context_for_attempt(
@@ -292,6 +339,7 @@ impl CapabilityExecutor for RecordingExecutor {
         &self,
         context: CapabilityExecutionContext,
     ) -> Result<CapabilityResult, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         self.executions.fetch_add(1, Ordering::SeqCst);
         self.contexts.lock().unwrap().push(context);
         if self
@@ -308,8 +356,9 @@ impl CapabilityExecutor for RecordingExecutor {
 
     async fn reconcile(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
         Ok(self.reconcile_result.clone())
     }
@@ -336,8 +385,9 @@ impl CapabilityExecutor for BarrierExecutor {
 
     async fn execute(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<CapabilityResult, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         if let Some(entered) = self.execute_entered.lock().unwrap().take() {
             let _ = entered.send(());
         }
@@ -350,8 +400,9 @@ impl CapabilityExecutor for BarrierExecutor {
 
     async fn reconcile(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
         Ok(self.reconcile_result.clone())
     }
@@ -398,15 +449,16 @@ impl CapabilityExecutor for FenceAwareBarrierExecutor {
         if let Some(release) = release {
             let _ = release.await;
         }
-        fence.ensure_valid()?;
+        fence.ensure_valid().await?;
         self.external_calls.fetch_add(1, Ordering::SeqCst);
         Ok(CapabilityResult::new(json!({ "ok": true })))
     }
 
     async fn reconcile(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         if self.reconcile_calls.fetch_add(1, Ordering::SeqCst) == 0 {
             Ok(ReconcileOutcome::Pending)
         } else {
@@ -423,8 +475,9 @@ impl CapabilityExecutor for RetryBarrierExecutor {
 
     async fn execute(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<CapabilityResult, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         if self.executions.fetch_add(1, Ordering::SeqCst) == 0 {
             return Err(CapabilityError::execution());
         }
@@ -440,8 +493,9 @@ impl CapabilityExecutor for RetryBarrierExecutor {
 
     async fn reconcile(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
         Ok(ReconcileOutcome::AuthoritativeAbsence)
     }
@@ -455,15 +509,17 @@ impl CapabilityExecutor for ConflictingReconcileExecutor {
 
     async fn execute(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<CapabilityResult, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         Err(CapabilityError::execution())
     }
 
     async fn reconcile(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         let call = self.reconciliations.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
             if let Some(entered) = self.reconcile_entered.lock().unwrap().take() {
@@ -490,16 +546,18 @@ impl CapabilityExecutor for SecretLeakingExecutor {
 
     async fn execute(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<CapabilityResult, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         assert!(!self.upstream_diagnostic.is_empty());
         Err(CapabilityError::execution())
     }
 
     async fn reconcile(
         &self,
-        _context: CapabilityExecutionContext,
+        context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
+        ensure_effect_fence(&context).await?;
         assert!(!self.upstream_diagnostic.is_empty());
         Err(CapabilityError::reconciliation())
     }
@@ -1254,6 +1312,88 @@ async fn lost_execution_fence_cancels_original_and_requires_strong_absence_for_r
         registry.recover(initial).await.unwrap().kind(),
         RecoveryActionKind::RetrySameKey
     );
+}
+
+#[tokio::test]
+async fn authoritative_effect_check_rejects_takeover_before_heartbeat_observes_loss() {
+    let mut manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    manifest.timeout_ms = 40_000;
+    let store = Arc::new(TestLineageStore::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let external_calls = Arc::new(AtomicUsize::new(0));
+    let executor = FenceAwareBarrierExecutor {
+        manifest: manifest.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+        external_calls: external_calls.clone(),
+        reconcile_calls: AtomicUsize::new(0),
+    };
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut mutable_registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    let execution_registry = registry.clone();
+    let execution_context = initial.clone();
+    let execution =
+        tokio::spawn(async move { execution_registry.execute(execution_context).await });
+    let fence = entered_rx.await.unwrap();
+    assert_eq!(
+        fence.idempotency_key(),
+        initial.invocation().idempotency_key()
+    );
+    let destination_fencing_token = fence.fencing_token().destination_value();
+    assert!(!destination_fencing_token.is_empty());
+    assert!(!format!("{:?}", fence.fencing_token()).contains(&destination_fencing_token));
+    let key = (initial.invocation().id(), initial.attempt().number());
+    let active = store.load(key.0, key.1).await.unwrap().unwrap();
+    let active_fence = match &active {
+        CapabilityAttemptLineageState::Executing { fence, .. } => *fence,
+        _ => panic!("initial execution must hold an executing lease"),
+    };
+    assert!(store
+        .validate_effect_fence(key.0, key.1, CapabilityLeaseKind::Executing, active_fence,)
+        .await
+        .unwrap());
+    assert!(!store
+        .validate_effect_fence(key.0, key.1, CapabilityLeaseKind::Reconciling, active_fence,)
+        .await
+        .unwrap());
+    store.authoritative_now_ms.store(50_000, Ordering::SeqCst);
+    assert!(store
+        .expire_lease(
+            key.0,
+            key.1,
+            active,
+            CapabilityAttemptLineageState::Uncertain,
+        )
+        .await
+        .unwrap());
+    assert!(store
+        .acquire_lease(
+            key.0,
+            key.1,
+            Some(CapabilityAttemptLineageState::Uncertain),
+            CapabilityLeaseKind::Reconciling,
+            40_000,
+        )
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(store.renewals.load(Ordering::SeqCst), 0);
+    assert!(fence.is_valid());
+
+    release_tx.send(()).unwrap();
+
+    assert_eq!(
+        execution.await.unwrap().unwrap_err().code(),
+        CapabilityErrorCode::Cancelled
+    );
+    assert_eq!(external_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
