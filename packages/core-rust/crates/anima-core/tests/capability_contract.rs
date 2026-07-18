@@ -14,7 +14,7 @@ use anima_core::{
     DefinitionPin, DurableCapabilityResult, DurableCapabilityStatus, ExecutionFence,
     InvocationAttemptRecord, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ManifestPin,
     ReconcileOutcome, RecoveryActionKind, RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord,
-    RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility,
+    RecoveryRecord, RiskLevel, Run, RunState, RuntimeCommand, RuntimeCompatibility,
     UncertainInvocationRecord, Usage, MAX_DURABLE_RESULT_SIZE_BYTES,
 };
 use async_trait::async_trait;
@@ -1309,11 +1309,12 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
         RecoveryPauseReason::AuthoritativeAbsence,
     )
     .unwrap();
+    let recovery = RecoveryRecord::new_with_pause(recovery_pause, Some(binding.clone())).unwrap();
     let paused = Run::queued(binding.run_id(), Uuid::from_u128(500), "writer", 1)
         .unwrap()
         .transition(RunState::Running, None)
         .unwrap()
-        .pause_for_recovery(recovery_pause)
+        .require_recovery(recovery)
         .unwrap();
     let resume = RuntimeCommand::resume_with_recovery_binding(
         Uuid::from_u128(501),
@@ -1353,7 +1354,7 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
         Budget::default(),
         Usage::default(),
     )
-    .state(RunState::Paused, Some(RunPauseReason::RecoveryRequired))
+    .state(RunState::RecoveryRequired, None)
     .cursor_step_id(Some("step-7".into()))
     .attempts(vec![uncertain_attempt])
     .uncertain_invocations(vec![uncertain])

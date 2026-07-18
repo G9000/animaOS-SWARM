@@ -7,8 +7,8 @@ use uuid::Uuid;
 
 use super::{
     store::AuthoritativeGrantChangeKind, AuthoritativeGrantChange, AuthoritativeGrantState,
-    AuthoritativeGrantStatus, CreateRun, DurableResultMutation, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
+    AuthoritativeGrantStatus, CheckpointMutation, CreateRun, DurableResultMutation,
+    ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
     ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy, StoredRun,
 };
 use crate::{CommandReceipt, DurableCapabilityResult, RunState};
@@ -25,7 +25,8 @@ struct StoredSession {
 struct RunAggregate {
     stored: StoredRun,
     lease: Option<ExecutionLease>,
-    checkpoint: Option<(u64, super::CheckpointV1)>,
+    checkpoint_version: u64,
+    checkpoint: Option<super::CheckpointV1>,
     events: Vec<RuntimeEvent>,
     steps: BTreeMap<String, super::Step>,
     attempts: BTreeMap<(Uuid, u32), super::InvocationAttemptRecord>,
@@ -147,7 +148,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         let session = request.session();
         if owner_id.is_nil()
             || request.owner_id() != owner_id
-            || request.run().state().is_terminal()
+            || request.run().state() != RunState::Queued
             || request.run().session_id() != session.id()
             || request.run().definition_id() != session.definition().id()
             || request.run().definition_version() != session.definition().version()
@@ -224,6 +225,7 @@ impl ExecutionStore for InMemoryExecutionStore {
             RunAggregate {
                 stored: stored.clone(),
                 lease: None,
+                checkpoint_version: 0,
                 checkpoint: None,
                 events: vec![],
                 steps: BTreeMap::new(),
@@ -349,10 +351,7 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ExecutionStoreErrorCode::VersionConflict,
             ));
         }
-        let checkpoint_version = aggregate
-            .checkpoint
-            .as_ref()
-            .map_or(0, |(version, _)| *version);
+        let checkpoint_version = aggregate.checkpoint_version;
         if checkpoint_version != commit.expected_checkpoint_version() {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::CheckpointConflict,
@@ -370,6 +369,7 @@ impl ExecutionStore for InMemoryExecutionStore {
             commit.target_run(),
             commit.command(),
             commit.approval(),
+            commit.attempts(),
         ) {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::InvalidRequest,
@@ -401,12 +401,22 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ExecutionStoreErrorCode::EventConflict,
             ));
         }
-        if let Some(checkpoint) = commit.checkpoint() {
+        if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
             if checkpoint.run_id() != run_id
                 || checkpoint.session_id() != aggregate.stored.run().session_id()
                 || checkpoint.definition().id() != aggregate.stored.run().definition_id()
                 || checkpoint.definition().version() != aggregate.stored.run().definition_version()
                 || checkpoint.state() != commit.target_run().state()
+                || checkpoint.pause_reason() != commit.target_run().pause_reason()
+                || checkpoint
+                    .pending_approval()
+                    .map(|pending| pending.request())
+                    != commit.target_run().pending_approval()
+                || commit.target_run().state() == RunState::RecoveryRequired
+                    && !checkpoint.uncertain_invocations().iter().any(|record| {
+                        commit.target_run().recovery_pause() == Some(record.pause())
+                            && commit.target_run().recovery_binding() == record.recovery_binding()
+                    })
                 || checkpoint.last_durable_event_sequence() != last_sequence
             {
                 return Err(ExecutionStoreError::new(
@@ -545,7 +555,7 @@ impl ExecutionStore for InMemoryExecutionStore {
         for mutation in commit.results() {
             insert_result(&mut aggregate, mutation)?;
         }
-        if let Some(checkpoint) = commit.checkpoint() {
+        if let CheckpointMutation::Replace(checkpoint) = commit.checkpoint_mutation() {
             let attempts: Vec<_> = aggregate.attempts.values().cloned().collect();
             let completed: Vec<_> = aggregate
                 .results
@@ -563,12 +573,44 @@ impl ExecutionStore for InMemoryExecutionStore {
                 ));
             }
         }
+        let aggregate_changed = aggregate.stored.run() != commit.target_run()
+            || !commit.events().is_empty()
+            || aggregate.steps != state.runs[&(owner_id, run_id)].steps
+            || aggregate.attempts != state.runs[&(owner_id, run_id)].attempts
+            || aggregate.results != state.runs[&(owner_id, run_id)].results;
+        if aggregate_changed
+            && matches!(commit.checkpoint_mutation(), CheckpointMutation::Unchanged)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::CheckpointConflict,
+            ));
+        }
+        if commit.target_run().state().is_terminal()
+            && !matches!(commit.checkpoint_mutation(), CheckpointMutation::Clear)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::CheckpointConflict,
+            ));
+        }
         aggregate.events.extend_from_slice(commit.events());
-        if let Some(checkpoint) = commit.checkpoint() {
-            let next_checkpoint_version = checkpoint_version.checked_add(1).ok_or_else(|| {
-                ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
-            })?;
-            aggregate.checkpoint = Some((next_checkpoint_version, checkpoint.clone()));
+        match commit.checkpoint_mutation() {
+            CheckpointMutation::Unchanged => {}
+            CheckpointMutation::Replace(checkpoint) => {
+                aggregate.checkpoint_version =
+                    checkpoint_version.checked_add(1).ok_or_else(|| {
+                        ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
+                    })?;
+                aggregate.checkpoint = Some(checkpoint.clone());
+            }
+            CheckpointMutation::Clear => {
+                if aggregate.checkpoint.is_some() {
+                    aggregate.checkpoint_version =
+                        checkpoint_version.checked_add(1).ok_or_else(|| {
+                            ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
+                        })?;
+                }
+                aggregate.checkpoint = None;
+            }
         }
         let mut stored = StoredRun::new(
             owner_id,
@@ -632,13 +674,21 @@ impl ExecutionStore for InMemoryExecutionStore {
                 .serial_claims
                 .remove(&(owner_id, commit.target_run().session_id()));
         }
-        state.runs.insert((owner_id, run_id), aggregate);
-        state.receipts.insert(command_key, receipt.clone());
-        state.outcomes.insert(
-            command_key,
-            ExecutionCommitOutcome::new(stored.clone(), receipt.clone()),
+        let grant_consumption = commit
+            .approval()
+            .and_then(|approval| approval.grant_consumption())
+            .cloned();
+        let outcome = ExecutionCommitOutcome::new(
+            stored.clone(),
+            receipt.clone(),
+            aggregate.checkpoint_version,
+            aggregate.checkpoint.clone(),
+            grant_consumption,
         );
-        Ok(ExecutionCommitOutcome::new(stored, receipt))
+        state.runs.insert((owner_id, run_id), aggregate);
+        state.receipts.insert(command_key, receipt);
+        state.outcomes.insert(command_key, outcome.clone());
+        Ok(outcome)
     }
 
     async fn load_run(
@@ -661,12 +711,14 @@ impl ExecutionStore for InMemoryExecutionStore {
         run_id: Uuid,
     ) -> Result<Option<(u64, super::CheckpointV1)>, ExecutionStoreError> {
         let state = self.state.lock().await;
-        Ok(state
+        let aggregate = state
             .runs
             .get(&(owner_id, run_id))
-            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+        Ok(aggregate
             .checkpoint
-            .clone())
+            .clone()
+            .map(|checkpoint| (aggregate.checkpoint_version, checkpoint)))
     }
 
     async fn load_steps_page(
@@ -811,6 +863,7 @@ fn valid_command_transition(
     target: &super::Run,
     command: &super::RuntimeCommand,
     approval: Option<&super::ApprovalGrantMutation>,
+    attempts: &[super::InvocationAttemptRecord],
 ) -> bool {
     if current.id() != target.id()
         || current.session_id() != target.session_id()
@@ -828,26 +881,96 @@ fn valid_command_transition(
                 && current.state() == RunState::Queued
                 && target.state() == RunState::Running
         }
-        super::RuntimeCommandKind::Advance => approval.is_none() && current == target,
+        super::RuntimeCommandKind::RecordProgress => {
+            approval.is_none() && current.state() == RunState::Running && current == target
+        }
+        super::RuntimeCommandKind::RequestApproval => {
+            approval.is_none()
+                && command.approval_request().is_some_and(|request| {
+                    current
+                        .wait_for_approval(request.clone())
+                        .is_ok_and(|expected| &expected == target)
+                })
+        }
+        super::RuntimeCommandKind::RequireRecovery => {
+            approval.is_none()
+                && command.recovery_record().is_some_and(|recovery| {
+                    let pause = recovery.pause();
+                    attempts.iter().any(|attempt| {
+                        attempt.invocation() == pause.invocation()
+                            && attempt.attempt_number() == pause.attempt_number()
+                            && attempt.state() == super::AttemptRecordState::Uncertain
+                            && attempt.manifest() == pause.manifest()
+                            && attempt.recovery_mode() == pause.manifest().recovery_mode()
+                    }) && current
+                        .require_recovery(recovery.clone())
+                        .is_ok_and(|expected| &expected == target)
+                })
+        }
         super::RuntimeCommandKind::Pause => {
             approval.is_none()
-                && current.state() == RunState::Running
-                && target.state() == RunState::Paused
-                && target.pause_reason() != Some(super::RunPauseReason::RecoveryRequired)
+                && command.pause_reason().is_some_and(|reason| {
+                    current
+                        .transition(RunState::Paused, Some(reason))
+                        .is_ok_and(|expected| &expected == target)
+                })
         }
-        super::RuntimeCommandKind::Cancel => {
-            approval.is_none() && target.state() == RunState::Cancelled
-        }
-        super::RuntimeCommandKind::Resume => current
+        super::RuntimeCommandKind::ResumeApproval => current
             .apply_resume_command(command, approval.map(|mutation| mutation.claim()), None)
             .is_ok_and(|outcome| outcome.run() == target),
-        super::RuntimeCommandKind::Retry => {
+        super::RuntimeCommandKind::ResumeRecovery => {
             approval.is_none()
-                && current == target
-                && current.pause_reason() == Some(super::RunPauseReason::RecoveryRequired)
+                && current.state() == RunState::RecoveryRequired
                 && current.recovery_pause().is_some_and(|pause| {
-                    command.retry_invocation_id() == Some(pause.invocation().id())
+                    command.recovery_binding().is_some_and(|binding| {
+                        current.recovery_binding() == Some(binding)
+                            && pause.matches_resume_binding(binding)
+                            && attempts.iter().any(|attempt| {
+                                attempt.invocation().id() == binding.logical_invocation_id()
+                                    && attempt.attempt_number() == binding.retry_attempt_number()
+                                    && attempt.state() == super::AttemptRecordState::Pending
+                                    && attempt.manifest().id() == binding.manifest_id()
+                                    && attempt.manifest().version() == binding.manifest_version()
+                                    && attempt.manifest().schema_digest()
+                                        == binding.manifest_digest()
+                                    && attempt.recovery_mode() == binding.recovery_mode()
+                            })
+                    })
                 })
+                && target.state() == RunState::Running
+                && target.pause_reason().is_none()
+                && target.pending_approval().is_none()
+                && target.recovery_pause().is_none()
+        }
+        super::RuntimeCommandKind::Complete => {
+            approval.is_none()
+                && current
+                    .transition(RunState::Completed, None)
+                    .is_ok_and(|expected| &expected == target)
+        }
+        super::RuntimeCommandKind::Fail => {
+            approval.is_none()
+                && match current.state() {
+                    RunState::Running => current
+                        .transition(RunState::Failed, None)
+                        .is_ok_and(|expected| &expected == target),
+                    RunState::RecoveryRequired => current
+                        .resolve_recovery_terminal(super::RecoveryTerminalResolution::Fail)
+                        .is_ok_and(|expected| expected.run() == target),
+                    _ => false,
+                }
+        }
+        super::RuntimeCommandKind::Cancel => {
+            approval.is_none()
+                && match current.state() {
+                    RunState::Running => current
+                        .transition(RunState::Cancelled, None)
+                        .is_ok_and(|expected| &expected == target),
+                    RunState::RecoveryRequired => current
+                        .resolve_recovery_terminal(super::RecoveryTerminalResolution::Cancel)
+                        .is_ok_and(|expected| expected.run() == target),
+                    _ => false,
+                }
         }
     }
 }

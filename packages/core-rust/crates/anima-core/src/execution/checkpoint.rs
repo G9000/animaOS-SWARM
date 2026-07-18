@@ -465,6 +465,10 @@ impl RecoveryPauseRecord {
     pub fn matches_resume_binding(&self, binding: &RecoveryResumeBinding) -> bool {
         self.allows_automatic_resume()
             && binding.logical_invocation_id() == self.invocation.id()
+            && binding.run_id() == self.invocation.run_id()
+            && binding.logical_step_id() == self.invocation.logical_step_id()
+            && binding.capability_id() == self.invocation.capability_id()
+            && binding.canonical_argument_digest() == self.invocation.canonical_argument_digest()
             && binding.completed_attempt_number() == self.attempt_number
             && binding.manifest_id() == self.manifest.id()
             && binding.manifest_version() == self.manifest.version()
@@ -863,6 +867,7 @@ impl CheckpointV1 {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
         if (self.state == RunState::Paused) != self.pause_reason.is_some()
+            || self.pause_reason == Some(RunPauseReason::RecoveryRequired)
             || (self.state == RunState::WaitingForApproval) != self.pending_approval.is_some()
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
@@ -979,7 +984,7 @@ impl CheckpointV1 {
         if pending.len() > 1 {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
-        if self.pause_reason == Some(RunPauseReason::RecoveryRequired)
+        if self.state == RunState::RecoveryRequired
             && (self.uncertain_invocations.is_empty()
                 || self
                     .uncertain_invocations
@@ -988,7 +993,7 @@ impl CheckpointV1 {
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
-        if self.pause_reason != Some(RunPauseReason::RecoveryRequired)
+        if self.state != RunState::RecoveryRequired
             && self
                 .uncertain_invocations
                 .iter()
@@ -1019,10 +1024,13 @@ impl CheckpointV1 {
             ) && self.cursor.is_some()
             || matches!(
                 self.state,
-                RunState::Running | RunState::WaitingForApproval | RunState::Paused
+                RunState::Running
+                    | RunState::WaitingForApproval
+                    | RunState::Paused
+                    | RunState::RecoveryRequired
             ) && !self.attempts.is_empty()
                 && self.cursor.is_none()
-            || self.pause_reason == Some(RunPauseReason::RecoveryRequired)
+            || self.state == RunState::RecoveryRequired
                 && cursor_attempt.is_none_or(|a| a.state != AttemptRecordState::Uncertain)
             || matches!(self.state, RunState::Running | RunState::WaitingForApproval)
                 && cursor_attempt.is_some_and(|a| a.state != AttemptRecordState::Pending)

@@ -3,7 +3,7 @@ use anima_core::{
     ApprovalResumeClaim, AttemptRecordState, AuthoritativeGrantChange,
     AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus, AutonomyGrant,
     Budget, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointCursor,
-    CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin,
+    CheckpointMutation, CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin,
     DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
     ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
     ExecutionStoreFactory, GrantEffect, GrantScope, GrantStatus, InMemoryExecutionStore,
@@ -347,13 +347,14 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
     let (waiting, target, command, approval, grant) = approval_resume_parts(&session, id(63));
     assert_eq!(approval.remaining_uses(), Some(1));
     assert!(approval.grant_consumption().is_some());
-    store
+    let queued = Run::queued(id(63), session.id(), "writer", 3).unwrap();
+    let created = store
         .create_run(
             owner_id,
             CreateRun::new_for_owner(
                 id(65),
                 session.clone(),
-                waiting,
+                queued.clone(),
                 0,
                 SessionConcurrencyPolicy::Serial,
             ),
@@ -361,7 +362,50 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
         .await
         .unwrap();
     let lease = store
-        .acquire_lease(owner_id, id(63), 1, 1_000)
+        .acquire_lease(owner_id, id(63), created.run_version(), 1_000)
+        .await
+        .unwrap();
+    let running = queued.transition(RunState::Running, None).unwrap();
+    let started = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(66), session.id(), queued.id()).unwrap(),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running,
+            ),
+        )
+        .await
+        .unwrap();
+    let waiting_outcome = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::request_approval(
+                    id(67),
+                    session.id(),
+                    queued.id(),
+                    waiting.pending_approval().unwrap().clone(),
+                )
+                .unwrap(),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                waiting,
+            ),
+        )
         .await
         .unwrap();
     let event = RuntimeEvent::new(
@@ -374,9 +418,10 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
         RuntimeEventKind::RunResumed,
     )
     .unwrap();
+    let expected_consumption = approval.grant_consumption().cloned();
     let commit = ExecutionCommit::new(
-        1,
-        0,
+        waiting_outcome.stored_run().run_version(),
+        waiting_outcome.checkpoint_version(),
         lease,
         command,
         vec![event],
@@ -403,11 +448,15 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
         )
         .await
         .unwrap();
-    store
+    let outcome = store
         .commit_execution(owner_id, commit.clone())
         .await
         .unwrap();
-    store.commit_execution(owner_id, commit).await.unwrap();
+    assert_eq!(outcome.grant_consumption(), expected_consumption.as_ref());
+    assert_eq!(
+        store.commit_execution(owner_id, commit).await.unwrap(),
+        outcome
+    );
 }
 
 #[tokio::test]
@@ -668,6 +717,40 @@ async fn session_identity_pins_owner_definition_and_initial_lifecycle() {
 }
 
 #[tokio::test]
+async fn create_run_requires_a_queued_initial_run() {
+    let store = InMemoryExecutionStore::default();
+    let owner_id = id(0x92);
+    let session = Session::new(id(0x93), "writer", 1, SessionConcurrencyPolicy::Serial).unwrap();
+    let running = Run::queued(id(0x94), session.id(), "writer", 1)
+        .unwrap()
+        .transition(RunState::Running, None)
+        .unwrap();
+
+    assert_eq!(
+        store
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    owner_id,
+                    session,
+                    running.clone(),
+                    0,
+                    SessionConcurrencyPolicy::Serial,
+                ),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::InvalidRequest
+    );
+    assert!(store
+        .load_run(owner_id, running.id())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn logical_invocation_results_accept_identical_replays_and_reject_conflicts() {
     let store = InMemoryExecutionStore::default();
     let owner_id = id(54);
@@ -825,7 +908,7 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
                     2,
                     0,
                     renewed,
-                    RuntimeCommand::advance(id(57), session.id(), queued.id()).unwrap(),
+                    RuntimeCommand::record_progress(id(57), session.id(), queued.id()).unwrap(),
                     vec![second_event],
                     vec![],
                     vec![attempt],
@@ -926,7 +1009,7 @@ async fn execution_step_and_attempt_history_is_append_only() {
                 2,
                 0,
                 lease.clone(),
-                RuntimeCommand::advance(id(75), session.id(), queued.id()).unwrap(),
+                RuntimeCommand::record_progress(id(75), session.id(), queued.id()).unwrap(),
                 vec![],
                 vec![step.clone()],
                 vec![pending.clone()],
@@ -948,7 +1031,7 @@ async fn execution_step_and_attempt_history_is_append_only() {
                     3,
                     0,
                     lease.clone(),
-                    RuntimeCommand::advance(id(76), session.id(), queued.id()).unwrap(),
+                    RuntimeCommand::record_progress(id(76), session.id(), queued.id()).unwrap(),
                     vec![],
                     vec![conflicting_step],
                     vec![],
@@ -978,7 +1061,7 @@ async fn execution_step_and_attempt_history_is_append_only() {
                     3,
                     0,
                     lease,
-                    RuntimeCommand::advance(id(77), session.id(), queued.id()).unwrap(),
+                    RuntimeCommand::record_progress(id(77), session.id(), queued.id()).unwrap(),
                     vec![],
                     vec![],
                     vec![conflicting_attempt],
@@ -1182,13 +1265,13 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
     ))
     .build()
     .unwrap();
-    store
+    let committed = store
         .commit_execution(
             owner_id,
             ExecutionCommit::new(
                 1,
                 0,
-                lease,
+                lease.clone(),
                 command,
                 vec![event],
                 vec![checkpoint_step],
@@ -1197,10 +1280,78 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
                 None,
                 running,
             )
-            .with_checkpoint(checkpoint),
+            .with_checkpoint(checkpoint.clone()),
         )
         .await
         .unwrap();
+    assert_eq!(committed.checkpoint_version(), 1);
+    assert_eq!(committed.checkpoint(), Some(&checkpoint));
+
+    let lease = store.renew_lease(owner_id, lease, 1_000).await.unwrap();
+    let progress = RuntimeCommand::record_progress(id(0x26), session.id(), queued.id()).unwrap();
+    let progressed = RuntimeEvent::new(
+        id(0x27),
+        owner_id,
+        session.id(),
+        queued.id(),
+        2,
+        2,
+        RuntimeEventKind::StepStarted,
+    )
+    .unwrap();
+    let stale = ExecutionCommit::new(
+        committed.stored_run().run_version(),
+        committed.checkpoint_version(),
+        lease.clone(),
+        progress.clone(),
+        vec![progressed.clone()],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        committed.stored_run().run().clone(),
+    )
+    .with_checkpoint_mutation(CheckpointMutation::Unchanged);
+    assert_eq!(
+        store
+            .commit_execution(owner_id, stale)
+            .await
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::CheckpointConflict
+    );
+    assert_eq!(
+        store.load_checkpoint(owner_id, queued.id()).await.unwrap(),
+        Some((1, checkpoint))
+    );
+
+    let clear = ExecutionCommit::new(
+        committed.stored_run().run_version(),
+        committed.checkpoint_version(),
+        lease,
+        progress,
+        vec![progressed],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        committed.stored_run().run().clone(),
+    )
+    .with_checkpoint_mutation(CheckpointMutation::Clear);
+    let cleared = store
+        .commit_execution(owner_id, clear.clone())
+        .await
+        .unwrap();
+    assert_eq!(cleared.checkpoint_version(), 2);
+    assert_eq!(cleared.checkpoint(), None);
+    assert_eq!(
+        store.commit_execution(owner_id, clear).await.unwrap(),
+        cleared
+    );
+    assert_eq!(
+        store.load_checkpoint(owner_id, queued.id()).await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test]
@@ -1368,7 +1519,7 @@ async fn commands_bind_session_kind_and_exact_run_transition() {
                 started.stored_run().run_version(),
                 0,
                 lease.clone(),
-                RuntimeCommand::advance(id(107), session.id(), queued.id()).unwrap(),
+                RuntimeCommand::record_progress(id(107), session.id(), queued.id()).unwrap(),
                 vec![],
                 vec![],
                 vec![],

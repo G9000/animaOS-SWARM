@@ -8,15 +8,16 @@ use super::{
     ApprovalResumeClaim, Budget, CheckpointV1, CheckpointV1Builder, CommandReceipt,
     CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionLease,
     GrantAuthorityBinding, GrantAuthorityKey, InvocationAttemptRecord, Run, RunState,
-    RuntimeCommand, RuntimeEvent, RuntimeEventKind, Session, SessionConcurrencyPolicy, Step,
-    StepKind, Usage,
+    RuntimeCommand, RuntimeCommandKind, RuntimeEvent, RuntimeEventKind, Session,
+    SessionConcurrencyPolicy, Step, StepKind, Usage,
 };
 use crate::{
     AgentDefinition, ApprovalDecision, AutonomyGrant, CapabilityKind, CapabilityManifest,
     CapabilityReferenceId, DurableCapabilityResult, DurableCapabilityStatus, GrantConsumption,
     GrantEffect, GrantScope, GrantStatus, LifecyclePolicy, LogicalInvocation, ManifestPin,
     MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions,
-    ProfileRef, RecoveryMode, RiskLevel, RuntimeCompatibility, RuntimeLimits,
+    ProfileRef, RecoveryMode, RecoveryResumeBinding, RiskLevel, RuntimeCompatibility,
+    RuntimeLimits,
 };
 
 pub const MAX_COMMIT_EVENTS: usize = 256;
@@ -469,6 +470,17 @@ pub struct DurableResultMutation {
     result: DurableCapabilityResult,
 }
 
+/// Explicit checkpoint freshness decision for one atomic execution commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CheckpointMutation {
+    /// Retain the current checkpoint only when the post-commit aggregate is still identical to it.
+    Unchanged,
+    /// Replace the current checkpoint with an exact snapshot of the post-commit aggregate.
+    Replace(CheckpointV1),
+    /// Invalidate any current checkpoint while advancing the checkpoint generation.
+    Clear,
+}
+
 impl DurableResultMutation {
     pub fn new(completed: CompletedInvocationRecord, result: DurableCapabilityResult) -> Self {
         Self { completed, result }
@@ -495,7 +507,7 @@ pub struct ExecutionCommit {
     attempts: Vec<InvocationAttemptRecord>,
     results: Vec<DurableResultMutation>,
     approval: Option<ApprovalGrantMutation>,
-    checkpoint: Option<CheckpointV1>,
+    checkpoint: CheckpointMutation,
     target_run: Run,
 }
 
@@ -523,13 +535,18 @@ impl ExecutionCommit {
             attempts,
             results,
             approval,
-            checkpoint: None,
+            checkpoint: CheckpointMutation::Clear,
             target_run,
         }
     }
 
     pub fn with_checkpoint(mut self, checkpoint: CheckpointV1) -> Self {
-        self.checkpoint = Some(checkpoint);
+        self.checkpoint = CheckpointMutation::Replace(checkpoint);
+        self
+    }
+
+    pub fn with_checkpoint_mutation(mut self, mutation: CheckpointMutation) -> Self {
+        self.checkpoint = mutation;
         self
     }
 
@@ -570,7 +587,14 @@ impl ExecutionCommit {
     }
 
     pub fn checkpoint(&self) -> Option<&CheckpointV1> {
-        self.checkpoint.as_ref()
+        match &self.checkpoint {
+            CheckpointMutation::Replace(checkpoint) => Some(checkpoint),
+            CheckpointMutation::Unchanged | CheckpointMutation::Clear => None,
+        }
+    }
+
+    pub fn checkpoint_mutation(&self) -> &CheckpointMutation {
+        &self.checkpoint
     }
 
     pub fn target_run(&self) -> &Run {
@@ -595,7 +619,7 @@ impl ExecutionCommit {
             .and_then(|value| value.checked_add(self.results.len()))
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::BoundsExceeded))?;
         if total > MAX_COMMIT_BATCH_ITEMS
-            || self.checkpoint.as_ref().is_some_and(|checkpoint| {
+            || self.checkpoint().is_some_and(|checkpoint| {
                 serde_jcs::to_vec(checkpoint)
                     .map_or(true, |bytes| bytes.len() > MAX_COMMIT_CHECKPOINT_BYTES)
             })
@@ -612,13 +636,25 @@ impl ExecutionCommit {
 pub struct ExecutionCommitOutcome {
     stored_run: StoredRun,
     receipt: CommandReceipt,
+    checkpoint_version: u64,
+    checkpoint: Option<CheckpointV1>,
+    grant_consumption: Option<GrantConsumption>,
 }
 
 impl ExecutionCommitOutcome {
-    pub fn new(stored_run: StoredRun, receipt: CommandReceipt) -> Self {
+    pub fn new(
+        stored_run: StoredRun,
+        receipt: CommandReceipt,
+        checkpoint_version: u64,
+        checkpoint: Option<CheckpointV1>,
+        grant_consumption: Option<GrantConsumption>,
+    ) -> Self {
         Self {
             stored_run,
             receipt,
+            checkpoint_version,
+            checkpoint,
+            grant_consumption,
         }
     }
 
@@ -628,6 +664,18 @@ impl ExecutionCommitOutcome {
 
     pub fn receipt(&self) -> &CommandReceipt {
         &self.receipt
+    }
+
+    pub fn checkpoint_version(&self) -> u64 {
+        self.checkpoint_version
+    }
+
+    pub fn checkpoint(&self) -> Option<&CheckpointV1> {
+        self.checkpoint.as_ref()
+    }
+
+    pub fn grant_consumption(&self) -> Option<&GrantConsumption> {
+        self.grant_consumption.as_ref()
     }
 }
 
@@ -1079,8 +1127,13 @@ where
                 created.run_version(),
                 1,
                 lease.clone(),
-                RuntimeCommand::pause(Uuid::from_u128(0x000f_eed9), session_id, run.id())
-                    .map_err(ExecutionStoreError::from)?,
+                RuntimeCommand::pause(
+                    Uuid::from_u128(0x000f_eed9),
+                    session_id,
+                    run.id(),
+                    super::RunPauseReason::Requested,
+                )
+                .map_err(ExecutionStoreError::from)?,
                 vec![paused_event.clone()],
                 vec![],
                 vec![],
@@ -1105,8 +1158,13 @@ where
                 outcome.stored_run().run_version(),
                 0,
                 lease.clone(),
-                RuntimeCommand::pause(Uuid::from_u128(0x000f_eeda), session_id, run.id())
-                    .map_err(ExecutionStoreError::from)?,
+                RuntimeCommand::pause(
+                    Uuid::from_u128(0x000f_eeda),
+                    session_id,
+                    run.id(),
+                    super::RunPauseReason::Requested,
+                )
+                .map_err(ExecutionStoreError::from)?,
                 vec![paused_event.clone()],
                 vec![],
                 vec![],
@@ -1137,6 +1195,46 @@ where
             ExecutionStoreErrorCode::InvalidRequest,
         ));
     }
+    let unchanged_checkpoint = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                outcome.stored_run().run_version(),
+                1,
+                lease.clone(),
+                RuntimeCommand::pause(
+                    Uuid::from_u128(0x000f_eedd),
+                    session_id,
+                    run.id(),
+                    super::RunPauseReason::Requested,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![paused_event.clone()],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                paused.clone(),
+            )
+            .with_checkpoint_mutation(CheckpointMutation::Unchanged),
+        )
+        .await;
+    if !matches!(
+        unchanged_checkpoint,
+        Err(error) if error.code() == ExecutionStoreErrorCode::CheckpointConflict
+    ) || store.load_run(owner_id, run.id()).await?.as_ref() != Some(outcome.stored_run())
+        || replay_all_events(&store, owner_id, run.id()).await? != events
+        || store
+            .load_checkpoint(owner_id, run.id())
+            .await?
+            .as_ref()
+            .map(|(version, checkpoint)| (*version, checkpoint.state()))
+            != Some((1, RunState::Running))
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
     let paused_outcome = store
         .commit_execution(
             owner_id,
@@ -1144,8 +1242,13 @@ where
                 outcome.stored_run().run_version(),
                 1,
                 lease,
-                RuntimeCommand::pause(Uuid::from_u128(0x000f_eedc), session_id, run.id())
-                    .map_err(ExecutionStoreError::from)?,
+                RuntimeCommand::pause(
+                    Uuid::from_u128(0x000f_eedc),
+                    session_id,
+                    run.id(),
+                    super::RunPauseReason::Requested,
+                )
+                .map_err(ExecutionStoreError::from)?,
                 vec![paused_event.clone()],
                 vec![],
                 vec![],
@@ -1210,6 +1313,7 @@ where
     assert_portable_commit_bounds_contract(factory).await?;
     assert_portable_session_identity_contract(factory).await?;
     assert_portable_command_semantics_contract(factory).await?;
+    assert_portable_lifecycle_transition_contract(factory).await?;
     assert_portable_append_only_history_contract(factory).await?;
     assert_portable_checkpoint_rollback_contract(factory).await?;
     assert_concurrent_session_contract(factory).await?;
@@ -1258,6 +1362,513 @@ async fn replay_all_events<S: ExecutionStore + ?Sized>(
             None => return Ok(events),
         }
     }
+}
+
+async fn create_running_run<F>(
+    factory: &F,
+    seed: u128,
+) -> Result<
+    (
+        F::Store,
+        Uuid,
+        Session,
+        Run,
+        ExecutionCommitOutcome,
+        ExecutionLease,
+    ),
+    ExecutionStoreError,
+>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let owner_id = Uuid::from_u128(seed + 1);
+    let session = Session::new(
+        Uuid::from_u128(seed + 2),
+        "portable-lifecycle",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let queued = Run::queued(
+        Uuid::from_u128(seed + 3),
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let created = store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner_id,
+                session.clone(),
+                queued.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            ),
+        )
+        .await?;
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), created.run_version(), 1_000)
+        .await?;
+    let running = queued
+        .transition(RunState::Running, None)
+        .map_err(ExecutionStoreError::from)?;
+    let started = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(Uuid::from_u128(seed + 4), session.id(), queued.id())
+                    .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running,
+            ),
+        )
+        .await?;
+    Ok((store, owner_id, session, queued, started, lease))
+}
+
+async fn assert_portable_terminal_transition<F>(
+    factory: &F,
+    seed: u128,
+    kind: RuntimeCommandKind,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let (store, owner_id, session, queued, started, lease) =
+        create_running_run(factory, seed).await?;
+    let (command, target_state) = match kind {
+        RuntimeCommandKind::Complete => (
+            RuntimeCommand::complete(Uuid::from_u128(seed + 5), session.id(), queued.id()),
+            RunState::Completed,
+        ),
+        RuntimeCommandKind::Fail => (
+            RuntimeCommand::fail(Uuid::from_u128(seed + 5), session.id(), queued.id()),
+            RunState::Failed,
+        ),
+        RuntimeCommandKind::Cancel => (
+            RuntimeCommand::cancel(Uuid::from_u128(seed + 5), session.id(), queued.id()),
+            RunState::Cancelled,
+        ),
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    };
+    let target = started
+        .stored_run()
+        .run()
+        .transition(target_state, None)
+        .map_err(ExecutionStoreError::from)?;
+    let outcome = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease,
+                command.map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                target.clone(),
+            ),
+        )
+        .await?;
+    if outcome.stored_run().run() != &target
+        || outcome.checkpoint().is_some()
+        || store
+            .load_checkpoint(owner_id, queued.id())
+            .await?
+            .is_some()
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+fn conformance_recovery_binding(
+    invocation: &LogicalInvocation,
+    manifest: &ManifestPin,
+    recovery_mode: RecoveryMode,
+    authorization_identity: Uuid,
+) -> Result<RecoveryResumeBinding, ExecutionStoreError> {
+    serde_json::from_value(serde_json::json!({
+        "logical_invocation_id": invocation.id(),
+        "run_id": invocation.run_id(),
+        "logical_step_id": invocation.logical_step_id(),
+        "capability_id": invocation.capability_id(),
+        "canonical_argument_digest": invocation.canonical_argument_digest(),
+        "completed_attempt_number": 1,
+        "retry_attempt_number": 2,
+        "manifest_id": manifest.id(),
+        "manifest_version": manifest.version(),
+        "manifest_digest": manifest.schema_digest(),
+        "recovery_mode": recovery_mode,
+        "idempotency_key": invocation.idempotency_key(),
+        "authorization_identity": authorization_identity,
+    }))
+    .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))
+}
+
+async fn assert_recovery_mode_cannot_retry<F>(
+    factory: &F,
+    seed: u128,
+    recovery_mode: RecoveryMode,
+    reason: super::RecoveryPauseReason,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let (store, owner_id, session, queued, started, lease) =
+        create_running_run(factory, seed).await?;
+    let invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "blocked-recovery",
+        "workspace.write",
+        1,
+        serde_json::json!({"path": "blocked.txt"}),
+    ))?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:blocked-recovery",
+        recovery_mode,
+    ))?;
+    let pause = conformance_value(super::RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        reason,
+    ))?;
+    let recovery = conformance_value(super::RecoveryRecord::new_with_pause(pause.clone(), None))?;
+    let uncertain = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        super::AttemptRecordState::Uncertain,
+        manifest.clone(),
+        recovery_mode,
+    ))?;
+    let recovery_required = started
+        .stored_run()
+        .run()
+        .require_recovery(recovery.clone())
+        .map_err(ExecutionStoreError::from)?;
+    let required = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::require_recovery(
+                    Uuid::from_u128(seed + 5),
+                    session.id(),
+                    queued.id(),
+                    recovery,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![uncertain],
+                vec![],
+                None,
+                recovery_required.clone(),
+            ),
+        )
+        .await?;
+    let forged_retry = conformance_recovery_binding(
+        &invocation,
+        &manifest,
+        RecoveryMode::KeyedIdempotent,
+        Uuid::from_u128(seed + 6),
+    )?;
+    let retry_attempt = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        2,
+        super::AttemptRecordState::Pending,
+        manifest,
+        recovery_mode,
+    ))?;
+    let running = Run::queued(
+        queued.id(),
+        session.id(),
+        queued.definition_id(),
+        queued.definition_version(),
+    )
+    .and_then(|run| run.transition(RunState::Running, None))
+    .map_err(ExecutionStoreError::from)?;
+    let rejected = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                required.stored_run().run_version(),
+                required.checkpoint_version(),
+                lease,
+                RuntimeCommand::resume_recovery(
+                    Uuid::from_u128(seed + 7),
+                    session.id(),
+                    queued.id(),
+                    forged_retry,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![retry_attempt],
+                vec![],
+                None,
+                running,
+            ),
+        )
+        .await;
+    if !matches!(rejected, Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest)
+        || store
+            .load_run(owner_id, queued.id())
+            .await?
+            .as_ref()
+            .map(StoredRun::run)
+            != Some(&recovery_required)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_portable_lifecycle_transition_contract<F>(
+    factory: &F,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    assert_create_run_rejects_non_queued(factory).await?;
+    assert_portable_terminal_transition(factory, 0xe1_00, RuntimeCommandKind::Complete).await?;
+    assert_portable_terminal_transition(factory, 0xe2_00, RuntimeCommandKind::Fail).await?;
+    assert_portable_terminal_transition(factory, 0xe3_00, RuntimeCommandKind::Cancel).await?;
+    assert_recovery_mode_cannot_retry(
+        factory,
+        0xe5_00,
+        RecoveryMode::Manual,
+        super::RecoveryPauseReason::ManualReview,
+    )
+    .await?;
+    assert_recovery_mode_cannot_retry(
+        factory,
+        0xe6_00,
+        RecoveryMode::NonRetryable,
+        super::RecoveryPauseReason::UncertainOutcome,
+    )
+    .await?;
+    assert_recovery_mode_cannot_retry(
+        factory,
+        0xe7_00,
+        RecoveryMode::Compensate,
+        super::RecoveryPauseReason::UncertainOutcome,
+    )
+    .await?;
+
+    let (store, owner_id, session, queued, started, lease) =
+        create_running_run(factory, 0xe4_00).await?;
+    let invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "recover-step",
+        "workspace.write",
+        1,
+        serde_json::json!({"path": "recover.txt"}),
+    ))?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:portable-recovery",
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let pause = conformance_value(super::RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        super::RecoveryPauseReason::AuthoritativeAbsence,
+    ))?;
+    let binding = conformance_recovery_binding(
+        &invocation,
+        &manifest,
+        RecoveryMode::KeyedIdempotent,
+        Uuid::from_u128(0xe4_06),
+    )?;
+    let recovery = conformance_value(super::RecoveryRecord::new_with_pause(
+        pause.clone(),
+        Some(binding.clone()),
+    ))?;
+    let uncertain = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        super::AttemptRecordState::Uncertain,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let recovery_required = started
+        .stored_run()
+        .run()
+        .require_recovery(recovery.clone())
+        .map_err(ExecutionStoreError::from)?;
+    let required = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::require_recovery(
+                    Uuid::from_u128(0xe4_05),
+                    session.id(),
+                    queued.id(),
+                    recovery,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![uncertain],
+                vec![],
+                None,
+                recovery_required,
+            ),
+        )
+        .await?;
+    let retry_attempt = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        2,
+        super::AttemptRecordState::Pending,
+        manifest,
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let resumed = Run::queued(
+        queued.id(),
+        session.id(),
+        queued.definition_id(),
+        queued.definition_version(),
+    )
+    .and_then(|run| run.transition(RunState::Running, None))
+    .map_err(ExecutionStoreError::from)?;
+    let resume_command = RuntimeCommand::resume_recovery(
+        Uuid::from_u128(0xe4_07),
+        session.id(),
+        queued.id(),
+        binding,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let resumed_outcome = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                required.stored_run().run_version(),
+                required.checkpoint_version(),
+                lease,
+                resume_command,
+                vec![],
+                vec![],
+                vec![retry_attempt],
+                vec![],
+                None,
+                resumed.clone(),
+            ),
+        )
+        .await?;
+    if resumed_outcome.stored_run().run() != &resumed {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_create_run_rejects_non_queued<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let owner_id = Uuid::from_u128(0xe0_00);
+    let session = conformance_value(Session::new(
+        Uuid::from_u128(0xe0_01),
+        "portable-create-run",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    ))?;
+    let queued = conformance_value(Run::queued(
+        Uuid::from_u128(0xe0_02),
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    ))?;
+    let running = conformance_value(queued.transition(RunState::Running, None))?;
+    let (invocation, context) = conformance_policy_context(queued.id())?;
+    let grant = conformance_counted_grant(&context)?;
+    let request = conformance_value(PolicyEngine::approval_request(&context, Some(&grant)))?;
+    let waiting = conformance_value(running.wait_for_approval(request))?;
+    let paused = conformance_value(
+        running.transition(RunState::Paused, Some(super::RunPauseReason::Requested)),
+    )?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        invocation.capability_id(),
+        invocation.manifest_version(),
+        "sha256:portable-create-run",
+        RecoveryMode::Manual,
+    ))?;
+    let recovery_pause = conformance_value(super::RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest,
+        super::RecoveryPauseReason::ManualReview,
+    ))?;
+    let recovery_required = conformance_value(running.pause_for_recovery(recovery_pause))?;
+    let completed = conformance_value(running.transition(RunState::Completed, None))?;
+    let failed = conformance_value(running.transition(RunState::Failed, None))?;
+    let cancelled = conformance_value(running.transition(RunState::Cancelled, None))?;
+
+    for run in [
+        running,
+        waiting,
+        paused,
+        recovery_required,
+        completed,
+        failed,
+        cancelled,
+    ] {
+        let store = factory.create_execution_store().await?;
+        let result = store
+            .create_run(
+                owner_id,
+                CreateRun::new_for_owner(
+                    owner_id,
+                    session.clone(),
+                    run,
+                    0,
+                    SessionConcurrencyPolicy::Serial,
+                ),
+            )
+            .await;
+        if !matches!(
+            result,
+            Err(error) if error.code() == ExecutionStoreErrorCode::InvalidRequest
+        ) {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn assert_portable_commit_bounds_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
@@ -1718,7 +2329,7 @@ where
                 baseline.stored_run().run_version(),
                 0,
                 lease.clone(),
-                RuntimeCommand::advance(Uuid::from_u128(52_005), session.id(), queued.id())
+                RuntimeCommand::record_progress(Uuid::from_u128(52_005), session.id(), queued.id())
                     .map_err(ExecutionStoreError::from)?,
                 vec![],
                 vec![conflicting_step],
@@ -1743,7 +2354,7 @@ where
                 baseline.stored_run().run_version(),
                 0,
                 lease,
-                RuntimeCommand::advance(Uuid::from_u128(52_006), session.id(), queued.id())
+                RuntimeCommand::record_progress(Uuid::from_u128(52_006), session.id(), queued.id())
                     .map_err(ExecutionStoreError::from)?,
                 vec![],
                 vec![],
@@ -1909,7 +2520,7 @@ where
                 baseline.stored_run().run_version(),
                 0,
                 lease,
-                RuntimeCommand::advance(Uuid::from_u128(53_006), session.id(), queued.id())
+                RuntimeCommand::record_progress(Uuid::from_u128(53_006), session.id(), queued.id())
                     .map_err(ExecutionStoreError::from)?,
                 vec![candidate_event],
                 vec![step],
@@ -2225,21 +2836,17 @@ where
             &context,
             &grant,
         )?;
-        let created = store
-            .create_run(
-                owner_id,
-                CreateRun::new_for_owner(
-                    owner_id,
-                    session.clone(),
-                    waiting,
-                    0,
-                    SessionConcurrencyPolicy::Serial,
-                ),
-            )
-            .await?;
-        let lease = store
-            .acquire_lease(owner_id, run_id, created.run_version(), 1_000)
-            .await?;
+        let (created, lease) = create_waiting_run(
+            &store,
+            owner_id,
+            &session,
+            &waiting,
+            0,
+            SessionConcurrencyPolicy::Serial,
+            Uuid::from_u128(0xb0_70 + mutation * 2),
+            Uuid::from_u128(0xb0_71 + mutation * 2),
+        )
+        .await?;
         let event = RuntimeEvent::new(
             Uuid::from_u128(0xb0_60 + mutation),
             owner_id,
@@ -2272,6 +2879,89 @@ where
         }
     }
     Ok(())
+}
+
+async fn create_waiting_run<S: ExecutionStore>(
+    store: &S,
+    owner_id: Uuid,
+    session: &Session,
+    waiting: &Run,
+    expected_session_version: u64,
+    concurrency_policy: SessionConcurrencyPolicy,
+    start_command_id: Uuid,
+    approval_command_id: Uuid,
+) -> Result<(StoredRun, ExecutionLease), ExecutionStoreError> {
+    let queued = Run::queued(
+        waiting.id(),
+        waiting.session_id(),
+        waiting.definition_id(),
+        waiting.definition_version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let created = store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner_id,
+                session.clone(),
+                queued.clone(),
+                expected_session_version,
+                concurrency_policy,
+            ),
+        )
+        .await?;
+    let lease = store
+        .acquire_lease(owner_id, queued.id(), created.run_version(), 1_000)
+        .await?;
+    let running = queued
+        .transition(RunState::Running, None)
+        .map_err(ExecutionStoreError::from)?;
+    let started = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                created.run_version(),
+                0,
+                lease.clone(),
+                RuntimeCommand::start(start_command_id, session.id(), queued.id())
+                    .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
+        .await?;
+    let request = waiting
+        .pending_approval()
+        .cloned()
+        .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))?;
+    let waiting_outcome = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                started.stored_run().run_version(),
+                started.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::request_approval(
+                    approval_command_id,
+                    session.id(),
+                    queued.id(),
+                    request,
+                )
+                .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                waiting.clone(),
+            ),
+        )
+        .await?;
+    Ok((waiting_outcome.stored_run().clone(), lease))
 }
 
 fn conformance_definition(allows_concurrent_sessions: bool) -> AgentDefinition {
@@ -2752,21 +3442,17 @@ where
             ExecutionStoreErrorCode::InvalidRequest,
         ));
     }
-    let created = store
-        .create_run(
-            owner_id,
-            CreateRun::new_for_owner(
-                Uuid::from_u128(0xa9_14),
-                session.clone(),
-                waiting.clone(),
-                0,
-                SessionConcurrencyPolicy::Serial,
-            ),
-        )
-        .await?;
-    let lease = store
-        .acquire_lease(owner_id, run_id, created.run_version(), 1_000)
-        .await?;
+    let (created, lease) = create_waiting_run(
+        &store,
+        owner_id,
+        &session,
+        &waiting,
+        0,
+        SessionConcurrencyPolicy::Serial,
+        Uuid::from_u128(0xa9_15),
+        Uuid::from_u128(0x00a9_0016),
+    )
+    .await?;
     let event = RuntimeEvent::new(
         Uuid::from_u128(0xa9_13),
         Uuid::from_u128(0xa9_14),
@@ -2807,6 +3493,7 @@ where
         .await?;
     let outcome = store.commit_execution(owner_id, commit.clone()).await?;
     if store.commit_execution(owner_id, commit).await? != outcome
+        || outcome.grant_consumption().is_some()
         || store
             .load_run(owner_id, run_id)
             .await?
@@ -3091,8 +3778,12 @@ where
                 baseline.stored_run().run_version(),
                 0,
                 store.renew_lease(owner_id, lease, 1_000).await?,
-                RuntimeCommand::advance(Uuid::from_u128(0xaf_17), session.id(), queued.id())
-                    .map_err(ExecutionStoreError::from)?,
+                RuntimeCommand::record_progress(
+                    Uuid::from_u128(0xaf_17),
+                    session.id(),
+                    queued.id(),
+                )
+                .map_err(ExecutionStoreError::from)?,
                 vec![candidate_event],
                 vec![candidate_step],
                 vec![candidate_attempt],
@@ -3381,46 +4072,28 @@ where
             ExecutionStoreErrorCode::InvalidRequest,
         ));
     }
-    let first_created = store
-        .create_run(
-            owner_id,
-            CreateRun::new_for_owner(
-                Uuid::from_u128(0xc0_27),
-                session.clone(),
-                first_waiting.clone(),
-                0,
-                SessionConcurrencyPolicy::Concurrent,
-            ),
-        )
-        .await?;
-    let second_created = store
-        .create_run(
-            owner_id,
-            CreateRun::new_for_owner(
-                Uuid::from_u128(0xc0_27),
-                session.clone(),
-                second_waiting.clone(),
-                first_created.session_version(),
-                SessionConcurrencyPolicy::Concurrent,
-            ),
-        )
-        .await?;
-    let first_lease = store
-        .acquire_lease(
-            owner_id,
-            first_waiting.id(),
-            first_created.run_version(),
-            1_000,
-        )
-        .await?;
-    let second_lease = store
-        .acquire_lease(
-            owner_id,
-            second_waiting.id(),
-            second_created.run_version(),
-            1_000,
-        )
-        .await?;
+    let (first_created, first_lease) = create_waiting_run(
+        &store,
+        owner_id,
+        &session,
+        &first_waiting,
+        0,
+        SessionConcurrencyPolicy::Concurrent,
+        Uuid::from_u128(0xc0_28),
+        Uuid::from_u128(0xc0_29),
+    )
+    .await?;
+    let (second_created, second_lease) = create_waiting_run(
+        &store,
+        owner_id,
+        &session,
+        &second_waiting,
+        first_created.session_version(),
+        SessionConcurrencyPolicy::Concurrent,
+        Uuid::from_u128(0xc0_2a),
+        Uuid::from_u128(0xc0_2b),
+    )
+    .await?;
     let first_event = RuntimeEvent::new(
         Uuid::from_u128(0xc0_25),
         Uuid::from_u128(0xc0_27),
@@ -3453,6 +4126,10 @@ where
         Some(first_approval),
         first_target,
     );
+    let first_consumption = first_commit
+        .approval()
+        .and_then(ApprovalGrantMutation::grant_consumption)
+        .cloned();
     let second_commit = ExecutionCommit::new(
         second_created.run_version(),
         0,
@@ -3465,24 +4142,30 @@ where
         Some(second_approval),
         second_target,
     );
+    let second_consumption = second_commit
+        .approval()
+        .and_then(ApprovalGrantMutation::grant_consumption)
+        .cloned();
     let (first_result, second_result) = futures::join!(
         store.commit_execution(owner_id, first_commit.clone()),
         store.commit_execution(owner_id, second_commit.clone())
     );
-    let (winning_commit, original_outcome, losing_waiting) = match (first_result, second_result) {
-        (Ok(outcome), Err(error)) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
-            (first_commit, outcome, second_waiting)
-        }
-        (Err(error), Ok(outcome)) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
-            (second_commit, outcome, first_waiting)
-        }
-        _ => {
-            return Err(ExecutionStoreError::new(
-                ExecutionStoreErrorCode::InvalidRequest,
-            ))
-        }
-    };
+    let (winning_commit, original_outcome, expected_consumption, losing_waiting) =
+        match (first_result, second_result) {
+            (Ok(outcome), Err(error)) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
+                (first_commit, outcome, first_consumption, second_waiting)
+            }
+            (Err(error), Ok(outcome)) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
+                (second_commit, outcome, second_consumption, first_waiting)
+            }
+            _ => {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::InvalidRequest,
+                ))
+            }
+        };
     if store.commit_execution(owner_id, winning_commit).await? != original_outcome
+        || original_outcome.grant_consumption() != expected_consumption.as_ref()
         || store
             .load_run(owner_id, losing_waiting.id())
             .await?
@@ -3685,7 +4368,7 @@ where
         first_outcome.stored_run().run_version(),
         0,
         renewed.clone(),
-        RuntimeCommand::advance(Uuid::from_u128(0xd0_17), session.id(), queued.id())
+        RuntimeCommand::record_progress(Uuid::from_u128(0xd0_17), session.id(), queued.id())
             .map_err(ExecutionStoreError::from)?,
         vec![second_event],
         vec![],
@@ -3744,8 +4427,12 @@ where
                 identical_outcome.stored_run().run_version(),
                 0,
                 store.renew_lease(owner_id, renewed, 1_000).await?,
-                RuntimeCommand::advance(Uuid::from_u128(0xd0_19), session.id(), queued.id())
-                    .map_err(ExecutionStoreError::from)?,
+                RuntimeCommand::record_progress(
+                    Uuid::from_u128(0xd0_19),
+                    session.id(),
+                    queued.id(),
+                )
+                .map_err(ExecutionStoreError::from)?,
                 vec![conflicting_event],
                 vec![],
                 vec![],

@@ -155,6 +155,40 @@ fn run_transitions_are_explicit_and_terminal_states_are_immutable() {
 }
 
 #[test]
+fn durable_lifecycle_commands_name_their_exact_transition() {
+    let session_id = id(0x70);
+    let run_id = id(0x71);
+    let cases = [
+        (
+            RuntimeCommand::start(id(0x72), session_id, run_id).unwrap(),
+            RuntimeCommandKind::Start,
+        ),
+        (
+            RuntimeCommand::pause(id(0x73), session_id, run_id, RunPauseReason::Requested).unwrap(),
+            RuntimeCommandKind::Pause,
+        ),
+        (
+            RuntimeCommand::complete(id(0x74), session_id, run_id).unwrap(),
+            RuntimeCommandKind::Complete,
+        ),
+        (
+            RuntimeCommand::fail(id(0x75), session_id, run_id).unwrap(),
+            RuntimeCommandKind::Fail,
+        ),
+        (
+            RuntimeCommand::cancel(id(0x76), session_id, run_id).unwrap(),
+            RuntimeCommandKind::Cancel,
+        ),
+    ];
+
+    for (command, expected) in cases {
+        assert_eq!(command.kind(), expected);
+        assert_eq!(command.session_id(), session_id);
+        assert_eq!(command.target_run_id(), run_id);
+    }
+}
+
+#[test]
 fn generic_transitions_cannot_bypass_resume_authorization() {
     let running = Run::queued(id(1), id(2), "writer", 3)
         .unwrap()
@@ -666,7 +700,8 @@ fn command_receipts_are_idempotent_only_for_same_canonical_payload() {
     let command = RuntimeCommand::start(id(1), id(2), id(3)).unwrap();
     let receipt = CommandReceipt::accepted(&command).unwrap();
     assert_eq!(receipt.replay(&command).unwrap(), CommandOutcome::Accepted);
-    let conflicting = RuntimeCommand::pause(id(1), id(2), id(3)).unwrap();
+    let conflicting =
+        RuntimeCommand::pause(id(1), id(2), id(3), RunPauseReason::Requested).unwrap();
     assert!(receipt.replay(&conflicting).is_err());
     assert_eq!(command.kind(), RuntimeCommandKind::Start);
 }
@@ -1167,6 +1202,7 @@ fn manual_recovery_pause_has_no_automatic_resume_path() {
         .unwrap()
         .pause_for_recovery(pause.clone())
         .unwrap();
+    assert_eq!(run.state(), RunState::RecoveryRequired);
     assert!(run.resume(None, None).is_err());
     assert_eq!(
         run.resolve_recovery_terminal(RecoveryTerminalResolution::Fail)
@@ -1200,11 +1236,26 @@ fn manual_recovery_pause_has_no_automatic_resume_path() {
         id(2),
         DefinitionPin::new(1, "writer", 1).unwrap(),
         1,
-        vec![manifest],
+        vec![manifest.clone()],
         Budget::default(),
         Usage::default(),
     )
     .state(RunState::Paused, Some(RunPauseReason::RecoveryRequired))
+    .cursor_step_id(Some("manual-step".into()))
+    .attempts(vec![attempt.clone()])
+    .uncertain_invocations(vec![uncertain.clone()])
+    .build()
+    .is_err());
+    assert!(CheckpointV1Builder::new(
+        id(1),
+        id(2),
+        DefinitionPin::new(1, "writer", 1).unwrap(),
+        1,
+        vec![manifest],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::RecoveryRequired, None)
     .cursor_step_id(Some("manual-step".into()))
     .attempts(vec![attempt])
     .uncertain_invocations(vec![uncertain])
