@@ -1083,7 +1083,7 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
         retry.invocation().binding(),
         1,
         manifest_pin.clone(),
-        RecoveryPauseReason::UncertainOutcome,
+        RecoveryPauseReason::AuthoritativeAbsence,
     )
     .unwrap();
     let paused = Run::queued(binding.run_id(), Uuid::from_u128(500), "writer", 1)

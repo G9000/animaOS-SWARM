@@ -75,6 +75,7 @@ fn draft(profile_version: u32) -> AgentDefinitionDraft {
             auto_start: false,
             restart_on_failure: true,
             max_restarts: 3,
+            allows_concurrent_sessions: false,
         },
         host_requirements: vec![HostRequirement {
             id: "workspace-host".into(),
@@ -212,6 +213,27 @@ fn drafts_and_published_definitions_round_trip_through_serde_with_pins_intact() 
         restored_definition.resolved_capabilities[0].approval_policy_revision,
         3
     );
+}
+
+#[test]
+fn legacy_lifecycle_payloads_default_to_serial_sessions() {
+    let mut draft_json = serde_json::to_value(draft(1)).unwrap();
+    draft_json["lifecycle"]
+        .as_object_mut()
+        .unwrap()
+        .remove("allows_concurrent_sessions");
+    let restored_draft: AgentDefinitionDraft = serde_json::from_value(draft_json).unwrap();
+    assert!(!restored_draft.lifecycle.allows_concurrent_sessions);
+
+    let definition = publisher().publish(&catalog(), restored_draft).unwrap();
+    let mut definition_json = serde_json::to_value(definition).unwrap();
+    definition_json["lifecycle"]
+        .as_object_mut()
+        .unwrap()
+        .remove("allows_concurrent_sessions");
+    let restored_definition: anima_core::AgentDefinition =
+        serde_json::from_value(definition_json).unwrap();
+    assert!(!restored_definition.lifecycle.allows_concurrent_sessions);
 }
 
 #[test]

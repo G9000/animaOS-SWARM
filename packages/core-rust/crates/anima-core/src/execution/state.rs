@@ -3,10 +3,11 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use super::checkpoint::RecoveryPauseRecord;
+use super::checkpoint::{DefinitionPin, RecoveryPauseRecord};
 use crate::{
-    ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity, PolicyContext,
-    PolicyEngine, RecoveryResumeBinding, ValidatedRecoveryResume, CAPABILITY_INVOCATION_NAMESPACE,
+    AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity,
+    PolicyContext, PolicyEngine, RecoveryResumeBinding, ValidatedRecoveryResume,
+    CAPABILITY_INVOCATION_NAMESPACE, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -23,15 +24,32 @@ pub enum SessionConcurrencyPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Session {
     id: Uuid,
-    definition_id: String,
-    definition_version: u32,
+    definition: DefinitionPin,
     concurrency: SessionConcurrencyPolicy,
-    concurrency_pinned: bool,
+    allows_concurrent_sessions: bool,
+    #[serde(skip)]
+    verified: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SessionWire {
+    Current(CurrentSessionWire),
+    Legacy(LegacySessionWire),
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SessionWire {
+struct CurrentSessionWire {
+    id: Uuid,
+    definition: DefinitionPin,
+    concurrency: SessionConcurrencyPolicy,
+    allows_concurrent_sessions: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacySessionWire {
     id: Uuid,
     definition_id: String,
     definition_version: u32,
@@ -51,68 +69,107 @@ impl Session {
         }
         Self::new_inner(
             id,
-            definition_id.into(),
-            definition_version,
+            DefinitionPin::new(
+                SUPPORTED_DEFINITION_SCHEMA_VERSION,
+                definition_id,
+                definition_version,
+            )?,
             concurrency,
             false,
+            true,
         )
     }
-    pub fn new_with_definition_setting(
+
+    pub fn new_for_definition(
         id: Uuid,
-        definition_id: impl Into<String>,
-        definition_version: u32,
-        allows_concurrent: bool,
+        definition: &AgentDefinition,
+        concurrency: SessionConcurrencyPolicy,
     ) -> Result<Self, ExecutionError> {
         Self::new_inner(
             id,
-            definition_id.into(),
-            definition_version,
-            if allows_concurrent {
-                SessionConcurrencyPolicy::Concurrent
-            } else {
-                SessionConcurrencyPolicy::Serial
-            },
-            allows_concurrent,
+            DefinitionPin::from_definition(definition)?,
+            concurrency,
+            definition.lifecycle.allows_concurrent_sessions,
+            true,
         )
     }
+
     fn new_inner(
         id: Uuid,
-        definition_id: String,
-        definition_version: u32,
+        definition: DefinitionPin,
         concurrency: SessionConcurrencyPolicy,
-        concurrency_pinned: bool,
+        allows_concurrent_sessions: bool,
+        verified: bool,
     ) -> Result<Self, ExecutionError> {
         valid_uuid(id)?;
-        valid_id(&definition_id)?;
-        valid_version(definition_version)?;
-        if concurrency == SessionConcurrencyPolicy::Concurrent && !concurrency_pinned {
+        if concurrency == SessionConcurrencyPolicy::Concurrent && !allows_concurrent_sessions {
             return Err(ExecutionError::new(ExecutionErrorCode::ConcurrentNotPinned));
         }
         Ok(Self {
             id,
-            definition_id,
-            definition_version,
+            definition,
             concurrency,
-            concurrency_pinned,
+            allows_concurrent_sessions,
+            verified,
         })
     }
+
     pub fn id(&self) -> Uuid {
         self.id
     }
-    pub fn concurrency(&self) -> SessionConcurrencyPolicy {
-        self.concurrency
+
+    pub fn definition(&self) -> &DefinitionPin {
+        &self.definition
+    }
+
+    pub fn concurrency(&self) -> Result<SessionConcurrencyPolicy, ExecutionError> {
+        if !self.verified {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        Ok(self.concurrency)
+    }
+
+    pub fn assert_compatible(&self, definition: &AgentDefinition) -> Result<Self, ExecutionError> {
+        let live_pin = DefinitionPin::from_definition(definition)?;
+        let live_allows_concurrent = definition.lifecycle.allows_concurrent_sessions;
+        if self.definition != live_pin
+            || self.allows_concurrent_sessions != live_allows_concurrent
+            || (self.concurrency == SessionConcurrencyPolicy::Concurrent && !live_allows_concurrent)
+        {
+            return Err(ExecutionError::new(
+                ExecutionErrorCode::IncompatibleCheckpoint,
+            ));
+        }
+        let mut verified = self.clone();
+        verified.verified = true;
+        Ok(verified)
     }
 }
 impl<'de> Deserialize<'de> for Session {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let w = SessionWire::deserialize(d)?;
-        Self::new_inner(
-            w.id,
-            w.definition_id,
-            w.definition_version,
-            w.concurrency,
-            w.concurrency_pinned,
-        )
+        match SessionWire::deserialize(d)? {
+            SessionWire::Current(w) => Self::new_inner(
+                w.id,
+                w.definition,
+                w.concurrency,
+                w.allows_concurrent_sessions,
+                w.concurrency == SessionConcurrencyPolicy::Serial,
+            ),
+            SessionWire::Legacy(w) => DefinitionPin::new(
+                SUPPORTED_DEFINITION_SCHEMA_VERSION,
+                w.definition_id,
+                w.definition_version,
+            )
+            .and_then(|definition| {
+                Self::new_inner(
+                    w.id,
+                    definition,
+                    w.concurrency,
+                    w.concurrency_pinned,
+                    w.concurrency == SessionConcurrencyPolicy::Serial,
+                )
+            }),
+        }
         .map_err(serde::de::Error::custom)
     }
 }
@@ -1086,6 +1143,8 @@ impl Usage {
         Ok(())
     }
     pub fn checked_add(&self, other: &Self) -> Result<Self, ExecutionError> {
+        self.validate()?;
+        other.validate()?;
         macro_rules! add {
             ($f:ident) => {
                 self.$f
@@ -1349,6 +1408,9 @@ impl Budget {
         Ok(BudgetDecision::Continue)
     }
     pub fn accumulate(&self, usage: &Usage, delta: &Usage) -> Result<Usage, ExecutionError> {
+        self.validate()?;
+        usage.validate()?;
+        delta.validate()?;
         let next = usage.checked_add(delta)?;
         match self.evaluate(&next)? {
             BudgetDecision::Exhausted => {

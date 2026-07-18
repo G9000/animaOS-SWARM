@@ -68,6 +68,8 @@ pub struct LifecyclePolicy {
     pub auto_start: bool,
     pub restart_on_failure: bool,
     pub max_restarts: u32,
+    #[serde(default)]
+    pub allows_concurrent_sessions: bool,
 }
 
 /// An exact host feature/revision a definition requires, independent of an executor implementation.

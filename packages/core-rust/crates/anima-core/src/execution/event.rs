@@ -45,8 +45,7 @@ pub enum RuntimeEventKind {
     UsageRecorded,
     Error,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SafeEventPayload {
     None,
     Reference {
@@ -56,6 +55,32 @@ pub enum SafeEventPayload {
         code: ExecutionErrorCode,
         reference: Option<Uuid>,
     },
+}
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PayloadRef<'a> {
+    None,
+    Reference {
+        reference: &'a Uuid,
+    },
+    Error {
+        code: ExecutionErrorCode,
+        reference: Option<&'a Uuid>,
+    },
+}
+impl Serialize for SafeEventPayload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        match self {
+            Self::None => PayloadRef::None,
+            Self::Reference { reference } => PayloadRef::Reference { reference },
+            Self::Error { code, reference } => PayloadRef::Error {
+                code: *code,
+                reference: reference.as_ref(),
+            },
+        }
+        .serialize(serializer)
+    }
 }
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

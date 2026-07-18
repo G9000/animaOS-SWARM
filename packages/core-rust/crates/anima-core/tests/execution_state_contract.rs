@@ -1,19 +1,69 @@
 use anima_core::execution::Step;
 use anima_core::{
-    ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, Budget, BudgetDecision,
-    CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointV1, CheckpointV1Builder,
-    CommandOutcome, CommandReceipt, CompletedInvocationRecord, DefinitionPin, ExecutionErrorCode,
-    ExecutionLease, InvocationAttemptRecord, LogicalInvocation, ManifestPin, OpaqueReference,
-    PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RecoveryPauseReason,
+    AgentDefinition, ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, Budget,
+    BudgetDecision, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointV1,
+    CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord, DefinitionPin,
+    ExecutionErrorCode, ExecutionLease, InvocationAttemptRecord, LifecyclePolicy,
+    LogicalInvocation, ManifestPin, MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext,
+    PolicyEngine, PolicyRestrictions, ProfileRef, RecoveryMode, RecoveryPauseReason,
     RecoveryPauseRecord, RecoveryTerminalResolution, RiskLevel, Run, RunPauseReason, RunState,
     RuntimeCommand, RuntimeCommandKind, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind,
-    Session, SessionConcurrencyPolicy, StepKind, UncertainInvocationRecord, Usage,
+    RuntimeLimits, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind,
+    UncertainInvocationRecord, Usage,
 };
 use serde_json::json;
 use uuid::Uuid;
 
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
+}
+
+fn session_definition(
+    definition_id: &str,
+    version: u32,
+    allows_concurrent_sessions: bool,
+) -> AgentDefinition {
+    AgentDefinition {
+        schema_version: 1,
+        id: definition_id.into(),
+        version,
+        name: "writer".into(),
+        display_name: "Writer".into(),
+        description: "Writes".into(),
+        persona: "Careful".into(),
+        system: "Write carefully".into(),
+        model: ModelPolicy {
+            provider: "test".into(),
+            model: "test".into(),
+            credential_reference: None,
+            temperature: None,
+        },
+        source_profile: ProfileRef {
+            profile_id: "profile".into(),
+            profile_version: 1,
+        },
+        resolved_capabilities: vec![],
+        memory: MemoryPolicy {
+            enabled: false,
+            namespace: "session".into(),
+            retention_days: None,
+        },
+        approval_policy_id: "policy".into(),
+        approval_policy_revision: 1,
+        approval_restrictions: vec![],
+        limits: RuntimeLimits {
+            max_turns: 1,
+            timeout_ms: 1,
+            max_concurrent_tasks: 1,
+        },
+        lifecycle: LifecyclePolicy {
+            auto_start: false,
+            restart_on_failure: false,
+            max_restarts: 0,
+            allows_concurrent_sessions,
+        },
+        host_requirements: vec![],
+    }
 }
 
 fn approval_context(arguments: serde_json::Value) -> PolicyContext {
@@ -183,14 +233,77 @@ fn sessions_default_serial_and_concurrent_requires_pinned_definition() {
         SessionConcurrencyPolicy::Serial
     );
     assert!(Session::new(id(1), "writer", 3, SessionConcurrencyPolicy::Concurrent).is_err());
-    assert!(Session::new_with_definition_setting(id(1), "writer", 3, true).is_ok());
-    let concurrent = Session::new_with_definition_setting(id(1), "writer", 3, true).unwrap();
+
+    let allowed = session_definition("writer", 3, true);
+    let serial_only = session_definition("writer", 3, false);
+    let concurrent =
+        Session::new_for_definition(id(1), &allowed, SessionConcurrencyPolicy::Concurrent).unwrap();
+    assert_eq!(
+        concurrent.concurrency().unwrap(),
+        SessionConcurrencyPolicy::Concurrent
+    );
+
     let restored: Session =
         serde_json::from_value(serde_json::to_value(&concurrent).unwrap()).unwrap();
-    assert_eq!(restored.concurrency(), SessionConcurrencyPolicy::Concurrent);
-    let mut forged = serde_json::to_value(&concurrent).unwrap();
-    forged["concurrency_pinned"] = json!(false);
-    assert!(serde_json::from_value::<Session>(forged).is_err());
+    assert_eq!(
+        restored.concurrency().unwrap_err().code(),
+        ExecutionErrorCode::MissingPrerequisite
+    );
+    assert_eq!(
+        restored
+            .assert_compatible(&allowed)
+            .unwrap()
+            .concurrency()
+            .unwrap(),
+        SessionConcurrencyPolicy::Concurrent
+    );
+    assert!(restored.assert_compatible(&serial_only).is_err());
+    assert!(restored
+        .assert_compatible(&session_definition("other", 3, true))
+        .is_err());
+    assert!(restored
+        .assert_compatible(&session_definition("writer", 4, true))
+        .is_err());
+
+    let legacy: Session = serde_json::from_value(json!({
+        "id": id(3),
+        "definition_id": "writer",
+        "definition_version": 3,
+        "concurrency": "concurrent",
+        "concurrency_pinned": true
+    }))
+    .unwrap();
+    assert!(legacy.concurrency().is_err());
+    assert_eq!(
+        legacy
+            .assert_compatible(&allowed)
+            .unwrap()
+            .concurrency()
+            .unwrap(),
+        SessionConcurrencyPolicy::Concurrent
+    );
+    assert!(legacy.assert_compatible(&serial_only).is_err());
+    assert!(serde_json::from_value::<Session>(json!({
+        "id": id(4),
+        "definition_id": "writer",
+        "definition_version": 3,
+        "concurrency": "concurrent",
+        "concurrency_pinned": false
+    }))
+    .is_err());
+
+    let serial =
+        Session::new_for_definition(id(2), &serial_only, SessionConcurrencyPolicy::Serial).unwrap();
+    let mut forged = serde_json::to_value(&serial).unwrap();
+    forged["concurrency"] = json!("concurrent");
+    forged["allows_concurrent_sessions"] = json!(true);
+    let forged: Session = serde_json::from_value(forged).unwrap();
+    assert!(forged.concurrency().is_err());
+    assert!(forged.assert_compatible(&serial_only).is_err());
+
+    let mut contradictory = serde_json::to_value(&concurrent).unwrap();
+    contradictory["allows_concurrent_sessions"] = json!(false);
+    assert!(serde_json::from_value::<Session>(contradictory).is_err());
 }
 
 #[test]
@@ -239,6 +352,16 @@ fn durable_event_vocabulary_is_complete_and_live_events_validate_standalone() {
         }))
         .is_err()
     );
+    assert!(serde_json::to_value(SafeEventPayload::Reference {
+        reference: Uuid::nil(),
+    })
+    .is_err());
+    assert!(serde_json::to_value(SafeEventPayload::Error {
+        code: ExecutionErrorCode::InvalidEvent,
+        reference: Some(Uuid::nil()),
+    })
+    .is_err());
+    assert!(serde_json::to_value(SafeEventPayload::None).is_ok());
 }
 
 #[test]
@@ -484,6 +607,27 @@ fn standalone_budget_and_usage_serde_revalidate_invariants() {
         expires_at_ms: 10,
     })
     .is_err());
+    let invalid_left = Usage {
+        input_tokens: 1,
+        total_tokens: 0,
+        ..Usage::default()
+    };
+    let invalid_right = Usage {
+        output_tokens: 1,
+        total_tokens: 2,
+        ..Usage::default()
+    };
+    assert_eq!(
+        invalid_left.checked_add(&invalid_right).unwrap_err().code(),
+        ExecutionErrorCode::InvalidUsage
+    );
+    assert_eq!(
+        Budget::default()
+            .accumulate(&invalid_left, &invalid_right)
+            .unwrap_err()
+            .code(),
+        ExecutionErrorCode::InvalidUsage
+    );
 }
 
 #[test]
@@ -553,6 +697,33 @@ fn manual_recovery_pause_has_no_automatic_resume_path() {
     .uncertain_invocations(vec![uncertain])
     .build()
     .is_ok());
+}
+
+#[test]
+fn keyed_manifest_with_manual_pause_reason_cannot_resume_automatically() {
+    let invocation = LogicalInvocation::new(
+        id(2),
+        "keyed-manual",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let manifest = ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:keyed-manual",
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let pause = RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest,
+        RecoveryPauseReason::ManualReview,
+    )
+    .unwrap();
+    assert!(!pause.allows_automatic_resume());
 }
 
 #[test]

@@ -382,6 +382,8 @@ impl<'de> Deserialize<'de> for CompletedInvocationRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryPauseReason {
+    Retryable,
+    AuthoritativeAbsence,
     UncertainOutcome,
     ReconciliationPending,
     ManualReview,
@@ -444,6 +446,9 @@ impl RecoveryPauseRecord {
     }
     pub fn allows_automatic_resume(&self) -> bool {
         matches!(
+            self.reason,
+            RecoveryPauseReason::Retryable | RecoveryPauseReason::AuthoritativeAbsence
+        ) && matches!(
             self.manifest.recovery_mode(),
             RecoveryMode::InherentlyIdempotent
                 | RecoveryMode::KeyedIdempotent
@@ -497,7 +502,11 @@ impl UncertainInvocationRecord {
             invocation,
             attempt_number,
             manifest,
-            RecoveryPauseReason::UncertainOutcome,
+            if recovery_binding.is_some() {
+                RecoveryPauseReason::AuthoritativeAbsence
+            } else {
+                RecoveryPauseReason::UncertainOutcome
+            },
         )?;
         Self::new_with_pause(pause, recovery_binding)
     }
