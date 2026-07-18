@@ -23,7 +23,10 @@ pub struct CapabilityRegistry {
 }
 
 struct InvocationBoundReferenceValidator;
-struct InMemoryCapabilityResultRecorder;
+#[derive(Default)]
+struct InMemoryCapabilityResultRecorder {
+    records: Mutex<BTreeMap<(Uuid, u32), (DurableCapabilityResult, CapabilityResult)>>,
+}
 
 #[async_trait]
 impl CapabilityReferenceValidator for InvocationBoundReferenceValidator {
@@ -46,11 +49,21 @@ impl CapabilityReferenceValidator for InvocationBoundReferenceValidator {
 impl CapabilityResultRecorder for InMemoryCapabilityResultRecorder {
     async fn record(
         &self,
-        _context: &CapabilityExecutionContext,
+        context: &CapabilityExecutionContext,
         _manifest: &CapabilityManifest,
-        _result: &CapabilityResult,
-        _durable: &DurableCapabilityResult,
+        result: &CapabilityResult,
+        durable: &DurableCapabilityResult,
     ) -> Result<(), CapabilityError> {
+        let key = (context.invocation().id(), context.attempt().number());
+        let mut records = self.records.lock().await;
+        if let Some((recorded, recorded_result)) = records.get(&key) {
+            return if recorded == durable && recorded_result == result {
+                Ok(())
+            } else {
+                Err(CapabilityError::validation())
+            };
+        }
+        records.insert(key, (durable.clone(), result.clone()));
         Ok(())
     }
 }
@@ -63,19 +76,26 @@ struct RegisteredExecutor {
 
 impl CapabilityRegistry {
     pub fn new(catalog: ManifestCatalog) -> Self {
-        Self::with_lineage_store(catalog, Arc::new(InMemoryCapabilityLineageStore::default()))
+        Self::with_stores(
+            catalog,
+            Arc::new(InMemoryCapabilityLineageStore::default()),
+            Arc::new(InMemoryCapabilityResultRecorder::default()),
+        )
     }
 
-    pub fn with_lineage_store(
+    /// Pairs externally managed durable lineage with the result recorder that owns every
+    /// `Completed` reference written into that lineage.
+    pub fn with_stores(
         catalog: ManifestCatalog,
         lineage: Arc<dyn CapabilityLineageStore>,
+        result_recorder: Arc<dyn CapabilityResultRecorder>,
     ) -> Self {
         Self {
             catalog,
             executors: BTreeMap::new(),
             lineage,
             reference_validator: Arc::new(InvocationBoundReferenceValidator),
-            result_recorder: Arc::new(InMemoryCapabilityResultRecorder),
+            result_recorder,
         }
     }
 
@@ -942,5 +962,84 @@ fn lease_fence(state: &CapabilityAttemptLineageState) -> Option<Uuid> {
         | CapabilityAttemptLineageState::RetryExecuting { fence, .. }
         | CapabilityAttemptLineageState::Reconciling { fence, .. } => Some(*fence),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod result_recorder_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn manifest() -> CapabilityManifest {
+        CapabilityManifest {
+            id: "test.record".into(),
+            version: 1,
+            kind: CapabilityKind::Automation,
+            label: "record".into(),
+            description: "record".into(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: json!({ "type": "object" }),
+            side_effects: true,
+            risk_level: RiskLevel::Low,
+            host_permissions: vec![],
+            secret_references: vec![],
+            environment_requirements: vec![],
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            max_retries: 0,
+            idempotent: false,
+            recovery_mode: RecoveryMode::Reconcilable,
+            supports_streaming: false,
+            supports_artifacts: false,
+            supports_citations: false,
+            schema_digest: "sha256:test-record".into(),
+            compatibility: RuntimeCompatibility {
+                minimum_runtime_schema_version: 1,
+                maximum_runtime_schema_version: 1,
+                manifest_schema_version: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_recorder_replays_identical_results_and_rejects_conflicts() {
+        let manifest = manifest();
+        let invocation = LogicalInvocation::new(
+            Uuid::from_u128(1),
+            "step",
+            &manifest.id,
+            manifest.version,
+            json!({}),
+        )
+        .unwrap();
+        let context = CapabilityExecutionContext::for_attempt(
+            invocation.clone(),
+            CapabilityAttempt::new(&invocation, 1).unwrap(),
+        )
+        .unwrap();
+        let recorder = InMemoryCapabilityResultRecorder::default();
+        let first = CapabilityResult::new(json!({ "ok": true }));
+        let first_durable = durable_result(&context, &manifest, &first).unwrap();
+
+        recorder
+            .record(&context, &manifest, &first, &first_durable)
+            .await
+            .unwrap();
+        recorder
+            .record(&context, &manifest, &first, &first_durable)
+            .await
+            .unwrap();
+
+        let conflicting = CapabilityResult::new(json!({ "ok": false }));
+        let conflicting_durable = durable_result(&context, &manifest, &conflicting).unwrap();
+        assert_eq!(first_durable.result_ref(), conflicting_durable.result_ref());
+        assert_eq!(
+            recorder
+                .record(&context, &manifest, &conflicting, &conflicting_durable)
+                .await
+                .unwrap_err()
+                .code(),
+            CapabilityErrorCode::Validation
+        );
     }
 }

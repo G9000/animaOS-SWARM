@@ -105,13 +105,26 @@ impl CapabilityResultRecorder for StableRepeatedResultRecorder {
         let key = (context.invocation().id(), context.attempt().number());
         let mut records = self.records.lock().unwrap();
         if let Some(recorded) = records.get(&key) {
-            assert_eq!(recorded, durable);
+            if recorded != durable {
+                return Err(CapabilityError::validation());
+            }
         } else {
             records.insert(key, durable.clone());
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+}
+
+fn registry_with_test_stores(
+    catalog: ManifestCatalog,
+    lineage: Arc<dyn CapabilityLineageStore>,
+) -> CapabilityRegistry {
+    CapabilityRegistry::with_stores(
+        catalog,
+        lineage,
+        Arc::new(StableRepeatedResultRecorder::default()),
+    )
 }
 
 #[derive(Default)]
@@ -936,7 +949,7 @@ async fn compensate_recovery_never_authorizes_a_retry_for_any_reconcile_outcome(
         let store = Arc::new(TestLineageStore::default());
         let mut catalog = ManifestCatalog::default();
         catalog.register_manifest(manifest.clone()).unwrap();
-        let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+        let mut registry = registry_with_test_stores(catalog, store.clone());
         let mut executor = RecordingExecutor::failing_once(manifest.clone());
         executor.reconcile_result = outcome;
         registry.register_executor(Arc::new(executor)).unwrap();
@@ -969,7 +982,7 @@ async fn compensate_recovery_reloads_after_losing_the_terminal_upgrade_cas() {
         .store(1, Ordering::SeqCst);
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest).unwrap();
-    let registry = CapabilityRegistry::with_lineage_store(catalog, store);
+    let registry = registry_with_test_stores(catalog, store);
 
     assert_eq!(
         registry.recover(context).await.unwrap().kind(),
@@ -1448,7 +1461,7 @@ async fn store_authoritative_heartbeat_keeps_long_running_execution_fenced() {
     };
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest.clone()).unwrap();
-    let mut mutable_registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    let mut mutable_registry = registry_with_test_stores(catalog, store.clone());
     mutable_registry
         .register_executor(Arc::new(executor))
         .unwrap();
@@ -1495,7 +1508,7 @@ async fn lost_execution_fence_cancels_original_and_requires_strong_absence_for_r
     };
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest.clone()).unwrap();
-    let mut mutable_registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    let mut mutable_registry = registry_with_test_stores(catalog, store.clone());
     mutable_registry
         .register_executor(Arc::new(executor))
         .unwrap();
@@ -1550,7 +1563,7 @@ async fn authoritative_effect_check_rejects_takeover_before_heartbeat_observes_l
     };
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest.clone()).unwrap();
-    let mut mutable_registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    let mut mutable_registry = registry_with_test_stores(catalog, store.clone());
     mutable_registry
         .register_executor(Arc::new(executor))
         .unwrap();
@@ -1704,7 +1717,7 @@ async fn durable_lineage_store_preserves_retry_authorization_across_registries()
     let store = Arc::new(TestLineageStore::default());
     let mut first_catalog = ManifestCatalog::default();
     first_catalog.register_manifest(manifest.clone()).unwrap();
-    let mut first_registry = CapabilityRegistry::with_lineage_store(first_catalog, store.clone());
+    let mut first_registry = registry_with_test_stores(first_catalog, store.clone());
     first_registry
         .register_executor(Arc::new(RecordingExecutor::failing_once(manifest.clone())))
         .unwrap();
@@ -1714,7 +1727,7 @@ async fn durable_lineage_store_preserves_retry_authorization_across_registries()
 
     let mut second_catalog = ManifestCatalog::default();
     second_catalog.register_manifest(manifest.clone()).unwrap();
-    let mut second_registry = CapabilityRegistry::with_lineage_store(second_catalog, store);
+    let mut second_registry = registry_with_test_stores(second_catalog, store);
     second_registry
         .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
         .unwrap();
@@ -1733,9 +1746,11 @@ async fn durable_lineage_store_preserves_retry_authorization_across_registries()
 async fn durable_lineage_store_returns_cached_completion_after_registry_restart() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
     let store = Arc::new(TestLineageStore::default());
+    let results = Arc::new(StableRepeatedResultRecorder::default());
     let mut first_catalog = ManifestCatalog::default();
     first_catalog.register_manifest(manifest.clone()).unwrap();
-    let mut first_registry = CapabilityRegistry::with_lineage_store(first_catalog, store.clone());
+    let mut first_registry =
+        CapabilityRegistry::with_stores(first_catalog, store.clone(), results.clone());
     first_registry
         .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
         .unwrap();
@@ -1755,16 +1770,25 @@ async fn durable_lineage_store_returns_cached_completion_after_registry_restart(
     second_catalog.register_manifest(manifest.clone()).unwrap();
     let second_executor = RecordingExecutor::new(manifest.clone());
     let reconciliations = second_executor.reconciliations.clone();
-    let mut second_registry = CapabilityRegistry::with_lineage_store(second_catalog, store);
+    let mut second_registry =
+        CapabilityRegistry::with_stores(second_catalog, store, results.clone());
     second_registry
         .register_executor(Arc::new(second_executor))
         .unwrap();
 
     assert_eq!(
-        second_registry.recover(initial).await.unwrap(),
-        anima_core::RecoveryAction::Completed(completed)
+        second_registry.recover(initial.clone()).await.unwrap(),
+        anima_core::RecoveryAction::Completed(completed.clone())
     );
     assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        results
+            .records
+            .lock()
+            .unwrap()
+            .get(&(initial.invocation().id(), initial.attempt().number())),
+        Some(&completed)
+    );
 }
 
 #[tokio::test]
@@ -1785,7 +1809,7 @@ async fn expired_execution_lease_can_be_fenced_and_reconciled() {
     executor.reconcile_result =
         ReconcileOutcome::Completed(CapabilityResult::new(json!({ "ok": true })));
     let reconciliations = executor.reconciliations.clone();
-    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store);
+    let mut registry = registry_with_test_stores(catalog, store);
     registry.register_executor(Arc::new(executor)).unwrap();
 
     assert_eq!(
@@ -2024,7 +2048,7 @@ async fn durable_lineage_records_only_opaque_result_metadata() {
     let store = Arc::new(TestLineageStore::default());
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest.clone()).unwrap();
-    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    let mut registry = registry_with_test_stores(catalog, store.clone());
     registry.register_executor(Arc::new(executor)).unwrap();
     let context = context(&manifest, json!({ "query": "hello" }));
 
@@ -2061,8 +2085,7 @@ async fn result_recording_is_at_least_once_with_stable_attempt_identity() {
     executor.reconcile_result = ReconcileOutcome::Completed(CapabilityResult::new(json!({
         "ok": true
     })));
-    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone())
-        .with_result_recorder(recorder.clone());
+    let mut registry = CapabilityRegistry::with_stores(catalog, store.clone(), recorder.clone());
     registry.register_executor(Arc::new(executor)).unwrap();
 
     registry.execute(context.clone()).await.unwrap_err();
@@ -2087,8 +2110,8 @@ async fn result_recorder_failure_leaves_the_attempt_uncertain() {
     let store = Arc::new(TestLineageStore::default());
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest.clone()).unwrap();
-    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone())
-        .with_result_recorder(Arc::new(RejectingResultRecorder));
+    let mut registry =
+        CapabilityRegistry::with_stores(catalog, store.clone(), Arc::new(RejectingResultRecorder));
     registry
         .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
         .unwrap();
