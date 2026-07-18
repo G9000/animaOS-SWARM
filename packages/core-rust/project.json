@@ -8,7 +8,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
-        "command": "cargo build --manifest-path Cargo.toml --target-dir target/core-rust/build -p anima-core -p anima-memory -p anima-swarm"
+        "command": "cargo build --manifest-path Cargo.toml --target-dir target/core-rust/build -p anima-core -p anima-model-adapters -p anima-memory -p anima-swarm"
       },
       "inputs": [
         "default",
@@ -21,7 +21,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
-        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/test -p anima-core -p anima-memory -p anima-swarm"
+        "command": "cargo test --manifest-path Cargo.toml --target-dir target/core-rust/test -p anima-core -p anima-model-adapters -p anima-memory -p anima-swarm"
       },
       "inputs": [
         "default",
@@ -88,7 +88,7 @@
       "executor": "nx:run-commands",
       "options": {
         "cwd": ".",
-        "command": "cargo fmt --manifest-path Cargo.toml --package anima-core --package anima-memory --package anima-swarm --check"
+        "command": "cargo fmt --manifest-path Cargo.toml --package anima-core --package anima-model-adapters --package anima-memory --package anima-swarm --check"
       },
       "inputs": [
         "default",

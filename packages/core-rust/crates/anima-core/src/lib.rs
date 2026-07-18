@@ -58,7 +58,8 @@ pub use execution::{
     MAX_COMMIT_STEPS, MAX_STORE_READ_CURSOR_BYTES, MAX_STORE_READ_PAGE_SIZE,
 };
 pub use model::{
-    ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
+    ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,
+    ModelStreamSink, ToolCall,
 };
 pub use persistence::{DatabaseAdapter, PersistenceError, PersistenceResult, Step, StepStatus};
 pub use policy::{

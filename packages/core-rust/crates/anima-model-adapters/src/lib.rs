@@ -7,9 +7,11 @@ mod common;
 mod google;
 mod ollama;
 mod openai_compatible;
+mod stream;
 
 pub use adapter::ProviderModelAdapter;
 pub use catalog::provider_definitions;
+pub use stream::DeterministicModelAdapter;
 
 #[derive(Clone)]
 pub struct ProviderCredential {

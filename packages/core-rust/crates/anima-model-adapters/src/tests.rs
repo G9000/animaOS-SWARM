@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 
 use anima_core::{
     AgentConfig, AgentSettings, Content, DataValue, Message, MessageRole, ModelAdapter,
-    ModelGenerateRequest, ModelStopReason, ToolDescriptor,
+    ModelGenerateRequest, ModelStopReason, ModelStreamFrame, ModelStreamSink, ToolDescriptor,
 };
 use axum::{
     extract::Json,
@@ -15,8 +18,155 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
 use crate::{
-    provider_definitions, ProviderAdapterConfig, ProviderCredential, ProviderModelAdapter,
+    provider_definitions, DeterministicModelAdapter, ProviderAdapterConfig, ProviderCredential,
+    ProviderModelAdapter,
 };
+
+struct FrameSink(Mutex<Vec<ModelStreamFrame>>);
+
+struct DroppedSink(AtomicUsize);
+
+#[async_trait::async_trait]
+impl ModelStreamSink for FrameSink {
+    async fn emit(&self, frame: ModelStreamFrame) -> Result<(), String> {
+        self.0.lock().unwrap().push(frame);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelStreamSink for DroppedSink {
+    async fn emit(&self, _frame: ModelStreamFrame) -> Result<(), String> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err("consumer disconnected".into())
+    }
+}
+
+#[tokio::test]
+async fn deterministic_adapter_emits_multiple_text_frames_before_final() {
+    let adapter = DeterministicModelAdapter::new("one two three");
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sink.0.lock().unwrap().as_slice(),
+        &[
+            ModelStreamFrame::TextDelta("one ".into()),
+            ModelStreamFrame::TextDelta("two ".into()),
+            ModelStreamFrame::TextDelta("three".into()),
+            ModelStreamFrame::Final(
+                adapter
+                    .generate(&agent_config("openai", false), &request())
+                    .await
+                    .unwrap()
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn openai_compatible_stream_normalizes_ordered_deltas_and_final_response() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames[0], ModelStreamFrame::TextDelta("hello ".into()));
+    assert_eq!(frames[1], ModelStreamFrame::TextDelta("world".into()));
+    assert!(
+        matches!(&frames[2], ModelStreamFrame::Final(response) if response.content.text == "hello world")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_stream_normalizes_ordered_deltas_and_final_response() {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi \"}}\n\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"there\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n",
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("anthropic", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("anthropic", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames[0], ModelStreamFrame::TextDelta("hi ".into()));
+    assert_eq!(frames[1], ModelStreamFrame::TextDelta("there".into()));
+    assert!(
+        matches!(&frames[2], ModelStreamFrame::Final(response) if response.content.text == "hi there")
+    );
+}
+
+#[tokio::test]
+async fn openai_stream_retries_one_retryable_response_with_normalized_error_contract() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "temporary")
+                    } else {
+                        (axum::http::StatusCode::OK, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+                    }
+                }
+            }
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn deterministic_stream_continues_when_consumer_is_dropped() {
+    let adapter = DeterministicModelAdapter::new("one two");
+    let sink = DroppedSink(AtomicUsize::new(0));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(sink.0.load(Ordering::SeqCst), 3);
+}
 
 #[test]
 fn provider_definitions_expose_current_non_secret_metadata() {

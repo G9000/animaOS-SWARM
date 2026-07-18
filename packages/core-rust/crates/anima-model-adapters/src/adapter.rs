@@ -1,4 +1,6 @@
-use anima_core::{AgentConfig, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse};
+use anima_core::{
+    AgentConfig, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStreamSink,
+};
 use async_trait::async_trait;
 use reqwest::Client;
 
@@ -7,6 +9,7 @@ use crate::catalog::{resolve_provider, ProviderKind};
 use crate::google::{build_google_body, parse_google_response};
 use crate::ollama::{build_ollama_body, parse_ollama_response};
 use crate::openai_compatible::{build_openai_compatible_body, parse_openai_compatible_response};
+use crate::stream::{consume_anthropic_sse, consume_openai_sse};
 use crate::{ProviderAdapterConfig, ProviderCredential};
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -146,6 +149,79 @@ impl ProviderModelAdapter {
         let payload = response_payload(response, "Ollama", credential.api_key.as_deref()).await?;
         parse_ollama_response(&payload)
     }
+
+    async fn stream_anthropic(
+        &self,
+        credential: ProviderCredential,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        let api_key = self.key_required(&credential, "ANTHROPIC_API_KEY", "anthropic")?;
+        for attempt in 0..2 {
+            let mut body = build_anthropic_body(config, request)?;
+            body["stream"] = serde_json::Value::Bool(true);
+            let response = self
+                .client
+                .post(join_base_url(&credential.base_url, "/v1/messages"))
+                .header("content-type", "application/json")
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", ANTHROPIC_API_VERSION)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| transport_error("Anthropic", "stream request", error))?;
+            if response.status().is_success() {
+                return consume_anthropic_sse(response, sink).await;
+            }
+            let retry = retryable(response.status()) && attempt == 0;
+            let error = response_payload(response, "Anthropic", Some(&api_key))
+                .await
+                .unwrap_err();
+            if !retry {
+                return Err(error);
+            }
+        }
+        Err("Anthropic stream retry exhausted".into())
+    }
+
+    async fn stream_openai_compatible(
+        &self,
+        provider_name: &str,
+        endpoint: String,
+        api_key: Option<&str>,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        for attempt in 0..2 {
+            let mut body = build_openai_compatible_body(config, request)?;
+            body["stream"] = serde_json::Value::Bool(true);
+            let mut builder = self
+                .client
+                .post(&endpoint)
+                .header("content-type", "application/json")
+                .json(&body);
+            if let Some(api_key) = api_key {
+                builder = builder.bearer_auth(api_key);
+            }
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| transport_error(provider_name, "stream request", error))?;
+            if response.status().is_success() {
+                return consume_openai_sse(response, sink).await;
+            }
+            let retry = retryable(response.status()) && attempt == 0;
+            let error = response_payload(response, provider_name, api_key)
+                .await
+                .unwrap_err();
+            if !retry {
+                return Err(error);
+            }
+        }
+        Err(format!("{provider_name} stream retry exhausted"))
+    }
 }
 
 #[async_trait]
@@ -202,6 +278,64 @@ impl ModelAdapter for ProviderModelAdapter {
             }
         }
     }
+
+    async fn stream(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        let requested = config
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .unwrap_or("deterministic")
+            .to_ascii_lowercase();
+        let entry = resolve_provider(&requested)
+            .ok_or_else(|| format!("unknown model provider: {requested}"))?;
+        let definition = &entry.definition;
+        let credential = self.credential_for(definition.id, definition.default_base_url);
+        match entry.kind {
+            ProviderKind::Anthropic => {
+                self.stream_anthropic(credential, config, request, sink)
+                    .await
+            }
+            ProviderKind::OpenAiCompatible if definition.id != "ollama" => {
+                if definition.requires_key {
+                    self.key_required(
+                        &credential,
+                        definition
+                            .api_key_envs
+                            .first()
+                            .copied()
+                            .unwrap_or("API_KEY"),
+                        definition.label,
+                    )?;
+                }
+                self.stream_openai_compatible(
+                    definition.label,
+                    join_base_url(&credential.base_url, "/chat/completions"),
+                    credential.api_key.as_deref(),
+                    config,
+                    request,
+                    sink,
+                )
+                .await
+            }
+            ProviderKind::Google | ProviderKind::OpenAiCompatible => {
+                let final_response = self.generate(config, request).await?;
+                let _ = sink
+                    .emit(anima_core::ModelStreamFrame::Final(final_response))
+                    .await;
+                Ok(())
+            }
+        }
+    }
+}
+
+fn retryable(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
 }
 
 async fn response_payload(
