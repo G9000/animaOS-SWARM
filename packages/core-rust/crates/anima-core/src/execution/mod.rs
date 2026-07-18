@@ -22,7 +22,7 @@ pub use state::{
     StepKind, Usage,
 };
 pub use store::{
-    ApprovalGrantMutation, CreateRun, DurableResultMutation, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
-    StoredRun,
+    assert_execution_store_conformance, ApprovalGrantMutation, CreateRun, DurableResultMutation,
+    ExecutionCommit, ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreErrorCode, ExecutionStoreFactory, StoredRun,
 };

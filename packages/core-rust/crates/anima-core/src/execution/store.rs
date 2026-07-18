@@ -4,9 +4,10 @@ use std::fmt;
 use uuid::Uuid;
 
 use super::{
-    ApprovalResumeClaim, CheckpointV1, CommandReceipt, CompletedInvocationRecord, ExecutionError,
-    ExecutionLease, InvocationAttemptRecord, Run, RuntimeCommand, RuntimeEvent, Session,
-    SessionConcurrencyPolicy, Step,
+    ApprovalResumeClaim, Budget, CheckpointV1, CheckpointV1Builder, CommandReceipt,
+    CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionLease,
+    InvocationAttemptRecord, Run, RunState, RuntimeCommand, RuntimeEvent, RuntimeEventKind,
+    Session, SessionConcurrencyPolicy, Step, Usage,
 };
 use crate::{DurableCapabilityResult, GrantConsumption};
 
@@ -64,15 +65,25 @@ pub struct StoredRun {
 pub struct ApprovalGrantMutation {
     claim: ApprovalResumeClaim,
     grant_consumption: Option<GrantConsumption>,
+    remaining_uses: Option<u32>,
 }
 
 impl ApprovalGrantMutation {
     /// Preserves Task 4's validated approval claim and its exact consumption as one commit input.
-    pub fn from_claim(claim: ApprovalResumeClaim) -> Self {
-        Self {
+    pub fn from_claim(
+        claim: ApprovalResumeClaim,
+        remaining_uses: Option<u32>,
+    ) -> Result<Self, ExecutionStoreError> {
+        if remaining_uses == Some(0) {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self {
             grant_consumption: claim.grant_consumption().cloned(),
             claim,
-        }
+            remaining_uses,
+        })
     }
 
     pub fn claim(&self) -> &ApprovalResumeClaim {
@@ -81,6 +92,10 @@ impl ApprovalGrantMutation {
 
     pub fn grant_consumption(&self) -> Option<&GrantConsumption> {
         self.grant_consumption.as_ref()
+    }
+
+    pub fn remaining_uses(&self) -> Option<u32> {
+        self.remaining_uses
     }
 }
 
@@ -207,7 +222,7 @@ pub struct ExecutionCommitOutcome {
 }
 
 impl ExecutionCommitOutcome {
-    pub(crate) fn new(stored_run: StoredRun, receipt: CommandReceipt) -> Self {
+    pub fn new(stored_run: StoredRun, receipt: CommandReceipt) -> Self {
         Self {
             stored_run,
             receipt,
@@ -224,12 +239,21 @@ impl ExecutionCommitOutcome {
 }
 
 impl StoredRun {
-    pub(crate) fn new(run: Run, run_version: u64, session_version: u64) -> Self {
-        Self {
+    pub fn new(
+        run: Run,
+        run_version: u64,
+        session_version: u64,
+    ) -> Result<Self, ExecutionStoreError> {
+        if run_version == 0 || session_version == 0 {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self {
             run,
             run_version,
             session_version,
-        }
+        })
     }
 
     pub fn run(&self) -> &Run {
@@ -332,9 +356,199 @@ pub trait ExecutionStore: Send + Sync {
 
     async fn load_run(&self, run_id: Uuid) -> Result<Option<StoredRun>, ExecutionStoreError>;
 
+    async fn load_checkpoint(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<(u64, CheckpointV1)>, ExecutionStoreError>;
+
+    async fn load_steps(&self, run_id: Uuid) -> Result<Vec<Step>, ExecutionStoreError>;
+
+    async fn load_attempts(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<InvocationAttemptRecord>, ExecutionStoreError>;
+
+    async fn load_durable_result(
+        &self,
+        run_id: Uuid,
+        logical_invocation_id: Uuid,
+    ) -> Result<Option<DurableCapabilityResult>, ExecutionStoreError>;
+
     async fn replay_events(
         &self,
         run_id: Uuid,
         after_sequence: u64,
     ) -> Result<Vec<RuntimeEvent>, ExecutionStoreError>;
+}
+
+#[async_trait]
+pub trait ExecutionStoreFactory: Send + Sync {
+    type Store: ExecutionStore;
+
+    async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError>;
+}
+
+/// Runs portable adapter checks using only the public execution-store port.
+pub async fn assert_execution_store_conformance<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let session_id = Uuid::from_u128(0xfeed);
+    let session = Session::new(
+        session_id,
+        "execution-store-contract",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let run = Run::queued(
+        Uuid::from_u128(0xfeed_1),
+        session_id,
+        "execution-store-contract",
+        1,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let created = store
+        .create_run(CreateRun::new(
+            session.clone(),
+            run.clone(),
+            0,
+            SessionConcurrencyPolicy::Serial,
+        ))
+        .await?;
+    let conflicting = Run::queued(
+        Uuid::from_u128(0xfeed_2),
+        session_id,
+        "execution-store-contract",
+        1,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    match store
+        .create_run(CreateRun::new(
+            session,
+            conflicting,
+            1,
+            SessionConcurrencyPolicy::Serial,
+        ))
+        .await
+    {
+        Err(error) if error.code() == ExecutionStoreErrorCode::ActiveRunConflict => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    };
+    let lease = store
+        .acquire_lease(run.id(), created.run_version(), 1_000)
+        .await?;
+    match store
+        .acquire_lease(run.id(), created.run_version(), 1_000)
+        .await
+    {
+        Err(error) if error.code() == ExecutionStoreErrorCode::LeaseConflict => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    }
+    let lease = store.renew_lease(lease, 1_000).await?;
+    let running = run
+        .transition(RunState::Running, None)
+        .map_err(ExecutionStoreError::from)?;
+    let command = RuntimeCommand::start(Uuid::from_u128(0xfeed_3), session_id, run.id())
+        .map_err(ExecutionStoreError::from)?;
+    let gap = RuntimeEvent::new(
+        Uuid::from_u128(0xfeed_4),
+        Uuid::from_u128(0xfeed_5),
+        session_id,
+        run.id(),
+        1,
+        2,
+        RuntimeEventKind::RunStarted,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let gap_commit = ExecutionCommit::new(
+        created.run_version(),
+        0,
+        lease.clone(),
+        command.clone(),
+        vec![gap],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        running.clone(),
+    );
+    match store.commit_execution(gap_commit).await {
+        Err(error) if error.code() == ExecutionStoreErrorCode::EventConflict => {}
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    }
+    let events = vec![
+        RuntimeEvent::new(
+            Uuid::from_u128(0xfeed_6),
+            Uuid::from_u128(0xfeed_5),
+            session_id,
+            run.id(),
+            1,
+            1,
+            RuntimeEventKind::RunStarted,
+        )
+        .map_err(ExecutionStoreError::from)?,
+        RuntimeEvent::new(
+            Uuid::from_u128(0xfeed_7),
+            Uuid::from_u128(0xfeed_5),
+            session_id,
+            run.id(),
+            2,
+            2,
+            RuntimeEventKind::StepStarted,
+        )
+        .map_err(ExecutionStoreError::from)?,
+    ];
+    let checkpoint = CheckpointV1Builder::new(
+        session_id,
+        run.id(),
+        DefinitionPin::new(1, "execution-store-contract", 1).map_err(ExecutionStoreError::from)?,
+        2,
+        vec![],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::Running, None)
+    .build()
+    .map_err(ExecutionStoreError::from)?;
+    let commit = ExecutionCommit::new(
+        created.run_version(),
+        0,
+        lease,
+        command,
+        events.clone(),
+        vec![],
+        vec![],
+        vec![],
+        None,
+        running,
+    )
+    .with_checkpoint(checkpoint);
+    let outcome = store.commit_execution(commit.clone()).await?;
+    if store.commit_execution(commit).await? != outcome
+        || store.replay_events(run.id(), 0).await? != events
+        || store
+            .load_checkpoint(run.id())
+            .await?
+            .map(|(version, _)| version)
+            != Some(1)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
 }

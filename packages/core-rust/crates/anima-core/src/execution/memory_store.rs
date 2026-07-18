@@ -35,7 +35,9 @@ struct State {
     runs: BTreeMap<Uuid, RunAggregate>,
     serial_claims: BTreeMap<Uuid, Uuid>,
     receipts: BTreeMap<Uuid, CommandReceipt>,
+    outcomes: BTreeMap<Uuid, ExecutionCommitOutcome>,
     grant_consumptions: BTreeSet<(String, u32, Uuid)>,
+    grant_use_counts: BTreeMap<(String, u32), u32>,
 }
 
 /// In-process reference adapter. It clones no externally visible state until validation succeeds.
@@ -70,7 +72,7 @@ impl ExecutionStore for InMemoryExecutionStore {
                 if current.version == request.expected_session_version()
                     && current.policy == request.concurrency_policy() =>
             {
-                current.version
+                current.version.saturating_add(1)
             }
             Some(_) => {
                 return Err(ExecutionStoreError::new(
@@ -93,14 +95,17 @@ impl ExecutionStore for InMemoryExecutionStore {
             ));
         }
 
-        state.sessions.entry(session.id()).or_insert(StoredSession {
-            version: session_version,
-            policy: request.concurrency_policy(),
-        });
+        state.sessions.insert(
+            session.id(),
+            StoredSession {
+                version: session_version,
+                policy: request.concurrency_policy(),
+            },
+        );
         if request.concurrency_policy() == SessionConcurrencyPolicy::Serial {
             state.serial_claims.insert(session.id(), request.run().id());
         }
-        let stored = StoredRun::new(request.run().clone(), 1, session_version);
+        let stored = StoredRun::new(request.run().clone(), 1, session_version)?;
         state.runs.insert(
             request.run().id(),
             RunAggregate {
@@ -208,13 +213,11 @@ impl ExecutionStore for InMemoryExecutionStore {
             receipt
                 .replay(commit.command())
                 .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::CommandConflict))?;
-            let stored = state
-                .runs
-                .get(&run_id)
-                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
-                .stored
-                .clone();
-            return Ok(ExecutionCommitOutcome::new(stored, receipt.clone()));
+            return state
+                .outcomes
+                .get(&commit.command().id())
+                .cloned()
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound));
         }
 
         let mut next = state.clone();
@@ -299,6 +302,15 @@ impl ExecutionStore for InMemoryExecutionStore {
                         ExecutionStoreErrorCode::GrantAlreadyConsumed,
                     ));
                 }
+                let grant_key = (consumption.grant_id.clone(), consumption.grant_revision);
+                let used = next.grant_use_counts.get(&grant_key).copied().unwrap_or(0);
+                if approval.remaining_uses().is_some_and(|limit| used >= limit) {
+                    return Err(ExecutionStoreError::new(
+                        ExecutionStoreErrorCode::GrantAlreadyConsumed,
+                    ));
+                }
+                next.grant_use_counts
+                    .insert(grant_key, used.saturating_add(1));
             }
         }
         for step in commit.steps() {
@@ -329,21 +341,36 @@ impl ExecutionStore for InMemoryExecutionStore {
         if let Some(checkpoint) = commit.checkpoint() {
             aggregate.checkpoint = Some((checkpoint_version.saturating_add(1), checkpoint.clone()));
         }
-        let stored = StoredRun::new(
+        let mut stored = StoredRun::new(
             commit.target_run().clone(),
             aggregate.stored.run_version().saturating_add(1),
             aggregate.stored.session_version(),
-        );
+        )?;
         aggregate.stored = stored.clone();
         if commit.target_run().state().is_terminal() {
             aggregate.lease = None;
             if next.serial_claims.get(&commit.target_run().session_id()) == Some(&run_id) {
                 next.serial_claims.remove(&commit.target_run().session_id());
+                let session = next
+                    .sessions
+                    .get_mut(&commit.target_run().session_id())
+                    .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+                session.version = session.version.saturating_add(1);
+                stored = StoredRun::new(
+                    commit.target_run().clone(),
+                    stored.run_version(),
+                    session.version,
+                )?;
+                aggregate.stored = stored.clone();
             }
         }
         let receipt =
             CommandReceipt::accepted(commit.command()).map_err(ExecutionStoreError::from)?;
         next.receipts.insert(commit.command().id(), receipt.clone());
+        next.outcomes.insert(
+            commit.command().id(),
+            ExecutionCommitOutcome::new(stored.clone(), receipt.clone()),
+        );
         *state = next;
         Ok(ExecutionCommitOutcome::new(stored, receipt))
     }
@@ -356,6 +383,61 @@ impl ExecutionStore for InMemoryExecutionStore {
             .runs
             .get(&run_id)
             .map(|aggregate| aggregate.stored.clone()))
+    }
+
+    async fn load_checkpoint(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Option<(u64, super::CheckpointV1)>, ExecutionStoreError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
+            .checkpoint
+            .clone())
+    }
+
+    async fn load_steps(&self, run_id: Uuid) -> Result<Vec<super::Step>, ExecutionStoreError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
+            .steps
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn load_attempts(
+        &self,
+        run_id: Uuid,
+    ) -> Result<Vec<super::InvocationAttemptRecord>, ExecutionStoreError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
+            .attempts
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    async fn load_durable_result(
+        &self,
+        run_id: Uuid,
+        logical_invocation_id: Uuid,
+    ) -> Result<Option<DurableCapabilityResult>, ExecutionStoreError> {
+        let state = self.state.lock().await;
+        Ok(state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?
+            .results
+            .get(&logical_invocation_id)
+            .map(|(_, result)| result.clone()))
     }
 
     async fn replay_events(

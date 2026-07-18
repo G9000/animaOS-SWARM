@@ -1,9 +1,10 @@
 use anima_core::{
-    ApprovalDecision, ApprovalGrantMutation, ApprovalResumeClaim, AttemptRecordState,
-    AutonomyGrant, Budget, CapabilityKind, CapabilityManifest, CapabilityReferenceId,
-    CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin,
-    DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
-    ExecutionStore, ExecutionStoreErrorCode, GrantEffect, GrantScope, GrantStatus,
+    assert_execution_store_conformance, ApprovalDecision, ApprovalGrantMutation,
+    ApprovalResumeClaim, AttemptRecordState, AutonomyGrant, Budget, CapabilityKind,
+    CapabilityManifest, CapabilityReferenceId, CheckpointV1Builder, CompletedInvocationRecord,
+    CreateRun, DefinitionPin, DurableCapabilityResult, DurableCapabilityStatus,
+    DurableResultMutation, ExecutionCommit, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreErrorCode, ExecutionStoreFactory, GrantEffect, GrantScope, GrantStatus,
     InMemoryExecutionStore, InvocationAttemptRecord, LogicalInvocation, ManifestPin,
     OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run,
     RunState, RuntimeCommand, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session,
@@ -13,6 +14,24 @@ use uuid::Uuid;
 
 fn id(value: u128) -> Uuid {
     Uuid::from_u128(value)
+}
+
+struct MemoryFactory;
+
+#[async_trait::async_trait]
+impl ExecutionStoreFactory for MemoryFactory {
+    type Store = InMemoryExecutionStore;
+
+    async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError> {
+        Ok(InMemoryExecutionStore::default())
+    }
+}
+
+#[tokio::test]
+async fn public_adapter_conformance_suite_runs_against_memory_store() {
+    assert_execution_store_conformance(&MemoryFactory)
+        .await
+        .unwrap();
 }
 
 fn approval_resume_parts(
@@ -113,7 +132,7 @@ fn approval_resume_parts(
         waiting,
         target,
         command,
-        ApprovalGrantMutation::from_claim(claim),
+        ApprovalGrantMutation::from_claim(claim, Some(1)).unwrap(),
     )
 }
 
@@ -230,7 +249,7 @@ async fn terminal_commit_releases_the_serial_session_claim() {
         .create_run(CreateRun::new(
             session.clone(),
             Run::queued(id(48), session.id(), "writer", 1).unwrap(),
-            1,
+            2,
             SessionConcurrencyPolicy::Serial,
         ))
         .await
