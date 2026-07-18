@@ -13,7 +13,7 @@ pub use checkpoint::{
 pub use event::{LiveRuntimeEvent, RuntimeEvent, RuntimeEventKind, SafeEventPayload};
 pub use state::{
     ApprovalResumeBinding, ApprovalResumeClaim, Attempt, Budget, BudgetDecision, CommandOutcome,
-    CommandReceipt, ExecutionError, ExecutionErrorCode, ExecutionLease, RecoveryTerminalResolution,
-    Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, Session,
-    SessionConcurrencyPolicy, Step, StepKind, Usage,
+    CommandReceipt, ExecutionError, ExecutionErrorCode, ExecutionLease, RecoveryTerminalOutcome,
+    RecoveryTerminalResolution, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind,
+    Session, SessionConcurrencyPolicy, Step, StepKind, Usage,
 };

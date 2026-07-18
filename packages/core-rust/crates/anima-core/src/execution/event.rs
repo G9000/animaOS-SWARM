@@ -176,7 +176,7 @@ impl RuntimeEvent {
         for id in [event_id, owner_id, session_id, run_id] {
             valid_uuid(id)?;
         }
-        if sequence == 0 {
+        if timestamp_ms == 0 || sequence == 0 {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidEvent));
         }
         payload.validate()?;
@@ -195,19 +195,40 @@ impl RuntimeEvent {
     pub fn sequence(&self) -> u64 {
         self.sequence
     }
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+    pub fn event_id(&self) -> Uuid {
+        self.event_id
+    }
+    pub fn owner_id(&self) -> Uuid {
+        self.owner_id
+    }
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
     pub fn run_id(&self) -> Uuid {
         self.run_id
     }
+    pub fn timestamp_ms(&self) -> u64 {
+        self.timestamp_ms
+    }
     pub fn kind(&self) -> RuntimeEventKind {
         self.kind
+    }
+    pub fn payload(&self) -> &SafeEventPayload {
+        &self.payload
     }
     pub fn validate_batch(start: u64, events: &[Self]) -> Result<(), ExecutionError> {
         let mut expected = start;
         let mut ids = std::collections::BTreeSet::new();
         let mut scope = None;
+        let mut prior_timestamp_ms = None;
         for e in events {
             if e.schema_version != RUNTIME_EVENT_SCHEMA_VERSION
                 || e.sequence != expected
+                || e.timestamp_ms == 0
+                || prior_timestamp_ms.is_some_and(|prior| e.timestamp_ms < prior)
                 || !ids.insert(e.event_id)
             {
                 return Err(ExecutionError::new(ExecutionErrorCode::InvalidEvent));
@@ -217,6 +238,7 @@ impl RuntimeEvent {
                 return Err(ExecutionError::new(ExecutionErrorCode::InvalidEvent));
             }
             scope = Some(s);
+            prior_timestamp_ms = Some(e.timestamp_ms);
             expected = expected
                 .checked_add(1)
                 .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::ArithmeticOverflow))?;

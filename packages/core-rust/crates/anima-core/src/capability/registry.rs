@@ -18,6 +18,60 @@ pub struct CapabilityRegistry {
     catalog: ManifestCatalog,
     executors: BTreeMap<(String, u32), RegisteredExecutor>,
     lineage: Arc<dyn CapabilityLineageStore>,
+    reference_validator: Arc<dyn CapabilityReferenceValidator>,
+    result_recorder: Arc<dyn CapabilityResultRecorder>,
+}
+
+struct InvocationBoundReferenceValidator;
+struct InMemoryCapabilityResultRecorder;
+
+#[async_trait]
+impl CapabilityReferenceValidator for InvocationBoundReferenceValidator {
+    async fn validate(
+        &self,
+        context: &CapabilityExecutionContext,
+        _manifest: &CapabilityManifest,
+    ) -> Result<(), CapabilityError> {
+        if context.references().is_bound_to(context.invocation())
+            && context.references().is_run_only()
+        {
+            Ok(())
+        } else {
+            Err(CapabilityError::validation())
+        }
+    }
+}
+
+#[async_trait]
+impl CapabilityResultRecorder for InMemoryCapabilityResultRecorder {
+    async fn record(
+        &self,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+        result: &CapabilityResult,
+    ) -> Result<DurableCapabilityResult, CapabilityError> {
+        let bytes =
+            serde_jcs::to_vec(&result.output).map_err(|_| CapabilityError::output_validation())?;
+        let digest = Uuid::new_v5(&CAPABILITY_RESULT_NAMESPACE, &bytes);
+        let result_ref = Uuid::new_v5(
+            &CAPABILITY_RESULT_NAMESPACE,
+            format!(
+                "{}:{}:{}:{}",
+                context.invocation().id(),
+                context.attempt().number(),
+                manifest.schema_digest,
+                digest
+            )
+            .as_bytes(),
+        );
+        DurableCapabilityResult::new(
+            CapabilityReferenceId::new(result_ref),
+            format!("jcs-v1:{digest}"),
+            manifest.schema_digest.clone(),
+            u64::try_from(bytes.len()).map_err(|_| CapabilityError::output_validation())?,
+            DurableCapabilityStatus::Completed,
+        )
+    }
 }
 
 struct RegisteredExecutor {
@@ -39,7 +93,22 @@ impl CapabilityRegistry {
             catalog,
             executors: BTreeMap::new(),
             lineage,
+            reference_validator: Arc::new(InvocationBoundReferenceValidator),
+            result_recorder: Arc::new(InMemoryCapabilityResultRecorder),
         }
+    }
+
+    pub fn with_reference_validator(
+        mut self,
+        validator: Arc<dyn CapabilityReferenceValidator>,
+    ) -> Self {
+        self.reference_validator = validator;
+        self
+    }
+
+    pub fn with_result_recorder(mut self, recorder: Arc<dyn CapabilityResultRecorder>) -> Self {
+        self.result_recorder = recorder;
+        self
     }
 
     pub fn manifest(&self, id: &str, version: u32) -> Option<&CapabilityManifest> {
@@ -109,7 +178,7 @@ impl CapabilityRegistry {
             return Err(CapabilityError::validation());
         }
         let manifest = self.manifest_for_context(&context)?;
-        self.validate_context(&context, manifest)?;
+        self.validate_context(&context, manifest).await?;
         let entry = self.entry_for_context(&context)?;
         validate_instance(
             &entry.input_validator,
@@ -141,6 +210,7 @@ impl CapabilityRegistry {
             context.invocation().idempotency_key(),
             self.lineage.clone(),
         );
+        let recording_context = context.clone();
         let execution = executor.execute(context.with_execution_fence(execution_fence.clone()));
         let (execution, executing, heartbeat_error) = self
             .await_with_heartbeat(
@@ -155,8 +225,15 @@ impl CapabilityRegistry {
             self.transition_to_uncertain(lineage_key, executing).await?;
             return Err(error);
         }
-        self.finish_execution(lineage_key, executing, execution, entry)
-            .await
+        self.finish_execution(
+            lineage_key,
+            executing,
+            execution,
+            entry,
+            &recording_context,
+            manifest,
+        )
+        .await
     }
 
     /// Executes a retry only when it presents a one-time authorization issued by `recover`.
@@ -166,7 +243,7 @@ impl CapabilityRegistry {
         authorization: CapabilityRetryAuthorization,
     ) -> Result<CapabilityResult, CapabilityError> {
         let manifest = self.manifest_for_context(&context)?;
-        self.validate_context(&context, manifest)?;
+        self.validate_context(&context, manifest).await?;
         if !authorization.matches_resume(&context, manifest, &authorization.resume_binding) {
             return Err(CapabilityError::validation());
         }
@@ -203,6 +280,7 @@ impl CapabilityRegistry {
             context.invocation().idempotency_key(),
             self.lineage.clone(),
         );
+        let recording_context = context.clone();
         let execution = entry
             .executor
             .execute(context.with_execution_fence(execution_fence.clone()));
@@ -219,8 +297,15 @@ impl CapabilityRegistry {
             self.transition_to_uncertain(lineage_key, executing).await?;
             return Err(error);
         }
-        self.finish_execution(lineage_key, executing, execution, entry)
-            .await
+        self.finish_execution(
+            lineage_key,
+            executing,
+            execution,
+            entry,
+            &recording_context,
+            manifest,
+        )
+        .await
     }
 
     /// Validates a durable resume binding against both the live bearer authorization and the
@@ -232,7 +317,7 @@ impl CapabilityRegistry {
         binding: &RecoveryResumeBinding,
     ) -> Result<ValidatedRecoveryResume, CapabilityError> {
         let manifest = self.manifest_for_context(retry_context)?;
-        self.validate_context(retry_context, manifest)?;
+        self.validate_context(retry_context, manifest).await?;
         if !authorization.matches_resume(retry_context, manifest, binding) {
             return Err(CapabilityError::validation());
         }
@@ -257,7 +342,7 @@ impl CapabilityRegistry {
         context: CapabilityExecutionContext,
     ) -> Result<RecoveryAction, CapabilityError> {
         let manifest = self.manifest_for_context(&context)?;
-        self.validate_context(&context, manifest)?;
+        self.validate_context(&context, manifest).await?;
         let key = (context.invocation().id(), context.attempt().number());
         loop {
             let Some(state) = self.lineage.load(key.0, key.1).await? else {
@@ -268,7 +353,23 @@ impl CapabilityRegistry {
                     return Ok(RecoveryAction::Completed(result));
                 }
                 CapabilityAttemptLineageState::RecoveryRequired => {
+                    if manifest.recovery_mode == RecoveryMode::Compensate
+                        && self
+                            .lineage
+                            .compare_exchange(
+                                key.0,
+                                key.1,
+                                Some(state),
+                                CapabilityAttemptLineageState::CompensationRequired,
+                            )
+                            .await?
+                    {
+                        return Ok(RecoveryAction::CompensationRequired);
+                    }
                     return Ok(RecoveryAction::RecoveryRequired);
+                }
+                CapabilityAttemptLineageState::CompensationRequired => {
+                    return Ok(RecoveryAction::CompensationRequired);
                 }
                 CapabilityAttemptLineageState::RetryAuthorized { .. } => {
                     return Err(CapabilityError::validation());
@@ -293,6 +394,21 @@ impl CapabilityRegistry {
                     }
                 }
                 CapabilityAttemptLineageState::AuthoritativeAbsence { .. } => {
+                    if manifest.recovery_mode == RecoveryMode::Compensate {
+                        if self
+                            .lineage
+                            .compare_exchange(
+                                key.0,
+                                key.1,
+                                Some(state),
+                                CapabilityAttemptLineageState::CompensationRequired,
+                            )
+                            .await?
+                        {
+                            return Ok(RecoveryAction::CompensationRequired);
+                        }
+                        continue;
+                    }
                     return self.authorize_retry(&context, manifest, state).await;
                 }
                 CapabilityAttemptLineageState::Uncertain => match manifest.recovery_mode {
@@ -322,7 +438,7 @@ impl CapabilityRegistry {
         }
     }
 
-    fn validate_context(
+    async fn validate_context(
         &self,
         context: &CapabilityExecutionContext,
         manifest: &CapabilityManifest,
@@ -332,6 +448,7 @@ impl CapabilityRegistry {
         {
             return Err(CapabilityError::validation());
         }
+        self.reference_validator.validate(context, manifest).await?;
         Ok(())
     }
 
@@ -415,6 +532,8 @@ impl CapabilityRegistry {
         executing: CapabilityAttemptLineageState,
         execution: Result<CapabilityResult, CapabilityError>,
         entry: &RegisteredExecutor,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
     ) -> Result<CapabilityResult, CapabilityError> {
         let mut result = match execution {
             Ok(result) => result,
@@ -427,20 +546,36 @@ impl CapabilityRegistry {
             self.transition_to_uncertain(key, executing).await?;
             return Err(error);
         }
+        let durable = match self
+            .result_recorder
+            .record(context, manifest, &result)
+            .await
+            .and_then(|durable| {
+                validate_recorded_result(manifest, &result, &durable)?;
+                Ok(durable)
+            }) {
+            Ok(durable) => durable,
+            Err(error) => {
+                self.transition_to_uncertain(key, executing).await?;
+                return Err(error);
+            }
+        };
         if self
             .lineage
             .compare_exchange(
                 key.0,
                 key.1,
                 Some(executing),
-                CapabilityAttemptLineageState::Completed(result.clone()),
+                CapabilityAttemptLineageState::Completed(durable.clone()),
             )
             .await?
         {
             return Ok(result);
         }
         match self.lineage.load(key.0, key.1).await? {
-            Some(CapabilityAttemptLineageState::Completed(cached)) => Ok(cached),
+            Some(CapabilityAttemptLineageState::Completed(cached)) if cached == durable => {
+                Ok(result)
+            }
             _ => Err(CapabilityError::execution()),
         }
     }
@@ -465,6 +600,7 @@ impl CapabilityRegistry {
         match self.lineage.load(key.0, key.1).await? {
             Some(CapabilityAttemptLineageState::Completed(_))
             | Some(CapabilityAttemptLineageState::Uncertain)
+            | Some(CapabilityAttemptLineageState::CompensationRequired)
             | Some(CapabilityAttemptLineageState::RecoveryRequired)
             | Some(CapabilityAttemptLineageState::Reconciling { .. })
             | Some(CapabilityAttemptLineageState::AuthoritativeAbsence { .. }) => Ok(()),
@@ -553,17 +689,31 @@ impl CapabilityRegistry {
                         .await?;
                     return Err(error);
                 }
+                let durable = match self
+                    .result_recorder
+                    .record(context, manifest, &result)
+                    .await
+                    .and_then(|durable| {
+                        validate_recorded_result(manifest, &result, &durable)?;
+                        Ok(durable)
+                    }) {
+                    Ok(durable) => durable,
+                    Err(error) => {
+                        self.transition_to_uncertain(key, reconciling).await?;
+                        return Err(error);
+                    }
+                };
                 if self
                     .lineage
                     .compare_exchange(
                         key.0,
                         key.1,
                         Some(reconciling),
-                        CapabilityAttemptLineageState::Completed(result.clone()),
+                        CapabilityAttemptLineageState::Completed(durable.clone()),
                     )
                     .await?
                 {
-                    Ok(RecoveryAction::Completed(result))
+                    Ok(RecoveryAction::Completed(durable))
                 } else {
                     self.current_recovery_action(key).await
                 }
@@ -580,6 +730,21 @@ impl CapabilityRegistry {
                 Ok(RecoveryAction::Pending)
             }
             ReconcileOutcome::AuthoritativeAbsence => {
+                if manifest.recovery_mode == RecoveryMode::Compensate {
+                    if self
+                        .lineage
+                        .compare_exchange(
+                            key.0,
+                            key.1,
+                            Some(reconciling),
+                            CapabilityAttemptLineageState::CompensationRequired,
+                        )
+                        .await?
+                    {
+                        return Ok(RecoveryAction::CompensationRequired);
+                    }
+                    return self.current_recovery_action(key).await;
+                }
                 let absence = CapabilityAttemptLineageState::AuthoritativeAbsence { fence };
                 if self
                     .lineage
@@ -592,17 +757,24 @@ impl CapabilityRegistry {
                 }
             }
             ReconcileOutcome::RecoveryRequired => {
+                let (lineage_state, action) = if manifest.recovery_mode == RecoveryMode::Compensate
+                {
+                    (
+                        CapabilityAttemptLineageState::CompensationRequired,
+                        RecoveryAction::CompensationRequired,
+                    )
+                } else {
+                    (
+                        CapabilityAttemptLineageState::RecoveryRequired,
+                        RecoveryAction::RecoveryRequired,
+                    )
+                };
                 if self
                     .lineage
-                    .compare_exchange(
-                        key.0,
-                        key.1,
-                        Some(reconciling),
-                        CapabilityAttemptLineageState::RecoveryRequired,
-                    )
+                    .compare_exchange(key.0, key.1, Some(reconciling), lineage_state)
                     .await?
                 {
-                    Ok(RecoveryAction::RecoveryRequired)
+                    Ok(action)
                 } else {
                     self.current_recovery_action(key).await
                 }
@@ -620,6 +792,9 @@ impl CapabilityRegistry {
             }
             Some(CapabilityAttemptLineageState::RecoveryRequired) => {
                 Ok(RecoveryAction::RecoveryRequired)
+            }
+            Some(CapabilityAttemptLineageState::CompensationRequired) => {
+                Ok(RecoveryAction::CompensationRequired)
             }
             _ => Ok(RecoveryAction::Pending),
         }
@@ -742,6 +917,26 @@ fn validate_result(
     validate_argument_bounds(&result.output).map_err(|_| CapabilityError::output_validation())?;
     validate_instance(&entry.output_validator, &result.output, true)?;
     result.output = canonicalize_json(std::mem::take(&mut result.output))?;
+    Ok(())
+}
+
+fn validate_recorded_result(
+    manifest: &CapabilityManifest,
+    result: &CapabilityResult,
+    durable: &DurableCapabilityResult,
+) -> Result<(), CapabilityError> {
+    let bytes =
+        serde_jcs::to_vec(&result.output).map_err(|_| CapabilityError::output_validation())?;
+    let digest = Uuid::new_v5(&CAPABILITY_RESULT_NAMESPACE, &bytes);
+    let size_bytes =
+        u64::try_from(bytes.len()).map_err(|_| CapabilityError::output_validation())?;
+    if durable.content_digest() != format!("jcs-v1:{digest}")
+        || durable.schema_digest() != manifest.schema_digest
+        || durable.size_bytes() != size_bytes
+        || durable.status() != DurableCapabilityStatus::Completed
+    {
+        return Err(CapabilityError::output_validation());
+    }
     Ok(())
 }
 

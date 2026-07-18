@@ -1,13 +1,15 @@
 use std::fmt;
+use std::ops::Deref;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use super::checkpoint::{DefinitionPin, RecoveryPauseRecord};
+use super::checkpoint::{DefinitionPin, OpaqueReference, RecoveryPauseRecord};
 use crate::{
     AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity,
-    PolicyContext, PolicyEngine, RecoveryResumeBinding, ValidatedRecoveryResume,
-    CAPABILITY_INVOCATION_NAMESPACE, SUPPORTED_DEFINITION_SCHEMA_VERSION,
+    AutonomyGrant, GrantConsumption, PolicyContext, PolicyEngine, PolicyReasonCode,
+    RecoveryResumeBinding, ValidatedRecoveryResume, CAPABILITY_INVOCATION_NAMESPACE,
+    SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
 
 const MAX_ID_BYTES: usize = 256;
@@ -208,6 +210,27 @@ pub enum RecoveryTerminalResolution {
     AdoptExternallyVerifiedResult { result_ref: Uuid },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveryTerminalOutcome {
+    run: Run,
+    adopted_result_ref: Option<OpaqueReference>,
+}
+impl RecoveryTerminalOutcome {
+    pub fn run(&self) -> &Run {
+        &self.run
+    }
+    pub fn adopted_result_ref(&self) -> Option<&OpaqueReference> {
+        self.adopted_result_ref.as_ref()
+    }
+}
+impl Deref for RecoveryTerminalOutcome {
+    type Target = Run;
+
+    fn deref(&self) -> &Self::Target {
+        &self.run
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Run {
     id: Uuid,
@@ -296,6 +319,12 @@ impl Run {
     pub fn session_id(&self) -> Uuid {
         self.session_id
     }
+    pub fn definition_id(&self) -> &str {
+        &self.definition_id
+    }
+    pub fn definition_version(&self) -> u32 {
+        self.definition_version
+    }
     pub fn state(&self) -> RunState {
         self.state
     }
@@ -382,7 +411,16 @@ impl Run {
             RunState::Paused if self.pause_reason == Some(RunPauseReason::RecoveryRequired) => {
                 Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired))
             }
-            RunState::Paused => self.transition(RunState::Running, None),
+            RunState::Paused => Self::from_parts(
+                self.id,
+                self.session_id,
+                self.definition_id.clone(),
+                self.definition_version,
+                RunState::Running,
+                None,
+                None,
+                None,
+            ),
             _ => Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition)),
         }
     }
@@ -401,8 +439,9 @@ impl Run {
         pending: &ApprovalRequest,
         decision: &ApprovalDecision,
         context: &PolicyContext,
+        grants: &[AutonomyGrant],
     ) -> Result<Self, ExecutionError> {
-        let claim = ApprovalResumeClaim::new(pending, decision, context)?;
+        let claim = ApprovalResumeClaim::new(pending, decision, context, grants)?;
         if self.pending_approval.as_ref() != Some(pending)
             || claim.binding.decision.request != *pending
         {
@@ -491,22 +530,21 @@ impl Run {
     pub fn resolve_recovery_terminal(
         &self,
         resolution: RecoveryTerminalResolution,
-    ) -> Result<Self, ExecutionError> {
+    ) -> Result<RecoveryTerminalOutcome, ExecutionError> {
         if self.state != RunState::Paused
             || self.pause_reason != Some(RunPauseReason::RecoveryRequired)
             || self.recovery_pause.is_none()
         {
             return Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition));
         }
-        let target = match resolution {
-            RecoveryTerminalResolution::Cancel => RunState::Cancelled,
-            RecoveryTerminalResolution::Fail => RunState::Failed,
+        let (target, adopted_result_ref) = match resolution {
+            RecoveryTerminalResolution::Cancel => (RunState::Cancelled, None),
+            RecoveryTerminalResolution::Fail => (RunState::Failed, None),
             RecoveryTerminalResolution::AdoptExternallyVerifiedResult { result_ref } => {
-                valid_uuid(result_ref)?;
-                RunState::Completed
+                (RunState::Completed, Some(OpaqueReference::new(result_ref)?))
             }
         };
-        Self::from_parts(
+        let run = Self::from_parts(
             self.id,
             self.session_id,
             self.definition_id.clone(),
@@ -515,7 +553,11 @@ impl Run {
             None,
             None,
             None,
-        )
+        )?;
+        Ok(RecoveryTerminalOutcome {
+            run,
+            adopted_result_ref,
+        })
     }
     /// A host records control intent while work is active, then calls this at a safe boundary.
     pub fn request_pause_or_cancel(
@@ -564,8 +606,6 @@ fn legal_transition(from: RunState, to: RunState) -> bool {
                     | RunState::Failed
                     | RunState::Cancelled
             )
-            | (RunState::WaitingForApproval, RunState::Running)
-            | (RunState::Paused, RunState::Running)
     )
 }
 
@@ -610,6 +650,15 @@ impl Step {
     }
     pub fn attempts(&self) -> &[Attempt] {
         &self.attempts
+    }
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    pub fn logical_step_id(&self) -> &str {
+        &self.logical_step_id
+    }
+    pub fn kind(&self) -> StepKind {
+        self.kind
     }
     pub fn start_attempt(&self, logical_invocation_id: Uuid) -> Result<Attempt, ExecutionError> {
         Attempt::new(
@@ -799,6 +848,7 @@ pub struct ApprovalResumeBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovalResumeClaim {
     binding: ApprovalResumeBinding,
+    grant_consumption: Option<GrantConsumption>,
 }
 
 impl ApprovalResumeClaim {
@@ -806,22 +856,33 @@ impl ApprovalResumeClaim {
         pending: &ApprovalRequest,
         decision: &ApprovalDecision,
         context: &PolicyContext,
+        grants: &[AutonomyGrant],
     ) -> Result<Self, ExecutionError> {
         if decision.kind != ApprovalDecisionKind::Approve
             || decision.request != *pending
-            || PolicyEngine::validate_approval(decision, context) != ApprovalValidity::Valid
+            || PolicyEngine::validate_approval_with_grants(decision, context, grants)
+                != ApprovalValidity::Valid
         {
+            return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+        }
+        let evaluation = PolicyEngine::evaluate_with_approval(context, grants, Some(decision))
+            .map_err(|_| ExecutionError::new(ExecutionErrorCode::MissingPrerequisite))?;
+        if evaluation.decision.kind() != PolicyReasonCode::AllowedByApproval {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
         Ok(Self {
             binding: ApprovalResumeBinding {
                 decision: decision.clone(),
             },
+            grant_consumption: evaluation.consumption,
         })
     }
 
     pub fn binding(&self) -> &ApprovalResumeBinding {
         &self.binding
+    }
+    pub fn grant_consumption(&self) -> Option<&GrantConsumption> {
+        self.grant_consumption.as_ref()
     }
 }
 
@@ -855,6 +916,15 @@ impl RuntimeCommandPayload {
             Self::Resume { .. } => RuntimeCommandKind::Resume,
             Self::Cancel { .. } => RuntimeCommandKind::Cancel,
             Self::Retry { .. } => RuntimeCommandKind::Retry,
+        }
+    }
+    fn run_id(&self) -> Uuid {
+        match self {
+            Self::Start { run_id }
+            | Self::Pause { run_id }
+            | Self::Resume { run_id, .. }
+            | Self::Cancel { run_id }
+            | Self::Retry { run_id, .. } => *run_id,
         }
     }
     fn validate(&self) -> Result<(), ExecutionError> {
@@ -990,8 +1060,17 @@ impl RuntimeCommand {
     pub fn id(&self) -> Uuid {
         self.id
     }
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+    pub fn target_run_id(&self) -> Uuid {
+        self.payload.run_id()
+    }
     pub fn kind(&self) -> RuntimeCommandKind {
         self.payload.kind()
+    }
+    pub fn payload_digest(&self) -> Uuid {
+        self.digest()
     }
     fn resume_parts(
         &self,
@@ -1046,12 +1125,27 @@ struct CommandReceiptWire {
     outcome: CommandOutcome,
 }
 impl CommandReceipt {
-    pub fn accepted(command: &RuntimeCommand) -> Result<Self, ExecutionError> {
+    fn new(command: &RuntimeCommand, outcome: CommandOutcome) -> Result<Self, ExecutionError> {
         Ok(Self {
             command_id: command.id,
             payload_digest: command.digest(),
-            outcome: CommandOutcome::Accepted,
+            outcome,
         })
+    }
+    pub fn accepted(command: &RuntimeCommand) -> Result<Self, ExecutionError> {
+        Self::new(command, CommandOutcome::Accepted)
+    }
+    pub fn rejected(command: &RuntimeCommand) -> Result<Self, ExecutionError> {
+        Self::new(command, CommandOutcome::Rejected)
+    }
+    pub fn command_id(&self) -> Uuid {
+        self.command_id
+    }
+    pub fn payload_digest(&self) -> Uuid {
+        self.payload_digest
+    }
+    pub fn outcome(&self) -> CommandOutcome {
+        self.outcome
     }
     pub fn replay(&self, command: &RuntimeCommand) -> Result<CommandOutcome, ExecutionError> {
         if self.command_id != command.id || self.payload_digest != command.digest() {
@@ -1125,6 +1219,10 @@ impl Usage {
     pub fn concurrent_runs(&self) -> u64 {
         self.concurrent_runs
     }
+    pub fn with_concurrent_runs(mut self, concurrent_runs: u64) -> Self {
+        self.concurrent_runs = concurrent_runs;
+        self
+    }
     pub fn artifact_bytes(&self) -> u64 {
         self.artifact_bytes
     }
@@ -1160,7 +1258,7 @@ impl Usage {
             output_tokens: add!(output_tokens),
             total_tokens: add!(total_tokens),
             estimated_cost_micros: add!(estimated_cost_micros),
-            concurrent_runs: add!(concurrent_runs),
+            concurrent_runs: other.concurrent_runs,
             artifact_bytes: add!(artifact_bytes),
             download_bytes: add!(download_bytes),
         };

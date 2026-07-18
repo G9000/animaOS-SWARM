@@ -7,7 +7,7 @@ use futures::lock::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{CapabilityError, CapabilityResult};
+use super::{CapabilityError, DurableCapabilityResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapabilityLeaseKind {
@@ -29,7 +29,7 @@ pub enum CapabilityAttemptLineageState {
         fence: Uuid,
         lease_expires_at_ms: u64,
     },
-    Completed(CapabilityResult),
+    Completed(DurableCapabilityResult),
     Uncertain,
     Reconciling {
         fence: Uuid,
@@ -38,6 +38,7 @@ pub enum CapabilityAttemptLineageState {
     AuthoritativeAbsence {
         fence: Uuid,
     },
+    CompensationRequired,
     RecoveryRequired,
 }
 
@@ -63,6 +64,7 @@ impl fmt::Debug for CapabilityAttemptLineageState {
                 .debug_struct("AuthoritativeAbsence")
                 .field("fence", fence)
                 .finish(),
+            Self::CompensationRequired => formatter.write_str("CompensationRequired"),
             Self::RecoveryRequired => formatter.write_str("RecoveryRequired"),
         }
     }

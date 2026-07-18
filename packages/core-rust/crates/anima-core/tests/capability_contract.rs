@@ -7,13 +7,15 @@ use std::sync::{
 use anima_core::{
     AttemptRecordState, Budget, CapabilityAttempt, CapabilityAttemptLineageState,
     CapabilityContextError, CapabilityError, CapabilityErrorCode, CapabilityExecutionContext,
-    CapabilityExecutor, CapabilityKind, CapabilityLeaseKind, CapabilityLineageStore,
-    CapabilityManifest, CapabilityReferenceId, CapabilityRegistry, CapabilityRegistryError,
-    CapabilityResult, CapabilitySecretReferenceId, CheckpointV1, CheckpointV1Builder,
-    DefinitionPin, ExecutionFence, InvocationAttemptRecord, LogicalInvocation, ManifestCatalog,
-    ManifestCatalogError, ManifestPin, ReconcileOutcome, RecoveryActionKind, RecoveryMode,
-    RecoveryPauseReason, RecoveryPauseRecord, RiskLevel, Run, RunPauseReason, RunState,
-    RuntimeCommand, RuntimeCompatibility, UncertainInvocationRecord, Usage,
+    CapabilityExecutionReferences, CapabilityExecutor, CapabilityKind, CapabilityLeaseKind,
+    CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId,
+    CapabilityReferenceValidator, CapabilityRegistry, CapabilityRegistryError, CapabilityResult,
+    CapabilityResultRecorder, CapabilitySecretReferenceId, CheckpointV1, CheckpointV1Builder,
+    DefinitionPin, DurableCapabilityResult, DurableCapabilityStatus, ExecutionFence,
+    InvocationAttemptRecord, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ManifestPin,
+    ReconcileOutcome, RecoveryActionKind, RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord,
+    RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility,
+    UncertainInvocationRecord, Usage,
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -68,6 +70,26 @@ fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
         catalog.register_manifest(manifest).unwrap();
     }
     CapabilityRegistry::new(catalog)
+}
+
+struct ForgedResultRecorder;
+
+#[async_trait]
+impl CapabilityResultRecorder for ForgedResultRecorder {
+    async fn record(
+        &self,
+        _context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+        _result: &CapabilityResult,
+    ) -> Result<DurableCapabilityResult, CapabilityError> {
+        DurableCapabilityResult::new(
+            CapabilityReferenceId::new(Uuid::from_u128(900)),
+            "jcs-v1:wrong-content",
+            manifest.schema_digest.clone(),
+            1,
+            DurableCapabilityStatus::Completed,
+        )
+    }
 }
 
 #[derive(Default)]
@@ -850,6 +872,46 @@ async fn reconcilers_return_all_portable_recovery_outcomes() {
     }
 }
 
+#[tokio::test]
+async fn compensate_recovery_never_authorizes_a_retry_for_any_reconcile_outcome() {
+    let manifest = manifest("workspace.compensate", 1, RecoveryMode::Compensate);
+    for (outcome, expected) in [
+        (
+            ReconcileOutcome::Completed(CapabilityResult::new(json!({ "ok": true }))),
+            RecoveryActionKind::Completed,
+        ),
+        (ReconcileOutcome::Pending, RecoveryActionKind::Pending),
+        (
+            ReconcileOutcome::AuthoritativeAbsence,
+            RecoveryActionKind::CompensationRequired,
+        ),
+        (
+            ReconcileOutcome::RecoveryRequired,
+            RecoveryActionKind::CompensationRequired,
+        ),
+    ] {
+        let store = Arc::new(TestLineageStore::default());
+        let mut catalog = ManifestCatalog::default();
+        catalog.register_manifest(manifest.clone()).unwrap();
+        let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+        let mut executor = RecordingExecutor::failing_once(manifest.clone());
+        executor.reconcile_result = outcome;
+        registry.register_executor(Arc::new(executor)).unwrap();
+
+        let initial = context(&manifest, json!({ "query": "hello" }));
+        registry.execute(initial.clone()).await.unwrap_err();
+        let action = registry.recover(initial.clone()).await.unwrap();
+
+        assert_eq!(action.kind(), expected);
+        assert!(action.retry_authorization().is_none());
+        assert!(store
+            .load(initial.invocation().id(), initial.attempt().number() + 1)
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 #[test]
 fn capability_errors_have_stable_safe_codes_without_upstream_diagnostics() {
     for (error, code, retryable) in [
@@ -1613,7 +1675,16 @@ async fn durable_lineage_store_returns_cached_completion_after_registry_restart(
         .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
         .unwrap();
     let initial = context(&manifest, json!({ "query": "hello" }));
-    let completed = first_registry.execute(initial.clone()).await.unwrap();
+    first_registry.execute(initial.clone()).await.unwrap();
+    let completed = match store
+        .load(initial.invocation().id(), initial.attempt().number())
+        .await
+        .unwrap()
+        .unwrap()
+    {
+        CapabilityAttemptLineageState::Completed(completed) => completed,
+        _ => panic!("completion must be durable metadata"),
+    };
 
     let mut second_catalog = ManifestCatalog::default();
     second_catalog.register_manifest(manifest.clone()).unwrap();
@@ -1783,6 +1854,158 @@ fn references_cannot_be_grafted_across_runs() {
             .with_references(first.references().clone())
             .unwrap_err(),
         CapabilityContextError::RunReferenceMismatch
+    );
+}
+
+#[derive(Clone)]
+struct ExactScopeValidator {
+    invocation_id: Uuid,
+    references: CapabilityExecutionReferences,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl CapabilityReferenceValidator for ExactScopeValidator {
+    async fn validate(
+        &self,
+        context: &CapabilityExecutionContext,
+        _manifest: &CapabilityManifest,
+    ) -> Result<(), CapabilityError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if context.invocation().id() == self.invocation_id
+            && context.references() == &self.references
+        {
+            Ok(())
+        } else {
+            Err(CapabilityError::validation())
+        }
+    }
+}
+
+#[tokio::test]
+async fn expanded_reference_scopes_require_host_attestation_and_reject_same_run_grafts() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let executor = RecordingExecutor::new(manifest.clone());
+    let executions = executor.executions.clone();
+    let base = context(&manifest, json!({ "query": "hello" }));
+    let expected = base
+        .references()
+        .clone()
+        .with_owner(CapabilityReferenceId::new(Uuid::from_u128(10)))
+        .with_agent(CapabilityReferenceId::new(Uuid::from_u128(11)))
+        .with_session(CapabilityReferenceId::new(Uuid::from_u128(12)))
+        .with_workspace(CapabilityReferenceId::new(Uuid::from_u128(13)));
+    let scoped = base.clone().with_references(expected.clone()).unwrap();
+    let expected = scoped.references().clone();
+
+    let mut default_registry = registry(vec![manifest.clone()]);
+    default_registry
+        .register_executor(Arc::new(executor.clone()))
+        .unwrap();
+    assert_eq!(
+        default_registry
+            .execute(scoped.clone())
+            .await
+            .unwrap_err()
+            .code(),
+        CapabilityErrorCode::Validation
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let validator = ExactScopeValidator {
+        invocation_id: base.invocation().id(),
+        references: expected.clone(),
+        calls: calls.clone(),
+    };
+    let mut attested_registry =
+        registry(vec![manifest.clone()]).with_reference_validator(Arc::new(validator));
+    attested_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    attested_registry.execute(scoped).await.unwrap();
+
+    for grafted in [
+        expected
+            .clone()
+            .with_owner(CapabilityReferenceId::new(Uuid::from_u128(20))),
+        expected
+            .clone()
+            .with_agent(CapabilityReferenceId::new(Uuid::from_u128(21))),
+        expected
+            .clone()
+            .with_session(CapabilityReferenceId::new(Uuid::from_u128(22))),
+        expected
+            .clone()
+            .with_workspace(CapabilityReferenceId::new(Uuid::from_u128(23))),
+    ] {
+        let grafted = base.clone().with_references(grafted).unwrap();
+        assert_eq!(
+            attested_registry.execute(grafted).await.unwrap_err().code(),
+            CapabilityErrorCode::Validation
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 5);
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn durable_lineage_records_only_opaque_result_metadata() {
+    let mut manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    manifest.output_schema = json!({});
+    let secret = "sk-secret-output-must-not-persist";
+    let mut executor = RecordingExecutor::new(manifest.clone());
+    executor.execute_result = CapabilityResult::new(json!({ "ok": true, "secret": secret }));
+    let store = Arc::new(TestLineageStore::default());
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    registry.register_executor(Arc::new(executor)).unwrap();
+    let context = context(&manifest, json!({ "query": "hello" }));
+
+    let live = registry.execute(context.clone()).await.unwrap();
+    assert_eq!(live.output["secret"], json!(secret));
+    let state = store
+        .load(context.invocation().id(), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    let durable = match &state {
+        CapabilityAttemptLineageState::Completed(record) => record,
+        _ => panic!("execution must store a durable completion record"),
+    };
+    let _: &DurableCapabilityResult = durable;
+    assert!(!serde_json::to_string(&state).unwrap().contains(secret));
+    assert!(!format!("{state:?}").contains(secret));
+    assert_eq!(
+        registry.recover(context).await.unwrap().result_ref(),
+        Some(durable.result_ref())
+    );
+}
+
+#[tokio::test]
+async fn result_recorders_cannot_persist_metadata_for_different_content() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let store = Arc::new(TestLineageStore::default());
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone())
+        .with_result_recorder(Arc::new(ForgedResultRecorder));
+    registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+    let context = context(&manifest, json!({ "query": "hello" }));
+
+    assert_eq!(
+        registry.execute(context.clone()).await.unwrap_err().code(),
+        CapabilityErrorCode::OutputValidation
+    );
+    assert_eq!(
+        store
+            .load(context.invocation().id(), context.attempt().number())
+            .await
+            .unwrap(),
+        Some(CapabilityAttemptLineageState::Uncertain)
     );
 }
 

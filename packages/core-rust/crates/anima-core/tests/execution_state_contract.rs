@@ -1,9 +1,10 @@
 use anima_core::execution::Step;
 use anima_core::{
-    AgentDefinition, ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, Budget,
-    BudgetDecision, CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointCursor,
-    CheckpointV1, CheckpointV1Builder, CommandOutcome, CommandReceipt, CompletedInvocationRecord,
-    DefinitionPin, ExecutionErrorCode, ExecutionLease, InvocationAttemptRecord, LifecyclePolicy,
+    AgentDefinition, ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, AutonomyGrant,
+    Budget, BudgetDecision, CapabilityKind, CapabilityManifest, CapabilityReferenceId,
+    CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome, CommandReceipt,
+    CompletedInvocationRecord, DefinitionPin, ExecutionErrorCode, ExecutionLease, GrantConsumption,
+    GrantEffect, GrantScope, GrantStatus, InvocationAttemptRecord, LifecyclePolicy,
     LogicalInvocation, ManifestCatalog, ManifestPin, MemoryPolicy, ModelPolicy, OpaqueReference,
     PendingApprovalRecord, PolicyContext, PolicyEngine, PolicyRestrictions, ProfileRef,
     RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord, RecoveryTerminalResolution,
@@ -154,6 +155,76 @@ fn run_transitions_are_explicit_and_terminal_states_are_immutable() {
 }
 
 #[test]
+fn generic_transitions_cannot_bypass_resume_authorization() {
+    let running = Run::queued(id(1), id(2), "writer", 3)
+        .unwrap()
+        .transition(RunState::Running, None)
+        .unwrap();
+    let request = PolicyEngine::approval_request(
+        &approval_context_for(
+            &approval_manifest("workspace.write", 1),
+            &LogicalInvocation::new(
+                id(1),
+                "write",
+                "workspace.write",
+                1,
+                json!({ "path": "a.md" }),
+            )
+            .unwrap(),
+        ),
+        None,
+    )
+    .unwrap();
+    let waiting = running.wait_for_approval(request).unwrap();
+    assert!(waiting.transition(RunState::Running, None).is_err());
+
+    let manually_paused = running
+        .transition(RunState::Paused, Some(RunPauseReason::Requested))
+        .unwrap();
+    assert!(manually_paused.transition(RunState::Running, None).is_err());
+    assert_eq!(
+        manually_paused.resume(None, None).unwrap().state(),
+        RunState::Running
+    );
+
+    for (mode, reason) in [
+        (
+            RecoveryMode::KeyedIdempotent,
+            RecoveryPauseReason::Retryable,
+        ),
+        (RecoveryMode::Manual, RecoveryPauseReason::ManualReview),
+        (
+            RecoveryMode::NonRetryable,
+            RecoveryPauseReason::ManualReview,
+        ),
+    ] {
+        let invocation = LogicalInvocation::new(
+            id(1),
+            format!("pause-{mode:?}"),
+            "workspace.write",
+            1,
+            json!({ "path": "a.md" }),
+        )
+        .unwrap();
+        let pause = RecoveryPauseRecord::new(
+            invocation.binding(),
+            1,
+            ManifestPin::new_with_recovery_mode(
+                "workspace.write",
+                1,
+                format!("sha256:{mode:?}"),
+                mode,
+            )
+            .unwrap(),
+            reason,
+        )
+        .unwrap();
+        let paused = running.pause_for_recovery(pause).unwrap();
+        assert!(paused.transition(RunState::Running, None).is_err());
+    }
+}
+
+#[test]
 fn arbitrary_uuid_resume_claims_are_rejected_and_control_applies_at_safe_boundary() {
     let running = Run::queued(id(1), id(2), "writer", 3)
         .unwrap()
@@ -195,7 +266,7 @@ fn approval_resume_requires_the_exact_pending_request_command_and_live_claim() {
     let context = approval_context(json!({ "path": "a.md" }));
     let request = PolicyEngine::approval_request(&context, None).unwrap();
     let decision = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
-    let claim = ApprovalResumeClaim::new(&request, &decision, &context).unwrap();
+    let claim = ApprovalResumeClaim::new(&request, &decision, &context, &[]).unwrap();
     let waiting = Run::queued(id(1), id(2), "writer", 3)
         .unwrap()
         .transition(RunState::Running, None)
@@ -215,13 +286,60 @@ fn approval_resume_requires_the_exact_pending_request_command_and_live_claim() {
     let other_request = PolicyEngine::approval_request(&other_context, None).unwrap();
     let other_decision = ApprovalDecision::new_approved(other_request.clone(), 1_000).unwrap();
     let other_claim =
-        ApprovalResumeClaim::new(&other_request, &other_decision, &other_context).unwrap();
+        ApprovalResumeClaim::new(&other_request, &other_decision, &other_context, &[]).unwrap();
     let other_command =
         RuntimeCommand::resume_with_approval(id(51), id(2), id(1), other_claim.binding().clone())
             .unwrap();
     assert!(waiting
         .apply_resume_command(&other_command, Some(&other_claim), None)
         .is_err());
+}
+
+#[test]
+fn approval_resume_claim_binds_live_grant_and_consumption_proposal() {
+    let context = approval_context(json!({ "path": "a.md" }));
+    let scope = GrantScope::new(
+        context.owner_id.clone(),
+        context.actor_id.clone(),
+        context.agent_definition_id.clone(),
+        context.agent_definition_version,
+        context.workspace_id.clone(),
+        context.resource_boundary.clone(),
+        context.capability_id.clone(),
+        context.manifest_version,
+        Some(context.canonical_argument_digest),
+    )
+    .unwrap();
+    let grant = AutonomyGrant::new_with_effect(
+        "approval-grant",
+        1,
+        GrantStatus::Active,
+        scope,
+        RiskLevel::High,
+        500,
+        Some(2_000),
+        Some(1),
+        GrantEffect::ApprovalRequired,
+    )
+    .unwrap();
+    let request = PolicyEngine::approval_request(&context, Some(&grant)).unwrap();
+    let decision = ApprovalDecision::new_approved(request.clone(), 1_000).unwrap();
+    let claim = ApprovalResumeClaim::new(&request, &decision, &context, &[grant.clone()]).unwrap();
+    assert_eq!(
+        claim.grant_consumption(),
+        Some(&GrantConsumption::new("approval-grant", 1, context.logical_invocation_id).unwrap())
+    );
+
+    assert!(ApprovalResumeClaim::new(&request, &decision, &context, &[]).is_err());
+    let mut revoked = grant.clone();
+    revoked.status = GrantStatus::Revoked;
+    assert!(ApprovalResumeClaim::new(&request, &decision, &context, &[revoked]).is_err());
+    let mut expired = grant.clone();
+    expired.valid_until_ms = Some(1_000);
+    assert!(ApprovalResumeClaim::new(&request, &decision, &context, &[expired]).is_err());
+    let mut revised = grant;
+    revised.revision = 2;
+    assert!(ApprovalResumeClaim::new(&request, &decision, &context, &[revised]).is_err());
 }
 
 #[test]
@@ -336,6 +454,42 @@ fn events_are_contiguous_and_token_deltas_are_live_not_checkpoint_semantic() {
 }
 
 #[test]
+fn durable_events_require_positive_nondecreasing_timestamps() {
+    assert!(RuntimeEvent::new(
+        id(9),
+        id(8),
+        id(7),
+        id(1),
+        0,
+        1,
+        RuntimeEventKind::RunStarted,
+    )
+    .is_err());
+
+    let first = RuntimeEvent::new(
+        id(9),
+        id(8),
+        id(7),
+        id(1),
+        20,
+        1,
+        RuntimeEventKind::RunStarted,
+    )
+    .unwrap();
+    let backwards = RuntimeEvent::new(
+        id(10),
+        id(8),
+        id(7),
+        id(1),
+        19,
+        2,
+        RuntimeEventKind::StepStarted,
+    )
+    .unwrap();
+    assert!(RuntimeEvent::validate_batch(1, &[first, backwards]).is_err());
+}
+
+#[test]
 fn durable_event_vocabulary_is_complete_and_live_events_validate_standalone() {
     let durable = [
         RuntimeEventKind::StepStarted,
@@ -384,6 +538,49 @@ fn command_receipts_are_idempotent_only_for_same_canonical_payload() {
     let conflicting = RuntimeCommand::pause(id(1), id(2), id(3)).unwrap();
     assert!(receipt.replay(&conflicting).is_err());
     assert_eq!(command.kind(), RuntimeCommandKind::Start);
+}
+
+#[test]
+fn durable_execution_records_expose_identity_and_safe_read_models() {
+    let run = Run::queued(id(1), id(2), "writer", 3).unwrap();
+    assert_eq!(run.definition_id(), "writer");
+    assert_eq!(run.definition_version(), 3);
+
+    let step = Step::new(id(1), "step-a", StepKind::Capability).unwrap();
+    assert_eq!(step.run_id(), id(1));
+    assert_eq!(step.logical_step_id(), "step-a");
+    assert_eq!(step.kind(), StepKind::Capability);
+
+    let command = RuntimeCommand::start(id(3), id(2), id(1)).unwrap();
+    assert_eq!(command.session_id(), id(2));
+    assert_eq!(command.target_run_id(), id(1));
+    assert_ne!(command.payload_digest(), Uuid::nil());
+
+    let rejected = CommandReceipt::rejected(&command).unwrap();
+    assert_eq!(rejected.command_id(), command.id());
+    assert_eq!(rejected.payload_digest(), command.payload_digest());
+    assert_eq!(rejected.outcome(), CommandOutcome::Rejected);
+    assert_eq!(rejected.replay(&command).unwrap(), CommandOutcome::Rejected);
+
+    let event = RuntimeEvent::with_payload(
+        id(4),
+        id(5),
+        id(2),
+        id(1),
+        10,
+        1,
+        RuntimeEventKind::ArtifactRecorded,
+        SafeEventPayload::Reference { reference: id(6) },
+    )
+    .unwrap();
+    assert_eq!(event.event_id(), id(4));
+    assert_eq!(event.owner_id(), id(5));
+    assert_eq!(event.session_id(), id(2));
+    assert_eq!(event.timestamp_ms(), 10);
+    assert_eq!(
+        event.payload(),
+        &SafeEventPayload::Reference { reference: id(6) }
+    );
 }
 
 #[test]
@@ -720,6 +917,33 @@ fn budget_usage_is_checked_and_policy_driven() {
 }
 
 #[test]
+fn concurrent_run_usage_is_a_latest_value_gauge_not_an_accumulating_counter() {
+    let budget = Budget {
+        max_concurrent_runs: Some(1),
+        ..Budget::default()
+    };
+    let active = Usage::default().with_concurrent_runs(1);
+    let completed = Usage::default().with_concurrent_runs(0);
+
+    let idle = budget.accumulate(&active, &completed).unwrap();
+    assert_eq!(idle.concurrent_runs(), 0);
+    assert_eq!(
+        budget
+            .accumulate(&idle, &Usage::default().with_concurrent_runs(1))
+            .unwrap()
+            .concurrent_runs(),
+        1
+    );
+    assert_eq!(
+        budget
+            .accumulate(&idle, &Usage::default().with_concurrent_runs(2))
+            .unwrap_err()
+            .code(),
+        ExecutionErrorCode::BudgetExceeded
+    );
+}
+
+#[test]
 fn standalone_budget_and_usage_serde_revalidate_invariants() {
     let mut usage = serde_json::to_value(Usage::default()).unwrap();
     usage["total_tokens"] = serde_json::json!(1);
@@ -824,6 +1048,13 @@ fn manual_recovery_pause_has_no_automatic_resume_path() {
             result_ref: Uuid::nil()
         })
         .is_err());
+    let adopted = run
+        .resolve_recovery_terminal(RecoveryTerminalResolution::AdoptExternallyVerifiedResult {
+            result_ref: id(61),
+        })
+        .unwrap();
+    assert_eq!(adopted.state(), RunState::Completed);
+    assert_eq!(adopted.adopted_result_ref().unwrap().value(), id(61));
     let attempt = InvocationAttemptRecord::new(
         invocation.binding(),
         1,

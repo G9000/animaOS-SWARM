@@ -304,6 +304,10 @@ pub const MAX_CAPABILITY_ID_BYTES: usize = 256;
 pub const MAX_CAPABILITY_SECRET_REFERENCES: usize = (u16::MAX as usize) + 1;
 const RECOVERY_RESUME_BINDING_NAMESPACE: Uuid =
     Uuid::from_u128(0x9e12_2517_19cb_5f46_a51c_9620_1dc5_4208);
+const CAPABILITY_SCOPE_BINDING_NAMESPACE: Uuid =
+    Uuid::from_u128(0xb553_eac9_2fd5_5b94_8bc8_d388_21f4_99ce);
+const CAPABILITY_RESULT_NAMESPACE: Uuid =
+    Uuid::from_u128(0xa17f_9f2d_e34e_5f5a_a325_90aa_88d9_c34f);
 
 /// Errors raised before an argument value enters schema validation or an executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -680,20 +684,23 @@ pub struct CapabilityExecutionReferences {
     deadline: Option<CapabilityReferenceId>,
     cancellation: Option<CapabilityReferenceId>,
     secrets: Vec<CapabilitySecretReferenceId>,
+    scope_binding: Uuid,
 }
 
 impl CapabilityExecutionReferences {
-    fn for_run(run_id: Uuid) -> Self {
+    fn for_invocation(invocation: &LogicalInvocation) -> Self {
         Self {
             owner: None,
             agent: None,
             session: None,
-            run: CapabilityReferenceId::new(run_id),
+            run: CapabilityReferenceId::new(invocation.run_id()),
             workspace: None,
             deadline: None,
             cancellation: None,
             secrets: Vec::new(),
+            scope_binding: Uuid::nil(),
         }
+        .bind_to(invocation)
     }
 
     pub fn with_owner(mut self, reference: CapabilityReferenceId) -> Self {
@@ -761,6 +768,65 @@ impl CapabilityExecutionReferences {
             usize::from(reference.manifest_index()) < manifest.secret_references.len()
         })
     }
+
+    fn bind_to(mut self, invocation: &LogicalInvocation) -> Self {
+        self.scope_binding = scope_binding(invocation, &self);
+        self
+    }
+
+    fn is_bound_to(&self, invocation: &LogicalInvocation) -> bool {
+        self.run.handle() == invocation.run_id()
+            && self.scope_binding == scope_binding(invocation, self)
+    }
+
+    fn is_run_only(&self) -> bool {
+        self.owner.is_none()
+            && self.agent.is_none()
+            && self.session.is_none()
+            && self.workspace.is_none()
+            && self.deadline.is_none()
+            && self.cancellation.is_none()
+    }
+}
+
+fn scope_binding(
+    invocation: &LogicalInvocation,
+    references: &CapabilityExecutionReferences,
+) -> Uuid {
+    let handles = [
+        references.owner.as_ref(),
+        references.agent.as_ref(),
+        references.session.as_ref(),
+        references.workspace.as_ref(),
+        references.deadline.as_ref(),
+        references.cancellation.as_ref(),
+    ]
+    .map(|reference| {
+        reference
+            .map(CapabilityReferenceId::handle)
+            .unwrap_or_default()
+    });
+    let name = format!(
+        "{}:{}:{}:{handles:?}:{:?}",
+        invocation.id(),
+        invocation.canonical_argument_digest(),
+        references.run.handle(),
+        references
+            .secrets
+            .iter()
+            .map(|reference| reference.manifest_index())
+            .collect::<Vec<_>>()
+    );
+    Uuid::new_v5(&CAPABILITY_SCOPE_BINDING_NAMESPACE, name.as_bytes())
+}
+
+#[async_trait]
+pub trait CapabilityReferenceValidator: Send + Sync {
+    async fn validate(
+        &self,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+    ) -> Result<(), CapabilityError>;
 }
 
 impl fmt::Debug for CapabilityExecutionReferences {
@@ -953,7 +1019,7 @@ impl CapabilityExecutionContext {
         if references.run != expected_run {
             return Err(CapabilityContextError::RunReferenceMismatch);
         }
-        self.references = references;
+        self.references = references.bind_to(&self.invocation);
         Ok(self)
     }
 
@@ -969,7 +1035,7 @@ impl CapabilityExecutionContext {
             return Err(CapabilityContextError::AttemptIdentityMismatch);
         }
         Ok(Self {
-            references: CapabilityExecutionReferences::for_run(invocation.run_id()),
+            references: CapabilityExecutionReferences::for_invocation(&invocation),
             invocation,
             attempt,
             execution_fence: None,
@@ -1042,7 +1108,9 @@ impl<'de> Deserialize<'de> for CapabilityExecutionContext {
         let snapshot = CapabilityExecutionContextDeserialization::deserialize(deserializer)?;
         let mut context = Self::try_new(snapshot.invocation, snapshot.attempt)
             .map_err(serde::de::Error::custom)?;
-        if snapshot.references.run != context.references.run {
+        if snapshot.references.run != context.references.run
+            || !snapshot.references.is_bound_to(&context.invocation)
+        {
             return Err(serde::de::Error::custom(
                 CapabilityContextError::RunReferenceMismatch,
             ));
@@ -1068,6 +1136,122 @@ impl fmt::Debug for CapabilityExecutionContext {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CapabilityResult {
     pub output: Value,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurableCapabilityStatus {
+    Completed,
+    Adopted,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableCapabilityResult {
+    result_ref: CapabilityReferenceId,
+    content_digest: String,
+    schema_digest: String,
+    size_bytes: u64,
+    status: DurableCapabilityStatus,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableCapabilityResultWire {
+    result_ref: CapabilityReferenceId,
+    content_digest: String,
+    schema_digest: String,
+    size_bytes: u64,
+    status: DurableCapabilityStatus,
+}
+
+impl DurableCapabilityResult {
+    pub fn new(
+        result_ref: CapabilityReferenceId,
+        content_digest: impl Into<String>,
+        schema_digest: impl Into<String>,
+        size_bytes: u64,
+        status: DurableCapabilityStatus,
+    ) -> Result<Self, CapabilityError> {
+        let value = Self {
+            result_ref,
+            content_digest: content_digest.into(),
+            schema_digest: schema_digest.into(),
+            size_bytes,
+            status,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), CapabilityError> {
+        if self.result_ref.handle().is_nil()
+            || !self.content_digest.starts_with("jcs-v1:")
+            || self.content_digest.len() <= "jcs-v1:".len()
+            || !self.schema_digest.starts_with("sha256:")
+            || self.schema_digest.len() <= "sha256:".len()
+            || self.size_bytes == 0
+        {
+            return Err(CapabilityError::validation());
+        }
+        Ok(())
+    }
+
+    pub fn result_ref(&self) -> &CapabilityReferenceId {
+        &self.result_ref
+    }
+    pub fn content_digest(&self) -> &str {
+        &self.content_digest
+    }
+    pub fn schema_digest(&self) -> &str {
+        &self.schema_digest
+    }
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
+    pub fn status(&self) -> DurableCapabilityStatus {
+        self.status
+    }
+}
+
+impl fmt::Debug for DurableCapabilityResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableCapabilityResult")
+            .field("result_ref", &"REDACTED")
+            .field("content_digest", &"REDACTED")
+            .field("schema_digest", &"REDACTED")
+            .field("size_bytes", &self.size_bytes)
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for DurableCapabilityResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = DurableCapabilityResultWire::deserialize(deserializer)?;
+        Self::new(
+            wire.result_ref,
+            wire.content_digest,
+            wire.schema_digest,
+            wire.size_bytes,
+            wire.status,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[async_trait]
+pub trait CapabilityResultRecorder: Send + Sync {
+    async fn record(
+        &self,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+        result: &CapabilityResult,
+    ) -> Result<DurableCapabilityResult, CapabilityError>;
 }
 
 impl CapabilityResult {
@@ -1219,9 +1403,10 @@ pub enum RecoveryAction {
         idempotency_key: String,
         authorization: CapabilityRetryAuthorization,
     },
-    Completed(CapabilityResult),
+    Completed(DurableCapabilityResult),
     Pending,
     AuthoritativeAbsence,
+    CompensationRequired,
     RecoveryRequired,
 }
 
@@ -1469,6 +1654,7 @@ pub enum RecoveryActionKind {
     Completed,
     Pending,
     AuthoritativeAbsence,
+    CompensationRequired,
     RecoveryRequired,
 }
 
@@ -1479,6 +1665,7 @@ impl RecoveryAction {
             Self::Completed(_) => RecoveryActionKind::Completed,
             Self::Pending => RecoveryActionKind::Pending,
             Self::AuthoritativeAbsence => RecoveryActionKind::AuthoritativeAbsence,
+            Self::CompensationRequired => RecoveryActionKind::CompensationRequired,
             Self::RecoveryRequired => RecoveryActionKind::RecoveryRequired,
         }
     }
@@ -1486,6 +1673,13 @@ impl RecoveryAction {
     pub fn retry_authorization(&self) -> Option<&CapabilityRetryAuthorization> {
         match self {
             Self::RetrySameKey { authorization, .. } => Some(authorization),
+            _ => None,
+        }
+    }
+
+    pub fn result_ref(&self) -> Option<&CapabilityReferenceId> {
+        match self {
+            Self::Completed(result) => Some(result.result_ref()),
             _ => None,
         }
     }

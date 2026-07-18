@@ -364,6 +364,12 @@ impl CompletedInvocationRecord {
     pub fn result_ref(&self) -> &OpaqueReference {
         &self.result_ref
     }
+    pub fn manifest(&self) -> &ManifestPin {
+        &self.manifest
+    }
+    pub fn recovery_mode(&self) -> RecoveryMode {
+        self.recovery_mode
+    }
 }
 impl<'de> Deserialize<'de> for CompletedInvocationRecord {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
