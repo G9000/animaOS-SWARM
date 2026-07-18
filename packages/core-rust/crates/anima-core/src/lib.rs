@@ -37,8 +37,8 @@ pub use definition::{
 };
 pub use events::{EngineEvent, EventType};
 pub use execution::{
-    ApprovalResumeBinding, ApprovalResumeClaim, Attempt, AttemptRecordState, Budget,
-    BudgetDecision, CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome,
+    ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, AttemptRecordState,
+    Budget, BudgetDecision, CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome,
     CommandReceipt, CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionErrorCode,
     ExecutionLease, InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin, OpaqueReference,
     PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord, RecoveryRecord,

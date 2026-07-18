@@ -46,31 +46,12 @@ impl CapabilityReferenceValidator for InvocationBoundReferenceValidator {
 impl CapabilityResultRecorder for InMemoryCapabilityResultRecorder {
     async fn record(
         &self,
-        context: &CapabilityExecutionContext,
-        manifest: &CapabilityManifest,
-        result: &CapabilityResult,
-    ) -> Result<DurableCapabilityResult, CapabilityError> {
-        let bytes =
-            serde_jcs::to_vec(&result.output).map_err(|_| CapabilityError::output_validation())?;
-        let digest = Uuid::new_v5(&CAPABILITY_RESULT_NAMESPACE, &bytes);
-        let result_ref = Uuid::new_v5(
-            &CAPABILITY_RESULT_NAMESPACE,
-            format!(
-                "{}:{}:{}:{}",
-                context.invocation().id(),
-                context.attempt().number(),
-                manifest.schema_digest,
-                digest
-            )
-            .as_bytes(),
-        );
-        DurableCapabilityResult::new(
-            CapabilityReferenceId::new(result_ref),
-            format!("jcs-v1:{digest}"),
-            manifest.schema_digest.clone(),
-            u64::try_from(bytes.len()).map_err(|_| CapabilityError::output_validation())?,
-            DurableCapabilityStatus::Completed,
-        )
+        _context: &CapabilityExecutionContext,
+        _manifest: &CapabilityManifest,
+        _result: &CapabilityResult,
+        _durable: &DurableCapabilityResult,
+    ) -> Result<(), CapabilityError> {
+        Ok(())
     }
 }
 
@@ -353,8 +334,8 @@ impl CapabilityRegistry {
                     return Ok(RecoveryAction::Completed(result));
                 }
                 CapabilityAttemptLineageState::RecoveryRequired => {
-                    if manifest.recovery_mode == RecoveryMode::Compensate
-                        && self
+                    if manifest.recovery_mode == RecoveryMode::Compensate {
+                        if self
                             .lineage
                             .compare_exchange(
                                 key.0,
@@ -363,8 +344,10 @@ impl CapabilityRegistry {
                                 CapabilityAttemptLineageState::CompensationRequired,
                             )
                             .await?
-                    {
-                        return Ok(RecoveryAction::CompensationRequired);
+                        {
+                            return Ok(RecoveryAction::CompensationRequired);
+                        }
+                        continue;
                     }
                     return Ok(RecoveryAction::RecoveryRequired);
                 }
@@ -546,20 +529,18 @@ impl CapabilityRegistry {
             self.transition_to_uncertain(key, executing).await?;
             return Err(error);
         }
-        let durable = match self
+        let durable = durable_result(context, manifest, &result)?;
+        match self
             .result_recorder
-            .record(context, manifest, &result)
+            .record(context, manifest, &result, &durable)
             .await
-            .and_then(|durable| {
-                validate_recorded_result(manifest, &result, &durable)?;
-                Ok(durable)
-            }) {
-            Ok(durable) => durable,
+        {
+            Ok(()) => {}
             Err(error) => {
                 self.transition_to_uncertain(key, executing).await?;
                 return Err(error);
             }
-        };
+        }
         if self
             .lineage
             .compare_exchange(
@@ -689,20 +670,18 @@ impl CapabilityRegistry {
                         .await?;
                     return Err(error);
                 }
-                let durable = match self
+                let durable = durable_result(context, manifest, &result)?;
+                match self
                     .result_recorder
-                    .record(context, manifest, &result)
+                    .record(context, manifest, &result, &durable)
                     .await
-                    .and_then(|durable| {
-                        validate_recorded_result(manifest, &result, &durable)?;
-                        Ok(durable)
-                    }) {
-                    Ok(durable) => durable,
+                {
+                    Ok(()) => {}
                     Err(error) => {
                         self.transition_to_uncertain(key, reconciling).await?;
                         return Err(error);
                     }
-                };
+                }
                 if self
                     .lineage
                     .compare_exchange(
@@ -920,24 +899,32 @@ fn validate_result(
     Ok(())
 }
 
-fn validate_recorded_result(
+fn durable_result(
+    context: &CapabilityExecutionContext,
     manifest: &CapabilityManifest,
     result: &CapabilityResult,
-    durable: &DurableCapabilityResult,
-) -> Result<(), CapabilityError> {
+) -> Result<DurableCapabilityResult, CapabilityError> {
     let bytes =
         serde_jcs::to_vec(&result.output).map_err(|_| CapabilityError::output_validation())?;
     let digest = Uuid::new_v5(&CAPABILITY_RESULT_NAMESPACE, &bytes);
+    let result_ref = Uuid::new_v5(
+        &CAPABILITY_RESULT_NAMESPACE,
+        format!(
+            "{}:{}",
+            context.invocation().id(),
+            context.attempt().number()
+        )
+        .as_bytes(),
+    );
     let size_bytes =
         u64::try_from(bytes.len()).map_err(|_| CapabilityError::output_validation())?;
-    if durable.content_digest() != format!("jcs-v1:{digest}")
-        || durable.schema_digest() != manifest.schema_digest
-        || durable.size_bytes() != size_bytes
-        || durable.status() != DurableCapabilityStatus::Completed
-    {
-        return Err(CapabilityError::output_validation());
-    }
-    Ok(())
+    DurableCapabilityResult::new(
+        CapabilityReferenceId::new(result_ref),
+        format!("jcs-v1:{digest}"),
+        manifest.schema_digest.clone(),
+        size_bytes,
+        DurableCapabilityStatus::Completed,
+    )
 }
 
 fn execution_lease_duration_ms(manifest: &CapabilityManifest) -> u64 {

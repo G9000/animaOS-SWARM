@@ -11,11 +11,11 @@ use anima_core::{
     CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId,
     CapabilityReferenceValidator, CapabilityRegistry, CapabilityRegistryError, CapabilityResult,
     CapabilityResultRecorder, CapabilitySecretReferenceId, CheckpointV1, CheckpointV1Builder,
-    DefinitionPin, DurableCapabilityResult, DurableCapabilityStatus, ExecutionFence,
-    InvocationAttemptRecord, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ManifestPin,
-    ReconcileOutcome, RecoveryActionKind, RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord,
-    RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility,
-    UncertainInvocationRecord, Usage,
+    DefinitionPin, DurableCapabilityResult, ExecutionFence, InvocationAttemptRecord,
+    LogicalInvocation, ManifestCatalog, ManifestCatalogError, ManifestPin, ReconcileOutcome,
+    RecoveryActionKind, RecoveryMode, RecoveryPauseReason, RecoveryPauseRecord, RiskLevel, Run,
+    RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility, UncertainInvocationRecord,
+    Usage,
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -72,23 +72,45 @@ fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
     CapabilityRegistry::new(catalog)
 }
 
-struct ForgedResultRecorder;
+struct RejectingResultRecorder;
 
 #[async_trait]
-impl CapabilityResultRecorder for ForgedResultRecorder {
+impl CapabilityResultRecorder for RejectingResultRecorder {
     async fn record(
         &self,
         _context: &CapabilityExecutionContext,
-        manifest: &CapabilityManifest,
+        _manifest: &CapabilityManifest,
         _result: &CapabilityResult,
-    ) -> Result<DurableCapabilityResult, CapabilityError> {
-        DurableCapabilityResult::new(
-            CapabilityReferenceId::new(Uuid::from_u128(900)),
-            "jcs-v1:wrong-content",
-            manifest.schema_digest.clone(),
-            1,
-            DurableCapabilityStatus::Completed,
-        )
+        _durable: &DurableCapabilityResult,
+    ) -> Result<(), CapabilityError> {
+        Err(CapabilityError::output_validation())
+    }
+}
+
+#[derive(Default)]
+struct StableRepeatedResultRecorder {
+    records: Mutex<BTreeMap<(Uuid, u32), DurableCapabilityResult>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CapabilityResultRecorder for StableRepeatedResultRecorder {
+    async fn record(
+        &self,
+        context: &CapabilityExecutionContext,
+        _manifest: &CapabilityManifest,
+        _result: &CapabilityResult,
+        durable: &DurableCapabilityResult,
+    ) -> Result<(), CapabilityError> {
+        let key = (context.invocation().id(), context.attempt().number());
+        let mut records = self.records.lock().unwrap();
+        if let Some(recorded) = records.get(&key) {
+            assert_eq!(recorded, durable);
+        } else {
+            records.insert(key, durable.clone());
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -97,6 +119,8 @@ struct TestLineageStore {
     states: Mutex<BTreeMap<(Uuid, u32), CapabilityAttemptLineageState>>,
     authoritative_now_ms: AtomicU64,
     renewals: AtomicUsize,
+    fail_compensation_upgrade_once: AtomicUsize,
+    fail_completion_cas_once: AtomicUsize,
 }
 
 #[async_trait]
@@ -123,6 +147,25 @@ impl CapabilityLineageStore for TestLineageStore {
     ) -> Result<bool, CapabilityError> {
         let mut states = self.states.lock().unwrap();
         if states.get(&(invocation_id, attempt_number)) != current.as_ref() {
+            return Ok(false);
+        }
+        if current == Some(CapabilityAttemptLineageState::RecoveryRequired)
+            && new == CapabilityAttemptLineageState::CompensationRequired
+            && self
+                .fail_compensation_upgrade_once
+                .swap(0, Ordering::SeqCst)
+                == 1
+        {
+            states.insert((invocation_id, attempt_number), new);
+            return Ok(false);
+        }
+        if matches!(new, CapabilityAttemptLineageState::Completed(_))
+            && self.fail_completion_cas_once.swap(0, Ordering::SeqCst) == 1
+        {
+            states.insert(
+                (invocation_id, attempt_number),
+                CapabilityAttemptLineageState::Uncertain,
+            );
             return Ok(false);
         }
         states.insert((invocation_id, attempt_number), new);
@@ -910,6 +953,28 @@ async fn compensate_recovery_never_authorizes_a_retry_for_any_reconcile_outcome(
             .unwrap()
             .is_none());
     }
+}
+
+#[tokio::test]
+async fn compensate_recovery_reloads_after_losing_the_terminal_upgrade_cas() {
+    let manifest = manifest("workspace.compensate", 1, RecoveryMode::Compensate);
+    let context = context(&manifest, json!({ "query": "hello" }));
+    let store = Arc::new(TestLineageStore::default());
+    store.states.lock().unwrap().insert(
+        (context.invocation().id(), context.attempt().number()),
+        CapabilityAttemptLineageState::RecoveryRequired,
+    );
+    store
+        .fail_compensation_upgrade_once
+        .store(1, Ordering::SeqCst);
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest).unwrap();
+    let registry = CapabilityRegistry::with_lineage_store(catalog, store);
+
+    assert_eq!(
+        registry.recover(context).await.unwrap().kind(),
+        RecoveryActionKind::CompensationRequired
+    );
 }
 
 #[test]
@@ -1984,13 +2049,46 @@ async fn durable_lineage_records_only_opaque_result_metadata() {
 }
 
 #[tokio::test]
-async fn result_recorders_cannot_persist_metadata_for_different_content() {
+async fn result_recording_is_at_least_once_with_stable_attempt_identity() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let context = context(&manifest, json!({ "query": "hello" }));
+    let recorder = Arc::new(StableRepeatedResultRecorder::default());
+    let store = Arc::new(TestLineageStore::default());
+    store.fail_completion_cas_once.store(1, Ordering::SeqCst);
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut executor = RecordingExecutor::new(manifest.clone());
+    executor.reconcile_result = ReconcileOutcome::Completed(CapabilityResult::new(json!({
+        "ok": true
+    })));
+    let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone())
+        .with_result_recorder(recorder.clone());
+    registry.register_executor(Arc::new(executor)).unwrap();
+
+    registry.execute(context.clone()).await.unwrap_err();
+    assert_eq!(
+        registry.recover(context.clone()).await.unwrap().kind(),
+        RecoveryActionKind::Completed
+    );
+    let state = store
+        .load(context.invocation().id(), context.attempt().number())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(state, CapabilityAttemptLineageState::Completed(_)));
+
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(recorder.records.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn result_recorder_failure_leaves_the_attempt_uncertain() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
     let store = Arc::new(TestLineageStore::default());
     let mut catalog = ManifestCatalog::default();
     catalog.register_manifest(manifest.clone()).unwrap();
     let mut registry = CapabilityRegistry::with_lineage_store(catalog, store.clone())
-        .with_result_recorder(Arc::new(ForgedResultRecorder));
+        .with_result_recorder(Arc::new(RejectingResultRecorder));
     registry
         .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
         .unwrap();

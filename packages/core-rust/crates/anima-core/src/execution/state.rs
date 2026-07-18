@@ -231,6 +231,26 @@ impl Deref for RecoveryTerminalOutcome {
     }
 }
 
+/// A validated approval resume and the counted-grant consumption that the host must commit
+/// atomically with the resumed run state.
+#[must_use = "persist grant_consumption atomically with the resumed run state"]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalResumeOutcome {
+    run: Run,
+    grant_consumption: Option<GrantConsumption>,
+}
+impl ApprovalResumeOutcome {
+    pub fn run(&self) -> &Run {
+        &self.run
+    }
+    pub fn grant_consumption(&self) -> Option<&GrantConsumption> {
+        self.grant_consumption.as_ref()
+    }
+    pub fn into_parts(self) -> (Run, Option<GrantConsumption>) {
+        (self.run, self.grant_consumption)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Run {
     id: Uuid,
@@ -440,14 +460,14 @@ impl Run {
         decision: &ApprovalDecision,
         context: &PolicyContext,
         grants: &[AutonomyGrant],
-    ) -> Result<Self, ExecutionError> {
+    ) -> Result<ApprovalResumeOutcome, ExecutionError> {
         let claim = ApprovalResumeClaim::new(pending, decision, context, grants)?;
         if self.pending_approval.as_ref() != Some(pending)
             || claim.binding.decision.request != *pending
         {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
-        Self::from_parts(
+        let run = Self::from_parts(
             self.id,
             self.session_id,
             self.definition_id.clone(),
@@ -456,7 +476,11 @@ impl Run {
             None,
             None,
             None,
-        )
+        )?;
+        Ok(ApprovalResumeOutcome {
+            run,
+            grant_consumption: claim.grant_consumption,
+        })
     }
 
     pub fn apply_resume_command(

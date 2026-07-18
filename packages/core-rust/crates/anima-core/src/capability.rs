@@ -1246,12 +1246,21 @@ impl<'de> Deserialize<'de> for DurableCapabilityResult {
 
 #[async_trait]
 pub trait CapabilityResultRecorder: Send + Sync {
+    /// Persists one executor result outside portable lineage under the core-minted
+    /// `durable.result_ref()`.
+    ///
+    /// Delivery is at least once: a crash after this method commits but before lineage CAS may
+    /// call it again for the same `(logical_invocation_id, attempt_number)`. Implementations must
+    /// perform an idempotent upsert, return success for an identical replay, and reject conflicting
+    /// content for an already-recorded attempt. Core supplies stable reference and digest metadata
+    /// and never writes the raw result into lineage.
     async fn record(
         &self,
         context: &CapabilityExecutionContext,
         manifest: &CapabilityManifest,
         result: &CapabilityResult,
-    ) -> Result<DurableCapabilityResult, CapabilityError>;
+        durable: &DurableCapabilityResult,
+    ) -> Result<(), CapabilityError>;
 }
 
 impl CapabilityResult {
