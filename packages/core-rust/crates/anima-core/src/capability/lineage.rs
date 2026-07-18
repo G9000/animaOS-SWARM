@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -8,7 +9,12 @@ use uuid::Uuid;
 
 use super::{CapabilityError, CapabilityResult};
 
-pub const CAPABILITY_EXECUTION_LEASE_MS: u64 = 30_000;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityLeaseKind {
+    Executing,
+    RetryExecuting,
+    Reconciling,
+}
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum CapabilityAttemptLineageState {
@@ -78,6 +84,34 @@ pub trait CapabilityLineageStore: Send + Sync {
         current: Option<CapabilityAttemptLineageState>,
         new: CapabilityAttemptLineageState,
     ) -> Result<bool, CapabilityError>;
+
+    /// Atomically creates a fenced lease using the store's own time authority.
+    async fn acquire_lease(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: Option<CapabilityAttemptLineageState>,
+        kind: CapabilityLeaseKind,
+        lease_duration_ms: u64,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError>;
+
+    /// Atomically renews the exact fence only while its prior lease remains unexpired.
+    async fn renew_lease(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: CapabilityAttemptLineageState,
+        lease_duration_ms: u64,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError>;
+
+    /// Atomically replaces the exact lease only when it is expired by store-authoritative time.
+    async fn expire_lease(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: CapabilityAttemptLineageState,
+        new: CapabilityAttemptLineageState,
+    ) -> Result<bool, CapabilityError>;
 }
 
 #[derive(Default)]
@@ -113,5 +147,124 @@ impl CapabilityLineageStore for InMemoryCapabilityLineageStore {
         }
         states.insert((logical_invocation_id, attempt_number), new);
         Ok(true)
+    }
+
+    async fn acquire_lease(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: Option<CapabilityAttemptLineageState>,
+        kind: CapabilityLeaseKind,
+        lease_duration_ms: u64,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
+        let mut states = self.states.lock().await;
+        if states.get(&(logical_invocation_id, attempt_number)) != current.as_ref() {
+            return Ok(None);
+        }
+        let state = lease_state(
+            kind,
+            Uuid::new_v4(),
+            now_ms().saturating_add(lease_duration_ms),
+        );
+        states.insert((logical_invocation_id, attempt_number), state.clone());
+        Ok(Some(state))
+    }
+
+    async fn renew_lease(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: CapabilityAttemptLineageState,
+        lease_duration_ms: u64,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
+        let mut states = self.states.lock().await;
+        if states.get(&(logical_invocation_id, attempt_number)) != Some(&current) {
+            return Ok(None);
+        }
+        let now_ms = now_ms();
+        let Some((kind, fence, lease_expires_at_ms)) = lease_parts(&current) else {
+            return Ok(None);
+        };
+        if lease_expires_at_ms <= now_ms {
+            return Ok(None);
+        }
+        let renewed = lease_state(kind, fence, now_ms.saturating_add(lease_duration_ms));
+        states.insert((logical_invocation_id, attempt_number), renewed.clone());
+        Ok(Some(renewed))
+    }
+
+    async fn expire_lease(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: CapabilityAttemptLineageState,
+        new: CapabilityAttemptLineageState,
+    ) -> Result<bool, CapabilityError> {
+        let mut states = self.states.lock().await;
+        if states.get(&(logical_invocation_id, attempt_number)) != Some(&current) {
+            return Ok(false);
+        }
+        let Some((_, _, lease_expires_at_ms)) = lease_parts(&current) else {
+            return Ok(false);
+        };
+        if lease_expires_at_ms > now_ms() {
+            return Ok(false);
+        }
+        states.insert((logical_invocation_id, attempt_number), new);
+        Ok(true)
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn lease_state(
+    kind: CapabilityLeaseKind,
+    fence: Uuid,
+    lease_expires_at_ms: u64,
+) -> CapabilityAttemptLineageState {
+    match kind {
+        CapabilityLeaseKind::Executing => CapabilityAttemptLineageState::Executing {
+            fence,
+            lease_expires_at_ms,
+        },
+        CapabilityLeaseKind::RetryExecuting => CapabilityAttemptLineageState::RetryExecuting {
+            fence,
+            lease_expires_at_ms,
+        },
+        CapabilityLeaseKind::Reconciling => CapabilityAttemptLineageState::Reconciling {
+            fence,
+            lease_expires_at_ms,
+        },
+    }
+}
+
+fn lease_parts(state: &CapabilityAttemptLineageState) -> Option<(CapabilityLeaseKind, Uuid, u64)> {
+    match state {
+        CapabilityAttemptLineageState::Executing {
+            fence,
+            lease_expires_at_ms,
+        } => Some((CapabilityLeaseKind::Executing, *fence, *lease_expires_at_ms)),
+        CapabilityAttemptLineageState::RetryExecuting {
+            fence,
+            lease_expires_at_ms,
+        } => Some((
+            CapabilityLeaseKind::RetryExecuting,
+            *fence,
+            *lease_expires_at_ms,
+        )),
+        CapabilityAttemptLineageState::Reconciling {
+            fence,
+            lease_expires_at_ms,
+        } => Some((
+            CapabilityLeaseKind::Reconciling,
+            *fence,
+            *lease_expires_at_ms,
+        )),
+        _ => None,
     }
 }

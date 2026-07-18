@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use futures::channel::oneshot;
+use futures::future::{select, Either};
+use futures::lock::Mutex;
+use futures_timer::Delay;
 use jsonschema::JSONSchema;
 use uuid::Uuid;
 
@@ -112,19 +117,37 @@ impl CapabilityRegistry {
             false,
         )?;
         let lineage_key = (context.invocation().id(), 1);
-        let executing = CapabilityAttemptLineageState::Executing {
-            fence: Uuid::new_v4(),
-            lease_expires_at_ms: lease_expires_at_ms(),
-        };
-        if !self
+        let lease_duration_ms = execution_lease_duration_ms(manifest);
+        let Some(executing) = self
             .lineage
-            .compare_exchange(lineage_key.0, lineage_key.1, None, executing.clone())
+            .acquire_lease(
+                lineage_key.0,
+                lineage_key.1,
+                None,
+                CapabilityLeaseKind::Executing,
+                lease_duration_ms,
+            )
             .await?
-        {
+        else {
             return Err(CapabilityError::validation());
-        }
+        };
+        let fence_token = lease_fence(&executing).ok_or_else(CapabilityError::execution)?;
         let executor = entry.executor.clone();
-        let execution = executor.execute(context).await;
+        let execution_fence = ExecutionFence::new(fence_token);
+        let execution = executor.execute(context.with_execution_fence(execution_fence.clone()));
+        let (execution, executing, heartbeat_error) = self
+            .await_with_heartbeat(
+                lineage_key,
+                executing,
+                lease_duration_ms,
+                execution_fence,
+                execution,
+            )
+            .await;
+        if let Some(error) = heartbeat_error {
+            self.transition_to_uncertain(lineage_key, executing).await?;
+            return Err(error);
+        }
         self.finish_execution(lineage_key, executing, execution, entry)
             .await
     }
@@ -147,23 +170,38 @@ impl CapabilityRegistry {
         let authorized = CapabilityAttemptLineageState::RetryAuthorized {
             authorization_id: authorization.nonce,
         };
-        let executing = CapabilityAttemptLineageState::RetryExecuting {
-            fence: Uuid::new_v4(),
-            lease_expires_at_ms: lease_expires_at_ms(),
-        };
-        if !self
+        let lease_duration_ms = execution_lease_duration_ms(manifest);
+        let Some(executing) = self
             .lineage
-            .compare_exchange(
+            .acquire_lease(
                 lineage_key.0,
                 lineage_key.1,
                 Some(authorized),
-                executing.clone(),
+                CapabilityLeaseKind::RetryExecuting,
+                lease_duration_ms,
             )
             .await?
-        {
+        else {
             return Err(CapabilityError::validation());
+        };
+        let fence_token = lease_fence(&executing).ok_or_else(CapabilityError::execution)?;
+        let execution_fence = ExecutionFence::new(fence_token);
+        let execution = entry
+            .executor
+            .execute(context.with_execution_fence(execution_fence.clone()));
+        let (execution, executing, heartbeat_error) = self
+            .await_with_heartbeat(
+                lineage_key,
+                executing,
+                lease_duration_ms,
+                execution_fence,
+                execution,
+            )
+            .await;
+        if let Some(error) = heartbeat_error {
+            self.transition_to_uncertain(lineage_key, executing).await?;
+            return Err(error);
         }
-        let execution = entry.executor.execute(context).await;
         self.finish_execution(lineage_key, executing, execution, entry)
             .await
     }
@@ -189,34 +227,23 @@ impl CapabilityRegistry {
                 CapabilityAttemptLineageState::RetryAuthorized { .. } => {
                     return Err(CapabilityError::validation());
                 }
-                CapabilityAttemptLineageState::Executing {
-                    lease_expires_at_ms,
-                    ..
-                }
-                | CapabilityAttemptLineageState::RetryExecuting {
-                    lease_expires_at_ms,
-                    ..
-                }
-                | CapabilityAttemptLineageState::Reconciling {
-                    lease_expires_at_ms,
-                    ..
-                } if !lease_is_expired(lease_expires_at_ms) => {
-                    return Ok(RecoveryAction::Pending);
-                }
                 CapabilityAttemptLineageState::Executing { .. }
                 | CapabilityAttemptLineageState::RetryExecuting { .. }
                 | CapabilityAttemptLineageState::Reconciling { .. } => {
                     if self
                         .lineage
-                        .compare_exchange(
+                        .expire_lease(
                             key.0,
                             key.1,
-                            Some(state),
+                            state.clone(),
                             CapabilityAttemptLineageState::Uncertain,
                         )
                         .await?
                     {
                         continue;
+                    }
+                    if self.lineage.load(key.0, key.1).await? == Some(state) {
+                        return Ok(RecoveryAction::Pending);
                     }
                 }
                 CapabilityAttemptLineageState::AuthoritativeAbsence { .. } => {
@@ -225,19 +252,9 @@ impl CapabilityRegistry {
                 CapabilityAttemptLineageState::Uncertain => match manifest.recovery_mode {
                     RecoveryMode::InherentlyIdempotent
                     | RecoveryMode::KeyedIdempotent
-                    | RecoveryMode::Retry => {
-                        let absence = CapabilityAttemptLineageState::AuthoritativeAbsence {
-                            fence: Uuid::new_v4(),
-                        };
-                        if self
-                            .lineage
-                            .compare_exchange(key.0, key.1, Some(state), absence.clone())
-                            .await?
-                        {
-                            return self.authorize_retry(&context, manifest, absence).await;
-                        }
-                    }
-                    RecoveryMode::Reconcilable | RecoveryMode::Compensate => {
+                    | RecoveryMode::Retry
+                    | RecoveryMode::Reconcilable
+                    | RecoveryMode::Compensate => {
                         return self.reconcile_uncertain(&context, manifest, state).await;
                     }
                     RecoveryMode::NonRetryable | RecoveryMode::None | RecoveryMode::Manual => {
@@ -270,6 +287,80 @@ impl CapabilityRegistry {
             return Err(CapabilityError::validation());
         }
         Ok(())
+    }
+
+    async fn await_with_heartbeat<F, T>(
+        &self,
+        key: (Uuid, u32),
+        initial_state: CapabilityAttemptLineageState,
+        lease_duration_ms: u64,
+        execution_fence: ExecutionFence,
+        operation: F,
+    ) -> (T, CapabilityAttemptLineageState, Option<CapabilityError>)
+    where
+        F: Future<Output = T>,
+    {
+        let state = Arc::new(Mutex::new(initial_state));
+        let (stop_heartbeat, heartbeat_stopped) = oneshot::channel();
+        let heartbeat = self.heartbeat(
+            key,
+            state.clone(),
+            lease_duration_ms,
+            execution_fence,
+            heartbeat_stopped,
+        );
+        let (output, heartbeat_error) = match select(Box::pin(operation), Box::pin(heartbeat)).await
+        {
+            Either::Left((output, heartbeat)) => {
+                let _ = stop_heartbeat.send(());
+                (output, heartbeat.await.err())
+            }
+            Either::Right((heartbeat_result, operation)) => {
+                drop(stop_heartbeat);
+                (operation.await, heartbeat_result.err())
+            }
+        };
+        let latest_state = state.lock().await.clone();
+        (output, latest_state, heartbeat_error)
+    }
+
+    async fn heartbeat(
+        &self,
+        key: (Uuid, u32),
+        state: Arc<Mutex<CapabilityAttemptLineageState>>,
+        lease_duration_ms: u64,
+        execution_fence: ExecutionFence,
+        heartbeat_stopped: oneshot::Receiver<()>,
+    ) -> Result<(), CapabilityError> {
+        let interval_ms = heartbeat_interval_ms(lease_duration_ms);
+        let mut heartbeat_stopped = Box::pin(heartbeat_stopped);
+        loop {
+            heartbeat_stopped = match select(
+                Box::pin(Delay::new(Duration::from_millis(interval_ms))),
+                heartbeat_stopped,
+            )
+            .await
+            {
+                Either::Left((_, heartbeat_stopped)) => heartbeat_stopped,
+                Either::Right((_, _delay)) => return Ok(()),
+            };
+            let expected = state.lock().await.clone();
+            match self
+                .lineage
+                .renew_lease(key.0, key.1, expected, lease_duration_ms)
+                .await
+            {
+                Ok(Some(renewed)) => *state.lock().await = renewed,
+                Ok(None) => {
+                    execution_fence.cancel();
+                    return Ok(());
+                }
+                Err(error) => {
+                    execution_fence.cancel();
+                    return Err(error);
+                }
+            }
+        }
     }
 
     async fn finish_execution(
@@ -327,6 +418,7 @@ impl CapabilityRegistry {
         }
         match self.lineage.load(key.0, key.1).await? {
             Some(CapabilityAttemptLineageState::Completed(_))
+            | Some(CapabilityAttemptLineageState::Uncertain)
             | Some(CapabilityAttemptLineageState::RecoveryRequired)
             | Some(CapabilityAttemptLineageState::Reconciling { .. })
             | Some(CapabilityAttemptLineageState::AuthoritativeAbsence { .. }) => Ok(()),
@@ -347,19 +439,41 @@ impl CapabilityRegistry {
             false,
         )?;
         let key = (context.invocation().id(), context.attempt().number());
-        let fence = Uuid::new_v4();
-        let reconciling = CapabilityAttemptLineageState::Reconciling {
-            fence,
-            lease_expires_at_ms: lease_expires_at_ms(),
-        };
-        if !self
+        let lease_duration_ms = execution_lease_duration_ms(manifest);
+        let Some(reconciling) = self
             .lineage
-            .compare_exchange(key.0, key.1, Some(uncertain), reconciling.clone())
+            .acquire_lease(
+                key.0,
+                key.1,
+                Some(uncertain),
+                CapabilityLeaseKind::Reconciling,
+                lease_duration_ms,
+            )
             .await?
-        {
+        else {
             return Ok(RecoveryAction::Pending);
+        };
+        let fence = lease_fence(&reconciling).ok_or_else(CapabilityError::execution)?;
+        let execution_fence = ExecutionFence::new(fence);
+        let reconciliation = entry.executor.reconcile(
+            context
+                .clone()
+                .with_execution_fence(execution_fence.clone()),
+        );
+        let (outcome, reconciling, heartbeat_error) = self
+            .await_with_heartbeat(
+                key,
+                reconciling,
+                lease_duration_ms,
+                execution_fence,
+                reconciliation,
+            )
+            .await;
+        if let Some(error) = heartbeat_error {
+            self.transition_to_uncertain(key, reconciling).await?;
+            return Err(error);
         }
-        let outcome = match entry.executor.reconcile(context.clone()).await {
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(error) => {
                 self.lineage
@@ -574,17 +688,20 @@ fn validate_result(
     Ok(())
 }
 
-fn lease_expires_at_ms() -> u64 {
-    current_time_ms().saturating_add(CAPABILITY_EXECUTION_LEASE_MS)
+fn execution_lease_duration_ms(manifest: &CapabilityManifest) -> u64 {
+    let grace_ms = (manifest.timeout_ms / 10).clamp(25, 5_000);
+    manifest.timeout_ms.saturating_add(grace_ms).max(30)
 }
 
-fn lease_is_expired(lease_expires_at_ms: u64) -> bool {
-    lease_expires_at_ms <= current_time_ms()
+fn heartbeat_interval_ms(lease_duration_ms: u64) -> u64 {
+    (lease_duration_ms / 3).clamp(5, 1_000)
 }
 
-fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+fn lease_fence(state: &CapabilityAttemptLineageState) -> Option<Uuid> {
+    match state {
+        CapabilityAttemptLineageState::Executing { fence, .. }
+        | CapabilityAttemptLineageState::RetryExecuting { fence, .. }
+        | CapabilityAttemptLineageState::Reconciling { fence, .. } => Some(*fence),
+        _ => None,
+    }
 }

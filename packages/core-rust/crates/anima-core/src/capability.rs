@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -666,11 +670,75 @@ impl fmt::Debug for CapabilityExecutionReferences {
 }
 
 /// Portable references supplied to a host executor. No credential values are carried here.
+#[derive(Clone)]
+pub struct ExecutionFence {
+    inner: Arc<ExecutionFenceState>,
+}
+
+struct ExecutionFenceState {
+    _token: Uuid,
+    valid: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl ExecutionFence {
+    fn new(token: Uuid) -> Self {
+        Self {
+            inner: Arc::new(ExecutionFenceState {
+                _token: token,
+                valid: AtomicBool::new(true),
+                cancelled: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    /// Hosts must call this immediately before each irreversible external side effect.
+    pub fn ensure_valid(&self) -> Result<(), CapabilityError> {
+        if self.is_valid() {
+            Ok(())
+        } else {
+            Err(CapabilityError::cancelled())
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.inner.valid.load(Ordering::Acquire)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.cancelled.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        self.inner.valid.store(false, Ordering::Release);
+        self.inner.cancelled.store(true, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for ExecutionFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutionFence")
+            .field("valid", &self.is_valid())
+            .field("cancelled", &self.is_cancelled())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ExecutionFence {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner._token == other.inner._token
+    }
+}
+
+impl Eq for ExecutionFence {}
+
 #[derive(Clone, PartialEq)]
 pub struct CapabilityExecutionContext {
     invocation: LogicalInvocation,
     attempt: CapabilityAttempt,
     references: CapabilityExecutionReferences,
+    execution_fence: Option<ExecutionFence>,
 }
 
 impl CapabilityExecutionContext {
@@ -695,6 +763,15 @@ impl CapabilityExecutionContext {
 
     pub fn references(&self) -> &CapabilityExecutionReferences {
         &self.references
+    }
+
+    pub fn execution_fence(&self) -> Option<&ExecutionFence> {
+        self.execution_fence.as_ref()
+    }
+
+    fn with_execution_fence(mut self, execution_fence: ExecutionFence) -> Self {
+        self.execution_fence = Some(execution_fence);
+        self
     }
 
     pub fn with_references(
@@ -724,6 +801,7 @@ impl CapabilityExecutionContext {
             references: CapabilityExecutionReferences::for_run(invocation.run_id()),
             invocation,
             attempt,
+            execution_fence: None,
         })
     }
 }
@@ -810,6 +888,7 @@ impl fmt::Debug for CapabilityExecutionContext {
             .field("logical_invocation_id", &self.invocation.id())
             .field("attempt_number", &self.attempt.number())
             .field("references", &self.references)
+            .field("execution_fence_present", &self.execution_fence.is_some())
             .finish()
     }
 }
@@ -933,6 +1012,10 @@ impl std::error::Error for CapabilityError {}
 pub trait CapabilityExecutor: Send + Sync {
     fn manifest(&self) -> &CapabilityManifest;
 
+    /// Implementations must use `context.invocation().idempotency_key()` for every external
+    /// operation and validate `context.execution_fence()` immediately before each irreversible
+    /// side effect. The fence is cooperative protection, not a generic exactly-once guarantee for
+    /// external systems.
     async fn execute(
         &self,
         context: CapabilityExecutionContext,
@@ -949,6 +1032,9 @@ pub trait CapabilityExecutor: Send + Sync {
 pub enum ReconcileOutcome {
     Completed(CapabilityResult),
     Pending,
+    /// Strong guarantee that the prior operation is not in flight and cannot later complete, even
+    /// if an abandoned worker resumes. Executors that cannot prove this must return `Pending` or
+    /// `RecoveryRequired`.
     AuthoritativeAbsence,
     RecoveryRequired,
 }
@@ -1045,9 +1131,7 @@ impl std::error::Error for CapabilityRegistryError {}
 
 #[path = "capability/lineage.rs"]
 mod lineage;
-pub use lineage::{
-    CapabilityAttemptLineageState, CapabilityLineageStore, CAPABILITY_EXECUTION_LEASE_MS,
-};
+pub use lineage::{CapabilityAttemptLineageState, CapabilityLeaseKind, CapabilityLineageStore};
 #[path = "capability/registry.rs"]
 mod registry;
 pub use registry::CapabilityRegistry;

@@ -1,19 +1,20 @@
 use std::collections::BTreeMap;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
 use anima_core::{
     CapabilityAttempt, CapabilityAttemptLineageState, CapabilityContextError, CapabilityError,
     CapabilityErrorCode, CapabilityExecutionContext, CapabilityExecutor, CapabilityKind,
-    CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId, CapabilityRegistry,
-    CapabilityRegistryError, CapabilityResult, CapabilitySecretReferenceId, LogicalInvocation,
-    ManifestCatalog, ManifestCatalogError, ReconcileOutcome, RecoveryActionKind, RecoveryMode,
-    RiskLevel, RuntimeCompatibility,
+    CapabilityLeaseKind, CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId,
+    CapabilityRegistry, CapabilityRegistryError, CapabilityResult, CapabilitySecretReferenceId,
+    ExecutionFence, LogicalInvocation, ManifestCatalog, ManifestCatalogError, ReconcileOutcome,
+    RecoveryActionKind, RecoveryMode, RiskLevel, RuntimeCompatibility,
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
+use futures_timer::Delay;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -69,6 +70,8 @@ fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
 #[derive(Default)]
 struct TestLineageStore {
     states: Mutex<BTreeMap<(Uuid, u32), CapabilityAttemptLineageState>>,
+    authoritative_now_ms: AtomicU64,
+    renewals: AtomicUsize,
 }
 
 #[async_trait]
@@ -95,6 +98,115 @@ impl CapabilityLineageStore for TestLineageStore {
     ) -> Result<bool, CapabilityError> {
         let mut states = self.states.lock().unwrap();
         if states.get(&(invocation_id, attempt_number)) != current.as_ref() {
+            return Ok(false);
+        }
+        states.insert((invocation_id, attempt_number), new);
+        Ok(true)
+    }
+
+    async fn acquire_lease(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+        current: Option<CapabilityAttemptLineageState>,
+        kind: CapabilityLeaseKind,
+        lease_duration_ms: u64,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
+        let mut states = self.states.lock().unwrap();
+        if states.get(&(invocation_id, attempt_number)) != current.as_ref() {
+            return Ok(None);
+        }
+        let fence = Uuid::new_v4();
+        let lease_expires_at_ms = self
+            .authoritative_now_ms
+            .load(Ordering::SeqCst)
+            .saturating_add(lease_duration_ms);
+        let state = match kind {
+            CapabilityLeaseKind::Executing => CapabilityAttemptLineageState::Executing {
+                fence,
+                lease_expires_at_ms,
+            },
+            CapabilityLeaseKind::RetryExecuting => CapabilityAttemptLineageState::RetryExecuting {
+                fence,
+                lease_expires_at_ms,
+            },
+            CapabilityLeaseKind::Reconciling => CapabilityAttemptLineageState::Reconciling {
+                fence,
+                lease_expires_at_ms,
+            },
+        };
+        states.insert((invocation_id, attempt_number), state.clone());
+        Ok(Some(state))
+    }
+
+    async fn renew_lease(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+        current: CapabilityAttemptLineageState,
+        lease_duration_ms: u64,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
+        let mut states = self.states.lock().unwrap();
+        if states.get(&(invocation_id, attempt_number)) != Some(&current) {
+            return Ok(None);
+        }
+        let now_ms = self.authoritative_now_ms.load(Ordering::SeqCst);
+        let renewed = match current {
+            CapabilityAttemptLineageState::Executing {
+                fence,
+                lease_expires_at_ms,
+            } if lease_expires_at_ms > now_ms => CapabilityAttemptLineageState::Executing {
+                fence,
+                lease_expires_at_ms: now_ms.saturating_add(lease_duration_ms),
+            },
+            CapabilityAttemptLineageState::RetryExecuting {
+                fence,
+                lease_expires_at_ms,
+            } if lease_expires_at_ms > now_ms => CapabilityAttemptLineageState::RetryExecuting {
+                fence,
+                lease_expires_at_ms: now_ms.saturating_add(lease_duration_ms),
+            },
+            CapabilityAttemptLineageState::Reconciling {
+                fence,
+                lease_expires_at_ms,
+            } if lease_expires_at_ms > now_ms => CapabilityAttemptLineageState::Reconciling {
+                fence,
+                lease_expires_at_ms: now_ms.saturating_add(lease_duration_ms),
+            },
+            _ => return Ok(None),
+        };
+        states.insert((invocation_id, attempt_number), renewed.clone());
+        self.renewals.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(renewed))
+    }
+
+    async fn expire_lease(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+        current: CapabilityAttemptLineageState,
+        new: CapabilityAttemptLineageState,
+    ) -> Result<bool, CapabilityError> {
+        let mut states = self.states.lock().unwrap();
+        if states.get(&(invocation_id, attempt_number)) != Some(&current) {
+            return Ok(false);
+        }
+        let lease_expires_at_ms = match current {
+            CapabilityAttemptLineageState::Executing {
+                lease_expires_at_ms,
+                ..
+            }
+            | CapabilityAttemptLineageState::RetryExecuting {
+                lease_expires_at_ms,
+                ..
+            }
+            | CapabilityAttemptLineageState::Reconciling {
+                lease_expires_at_ms,
+                ..
+            } => lease_expires_at_ms,
+            _ => return Ok(false),
+        };
+        if lease_expires_at_ms > self.authoritative_now_ms.load(Ordering::SeqCst) {
             return Ok(false);
         }
         states.insert((invocation_id, attempt_number), new);
@@ -163,8 +275,9 @@ impl RecordingExecutor {
     }
 
     fn failing_once(manifest: CapabilityManifest) -> Self {
-        let executor = Self::new(manifest);
+        let mut executor = Self::new(manifest);
         executor.failures_remaining.store(1, Ordering::SeqCst);
+        executor.reconcile_result = ReconcileOutcome::AuthoritativeAbsence;
         executor
     }
 }
@@ -259,6 +372,49 @@ struct RetryBarrierExecutor {
     reconciliations: Arc<AtomicUsize>,
 }
 
+struct FenceAwareBarrierExecutor {
+    manifest: CapabilityManifest,
+    entered: Mutex<Option<oneshot::Sender<ExecutionFence>>>,
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+    external_calls: Arc<AtomicUsize>,
+    reconcile_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CapabilityExecutor for FenceAwareBarrierExecutor {
+    fn manifest(&self) -> &CapabilityManifest {
+        &self.manifest
+    }
+
+    async fn execute(
+        &self,
+        context: CapabilityExecutionContext,
+    ) -> Result<CapabilityResult, CapabilityError> {
+        let fence = context.execution_fence().unwrap().clone();
+        if let Some(entered) = self.entered.lock().unwrap().take() {
+            let _ = entered.send(fence.clone());
+        }
+        let release = self.release.lock().unwrap().take();
+        if let Some(release) = release {
+            let _ = release.await;
+        }
+        fence.ensure_valid()?;
+        self.external_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(CapabilityResult::new(json!({ "ok": true })))
+    }
+
+    async fn reconcile(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<ReconcileOutcome, CapabilityError> {
+        if self.reconcile_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            Ok(ReconcileOutcome::Pending)
+        } else {
+            Ok(ReconcileOutcome::AuthoritativeAbsence)
+        }
+    }
+}
+
 #[async_trait]
 impl CapabilityExecutor for RetryBarrierExecutor {
     fn manifest(&self) -> &CapabilityManifest {
@@ -287,7 +443,7 @@ impl CapabilityExecutor for RetryBarrierExecutor {
         _context: CapabilityExecutionContext,
     ) -> Result<ReconcileOutcome, CapabilityError> {
         self.reconciliations.fetch_add(1, Ordering::SeqCst);
-        Ok(ReconcileOutcome::RecoveryRequired)
+        Ok(ReconcileOutcome::AuthoritativeAbsence)
     }
 }
 
@@ -566,12 +722,12 @@ async fn recovery_decides_retry_reconcile_or_manual_without_automatic_execution(
     let modes = [
         (
             RecoveryMode::InherentlyIdempotent,
-            false,
+            true,
             RecoveryActionKind::RetrySameKey,
         ),
         (
             RecoveryMode::KeyedIdempotent,
-            false,
+            true,
             RecoveryActionKind::RetrySameKey,
         ),
         (
@@ -588,7 +744,10 @@ async fn recovery_decides_retry_reconcile_or_manual_without_automatic_execution(
 
     for (mode, calls_reconciler, expected) in modes {
         let manifest = manifest("workspace.apply", 1, mode);
-        let executor = RecordingExecutor::failing_once(manifest.clone());
+        let mut executor = RecordingExecutor::failing_once(manifest.clone());
+        if mode == RecoveryMode::Reconcilable {
+            executor.reconcile_result = ReconcileOutcome::Pending;
+        }
         let reconciliations = executor.reconciliations.clone();
         let mut registry = registry(vec![manifest.clone()]);
         registry.register_executor(Arc::new(executor)).unwrap();
@@ -858,8 +1017,9 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
 async fn retry_budget_blocks_authorization_after_an_uncertain_final_attempt() {
     let mut manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
     manifest.max_retries = 1;
-    let executor = RecordingExecutor::new(manifest.clone());
+    let mut executor = RecordingExecutor::new(manifest.clone());
     executor.failures_remaining.store(2, Ordering::SeqCst);
+    executor.reconcile_result = ReconcileOutcome::AuthoritativeAbsence;
     let mut registry = registry(vec![manifest.clone()]);
     registry.register_executor(Arc::new(executor)).unwrap();
     let initial = context(&manifest, json!({ "query": "hello" }));
@@ -985,12 +1145,114 @@ async fn recovery_racing_active_retry_returns_pending_without_reconciliation() {
         registry.recover(retry.clone()).await.unwrap().kind(),
         RecoveryActionKind::Pending
     );
-    assert_eq!(reconciliations.load(Ordering::SeqCst), 0);
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
     release_tx.send(()).unwrap();
     execution.await.unwrap().unwrap();
     assert_eq!(
         registry.recover(retry).await.unwrap().kind(),
         RecoveryActionKind::Completed
+    );
+}
+
+#[tokio::test]
+async fn store_authoritative_heartbeat_keeps_long_running_execution_fenced() {
+    let mut manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    manifest.timeout_ms = 40_000;
+    let store = Arc::new(TestLineageStore::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let external_calls = Arc::new(AtomicUsize::new(0));
+    let executor = FenceAwareBarrierExecutor {
+        manifest: manifest.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+        external_calls: external_calls.clone(),
+        reconcile_calls: AtomicUsize::new(0),
+    };
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut mutable_registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    let execution_registry = registry.clone();
+    let execution_context = initial.clone();
+    let execution =
+        tokio::spawn(async move { execution_registry.execute(execution_context).await });
+    let fence = entered_rx.await.unwrap();
+
+    for _ in 0..150 {
+        if store.renewals.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        Delay::new(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(store.renewals.load(Ordering::SeqCst) > 0);
+    store.authoritative_now_ms.store(31_000, Ordering::SeqCst);
+    assert!(fence.is_valid());
+    assert_eq!(
+        registry.recover(initial).await.unwrap().kind(),
+        RecoveryActionKind::Pending
+    );
+    release_tx.send(()).unwrap();
+    execution.await.unwrap().unwrap();
+    assert_eq!(external_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn lost_execution_fence_cancels_original_and_requires_strong_absence_for_retry() {
+    let mut manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    manifest.timeout_ms = 30;
+    let store = Arc::new(TestLineageStore::default());
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let external_calls = Arc::new(AtomicUsize::new(0));
+    let executor = FenceAwareBarrierExecutor {
+        manifest: manifest.clone(),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+        external_calls: external_calls.clone(),
+        reconcile_calls: AtomicUsize::new(0),
+    };
+    let mut catalog = ManifestCatalog::default();
+    catalog.register_manifest(manifest.clone()).unwrap();
+    let mut mutable_registry = CapabilityRegistry::with_lineage_store(catalog, store.clone());
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    let execution_registry = registry.clone();
+    let execution_context = initial.clone();
+    let execution =
+        tokio::spawn(async move { execution_registry.execute(execution_context).await });
+    let fence = entered_rx.await.unwrap();
+    store.states.lock().unwrap().insert(
+        (initial.invocation().id(), initial.attempt().number()),
+        CapabilityAttemptLineageState::Uncertain,
+    );
+
+    for _ in 0..30 {
+        if fence.is_cancelled() {
+            break;
+        }
+        Delay::new(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(fence.is_cancelled());
+    let pending = registry.recover(initial.clone()).await.unwrap();
+    assert_eq!(pending.kind(), RecoveryActionKind::Pending);
+    assert!(pending.retry_authorization().is_none());
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        execution.await.unwrap().unwrap_err().code(),
+        CapabilityErrorCode::Cancelled
+    );
+    assert_eq!(external_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        registry.recover(initial).await.unwrap().kind(),
+        RecoveryActionKind::RetrySameKey
     );
 }
 
