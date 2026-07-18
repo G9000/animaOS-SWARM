@@ -16,7 +16,6 @@ use crate::{
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub const RUNTIME_SCHEMA_VERSION: u32 = 1;
-const MAX_DIGEST_BYTES: usize = 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct HistoryFingerprint([u8; 32]);
@@ -148,10 +147,11 @@ impl ManifestPin {
     fn validate(&self) -> Result<(), ExecutionError> {
         valid_id(&self.id)?;
         valid_version(self.version)?;
-        if !self.schema_digest.starts_with("sha256:")
-            || self.schema_digest.len() <= 7
-            || self.schema_digest.len() > MAX_DIGEST_BYTES
-            || self.schema_digest.chars().any(char::is_whitespace)
+        if self.schema_digest.len() != 71
+            || !self.schema_digest.starts_with("sha256:")
+            || !self.schema_digest[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }

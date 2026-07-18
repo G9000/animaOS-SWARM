@@ -10,10 +10,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    store::AuthoritativeGrantChangeKind, AuthoritativeGrantChange, AuthoritativeGrantState,
-    AuthoritativeGrantStatus, CheckpointMutation, CreateRun, ExecutionClock, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy, StoredRun,
+    AuthoritativeGrantChange, AuthoritativeGrantState, CheckpointMutation, CreateRun,
+    ExecutionClock, ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStore,
+    ExecutionStoreError, ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy,
+    StoredRun,
 };
 use crate::{CommandReceipt, DurableCapabilityResult, RunState};
 
@@ -304,52 +304,8 @@ impl ExecutionStore for InMemoryExecutionStore {
             ));
         }
         let mut state = self.state.lock().await;
-        let next = match change.kind() {
-            AuthoritativeGrantChangeKind::Create(next) => {
-                let key = (owner_id, next.authority_key_encoded().to_owned());
-                if state.authoritative_grants.contains_key(&key) {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::VersionConflict,
-                    ));
-                }
-                next.clone()
-            }
-            AuthoritativeGrantChangeKind::Update {
-                expected_revision,
-                state: next,
-            } => {
-                let current = state
-                    .authoritative_grants
-                    .get(&(owner_id, next.authority_key_encoded().to_owned()))
-                    .ok_or_else(|| {
-                        ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
-                    })?;
-                if current.revision() != *expected_revision || next.revision() <= current.revision()
-                {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::VersionConflict,
-                    ));
-                }
-                next.clone()
-            }
-            AuthoritativeGrantChangeKind::Revoke {
-                authority_key,
-                expected_revision,
-            } => {
-                let current = state
-                    .authoritative_grants
-                    .get(&(owner_id, authority_key.as_str().to_owned()))
-                    .ok_or_else(|| {
-                        ExecutionStoreError::new(ExecutionStoreErrorCode::VersionConflict)
-                    })?;
-                if current.revision() != *expected_revision {
-                    return Err(ExecutionStoreError::new(
-                        ExecutionStoreErrorCode::VersionConflict,
-                    ));
-                }
-                current.as_revoked()
-            }
-        };
+        let key = (owner_id, change.authority_key().as_str().to_owned());
+        let next = change.apply_to(state.authoritative_grants.get(&key))?;
         state.authoritative_grants.insert(
             (owner_id, next.authority_key_encoded().to_owned()),
             next.clone(),
@@ -916,9 +872,8 @@ fn build_commit_patch(
                     .ok_or_else(|| {
                         ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
                     })?;
-                if authoritative.binding()? != *binding
-                    || authoritative.status() != AuthoritativeGrantStatus::Active
-                    || authoritative.revision() != grant_revision
+                authoritative.validate_binding(binding, now_ms)?;
+                if authoritative.revision() != grant_revision
                     || authoritative.remaining_uses() != claimed_remaining
                 {
                     return Err(ExecutionStoreError::new(
@@ -952,7 +907,7 @@ fn build_commit_patch(
                                 ExecutionStoreErrorCode::GrantAlreadyConsumed,
                             ));
                         }
-                        authoritative.consume_one()?;
+                        authoritative = authoritative.consume(binding, now_ms)?;
                         grant_consumption_key = Some(key);
                     }
                     (None, None) => {}
@@ -1066,6 +1021,7 @@ fn build_commit_patch(
             || attempt.state() != super::AttemptRecordState::Completed
             || attempt.manifest() != completed.manifest()
             || attempt.recovery_mode() != completed.recovery_mode()
+            || mutation.result().schema_digest() != attempt.manifest().schema_digest()
         {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::LineageConflict,

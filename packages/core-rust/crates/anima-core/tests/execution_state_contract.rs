@@ -246,7 +246,7 @@ fn generic_transitions_cannot_bypass_resume_authorization() {
             ManifestPin::new_with_recovery_mode(
                 "workspace.write",
                 1,
-                format!("sha256:{mode:?}"),
+                format!("sha256:{}", "6".repeat(64)),
                 mode,
             )
             .unwrap(),
@@ -757,7 +757,7 @@ fn checkpoints_round_trip_and_fail_closed_for_mismatch_or_secrets() {
         "writer",
         3,
         4,
-        vec![ManifestPin::new("cap", 1, "sha256:abc").unwrap()],
+        vec![ManifestPin::new("cap", 1, format!("sha256:{}", "7".repeat(64))).unwrap()],
     )
     .unwrap();
     let encoded = serde_json::to_string(&checkpoint).unwrap();
@@ -768,6 +768,21 @@ fn checkpoints_round_trip_and_fail_closed_for_mismatch_or_secrets() {
     value["runtime_schema_version"] = serde_json::json!(99);
     assert!(serde_json::from_value::<CheckpointV1>(value).is_err());
     assert!(ManifestPin::new("cap", 1, "token-value").is_err());
+}
+
+#[test]
+fn manifest_pins_require_exact_canonical_sha256_digests() {
+    let canonical = format!("sha256:{}", "a".repeat(64));
+    assert!(ManifestPin::new("cap", 1, canonical).is_ok());
+    for malformed in [
+        "sha256:abc".to_owned(),
+        format!("sha256:{}", "A".repeat(64)),
+        format!("sha256:{}", "g".repeat(64)),
+        format!("sha256:{}", "a".repeat(63)),
+        format!("sha256:{}", "a".repeat(65)),
+    ] {
+        assert!(ManifestPin::new("cap", 1, malformed).is_err());
+    }
 }
 
 #[test]
@@ -783,7 +798,7 @@ fn full_checkpoints_round_trip_and_reject_tampered_records() {
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:abc",
+        format!("sha256:{}", "7".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();
@@ -989,7 +1004,7 @@ fn standalone_checkpoint_records_and_canonical_order_fail_closed() {
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:abc",
+        format!("sha256:{}", "7".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();
@@ -1012,8 +1027,8 @@ fn standalone_checkpoint_records_and_canonical_order_fail_closed() {
         3,
         4,
         vec![
-            ManifestPin::new("a", 1, "sha256:aa").unwrap(),
-            ManifestPin::new("b", 1, "sha256:bb").unwrap(),
+            ManifestPin::new("a", 1, format!("sha256:{}", "8".repeat(64))).unwrap(),
+            ManifestPin::new("b", 1, format!("sha256:{}", "9".repeat(64))).unwrap(),
         ],
     )
     .unwrap();
@@ -1184,7 +1199,7 @@ fn manual_recovery_pause_has_no_automatic_resume_path() {
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:manual",
+        format!("sha256:{}", "a".repeat(64)),
         RecoveryMode::Manual,
     )
     .unwrap();
@@ -1276,7 +1291,7 @@ fn keyed_manifest_with_manual_pause_reason_cannot_resume_automatically() {
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:keyed-manual",
+        format!("sha256:{}", "b".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();
@@ -1303,7 +1318,7 @@ fn checkpoint_preserves_uncertain_then_completed_attempt_history_and_pinned_mode
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:keyed",
+        format!("sha256:{}", "c".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();

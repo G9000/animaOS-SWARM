@@ -6,11 +6,11 @@ use anima_core::{
     CheckpointMutation, CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin,
     DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
     ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
-    ExecutionStoreFactory, GrantEffect, GrantScope, GrantStatus, InMemoryExecutionStore,
-    InvocationAttemptRecord, LogicalInvocation, ManifestPin, ManualExecutionClock, OpaqueReference,
-    PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run, RunState,
-    RuntimeCommand, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session,
-    SessionConcurrencyPolicy, StoreReadPage, Usage, MAX_COMMIT_EVENTS,
+    ExecutionStoreFactory, GrantAuthorityBinding, GrantEffect, GrantScope, GrantStatus,
+    InMemoryExecutionStore, InvocationAttemptRecord, LogicalInvocation, ManifestPin,
+    ManualExecutionClock, OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions,
+    RecoveryMode, RiskLevel, Run, RunState, RuntimeCommand, RuntimeCompatibility, RuntimeEvent,
+    RuntimeEventKind, Session, SessionConcurrencyPolicy, StoreReadPage, Usage, MAX_COMMIT_EVENTS,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -163,6 +163,49 @@ fn external_adapters_can_exhaustively_inspect_validated_grant_changes() {
     assert_eq!(inspect(&revoke).1, Some(2));
     assert_eq!(inspect(&create).0, inspect(&update).0);
     assert_eq!(inspect(&update).0, inspect(&revoke).0);
+}
+
+#[test]
+fn public_grant_transitions_validate_cas_revoke_and_exact_consumption() {
+    let owner_id = id(0x8f3);
+    let grant = authority_fixture("public-transition-grant", 1, Some(1));
+    let binding = GrantAuthorityBinding::from_grant(&grant).unwrap();
+    let created = AuthoritativeGrantState::from_grant(owner_id, &grant).unwrap();
+    let create = AuthoritativeGrantChange::create(created.clone());
+
+    assert_eq!(create.apply_to(None).unwrap(), created);
+    assert_eq!(
+        create.apply_to(Some(&created)).unwrap_err().code(),
+        ExecutionStoreErrorCode::VersionConflict
+    );
+
+    let consumed = created.consume(&binding, 1_000).unwrap();
+    assert_eq!(consumed.remaining_uses(), Some(0));
+    assert_eq!(
+        consumed.consume(&binding, 1_000).unwrap_err().code(),
+        ExecutionStoreErrorCode::GrantConflict
+    );
+
+    let revoked = AuthoritativeGrantChange::revoke(created.authority_key().clone(), 1)
+        .unwrap()
+        .apply_to(Some(&created))
+        .unwrap();
+    assert_eq!(revoked.status(), GrantStatus::Revoked);
+    assert_eq!(
+        revoked
+            .validate_binding(&binding, 1_000)
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::GrantConflict
+    );
+
+    let mut forged = grant;
+    forged.scope.workspace_id = "forged-workspace".into();
+    let forged_binding = GrantAuthorityBinding::from_grant(&forged).unwrap();
+    assert_eq!(
+        created.consume(&forged_binding, 1_000).unwrap_err().code(),
+        ExecutionStoreErrorCode::GrantConflict
+    );
 }
 
 fn authority_fixture(raw_id: &str, revision: u32, remaining_uses: Option<u32>) -> AutonomyGrant {
@@ -351,7 +394,7 @@ fn approval_resume_parts(
 
 #[tokio::test]
 async fn validated_approval_claim_and_grant_consumption_commit_once_with_command_replay() {
-    let store = InMemoryExecutionStore::default();
+    let store = InMemoryExecutionStore::with_clock(Arc::new(ManualExecutionClock::new(1_000)));
     let owner_id = id(65);
     let session = Session::new(id(60), "writer", 3, SessionConcurrencyPolicy::Serial).unwrap();
     let (waiting, target, command, approval, grant) = approval_resume_parts(&session, id(63));
@@ -790,7 +833,7 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:manifest",
+        format!("sha256:{}", "2".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();
@@ -805,7 +848,7 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
     let completed = CompletedInvocationRecord::new(
         invocation.binding(),
         1,
-        manifest,
+        manifest.clone(),
         RecoveryMode::KeyedIdempotent,
         OpaqueReference::new(id(52)).unwrap(),
     )
@@ -869,6 +912,53 @@ async fn logical_invocation_results_accept_identical_replays_and_reject_conflict
         .await
         .unwrap()
         .is_none());
+    let mismatched_result = DurableCapabilityResult::new(
+        CapabilityReferenceId::new(id(52)),
+        format!("jcs-v1:{}", "4".repeat(64)),
+        format!("sha256:{}", "3".repeat(64)),
+        1,
+        DurableCapabilityStatus::Completed,
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    1,
+                    0,
+                    lease.clone(),
+                    RuntimeCommand::start(id(59), session.id(), queued.id()).unwrap(),
+                    vec![first_event.clone()],
+                    vec![],
+                    vec![attempt.clone()],
+                    vec![DurableResultMutation::new(
+                        completed.clone(),
+                        mismatched_result,
+                    )],
+                    None,
+                    running.clone(),
+                ),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::LineageConflict
+    );
+    assert_eq!(
+        store
+            .load_run(owner_id, queued.id())
+            .await
+            .unwrap()
+            .unwrap(),
+        created
+    );
+    assert!(store
+        .load_attempts_page(owner_id, queued.id(), StoreReadPage::first(1).unwrap())
+        .await
+        .unwrap()
+        .items()
+        .is_empty());
     store
         .commit_execution(
             owner_id,
@@ -964,7 +1054,7 @@ async fn execution_step_and_attempt_history_is_append_only() {
     let manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:append-only",
+        format!("sha256:{}", "4".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();
@@ -1198,7 +1288,7 @@ async fn commit_is_all_or_nothing_and_checkpoint_versions_co_commit_with_state()
     let checkpoint_manifest = ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:checkpoint",
+        format!("sha256:{}", "5".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     )
     .unwrap();

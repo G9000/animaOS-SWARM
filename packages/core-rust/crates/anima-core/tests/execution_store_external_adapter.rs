@@ -1,10 +1,13 @@
 use anima_core::{
     assert_execution_store_conformance, AuthoritativeGrantChange, AuthoritativeGrantState,
-    CheckpointV1, CreateRun, DurableCapabilityResult, EventReplayPage, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreFactory, GrantAuthorityKey, InMemoryExecutionStore, InvocationAttemptRecord,
-    ManualExecutionClock, StoreHistoryPage, StoreReadPage, StoredRun,
+    CheckpointV1, CreateRun, DurableCapabilityResult, EventReplayPage, ExecutionClock,
+    ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore,
+    ExecutionStoreError, ExecutionStoreErrorCode, ExecutionStoreFactory, GrantAuthorityKey,
+    InMemoryExecutionStore, InvocationAttemptRecord, ManualExecutionClock, StoreHistoryPage,
+    StoreReadPage, StoredRun,
 };
+use futures::lock::Mutex;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -12,6 +15,14 @@ use uuid::Uuid;
 /// without access to crate-private authority material.
 struct ExternalStyleAdapter {
     durable: InMemoryExecutionStore,
+    authority: Mutex<ExternalAuthorityState>,
+    clock: ManualExecutionClock,
+}
+
+#[derive(Default)]
+struct ExternalAuthorityState {
+    grants: BTreeMap<(Uuid, String), AuthoritativeGrantState>,
+    consumptions: BTreeSet<(Uuid, String, u32, Uuid)>,
 }
 
 #[async_trait::async_trait]
@@ -21,9 +32,23 @@ impl ExecutionStore for ExternalStyleAdapter {
         owner_id: Uuid,
         change: AuthoritativeGrantChange,
     ) -> Result<AuthoritativeGrantState, ExecutionStoreError> {
+        if owner_id.is_nil()
+            || change
+                .new_state()
+                .is_some_and(|state| state.owner_id() != owner_id)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        let mut authority = self.authority.lock().await;
+        let key = (owner_id, change.authority_key().as_str().to_owned());
+        let next = change.apply_to(authority.grants.get(&key))?;
         self.durable
             .apply_authoritative_grant(owner_id, change)
-            .await
+            .await?;
+        authority.grants.insert(key, next.clone());
+        Ok(next)
     }
 
     async fn load_authoritative_grant(
@@ -31,9 +56,13 @@ impl ExecutionStore for ExternalStyleAdapter {
         owner_id: Uuid,
         authority_key: &GrantAuthorityKey,
     ) -> Result<Option<AuthoritativeGrantState>, ExecutionStoreError> {
-        self.durable
-            .load_authoritative_grant(owner_id, authority_key)
+        Ok(self
+            .authority
+            .lock()
             .await
+            .grants
+            .get(&(owner_id, authority_key.as_str().to_owned()))
+            .cloned())
     }
 
     async fn create_run(
@@ -70,7 +99,48 @@ impl ExecutionStore for ExternalStyleAdapter {
         owner_id: Uuid,
         commit: ExecutionCommit,
     ) -> Result<ExecutionCommitOutcome, ExecutionStoreError> {
-        self.durable.commit_execution(owner_id, commit).await
+        let mut authority = self.authority.lock().await;
+        let mut grant_update = None;
+        let mut consumption_key = None;
+        if let Some(approval) = commit.approval() {
+            if let Some(binding) = approval.claim().grant_authority_binding() {
+                let key = (owner_id, binding.authority_key().as_str().to_owned());
+                let current = authority.grants.get(&key).ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict)
+                })?;
+                if let Some(consumption) = approval.grant_consumption() {
+                    if consumption.grant_revision != binding.revision() {
+                        return Err(ExecutionStoreError::new(
+                            ExecutionStoreErrorCode::GrantConflict,
+                        ));
+                    }
+                    let key = (
+                        owner_id,
+                        binding.authority_key().as_str().to_owned(),
+                        consumption.grant_revision,
+                        consumption.logical_invocation_id,
+                    );
+                    if authority.consumptions.contains(&key) {
+                        return self.durable.commit_execution(owner_id, commit).await;
+                    }
+                    current.validate_binding(binding, self.clock.now_ms())?;
+                    grant_update = Some(current.consume(binding, self.clock.now_ms())?);
+                    consumption_key = Some(key);
+                } else {
+                    current.validate_binding(binding, self.clock.now_ms())?;
+                }
+            }
+        }
+        let outcome = self.durable.commit_execution(owner_id, commit).await?;
+        if let Some(next) = grant_update {
+            authority
+                .grants
+                .insert((owner_id, next.authority_key_encoded().to_owned()), next);
+        }
+        if let Some(key) = consumption_key {
+            authority.consumptions.insert(key);
+        }
+        Ok(outcome)
     }
 
     async fn load_run(
@@ -142,6 +212,8 @@ impl ExecutionStoreFactory for ExternalStyleAdapterFactory {
     async fn create_execution_store(&self) -> Result<Self::Store, ExecutionStoreError> {
         Ok(ExternalStyleAdapter {
             durable: InMemoryExecutionStore::with_clock(Arc::new(self.clock.clone())),
+            authority: Mutex::new(ExternalAuthorityState::default()),
+            clock: self.clock.clone(),
         })
     }
 

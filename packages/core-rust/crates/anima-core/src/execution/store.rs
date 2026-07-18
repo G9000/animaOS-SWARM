@@ -231,7 +231,7 @@ impl AuthoritativeGrantState {
         })
     }
 
-    pub(crate) fn binding(&self) -> Result<GrantAuthorityBinding, ExecutionStoreError> {
+    fn binding(&self) -> Result<GrantAuthorityBinding, ExecutionStoreError> {
         GrantAuthorityBinding::from_parts(
             self.authority_key.as_str().to_owned(),
             self.full_grant_digest.clone(),
@@ -284,20 +284,50 @@ impl AuthoritativeGrantState {
         self.remaining_uses
     }
 
-    pub(crate) fn as_revoked(&self) -> Self {
+    fn as_revoked(&self) -> Self {
         let mut revoked = self.clone();
         revoked.status = GrantStatus::Revoked;
         revoked
     }
 
-    pub(crate) fn consume_one(&mut self) -> Result<(), ExecutionStoreError> {
+    /// Validates that this exact authoritative snapshot is active at adapter time.
+    pub fn validate_binding(
+        &self,
+        binding: &GrantAuthorityBinding,
+        now_ms: u64,
+    ) -> Result<(), ExecutionStoreError> {
+        let now_ms = i64::try_from(now_ms)
+            .map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
+        if self.binding()? != *binding
+            || self.status != GrantStatus::Active
+            || now_ms < self.valid_from_ms
+            || self.valid_until_ms.is_some_and(|until| now_ms >= until)
+            || self.remaining_uses == Some(0)
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::GrantConflict,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the next counted-grant snapshot after validating the exact immutable binding.
+    pub fn consume(
+        &self,
+        binding: &GrantAuthorityBinding,
+        now_ms: u64,
+    ) -> Result<Self, ExecutionStoreError> {
+        self.validate_binding(binding, now_ms)?;
         let remaining = self
             .remaining_uses
             .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?;
-        self.remaining_uses = Some(remaining.checked_sub(1).ok_or_else(|| {
-            ExecutionStoreError::new(ExecutionStoreErrorCode::GrantAlreadyConsumed)
-        })?);
-        Ok(())
+        let mut consumed = self.clone();
+        consumed.remaining_uses = Some(
+            remaining
+                .checked_sub(1)
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::GrantConflict))?,
+        );
+        Ok(consumed)
     }
 }
 
@@ -428,6 +458,46 @@ impl AuthoritativeGrantChange {
             AuthoritativeGrantChangeKind::Create(state)
             | AuthoritativeGrantChangeKind::Update { state, .. } => state.authority_key(),
             AuthoritativeGrantChangeKind::Revoke { authority_key, .. } => authority_key,
+        }
+    }
+
+    /// Applies a validated grant mutation as a pure CAS transition for durable adapters.
+    pub fn apply_to(
+        &self,
+        current: Option<&AuthoritativeGrantState>,
+    ) -> Result<AuthoritativeGrantState, ExecutionStoreError> {
+        match (&self.kind, current) {
+            (AuthoritativeGrantChangeKind::Create(next), None) => Ok(next.clone()),
+            (AuthoritativeGrantChangeKind::Create(_), Some(_)) => Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::VersionConflict,
+            )),
+            (
+                AuthoritativeGrantChangeKind::Update {
+                    expected_revision,
+                    state: next,
+                },
+                Some(current),
+            ) if current.owner_id == next.owner_id
+                && current.authority_key == next.authority_key
+                && current.revision == *expected_revision
+                && next.revision > current.revision =>
+            {
+                Ok(next.clone())
+            }
+            (
+                AuthoritativeGrantChangeKind::Revoke {
+                    authority_key,
+                    expected_revision,
+                },
+                Some(current),
+            ) if current.authority_key == *authority_key
+                && current.revision == *expected_revision =>
+            {
+                Ok(current.as_revoked())
+            }
+            _ => Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::VersionConflict,
+            )),
         }
     }
 }
@@ -1132,7 +1202,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:execution-store-step",
+        format!("sha256:{}", "a".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let attempt = conformance_value(InvocationAttemptRecord::new(
@@ -1418,6 +1488,7 @@ where
     assert_command_conflict_contract(factory).await?;
     assert_atomic_failure_contract(factory).await?;
     assert_counted_grant_contract(factory).await?;
+    assert_counted_grant_revoke_race_contract(factory).await?;
     assert_durable_result_contract(factory).await
 }
 
@@ -1639,7 +1710,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:blocked-recovery",
+        format!("sha256:{}", "b".repeat(64)),
         recovery_mode,
     ))?;
     let pause = conformance_value(super::RecoveryPauseRecord::new(
@@ -1787,7 +1858,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:portable-recovery",
+        format!("sha256:{}", "c".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let pause = conformance_value(super::RecoveryPauseRecord::new(
@@ -1916,7 +1987,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         invocation.capability_id(),
         invocation.manifest_version(),
-        "sha256:portable-create-run",
+        format!("sha256:{}", "d".repeat(64)),
         RecoveryMode::Manual,
     ))?;
     let recovery_pause = conformance_value(super::RecoveryPauseRecord::new(
@@ -2367,7 +2438,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:portable-history",
+        format!("sha256:{}", "e".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let pending = conformance_value(InvocationAttemptRecord::new(
@@ -2527,7 +2598,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:keyset-history",
+        format!("sha256:{}", "f".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let make_attempt = |value: u128, step: &str| -> Result<_, ExecutionStoreError> {
@@ -2802,7 +2873,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:portable-checkpoint",
+        format!("sha256:{}", "1".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let pending = conformance_value(InvocationAttemptRecord::new(
@@ -2846,7 +2917,7 @@ where
             ExecutionCommit::new(
                 baseline.stored_run().run_version(),
                 0,
-                lease,
+                lease.clone(),
                 RuntimeCommand::record_progress(Uuid::from_u128(53_006), session.id(), queued.id())
                     .map_err(ExecutionStoreError::from)?,
                 vec![candidate_event],
@@ -2884,6 +2955,72 @@ where
             .await?
             .is_empty()
         || replay_all_events(&store, owner_id, queued.id()).await? != vec![baseline_event]
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let persisted_checkpoint = CheckpointV1Builder::new(
+        session.id(),
+        queued.id(),
+        DefinitionPin::new(1, "portable-checkpoint", 1).map_err(ExecutionStoreError::from)?,
+        1,
+        vec![],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::Running, None)
+    .build()
+    .map_err(ExecutionStoreError::from)?;
+    let installed = store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                baseline.stored_run().run_version(),
+                baseline.checkpoint_version(),
+                lease.clone(),
+                RuntimeCommand::record_progress(Uuid::from_u128(53_007), session.id(), queued.id())
+                    .map_err(ExecutionStoreError::from)?,
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                baseline.stored_run().run().clone(),
+            )
+            .with_checkpoint(persisted_checkpoint.clone()),
+        )
+        .await?;
+    if installed.checkpoint_version() != 1
+        || installed.checkpoint() != Some(&persisted_checkpoint)
+        || store.load_checkpoint(owner_id, queued.id()).await? != Some((1, persisted_checkpoint))
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let clear = ExecutionCommit::new(
+        installed.stored_run().run_version(),
+        installed.checkpoint_version(),
+        lease,
+        RuntimeCommand::record_progress(Uuid::from_u128(53_008), session.id(), queued.id())
+            .map_err(ExecutionStoreError::from)?,
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        None,
+        installed.stored_run().run().clone(),
+    )
+    .with_checkpoint_mutation(CheckpointMutation::Clear);
+    let cleared = store.commit_execution(owner_id, clear.clone()).await?;
+    if cleared.checkpoint_version() != 2
+        || cleared.checkpoint().is_some()
+        || store
+            .load_checkpoint(owner_id, queued.id())
+            .await?
+            .is_some()
+        || store.commit_execution(owner_id, clear).await? != cleared
     {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
@@ -3991,7 +4128,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:execution-store-atomic",
+        format!("sha256:{}", "2".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let baseline_attempt = conformance_value(InvocationAttemptRecord::new(
@@ -4012,7 +4149,7 @@ where
     let result = conformance_value(DurableCapabilityResult::new(
         result_reference.clone(),
         format!("jcs-v1:{}", "a".repeat(64)),
-        format!("sha256:{}", "c".repeat(64)),
+        format!("sha256:{}", "2".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -4094,7 +4231,7 @@ where
     let conflicting_result = conformance_value(DurableCapabilityResult::new(
         result_reference,
         format!("jcs-v1:{}", "b".repeat(64)),
-        format!("sha256:{}", "c".repeat(64)),
+        format!("sha256:{}", "2".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -4242,7 +4379,7 @@ fn conformance_counted_grant(
         ))?,
         RiskLevel::High,
         500,
-        Some(2_000),
+        Some(2_000_000),
         Some(1),
         GrantEffect::ApprovalRequired,
     ))
@@ -4511,10 +4648,115 @@ where
     Ok(())
 }
 
+async fn assert_counted_grant_revoke_race_contract<F>(
+    factory: &F,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let owner_id = Uuid::from_u128(0xc0_37);
+    let session = conformance_value(Session::new_for_definition(
+        Uuid::from_u128(0xc0_30),
+        &conformance_definition(true),
+        SessionConcurrencyPolicy::Concurrent,
+    ))?;
+    let run_id = Uuid::from_u128(0xc0_31);
+    let (invocation, context) = conformance_policy_context(run_id)?;
+    let grant = conformance_counted_grant(&context)?;
+    let authority = AuthoritativeGrantState::from_grant(owner_id, &grant)?;
+    store
+        .apply_authoritative_grant(
+            owner_id,
+            AuthoritativeGrantChange::create(authority.clone()),
+        )
+        .await?;
+    let (waiting, target, command, approval) = conformance_approval_resume(
+        &session,
+        run_id,
+        Uuid::from_u128(0xc032),
+        &invocation,
+        &context,
+        &grant,
+    )?;
+    let (created, lease) = create_waiting_run(
+        &store,
+        owner_id,
+        &session,
+        &waiting,
+        0,
+        SessionConcurrencyPolicy::Concurrent,
+        Uuid::from_u128(0xc0_33),
+        Uuid::from_u128(0xc0_34),
+    )
+    .await?;
+    let event = RuntimeEvent::new(
+        Uuid::from_u128(0xc0_35),
+        owner_id,
+        session.id(),
+        run_id,
+        1,
+        1,
+        RuntimeEventKind::RunResumed,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let commit = ExecutionCommit::new(
+        created.run_version(),
+        0,
+        lease,
+        command,
+        vec![event],
+        vec![],
+        vec![],
+        vec![],
+        Some(approval),
+        target.clone(),
+    );
+    let revoke = AuthoritativeGrantChange::revoke(authority.authority_key().clone(), 1)?;
+    let (commit_result, revoke_result) = futures::join!(
+        store.commit_execution(owner_id, commit),
+        store.apply_authoritative_grant(owner_id, revoke)
+    );
+    let revoked = revoke_result?;
+    if revoked.status() != GrantStatus::Revoked {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    match commit_result {
+        Ok(outcome)
+            if outcome.stored_run().run() == &target && outcome.grant_consumption().is_some() => {}
+        Err(error) if error.code() == ExecutionStoreErrorCode::GrantConflict => {
+            if store
+                .load_run(owner_id, run_id)
+                .await?
+                .as_ref()
+                .map(StoredRun::run)
+                != Some(&waiting)
+            {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::InvalidRequest,
+                ));
+            }
+        }
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    }
+    Ok(())
+}
+
 async fn assert_durable_result_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
 where
     F: ExecutionStoreFactory,
 {
+    if ManifestPin::new("malformed", 1, "sha256:abc").is_ok() {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
     let store = factory.create_execution_store().await?;
     let owner_id = Uuid::from_u128(0xd0_14);
     let session = Session::new(
@@ -4553,7 +4795,7 @@ where
     let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
         "workspace.write",
         1,
-        "sha256:execution-store-result",
+        format!("sha256:{}", "3".repeat(64)),
         RecoveryMode::KeyedIdempotent,
     ))?;
     let attempt = conformance_value(InvocationAttemptRecord::new(
@@ -4581,14 +4823,34 @@ where
     let cross_run_completed = conformance_value(CompletedInvocationRecord::new(
         cross_run_invocation.binding(),
         1,
-        manifest,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        conformance_value(OpaqueReference::new(result_reference.handle()))?,
+    ))?;
+    let cross_manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        format!("sha256:{}", "4".repeat(64)),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let cross_manifest_completed = conformance_value(CompletedInvocationRecord::new(
+        invocation.binding(),
+        1,
+        cross_manifest,
         RecoveryMode::KeyedIdempotent,
         conformance_value(OpaqueReference::new(result_reference.handle()))?,
     ))?;
     let result = conformance_value(DurableCapabilityResult::new(
         result_reference.clone(),
         format!("jcs-v1:{}", "d".repeat(64)),
-        format!("sha256:{}", "e".repeat(64)),
+        format!("sha256:{}", "3".repeat(64)),
+        1,
+        DurableCapabilityStatus::Completed,
+    ))?;
+    let mismatched_result = conformance_value(DurableCapabilityResult::new(
+        result_reference.clone(),
+        format!("jcs-v1:{}", "4".repeat(64)),
+        format!("sha256:{}", "4".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -4608,12 +4870,30 @@ where
         RuntimeEventKind::RunStarted,
     )
     .map_err(ExecutionStoreError::from)?;
-    for (command_id, completed_without_lineage, attempts) in [
-        (Uuid::from_u128(0xd0_21), completed.clone(), vec![]),
+    for (command_id, completed_without_lineage, attempts, candidate_result) in [
+        (
+            Uuid::from_u128(0xd0_21),
+            completed.clone(),
+            vec![],
+            result.clone(),
+        ),
         (
             Uuid::from_u128(0xd0_22),
             cross_run_completed,
             vec![attempt.clone()],
+            result.clone(),
+        ),
+        (
+            Uuid::from_u128(0xd0_23),
+            cross_manifest_completed,
+            vec![attempt.clone()],
+            mismatched_result.clone(),
+        ),
+        (
+            Uuid::from_u128(0xd0_24),
+            completed.clone(),
+            vec![attempt.clone()],
+            mismatched_result.clone(),
         ),
     ] {
         let rejected = store
@@ -4630,7 +4910,7 @@ where
                     attempts,
                     vec![DurableResultMutation::new(
                         completed_without_lineage,
-                        result.clone(),
+                        candidate_result,
                     )],
                     None,
                     running.clone(),
@@ -4641,6 +4921,19 @@ where
             rejected,
             Err(error) if error.code() == ExecutionStoreErrorCode::LineageConflict
         ) || store.load_run(owner_id, queued.id()).await?.as_ref() != Some(&created)
+            || !store
+                .load_attempts_page(
+                    owner_id,
+                    queued.id(),
+                    StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+                )
+                .await?
+                .items()
+                .is_empty()
+            || store
+                .load_durable_result(owner_id, queued.id(), invocation.id())
+                .await?
+                .is_some()
             || !replay_all_events(&store, owner_id, queued.id())
                 .await?
                 .is_empty()
@@ -4735,7 +5028,7 @@ where
     let conflicting_result = conformance_value(DurableCapabilityResult::new(
         result_reference,
         format!("jcs-v1:{}", "f".repeat(64)),
-        format!("sha256:{}", "e".repeat(64)),
+        format!("sha256:{}", "3".repeat(64)),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
