@@ -11,6 +11,9 @@ use uuid::Uuid;
 #[path = "capability/invocation.rs"]
 mod invocation;
 use invocation::{canonicalize_arguments, validate_argument_bounds};
+#[path = "capability/manifest.rs"]
+mod manifest;
+use manifest::validate_manifest;
 #[path = "capability/schema.rs"]
 mod schema;
 use schema::{compile_schema, validate_instance};
@@ -120,6 +123,7 @@ pub enum ManifestCatalogError {
     InvalidManifestVersion,
     InvalidManifestSchemaVersion,
     InvalidSchemaDigest,
+    InvalidSecretReferenceName,
     InvalidRuntimeCompatibility,
     InvalidProfileId,
     InvalidProfileVersion,
@@ -145,6 +149,9 @@ impl fmt::Display for ManifestCatalogError {
             }
             Self::InvalidSchemaDigest => {
                 write!(formatter, "manifest schema digest must not be blank")
+            }
+            Self::InvalidSecretReferenceName => {
+                write!(formatter, "manifest secret reference names are invalid")
             }
             Self::InvalidRuntimeCompatibility => {
                 write!(formatter, "runtime compatibility bounds are invalid")
@@ -287,6 +294,7 @@ pub const CAPABILITY_INVOCATION_NAMESPACE: Uuid =
 pub const MAX_CAPABILITY_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_CAPABILITY_ARGUMENT_DEPTH: usize = 64;
 pub const MAX_CAPABILITY_ARGUMENT_NODES: usize = 10_000;
+pub const MAX_CAPABILITY_ID_BYTES: usize = 256;
 
 /// Errors raised before an argument value enters schema validation or an executor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +303,7 @@ pub enum LogicalInvocationError {
     ArgumentsTooDeep,
     ArgumentsTooManyNodes,
     CanonicalizationFailed,
+    IdentifierTooLarge,
 }
 
 impl fmt::Display for LogicalInvocationError {
@@ -304,6 +313,7 @@ impl fmt::Display for LogicalInvocationError {
             Self::ArgumentsTooDeep => "capability arguments exceed the nesting limit",
             Self::ArgumentsTooManyNodes => "capability arguments exceed the node limit",
             Self::CanonicalizationFailed => "capability arguments cannot be canonicalized",
+            Self::IdentifierTooLarge => "capability invocation identifier exceeds the byte limit",
         })
     }
 }
@@ -334,15 +344,24 @@ impl LogicalInvocation {
         manifest_version: u32,
         arguments: Value,
     ) -> Result<Self, LogicalInvocationError> {
+        let logical_step_id = logical_step_id.into();
+        let capability_id = capability_id.into();
+        if logical_step_id.is_empty()
+            || capability_id.is_empty()
+            || logical_step_id.len() > MAX_CAPABILITY_ID_BYTES
+            || capability_id.len() > MAX_CAPABILITY_ID_BYTES
+        {
+            return Err(LogicalInvocationError::IdentifierTooLarge);
+        }
         validate_argument_bounds(&arguments)?;
         let normalized_arguments = canonicalize_arguments(arguments)?;
-        Ok(Self::from_seed(LogicalInvocationSeed {
+        Self::from_seed(LogicalInvocationSeed {
             run_id,
-            logical_step_id: logical_step_id.into(),
-            capability_id: capability_id.into(),
+            logical_step_id,
+            capability_id,
             manifest_version,
             normalized_arguments,
-        }))
+        })
     }
 
     pub fn id(&self) -> Uuid {
@@ -369,7 +388,7 @@ impl LogicalInvocation {
         &self.seed.normalized_arguments
     }
 
-    fn from_seed(seed: LogicalInvocationSeed) -> Self {
+    fn from_seed(seed: LogicalInvocationSeed) -> Result<Self, LogicalInvocationError> {
         #[derive(Serialize)]
         struct VersionedSeed<'a> {
             format: &'static str,
@@ -387,11 +406,11 @@ impl LogicalInvocation {
             manifest_version: seed.manifest_version,
             normalized_arguments: &seed.normalized_arguments,
         })
-        .expect("validated logical invocation seeds must canonicalize");
-        Self {
+        .map_err(|_| LogicalInvocationError::CanonicalizationFailed)?;
+        Ok(Self {
             id: Uuid::new_v5(&CAPABILITY_INVOCATION_NAMESPACE, &bytes),
             seed,
-        }
+        })
     }
 }
 
@@ -492,34 +511,18 @@ fn attempt_id(logical_invocation_id: Uuid, number: u32) -> Uuid {
     Uuid::new_v5(&CAPABILITY_INVOCATION_NAMESPACE, name.as_bytes())
 }
 
-/// A validated non-secret resource identifier such as `owner:42` or `workspace:primary`.
-#[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct CapabilityReferenceId(String);
+/// An opaque non-secret resource handle. The field carrying it supplies its meaning.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapabilityReferenceId(Uuid);
 
 impl CapabilityReferenceId {
-    pub fn parse(value: impl Into<String>) -> Result<Self, CapabilityContextError> {
-        let value = value.into();
-        let Some((kind, identifier)) = value.split_once(':') else {
-            return Err(CapabilityContextError::InvalidReference);
-        };
-        if kind.is_empty()
-            || kind.len() > 32
-            || identifier.is_empty()
-            || identifier.len() > 64
-            || !kind
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-            || !identifier
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
-            return Err(CapabilityContextError::InvalidReference);
-        }
-        Ok(Self(value))
+    pub fn new(handle: Uuid) -> Self {
+        Self(handle)
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn handle(&self) -> Uuid {
+        self.0
     }
 }
 
@@ -529,55 +532,24 @@ impl fmt::Debug for CapabilityReferenceId {
     }
 }
 
-impl<'de> Deserialize<'de> for CapabilityReferenceId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
-
-/// A declared secret name, never a secret value.
-#[derive(Clone, PartialEq, Eq, Serialize)]
-pub struct CapabilitySecretReferenceId(String);
+/// An index into the manifest's declared secret references, never a name or value.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CapabilitySecretReferenceId(u16);
 
 impl CapabilitySecretReferenceId {
-    pub fn parse(value: impl Into<String>) -> Result<Self, CapabilityContextError> {
-        let value = value.into();
-        let Some(name) = value.strip_prefix("secret:") else {
-            return Err(CapabilityContextError::InvalidSecretReference);
-        };
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err(CapabilityContextError::InvalidSecretReference);
-        }
-        Ok(Self(value))
+    pub fn from_manifest_index(index: u16) -> Self {
+        Self(index)
     }
 
-    pub fn as_str(&self) -> &str {
+    pub fn manifest_index(self) -> u16 {
         self.0
-            .strip_prefix("secret:")
-            .expect("validated secret reference prefix")
     }
 }
 
 impl fmt::Debug for CapabilitySecretReferenceId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("CapabilitySecretReferenceId(REDACTED)")
-    }
-}
-
-impl<'de> Deserialize<'de> for CapabilitySecretReferenceId {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -600,7 +572,7 @@ impl CapabilityExecutionReferences {
             owner: None,
             agent: None,
             session: None,
-            run: CapabilityReferenceId::parse(format!("run:{run_id}")).expect("UUID run reference"),
+            run: CapabilityReferenceId::new(run_id),
             workspace: None,
             deadline: None,
             cancellation: None,
@@ -643,12 +615,28 @@ impl CapabilityExecutionReferences {
         self
     }
 
+    pub fn owner(&self) -> Option<&CapabilityReferenceId> {
+        self.owner.as_ref()
+    }
+    pub fn agent(&self) -> Option<&CapabilityReferenceId> {
+        self.agent.as_ref()
+    }
+    pub fn session(&self) -> Option<&CapabilityReferenceId> {
+        self.session.as_ref()
+    }
+    pub fn run(&self) -> &CapabilityReferenceId {
+        &self.run
+    }
+    pub fn workspace(&self) -> Option<&CapabilityReferenceId> {
+        self.workspace.as_ref()
+    }
+    pub fn secret_handles(&self) -> &[CapabilitySecretReferenceId] {
+        &self.secrets
+    }
+
     fn secrets_are_declared_by(&self, manifest: &CapabilityManifest) -> bool {
         self.secrets.iter().all(|reference| {
-            manifest
-                .secret_references
-                .iter()
-                .any(|declared| declared == reference.as_str())
+            usize::from(reference.manifest_index()) < manifest.secret_references.len()
         })
     }
 }
@@ -700,9 +688,16 @@ impl CapabilityExecutionContext {
         &self.references
     }
 
-    pub fn with_references(mut self, references: CapabilityExecutionReferences) -> Self {
+    pub fn with_references(
+        mut self,
+        references: CapabilityExecutionReferences,
+    ) -> Result<Self, CapabilityContextError> {
+        let expected_run = CapabilityReferenceId::new(self.invocation.run_id());
+        if references.run != expected_run {
+            return Err(CapabilityContextError::RunReferenceMismatch);
+        }
         self.references = references;
-        self
+        Ok(self)
     }
 
     fn try_new(
@@ -963,9 +958,15 @@ pub enum RecoveryAction {
 }
 
 /// An opaque, one-time registry authorization for a specific retry attempt.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CapabilityRetryAuthorization {
     nonce: Uuid,
+}
+
+impl fmt::Debug for CapabilityRetryAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapabilityRetryAuthorization(REDACTED)")
+    }
 }
 
 /// A compact discriminator for recovery orchestration and public tests.
@@ -1037,7 +1038,7 @@ impl std::error::Error for CapabilityRegistryError {}
 pub struct CapabilityRegistry {
     catalog: ManifestCatalog,
     executors: BTreeMap<(String, u32), RegisteredExecutor>,
-    retry_authorizations: Mutex<BTreeMap<Uuid, RetryAuthorizationRecord>>,
+    lineage: Arc<dyn CapabilityLineageStore>,
 }
 
 struct RegisteredExecutor {
@@ -1046,21 +1047,119 @@ struct RegisteredExecutor {
     output_validator: Arc<JSONSchema>,
 }
 
-#[derive(Clone)]
-struct RetryAuthorizationRecord {
-    logical_invocation_id: Uuid,
-    idempotency_key: String,
-    capability_id: String,
-    manifest_version: u32,
-    attempt_number: u32,
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub enum CapabilityAttemptLineageState {
+    Executed,
+    RetryAuthorized { authorization_id: Uuid },
+    RetryInFlight,
+    Completed(CapabilityResult),
+    Pending,
+    AuthoritativeAbsence,
+    RecoveryRequired,
+}
+
+impl fmt::Debug for CapabilityAttemptLineageState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Executed => formatter.write_str("Executed"),
+            Self::RetryAuthorized { .. } => formatter.write_str("RetryAuthorized(REDACTED)"),
+            Self::RetryInFlight => formatter.write_str("RetryInFlight"),
+            Self::Completed(result) => formatter.debug_tuple("Completed").field(result).finish(),
+            Self::Pending => formatter.write_str("Pending"),
+            Self::AuthoritativeAbsence => formatter.write_str("AuthoritativeAbsence"),
+            Self::RecoveryRequired => formatter.write_str("RecoveryRequired"),
+        }
+    }
+}
+
+/// A host may implement this with durable compare-and-swap storage.
+pub trait CapabilityLineageStore: Send + Sync {
+    fn load(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError>;
+
+    fn compare_exchange(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: Option<&CapabilityAttemptLineageState>,
+        new: CapabilityAttemptLineageState,
+    ) -> Result<bool, CapabilityError>;
+
+    fn set(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        state: CapabilityAttemptLineageState,
+    ) -> Result<(), CapabilityError>;
+}
+
+#[derive(Default)]
+struct InMemoryCapabilityLineageStore {
+    states: Mutex<BTreeMap<(Uuid, u32), CapabilityAttemptLineageState>>,
+}
+
+impl CapabilityLineageStore for InMemoryCapabilityLineageStore {
+    fn load(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
+        Ok(self
+            .states
+            .lock()
+            .map_err(|_| CapabilityError::execution())?
+            .get(&(logical_invocation_id, attempt_number))
+            .cloned())
+    }
+
+    fn compare_exchange(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        current: Option<&CapabilityAttemptLineageState>,
+        new: CapabilityAttemptLineageState,
+    ) -> Result<bool, CapabilityError> {
+        let mut states = self
+            .states
+            .lock()
+            .map_err(|_| CapabilityError::execution())?;
+        if states.get(&(logical_invocation_id, attempt_number)) != current {
+            return Ok(false);
+        }
+        states.insert((logical_invocation_id, attempt_number), new);
+        Ok(true)
+    }
+
+    fn set(
+        &self,
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        state: CapabilityAttemptLineageState,
+    ) -> Result<(), CapabilityError> {
+        self.states
+            .lock()
+            .map_err(|_| CapabilityError::execution())?
+            .insert((logical_invocation_id, attempt_number), state);
+        Ok(())
+    }
 }
 
 impl CapabilityRegistry {
     pub fn new(catalog: ManifestCatalog) -> Self {
+        Self::with_lineage_store(catalog, Arc::new(InMemoryCapabilityLineageStore::default()))
+    }
+
+    pub fn with_lineage_store(
+        catalog: ManifestCatalog,
+        lineage: Arc<dyn CapabilityLineageStore>,
+    ) -> Self {
         Self {
             catalog,
             executors: BTreeMap::new(),
-            retry_authorizations: Mutex::new(BTreeMap::new()),
+            lineage,
         }
     }
 
@@ -1131,19 +1230,28 @@ impl CapabilityRegistry {
             return Err(CapabilityError::validation());
         }
         let manifest = self.manifest_for_context(&context)?;
-        if !context.references().secrets_are_declared_by(manifest) {
-            return Err(CapabilityError::validation());
-        }
+        self.validate_context(&context, manifest)?;
         let entry = self.entry_for_context(&context)?;
         validate_instance(
             &entry.input_validator,
             context.normalized_arguments(),
             false,
         )?;
+        let lineage_key = (context.invocation().id(), 1);
+        if !self.lineage.compare_exchange(
+            lineage_key.0,
+            lineage_key.1,
+            None,
+            CapabilityAttemptLineageState::Executed,
+        )? {
+            return Err(CapabilityError::validation());
+        }
         let executor = entry.executor.clone();
         let mut result = executor.execute(context).await?;
+        validate_argument_bounds(&result.output)
+            .map_err(|_| CapabilityError::output_validation())?;
         validate_instance(&entry.output_validator, &result.output, true)?;
-        result.output = canonicalize_json(result.output);
+        result.output = canonicalize_json(result.output)?;
         Ok(result)
     }
 
@@ -1154,33 +1262,30 @@ impl CapabilityRegistry {
         authorization: CapabilityRetryAuthorization,
     ) -> Result<CapabilityResult, CapabilityError> {
         let manifest = self.manifest_for_context(&context)?;
-        if !context.references().secrets_are_declared_by(manifest) {
-            return Err(CapabilityError::validation());
-        }
+        self.validate_context(&context, manifest)?;
         let entry = self.entry_for_context(&context)?;
-        let key = context.invocation().idempotency_key();
-        let record = self
-            .retry_authorizations
-            .lock()
-            .map_err(|_| CapabilityError::execution())?
-            .remove(&authorization.nonce)
-            .ok_or_else(CapabilityError::validation)?;
-        if record.logical_invocation_id != context.invocation().id()
-            || record.idempotency_key != key
-            || record.capability_id != context.invocation().capability_id()
-            || record.manifest_version != context.invocation().manifest_version()
-            || record.attempt_number != context.attempt().number()
-        {
-            return Err(CapabilityError::validation());
-        }
         validate_instance(
             &entry.input_validator,
             context.normalized_arguments(),
             false,
         )?;
+        let lineage_key = (context.invocation().id(), context.attempt().number());
+        let authorized = CapabilityAttemptLineageState::RetryAuthorized {
+            authorization_id: authorization.nonce,
+        };
+        if !self.lineage.compare_exchange(
+            lineage_key.0,
+            lineage_key.1,
+            Some(&authorized),
+            CapabilityAttemptLineageState::RetryInFlight,
+        )? {
+            return Err(CapabilityError::validation());
+        }
         let mut result = entry.executor.execute(context).await?;
+        validate_argument_bounds(&result.output)
+            .map_err(|_| CapabilityError::output_validation())?;
         validate_instance(&entry.output_validator, &result.output, true)?;
-        result.output = canonicalize_json(result.output);
+        result.output = canonicalize_json(result.output)?;
         Ok(result)
     }
 
@@ -1189,8 +1294,16 @@ impl CapabilityRegistry {
         context: CapabilityExecutionContext,
     ) -> Result<RecoveryAction, CapabilityError> {
         let manifest = self.manifest_for_context(&context)?;
-        if !context.references().secrets_are_declared_by(manifest) {
-            return Err(CapabilityError::validation());
+        self.validate_context(&context, manifest)?;
+        if self
+            .lineage
+            .load(context.invocation().id(), context.attempt().number())?
+            == Some(CapabilityAttemptLineageState::AuthoritativeAbsence)
+        {
+            return self.authorize_retry(&context, manifest);
+        }
+        if let Some(action) = self.cached_recovery_action(&context)? {
+            return Ok(action);
         }
         match manifest.recovery_mode {
             RecoveryMode::InherentlyIdempotent
@@ -1205,21 +1318,85 @@ impl CapabilityRegistry {
                 )?;
                 match entry.executor.reconcile(context.clone()).await? {
                     ReconcileOutcome::Completed(mut result) => {
+                        validate_argument_bounds(&result.output)
+                            .map_err(|_| CapabilityError::output_validation())?;
                         validate_instance(&entry.output_validator, &result.output, true)?;
-                        result.output = canonicalize_json(result.output);
+                        result.output = canonicalize_json(result.output)?;
+                        self.set_lineage_state(
+                            &context,
+                            CapabilityAttemptLineageState::Completed(result.clone()),
+                        )?;
                         Ok(RecoveryAction::Completed(result))
                     }
-                    ReconcileOutcome::Pending => Ok(RecoveryAction::Pending),
+                    ReconcileOutcome::Pending => {
+                        self.set_lineage_state(&context, CapabilityAttemptLineageState::Pending)?;
+                        Ok(RecoveryAction::Pending)
+                    }
                     ReconcileOutcome::AuthoritativeAbsence => {
+                        self.set_lineage_state(
+                            &context,
+                            CapabilityAttemptLineageState::AuthoritativeAbsence,
+                        )?;
                         self.authorize_retry(&context, manifest)
                     }
-                    ReconcileOutcome::RecoveryRequired => Ok(RecoveryAction::RecoveryRequired),
+                    ReconcileOutcome::RecoveryRequired => {
+                        self.set_lineage_state(
+                            &context,
+                            CapabilityAttemptLineageState::RecoveryRequired,
+                        )?;
+                        Ok(RecoveryAction::RecoveryRequired)
+                    }
                 }
             }
             RecoveryMode::NonRetryable | RecoveryMode::None | RecoveryMode::Manual => {
+                self.set_lineage_state(&context, CapabilityAttemptLineageState::RecoveryRequired)?;
                 Ok(RecoveryAction::RecoveryRequired)
             }
         }
+    }
+
+    fn validate_context(
+        &self,
+        context: &CapabilityExecutionContext,
+        manifest: &CapabilityManifest,
+    ) -> Result<(), CapabilityError> {
+        if context.references().run().handle() != context.invocation().run_id()
+            || !context.references().secrets_are_declared_by(manifest)
+        {
+            return Err(CapabilityError::validation());
+        }
+        Ok(())
+    }
+
+    fn cached_recovery_action(
+        &self,
+        context: &CapabilityExecutionContext,
+    ) -> Result<Option<RecoveryAction>, CapabilityError> {
+        let key = (context.invocation().id(), context.attempt().number());
+        match self.lineage.load(key.0, key.1)? {
+            Some(CapabilityAttemptLineageState::Executed)
+            | Some(CapabilityAttemptLineageState::RetryInFlight)
+            | Some(CapabilityAttemptLineageState::Pending)
+            | Some(CapabilityAttemptLineageState::AuthoritativeAbsence) => Ok(None),
+            Some(CapabilityAttemptLineageState::Completed(result)) => {
+                Ok(Some(RecoveryAction::Completed(result)))
+            }
+            Some(CapabilityAttemptLineageState::RecoveryRequired) => {
+                Ok(Some(RecoveryAction::RecoveryRequired))
+            }
+            None | Some(CapabilityAttemptLineageState::RetryAuthorized { .. }) => {
+                Err(CapabilityError::validation())
+            }
+        }
+    }
+
+    fn set_lineage_state(
+        &self,
+        context: &CapabilityExecutionContext,
+        state: CapabilityAttemptLineageState,
+    ) -> Result<(), CapabilityError> {
+        self.lineage
+            .set(context.invocation().id(), context.attempt().number(), state)
     }
 
     fn manifest_for_context(
@@ -1258,21 +1435,52 @@ impl CapabilityRegistry {
         if next_attempt > manifest.max_retries.saturating_add(1) {
             return Ok(RecoveryAction::RecoveryRequired);
         }
+        let current_key = (context.invocation().id(), context.attempt().number());
+        let next_key = (context.invocation().id(), next_attempt);
+        let current_state = self.lineage.load(current_key.0, current_key.1)?;
+        if !matches!(
+            current_state,
+            Some(CapabilityAttemptLineageState::Executed)
+                | Some(CapabilityAttemptLineageState::RetryInFlight)
+                | Some(CapabilityAttemptLineageState::AuthoritativeAbsence)
+        ) {
+            return Err(CapabilityError::validation());
+        }
+        if let Some(CapabilityAttemptLineageState::RetryAuthorized { authorization_id }) =
+            self.lineage.load(next_key.0, next_key.1)?
+        {
+            return Ok(RecoveryAction::RetrySameKey {
+                idempotency_key: context.invocation().idempotency_key(),
+                authorization: CapabilityRetryAuthorization {
+                    nonce: authorization_id,
+                },
+            });
+        }
+        if self.lineage.load(next_key.0, next_key.1)?.is_some() {
+            return Ok(RecoveryAction::RecoveryRequired);
+        }
         let nonce = Uuid::new_v4();
         let idempotency_key = context.invocation().idempotency_key();
-        self.retry_authorizations
-            .lock()
-            .map_err(|_| CapabilityError::execution())?
-            .insert(
-                nonce,
-                RetryAuthorizationRecord {
-                    logical_invocation_id: context.invocation().id(),
-                    idempotency_key: idempotency_key.clone(),
-                    capability_id: context.invocation().capability_id().to_owned(),
-                    manifest_version: context.invocation().manifest_version(),
-                    attempt_number: next_attempt,
-                },
-            );
+        if !self.lineage.compare_exchange(
+            next_key.0,
+            next_key.1,
+            None,
+            CapabilityAttemptLineageState::RetryAuthorized {
+                authorization_id: nonce,
+            },
+        )? {
+            if let Some(CapabilityAttemptLineageState::RetryAuthorized { authorization_id }) =
+                self.lineage.load(next_key.0, next_key.1)?
+            {
+                return Ok(RecoveryAction::RetrySameKey {
+                    idempotency_key,
+                    authorization: CapabilityRetryAuthorization {
+                        nonce: authorization_id,
+                    },
+                });
+            }
+            return Ok(RecoveryAction::RecoveryRequired);
+        }
         Ok(RecoveryAction::RetrySameKey {
             idempotency_key,
             authorization: CapabilityRetryAuthorization { nonce },
@@ -1280,29 +1488,6 @@ impl CapabilityRegistry {
     }
 }
 
-fn canonicalize_json(value: Value) -> Value {
-    canonicalize_arguments(value).expect("executor JSON results must canonicalize")
-}
-
-fn validate_manifest(manifest: &CapabilityManifest) -> Result<(), ManifestCatalogError> {
-    if manifest.id.trim().is_empty() {
-        return Err(ManifestCatalogError::InvalidManifestId);
-    }
-    if manifest.version == 0 {
-        return Err(ManifestCatalogError::InvalidManifestVersion);
-    }
-    if manifest.compatibility.manifest_schema_version == 0 {
-        return Err(ManifestCatalogError::InvalidManifestSchemaVersion);
-    }
-    if manifest.schema_digest.trim().is_empty() {
-        return Err(ManifestCatalogError::InvalidSchemaDigest);
-    }
-    if manifest.compatibility.minimum_runtime_schema_version == 0
-        || manifest.compatibility.maximum_runtime_schema_version == 0
-        || manifest.compatibility.minimum_runtime_schema_version
-            > manifest.compatibility.maximum_runtime_schema_version
-    {
-        return Err(ManifestCatalogError::InvalidRuntimeCompatibility);
-    }
-    Ok(())
+fn canonicalize_json(value: Value) -> Result<Value, CapabilityError> {
+    canonicalize_arguments(value).map_err(|_| CapabilityError::output_validation())
 }

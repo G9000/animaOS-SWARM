@@ -14,14 +14,16 @@ pub use agent::{
     ToolDescriptor, ToolExample,
 };
 pub use capability::{
-    CapabilityAttempt, CapabilityContextError, CapabilityError, CapabilityErrorCode,
-    CapabilityExecutionContext, CapabilityExecutionReferences, CapabilityExecutor, CapabilityKind,
-    CapabilityManifest, CapabilityProfile, CapabilityProfileEntry, CapabilityReferenceId,
-    CapabilityRegistry, CapabilityRegistryError, CapabilityResult, CapabilityRetryAuthorization,
+    CapabilityAttempt, CapabilityAttemptLineageState, CapabilityContextError, CapabilityError,
+    CapabilityErrorCode, CapabilityExecutionContext, CapabilityExecutionReferences,
+    CapabilityExecutor, CapabilityKind, CapabilityLineageStore, CapabilityManifest,
+    CapabilityProfile, CapabilityProfileEntry, CapabilityReferenceId, CapabilityRegistry,
+    CapabilityRegistryError, CapabilityResult, CapabilityRetryAuthorization,
     CapabilitySecretReferenceId, LogicalInvocation, LogicalInvocationError, ManifestCatalog,
     ManifestCatalogError, ReconcileOutcome, RecoveryAction, RecoveryActionKind, RecoveryMode,
     RiskLevel, RuntimeCompatibility, CAPABILITY_INVOCATION_NAMESPACE,
     MAX_CAPABILITY_ARGUMENT_BYTES, MAX_CAPABILITY_ARGUMENT_DEPTH, MAX_CAPABILITY_ARGUMENT_NODES,
+    MAX_CAPABILITY_ID_BYTES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
 pub use definition::{

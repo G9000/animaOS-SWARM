@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
 use anima_core::{
-    CapabilityAttempt, CapabilityError, CapabilityErrorCode, CapabilityExecutionContext,
-    CapabilityExecutor, CapabilityKind, CapabilityManifest, CapabilityReferenceId,
-    CapabilityRegistry, CapabilityRegistryError, CapabilityResult, CapabilitySecretReferenceId,
-    LogicalInvocation, ManifestCatalog, ReconcileOutcome, RecoveryActionKind, RecoveryMode,
+    CapabilityAttempt, CapabilityAttemptLineageState, CapabilityContextError, CapabilityError,
+    CapabilityErrorCode, CapabilityExecutionContext, CapabilityExecutor, CapabilityKind,
+    CapabilityLineageStore, CapabilityManifest, CapabilityReferenceId, CapabilityRegistry,
+    CapabilityRegistryError, CapabilityResult, CapabilitySecretReferenceId, LogicalInvocation,
+    ManifestCatalog, ManifestCatalogError, ReconcileOutcome, RecoveryActionKind, RecoveryMode,
     RiskLevel, RuntimeCompatibility,
 };
 use async_trait::async_trait;
@@ -61,6 +63,54 @@ fn registry(manifests: Vec<CapabilityManifest>) -> CapabilityRegistry {
         catalog.register_manifest(manifest).unwrap();
     }
     CapabilityRegistry::new(catalog)
+}
+
+#[derive(Default)]
+struct TestLineageStore {
+    states: Mutex<BTreeMap<(Uuid, u32), CapabilityAttemptLineageState>>,
+}
+
+impl CapabilityLineageStore for TestLineageStore {
+    fn load(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+    ) -> Result<Option<CapabilityAttemptLineageState>, CapabilityError> {
+        Ok(self
+            .states
+            .lock()
+            .unwrap()
+            .get(&(invocation_id, attempt_number))
+            .cloned())
+    }
+
+    fn compare_exchange(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+        current: Option<&CapabilityAttemptLineageState>,
+        new: CapabilityAttemptLineageState,
+    ) -> Result<bool, CapabilityError> {
+        let mut states = self.states.lock().unwrap();
+        if states.get(&(invocation_id, attempt_number)) != current {
+            return Ok(false);
+        }
+        states.insert((invocation_id, attempt_number), new);
+        Ok(true)
+    }
+
+    fn set(
+        &self,
+        invocation_id: Uuid,
+        attempt_number: u32,
+        state: CapabilityAttemptLineageState,
+    ) -> Result<(), CapabilityError> {
+        self.states
+            .lock()
+            .unwrap()
+            .insert((invocation_id, attempt_number), state);
+        Ok(())
+    }
 }
 
 fn context(manifest: &CapabilityManifest, arguments: Value) -> CapabilityExecutionContext {
@@ -256,6 +306,47 @@ async fn registry_validates_output_before_returning_a_persistable_result() {
 }
 
 #[tokio::test]
+async fn output_preflight_bounds_execution_and_reconciliation_without_panics() {
+    let oversized = Value::String("x".repeat(anima_core::MAX_CAPABILITY_ARGUMENT_BYTES + 1));
+    let mut execution_manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    execution_manifest.output_schema = json!({});
+    let mut execution_executor = RecordingExecutor::new(execution_manifest.clone());
+    execution_executor.execute_result = CapabilityResult::new(oversized.clone());
+    let mut execution_registry = registry(vec![execution_manifest.clone()]);
+    execution_registry
+        .register_executor(Arc::new(execution_executor))
+        .unwrap();
+    assert_eq!(
+        execution_registry
+            .execute(context(&execution_manifest, json!({ "query": "hello" })))
+            .await
+            .unwrap_err()
+            .code(),
+        CapabilityErrorCode::OutputValidation
+    );
+
+    let mut reconcile_manifest = manifest("workspace.reconcile", 1, RecoveryMode::Reconcilable);
+    reconcile_manifest.output_schema = json!({});
+    let mut reconcile_executor = RecordingExecutor::new(reconcile_manifest.clone());
+    reconcile_executor.reconcile_result =
+        ReconcileOutcome::Completed(CapabilityResult::new(oversized));
+    let mut reconcile_registry = registry(vec![reconcile_manifest.clone()]);
+    reconcile_registry
+        .register_executor(Arc::new(reconcile_executor))
+        .unwrap();
+    let initial = context(&reconcile_manifest, json!({ "query": "hello" }));
+    reconcile_registry.execute(initial.clone()).await.unwrap();
+    assert_eq!(
+        reconcile_registry
+            .recover(initial)
+            .await
+            .unwrap_err()
+            .code(),
+        CapabilityErrorCode::OutputValidation
+    );
+}
+
+#[tokio::test]
 async fn unavailable_exact_pinned_manifest_is_reported_safely() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
     let registry = registry(vec![manifest.clone()]);
@@ -374,10 +465,9 @@ async fn recovery_decides_retry_reconcile_or_manual_without_automatic_execution(
         let mut registry = registry(vec![manifest.clone()]);
         registry.register_executor(Arc::new(executor)).unwrap();
 
-        let action = registry
-            .recover(context(&manifest, json!({ "query": "hello" })))
-            .await
-            .unwrap();
+        let initial = context(&manifest, json!({ "query": "hello" }));
+        registry.execute(initial.clone()).await.unwrap();
+        let action = registry.recover(initial).await.unwrap();
         assert_eq!(action.kind(), expected);
         assert_eq!(reconciliations.load(Ordering::SeqCst) > 0, calls_reconciler);
     }
@@ -405,10 +495,9 @@ async fn reconcilers_return_all_portable_recovery_outcomes() {
         executor.reconcile_result = outcome;
         let mut registry = registry(vec![manifest.clone()]);
         registry.register_executor(Arc::new(executor)).unwrap();
-        let action = registry
-            .recover(context(&manifest, json!({ "query": "hello" })))
-            .await
-            .unwrap();
+        let initial = context(&manifest, json!({ "query": "hello" }));
+        registry.execute(initial.clone()).await.unwrap();
+        let action = registry.recover(initial).await.unwrap();
         assert_eq!(action.kind(), expected);
     }
 }
@@ -466,21 +555,19 @@ fn execution_context_is_serde_safe_and_never_contains_raw_credentials() {
     let references = baseline
         .references()
         .clone()
-        .with_owner(CapabilityReferenceId::parse("owner:42").unwrap())
-        .with_agent(CapabilityReferenceId::parse("agent:7").unwrap())
-        .with_session(CapabilityReferenceId::parse("session:9").unwrap())
-        .with_workspace(CapabilityReferenceId::parse("workspace:11").unwrap())
-        .with_deadline(CapabilityReferenceId::parse("deadline:soon").unwrap())
-        .with_cancellation(CapabilityReferenceId::parse("cancel:request-2").unwrap())
-        .with_secrets(vec![CapabilitySecretReferenceId::parse(
-            "secret:github-token",
-        )
-        .unwrap()]);
-    let context = baseline.with_references(references);
+        .with_owner(CapabilityReferenceId::new(Uuid::from_u128(1)))
+        .with_agent(CapabilityReferenceId::new(Uuid::from_u128(2)))
+        .with_session(CapabilityReferenceId::new(Uuid::from_u128(3)))
+        .with_workspace(CapabilityReferenceId::new(Uuid::from_u128(4)))
+        .with_deadline(CapabilityReferenceId::new(Uuid::from_u128(5)))
+        .with_cancellation(CapabilityReferenceId::new(Uuid::from_u128(6)))
+        .with_secrets(vec![CapabilitySecretReferenceId::from_manifest_index(0)]);
+    let context = baseline.with_references(references).unwrap();
 
     let serialized = serde_json::to_string(&context).unwrap();
     let debug = format!("{context:?}");
-    assert!(serialized.contains("secret:github-token"));
+    assert!(serialized.contains("\"secrets\":[0]"));
+    assert!(!serialized.contains("github-token"));
     assert!(!debug.contains("github-token"));
     for representation in [&serialized, &debug] {
         assert!(!representation.contains("super-secret-access-token"));
@@ -632,6 +719,128 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
 }
 
 #[tokio::test]
+async fn recovery_requires_a_known_executed_attempt() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let mut registry = registry(vec![manifest.clone()]);
+    registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+
+    let unknown = context(&manifest, json!({ "query": "hello" }));
+    assert_eq!(
+        registry.recover(unknown).await.unwrap_err().code(),
+        CapabilityErrorCode::Validation
+    );
+
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    registry.execute(initial.clone()).await.unwrap();
+    let fabricated = context_for_attempt(&manifest, json!({ "query": "hello" }), 3);
+    assert_eq!(
+        registry.recover(fabricated).await.unwrap_err().code(),
+        CapabilityErrorCode::Validation
+    );
+}
+
+#[tokio::test]
+async fn concurrent_recovery_returns_one_redacted_authorization() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let mut mutable_registry = registry(vec![manifest.clone()]);
+    mutable_registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    registry.execute(initial.clone()).await.unwrap();
+
+    let (first, second) =
+        futures::join!(registry.recover(initial.clone()), registry.recover(initial));
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(
+        format!("{:?}", first.retry_authorization().unwrap()),
+        "CapabilityRetryAuthorization(REDACTED)"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_authoritative_absence_recovery_reuses_the_same_token() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::Reconcilable);
+    let mut executor = RecordingExecutor::new(manifest.clone());
+    executor.reconcile_result = ReconcileOutcome::AuthoritativeAbsence;
+    let reconciliations = executor.reconciliations.clone();
+    let mut registry = registry(vec![manifest.clone()]);
+    registry.register_executor(Arc::new(executor)).unwrap();
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    registry.execute(initial.clone()).await.unwrap();
+
+    let first = registry.recover(initial.clone()).await.unwrap();
+    let second = registry.recover(initial).await.unwrap();
+    assert_eq!(first, second);
+    assert_eq!(reconciliations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn durable_lineage_store_preserves_retry_authorization_across_registries() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let store = Arc::new(TestLineageStore::default());
+    let mut first_catalog = ManifestCatalog::default();
+    first_catalog.register_manifest(manifest.clone()).unwrap();
+    let mut first_registry = CapabilityRegistry::with_lineage_store(first_catalog, store.clone());
+    first_registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    first_registry.execute(initial.clone()).await.unwrap();
+    let first_action = first_registry.recover(initial.clone()).await.unwrap();
+
+    let mut second_catalog = ManifestCatalog::default();
+    second_catalog.register_manifest(manifest.clone()).unwrap();
+    let mut second_registry = CapabilityRegistry::with_lineage_store(second_catalog, store);
+    second_registry
+        .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
+        .unwrap();
+    let restored_action = second_registry.recover(initial).await.unwrap();
+    assert_eq!(first_action, restored_action);
+    second_registry
+        .execute_retry(
+            context_for_attempt(&manifest, json!({ "query": "hello" }), 2),
+            restored_action.retry_authorization().unwrap().clone(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_retry_consumption_has_exactly_one_winner() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let executor = RecordingExecutor::new(manifest.clone());
+    let executions = executor.executions.clone();
+    let mut mutable_registry = registry(vec![manifest.clone()]);
+    mutable_registry
+        .register_executor(Arc::new(executor))
+        .unwrap();
+    let registry = Arc::new(mutable_registry);
+    let initial = context(&manifest, json!({ "query": "hello" }));
+    registry.execute(initial.clone()).await.unwrap();
+    let authorization = registry
+        .recover(initial)
+        .await
+        .unwrap()
+        .retry_authorization()
+        .unwrap()
+        .clone();
+    let retry = context_for_attempt(&manifest, json!({ "query": "hello" }), 2);
+
+    let (first, second) = futures::join!(
+        registry.execute_retry(retry.clone(), authorization.clone()),
+        registry.execute_retry(retry, authorization)
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn recovery_authorizations_cannot_be_used_for_another_invocation() {
     let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
     let mut registry = registry(vec![manifest.clone()]);
@@ -639,6 +848,7 @@ async fn recovery_authorizations_cannot_be_used_for_another_invocation() {
         .register_executor(Arc::new(RecordingExecutor::new(manifest.clone())))
         .unwrap();
     let initial = context(&manifest, json!({ "query": "one" }));
+    registry.execute(initial.clone()).await.unwrap();
     let authorization = registry
         .recover(initial)
         .await
@@ -670,9 +880,62 @@ async fn injected_reference_values_are_rejected_or_redacted_before_executor_entr
     serialized["references"]["secrets"] = json!(["super-secret-upstream-body"]);
     assert!(serde_json::from_value::<CapabilityExecutionContext>(serialized).is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    assert!(CapabilityReferenceId::parse("https://token.example/path").is_err());
-    assert!(CapabilitySecretReferenceId::parse("super-secret-upstream-body").is_err());
+    assert!(
+        serde_json::from_value::<CapabilityReferenceId>(json!("https://token.example/path"))
+            .is_err()
+    );
+    assert!(serde_json::from_value::<CapabilitySecretReferenceId>(json!(
+        "super-secret-upstream-body"
+    ))
+    .is_err());
     assert!(!format!("{context:?}").contains("super-secret-upstream-body"));
+}
+
+#[tokio::test]
+async fn undeclared_secret_handle_is_rejected_before_executor_entry() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let executor = RecordingExecutor::new(manifest.clone());
+    let calls = executor.executions.clone();
+    let mut registry = registry(vec![manifest.clone()]);
+    registry.register_executor(Arc::new(executor)).unwrap();
+    let baseline = context(&manifest, json!({ "query": "hello" }));
+    let references = baseline
+        .references()
+        .clone()
+        .with_secrets(vec![CapabilitySecretReferenceId::from_manifest_index(1)]);
+    let context = baseline.with_references(references).unwrap();
+
+    assert_eq!(
+        registry.execute(context).await.unwrap_err().code(),
+        CapabilityErrorCode::Validation
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn references_cannot_be_grafted_across_runs() {
+    let manifest = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+    let first = context(&manifest, json!({ "query": "hello" }));
+    let second_invocation = LogicalInvocation::new(
+        Uuid::from_u128(99),
+        "step-7",
+        manifest.id.clone(),
+        manifest.version,
+        json!({ "query": "hello" }),
+    )
+    .unwrap();
+    let second = CapabilityExecutionContext::for_attempt(
+        second_invocation.clone(),
+        CapabilityAttempt::new(&second_invocation, 1).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        second
+            .with_references(first.references().clone())
+            .unwrap_err(),
+        CapabilityContextError::RunReferenceMismatch
+    );
 }
 
 #[test]
@@ -694,6 +957,11 @@ fn invocation_uses_jcs_numeric_equivalence_and_rejects_unbounded_arguments() {
 
     let oversized = Value::String("x".repeat(anima_core::MAX_CAPABILITY_ARGUMENT_BYTES + 1));
     assert!(LogicalInvocation::new(Uuid::nil(), "step", "capability", 1, oversized).is_err());
+    let escaped_oversized =
+        Value::String("\"".repeat(anima_core::MAX_CAPABILITY_ARGUMENT_BYTES / 2));
+    assert!(
+        LogicalInvocation::new(Uuid::nil(), "step", "capability", 1, escaped_oversized).is_err()
+    );
 
     let mut deep = json!(null);
     for _ in 0..=anima_core::MAX_CAPABILITY_ARGUMENT_DEPTH {
@@ -702,6 +970,43 @@ fn invocation_uses_jcs_numeric_equivalence_and_rejects_unbounded_arguments() {
     assert!(LogicalInvocation::new(Uuid::nil(), "step", "capability", 1, deep).is_err());
     let nodes = Value::Array(vec![Value::Null; anima_core::MAX_CAPABILITY_ARGUMENT_NODES]);
     assert!(LogicalInvocation::new(Uuid::nil(), "step", "capability", 1, nodes).is_err());
+    let bounded_nodes = Value::Array(vec![
+        Value::Null;
+        anima_core::MAX_CAPABILITY_ARGUMENT_NODES - 1
+    ]);
+    assert!(LogicalInvocation::new(
+        Uuid::nil(),
+        "s".repeat(anima_core::MAX_CAPABILITY_ID_BYTES),
+        "capability",
+        1,
+        bounded_nodes
+    )
+    .is_ok());
+    assert!(LogicalInvocation::new(
+        Uuid::nil(),
+        "s".repeat(anima_core::MAX_CAPABILITY_ID_BYTES + 1),
+        "capability",
+        1,
+        json!(null)
+    )
+    .is_err());
+}
+
+#[test]
+fn catalog_rejects_invalid_or_duplicate_secret_declaration_names() {
+    for names in [
+        vec!["UPPERCASE".to_owned()],
+        vec!["token/value".to_owned()],
+        vec!["duplicate".to_owned(), "duplicate".to_owned()],
+    ] {
+        let mut candidate = manifest("workspace.apply", 1, RecoveryMode::KeyedIdempotent);
+        candidate.secret_references = names;
+        let mut catalog = ManifestCatalog::default();
+        assert_eq!(
+            catalog.register_manifest(candidate).unwrap_err(),
+            ManifestCatalogError::InvalidSecretReferenceName
+        );
+    }
 }
 
 #[test]

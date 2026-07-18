@@ -7,6 +7,7 @@ use super::{
 
 pub(super) fn validate_argument_bounds(arguments: &Value) -> Result<(), LogicalInvocationError> {
     let mut nodes = 0usize;
+    let mut encoded_bytes = 0usize;
     let mut pending = vec![(arguments, 1usize)];
     while let Some((value, depth)) = pending.pop() {
         nodes += 1;
@@ -16,6 +17,21 @@ pub(super) fn validate_argument_bounds(arguments: &Value) -> Result<(), LogicalI
         if depth > MAX_CAPABILITY_ARGUMENT_DEPTH {
             return Err(LogicalInvocationError::ArgumentsTooDeep);
         }
+        encoded_bytes = encoded_bytes.saturating_add(match value {
+            Value::Null => 4,
+            Value::Bool(_) => 5,
+            Value::Number(_) => 32,
+            Value::String(value) => json_string_encoded_len(value),
+            Value::Array(values) => values.len().saturating_add(2),
+            Value::Object(values) => values
+                .keys()
+                .map(|key| json_string_encoded_len(key).saturating_add(2))
+                .sum::<usize>()
+                .saturating_add(2),
+        });
+        if encoded_bytes > MAX_CAPABILITY_ARGUMENT_BYTES {
+            return Err(LogicalInvocationError::ArgumentsTooLarge);
+        }
         match value {
             Value::Array(values) => pending.extend(values.iter().map(|value| (value, depth + 1))),
             Value::Object(values) => {
@@ -24,13 +40,17 @@ pub(super) fn validate_argument_bounds(arguments: &Value) -> Result<(), LogicalI
             _ => {}
         }
     }
-    let bytes = serde_json::to_vec(arguments)
-        .map_err(|_| LogicalInvocationError::CanonicalizationFailed)?;
-    if bytes.len() > MAX_CAPABILITY_ARGUMENT_BYTES {
-        Err(LogicalInvocationError::ArgumentsTooLarge)
-    } else {
-        Ok(())
-    }
+    Ok(())
+}
+
+fn json_string_encoded_len(value: &str) -> usize {
+    value.chars().fold(2usize, |length, character| {
+        length.saturating_add(match character {
+            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        })
+    })
 }
 
 pub(super) fn canonicalize_arguments(arguments: Value) -> Result<Value, LogicalInvocationError> {
