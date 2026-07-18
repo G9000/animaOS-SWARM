@@ -10,8 +10,11 @@ use super::{
     Session, SessionConcurrencyPolicy, Step, Usage,
 };
 use crate::{
-    AgentDefinition, DurableCapabilityResult, GrantConsumption, LifecyclePolicy, MemoryPolicy,
-    ModelPolicy, ProfileRef, RuntimeLimits,
+    AgentDefinition, ApprovalDecision, AutonomyGrant, CapabilityKind, CapabilityManifest,
+    CapabilityReferenceId, DurableCapabilityResult, DurableCapabilityStatus, GrantConsumption,
+    GrantEffect, GrantScope, GrantStatus, LifecyclePolicy, LogicalInvocation, ManifestPin,
+    MemoryPolicy, ModelPolicy, OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions,
+    ProfileRef, RecoveryMode, RiskLevel, RuntimeCompatibility, RuntimeLimits,
 };
 
 /// Input for atomically creating a durable run and claiming its session when required.
@@ -553,7 +556,9 @@ where
             ExecutionStoreErrorCode::InvalidRequest,
         ));
     }
-    assert_concurrent_session_contract(factory).await
+    assert_concurrent_session_contract(factory).await?;
+    assert_counted_grant_contract(factory).await?;
+    assert_durable_result_contract(factory).await
 }
 
 fn conformance_definition(allows_concurrent_sessions: bool) -> AgentDefinition {
@@ -653,6 +658,488 @@ where
         ))
         .await?;
     if two.session_version() != one.session_version().saturating_add(1) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+fn conformance_value<T, E>(result: Result<T, E>) -> Result<T, ExecutionStoreError> {
+    result.map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))
+}
+
+fn conformance_capability_manifest() -> CapabilityManifest {
+    CapabilityManifest {
+        id: "workspace.write".into(),
+        version: 1,
+        kind: CapabilityKind::Workspace,
+        label: "Write".into(),
+        description: "Writes a workspace file".into(),
+        input_schema: serde_json::json!({"type": "object"}),
+        output_schema: serde_json::json!({"type": "object"}),
+        side_effects: true,
+        risk_level: RiskLevel::High,
+        host_permissions: vec![],
+        secret_references: vec![],
+        environment_requirements: vec![],
+        timeout_ms: 1_000,
+        cancellation_supported: true,
+        max_retries: 0,
+        idempotent: false,
+        recovery_mode: RecoveryMode::NonRetryable,
+        supports_streaming: false,
+        supports_artifacts: false,
+        supports_citations: false,
+        schema_digest: "sha256:execution-store-contract:1".into(),
+        compatibility: RuntimeCompatibility {
+            minimum_runtime_schema_version: 1,
+            maximum_runtime_schema_version: 1,
+            manifest_schema_version: 1,
+        },
+    }
+}
+
+fn conformance_policy_context(
+    run_id: Uuid,
+) -> Result<(LogicalInvocation, PolicyContext), ExecutionStoreError> {
+    let manifest = conformance_capability_manifest();
+    let invocation = conformance_value(LogicalInvocation::new(
+        run_id,
+        "counted-grant-step",
+        manifest.id.clone(),
+        manifest.version,
+        serde_json::json!({"path": "contract.txt"}),
+    ))?;
+    let context = conformance_value(PolicyContext::new(
+        "contract-owner",
+        "contract-actor",
+        "execution-store-concurrent",
+        1,
+        "contract-workspace",
+        CapabilityReferenceId::new(Uuid::from_u128(0xc0_10)),
+        &manifest,
+        &invocation,
+        1,
+        PolicyRestrictions::default(),
+        1_000,
+    ))?;
+    Ok((invocation, context))
+}
+
+fn conformance_counted_grant(
+    context: &PolicyContext,
+) -> Result<AutonomyGrant, ExecutionStoreError> {
+    conformance_value(AutonomyGrant::new_with_effect(
+        "execution-store-counted-grant",
+        1,
+        GrantStatus::Active,
+        conformance_value(GrantScope::new(
+            context.owner_id.clone(),
+            context.actor_id.clone(),
+            context.agent_definition_id.clone(),
+            context.agent_definition_version,
+            context.workspace_id.clone(),
+            context.resource_boundary.clone(),
+            context.capability_id.clone(),
+            context.manifest_version,
+            Some(context.canonical_argument_digest),
+        ))?,
+        RiskLevel::High,
+        500,
+        Some(2_000),
+        Some(1),
+        GrantEffect::ApprovalRequired,
+    ))
+}
+
+fn conformance_approval_resume(
+    session: &Session,
+    run_id: Uuid,
+    command_id: Uuid,
+    invocation: &LogicalInvocation,
+    context: &PolicyContext,
+    grant: &AutonomyGrant,
+) -> Result<(Run, Run, RuntimeCommand, ApprovalGrantMutation), ExecutionStoreError> {
+    let request = conformance_value(PolicyEngine::approval_request(context, Some(grant)))?;
+    let decision = conformance_value(ApprovalDecision::new_approved(request.clone(), 1_000))?;
+    let claim = conformance_value(ApprovalResumeClaim::new(
+        &request,
+        &decision,
+        context,
+        &[grant.clone()],
+    ))?;
+    let expected_consumption = conformance_value(GrantConsumption::new(
+        grant.id.clone(),
+        grant.revision,
+        invocation.id(),
+    ))?;
+    if claim.grant_consumption() != Some(&expected_consumption) {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let waiting = Run::queued(
+        run_id,
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    )
+    .and_then(|run| run.transition(RunState::Running, None))
+    .and_then(|run| run.wait_for_approval(request))
+    .map_err(ExecutionStoreError::from)?;
+    let command = RuntimeCommand::resume_with_approval(
+        command_id,
+        session.id(),
+        run_id,
+        claim.binding().clone(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let target = waiting
+        .apply_resume_command(&command, Some(&claim), None)
+        .map_err(ExecutionStoreError::from)?
+        .run()
+        .clone();
+    Ok((
+        waiting,
+        target,
+        command,
+        ApprovalGrantMutation::from_claim(claim, Some(1))?,
+    ))
+}
+
+async fn assert_counted_grant_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let session = conformance_value(Session::new_for_definition(
+        Uuid::from_u128(0xc0_20),
+        &conformance_definition(true),
+        SessionConcurrencyPolicy::Concurrent,
+    ))?;
+    let (first_invocation, first_context) = conformance_policy_context(Uuid::from_u128(0xc0_21))?;
+    let (second_invocation, second_context) = conformance_policy_context(Uuid::from_u128(0xc0_22))?;
+    let grant = conformance_counted_grant(&first_context)?;
+    let (first_waiting, first_target, first_command, first_approval) = conformance_approval_resume(
+        &session,
+        Uuid::from_u128(0xc0_21),
+        Uuid::from_u128(0xc0_23),
+        &first_invocation,
+        &first_context,
+        &grant,
+    )?;
+    let (second_waiting, second_target, second_command, second_approval) =
+        conformance_approval_resume(
+            &session,
+            Uuid::from_u128(0xc0_22),
+            Uuid::from_u128(0xc0_24),
+            &second_invocation,
+            &second_context,
+            &grant,
+        )?;
+    if first_invocation.id() == second_invocation.id() || first_command.id() == second_command.id()
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let first_created = store
+        .create_run(CreateRun::new(
+            session.clone(),
+            first_waiting.clone(),
+            0,
+            SessionConcurrencyPolicy::Concurrent,
+        ))
+        .await?;
+    let second_created = store
+        .create_run(CreateRun::new(
+            session.clone(),
+            second_waiting.clone(),
+            first_created.session_version(),
+            SessionConcurrencyPolicy::Concurrent,
+        ))
+        .await?;
+    let first_lease = store
+        .acquire_lease(first_waiting.id(), first_created.run_version(), 1_000)
+        .await?;
+    let second_lease = store
+        .acquire_lease(second_waiting.id(), second_created.run_version(), 1_000)
+        .await?;
+    let first_event = RuntimeEvent::new(
+        Uuid::from_u128(0xc0_25),
+        Uuid::from_u128(0xc0_27),
+        session.id(),
+        first_waiting.id(),
+        1,
+        1,
+        RuntimeEventKind::RunResumed,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let second_event = RuntimeEvent::new(
+        Uuid::from_u128(0xc0_26),
+        Uuid::from_u128(0xc0_28),
+        session.id(),
+        second_waiting.id(),
+        1,
+        1,
+        RuntimeEventKind::RunResumed,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let first_commit = ExecutionCommit::new(
+        first_created.run_version(),
+        0,
+        first_lease,
+        first_command,
+        vec![first_event],
+        vec![],
+        vec![],
+        vec![],
+        Some(first_approval),
+        first_target,
+    );
+    let second_commit = ExecutionCommit::new(
+        second_created.run_version(),
+        0,
+        second_lease,
+        second_command,
+        vec![second_event],
+        vec![],
+        vec![],
+        vec![],
+        Some(second_approval),
+        second_target,
+    );
+    let (first_result, second_result) = futures::join!(
+        store.commit_execution(first_commit.clone()),
+        store.commit_execution(second_commit.clone())
+    );
+    let (winning_commit, original_outcome, losing_waiting) = match (first_result, second_result) {
+        (Ok(outcome), Err(error))
+            if error.code() == ExecutionStoreErrorCode::GrantAlreadyConsumed =>
+        {
+            (first_commit, outcome, second_waiting)
+        }
+        (Err(error), Ok(outcome))
+            if error.code() == ExecutionStoreErrorCode::GrantAlreadyConsumed =>
+        {
+            (second_commit, outcome, first_waiting)
+        }
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    };
+    if store.commit_execution(winning_commit).await? != original_outcome
+        || store
+            .load_run(losing_waiting.id())
+            .await?
+            .as_ref()
+            .map(StoredRun::run)
+            != Some(&losing_waiting)
+        || !store
+            .replay_events(losing_waiting.id(), 0)
+            .await?
+            .is_empty()
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    Ok(())
+}
+
+async fn assert_durable_result_contract<F>(factory: &F) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    let store = factory.create_execution_store().await?;
+    let session = Session::new(
+        Uuid::from_u128(0xd0_10),
+        "execution-store-result",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let queued = Run::queued(
+        Uuid::from_u128(0xd0_11),
+        session.id(),
+        session.definition().id(),
+        session.definition().version(),
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let created = store
+        .create_run(CreateRun::new(
+            session.clone(),
+            queued.clone(),
+            0,
+            SessionConcurrencyPolicy::Serial,
+        ))
+        .await?;
+    let invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "durable-result-step",
+        "workspace.write",
+        1,
+        serde_json::json!({"path": "contract.txt"}),
+    ))?;
+    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:execution-store-result",
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let attempt = conformance_value(InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        super::AttemptRecordState::Completed,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    ))?;
+    let result_reference = CapabilityReferenceId::new(Uuid::from_u128(0xd0_12));
+    let completed = conformance_value(CompletedInvocationRecord::new(
+        invocation.binding(),
+        1,
+        manifest,
+        RecoveryMode::KeyedIdempotent,
+        conformance_value(OpaqueReference::new(result_reference.handle()))?,
+    ))?;
+    let result = conformance_value(DurableCapabilityResult::new(
+        result_reference.clone(),
+        "jcs-v1:execution-store-result",
+        "sha256:execution-store-result",
+        1,
+        DurableCapabilityStatus::Completed,
+    ))?;
+    let running = queued
+        .transition(RunState::Running, None)
+        .map_err(ExecutionStoreError::from)?;
+    let lease = store
+        .acquire_lease(queued.id(), created.run_version(), 1_000)
+        .await?;
+    let first_event = RuntimeEvent::new(
+        Uuid::from_u128(0xd0_13),
+        Uuid::from_u128(0xd0_14),
+        session.id(),
+        queued.id(),
+        1,
+        1,
+        RuntimeEventKind::RunStarted,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let first_outcome = store
+        .commit_execution(ExecutionCommit::new(
+            created.run_version(),
+            0,
+            lease.clone(),
+            RuntimeCommand::start(Uuid::from_u128(0xd0_15), session.id(), queued.id())
+                .map_err(ExecutionStoreError::from)?,
+            vec![first_event],
+            vec![],
+            vec![attempt.clone()],
+            vec![DurableResultMutation::new(
+                completed.clone(),
+                result.clone(),
+            )],
+            None,
+            running.clone(),
+        ))
+        .await?;
+    if store
+        .load_durable_result(queued.id(), invocation.id())
+        .await?
+        .as_ref()
+        != Some(&result)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let renewed = store.renew_lease(lease, 1_000).await?;
+    let second_event = RuntimeEvent::new(
+        Uuid::from_u128(0xd0_16),
+        Uuid::from_u128(0xd0_14),
+        session.id(),
+        queued.id(),
+        2,
+        2,
+        RuntimeEventKind::StepCompleted,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let identical_commit = ExecutionCommit::new(
+        first_outcome.stored_run().run_version(),
+        0,
+        renewed.clone(),
+        RuntimeCommand::start(Uuid::from_u128(0xd0_17), session.id(), queued.id())
+            .map_err(ExecutionStoreError::from)?,
+        vec![second_event],
+        vec![],
+        vec![attempt.clone()],
+        vec![DurableResultMutation::new(
+            completed.clone(),
+            result.clone(),
+        )],
+        None,
+        running.clone(),
+    );
+    let identical_outcome = store.commit_execution(identical_commit.clone()).await?;
+    if store.commit_execution(identical_commit).await? != identical_outcome
+        || store
+            .load_durable_result(queued.id(), invocation.id())
+            .await?
+            .as_ref()
+            != Some(&result)
+        || store.load_attempts(queued.id()).await? != vec![attempt]
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
+    let before_conflict = store.load_run(queued.id()).await?;
+    let conflicting_result = conformance_value(DurableCapabilityResult::new(
+        result_reference,
+        "jcs-v1:conflicting-execution-store-result",
+        "sha256:execution-store-result",
+        1,
+        DurableCapabilityStatus::Completed,
+    ))?;
+    let conflicting_event = RuntimeEvent::new(
+        Uuid::from_u128(0xd0_18),
+        Uuid::from_u128(0xd0_14),
+        session.id(),
+        queued.id(),
+        3,
+        3,
+        RuntimeEventKind::StepCompleted,
+    )
+    .map_err(ExecutionStoreError::from)?;
+    let conflict = store
+        .commit_execution(ExecutionCommit::new(
+            identical_outcome.stored_run().run_version(),
+            0,
+            store.renew_lease(renewed, 1_000).await?,
+            RuntimeCommand::start(Uuid::from_u128(0xd0_19), session.id(), queued.id())
+                .map_err(ExecutionStoreError::from)?,
+            vec![conflicting_event],
+            vec![],
+            vec![],
+            vec![DurableResultMutation::new(completed, conflicting_result)],
+            None,
+            running,
+        ))
+        .await;
+    if !matches!(
+        conflict,
+        Err(error) if error.code() == ExecutionStoreErrorCode::ResultConflict
+    ) || store.load_run(queued.id()).await? != before_conflict
+        || store
+            .load_durable_result(queued.id(), invocation.id())
+            .await?
+            .as_ref()
+            != Some(&result)
+        || store.replay_events(queued.id(), 0).await?.len() != 2
+    {
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
