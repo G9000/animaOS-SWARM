@@ -730,6 +730,41 @@ fn approval_required_grants_bind_critical_approvals_and_fail_closed_after_change
 }
 
 #[test]
+fn duplicate_grant_snapshots_fail_closed_independent_of_input_order() {
+    let context = context(
+        RiskLevel::Critical,
+        invocation(json!({ "path": "reports/a.md" })),
+        Default::default(),
+    );
+    let counted = approval_grant(&context, RiskLevel::Critical);
+    let mut uncounted = counted.clone();
+    uncounted.remaining_uses = None;
+    let approval = ApprovalDecision::new_approved(
+        PolicyEngine::approval_request(&context, Some(&counted)).unwrap(),
+        1_000,
+    )
+    .unwrap();
+
+    for grants in [
+        vec![counted.clone(), uncounted.clone()],
+        vec![uncounted, counted],
+    ] {
+        assert_eq!(
+            PolicyEngine::evaluate(&context, &grants),
+            Err(PolicyValidationError::DuplicateGrantIdentity)
+        );
+        assert_eq!(
+            PolicyEngine::validate_approval_with_grants(&approval, &context, &grants),
+            ApprovalValidity::InvalidGrant
+        );
+        assert_eq!(
+            PolicyEngine::evaluate_with_approval(&context, &grants, Some(&approval)),
+            Err(PolicyValidationError::DuplicateGrantIdentity)
+        );
+    }
+}
+
+#[test]
 fn approval_is_exact_and_changed_arguments_invalidate_it() {
     let original = context(
         RiskLevel::High,

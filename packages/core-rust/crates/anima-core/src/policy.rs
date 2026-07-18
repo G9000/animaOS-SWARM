@@ -4,6 +4,7 @@
 //! never retain normalized arguments, credential values, executor state, or host-specific data.
 
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -1187,6 +1188,7 @@ pub enum PolicyValidationError {
     InvalidApprovalTime,
     ApprovalWindowOverflow,
     ApprovalNotRequired,
+    DuplicateGrantIdentity,
     SuppliedGrantDoesNotMatch,
     InvalidNilIdentifier,
     InvalidIdentifierFormat { field: &'static str },
@@ -1224,6 +1226,9 @@ impl fmt::Display for PolicyValidationError {
             Self::ApprovalNotRequired => {
                 formatter.write_str("approval requests require a current approval decision")
             }
+            Self::DuplicateGrantIdentity => {
+                formatter.write_str("grant set contains a duplicate grant identity")
+            }
             Self::SuppliedGrantDoesNotMatch => {
                 formatter.write_str("supplied autonomy grant does not match the policy context")
             }
@@ -1251,6 +1256,7 @@ impl PolicyEngine {
         grants: &[AutonomyGrant],
     ) -> Result<PolicyEvaluation, PolicyValidationError> {
         context.validate_evaluation_input()?;
+        validate_grant_set(grants)?;
         let effective_risk = context.effective_risk();
         if let Some(grant) = select_grant(context, grants) {
             if grant.effect == GrantEffect::ApprovalRequired
@@ -1343,12 +1349,7 @@ impl PolicyEngine {
                 approval.request.grant_id.as_deref(),
                 approval.request.grant_revision,
             ) {
-                (Some(id), Some(revision)) => grants.iter().find(|grant| {
-                    grant.id == id
-                        && grant.revision == revision
-                        && grant.effect == GrantEffect::ApprovalRequired
-                        && Self::grant_matches(grant, context)
-                }),
+                (Some(id), Some(revision)) => validated_grant_by_identity(grants, id, revision)?,
                 (None, None) => None,
                 _ => return Ok(initial),
             };
@@ -1457,11 +1458,15 @@ impl PolicyEngine {
             && grant.remaining_uses.is_none_or(|uses| uses > 0)
     }
 
-    fn validate_approval_with_grants(
+    /// Validates an approval against a complete, uniquely identified grant snapshot.
+    pub fn validate_approval_with_grants(
         approval: &ApprovalDecision,
         context: &PolicyContext,
         grants: &[AutonomyGrant],
     ) -> ApprovalValidity {
+        if validate_grant_set(grants).is_err() {
+            return ApprovalValidity::InvalidGrant;
+        }
         if context.validate_evaluation_input().is_err() || approval.validate().is_err() {
             return ApprovalValidity::InvalidBinding;
         }
@@ -1517,19 +1522,39 @@ impl PolicyEngine {
         }
         match (&request.grant_id, request.grant_revision) {
             (None, None) => ApprovalValidity::Valid,
-            (Some(id), Some(revision))
-                if grants.iter().any(|grant| {
-                    grant.id == *id
-                        && grant.revision == revision
-                        && grant.effect == GrantEffect::ApprovalRequired
-                        && Self::grant_matches(grant, context)
-                }) =>
-            {
-                ApprovalValidity::Valid
-            }
+            (Some(id), Some(revision)) => match validated_grant_by_identity(grants, id, revision) {
+                Ok(Some(grant))
+                    if grant.effect == GrantEffect::ApprovalRequired
+                        && Self::grant_matches(grant, context) =>
+                {
+                    ApprovalValidity::Valid
+                }
+                _ => ApprovalValidity::InvalidGrant,
+            },
             _ => ApprovalValidity::InvalidGrant,
         }
     }
+}
+
+fn validate_grant_set(grants: &[AutonomyGrant]) -> Result<(), PolicyValidationError> {
+    let mut identities = BTreeSet::new();
+    for grant in grants {
+        if !identities.insert((grant.id.as_str(), grant.revision)) {
+            return Err(PolicyValidationError::DuplicateGrantIdentity);
+        }
+    }
+    Ok(())
+}
+
+fn validated_grant_by_identity<'a>(
+    grants: &'a [AutonomyGrant],
+    id: &str,
+    revision: u32,
+) -> Result<Option<&'a AutonomyGrant>, PolicyValidationError> {
+    validate_grant_set(grants)?;
+    Ok(grants
+        .iter()
+        .find(|grant| grant.id == id && grant.revision == revision))
 }
 
 /// Matching grants are sorted by a total narrowness order. Argument-bound scopes and lower risk
