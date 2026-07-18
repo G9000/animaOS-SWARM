@@ -12,8 +12,8 @@ use anima_core::{
     CapabilityResult, CapabilitySecretReferenceId, CheckpointV1, CheckpointV1Builder,
     DefinitionPin, ExecutionFence, InvocationAttemptRecord, LogicalInvocation, ManifestCatalog,
     ManifestCatalogError, ManifestPin, ReconcileOutcome, RecoveryActionKind, RecoveryMode,
-    RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCompatibility,
-    UncertainInvocationRecord, Usage,
+    RecoveryPauseReason, RecoveryPauseRecord, RiskLevel, Run, RunPauseReason, RunState,
+    RuntimeCommand, RuntimeCompatibility, UncertainInvocationRecord, Usage,
 };
 use async_trait::async_trait;
 use futures::channel::oneshot;
@@ -1072,11 +1072,25 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
         .validate_recovery_resume(&retry, &authorization, &binding)
         .await
         .unwrap();
+    let manifest_pin = ManifestPin::new_with_recovery_mode(
+        &manifest.id,
+        manifest.version,
+        &manifest.schema_digest,
+        manifest.recovery_mode,
+    )
+    .unwrap();
+    let recovery_pause = RecoveryPauseRecord::new(
+        retry.invocation().binding(),
+        1,
+        manifest_pin.clone(),
+        RecoveryPauseReason::UncertainOutcome,
+    )
+    .unwrap();
     let paused = Run::queued(binding.run_id(), Uuid::from_u128(500), "writer", 1)
         .unwrap()
         .transition(RunState::Running, None)
         .unwrap()
-        .pause_for_recovery(binding.clone())
+        .pause_for_recovery(recovery_pause)
         .unwrap();
     let resume = RuntimeCommand::resume_with_recovery_binding(
         Uuid::from_u128(501),
@@ -1089,8 +1103,6 @@ async fn recovery_authorizations_are_exact_one_time_and_bounded() {
     assert!(paused
         .apply_resume_command(&resume, None, Some(&live_claim))
         .is_ok());
-    let manifest_pin =
-        ManifestPin::new(&manifest.id, manifest.version, &manifest.schema_digest).unwrap();
     let uncertain_attempt = InvocationAttemptRecord::new(
         retry.invocation().binding(),
         1,

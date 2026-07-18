@@ -37,10 +37,11 @@ pub use definition::{
 pub use events::{EngineEvent, EventType};
 pub use execution::{
     ApprovalResumeBinding, ApprovalResumeClaim, Attempt, AttemptRecordState, Budget,
-    BudgetDecision, CheckpointV1, CheckpointV1Builder, CommandOutcome, CommandReceipt,
-    CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionErrorCode, ExecutionLease,
-    InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin, OpaqueReference, PendingApprovalRecord,
-    RecoveryRecord, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind,
+    BudgetDecision, CheckpointCursor, CheckpointV1, CheckpointV1Builder, CommandOutcome,
+    CommandReceipt, CompletedInvocationRecord, DefinitionPin, ExecutionError, ExecutionErrorCode,
+    ExecutionLease, InvocationAttemptRecord, LiveRuntimeEvent, ManifestPin, OpaqueReference,
+    PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord, RecoveryRecord,
+    RecoveryTerminalResolution, Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind,
     RuntimeEvent, RuntimeEventKind, SafeEventPayload, Session, SessionConcurrencyPolicy, StepKind,
     UncertainInvocationRecord, Usage,
 };

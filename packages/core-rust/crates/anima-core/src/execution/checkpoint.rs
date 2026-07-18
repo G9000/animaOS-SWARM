@@ -80,6 +80,7 @@ pub struct ManifestPin {
     id: String,
     version: u32,
     schema_digest: String,
+    recovery_mode: RecoveryMode,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +88,7 @@ struct ManifestPinWire {
     id: String,
     version: u32,
     schema_digest: String,
+    recovery_mode: RecoveryMode,
 }
 impl ManifestPin {
     pub fn new(
@@ -94,16 +96,30 @@ impl ManifestPin {
         version: u32,
         schema_digest: impl Into<String>,
     ) -> Result<Self, ExecutionError> {
+        Self::new_with_recovery_mode(id, version, schema_digest, RecoveryMode::None)
+    }
+    pub fn new_with_recovery_mode(
+        id: impl Into<String>,
+        version: u32,
+        schema_digest: impl Into<String>,
+        recovery_mode: RecoveryMode,
+    ) -> Result<Self, ExecutionError> {
         let value = Self {
             id: id.into(),
             version,
             schema_digest: schema_digest.into(),
+            recovery_mode,
         };
         value.validate()?;
         Ok(value)
     }
     pub fn from_manifest(value: &CapabilityManifest) -> Result<Self, ExecutionError> {
-        Self::new(value.id.clone(), value.version, value.schema_digest.clone())
+        Self::new_with_recovery_mode(
+            value.id.clone(),
+            value.version,
+            value.schema_digest.clone(),
+            value.recovery_mode,
+        )
     }
     fn validate(&self) -> Result<(), ExecutionError> {
         valid_id(&self.id)?;
@@ -126,11 +142,15 @@ impl ManifestPin {
     pub fn schema_digest(&self) -> &str {
         &self.schema_digest
     }
+    pub fn recovery_mode(&self) -> RecoveryMode {
+        self.recovery_mode
+    }
 }
 impl<'de> Deserialize<'de> for ManifestPin {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = ManifestPinWire::deserialize(d)?;
-        Self::new(w.id, w.version, w.schema_digest).map_err(serde::de::Error::custom)
+        Self::new_with_recovery_mode(w.id, w.version, w.schema_digest, w.recovery_mode)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -158,6 +178,59 @@ pub enum AttemptRecordState {
     Pending,
     Completed,
     Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointCursor {
+    logical_invocation_id: Uuid,
+    attempt_number: u32,
+    logical_step_id: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckpointCursorWire {
+    logical_invocation_id: Uuid,
+    attempt_number: u32,
+    logical_step_id: String,
+}
+impl CheckpointCursor {
+    pub fn new(
+        logical_invocation_id: Uuid,
+        attempt_number: u32,
+        logical_step_id: impl Into<String>,
+    ) -> Result<Self, ExecutionError> {
+        let value = Self {
+            logical_invocation_id,
+            attempt_number,
+            logical_step_id: logical_step_id.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> Result<(), ExecutionError> {
+        valid_uuid(self.logical_invocation_id)?;
+        if self.attempt_number == 0 {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        }
+        valid_id(&self.logical_step_id)
+    }
+    pub fn logical_invocation_id(&self) -> Uuid {
+        self.logical_invocation_id
+    }
+    pub fn attempt_number(&self) -> u32 {
+        self.attempt_number
+    }
+    pub fn logical_step_id(&self) -> &str {
+        &self.logical_step_id
+    }
+}
+impl<'de> Deserialize<'de> for CheckpointCursor {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = CheckpointCursorWire::deserialize(d)?;
+        Self::new(w.logical_invocation_id, w.attempt_number, w.logical_step_id)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -200,10 +273,7 @@ impl InvocationAttemptRecord {
         if self.attempt_number == 0
             || self.invocation.capability_id() != self.manifest.id()
             || self.invocation.manifest_version() != self.manifest.version()
-            || matches!(
-                self.recovery_mode,
-                RecoveryMode::None | RecoveryMode::Compensate | RecoveryMode::Manual
-            )
+            || self.recovery_mode != self.manifest.recovery_mode()
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
@@ -309,38 +379,43 @@ impl<'de> Deserialize<'de> for CompletedInvocationRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPauseReason {
+    UncertainOutcome,
+    ReconciliationPending,
+    ManualReview,
+    HostRecovery,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct UncertainInvocationRecord {
+pub struct RecoveryPauseRecord {
     invocation: LogicalInvocationBinding,
     attempt_number: u32,
     manifest: ManifestPin,
-    recovery_mode: RecoveryMode,
-    recovery_binding: Option<RecoveryResumeBinding>,
+    reason: RecoveryPauseReason,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct UncertainInvocationRecordWire {
+struct RecoveryPauseRecordWire {
     invocation: LogicalInvocationBinding,
     attempt_number: u32,
     manifest: ManifestPin,
-    recovery_mode: RecoveryMode,
-    recovery_binding: Option<RecoveryResumeBinding>,
+    reason: RecoveryPauseReason,
 }
-impl UncertainInvocationRecord {
+impl RecoveryPauseRecord {
     pub fn new(
         invocation: LogicalInvocationBinding,
         attempt_number: u32,
         manifest: ManifestPin,
-        recovery_mode: RecoveryMode,
-        recovery_binding: Option<RecoveryResumeBinding>,
+        reason: RecoveryPauseReason,
     ) -> Result<Self, ExecutionError> {
         let value = Self {
             invocation,
             attempt_number,
             manifest,
-            recovery_mode,
-            recovery_binding,
+            reason,
         };
         value.validate()?;
         Ok(value)
@@ -351,21 +426,9 @@ impl UncertainInvocationRecord {
             self.attempt_number,
             AttemptRecordState::Uncertain,
             self.manifest.clone(),
-            self.recovery_mode,
-        )?;
-        if let Some(binding) = &self.recovery_binding {
-            if binding.logical_invocation_id() != self.invocation.id()
-                || binding.completed_attempt_number() != self.attempt_number
-                || binding.manifest_id() != self.manifest.id()
-                || binding.manifest_version() != self.manifest.version()
-                || binding.manifest_digest() != self.manifest.schema_digest()
-                || binding.recovery_mode() != self.recovery_mode
-                || binding.idempotency_key() != self.invocation.idempotency_key()
-            {
-                return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
-            }
-        }
-        Ok(())
+            self.manifest.recovery_mode(),
+        )
+        .map(|_| ())
     }
     pub fn invocation(&self) -> &LogicalInvocationBinding {
         &self.invocation
@@ -373,21 +436,108 @@ impl UncertainInvocationRecord {
     pub fn attempt_number(&self) -> u32 {
         self.attempt_number
     }
+    pub fn manifest(&self) -> &ManifestPin {
+        &self.manifest
+    }
+    pub fn reason(&self) -> RecoveryPauseReason {
+        self.reason
+    }
+    pub fn allows_automatic_resume(&self) -> bool {
+        matches!(
+            self.manifest.recovery_mode(),
+            RecoveryMode::InherentlyIdempotent
+                | RecoveryMode::KeyedIdempotent
+                | RecoveryMode::Reconcilable
+                | RecoveryMode::Retry
+        )
+    }
+    pub fn matches_resume_binding(&self, binding: &RecoveryResumeBinding) -> bool {
+        self.allows_automatic_resume()
+            && binding.logical_invocation_id() == self.invocation.id()
+            && binding.completed_attempt_number() == self.attempt_number
+            && binding.manifest_id() == self.manifest.id()
+            && binding.manifest_version() == self.manifest.version()
+            && binding.manifest_digest() == self.manifest.schema_digest()
+            && binding.recovery_mode() == self.manifest.recovery_mode()
+            && binding.idempotency_key() == self.invocation.idempotency_key()
+    }
+}
+impl<'de> Deserialize<'de> for RecoveryPauseRecord {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = RecoveryPauseRecordWire::deserialize(d)?;
+        Self::new(w.invocation, w.attempt_number, w.manifest, w.reason)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct UncertainInvocationRecord {
+    pause: RecoveryPauseRecord,
+    resume_binding: Option<RecoveryResumeBinding>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncertainInvocationRecordWire {
+    pause: RecoveryPauseRecord,
+    resume_binding: Option<RecoveryResumeBinding>,
+}
+impl UncertainInvocationRecord {
+    pub fn new(
+        invocation: LogicalInvocationBinding,
+        attempt_number: u32,
+        manifest: ManifestPin,
+        recovery_mode: RecoveryMode,
+        recovery_binding: Option<RecoveryResumeBinding>,
+    ) -> Result<Self, ExecutionError> {
+        if recovery_mode != manifest.recovery_mode() {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        }
+        let pause = RecoveryPauseRecord::new(
+            invocation,
+            attempt_number,
+            manifest,
+            RecoveryPauseReason::UncertainOutcome,
+        )?;
+        Self::new_with_pause(pause, recovery_binding)
+    }
+    pub fn new_with_pause(
+        pause: RecoveryPauseRecord,
+        resume_binding: Option<RecoveryResumeBinding>,
+    ) -> Result<Self, ExecutionError> {
+        let value = Self {
+            pause,
+            resume_binding,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> Result<(), ExecutionError> {
+        self.pause.validate()?;
+        if let Some(binding) = &self.resume_binding {
+            if !self.pause.matches_resume_binding(binding) {
+                return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+            }
+        }
+        Ok(())
+    }
+    pub fn invocation(&self) -> &LogicalInvocationBinding {
+        self.pause.invocation()
+    }
+    pub fn attempt_number(&self) -> u32 {
+        self.pause.attempt_number()
+    }
     pub fn recovery_binding(&self) -> Option<&RecoveryResumeBinding> {
-        self.recovery_binding.as_ref()
+        self.resume_binding.as_ref()
+    }
+    pub fn pause(&self) -> &RecoveryPauseRecord {
+        &self.pause
     }
 }
 impl<'de> Deserialize<'de> for UncertainInvocationRecord {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = UncertainInvocationRecordWire::deserialize(d)?;
-        Self::new(
-            w.invocation,
-            w.attempt_number,
-            w.manifest,
-            w.recovery_mode,
-            w.recovery_binding,
-        )
-        .map_err(serde::de::Error::custom)
+        Self::new_with_pause(w.pause, w.resume_binding).map_err(serde::de::Error::custom)
     }
 }
 pub type RecoveryRecord = UncertainInvocationRecord;
@@ -442,7 +592,7 @@ pub struct CheckpointV1 {
     last_durable_event_sequence: u64,
     state: RunState,
     pause_reason: Option<RunPauseReason>,
-    cursor_step_id: Option<String>,
+    cursor: Option<CheckpointCursor>,
     attempts: Vec<InvocationAttemptRecord>,
     message_context_refs: Vec<OpaqueReference>,
     model_context_refs: Vec<OpaqueReference>,
@@ -466,7 +616,7 @@ struct CheckpointWire {
     last_durable_event_sequence: u64,
     state: RunState,
     pause_reason: Option<RunPauseReason>,
-    cursor_step_id: Option<String>,
+    cursor: Option<CheckpointCursor>,
     attempts: Vec<InvocationAttemptRecord>,
     message_context_refs: Vec<OpaqueReference>,
     model_context_refs: Vec<OpaqueReference>,
@@ -481,6 +631,7 @@ struct CheckpointWire {
 
 pub struct CheckpointV1Builder {
     wire: CheckpointWire,
+    legacy_cursor_step_id: Option<String>,
 }
 impl CheckpointV1Builder {
     pub fn new(
@@ -504,7 +655,7 @@ impl CheckpointV1Builder {
                 last_durable_event_sequence,
                 state: RunState::Queued,
                 pause_reason: None,
-                cursor_step_id: None,
+                cursor: None,
                 attempts: vec![],
                 message_context_refs: vec![],
                 model_context_refs: vec![],
@@ -516,6 +667,7 @@ impl CheckpointV1Builder {
                 memory_refs: vec![],
                 artifact_refs: vec![],
             },
+            legacy_cursor_step_id: None,
         }
     }
     pub fn state(mut self, state: RunState, pause_reason: Option<RunPauseReason>) -> Self {
@@ -524,7 +676,11 @@ impl CheckpointV1Builder {
         self
     }
     pub fn cursor_step_id(mut self, value: Option<String>) -> Self {
-        self.wire.cursor_step_id = value;
+        self.legacy_cursor_step_id = value;
+        self
+    }
+    pub fn cursor(mut self, value: Option<CheckpointCursor>) -> Self {
+        self.wire.cursor = value;
         self
     }
     pub fn attempts(mut self, mut value: Vec<InvocationAttemptRecord>) -> Self {
@@ -533,12 +689,12 @@ impl CheckpointV1Builder {
         self
     }
     pub fn completed_invocations(mut self, mut value: Vec<CompletedInvocationRecord>) -> Self {
-        value.sort_by_key(|r| r.invocation.id());
+        value.sort_by_key(|r| (r.invocation.id(), r.attempt_number));
         self.wire.completed_invocations = value;
         self
     }
     pub fn uncertain_invocations(mut self, mut value: Vec<UncertainInvocationRecord>) -> Self {
-        value.sort_by_key(|r| r.invocation.id());
+        value.sort_by_key(|r| (r.invocation().id(), r.attempt_number()));
         self.wire.uncertain_invocations = value;
         self
     }
@@ -566,7 +722,26 @@ impl CheckpointV1Builder {
         self.wire.artifact_refs = value;
         self
     }
-    pub fn build(self) -> Result<CheckpointV1, ExecutionError> {
+    pub fn build(mut self) -> Result<CheckpointV1, ExecutionError> {
+        if self.wire.cursor.is_none() {
+            if let Some(step) = self.legacy_cursor_step_id {
+                let matching: Vec<_> = self
+                    .wire
+                    .attempts
+                    .iter()
+                    .filter(|a| a.invocation.logical_step_id() == step)
+                    .collect();
+                if let Some(record) = matching.iter().max_by_key(|a| a.attempt_number) {
+                    self.wire.cursor = Some(CheckpointCursor::new(
+                        record.invocation.id(),
+                        record.attempt_number,
+                        step,
+                    )?);
+                } else {
+                    return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+                }
+            }
+        }
         CheckpointV1::from_wire(self.wire)
     }
 }
@@ -606,7 +781,7 @@ impl CheckpointV1 {
             last_durable_event_sequence: w.last_durable_event_sequence,
             state: w.state,
             pause_reason: w.pause_reason,
-            cursor_step_id: w.cursor_step_id,
+            cursor: w.cursor,
             attempts: w.attempts,
             message_context_refs: w.message_context_refs,
             model_context_refs: w.model_context_refs,
@@ -644,10 +819,17 @@ impl CheckpointV1 {
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
-        if let Some(cursor) = &self.cursor_step_id {
-            valid_id(cursor)?;
+        if let Some(cursor) = &self.cursor {
+            cursor.validate()?;
         }
         canonical(&self.manifests)?;
+        if self
+            .manifests
+            .windows(2)
+            .any(|w| w[0].id() == w[1].id() && w[0].version() == w[1].version())
+        {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        }
         canonical(&self.message_context_refs)?;
         canonical(&self.model_context_refs)?;
         canonical(&self.memory_refs)?;
@@ -678,17 +860,21 @@ impl CheckpointV1 {
             }
             previous = Some(key);
         }
-        canonical_by_id(&self.completed_invocations, |r| r.invocation.id())?;
-        canonical_by_id(&self.uncertain_invocations, |r| r.invocation.id())?;
-        let completed_ids: BTreeSet<_> = self
+        canonical_by_pair(&self.completed_invocations, |r| {
+            (r.invocation.id(), r.attempt_number)
+        })?;
+        canonical_by_pair(&self.uncertain_invocations, |r| {
+            (r.invocation().id(), r.attempt_number())
+        })?;
+        let completed_keys: BTreeSet<_> = self
             .completed_invocations
             .iter()
-            .map(|r| r.invocation.id())
+            .map(|r| (r.invocation.id(), r.attempt_number))
             .collect();
         if self
             .uncertain_invocations
             .iter()
-            .any(|r| completed_ids.contains(&r.invocation.id()))
+            .any(|r| completed_keys.contains(&(r.invocation().id(), r.attempt_number())))
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
@@ -707,11 +893,11 @@ impl CheckpointV1 {
         for uncertain in &self.uncertain_invocations {
             uncertain.validate()?;
             if !self.attempts.iter().any(|a| {
-                a.invocation == uncertain.invocation
-                    && a.attempt_number == uncertain.attempt_number
+                a.invocation == *uncertain.invocation()
+                    && a.attempt_number == uncertain.attempt_number()
                     && a.state == AttemptRecordState::Uncertain
-                    && a.manifest == uncertain.manifest
-                    && a.recovery_mode == uncertain.recovery_mode
+                    && a.manifest == *uncertain.pause().manifest()
+                    && a.recovery_mode == uncertain.pause().manifest().recovery_mode()
             }) {
                 return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
             }
@@ -720,16 +906,16 @@ impl CheckpointV1 {
             match attempt.state {
                 AttemptRecordState::Completed
                     if !self.completed_invocations.iter().any(|r| {
-                        r.invocation == attempt.invocation
-                            && r.attempt_number == attempt.attempt_number
+                        r.invocation() == &attempt.invocation
+                            && r.attempt_number() == attempt.attempt_number
                     }) =>
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
                 }
                 AttemptRecordState::Uncertain
                     if !self.uncertain_invocations.iter().any(|r| {
-                        r.invocation == attempt.invocation
-                            && r.attempt_number == attempt.attempt_number
+                        r.invocation() == &attempt.invocation
+                            && r.attempt_number() == attempt.attempt_number
                     }) =>
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
@@ -742,11 +928,7 @@ impl CheckpointV1 {
             .iter()
             .filter(|a| a.state == AttemptRecordState::Pending)
             .collect();
-        if pending.len() > 1
-            || pending.first().is_some_and(|a| {
-                self.cursor_step_id.as_deref() != Some(a.invocation.logical_step_id())
-            })
-        {
+        if pending.len() > 1 {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
         if self.pause_reason == Some(RunPauseReason::RecoveryRequired)
@@ -754,7 +936,7 @@ impl CheckpointV1 {
                 || self
                     .uncertain_invocations
                     .iter()
-                    .any(|r| r.recovery_binding.is_none()))
+                    .any(|r| r.pause().invocation().run_id() != self.run_id))
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
@@ -762,19 +944,40 @@ impl CheckpointV1 {
             && self
                 .uncertain_invocations
                 .iter()
-                .any(|r| r.recovery_binding.is_some())
+                .any(|r| r.recovery_binding().is_some())
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
-        if self.cursor_step_id.as_ref().is_some_and(|cursor| {
-            !self
-                .attempts
-                .iter()
-                .any(|a| a.invocation.logical_step_id() == cursor)
-        }) || self.state == RunState::Queued
-            && (!self.attempts.is_empty() || self.cursor_step_id.is_some())
-            || self.state == RunState::Completed
-                && (self.cursor_step_id.is_some() || !self.uncertain_invocations.is_empty())
+        let cursor_attempt = self.cursor.as_ref().and_then(|cursor| {
+            self.attempts.iter().find(|a| {
+                a.invocation.id() == cursor.logical_invocation_id
+                    && a.attempt_number == cursor.attempt_number
+                    && a.invocation.logical_step_id() == cursor.logical_step_id
+            })
+        });
+        if self.cursor.is_some() != cursor_attempt.is_some()
+            || cursor_attempt.is_some_and(|current| {
+                self.attempts.iter().any(|a| {
+                    a.invocation.id() == current.invocation.id()
+                        && a.attempt_number > current.attempt_number
+                })
+            })
+            || pending.first().is_some_and(|a| cursor_attempt != Some(*a))
+            || self.state == RunState::Queued
+                && (!self.attempts.is_empty() || self.cursor.is_some())
+            || matches!(
+                self.state,
+                RunState::Completed | RunState::Failed | RunState::Cancelled
+            ) && self.cursor.is_some()
+            || matches!(
+                self.state,
+                RunState::Running | RunState::WaitingForApproval | RunState::Paused
+            ) && !self.attempts.is_empty()
+                && self.cursor.is_none()
+            || self.pause_reason == Some(RunPauseReason::RecoveryRequired)
+                && cursor_attempt.is_none_or(|a| a.state != AttemptRecordState::Uncertain)
+            || matches!(self.state, RunState::Running | RunState::WaitingForApproval)
+                && cursor_attempt.is_some_and(|a| a.state != AttemptRecordState::Pending)
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
         }
@@ -836,7 +1039,10 @@ impl CheckpointV1 {
         self.pause_reason
     }
     pub fn cursor_step_id(&self) -> Option<&str> {
-        self.cursor_step_id.as_deref()
+        self.cursor.as_ref().map(CheckpointCursor::logical_step_id)
+    }
+    pub fn cursor(&self) -> Option<&CheckpointCursor> {
+        self.cursor.as_ref()
     }
     pub fn attempts(&self) -> &[InvocationAttemptRecord] {
         &self.attempts
@@ -881,8 +1087,11 @@ fn canonical<T: Ord>(items: &[T]) -> Result<(), ExecutionError> {
         Ok(())
     }
 }
-fn canonical_by_id<T, F: Fn(&T) -> Uuid>(items: &[T], id: F) -> Result<(), ExecutionError> {
-    if items.windows(2).any(|w| id(&w[0]) >= id(&w[1])) {
+fn canonical_by_pair<T, F: Fn(&T) -> (Uuid, u32)>(
+    items: &[T],
+    key: F,
+) -> Result<(), ExecutionError> {
+    if items.windows(2).any(|w| key(&w[0]) >= key(&w[1])) {
         Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint))
     } else {
         Ok(())

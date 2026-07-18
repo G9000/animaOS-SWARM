@@ -41,7 +41,7 @@ pub enum RiskLevel {
 }
 
 /// The declared recovery path after a capability invocation fails.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum RecoveryMode {
     /// A repeated call has the same effect without an externally supplied key.
     InherentlyIdempotent,

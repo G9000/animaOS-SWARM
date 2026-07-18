@@ -5,14 +5,15 @@ mod event;
 mod state;
 
 pub use checkpoint::{
-    AttemptRecordState, CheckpointV1, CheckpointV1Builder, CompletedInvocationRecord,
-    DefinitionPin, InvocationAttemptRecord, ManifestPin, OpaqueReference, PendingApprovalRecord,
+    AttemptRecordState, CheckpointCursor, CheckpointV1, CheckpointV1Builder,
+    CompletedInvocationRecord, DefinitionPin, InvocationAttemptRecord, ManifestPin,
+    OpaqueReference, PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord,
     RecoveryRecord, UncertainInvocationRecord,
 };
 pub use event::{LiveRuntimeEvent, RuntimeEvent, RuntimeEventKind, SafeEventPayload};
 pub use state::{
     ApprovalResumeBinding, ApprovalResumeClaim, Attempt, Budget, BudgetDecision, CommandOutcome,
-    CommandReceipt, ExecutionError, ExecutionErrorCode, ExecutionLease, Run, RunPauseReason,
-    RunState, RuntimeCommand, RuntimeCommandKind, Session, SessionConcurrencyPolicy, Step,
-    StepKind, Usage,
+    CommandReceipt, ExecutionError, ExecutionErrorCode, ExecutionLease, RecoveryTerminalResolution,
+    Run, RunPauseReason, RunState, RuntimeCommand, RuntimeCommandKind, Session,
+    SessionConcurrencyPolicy, Step, StepKind, Usage,
 };

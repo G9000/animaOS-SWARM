@@ -16,15 +16,32 @@ pub enum RuntimeEventKind {
     RunCancelled,
     ModelStarted,
     ModelCompleted,
+    StepStarted,
+    StepRetried,
+    StepCompleted,
+    StepFailed,
+    CapabilityProposed,
+    CapabilityApproved,
+    CapabilityDenied,
     CapabilityStarted,
     CapabilityCompleted,
+    CapabilityFailed,
     PolicyEvaluated,
     ApprovalRequested,
     ApprovalResolved,
     MemoryRead,
+    MemoryProposed,
     MemoryWritten,
+    MemorySuperseded,
+    MemoryForgotten,
     CheckpointSaved,
     ArtifactRecorded,
+    ArtifactProposed,
+    ArtifactCreated,
+    ArtifactUpdated,
+    BudgetUpdated,
+    BudgetExtensionRequested,
+    BudgetExhausted,
     UsageRecorded,
     Error,
 }
@@ -203,10 +220,45 @@ impl<'de> Deserialize<'de> for RuntimeEvent {
         .map_err(serde::de::Error::custom)
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct LiveRuntimeEvent {
-    pub run_id: Uuid,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    run_id: Uuid,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+impl LiveRuntimeEvent {
+    pub fn new(
+        run_id: Uuid,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<Self, ExecutionError> {
+        valid_uuid(run_id)?;
+        Ok(Self {
+            run_id,
+            input_tokens,
+            output_tokens,
+        })
+    }
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    pub fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+    pub fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveRuntimeEventWire {
+    run_id: Uuid,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+impl<'de> Deserialize<'de> for LiveRuntimeEvent {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let w = LiveRuntimeEventWire::deserialize(d)?;
+        Self::new(w.run_id, w.input_tokens, w.output_tokens).map_err(serde::de::Error::custom)
+    }
 }

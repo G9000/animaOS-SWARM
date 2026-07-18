@@ -3,10 +3,11 @@ use anima_core::{
     ApprovalDecision, ApprovalResumeClaim, AttemptRecordState, Budget, BudgetDecision,
     CapabilityKind, CapabilityManifest, CapabilityReferenceId, CheckpointV1, CheckpointV1Builder,
     CommandOutcome, CommandReceipt, CompletedInvocationRecord, DefinitionPin, ExecutionErrorCode,
-    InvocationAttemptRecord, LogicalInvocation, ManifestPin, OpaqueReference, PolicyContext,
-    PolicyEngine, PolicyRestrictions, RecoveryMode, RiskLevel, Run, RunPauseReason, RunState,
+    ExecutionLease, InvocationAttemptRecord, LogicalInvocation, ManifestPin, OpaqueReference,
+    PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RecoveryPauseReason,
+    RecoveryPauseRecord, RecoveryTerminalResolution, RiskLevel, Run, RunPauseReason, RunState,
     RuntimeCommand, RuntimeCommandKind, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind,
-    Session, SessionConcurrencyPolicy, StepKind, Usage,
+    Session, SessionConcurrencyPolicy, StepKind, UncertainInvocationRecord, Usage,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -183,6 +184,13 @@ fn sessions_default_serial_and_concurrent_requires_pinned_definition() {
     );
     assert!(Session::new(id(1), "writer", 3, SessionConcurrencyPolicy::Concurrent).is_err());
     assert!(Session::new_with_definition_setting(id(1), "writer", 3, true).is_ok());
+    let concurrent = Session::new_with_definition_setting(id(1), "writer", 3, true).unwrap();
+    let restored: Session =
+        serde_json::from_value(serde_json::to_value(&concurrent).unwrap()).unwrap();
+    assert_eq!(restored.concurrency(), SessionConcurrencyPolicy::Concurrent);
+    let mut forged = serde_json::to_value(&concurrent).unwrap();
+    forged["concurrency_pinned"] = json!(false);
+    assert!(serde_json::from_value::<Session>(forged).is_err());
 }
 
 #[test]
@@ -200,6 +208,37 @@ fn events_are_contiguous_and_token_deltas_are_live_not_checkpoint_semantic() {
     assert!(RuntimeEvent::validate_batch(4, &[start.clone()]).is_ok());
     assert!(RuntimeEvent::validate_batch(4, &[start.clone(), start.clone()]).is_err());
     assert!(RuntimeEvent::validate_batch(1, &[start]).is_err());
+}
+
+#[test]
+fn durable_event_vocabulary_is_complete_and_live_events_validate_standalone() {
+    let durable = [
+        RuntimeEventKind::StepStarted,
+        RuntimeEventKind::StepRetried,
+        RuntimeEventKind::StepCompleted,
+        RuntimeEventKind::StepFailed,
+        RuntimeEventKind::CapabilityProposed,
+        RuntimeEventKind::CapabilityApproved,
+        RuntimeEventKind::CapabilityDenied,
+        RuntimeEventKind::MemoryProposed,
+        RuntimeEventKind::MemorySuperseded,
+        RuntimeEventKind::MemoryForgotten,
+        RuntimeEventKind::ArtifactProposed,
+        RuntimeEventKind::ArtifactCreated,
+        RuntimeEventKind::ArtifactUpdated,
+        RuntimeEventKind::BudgetUpdated,
+        RuntimeEventKind::BudgetExtensionRequested,
+        RuntimeEventKind::BudgetExhausted,
+    ];
+    for kind in durable {
+        assert!(!serde_json::to_string(&kind).unwrap().is_empty());
+    }
+    assert!(
+        serde_json::from_value::<anima_core::LiveRuntimeEvent>(json!({
+            "run_id": Uuid::nil(), "input_tokens": 1, "output_tokens": 1
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -243,7 +282,13 @@ fn full_checkpoints_round_trip_and_reject_tampered_records() {
         json!({ "path": "a.md" }),
     )
     .unwrap();
-    let manifest = ManifestPin::new("workspace.write", 1, "sha256:abc").unwrap();
+    let manifest = ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:abc",
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
     let attempt = InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -269,8 +314,7 @@ fn full_checkpoints_round_trip_and_reject_tampered_records() {
         Budget::default(),
         Usage::default(),
     )
-    .state(RunState::Running, None)
-    .cursor_step_id(Some("cap-step".into()))
+    .state(RunState::Completed, None)
     .attempts(vec![attempt])
     .completed_invocations(vec![completed])
     .message_context_refs(vec![OpaqueReference::new(id(201)).unwrap()])
@@ -305,7 +349,13 @@ fn standalone_checkpoint_records_and_canonical_order_fail_closed() {
         json!({ "path": "a.md" }),
     )
     .unwrap();
-    let manifest = ManifestPin::new("workspace.write", 1, "sha256:abc").unwrap();
+    let manifest = ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:abc",
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
     let record = InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -416,4 +466,168 @@ fn standalone_budget_and_usage_serde_revalidate_invariants() {
     .unwrap();
     budget["max_wall_time_ms"] = serde_json::json!(0);
     assert!(serde_json::from_value::<Budget>(budget).is_err());
+    let invalid_usage = Usage {
+        total_tokens: 1,
+        ..Usage::default()
+    };
+    assert!(serde_json::to_value(invalid_usage).is_err());
+    let invalid_budget = Budget {
+        max_wall_time_ms: Some(0),
+        ..Budget::default()
+    };
+    assert!(serde_json::to_value(invalid_budget).is_err());
+    let lease = ExecutionLease::new(id(1), id(2), 10).unwrap();
+    assert_eq!(lease.run_id(), id(1));
+    assert!(serde_json::to_value(ExecutionLease {
+        run_id: Uuid::nil(),
+        fence: id(2),
+        expires_at_ms: 10,
+    })
+    .is_err());
+}
+
+#[test]
+fn manual_recovery_pause_has_no_automatic_resume_path() {
+    let invocation = LogicalInvocation::new(
+        id(2),
+        "manual-step",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let manifest = ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:manual",
+        RecoveryMode::Manual,
+    )
+    .unwrap();
+    let pause = RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        RecoveryPauseReason::ManualReview,
+    )
+    .unwrap();
+    assert!(!pause.allows_automatic_resume());
+    let run = Run::queued(id(2), id(1), "writer", 1)
+        .unwrap()
+        .transition(RunState::Running, None)
+        .unwrap()
+        .pause_for_recovery(pause.clone())
+        .unwrap();
+    assert!(run.resume(None, None).is_err());
+    assert_eq!(
+        run.resolve_recovery_terminal(RecoveryTerminalResolution::Fail)
+            .unwrap()
+            .state(),
+        RunState::Failed
+    );
+    assert!(run
+        .resolve_recovery_terminal(RecoveryTerminalResolution::AdoptExternallyVerifiedResult {
+            result_ref: Uuid::nil()
+        })
+        .is_err());
+    let attempt = InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        AttemptRecordState::Uncertain,
+        manifest.clone(),
+        RecoveryMode::Manual,
+    )
+    .unwrap();
+    let uncertain = UncertainInvocationRecord::new_with_pause(pause, None).unwrap();
+    assert!(CheckpointV1Builder::new(
+        id(1),
+        id(2),
+        DefinitionPin::new(1, "writer", 1).unwrap(),
+        1,
+        vec![manifest],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::Paused, Some(RunPauseReason::RecoveryRequired))
+    .cursor_step_id(Some("manual-step".into()))
+    .attempts(vec![attempt])
+    .uncertain_invocations(vec![uncertain])
+    .build()
+    .is_ok());
+}
+
+#[test]
+fn checkpoint_preserves_uncertain_then_completed_attempt_history_and_pinned_mode() {
+    let invocation = LogicalInvocation::new(
+        id(2),
+        "retry-step",
+        "workspace.write",
+        1,
+        json!({ "path": "a.md" }),
+    )
+    .unwrap();
+    let manifest = ManifestPin::new_with_recovery_mode(
+        "workspace.write",
+        1,
+        "sha256:keyed",
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let attempt_one = InvocationAttemptRecord::new(
+        invocation.binding(),
+        1,
+        AttemptRecordState::Uncertain,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let attempt_two = InvocationAttemptRecord::new(
+        invocation.binding(),
+        2,
+        AttemptRecordState::Completed,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+    )
+    .unwrap();
+    let pause = RecoveryPauseRecord::new(
+        invocation.binding(),
+        1,
+        manifest.clone(),
+        RecoveryPauseReason::UncertainOutcome,
+    )
+    .unwrap();
+    let uncertain = UncertainInvocationRecord::new_with_pause(pause, None).unwrap();
+    let completed = CompletedInvocationRecord::new(
+        invocation.binding(),
+        2,
+        manifest.clone(),
+        RecoveryMode::KeyedIdempotent,
+        OpaqueReference::new(id(50)).unwrap(),
+    )
+    .unwrap();
+    let checkpoint = CheckpointV1Builder::new(
+        id(1),
+        id(2),
+        DefinitionPin::new(1, "writer", 1).unwrap(),
+        2,
+        vec![manifest],
+        Budget::default(),
+        Usage::default(),
+    )
+    .state(RunState::Completed, None)
+    .attempts(vec![attempt_two, attempt_one])
+    .uncertain_invocations(vec![uncertain])
+    .completed_invocations(vec![completed])
+    .build()
+    .unwrap();
+    assert_eq!(checkpoint.attempts().len(), 2);
+    let mut tampered = serde_json::to_value(&checkpoint).unwrap();
+    tampered["manifests"][0]["recovery_mode"] = json!("NonRetryable");
+    assert!(serde_json::from_value::<CheckpointV1>(tampered).is_err());
+    let mut duplicate = serde_json::to_value(&checkpoint).unwrap();
+    let first = duplicate["completed_invocations"][0].clone();
+    duplicate["completed_invocations"]
+        .as_array_mut()
+        .unwrap()
+        .push(first);
+    assert!(serde_json::from_value::<CheckpointV1>(duplicate).is_err());
 }

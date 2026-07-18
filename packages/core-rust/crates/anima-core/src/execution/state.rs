@@ -3,6 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
+use super::checkpoint::RecoveryPauseRecord;
 use crate::{
     ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, ApprovalValidity, PolicyContext,
     PolicyEngine, RecoveryResumeBinding, ValidatedRecoveryResume, CAPABILITY_INVOCATION_NAMESPACE,
@@ -25,6 +26,7 @@ pub struct Session {
     definition_id: String,
     definition_version: u32,
     concurrency: SessionConcurrencyPolicy,
+    concurrency_pinned: bool,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +36,7 @@ struct SessionWire {
     definition_id: String,
     definition_version: u32,
     concurrency: SessionConcurrencyPolicy,
+    concurrency_pinned: bool,
 }
 
 impl Session {
@@ -46,7 +49,13 @@ impl Session {
         if concurrency == SessionConcurrencyPolicy::Concurrent {
             return Err(ExecutionError::new(ExecutionErrorCode::ConcurrentNotPinned));
         }
-        Self::new_inner(id, definition_id.into(), definition_version, concurrency)
+        Self::new_inner(
+            id,
+            definition_id.into(),
+            definition_version,
+            concurrency,
+            false,
+        )
     }
     pub fn new_with_definition_setting(
         id: Uuid,
@@ -63,6 +72,7 @@ impl Session {
             } else {
                 SessionConcurrencyPolicy::Serial
             },
+            allows_concurrent,
         )
     }
     fn new_inner(
@@ -70,15 +80,20 @@ impl Session {
         definition_id: String,
         definition_version: u32,
         concurrency: SessionConcurrencyPolicy,
+        concurrency_pinned: bool,
     ) -> Result<Self, ExecutionError> {
         valid_uuid(id)?;
         valid_id(&definition_id)?;
         valid_version(definition_version)?;
+        if concurrency == SessionConcurrencyPolicy::Concurrent && !concurrency_pinned {
+            return Err(ExecutionError::new(ExecutionErrorCode::ConcurrentNotPinned));
+        }
         Ok(Self {
             id,
             definition_id,
             definition_version,
             concurrency,
+            concurrency_pinned,
         })
     }
     pub fn id(&self) -> Uuid {
@@ -91,8 +106,14 @@ impl Session {
 impl<'de> Deserialize<'de> for Session {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = SessionWire::deserialize(d)?;
-        Self::new(w.id, w.definition_id, w.definition_version, w.concurrency)
-            .map_err(serde::de::Error::custom)
+        Self::new_inner(
+            w.id,
+            w.definition_id,
+            w.definition_version,
+            w.concurrency,
+            w.concurrency_pinned,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -123,6 +144,13 @@ pub enum RunPauseReason {
     Policy,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecoveryTerminalResolution {
+    Cancel,
+    Fail,
+    AdoptExternallyVerifiedResult { result_ref: Uuid },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Run {
     id: Uuid,
@@ -132,7 +160,7 @@ pub struct Run {
     state: RunState,
     pause_reason: Option<RunPauseReason>,
     pending_approval: Option<ApprovalRequest>,
-    recovery_binding: Option<RecoveryResumeBinding>,
+    recovery_pause: Option<RecoveryPauseRecord>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -146,7 +174,7 @@ struct RunWire {
     #[serde(default)]
     pending_approval: Option<ApprovalRequest>,
     #[serde(default)]
-    recovery_binding: Option<RecoveryResumeBinding>,
+    recovery_pause: Option<RecoveryPauseRecord>,
 }
 impl Run {
     pub fn queued(
@@ -174,7 +202,7 @@ impl Run {
         state: RunState,
         pause_reason: Option<RunPauseReason>,
         pending_approval: Option<ApprovalRequest>,
-        recovery_binding: Option<RecoveryResumeBinding>,
+        recovery_pause: Option<RecoveryPauseRecord>,
     ) -> Result<Self, ExecutionError> {
         valid_uuid(id)?;
         valid_uuid(session_id)?;
@@ -184,14 +212,13 @@ impl Run {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidState));
         }
         if (state == RunState::WaitingForApproval) != pending_approval.is_some()
-            || (pause_reason == Some(RunPauseReason::RecoveryRequired))
-                != recovery_binding.is_some()
+            || (pause_reason == Some(RunPauseReason::RecoveryRequired)) != recovery_pause.is_some()
             || pending_approval
                 .as_ref()
                 .is_some_and(|request| request.run_id != id)
-            || recovery_binding
+            || recovery_pause
                 .as_ref()
-                .is_some_and(|binding| binding.run_id() != id)
+                .is_some_and(|pause| pause.invocation().run_id() != id)
         {
             return Err(ExecutionError::new(ExecutionErrorCode::InvalidState));
         }
@@ -203,7 +230,7 @@ impl Run {
             state,
             pause_reason,
             pending_approval,
-            recovery_binding,
+            recovery_pause,
         })
     }
     pub fn id(&self) -> Uuid {
@@ -221,8 +248,8 @@ impl Run {
     pub fn pending_approval(&self) -> Option<&ApprovalRequest> {
         self.pending_approval.as_ref()
     }
-    pub fn recovery_binding(&self) -> Option<&RecoveryResumeBinding> {
-        self.recovery_binding.as_ref()
+    pub fn recovery_pause(&self) -> Option<&RecoveryPauseRecord> {
+        self.recovery_pause.as_ref()
     }
     pub fn transition(
         &self,
@@ -271,11 +298,8 @@ impl Run {
         )
     }
 
-    pub fn pause_for_recovery(
-        &self,
-        binding: RecoveryResumeBinding,
-    ) -> Result<Self, ExecutionError> {
-        if self.state != RunState::Running || binding.run_id() != self.id {
+    pub fn pause_for_recovery(&self, pause: RecoveryPauseRecord) -> Result<Self, ExecutionError> {
+        if self.state != RunState::Running || pause.invocation().run_id() != self.id {
             return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
         }
         Self::from_parts(
@@ -286,7 +310,7 @@ impl Run {
             RunState::Paused,
             Some(RunPauseReason::RecoveryRequired),
             None,
-            Some(binding),
+            Some(pause),
         )
     }
     pub fn resume(
@@ -370,7 +394,7 @@ impl Run {
             }
             RunState::Paused if self.pause_reason == Some(RunPauseReason::RecoveryRequired) => {
                 let (Some(expected), Some(command_binding), Some(claim)) = (
-                    self.recovery_binding.as_ref(),
+                    self.recovery_pause.as_ref(),
                     recovery_binding,
                     recovery_claim,
                 ) else {
@@ -379,7 +403,7 @@ impl Run {
                 if approval_binding.is_some()
                     || approval_claim.is_some()
                     || claim.binding() != command_binding
-                    || command_binding != expected
+                    || !expected.matches_resume_binding(command_binding)
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::RecoveryRequired));
                 }
@@ -401,6 +425,36 @@ impl Run {
             self.definition_id.clone(),
             self.definition_version,
             RunState::Running,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn resolve_recovery_terminal(
+        &self,
+        resolution: RecoveryTerminalResolution,
+    ) -> Result<Self, ExecutionError> {
+        if self.state != RunState::Paused
+            || self.pause_reason != Some(RunPauseReason::RecoveryRequired)
+            || self.recovery_pause.is_none()
+        {
+            return Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition));
+        }
+        let target = match resolution {
+            RecoveryTerminalResolution::Cancel => RunState::Cancelled,
+            RecoveryTerminalResolution::Fail => RunState::Failed,
+            RecoveryTerminalResolution::AdoptExternallyVerifiedResult { result_ref } => {
+                valid_uuid(result_ref)?;
+                RunState::Completed
+            }
+        };
+        Self::from_parts(
+            self.id,
+            self.session_id,
+            self.definition_id.clone(),
+            self.definition_version,
+            target,
             None,
             None,
             None,
@@ -436,7 +490,7 @@ impl<'de> Deserialize<'de> for Run {
             w.state,
             w.pause_reason,
             w.pending_approval,
-            w.recovery_binding,
+            w.recovery_pause,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -602,12 +656,28 @@ fn attempt_uuid(invocation: Uuid, number: u32) -> Uuid {
     )
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExecutionLease {
     pub run_id: Uuid,
     pub fence: Uuid,
     pub expires_at_ms: u64,
+}
+impl Serialize for ExecutionLease {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        ExecutionLeaseWireRef {
+            run_id: self.run_id,
+            fence: self.fence,
+            expires_at_ms: self.expires_at_ms,
+        }
+        .serialize(serializer)
+    }
+}
+#[derive(Serialize)]
+struct ExecutionLeaseWireRef {
+    run_id: Uuid,
+    fence: Uuid,
+    expires_at_ms: u64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -617,6 +687,24 @@ struct ExecutionLeaseWire {
     expires_at_ms: u64,
 }
 impl ExecutionLease {
+    pub fn new(run_id: Uuid, fence: Uuid, expires_at_ms: u64) -> Result<Self, ExecutionError> {
+        let value = Self {
+            run_id,
+            fence,
+            expires_at_ms,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+    pub fn fence(&self) -> Uuid {
+        self.fence
+    }
+    pub fn expires_at_ms(&self) -> u64 {
+        self.expires_at_ms
+    }
     pub fn validate(&self) -> Result<(), ExecutionError> {
         valid_uuid(self.run_id)?;
         valid_uuid(self.fence)?;
@@ -629,13 +717,7 @@ impl ExecutionLease {
 impl<'de> Deserialize<'de> for ExecutionLease {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = ExecutionLeaseWire::deserialize(d)?;
-        let value = Self {
-            run_id: w.run_id,
-            fence: w.fence,
-            expires_at_ms: w.expires_at_ms,
-        };
-        value.validate().map_err(serde::de::Error::custom)?;
-        Ok(value)
+        Self::new(w.run_id, w.fence, w.expires_at_ms).map_err(serde::de::Error::custom)
     }
 }
 
@@ -934,8 +1016,7 @@ impl<'de> Deserialize<'de> for CommandReceipt {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Default)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Usage {
     pub wall_time_ms: u64,
     pub turns: u64,
@@ -963,6 +1044,36 @@ struct UsageWire {
     download_bytes: u64,
 }
 impl Usage {
+    pub fn wall_time_ms(&self) -> u64 {
+        self.wall_time_ms
+    }
+    pub fn turns(&self) -> u64 {
+        self.turns
+    }
+    pub fn capability_steps(&self) -> u64 {
+        self.capability_steps
+    }
+    pub fn input_tokens(&self) -> u64 {
+        self.input_tokens
+    }
+    pub fn output_tokens(&self) -> u64 {
+        self.output_tokens
+    }
+    pub fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+    pub fn estimated_cost_micros(&self) -> u64 {
+        self.estimated_cost_micros
+    }
+    pub fn concurrent_runs(&self) -> u64 {
+        self.concurrent_runs
+    }
+    pub fn artifact_bytes(&self) -> u64 {
+        self.artifact_bytes
+    }
+    pub fn download_bytes(&self) -> u64 {
+        self.download_bytes
+    }
     pub fn validate(&self) -> Result<(), ExecutionError> {
         if self.total_tokens
             != self
@@ -1005,6 +1116,41 @@ impl Usage {
         Ok(result)
     }
 }
+impl Serialize for Usage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        UsageWireRef::from(self).serialize(serializer)
+    }
+}
+#[derive(Serialize)]
+struct UsageWireRef {
+    wall_time_ms: u64,
+    turns: u64,
+    capability_steps: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    estimated_cost_micros: u64,
+    concurrent_runs: u64,
+    artifact_bytes: u64,
+    download_bytes: u64,
+}
+impl From<&Usage> for UsageWireRef {
+    fn from(v: &Usage) -> Self {
+        Self {
+            wall_time_ms: v.wall_time_ms,
+            turns: v.turns,
+            capability_steps: v.capability_steps,
+            input_tokens: v.input_tokens,
+            output_tokens: v.output_tokens,
+            total_tokens: v.total_tokens,
+            estimated_cost_micros: v.estimated_cost_micros,
+            concurrent_runs: v.concurrent_runs,
+            artifact_bytes: v.artifact_bytes,
+            download_bytes: v.download_bytes,
+        }
+    }
+}
 impl<'de> Deserialize<'de> for Usage {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let w = UsageWire::deserialize(d)?;
@@ -1024,8 +1170,7 @@ impl<'de> Deserialize<'de> for Usage {
         Ok(value)
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Budget {
     pub max_wall_time_ms: Option<u64>,
     pub max_turns: Option<u64>,
@@ -1056,6 +1201,43 @@ impl Default for Budget {
         }
     }
 }
+impl Serialize for Budget {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.validate().map_err(serde::ser::Error::custom)?;
+        BudgetWireRef::from(self).serialize(serializer)
+    }
+}
+#[derive(Serialize)]
+struct BudgetWireRef {
+    max_wall_time_ms: Option<u64>,
+    max_turns: Option<u64>,
+    max_capability_steps: Option<u64>,
+    max_input_tokens: Option<u64>,
+    max_output_tokens: Option<u64>,
+    max_total_tokens: Option<u64>,
+    max_estimated_cost_micros: Option<u64>,
+    max_concurrent_runs: Option<u64>,
+    max_artifact_bytes: Option<u64>,
+    max_download_bytes: Option<u64>,
+    require_approval_at_percent: Option<u8>,
+}
+impl From<&Budget> for BudgetWireRef {
+    fn from(v: &Budget) -> Self {
+        Self {
+            max_wall_time_ms: v.max_wall_time_ms,
+            max_turns: v.max_turns,
+            max_capability_steps: v.max_capability_steps,
+            max_input_tokens: v.max_input_tokens,
+            max_output_tokens: v.max_output_tokens,
+            max_total_tokens: v.max_total_tokens,
+            max_estimated_cost_micros: v.max_estimated_cost_micros,
+            max_concurrent_runs: v.max_concurrent_runs,
+            max_artifact_bytes: v.max_artifact_bytes,
+            max_download_bytes: v.max_download_bytes,
+            require_approval_at_percent: v.require_approval_at_percent,
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BudgetWire {
@@ -1079,6 +1261,39 @@ pub enum BudgetDecision {
     Exhausted,
 }
 impl Budget {
+    pub fn max_wall_time_ms(&self) -> Option<u64> {
+        self.max_wall_time_ms
+    }
+    pub fn max_turns(&self) -> Option<u64> {
+        self.max_turns
+    }
+    pub fn max_capability_steps(&self) -> Option<u64> {
+        self.max_capability_steps
+    }
+    pub fn max_input_tokens(&self) -> Option<u64> {
+        self.max_input_tokens
+    }
+    pub fn max_output_tokens(&self) -> Option<u64> {
+        self.max_output_tokens
+    }
+    pub fn max_total_tokens(&self) -> Option<u64> {
+        self.max_total_tokens
+    }
+    pub fn max_estimated_cost_micros(&self) -> Option<u64> {
+        self.max_estimated_cost_micros
+    }
+    pub fn max_concurrent_runs(&self) -> Option<u64> {
+        self.max_concurrent_runs
+    }
+    pub fn max_artifact_bytes(&self) -> Option<u64> {
+        self.max_artifact_bytes
+    }
+    pub fn max_download_bytes(&self) -> Option<u64> {
+        self.max_download_bytes
+    }
+    pub fn require_approval_at_percent(&self) -> Option<u8> {
+        self.require_approval_at_percent
+    }
     pub fn validate(&self) -> Result<(), ExecutionError> {
         for max in [
             self.max_wall_time_ms,
