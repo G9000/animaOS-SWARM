@@ -4,7 +4,9 @@ pub mod components;
 pub mod definition;
 pub mod engine;
 pub mod events;
+pub mod evidence;
 pub mod execution;
+pub mod memory;
 pub mod model;
 pub mod persistence;
 pub mod policy;
@@ -45,6 +47,11 @@ pub use engine::{
     EngineLiveEvent, EngineLiveEventSink, EnginePolicyRequest, EngineRunOutcome,
 };
 pub use events::{EngineEvent, EventType};
+pub use evidence::{
+    Artifact, ArtifactPort, ArtifactWrite, Citation, Document, DocumentChunk, DocumentPort,
+    Evidence, EvidencePortError, EvidencePortErrorCode, RetrievalHit, RetrievalQuery,
+    RetrieverPort,
+};
 pub use execution::{
     assert_execution_store_conformance, ApprovalGrantMutation, ApprovalResumeBinding,
     ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, AttemptRecordState,
@@ -65,6 +72,11 @@ pub use execution::{
     StoreReadCursor, StoreReadPage, StoredRun, UncertainInvocationRecord, Usage,
     MAX_COMMIT_ATTEMPTS, MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS, MAX_COMMIT_RESULTS,
     MAX_COMMIT_STEPS, MAX_STORE_READ_CURSOR_BYTES, MAX_STORE_READ_PAGE_SIZE,
+};
+pub use memory::{
+    MemoryHit, MemoryKind, MemoryPort, MemoryPortError, MemoryPortErrorCode, MemoryProvenance,
+    MemoryQuery, MemoryRecord, MemoryRetention, MemoryRevision, MemoryScope, MemoryWrite,
+    RetentionPolicy,
 };
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,

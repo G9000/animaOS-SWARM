@@ -1,4 +1,5 @@
 mod bm25;
+pub mod core_port;
 mod eval_harness;
 #[cfg(feature = "locomo-eval")]
 mod locomo_eval;
@@ -8,6 +9,10 @@ mod vector_index;
 pub use bm25::{
     QueryExpander, QueryExpansionContext, QueryExpansionRule, SearchResult, TextAnalysisProfile,
     TextAnalyzer, BM25,
+};
+pub use core_port::{
+    core_memory_to_legacy, legacy_memory_to_core, legacy_new_memory_to_core,
+    memory_manager_port_unavailable, LegacyBridgeError, LegacyBridgeErrorCode, LegacyMemoryContext,
 };
 pub use eval_harness::{
     baseline_memory_eval_cases, run_memory_eval_cases, run_memory_eval_checks, MemoryEvalCase,
