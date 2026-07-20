@@ -1343,6 +1343,8 @@ enum RuntimeCommandPayload {
     },
     Cancel {
         run_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<Box<RecoveryRecord>>,
     },
 }
 impl RuntimeCommandPayload {
@@ -1373,7 +1375,7 @@ impl RuntimeCommandPayload {
             | Self::ResumeRecovery { run_id, .. }
             | Self::Complete { run_id }
             | Self::Fail { run_id }
-            | Self::Cancel { run_id } => *run_id,
+            | Self::Cancel { run_id, .. } => *run_id,
         }
     }
     fn validate(&self) -> Result<(), ExecutionError> {
@@ -1405,6 +1407,14 @@ impl RuntimeCommandPayload {
                 if *reason == RunPauseReason::RecoveryRequired {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
                 }
+                if recovery
+                    .as_ref()
+                    .is_some_and(|record| record.invocation().run_id() != *run_id)
+                {
+                    return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
+            }
+            Self::Cancel { run_id, recovery } => {
                 if recovery
                     .as_ref()
                     .is_some_and(|record| record.invocation().run_id() != *run_id)
@@ -1592,7 +1602,29 @@ impl RuntimeCommand {
         Self::new(id, session_id, RuntimeCommandPayload::Fail { run_id })
     }
     pub fn cancel(id: Uuid, session_id: Uuid, run_id: Uuid) -> Result<Self, ExecutionError> {
-        Self::new(id, session_id, RuntimeCommandPayload::Cancel { run_id })
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::Cancel {
+                run_id,
+                recovery: None,
+            },
+        )
+    }
+    pub fn cancel_with_recovery(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        recovery: RecoveryRecord,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::Cancel {
+                run_id,
+                recovery: Some(Box::new(recovery)),
+            },
+        )
     }
     pub fn id(&self) -> Uuid {
         self.id
@@ -1623,6 +1655,10 @@ impl RuntimeCommand {
                 ..
             } => Some(recovery),
             RuntimeCommandPayload::Pause {
+                recovery: Some(recovery),
+                ..
+            } => Some(recovery),
+            RuntimeCommandPayload::Cancel {
                 recovery: Some(recovery),
                 ..
             } => Some(recovery),

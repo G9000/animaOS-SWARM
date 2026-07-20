@@ -1222,6 +1222,19 @@ where
                 .await
                 .map(CapabilityStepOutcome::committed);
         }
+        if let Some(outcome) = self
+            .observe_control_boundary(
+                signal,
+                owner_id,
+                &current,
+                &lease,
+                checkpoint_version,
+                &checkpoint,
+            )
+            .await?
+        {
+            return Ok(CapabilityStepOutcome::Adopted(outcome));
+        }
         let policy_guard = DispatchPolicyGuard::from_current_policy(
             owner_id,
             current_policy.context(),
@@ -1437,6 +1450,19 @@ where
             )
             .await;
         }
+        if let Some(outcome) = self
+            .observe_control_boundary(
+                signal,
+                owner_id,
+                prepared.stored_run(),
+                &lease,
+                prepared.checkpoint_version(),
+                &dispatch_checkpoint,
+            )
+            .await?
+        {
+            return Ok(CapabilityStepOutcome::Adopted(outcome));
+        }
         if self
             .crash
             .should_crash(EngineCrashPoint::AfterDispatchCommitBeforeExecutor)
@@ -1580,6 +1606,19 @@ where
                         )
                         .await
                         .map(CapabilityStepOutcome::committed);
+                }
+                if let Some(outcome) = self
+                    .observe_control_boundary(
+                        signal,
+                        owner_id,
+                        &current,
+                        &lease,
+                        checkpoint_version,
+                        &checkpoint,
+                    )
+                    .await?
+                {
+                    return Ok(CapabilityStepOutcome::Adopted(outcome));
                 }
                 let policy_guard = DispatchPolicyGuard::from_current_policy(
                     owner_id,
@@ -1765,6 +1804,19 @@ where
                         kind,
                     )
                     .await;
+                }
+                if let Some(outcome) = self
+                    .observe_control_boundary(
+                        signal,
+                        owner_id,
+                        prepared.stored_run(),
+                        &lease,
+                        prepared.checkpoint_version(),
+                        &retry_checkpoint,
+                    )
+                    .await?
+                {
+                    return Ok(CapabilityStepOutcome::Adopted(outcome));
                 }
                 if self
                     .crash
@@ -2616,6 +2668,65 @@ where
         .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))
     }
 
+    fn mark_dispatching_attempts_uncertain(
+        &self,
+        checkpoint: &CheckpointV1,
+    ) -> Result<
+        (
+            Vec<InvocationAttemptRecord>,
+            Vec<crate::RecoveryRecord>,
+            Vec<InvocationAttemptRecord>,
+            Option<crate::RecoveryRecord>,
+        ),
+        EngineError,
+    > {
+        let mut attempts = checkpoint.attempts().to_vec();
+        let mut uncertain_invocations = checkpoint.uncertain_invocations().to_vec();
+        let mut attempt_mutations = vec![];
+        let mut command_recovery = None;
+        for attempt in attempts
+            .iter_mut()
+            .filter(|attempt| attempt.state() == crate::AttemptRecordState::Dispatching)
+        {
+            let durable_invocation = attempt
+                .durable_invocation()
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
+                .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
+            let uncertain = InvocationAttemptRecord::new_durable(
+                &durable_invocation,
+                attempt.attempt_number(),
+                crate::AttemptRecordState::Uncertain,
+                attempt.manifest().clone(),
+                attempt.recovery_mode(),
+            )
+            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            let pause = crate::RecoveryPauseRecord::new(
+                uncertain.invocation().clone(),
+                uncertain.attempt_number(),
+                uncertain.manifest().clone(),
+                crate::RecoveryPauseReason::AuthoritativeAbsence,
+            )
+            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            let recovery = crate::RecoveryRecord::new_with_pause(pause, None)
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            *attempt = uncertain.clone();
+            attempt_mutations.push(uncertain);
+            if !uncertain_invocations.iter().any(|record| {
+                record.invocation().id() == recovery.invocation().id()
+                    && record.attempt_number() == recovery.attempt_number()
+            }) {
+                uncertain_invocations.push(recovery.clone());
+            }
+            command_recovery.get_or_insert(recovery);
+        }
+        Ok((
+            attempts,
+            uncertain_invocations,
+            attempt_mutations,
+            command_recovery,
+        ))
+    }
+
     async fn emit_semantic(&self, run_id: Uuid, sequence: u64, kind: RuntimeEventKind) {
         let _ = self
             .live
@@ -2690,13 +2801,47 @@ where
             sequence,
             RuntimeEventKind::RunPaused,
         )?;
-        let paused_checkpoint = self.rebuild_checkpoint_for_state(
-            checkpoint,
+        let (attempts, uncertain_invocations, attempt_mutations, command_recovery) =
+            self.mark_dispatching_attempts_uncertain(checkpoint)?;
+        let paused_checkpoint = CheckpointV1Builder::new(
+            checkpoint.session_id(),
+            checkpoint.run_id(),
+            checkpoint.definition().clone(),
             sequence,
-            RunState::Paused,
-            Some(crate::RunPauseReason::Requested),
+            checkpoint.manifests().to_vec(),
+            checkpoint.budget().clone(),
             checkpoint.usage().clone(),
-        )?;
+        )
+        .state(RunState::Paused, Some(crate::RunPauseReason::Requested))
+        .attempts(attempts)
+        .completed_invocations(checkpoint.completed_invocations().to_vec())
+        .uncertain_invocations(uncertain_invocations)
+        .pending_approval(checkpoint.pending_approval().cloned())
+        .provider_transcript(checkpoint.provider_transcript().to_vec())
+        .message_context_refs(checkpoint.message_context_refs().to_vec())
+        .model_context_refs(checkpoint.model_context_refs().to_vec())
+        .memory_refs(checkpoint.memory_refs().to_vec())
+        .artifact_refs(checkpoint.artifact_refs().to_vec())
+        .cursor(checkpoint.cursor().cloned())
+        .build()
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+        let command = if let Some(recovery) = command_recovery {
+            RuntimeCommand::pause_with_recovery(
+                deterministic_id(current.run().id(), "pause", sequence),
+                current.run().session_id(),
+                current.run().id(),
+                crate::RunPauseReason::Requested,
+                recovery,
+            )
+        } else {
+            RuntimeCommand::pause(
+                deterministic_id(current.run().id(), "pause", sequence),
+                current.run().session_id(),
+                current.run().id(),
+                crate::RunPauseReason::Requested,
+            )
+        }
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
         self.store
             .commit_execution(
                 owner_id,
@@ -2704,16 +2849,10 @@ where
                     current.run_version(),
                     checkpoint_version,
                     lease,
-                    RuntimeCommand::pause(
-                        deterministic_id(current.run().id(), "pause", sequence),
-                        current.run().session_id(),
-                        current.run().id(),
-                        crate::RunPauseReason::Requested,
-                    )
-                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                    command,
                     vec![event],
                     vec![],
-                    vec![],
+                    attempt_mutations,
                     vec![],
                     None,
                     target,
@@ -2746,27 +2885,34 @@ where
             sequence,
             RuntimeEventKind::RunCancelled,
         )?;
-        self.store
-            .commit_execution(
-                owner_id,
-                crate::ExecutionCommit::new(
-                    current.run_version(),
-                    checkpoint_version,
-                    lease,
-                    RuntimeCommand::cancel(
-                        deterministic_id(current.run().id(), "cancel", sequence),
-                        current.run().session_id(),
-                        current.run().id(),
-                    )
-                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
-                    vec![event],
-                    vec![],
-                    vec![],
-                    vec![],
-                    None,
-                    target,
-                ),
+        let (_, _, attempt_mutations, command_recovery) =
+            self.mark_dispatching_attempts_uncertain(checkpoint)?;
+        let command_id = deterministic_id(current.run().id(), "cancel", sequence);
+        let command = if let Some(recovery) = command_recovery {
+            RuntimeCommand::cancel_with_recovery(
+                command_id,
+                current.run().session_id(),
+                current.run().id(),
+                recovery,
             )
+        } else {
+            RuntimeCommand::cancel(command_id, current.run().session_id(), current.run().id())
+        }
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+        let commit = crate::ExecutionCommit::new(
+            current.run_version(),
+            checkpoint_version,
+            lease,
+            command,
+            vec![event],
+            vec![],
+            attempt_mutations,
+            vec![],
+            None,
+            target,
+        );
+        self.store
+            .commit_execution(owner_id, commit)
             .await
             .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
         self.emit_semantic(current.run().id(), sequence, RuntimeEventKind::RunCancelled)
