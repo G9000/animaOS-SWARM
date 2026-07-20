@@ -1,11 +1,12 @@
 use anima_core::{
     Artifact, ArtifactPort, ArtifactWrite, Citation, Document, DocumentChunk, DocumentPort,
     Evidence, MemoryHit, MemoryKind, MemoryPort, MemoryPortError, MemoryProvenance, MemoryQuery,
-    MemoryRecord, MemoryRevision, MemoryScope, MemoryWrite, RetrievalHit, RetrievalQuery,
-    RetrieverPort,
+    MemoryRecord, MemoryRetention, MemoryRevision, MemoryScope, MemoryWrite, RetrievalHit,
+    RetrievalQuery, RetrieverPort,
 };
 use async_trait::async_trait;
-use serde_json::{from_str, to_string};
+use serde::de::DeserializeOwned;
+use serde_json::{from_str, from_value, json, to_string, to_value, Value};
 
 const HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
@@ -20,6 +21,10 @@ fn scopes() -> Vec<MemoryScope> {
         MemoryScope::session("session-1").unwrap(),
         MemoryScope::workspace("workspace-1").unwrap(),
     ]
+}
+
+fn assert_rejects<T: DeserializeOwned>(value: Value) {
+    assert!(from_value::<T>(value).is_err());
 }
 
 #[test]
@@ -82,9 +87,118 @@ fn memory_contract_serde_and_lifecycle_fields_are_fail_closed() {
     let revision = MemoryRevision::correction("memory-1", 3, "memory-0", "new source").unwrap();
     assert_eq!(revision.expected_revision, 3);
     assert_eq!(revision.corrects.as_deref(), Some("memory-0"));
+    assert_eq!(revision.correction_reason.as_deref(), Some("new source"));
     assert!(revision.supersedes.contains(&"memory-0".to_owned()));
     assert!(MemoryRevision::forget("memory-1", 3, "retention policy").is_ok());
     assert!(record.retention.deadline_ms.is_some());
+}
+
+#[test]
+fn memory_wire_contract_revalidates_every_domain_value() {
+    assert_rejects::<MemoryScope>(json!({ "kind": "owner", "id": "" }));
+    assert_rejects::<MemoryScope>(json!({ "kind": "agent", "id": "x".repeat(257) }));
+    assert_rejects::<MemoryProvenance>(json!({
+        "source": "", "source_identity": "agent-1", "observed_at_ms": 1
+    }));
+    assert_rejects::<MemoryRetention>(json!({ "policy": "deadline", "deadline_ms": null }));
+    assert_rejects::<MemoryRetention>(json!({ "policy": "persistent", "deadline_ms": 1 }));
+
+    let record = MemoryRecord::from_write(
+        MemoryWrite::new(
+            "memory-1",
+            MemoryKind::Fact,
+            MemoryScope::owner("owner-1").unwrap(),
+            "content",
+            0.5,
+            provenance(),
+        )
+        .unwrap(),
+        1,
+    )
+    .unwrap();
+    for (field, value) in [
+        ("id", json!("")),
+        ("content", json!("")),
+        ("confidence", json!(1.1)),
+        ("revision", json!(0)),
+    ] {
+        let mut invalid = to_value(&record).unwrap();
+        invalid[field] = value;
+        assert_rejects::<MemoryRecord>(invalid);
+    }
+    let mut invalid_provenance = to_value(&record).unwrap();
+    invalid_provenance["provenance"]["source_identity"] = json!("");
+    assert_rejects::<MemoryRecord>(invalid_provenance);
+    let mut invalid_supersedes = to_value(&record).unwrap();
+    invalid_supersedes["supersedes"] = json!([""]);
+    assert_rejects::<MemoryRecord>(invalid_supersedes);
+
+    assert_rejects::<MemoryQuery>(json!({ "text": "query", "authorized_scopes": [], "limit": 1 }));
+    assert_rejects::<MemoryQuery>(
+        json!({ "text": "query", "authorized_scopes": [{ "kind": "owner", "id": "owner-1" }], "limit": 0 }),
+    );
+    assert_rejects::<MemoryRevision>(json!({
+        "memory_id": "memory-1", "expected_revision": 1, "supersedes": [],
+        "corrects": "memory-0", "correction_reason": null, "forget_reason": null
+    }));
+    assert_rejects::<MemoryRevision>(json!({
+        "memory_id": "memory-1", "expected_revision": 1, "supersedes": ["memory-0"],
+        "corrects": null, "correction_reason": null, "forget_reason": "forget"
+    }));
+    let hit = MemoryHit::new(record, 0.5, "reason").unwrap();
+    let mut invalid_hit = to_value(hit).unwrap();
+    invalid_hit["explanation"] = json!("");
+    assert_rejects::<MemoryHit>(invalid_hit);
+}
+
+#[test]
+fn evidence_wire_contract_revalidates_every_domain_value() {
+    let scope = MemoryScope::workspace("workspace-1").unwrap();
+    let document = Document::new("doc-1", scope.clone(), "title", HASH, provenance()).unwrap();
+    let chunk = DocumentChunk::new(
+        "chunk-1",
+        scope.clone(),
+        "doc-1",
+        0,
+        "content",
+        HASH,
+        "line:1",
+    )
+    .unwrap();
+    let citation = Citation::new("doc-1", Some("chunk-1"), "line:1").unwrap();
+    let artifact =
+        Artifact::new("artifact-1", scope.clone(), "report", HASH, provenance()).unwrap();
+    let artifact_write =
+        ArtifactWrite::new("artifact-1", scope.clone(), "report", HASH, provenance()).unwrap();
+
+    for (field, value) in [("title", json!("")), ("content_sha256", json!("invalid"))] {
+        let mut invalid = to_value(&document).unwrap();
+        invalid[field] = value;
+        assert_rejects::<Document>(invalid);
+    }
+    let mut invalid_chunk = to_value(&chunk).unwrap();
+    invalid_chunk["content"] = json!("");
+    assert_rejects::<DocumentChunk>(invalid_chunk);
+    let mut invalid_citation = to_value(&citation).unwrap();
+    invalid_citation["locator"] = json!("");
+    assert_rejects::<Citation>(invalid_citation);
+    let mut invalid_artifact = to_value(&artifact).unwrap();
+    invalid_artifact["content_sha256"] = json!("not-a-hash");
+    assert_rejects::<Artifact>(invalid_artifact);
+    let mut invalid_artifact_write = to_value(&artifact_write).unwrap();
+    invalid_artifact_write["name"] = json!("");
+    assert_rejects::<ArtifactWrite>(invalid_artifact_write);
+    assert_rejects::<RetrievalQuery>(
+        json!({ "text": "query", "authorized_scopes": [], "limit": 1 }),
+    );
+    assert_rejects::<RetrievalQuery>(
+        json!({ "text": "query", "authorized_scopes": [{ "kind": "workspace", "id": "workspace-1" }], "limit": 0 }),
+    );
+    let hit =
+        RetrievalHit::new(Evidence::Document(document), 0.4, "matched", vec![citation]).unwrap();
+    let mut invalid_hit = to_value(hit).unwrap();
+    invalid_hit["explanation"] = json!("");
+    assert_rejects::<RetrievalHit>(invalid_hit);
 }
 
 #[test]

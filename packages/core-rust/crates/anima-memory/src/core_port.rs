@@ -140,7 +140,12 @@ pub fn core_memory_to_legacy(
     };
 
     let (scope, room_id, world_id, session_id) = match &memory.scope {
-        CoreMemoryScope::Owner(_) => (MemoryScope::Private, None, None, None),
+        CoreMemoryScope::Owner(_) => {
+            return Err(LegacyBridgeError::new(
+                LegacyBridgeErrorCode::UnsupportedScope,
+                "legacy MemoryManager has no owner scope and must not coerce it to private",
+            ));
+        }
         CoreMemoryScope::Agent(agent_id) if agent_id == &context.agent_id => {
             (MemoryScope::Private, None, None, None)
         }
@@ -202,7 +207,7 @@ fn legacy_fields_to_core_write(
         MemoryType::Reflection => CoreMemoryKind::Reflection,
     };
     let scope = match legacy_scope {
-        MemoryScope::Private => CoreMemoryScope::owner(agent_id.to_owned()),
+        MemoryScope::Private => CoreMemoryScope::agent(agent_id.to_owned()),
         MemoryScope::Shared => CoreMemoryScope::workspace(
             required_context(world_id, "world ID for shared legacy memory")?.to_owned(),
         ),

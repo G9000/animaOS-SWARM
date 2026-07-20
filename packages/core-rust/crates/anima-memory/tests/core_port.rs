@@ -33,8 +33,8 @@ fn legacy_kinds_and_scopes_map_without_a_reverse_core_dependency() {
         assert_eq!(mapped.kind, core_kind);
     }
 
-    let owner = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Private)).unwrap();
-    assert_eq!(owner.scope, MemoryScope::owner("agent-1").unwrap());
+    let agent = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Private)).unwrap();
+    assert_eq!(agent.scope, MemoryScope::agent("agent-1").unwrap());
     let workspace = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Shared)).unwrap();
     assert_eq!(
         workspace.scope,
@@ -42,6 +42,66 @@ fn legacy_kinds_and_scopes_map_without_a_reverse_core_dependency() {
     );
     let session = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Room)).unwrap();
     assert_eq!(session.scope, MemoryScope::session("session-1").unwrap());
+}
+
+#[test]
+fn legacy_private_scope_round_trips_only_the_exact_agent_identity() {
+    let context = LegacyMemoryContext::new("agent-1", "Ada").unwrap();
+    let write = MemoryWrite::new(
+        "core-agent",
+        MemoryKind::Fact,
+        MemoryScope::agent("agent-1").unwrap(),
+        "content",
+        0.7,
+        MemoryProvenance::new("host", "agent-1", 1).unwrap(),
+    )
+    .unwrap();
+    let legacy = core_memory_to_legacy(&write, &context).unwrap();
+    assert_eq!(legacy.scope, Some(LegacyScope::Private));
+    let stored = Memory {
+        id: "legacy-agent".into(),
+        agent_id: legacy.agent_id,
+        agent_name: legacy.agent_name,
+        memory_type: legacy.memory_type,
+        content: legacy.content,
+        importance: legacy.importance,
+        created_at: 1,
+        tags: legacy.tags,
+        scope: legacy.scope.unwrap(),
+        room_id: legacy.room_id,
+        world_id: legacy.world_id,
+        session_id: legacy.session_id,
+    };
+    assert_eq!(legacy_memory_to_core(&stored).unwrap().scope, write.scope);
+
+    let different_agent = MemoryWrite::new(
+        "core-other",
+        MemoryKind::Fact,
+        MemoryScope::agent("agent-2").unwrap(),
+        "content",
+        0.7,
+        MemoryProvenance::new("host", "agent-2", 1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        core_memory_to_legacy(&different_agent, &context)
+            .unwrap_err()
+            .code,
+        LegacyBridgeErrorCode::UnsupportedScope
+    );
+    let owner = MemoryWrite::new(
+        "core-owner",
+        MemoryKind::Fact,
+        MemoryScope::owner("owner-1").unwrap(),
+        "content",
+        0.7,
+        MemoryProvenance::new("host", "owner-1", 1).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        core_memory_to_legacy(&owner, &context).unwrap_err().code,
+        LegacyBridgeErrorCode::UnsupportedScope
+    );
 }
 
 #[test]

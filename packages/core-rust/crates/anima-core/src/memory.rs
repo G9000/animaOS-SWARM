@@ -24,7 +24,12 @@ pub enum MemoryKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    content = "id",
+    rename_all = "snake_case",
+    try_from = "MemoryScopeWire"
+)]
 pub enum MemoryScope {
     Owner(String),
     Agent(String),
@@ -62,7 +67,7 @@ impl MemoryScope {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryProvenanceWire")]
 pub struct MemoryProvenance {
     pub source: String,
     pub source_identity: String,
@@ -92,7 +97,7 @@ pub enum RetentionPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryRetentionWire")]
 pub struct MemoryRetention {
     pub policy: RetentionPolicy,
     pub deadline_ms: Option<u64>,
@@ -119,10 +124,29 @@ impl MemoryRetention {
             deadline_ms: Some(deadline_ms),
         })
     }
+
+    fn validated(
+        policy: RetentionPolicy,
+        deadline_ms: Option<u64>,
+    ) -> Result<Self, MemoryPortError> {
+        match (policy, deadline_ms) {
+            (RetentionPolicy::Persistent | RetentionPolicy::Ephemeral, None) => Ok(Self {
+                policy,
+                deadline_ms,
+            }),
+            (RetentionPolicy::Deadline, Some(deadline_ms)) if deadline_ms > 0 => Ok(Self {
+                policy,
+                deadline_ms: Some(deadline_ms),
+            }),
+            _ => Err(MemoryPortError::invalid(
+                "retention policy and deadline must be consistent",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryWriteWire")]
 pub struct MemoryWrite {
     pub id: String,
     pub kind: MemoryKind,
@@ -161,7 +185,7 @@ impl MemoryWrite {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryRecordWire")]
 pub struct MemoryRecord {
     pub id: String,
     pub kind: MemoryKind,
@@ -199,15 +223,54 @@ impl MemoryRecord {
             retention: write.retention,
         })
     }
+
+    fn validated(
+        write: MemoryWrite,
+        revision: u64,
+        supersedes: Vec<String>,
+        corrects: Option<String>,
+        forgotten_at_ms: Option<u64>,
+        forget_reason: Option<String>,
+    ) -> Result<Self, MemoryPortError> {
+        let mut record = Self::from_write(write, revision)?;
+        record.supersedes = bounded_ids(supersedes, "superseded memory ID")?;
+        record.corrects = corrects
+            .map(|id| required(id, "corrected memory ID"))
+            .transpose()?;
+        if record
+            .corrects
+            .as_ref()
+            .is_some_and(|id| !record.supersedes.contains(id))
+        {
+            return Err(MemoryPortError::invalid(
+                "corrected memory must be superseded",
+            ));
+        }
+        match (forgotten_at_ms, forget_reason) {
+            (Some(timestamp), Some(reason)) => {
+                record.forgotten_at_ms = Some(timestamp);
+                record.forget_reason =
+                    Some(bounded(reason, "forget reason", MAX_EXPLANATION_BYTES)?);
+            }
+            (None, None) => {}
+            _ => {
+                return Err(MemoryPortError::invalid(
+                    "forgotten timestamp and reason must be paired",
+                ))
+            }
+        }
+        Ok(record)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryRevisionWire")]
 pub struct MemoryRevision {
     pub memory_id: String,
     pub expected_revision: u64,
     pub supersedes: Vec<String>,
     pub corrects: Option<String>,
+    pub correction_reason: Option<String>,
     pub forget_reason: Option<String>,
 }
 
@@ -217,11 +280,18 @@ impl MemoryRevision {
         expected_revision: u64,
         supersedes: Vec<String>,
     ) -> Result<Self, MemoryPortError> {
+        let supersedes = bounded_ids(supersedes, "superseded memory ID")?;
+        if supersedes.is_empty() {
+            return Err(MemoryPortError::invalid(
+                "supersession requires at least one superseded memory",
+            ));
+        }
         Ok(Self {
             memory_id: required(memory_id.into(), "memory ID")?,
             expected_revision: validated_expected_revision(expected_revision)?,
-            supersedes: bounded_ids(supersedes, "superseded memory ID")?,
+            supersedes,
             corrects: None,
+            correction_reason: None,
             forget_reason: None,
         })
     }
@@ -230,12 +300,17 @@ impl MemoryRevision {
         memory_id: impl Into<String>,
         expected_revision: u64,
         corrects: impl Into<String>,
-        _reason: impl Into<String>,
+        reason: impl Into<String>,
     ) -> Result<Self, MemoryPortError> {
         let corrects = required(corrects.into(), "corrected memory ID")?;
         let mut revision =
             Self::supersession(memory_id, expected_revision, vec![corrects.clone()])?;
         revision.corrects = Some(corrects);
+        revision.correction_reason = Some(bounded(
+            reason.into(),
+            "correction reason",
+            MAX_EXPLANATION_BYTES,
+        )?);
         Ok(revision)
     }
 
@@ -249,6 +324,7 @@ impl MemoryRevision {
             expected_revision: validated_expected_revision(expected_revision)?,
             supersedes: Vec::new(),
             corrects: None,
+            correction_reason: None,
             forget_reason: Some(bounded(
                 reason.into(),
                 "forget reason",
@@ -256,10 +332,44 @@ impl MemoryRevision {
             )?),
         })
     }
+
+    fn validated(
+        memory_id: String,
+        expected_revision: u64,
+        supersedes: Vec<String>,
+        corrects: Option<String>,
+        correction_reason: Option<String>,
+        forget_reason: Option<String>,
+    ) -> Result<Self, MemoryPortError> {
+        if let Some(reason) = forget_reason {
+            if !supersedes.is_empty() || corrects.is_some() || correction_reason.is_some() {
+                return Err(MemoryPortError::invalid(
+                    "forget revisions cannot also supersede or correct",
+                ));
+            }
+            return Self::forget(memory_id, expected_revision, reason);
+        }
+        match (corrects, correction_reason) {
+            (Some(corrects), Some(reason)) => {
+                let revision =
+                    Self::correction(memory_id, expected_revision, corrects.clone(), reason)?;
+                if supersedes != vec![corrects] {
+                    return Err(MemoryPortError::invalid(
+                        "correction must supersede exactly the corrected memory",
+                    ));
+                }
+                Ok(revision)
+            }
+            (None, None) => Self::supersession(memory_id, expected_revision, supersedes),
+            _ => Err(MemoryPortError::invalid(
+                "correction ID and reason must be paired",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryQueryWire")]
 pub struct MemoryQuery {
     pub text: String,
     pub authorized_scopes: Vec<MemoryScope>,
@@ -297,7 +407,7 @@ impl MemoryQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "MemoryHitWire")]
 pub struct MemoryHit {
     pub record: MemoryRecord,
     pub score: f64,
@@ -363,6 +473,182 @@ impl fmt::Display for MemoryPortError {
 }
 
 impl std::error::Error for MemoryPortError {}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+enum MemoryScopeWire {
+    Owner(String),
+    Agent(String),
+    Session(String),
+    Workspace(String),
+}
+
+impl TryFrom<MemoryScopeWire> for MemoryScope {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryScopeWire) -> Result<Self, Self::Error> {
+        match value {
+            MemoryScopeWire::Owner(id) => Self::owner(id),
+            MemoryScopeWire::Agent(id) => Self::agent(id),
+            MemoryScopeWire::Session(id) => Self::session(id),
+            MemoryScopeWire::Workspace(id) => Self::workspace(id),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryProvenanceWire {
+    source: String,
+    source_identity: String,
+    observed_at_ms: u64,
+}
+
+impl TryFrom<MemoryProvenanceWire> for MemoryProvenance {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryProvenanceWire) -> Result<Self, Self::Error> {
+        Self::new(value.source, value.source_identity, value.observed_at_ms)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRetentionWire {
+    policy: RetentionPolicy,
+    deadline_ms: Option<u64>,
+}
+
+impl TryFrom<MemoryRetentionWire> for MemoryRetention {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryRetentionWire) -> Result<Self, Self::Error> {
+        Self::validated(value.policy, value.deadline_ms)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryWriteWire {
+    id: String,
+    kind: MemoryKind,
+    scope: MemoryScope,
+    content: String,
+    confidence: f64,
+    provenance: MemoryProvenance,
+    #[serde(default)]
+    retention: MemoryRetention,
+}
+
+impl TryFrom<MemoryWriteWire> for MemoryWrite {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryWriteWire) -> Result<Self, Self::Error> {
+        let mut write = Self::new(
+            value.id,
+            value.kind,
+            value.scope,
+            value.content,
+            value.confidence,
+            value.provenance,
+        )?;
+        write.retention =
+            MemoryRetention::validated(value.retention.policy, value.retention.deadline_ms)?;
+        Ok(write)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRecordWire {
+    id: String,
+    kind: MemoryKind,
+    scope: MemoryScope,
+    content: String,
+    confidence: f64,
+    provenance: MemoryProvenance,
+    revision: u64,
+    supersedes: Vec<String>,
+    corrects: Option<String>,
+    forgotten_at_ms: Option<u64>,
+    forget_reason: Option<String>,
+    retention: MemoryRetention,
+}
+
+impl TryFrom<MemoryRecordWire> for MemoryRecord {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryRecordWire) -> Result<Self, Self::Error> {
+        let mut write = MemoryWrite::new(
+            value.id,
+            value.kind,
+            value.scope,
+            value.content,
+            value.confidence,
+            value.provenance,
+        )?;
+        write.retention = value.retention;
+        Self::validated(
+            write,
+            value.revision,
+            value.supersedes,
+            value.corrects,
+            value.forgotten_at_ms,
+            value.forget_reason,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryRevisionWire {
+    memory_id: String,
+    expected_revision: u64,
+    supersedes: Vec<String>,
+    corrects: Option<String>,
+    #[serde(default)]
+    correction_reason: Option<String>,
+    forget_reason: Option<String>,
+}
+
+impl TryFrom<MemoryRevisionWire> for MemoryRevision {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryRevisionWire) -> Result<Self, Self::Error> {
+        Self::validated(
+            value.memory_id,
+            value.expected_revision,
+            value.supersedes,
+            value.corrects,
+            value.correction_reason,
+            value.forget_reason,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryQueryWire {
+    text: String,
+    authorized_scopes: Vec<MemoryScope>,
+    limit: usize,
+}
+
+impl TryFrom<MemoryQueryWire> for MemoryQuery {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryQueryWire) -> Result<Self, Self::Error> {
+        Self::new(value.text, value.authorized_scopes, value.limit)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryHitWire {
+    record: MemoryRecord,
+    score: f64,
+    explanation: String,
+}
+
+impl TryFrom<MemoryHitWire> for MemoryHit {
+    type Error = MemoryPortError;
+    fn try_from(value: MemoryHitWire) -> Result<Self, Self::Error> {
+        Self::new(value.record, value.score, value.explanation)
+    }
+}
 
 #[async_trait]
 pub trait MemoryPort: Send + Sync {

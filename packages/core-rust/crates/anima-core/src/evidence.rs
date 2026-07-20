@@ -13,7 +13,7 @@ const MAX_LOCATOR_BYTES: usize = 4 * 1024;
 const MAX_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "DocumentWire")]
 pub struct Document {
     pub id: String,
     pub scope: MemoryScope,
@@ -41,7 +41,7 @@ impl Document {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "DocumentChunkWire")]
 pub struct DocumentChunk {
     pub id: String,
     pub scope: MemoryScope,
@@ -76,7 +76,7 @@ impl DocumentChunk {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "CitationWire")]
 pub struct Citation {
     pub document_id: String,
     pub chunk_id: Option<String>,
@@ -100,7 +100,7 @@ impl Citation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ArtifactWire")]
 pub struct Artifact {
     pub id: String,
     pub scope: MemoryScope,
@@ -128,7 +128,7 @@ impl Artifact {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ArtifactWriteWire")]
 pub struct ArtifactWrite {
     pub id: String,
     pub scope: MemoryScope,
@@ -175,7 +175,7 @@ impl Evidence {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RetrievalQueryWire")]
 pub struct RetrievalQuery {
     pub text: String,
     pub authorized_scopes: Vec<MemoryScope>,
@@ -215,7 +215,7 @@ impl RetrievalQuery {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RetrievalHitWire")]
 pub struct RetrievalHit {
     pub evidence: Evidence,
     pub score: f64,
@@ -285,6 +285,146 @@ impl fmt::Display for EvidencePortError {
     }
 }
 impl std::error::Error for EvidencePortError {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentWire {
+    id: String,
+    scope: MemoryScope,
+    title: String,
+    content_sha256: String,
+    provenance: MemoryProvenance,
+}
+impl TryFrom<DocumentWire> for Document {
+    type Error = EvidencePortError;
+    fn try_from(value: DocumentWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.id,
+            value.scope,
+            value.title,
+            value.content_sha256,
+            value.provenance,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentChunkWire {
+    id: String,
+    scope: MemoryScope,
+    document_id: String,
+    index: u32,
+    content: String,
+    content_sha256: String,
+    locator: String,
+}
+impl TryFrom<DocumentChunkWire> for DocumentChunk {
+    type Error = EvidencePortError;
+    fn try_from(value: DocumentChunkWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.id,
+            value.scope,
+            value.document_id,
+            value.index,
+            value.content,
+            value.content_sha256,
+            value.locator,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CitationWire {
+    document_id: String,
+    chunk_id: Option<String>,
+    locator: String,
+}
+impl TryFrom<CitationWire> for Citation {
+    type Error = EvidencePortError;
+    fn try_from(value: CitationWire) -> Result<Self, Self::Error> {
+        Self::new(value.document_id, value.chunk_id, value.locator)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactWire {
+    id: String,
+    scope: MemoryScope,
+    name: String,
+    content_sha256: String,
+    provenance: MemoryProvenance,
+}
+impl TryFrom<ArtifactWire> for Artifact {
+    type Error = EvidencePortError;
+    fn try_from(value: ArtifactWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.id,
+            value.scope,
+            value.name,
+            value.content_sha256,
+            value.provenance,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArtifactWriteWire {
+    id: String,
+    scope: MemoryScope,
+    name: String,
+    content_sha256: String,
+    provenance: MemoryProvenance,
+}
+impl TryFrom<ArtifactWriteWire> for ArtifactWrite {
+    type Error = EvidencePortError;
+    fn try_from(value: ArtifactWriteWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.id,
+            value.scope,
+            value.name,
+            value.content_sha256,
+            value.provenance,
+        )
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetrievalQueryWire {
+    text: String,
+    authorized_scopes: Vec<MemoryScope>,
+    limit: usize,
+}
+impl TryFrom<RetrievalQueryWire> for RetrievalQuery {
+    type Error = EvidencePortError;
+    fn try_from(value: RetrievalQueryWire) -> Result<Self, Self::Error> {
+        Self::new(value.text, value.authorized_scopes, value.limit)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetrievalHitWire {
+    evidence: Evidence,
+    score: f64,
+    explanation: String,
+    citations: Vec<Citation>,
+}
+impl TryFrom<RetrievalHitWire> for RetrievalHit {
+    type Error = EvidencePortError;
+    fn try_from(value: RetrievalHitWire) -> Result<Self, Self::Error> {
+        Self::new(
+            value.evidence,
+            value.score,
+            value.explanation,
+            value.citations,
+        )
+    }
+}
 
 #[async_trait]
 pub trait DocumentPort: Send + Sync {
