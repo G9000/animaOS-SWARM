@@ -1702,15 +1702,9 @@ fn valid_command_transition(
         }
         super::RuntimeCommandKind::Cancel => {
             approval.is_none()
-                && match current.state() {
-                    RunState::Running => current
-                        .transition(RunState::Cancelled, None)
-                        .is_ok_and(|expected| &expected == target),
-                    RunState::RecoveryRequired => current
-                        .resolve_recovery_terminal(super::RecoveryTerminalResolution::Cancel)
-                        .is_ok_and(|expected| expected.run() == target),
-                    _ => false,
-                }
+                && current
+                    .cancel_at_boundary()
+                    .is_ok_and(|expected| &expected == target)
         }
     }
 }

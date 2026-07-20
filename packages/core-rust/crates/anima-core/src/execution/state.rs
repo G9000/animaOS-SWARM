@@ -621,6 +621,42 @@ impl Run {
             adopted_result_ref,
         })
     }
+
+    /// Applies a cancellation request at a durable engine boundary while clearing
+    /// state-specific approval or recovery prerequisites through their typed paths.
+    pub fn cancel_at_boundary(&self) -> Result<Self, ExecutionError> {
+        match self.state {
+            RunState::Running => self.transition(RunState::Cancelled, None),
+            RunState::WaitingForApproval => Self::from_parts(
+                self.id,
+                self.session_id,
+                self.definition_id.clone(),
+                self.definition_version,
+                RunState::Cancelled,
+                None,
+                None,
+                None,
+                None,
+            ),
+            RunState::RecoveryRequired => self
+                .resolve_recovery_terminal(RecoveryTerminalResolution::Cancel)
+                .map(|outcome| outcome.run().clone()),
+            RunState::Paused if self.pause_reason == Some(RunPauseReason::PolicyDenied) => {
+                Self::from_parts(
+                    self.id,
+                    self.session_id,
+                    self.definition_id.clone(),
+                    self.definition_version,
+                    RunState::Cancelled,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            _ => Err(ExecutionError::new(ExecutionErrorCode::IllegalTransition)),
+        }
+    }
     /// A host records control intent while work is active, then calls this at a safe boundary.
     pub fn request_pause_or_cancel(
         &self,

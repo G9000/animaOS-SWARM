@@ -10,8 +10,9 @@ mod store;
 pub use checkpoint::{
     AttemptRecordState, CheckpointCursor, CheckpointV1, CheckpointV1Builder,
     CompletedInvocationRecord, DefinitionPin, InvocationAttemptRecord, ManifestPin,
-    OpaqueReference, PendingApprovalRecord, RecoveryPauseReason, RecoveryPauseRecord,
-    RecoveryRecord, UncertainInvocationRecord,
+    OpaqueReference, PendingApprovalRecord, ProviderContent, ProviderStopReason, ProviderToolCall,
+    ProviderTranscriptEntry, RecoveryPauseReason, RecoveryPauseRecord, RecoveryRecord,
+    UncertainInvocationRecord,
 };
 pub use event::{LiveRuntimeEvent, RuntimeEvent, RuntimeEventKind, SafeEventPayload};
 pub use memory_store::{InMemoryExecutionStore, ManualExecutionClock};

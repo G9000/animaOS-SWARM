@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -17,8 +17,9 @@ use crate::{
     DurableResultMutation, ExecutionClock, ExecutionStep, ExecutionStore, InvocationAttemptRecord,
     LogicalInvocation, ManifestPin, Message, MessageRole, ModelAdapter, ModelGenerateRequest,
     ModelGenerateResponse, ModelStreamFrame, ModelStreamSink, OpaqueReference,
-    PendingApprovalRecord, PolicyContext, PolicyDecision, PolicyEngine, RecoveryAction, Run,
-    RunState, RuntimeCommand, RuntimeEvent, RuntimeEventKind, StepKind, ToolCall, Usage,
+    PendingApprovalRecord, PolicyContext, PolicyDecision, PolicyEngine, ProviderTranscriptEntry,
+    RecoveryAction, Run, RunState, RuntimeCommand, RuntimeEvent, RuntimeEventKind, StepKind,
+    TokenUsage, ToolCall, Usage,
 };
 
 const ENGINE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x8d6d_9262_9e34_5b79_8ff0_89c1_240c_b241);
@@ -544,24 +545,24 @@ where
         ) {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
-        match signal.at_boundary() {
-            EngineBoundaryAction::Continue => {}
-            EngineBoundaryAction::Pause => {
-                return self
-                    .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
-                    .await
-            }
-            EngineBoundaryAction::Cancel => {
-                return self
-                    .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
-                    .await
-            }
+        if let Some(outcome) = self
+            .observe_control_boundary(
+                signal,
+                owner_id,
+                &current,
+                &lease,
+                checkpoint_version,
+                &checkpoint,
+            )
+            .await?
+        {
+            return Ok(outcome);
         }
 
         if current.run().state() == RunState::RecoveryRequired {
             return Ok(EngineRunOutcome::RecoveryRequired);
         }
-        let mut messages = Vec::new();
+        let mut messages = provider_transcript_messages(&checkpoint, &definition)?;
         if let Some(active) = checkpoint.attempts().iter().find(|attempt| {
             matches!(
                 attempt.state(),
@@ -584,6 +585,7 @@ where
                     checkpoint_version,
                     checkpoint,
                     tool_call,
+                    signal,
                 )
                 .await?;
             let CapabilityStepOutcome::Committed(executed) = executed else {
@@ -596,7 +598,20 @@ where
             lease = executed.1;
             checkpoint_version = executed.2;
             checkpoint = executed.3;
-            messages.push(executed.4);
+            messages = provider_transcript_messages(&checkpoint, &definition)?;
+            if let Some(outcome) = self
+                .observe_control_boundary(
+                    signal,
+                    owner_id,
+                    &current,
+                    &lease,
+                    checkpoint_version,
+                    &checkpoint,
+                )
+                .await?
+            {
+                return Ok(outcome);
+            }
             match current.run().state() {
                 RunState::WaitingForApproval => return Ok(EngineRunOutcome::WaitingForApproval),
                 RunState::RecoveryRequired => return Ok(EngineRunOutcome::RecoveryRequired),
@@ -609,162 +624,165 @@ where
                 RunState::Running => {}
                 _ => return Err(EngineError::new(EngineErrorCode::InvalidState)),
             }
-            match signal.at_boundary() {
-                EngineBoundaryAction::Continue => {}
-                EngineBoundaryAction::Pause => {
-                    return self
-                        .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
-                        .await
-                }
-                EngineBoundaryAction::Cancel => {
-                    return self
-                        .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
-                        .await
-                }
-            }
         } else if current.run().state() == RunState::WaitingForApproval {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
+        let mut resumed_response = pending_provider_response(&checkpoint)?;
         let response = loop {
-            if checkpoint
-                .budget()
-                .max_turns()
-                .is_some_and(|maximum| checkpoint.usage().turns() >= maximum)
-            {
-                return self
-                    .pause_for_budget(owner_id, current, lease, checkpoint_version, &checkpoint)
-                    .await;
-            }
-            {
-                let started_sequence = checkpoint.last_durable_event_sequence() + 1;
-                let started_event = self.event(
-                    owner_id,
-                    current.run(),
-                    started_sequence,
-                    RuntimeEventKind::ModelStarted,
-                )?;
-                checkpoint = self.rebuild_checkpoint(
-                    &checkpoint,
-                    started_sequence,
-                    RunState::Running,
-                    checkpoint.usage().clone(),
-                )?;
-                let started = self
-                    .store
-                    .commit_execution(
+            let response = if let Some(response) = resumed_response.take() {
+                response
+            } else {
+                if checkpoint
+                    .budget()
+                    .max_turns()
+                    .is_some_and(|maximum| checkpoint.usage().turns() >= maximum)
+                {
+                    return self
+                        .pause_for_budget(owner_id, current, lease, checkpoint_version, &checkpoint)
+                        .await;
+                }
+                {
+                    let started_sequence = checkpoint.last_durable_event_sequence() + 1;
+                    let started_event = self.event(
                         owner_id,
-                        crate::ExecutionCommit::new(
-                            current.run_version(),
-                            checkpoint_version,
-                            lease.clone(),
-                            RuntimeCommand::record_progress(
-                                deterministic_id(run_id, "model-started", started_sequence),
-                                current.run().session_id(),
-                                run_id,
+                        current.run(),
+                        started_sequence,
+                        RuntimeEventKind::ModelStarted,
+                    )?;
+                    checkpoint = self.rebuild_checkpoint(
+                        &checkpoint,
+                        started_sequence,
+                        RunState::Running,
+                        checkpoint.usage().clone(),
+                    )?;
+                    let started = self
+                        .store
+                        .commit_execution(
+                            owner_id,
+                            crate::ExecutionCommit::new(
+                                current.run_version(),
+                                checkpoint_version,
+                                lease.clone(),
+                                RuntimeCommand::record_progress(
+                                    deterministic_id(run_id, "model-started", started_sequence),
+                                    current.run().session_id(),
+                                    run_id,
+                                )
+                                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                                vec![started_event],
+                                vec![],
+                                vec![],
+                                vec![],
+                                None,
+                                current.run().clone(),
                             )
-                            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
-                            vec![started_event],
-                            vec![],
-                            vec![],
-                            vec![],
-                            None,
-                            current.run().clone(),
+                            .with_checkpoint(checkpoint.clone()),
                         )
-                        .with_checkpoint(checkpoint.clone()),
-                    )
-                    .await
-                    .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
-                self.emit_semantic(run_id, started_sequence, RuntimeEventKind::ModelStarted)
-                    .await;
-                current = started.stored_run().clone();
-                checkpoint_version = started.checkpoint_version();
-                lease = self.renew(owner_id, lease).await?;
-            }
+                        .await
+                        .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
+                    self.emit_semantic(run_id, started_sequence, RuntimeEventKind::ModelStarted)
+                        .await;
+                    current = started.stored_run().clone();
+                    checkpoint_version = started.checkpoint_version();
+                    lease = self.renew(owner_id, lease).await?;
+                }
 
-            let collector = EngineModelSink {
-                run_id,
-                live: self.live.as_ref(),
-                final_response: Mutex::new(None),
-            };
-            let model_request = ModelGenerateRequest {
-                system: definition.system.clone(),
-                messages: messages.clone(),
-                temperature: definition.model.temperature,
-                max_tokens: None,
-            };
-            let (stream_result, renewed) = self
-                .await_with_lease_heartbeat(
-                    owner_id,
-                    lease,
-                    self.model.stream(
-                        &agent_config(&definition, &manifests),
-                        &model_request,
-                        &collector,
-                    ),
-                )
-                .await?;
-            lease = renewed;
-            stream_result.map_err(|_| EngineError::new(EngineErrorCode::Model))?;
-            let response = collector
-                .final_response
-                .into_inner()
-                .map_err(|_| EngineError::new(EngineErrorCode::Model))?
-                .ok_or_else(|| EngineError::new(EngineErrorCode::Model))?;
-            {
-                let usage = checkpoint
-                    .usage()
-                    .checked_add(&Usage {
-                        turns: 1,
-                        input_tokens: response.usage.prompt_tokens,
-                        output_tokens: response.usage.completion_tokens,
-                        total_tokens: response.usage.total_tokens,
-                        ..Usage::default()
-                    })
-                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
-                let completed_sequence = checkpoint.last_durable_event_sequence() + 1;
-                let model_completed = self.event(
-                    owner_id,
-                    current.run(),
-                    completed_sequence,
-                    RuntimeEventKind::ModelCompleted,
-                )?;
-                checkpoint = self.rebuild_checkpoint(
-                    &checkpoint,
-                    completed_sequence,
-                    RunState::Running,
-                    usage,
-                )?;
-                let recorded = self
-                    .store
-                    .commit_execution(
+                let collector = EngineModelSink {
+                    run_id,
+                    live: self.live.as_ref(),
+                    final_response: Mutex::new(None),
+                };
+                let model_request = ModelGenerateRequest {
+                    system: definition.system.clone(),
+                    messages: messages.clone(),
+                    temperature: definition.model.temperature,
+                    max_tokens: None,
+                };
+                let (stream_result, renewed) = self
+                    .await_with_lease_heartbeat(
                         owner_id,
-                        crate::ExecutionCommit::new(
-                            current.run_version(),
-                            checkpoint_version,
-                            lease.clone(),
-                            RuntimeCommand::record_progress(
-                                deterministic_id(run_id, "model-completed", completed_sequence),
-                                current.run().session_id(),
-                                run_id,
-                            )
-                            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
-                            vec![model_completed],
-                            vec![],
-                            vec![],
-                            vec![],
-                            None,
-                            current.run().clone(),
-                        )
-                        .with_checkpoint(checkpoint.clone()),
+                        lease,
+                        self.model.stream(
+                            &agent_config(&definition, &manifests),
+                            &model_request,
+                            &collector,
+                        ),
                     )
-                    .await
-                    .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
-                self.emit_semantic(run_id, completed_sequence, RuntimeEventKind::ModelCompleted)
+                    .await?;
+                lease = renewed;
+                stream_result.map_err(|_| EngineError::new(EngineErrorCode::Model))?;
+                let response = collector
+                    .final_response
+                    .into_inner()
+                    .map_err(|_| EngineError::new(EngineErrorCode::Model))?
+                    .ok_or_else(|| EngineError::new(EngineErrorCode::Model))?;
+                {
+                    let usage = checkpoint
+                        .usage()
+                        .checked_add(&Usage {
+                            turns: 1,
+                            input_tokens: response.usage.prompt_tokens,
+                            output_tokens: response.usage.completion_tokens,
+                            total_tokens: response.usage.total_tokens,
+                            ..Usage::default()
+                        })
+                        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+                    let completed_sequence = checkpoint.last_durable_event_sequence() + 1;
+                    let model_completed = self.event(
+                        owner_id,
+                        current.run(),
+                        completed_sequence,
+                        RuntimeEventKind::ModelCompleted,
+                    )?;
+                    let mut provider_transcript = checkpoint.provider_transcript().to_vec();
+                    provider_transcript.push(
+                        ProviderTranscriptEntry::from_model_response(&response)
+                            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                    );
+                    checkpoint = self.rebuild_checkpoint_with_provider_transcript(
+                        &checkpoint,
+                        completed_sequence,
+                        RunState::Running,
+                        usage,
+                        provider_transcript,
+                    )?;
+                    let recorded = self
+                        .store
+                        .commit_execution(
+                            owner_id,
+                            crate::ExecutionCommit::new(
+                                current.run_version(),
+                                checkpoint_version,
+                                lease.clone(),
+                                RuntimeCommand::record_progress(
+                                    deterministic_id(run_id, "model-completed", completed_sequence),
+                                    current.run().session_id(),
+                                    run_id,
+                                )
+                                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                                vec![model_completed],
+                                vec![],
+                                vec![],
+                                vec![],
+                                None,
+                                current.run().clone(),
+                            )
+                            .with_checkpoint(checkpoint.clone()),
+                        )
+                        .await
+                        .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
+                    self.emit_semantic(
+                        run_id,
+                        completed_sequence,
+                        RuntimeEventKind::ModelCompleted,
+                    )
                     .await;
-                current = recorded.stored_run().clone();
-                checkpoint_version = recorded.checkpoint_version();
-                lease = self.renew(owner_id, lease).await?;
-            }
+                    current = recorded.stored_run().clone();
+                    checkpoint_version = recorded.checkpoint_version();
+                    lease = self.renew(owner_id, lease).await?;
+                }
+                response
+            };
 
             match signal.at_boundary() {
                 EngineBoundaryAction::Continue => {}
@@ -784,13 +802,8 @@ where
             if tool_calls.is_empty() {
                 break response;
             }
-            messages.push(assistant_tool_call_message(
-                &definition,
-                current.run().session_id(),
-                self.clock.now_ms(),
-                &tool_calls,
-            ));
-            for tool_call in tool_calls {
+            messages = provider_transcript_messages(&checkpoint, &definition)?;
+            for tool_call in pending_provider_tool_calls(&checkpoint, &tool_calls)? {
                 let executed = self
                     .execute_capability(
                         owner_id,
@@ -800,6 +813,7 @@ where
                         checkpoint_version,
                         checkpoint,
                         tool_call,
+                        signal,
                     )
                     .await?;
                 let CapabilityStepOutcome::Committed(executed) = executed else {
@@ -812,7 +826,20 @@ where
                 lease = executed.1;
                 checkpoint_version = executed.2;
                 checkpoint = executed.3;
-                messages.push(executed.4);
+                messages = provider_transcript_messages(&checkpoint, &definition)?;
+                if let Some(outcome) = self
+                    .observe_control_boundary(
+                        signal,
+                        owner_id,
+                        &current,
+                        &lease,
+                        checkpoint_version,
+                        &checkpoint,
+                    )
+                    .await?
+                {
+                    return Ok(outcome);
+                }
                 match current.run().state() {
                     RunState::WaitingForApproval => {
                         return Ok(EngineRunOutcome::WaitingForApproval)
@@ -825,19 +852,6 @@ where
                         return Ok(EngineRunOutcome::Denied)
                     }
                     _ => {}
-                }
-                match signal.at_boundary() {
-                    EngineBoundaryAction::Continue => {}
-                    EngineBoundaryAction::Pause => {
-                        return self
-                            .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
-                            .await
-                    }
-                    EngineBoundaryAction::Cancel => {
-                        return self
-                            .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
-                            .await
-                    }
                 }
             }
             match signal.at_boundary() {
@@ -906,6 +920,7 @@ where
         checkpoint_version: u64,
         checkpoint: CheckpointV1,
         tool_call: ToolCall,
+        signal: &dyn EngineControlSignal,
     ) -> Result<CapabilityStepOutcome, EngineError> {
         let pin = definition
             .resolved_capabilities
@@ -955,6 +970,7 @@ where
                     tool_call,
                     manifest,
                     attempt_number,
+                    signal,
                 )
                 .await;
         }
@@ -966,6 +982,19 @@ where
             pending_approval: current.run().pending_approval().cloned(),
         };
         let first = self.policy.resolve(request()).await?;
+        if let Some(outcome) = self
+            .observe_control_boundary(
+                signal,
+                owner_id,
+                &current,
+                &lease,
+                checkpoint_version,
+                &checkpoint,
+            )
+            .await?
+        {
+            return Ok(CapabilityStepOutcome::Adopted(outcome));
+        }
         let first_evaluation =
             PolicyEngine::evaluate_with_approval(first.context(), first.grants(), first.approval())
                 .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
@@ -1093,6 +1122,7 @@ where
                 PendingApprovalRecord::new(approval_request.clone(), None)
                     .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
             ))
+            .provider_transcript(checkpoint.provider_transcript().to_vec())
             .message_context_refs(checkpoint.message_context_refs().to_vec())
             .model_context_refs(checkpoint.model_context_refs().to_vec())
             .memory_refs(checkpoint.memory_refs().to_vec())
@@ -1388,7 +1418,13 @@ where
                 ) =>
             {
                 return self
-                    .adopt_dispatch_conflict(owner_id, definition, current.run().id())
+                    .adopt_dispatch_conflict(
+                        owner_id,
+                        definition,
+                        current.run().id(),
+                        &lease,
+                        signal,
+                    )
                     .await
             }
             Err(_) => return Err(EngineError::new(EngineErrorCode::Store)),
@@ -1453,6 +1489,7 @@ where
         tool_call: ToolCall,
         manifest: CapabilityManifest,
         attempt_number: u32,
+        signal: &dyn EngineControlSignal,
     ) -> Result<CapabilityStepOutcome, EngineError> {
         let lease = self.renew(owner_id, lease).await?;
         let attempt = CapabilityAttempt::new(&invocation, attempt_number)
@@ -1497,6 +1534,19 @@ where
                 .await
                 .map(CapabilityStepOutcome::committed),
             RecoveryAction::RetrySameKey { authorization, .. } => {
+                if let Some(outcome) = self
+                    .observe_control_boundary(
+                        signal,
+                        owner_id,
+                        &current,
+                        &lease,
+                        checkpoint_version,
+                        &checkpoint,
+                    )
+                    .await?
+                {
+                    return Ok(CapabilityStepOutcome::Adopted(outcome));
+                }
                 let retry_attempt_number = authorization.resume_binding().retry_attempt_number();
                 if retry_attempt_number != attempt_number.saturating_add(1) {
                     return Err(EngineError::new(EngineErrorCode::Capability));
@@ -1624,6 +1674,7 @@ where
                 .completed_invocations(checkpoint.completed_invocations().to_vec())
                 .uncertain_invocations(uncertain_invocations)
                 .pending_approval(None)
+                .provider_transcript(checkpoint.provider_transcript().to_vec())
                 .message_context_refs(checkpoint.message_context_refs().to_vec())
                 .model_context_refs(checkpoint.model_context_refs().to_vec())
                 .memory_refs(checkpoint.memory_refs().to_vec())
@@ -1696,7 +1747,13 @@ where
                         ) =>
                     {
                         return self
-                            .adopt_dispatch_conflict(owner_id, definition, current.run().id())
+                            .adopt_dispatch_conflict(
+                                owner_id,
+                                definition,
+                                current.run().id(),
+                                &lease,
+                                signal,
+                            )
                             .await
                     }
                     Err(_) => return Err(EngineError::new(EngineErrorCode::Store)),
@@ -1862,6 +1919,7 @@ where
         .attempts(attempts)
         .completed_invocations(checkpoint.completed_invocations().to_vec())
         .uncertain_invocations(uncertain_invocations)
+        .provider_transcript(checkpoint.provider_transcript().to_vec())
         .message_context_refs(checkpoint.message_context_refs().to_vec())
         .model_context_refs(checkpoint.model_context_refs().to_vec())
         .memory_refs(checkpoint.memory_refs().to_vec())
@@ -2025,6 +2083,7 @@ where
         .completed_invocations(checkpoint.completed_invocations().to_vec())
         .uncertain_invocations(uncertain_invocations)
         .pending_approval(None)
+        .provider_transcript(checkpoint.provider_transcript().to_vec())
         .message_context_refs(checkpoint.message_context_refs().to_vec())
         .model_context_refs(checkpoint.model_context_refs().to_vec())
         .memory_refs(checkpoint.memory_refs().to_vec())
@@ -2173,7 +2232,28 @@ where
                 ..Usage::default()
             })
             .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
-        let completed_checkpoint = self.rebuild_checkpoint_with_history(
+        let message = Message {
+            id: format!("tool:{}", invocation.id()),
+            agent_id: definition.id.clone(),
+            room_id: current.run().session_id().to_string(),
+            content: Content {
+                text: serde_json::to_string(&result.output.output)
+                    .map_err(|_| EngineError::new(EngineErrorCode::Capability))?,
+                attachments: None,
+                metadata: tool_result_content(invocation.logical_step_id()).metadata,
+            },
+            role: MessageRole::Tool,
+            created_at_ms: self.clock.now_ms(),
+        };
+        let mut provider_transcript = dispatch_checkpoint.provider_transcript().to_vec();
+        provider_transcript.push(
+            ProviderTranscriptEntry::capability_result(
+                invocation.logical_step_id(),
+                &message.content,
+            )
+            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+        );
+        let completed_checkpoint = self.rebuild_checkpoint_with_history_and_provider_transcript(
             &dispatch_checkpoint,
             completed_sequence,
             usage,
@@ -2183,6 +2263,7 @@ where
                 CheckpointCursor::new(invocation.id(), attempt_number, tool_call.id.clone())
                     .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
             ),
+            provider_transcript,
         )?;
         let recorded = self
             .store
@@ -2224,19 +2305,6 @@ where
             .await;
         }
         let renewed = self.renew(owner_id, lease).await?;
-        let message = Message {
-            id: format!("tool:{}", invocation.id()),
-            agent_id: definition.id.clone(),
-            room_id: current.run().session_id().to_string(),
-            content: Content {
-                text: serde_json::to_string(&result.output.output)
-                    .map_err(|_| EngineError::new(EngineErrorCode::Capability))?,
-                attachments: None,
-                metadata: tool_result_content(invocation.logical_step_id()).metadata,
-            },
-            role: MessageRole::Tool,
-            created_at_ms: self.clock.now_ms(),
-        };
         Ok((
             recorded.stored_run().clone(),
             renewed,
@@ -2251,6 +2319,8 @@ where
         owner_id: Uuid,
         definition: &AgentDefinition,
         run_id: Uuid,
+        lease: &crate::ExecutionLease,
+        signal: &dyn EngineControlSignal,
     ) -> Result<CapabilityStepOutcome, EngineError> {
         let stored = self
             .store
@@ -2258,7 +2328,7 @@ where
             .await
             .map_err(|_| EngineError::new(EngineErrorCode::Store))?
             .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
-        let (_, checkpoint) = self
+        let (checkpoint_version, checkpoint) = self
             .store
             .load_checkpoint(owner_id, run_id)
             .await
@@ -2283,7 +2353,18 @@ where
         {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
-        Ok(CapabilityStepOutcome::Adopted(EngineRunOutcome::Denied))
+        let outcome = self
+            .observe_control_boundary(
+                signal,
+                owner_id,
+                &stored,
+                lease,
+                checkpoint_version,
+                &checkpoint,
+            )
+            .await?
+            .unwrap_or(EngineRunOutcome::Denied);
+        Ok(CapabilityStepOutcome::Adopted(outcome))
     }
 
     async fn await_with_lease_heartbeat<T, F>(
@@ -2364,6 +2445,42 @@ where
         self.rebuild_checkpoint_for_state(checkpoint, sequence, state, None, usage)
     }
 
+    fn rebuild_checkpoint_with_provider_transcript(
+        &self,
+        checkpoint: &CheckpointV1,
+        sequence: u64,
+        state: RunState,
+        usage: Usage,
+        provider_transcript: Vec<ProviderTranscriptEntry>,
+    ) -> Result<CheckpointV1, EngineError> {
+        CheckpointV1Builder::new(
+            checkpoint.session_id(),
+            checkpoint.run_id(),
+            checkpoint.definition().clone(),
+            sequence,
+            checkpoint.manifests().to_vec(),
+            checkpoint.budget().clone(),
+            usage,
+        )
+        .state(state, None)
+        .attempts(checkpoint.attempts().to_vec())
+        .cursor(checkpoint.cursor().cloned())
+        .completed_invocations(checkpoint.completed_invocations().to_vec())
+        .uncertain_invocations(checkpoint.uncertain_invocations().to_vec())
+        .pending_approval(
+            (state == RunState::WaitingForApproval)
+                .then(|| checkpoint.pending_approval().cloned())
+                .flatten(),
+        )
+        .provider_transcript(provider_transcript)
+        .message_context_refs(checkpoint.message_context_refs().to_vec())
+        .model_context_refs(checkpoint.model_context_refs().to_vec())
+        .memory_refs(checkpoint.memory_refs().to_vec())
+        .artifact_refs(checkpoint.artifact_refs().to_vec())
+        .build()
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))
+    }
+
     fn rebuild_checkpoint_for_state(
         &self,
         checkpoint: &CheckpointV1,
@@ -2387,6 +2504,7 @@ where
         .completed_invocations(checkpoint.completed_invocations().to_vec())
         .uncertain_invocations(checkpoint.uncertain_invocations().to_vec())
         .pending_approval(checkpoint.pending_approval().cloned())
+        .provider_transcript(checkpoint.provider_transcript().to_vec())
         .message_context_refs(checkpoint.message_context_refs().to_vec())
         .model_context_refs(checkpoint.model_context_refs().to_vec())
         .memory_refs(checkpoint.memory_refs().to_vec())
@@ -2417,6 +2535,29 @@ where
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn rebuild_checkpoint_with_history_and_provider_transcript(
+        &self,
+        checkpoint: &CheckpointV1,
+        sequence: u64,
+        usage: Usage,
+        attempts: Vec<InvocationAttemptRecord>,
+        completed_invocations: Vec<CompletedInvocationRecord>,
+        cursor: Option<CheckpointCursor>,
+        provider_transcript: Vec<ProviderTranscriptEntry>,
+    ) -> Result<CheckpointV1, EngineError> {
+        self.rebuild_checkpoint_with_history_pending_and_provider_transcript(
+            checkpoint,
+            sequence,
+            usage,
+            attempts,
+            completed_invocations,
+            cursor,
+            checkpoint.pending_approval().cloned(),
+            provider_transcript,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn rebuild_checkpoint_with_history_and_pending(
         &self,
         checkpoint: &CheckpointV1,
@@ -2426,6 +2567,30 @@ where
         completed_invocations: Vec<CompletedInvocationRecord>,
         cursor: Option<CheckpointCursor>,
         pending_approval: Option<PendingApprovalRecord>,
+    ) -> Result<CheckpointV1, EngineError> {
+        self.rebuild_checkpoint_with_history_pending_and_provider_transcript(
+            checkpoint,
+            sequence,
+            usage,
+            attempts,
+            completed_invocations,
+            cursor,
+            pending_approval,
+            checkpoint.provider_transcript().to_vec(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rebuild_checkpoint_with_history_pending_and_provider_transcript(
+        &self,
+        checkpoint: &CheckpointV1,
+        sequence: u64,
+        usage: Usage,
+        attempts: Vec<InvocationAttemptRecord>,
+        completed_invocations: Vec<CompletedInvocationRecord>,
+        cursor: Option<CheckpointCursor>,
+        pending_approval: Option<PendingApprovalRecord>,
+        provider_transcript: Vec<ProviderTranscriptEntry>,
     ) -> Result<CheckpointV1, EngineError> {
         CheckpointV1Builder::new(
             checkpoint.session_id(),
@@ -2441,6 +2606,7 @@ where
         .completed_invocations(completed_invocations)
         .uncertain_invocations(checkpoint.uncertain_invocations().to_vec())
         .pending_approval(pending_approval)
+        .provider_transcript(provider_transcript)
         .message_context_refs(checkpoint.message_context_refs().to_vec())
         .model_context_refs(checkpoint.model_context_refs().to_vec())
         .memory_refs(checkpoint.memory_refs().to_vec())
@@ -2459,6 +2625,50 @@ where
                 kind,
             })
             .await;
+    }
+
+    async fn observe_control_boundary(
+        &self,
+        signal: &dyn EngineControlSignal,
+        owner_id: Uuid,
+        current: &crate::StoredRun,
+        lease: &crate::ExecutionLease,
+        checkpoint_version: u64,
+        checkpoint: &CheckpointV1,
+    ) -> Result<Option<EngineRunOutcome>, EngineError> {
+        match signal.at_boundary() {
+            EngineBoundaryAction::Continue => Ok(None),
+            EngineBoundaryAction::Pause => match current.run().state() {
+                RunState::Running | RunState::WaitingForApproval => self
+                    .pause(
+                        owner_id,
+                        current.clone(),
+                        lease.clone(),
+                        checkpoint_version,
+                        checkpoint,
+                    )
+                    .await
+                    .map(Some),
+                RunState::RecoveryRequired => Ok(Some(EngineRunOutcome::RecoveryRequired)),
+                RunState::Paused
+                    if current.run().pause_reason()
+                        == Some(crate::RunPauseReason::PolicyDenied) =>
+                {
+                    Ok(Some(EngineRunOutcome::Denied))
+                }
+                _ => Err(EngineError::new(EngineErrorCode::InvalidState)),
+            },
+            EngineBoundaryAction::Cancel => self
+                .cancel(
+                    owner_id,
+                    current.clone(),
+                    lease.clone(),
+                    checkpoint_version,
+                    checkpoint,
+                )
+                .await
+                .map(Some),
+        }
     }
 
     async fn pause(
@@ -2527,7 +2737,7 @@ where
     ) -> Result<EngineRunOutcome, EngineError> {
         let target = current
             .run()
-            .transition(RunState::Cancelled, None)
+            .cancel_at_boundary()
             .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
         let sequence = checkpoint.last_durable_event_sequence() + 1;
         let event = self.event(
@@ -2740,10 +2950,106 @@ fn json_to_data_value(value: &serde_json::Value) -> Option<crate::DataValue> {
     }
 }
 
+fn provider_transcript_messages(
+    checkpoint: &CheckpointV1,
+    definition: &AgentDefinition,
+) -> Result<Vec<Message>, EngineError> {
+    checkpoint
+        .provider_transcript()
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            if let Some((content, tool_calls, _)) = entry
+                .model_response()
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
+            {
+                Ok(assistant_tool_call_message(
+                    definition,
+                    checkpoint.session_id(),
+                    u64::try_from(index).unwrap_or(u64::MAX),
+                    content,
+                    &tool_calls,
+                ))
+            } else if let Some((tool_call_id, content)) = entry.capability_result_parts() {
+                Ok(Message {
+                    id: format!("provider-tool:{index}:{tool_call_id}"),
+                    agent_id: definition.id.clone(),
+                    room_id: checkpoint.session_id().to_string(),
+                    content: content
+                        .to_content()
+                        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                    role: MessageRole::Tool,
+                    created_at_ms: u64::try_from(index).unwrap_or(u64::MAX),
+                })
+            } else {
+                Err(EngineError::new(EngineErrorCode::InvalidState))
+            }
+        })
+        .collect()
+}
+
+fn pending_provider_response(
+    checkpoint: &CheckpointV1,
+) -> Result<Option<ModelGenerateResponse>, EngineError> {
+    let Some((index, entry)) = checkpoint
+        .provider_transcript()
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| matches!(entry, ProviderTranscriptEntry::ModelResponse { .. }))
+    else {
+        return Ok(None);
+    };
+    let Some((content, tool_calls, stop_reason)) = entry
+        .model_response()
+        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
+    else {
+        return Err(EngineError::new(EngineErrorCode::InvalidState));
+    };
+    let completed: BTreeSet<_> = checkpoint.provider_transcript()[index + 1..]
+        .iter()
+        .filter_map(|entry| entry.capability_result_parts().map(|(id, _)| id))
+        .collect();
+    if !tool_calls.is_empty()
+        && tool_calls
+            .iter()
+            .all(|tool_call| completed.contains(tool_call.id.as_str()))
+    {
+        return Ok(None);
+    }
+    Ok(Some(ModelGenerateResponse {
+        content,
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        usage: TokenUsage::default(),
+        stop_reason,
+    }))
+}
+
+fn pending_provider_tool_calls(
+    checkpoint: &CheckpointV1,
+    tool_calls: &[ToolCall],
+) -> Result<Vec<ToolCall>, EngineError> {
+    let index = checkpoint
+        .provider_transcript()
+        .iter()
+        .rposition(|entry| matches!(entry, ProviderTranscriptEntry::ModelResponse { .. }))
+        .ok_or_else(|| EngineError::new(EngineErrorCode::InvalidState))?;
+    let completed: BTreeSet<_> = checkpoint.provider_transcript()[index + 1..]
+        .iter()
+        .filter_map(|entry| entry.capability_result_parts().map(|(id, _)| id))
+        .collect();
+    Ok(tool_calls
+        .iter()
+        .filter(|tool_call| !completed.contains(tool_call.id.as_str()))
+        .cloned()
+        .collect())
+}
+
 fn assistant_tool_call_message(
     definition: &AgentDefinition,
     session_id: Uuid,
     now_ms: u64,
+    mut content: Content,
     tool_calls: &[ToolCall],
 ) -> Message {
     let tool_calls = tool_calls
@@ -2766,13 +3072,12 @@ fn assistant_tool_call_message(
         id: format!("assistant-tools:{now_ms}"),
         agent_id: definition.id.clone(),
         room_id: session_id.to_string(),
-        content: Content {
-            text: String::new(),
-            attachments: None,
-            metadata: Some(BTreeMap::from([(
-                "toolCalls".into(),
-                crate::DataValue::Array(tool_calls),
-            )])),
+        content: {
+            content
+                .metadata
+                .get_or_insert_with(BTreeMap::new)
+                .insert("toolCalls".into(), crate::DataValue::Array(tool_calls));
+            content
         },
         role: MessageRole::Assistant,
         created_at_ms: now_ms,

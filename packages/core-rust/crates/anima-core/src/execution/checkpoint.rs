@@ -10,9 +10,10 @@ use super::state::{
     RunPauseReason, RunState, Usage,
 };
 use crate::{
-    AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, CapabilityManifest,
-    LogicalInvocation, LogicalInvocationBinding, ManifestCatalog, RecoveryMode,
-    RecoveryResumeBinding, SUPPORTED_DEFINITION_SCHEMA_VERSION,
+    AgentDefinition, ApprovalDecision, ApprovalDecisionKind, ApprovalRequest, Attachment,
+    CapabilityManifest, Content, DataValue, LogicalInvocation, LogicalInvocationBinding,
+    ManifestCatalog, ModelGenerateResponse, ModelStopReason, RecoveryMode, RecoveryResumeBinding,
+    ToolCall, SUPPORTED_DEFINITION_SCHEMA_VERSION,
 };
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
@@ -194,6 +195,263 @@ impl OpaqueReference {
 impl<'de> Deserialize<'de> for OpaqueReference {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         Self::new(Uuid::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStopReason {
+    End,
+    ToolCall,
+    MaxTokens,
+}
+
+impl From<ModelStopReason> for ProviderStopReason {
+    fn from(value: ModelStopReason) -> Self {
+        match value {
+            ModelStopReason::End => Self::End,
+            ModelStopReason::ToolCall => Self::ToolCall,
+            ModelStopReason::MaxTokens => Self::MaxTokens,
+        }
+    }
+}
+
+impl From<ProviderStopReason> for ModelStopReason {
+    fn from(value: ProviderStopReason) -> Self {
+        match value {
+            ProviderStopReason::End => Self::End,
+            ProviderStopReason::ToolCall => Self::ToolCall,
+            ProviderStopReason::MaxTokens => Self::MaxTokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderContent {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attachments: Option<Vec<Attachment>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<BTreeMap<String, Value>>,
+}
+
+impl ProviderContent {
+    pub fn from_content(content: &Content) -> Self {
+        Self {
+            text: content.text.clone(),
+            attachments: content.attachments.clone(),
+            metadata: content.metadata.as_ref().map(|metadata| {
+                metadata
+                    .iter()
+                    .map(|(key, value)| {
+                        (key.clone(), crate::runtime_serde::data_value_to_json(value))
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    pub fn to_content(&self) -> Result<Content, ExecutionError> {
+        let metadata = self
+            .metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .iter()
+                    .map(|(key, value)| {
+                        provider_data_value(value).map(|value| (key.clone(), value))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+            })
+            .transpose()?;
+        Ok(Content {
+            text: self.text.clone(),
+            attachments: self.attachments.clone(),
+            metadata,
+        })
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+impl ProviderToolCall {
+    pub fn from_tool_call(tool_call: &ToolCall) -> Result<Self, ExecutionError> {
+        let value = Self {
+            id: tool_call.id.clone(),
+            name: tool_call.name.clone(),
+            arguments: crate::runtime_serde::data_value_to_json(&DataValue::Object(
+                tool_call.args.clone(),
+            )),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ExecutionError> {
+        valid_id(&self.id)?;
+        valid_id(&self.name)?;
+        if !self.arguments.is_object() || provider_data_value(&self.arguments).is_err() {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        }
+        Ok(())
+    }
+
+    pub fn to_tool_call(&self) -> Result<ToolCall, ExecutionError> {
+        let DataValue::Object(args) = provider_data_value(&self.arguments)? else {
+            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+        };
+        Ok(ToolCall {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            args,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn arguments(&self) -> &Value {
+        &self.arguments
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderTranscriptEntry {
+    ModelResponse {
+        content: ProviderContent,
+        tool_calls: Vec<ProviderToolCall>,
+        stop_reason: ProviderStopReason,
+    },
+    CapabilityResult {
+        tool_call_id: String,
+        content: ProviderContent,
+    },
+}
+
+impl ProviderTranscriptEntry {
+    pub fn from_model_response(response: &ModelGenerateResponse) -> Result<Self, ExecutionError> {
+        let tool_calls = response
+            .tool_calls
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(ProviderToolCall::from_tool_call)
+            .collect::<Result<Vec<_>, _>>()?;
+        let value = Self::ModelResponse {
+            content: ProviderContent::from_content(&response.content),
+            tool_calls,
+            stop_reason: response.stop_reason.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn capability_result(
+        tool_call_id: impl Into<String>,
+        content: &Content,
+    ) -> Result<Self, ExecutionError> {
+        let value = Self::CapabilityResult {
+            tool_call_id: tool_call_id.into(),
+            content: ProviderContent::from_content(content),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ExecutionError> {
+        match self {
+            Self::ModelResponse {
+                content,
+                tool_calls,
+                stop_reason,
+            } => {
+                content.to_content()?;
+                for call in tool_calls {
+                    call.validate()?;
+                }
+                if tool_calls.is_empty() != (*stop_reason != ProviderStopReason::ToolCall) {
+                    return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+                }
+            }
+            Self::CapabilityResult {
+                tool_call_id,
+                content,
+            } => {
+                valid_id(tool_call_id)?;
+                content.to_content()?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn model_response(
+        &self,
+    ) -> Result<Option<(Content, Vec<ToolCall>, ModelStopReason)>, ExecutionError> {
+        match self {
+            Self::ModelResponse {
+                content,
+                tool_calls,
+                stop_reason,
+            } => Ok(Some((
+                content.to_content()?,
+                tool_calls
+                    .iter()
+                    .map(ProviderToolCall::to_tool_call)
+                    .collect::<Result<Vec<_>, _>>()?,
+                (*stop_reason).into(),
+            ))),
+            Self::CapabilityResult { .. } => Ok(None),
+        }
+    }
+
+    pub fn capability_result_parts(&self) -> Option<(&str, &ProviderContent)> {
+        match self {
+            Self::CapabilityResult {
+                tool_call_id,
+                content,
+            } => Some((tool_call_id, content)),
+            Self::ModelResponse { .. } => None,
+        }
+    }
+}
+
+fn provider_data_value(value: &Value) -> Result<DataValue, ExecutionError> {
+    match value {
+        Value::Null => Ok(DataValue::Null),
+        Value::Bool(value) => Ok(DataValue::Bool(*value)),
+        Value::Number(value) => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(DataValue::Number)
+            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint)),
+        Value::String(value) => Ok(DataValue::String(value.clone())),
+        Value::Array(values) => values
+            .iter()
+            .map(provider_data_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map(DataValue::Array),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| provider_data_value(value).map(|value| (key.clone(), value)))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(DataValue::Object),
     }
 }
 
@@ -729,6 +987,8 @@ pub struct CheckpointV1 {
     pause_reason: Option<RunPauseReason>,
     cursor: Option<CheckpointCursor>,
     attempts: Vec<InvocationAttemptRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    provider_transcript: Vec<ProviderTranscriptEntry>,
     message_context_refs: Vec<OpaqueReference>,
     model_context_refs: Vec<OpaqueReference>,
     completed_invocations: Vec<CompletedInvocationRecord>,
@@ -757,6 +1017,8 @@ struct CheckpointWire {
     pause_reason: Option<RunPauseReason>,
     cursor: Option<CheckpointCursor>,
     attempts: Vec<InvocationAttemptRecord>,
+    #[serde(default)]
+    provider_transcript: Vec<ProviderTranscriptEntry>,
     message_context_refs: Vec<OpaqueReference>,
     model_context_refs: Vec<OpaqueReference>,
     completed_invocations: Vec<CompletedInvocationRecord>,
@@ -796,6 +1058,7 @@ impl CheckpointV1Builder {
                 pause_reason: None,
                 cursor: None,
                 attempts: vec![],
+                provider_transcript: vec![],
                 message_context_refs: vec![],
                 model_context_refs: vec![],
                 completed_invocations: vec![],
@@ -830,6 +1093,10 @@ impl CheckpointV1Builder {
     pub fn completed_invocations(mut self, mut value: Vec<CompletedInvocationRecord>) -> Self {
         value.sort_by_key(|r| (r.invocation.id(), r.attempt_number));
         self.wire.completed_invocations = value;
+        self
+    }
+    pub fn provider_transcript(mut self, value: Vec<ProviderTranscriptEntry>) -> Self {
+        self.wire.provider_transcript = value;
         self
     }
     pub fn uncertain_invocations(mut self, mut value: Vec<UncertainInvocationRecord>) -> Self {
@@ -924,6 +1191,7 @@ impl CheckpointV1 {
             pause_reason: w.pause_reason,
             cursor: w.cursor,
             attempts: w.attempts,
+            provider_transcript: w.provider_transcript,
             message_context_refs: w.message_context_refs,
             model_context_refs: w.model_context_refs,
             completed_invocations: w.completed_invocations,
@@ -979,6 +1247,27 @@ impl CheckpointV1 {
             .iter()
             .map(|m| ((m.id(), m.version()), m))
             .collect();
+        let mut pending_tool_calls = BTreeSet::new();
+        for entry in &self.provider_transcript {
+            entry.validate()?;
+            match entry {
+                ProviderTranscriptEntry::ModelResponse { tool_calls, .. } => {
+                    if !pending_tool_calls.is_empty() {
+                        return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+                    }
+                    for call in tool_calls {
+                        if !pending_tool_calls.insert(call.id().to_owned()) {
+                            return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+                        }
+                    }
+                }
+                ProviderTranscriptEntry::CapabilityResult { tool_call_id, .. } => {
+                    if !pending_tool_calls.remove(tool_call_id) {
+                        return Err(ExecutionError::new(ExecutionErrorCode::InvalidCheckpoint));
+                    }
+                }
+            }
+        }
         let mut previous = None;
         let mut last_by_invocation = BTreeMap::new();
         for record in &self.attempts {
@@ -1229,6 +1518,9 @@ impl CheckpointV1 {
     }
     pub fn completed_invocations(&self) -> &[CompletedInvocationRecord] {
         &self.completed_invocations
+    }
+    pub fn provider_transcript(&self) -> &[ProviderTranscriptEntry] {
+        &self.provider_transcript
     }
     pub(super) fn attempts_fingerprint(&self) -> HistoryFingerprint {
         self.attempts_fingerprint

@@ -1987,6 +1987,7 @@ where
     assert_atomic_failure_contract(factory).await?;
     assert_authoritative_policy_contract(factory).await?;
     assert_dispatching_attempt_transition_contract(factory).await?;
+    assert_plain_prepare_dispatch_lineage_rejections(factory).await?;
     assert_retry_attempt_adjacency_rejections(factory).await?;
     assert_retry_attempt_lineage_contract(factory).await?;
     assert_auto_allow_dispatch_grant_contract(factory).await?;
@@ -2389,6 +2390,217 @@ where
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum PlainPrepareLineageCase {
+    InitialAttemptTwo,
+    MissingUncertainTransition,
+    ChangedLogicalBinding,
+    ChangedNormalizedArguments,
+    ChangedManifest,
+    ChangedRecoveryMode,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConformanceRunSnapshot {
+    run: Option<StoredRun>,
+    events: Vec<RuntimeEvent>,
+    steps: Vec<Step>,
+    attempts: Vec<InvocationAttemptRecord>,
+    checkpoint: Option<(u64, CheckpointV1)>,
+}
+
+async fn conformance_run_snapshot<S: ExecutionStore>(
+    store: &S,
+    owner_id: Uuid,
+    run_id: Uuid,
+) -> Result<ConformanceRunSnapshot, ExecutionStoreError> {
+    Ok(ConformanceRunSnapshot {
+        run: store.load_run(owner_id, run_id).await?,
+        events: replay_all_events(store, owner_id, run_id).await?,
+        steps: store
+            .load_steps_page(
+                owner_id,
+                run_id,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            .items()
+            .to_vec(),
+        attempts: store
+            .load_attempts_page(
+                owner_id,
+                run_id,
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            .items()
+            .to_vec(),
+        checkpoint: store.load_checkpoint(owner_id, run_id).await?,
+    })
+}
+
+async fn assert_plain_prepare_dispatch_lineage_rejections<F>(
+    factory: &F,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    for (offset, case) in [
+        PlainPrepareLineageCase::InitialAttemptTwo,
+        PlainPrepareLineageCase::MissingUncertainTransition,
+        PlainPrepareLineageCase::ChangedLogicalBinding,
+        PlainPrepareLineageCase::ChangedNormalizedArguments,
+        PlainPrepareLineageCase::ChangedManifest,
+        PlainPrepareLineageCase::ChangedRecoveryMode,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0xd1_20 + (offset as u128 * 0x10);
+        let (store, owner_id, session, queued, started, lease) =
+            create_running_run(factory, seed).await?;
+        let invocation = conformance_value(LogicalInvocation::new(
+            queued.id(),
+            "plain-prepare-lineage",
+            "workspace.write",
+            1,
+            serde_json::json!({"path": "lineage.txt"}),
+        ))?;
+        let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+            "workspace.write",
+            1,
+            format!("sha256:{}", "4".repeat(64)),
+            RecoveryMode::KeyedIdempotent,
+        ))?;
+        let baseline = if matches!(case, PlainPrepareLineageCase::InitialAttemptTwo) {
+            started
+        } else {
+            let first = conformance_value(InvocationAttemptRecord::new_durable(
+                &invocation,
+                1,
+                super::AttemptRecordState::Dispatching,
+                manifest.clone(),
+                RecoveryMode::KeyedIdempotent,
+            ))?;
+            store
+                .commit_execution(
+                    owner_id,
+                    ExecutionCommit::new(
+                        started.stored_run().run_version(),
+                        started.checkpoint_version(),
+                        lease.clone(),
+                        RuntimeCommand::prepare_dispatch(
+                            Uuid::from_u128(seed + 5),
+                            session.id(),
+                            queued.id(),
+                        )
+                        .map_err(ExecutionStoreError::from)?,
+                        vec![],
+                        vec![],
+                        vec![first],
+                        vec![],
+                        None,
+                        started.stored_run().run().clone(),
+                    )
+                    .with_policy_guard(conformance_dispatch_guard(
+                        owner_id,
+                        &session,
+                        &invocation,
+                    )?),
+                )
+                .await?
+        };
+        let candidate_invocation = match case {
+            PlainPrepareLineageCase::ChangedLogicalBinding => {
+                conformance_value(LogicalInvocation::new(
+                    queued.id(),
+                    "changed-plain-prepare-lineage",
+                    "workspace.write",
+                    1,
+                    serde_json::json!({"path": "lineage.txt"}),
+                ))?
+            }
+            PlainPrepareLineageCase::ChangedNormalizedArguments => {
+                conformance_value(LogicalInvocation::new(
+                    queued.id(),
+                    "plain-prepare-lineage",
+                    "workspace.write",
+                    1,
+                    serde_json::json!({"path": "changed.txt"}),
+                ))?
+            }
+            _ => invocation.clone(),
+        };
+        let (candidate_manifest, candidate_mode) = match case {
+            PlainPrepareLineageCase::ChangedManifest => (
+                conformance_value(ManifestPin::new_with_recovery_mode(
+                    "workspace.write",
+                    1,
+                    format!("sha256:{}", "5".repeat(64)),
+                    RecoveryMode::KeyedIdempotent,
+                ))?,
+                RecoveryMode::KeyedIdempotent,
+            ),
+            PlainPrepareLineageCase::ChangedRecoveryMode => (
+                conformance_value(ManifestPin::new_with_recovery_mode(
+                    "workspace.write",
+                    1,
+                    format!("sha256:{}", "4".repeat(64)),
+                    RecoveryMode::Retry,
+                ))?,
+                RecoveryMode::Retry,
+            ),
+            _ => (manifest, RecoveryMode::KeyedIdempotent),
+        };
+        let candidate = conformance_value(InvocationAttemptRecord::new_durable(
+            &candidate_invocation,
+            2,
+            super::AttemptRecordState::Dispatching,
+            candidate_manifest,
+            candidate_mode,
+        ))?;
+        let before = conformance_run_snapshot(&store, owner_id, queued.id()).await?;
+        let rejected = store
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    baseline.stored_run().run_version(),
+                    baseline.checkpoint_version(),
+                    lease,
+                    RuntimeCommand::prepare_dispatch(
+                        Uuid::from_u128(seed + 6),
+                        session.id(),
+                        queued.id(),
+                    )
+                    .map_err(ExecutionStoreError::from)?,
+                    vec![],
+                    vec![],
+                    vec![candidate],
+                    vec![],
+                    None,
+                    baseline.stored_run().run().clone(),
+                )
+                .with_policy_guard(conformance_dispatch_guard(
+                    owner_id,
+                    &session,
+                    &candidate_invocation,
+                )?),
+            )
+            .await;
+        let after = conformance_run_snapshot(&store, owner_id, queued.id()).await?;
+        if !matches!(
+            rejected,
+            Err(error) if error.code() == ExecutionStoreErrorCode::LineageConflict
+        ) || before != after
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
     }
     Ok(())
 }

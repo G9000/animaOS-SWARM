@@ -115,6 +115,7 @@ struct RacingExecutionStore {
     reference: InMemoryExecutionStore,
     conflict: InjectedCasConflict,
     boundary: DispatchRaceBoundary,
+    boundary_signal: Option<MutableBoundarySignal>,
     fired: AtomicBool,
 }
 
@@ -128,8 +129,14 @@ impl RacingExecutionStore {
             reference: InMemoryExecutionStore::with_clock(clock),
             conflict,
             boundary,
+            boundary_signal: None,
             fired: AtomicBool::new(false),
         }
+    }
+
+    fn with_boundary_signal(mut self, signal: MutableBoundarySignal) -> Self {
+        self.boundary_signal = Some(signal);
+        self
     }
 
     fn should_race(&self, commit: &ExecutionCommit) -> bool {
@@ -271,6 +278,7 @@ fn rebuild_test_checkpoint(
     .model_context_refs(checkpoint.model_context_refs().to_vec())
     .memory_refs(checkpoint.memory_refs().to_vec())
     .artifact_refs(checkpoint.artifact_refs().to_vec())
+    .provider_transcript(checkpoint.provider_transcript().to_vec())
     .cursor(checkpoint.cursor().cloned())
     .build()
     .unwrap()
@@ -380,6 +388,9 @@ impl ExecutionStore for RacingExecutionStore {
             return self.reference.commit_execution(owner_id, commit).await;
         }
         let winner = self.install_policy_denied_winner(owner_id, &commit).await?;
+        if let Some(signal) = &self.boundary_signal {
+            signal.set(EngineBoundaryAction::Cancel);
+        }
         let commit = if matches!(self.conflict, InjectedCasConflict::CheckpointVersion) {
             rebuild_commit_with_run_version(&commit, winner.stored_run().run_version())
         } else {
@@ -617,6 +628,160 @@ impl EngineControlSignal for CancelAfterCapabilityResult {
         } else {
             EngineBoundaryAction::Cancel
         }
+    }
+}
+
+#[derive(Clone)]
+struct MutableBoundarySignal {
+    action: Arc<AtomicUsize>,
+}
+
+impl MutableBoundarySignal {
+    fn new() -> Self {
+        Self {
+            action: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn set(&self, action: EngineBoundaryAction) {
+        self.action.store(
+            match action {
+                EngineBoundaryAction::Continue => 0,
+                EngineBoundaryAction::Pause => 1,
+                EngineBoundaryAction::Cancel => 2,
+            },
+            Ordering::SeqCst,
+        );
+    }
+}
+
+impl EngineControlSignal for MutableBoundarySignal {
+    fn at_boundary(&self) -> EngineBoundaryAction {
+        match self.action.load(Ordering::SeqCst) {
+            0 => EngineBoundaryAction::Continue,
+            1 => EngineBoundaryAction::Pause,
+            _ => EngineBoundaryAction::Cancel,
+        }
+    }
+}
+
+struct FlipApprovalPolicy {
+    signal: MutableBoundarySignal,
+}
+
+#[async_trait]
+impl CurrentPolicyResolver for FlipApprovalPolicy {
+    async fn resolve(
+        &self,
+        request: EnginePolicyRequest,
+    ) -> Result<CurrentPolicyResolution, EngineError> {
+        let context = policy_context(&request, PolicyRestrictions::default())?;
+        let approval = request
+            .pending_approval()
+            .cloned()
+            .map(|pending| ApprovalDecision::new_approved(pending, 1_000_000))
+            .transpose()
+            .map_err(|_| EngineError::new(EngineErrorCode::Policy))?;
+        if approval.is_some() {
+            self.signal.set(EngineBoundaryAction::Cancel);
+        }
+        Ok(CurrentPolicyResolution::new(context, vec![], approval))
+    }
+}
+
+struct FlipDeniedPolicy {
+    signal: MutableBoundarySignal,
+    action: EngineBoundaryAction,
+}
+
+#[async_trait]
+impl CurrentPolicyResolver for FlipDeniedPolicy {
+    async fn resolve(
+        &self,
+        request: EnginePolicyRequest,
+    ) -> Result<CurrentPolicyResolution, EngineError> {
+        let context = policy_context(
+            &request,
+            PolicyRestrictions {
+                minimum_risk: None,
+                deny: true,
+            },
+        )?;
+        self.signal.set(self.action);
+        Ok(CurrentPolicyResolution::new(context, vec![], None))
+    }
+}
+
+fn policy_context(
+    request: &EnginePolicyRequest,
+    restrictions: PolicyRestrictions,
+) -> Result<PolicyContext, EngineError> {
+    PolicyContext::new(
+        request.owner_id().to_string(),
+        "mutable-boundary-actor",
+        request.definition().id.clone(),
+        request.definition().version,
+        "mutable-boundary-workspace",
+        CapabilityReferenceId::new(request.invocation().run_id()),
+        request.manifest(),
+        request.invocation(),
+        request.definition().approval_policy_revision,
+        restrictions,
+        1_000_000,
+    )
+    .map_err(|_| EngineError::new(EngineErrorCode::Policy))
+}
+
+struct FlipRecoveryCapabilities {
+    manifest: CapabilityManifest,
+    signal: MutableBoundarySignal,
+    recovery_action: RecoveryAction,
+    recovery_calls: AtomicUsize,
+    retry_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl EngineCapabilityRuntime for FlipRecoveryCapabilities {
+    fn manifest(&self, id: &str, version: u32) -> Option<CapabilityManifest> {
+        (id == self.manifest.id && version == self.manifest.version).then(|| self.manifest.clone())
+    }
+
+    async fn execute(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<EngineCapabilityResult, CapabilityError> {
+        Err(CapabilityError::unavailable())
+    }
+
+    async fn recover_dispatched(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<RecoveryAction, CapabilityError> {
+        self.recovery_calls.fetch_add(1, Ordering::SeqCst);
+        self.signal.set(EngineBoundaryAction::Cancel);
+        Ok(self.recovery_action.clone())
+    }
+
+    async fn execute_retry(
+        &self,
+        context: CapabilityExecutionContext,
+        _authorization: CapabilityRetryAuthorization,
+    ) -> Result<EngineCapabilityResult, CapabilityError> {
+        self.retry_calls.fetch_add(1, Ordering::SeqCst);
+        let durable = DurableCapabilityResult::new(
+            CapabilityReferenceId::new(Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                context.invocation().id().as_bytes(),
+            )),
+            format!("jcs-v1:{}", "d".repeat(64)),
+            self.manifest.schema_digest(),
+            1,
+            anima_core::DurableCapabilityStatus::Completed,
+        )?;
+        Ok(EngineCapabilityResult {
+            output: CapabilityResult::new(serde_json::json!({"ok": true})),
+            durable,
+        })
     }
 }
 
@@ -2504,7 +2669,7 @@ async fn revoked_policy_before_recovery_retry_denies_without_calling_executor() 
 }
 
 #[tokio::test]
-async fn initial_dispatch_adopts_policy_denied_winner_after_real_run_or_checkpoint_cas_loss() {
+async fn initial_dispatch_adopts_policy_denied_cas_winner_and_applies_late_cancel() {
     for (offset, conflict) in [
         InjectedCasConflict::RunVersion,
         InjectedCasConflict::CheckpointVersion,
@@ -2512,79 +2677,94 @@ async fn initial_dispatch_adopts_policy_denied_winner_after_real_run_or_checkpoi
     .into_iter()
     .enumerate()
     {
-        let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
-        let mut definition = definition();
-        definition.resolved_capabilities = vec![ResolvedCapability {
-            capability_id: capability_manifest.id.clone(),
-            manifest_version: capability_manifest.version,
-            schema_digest: capability_manifest.schema_digest().into(),
-            override_config: None,
-            approval_policy_revision: 1,
-        }];
-        let clock = Arc::new(ManualExecutionClock::default());
-        let store = Arc::new(RacingExecutionStore::new(
-            clock.clone(),
-            conflict,
-            DispatchRaceBoundary::Initial,
-        ));
-        let seed = 0x850 + (offset as u128 * 0x10);
-        let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, &definition).await;
-        let model = Arc::new(StreamingModel {
-            turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
-                ModelGenerateResponse {
-                    content: Content::default(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: "initial-cas-tool".into(),
-                        name: capability_manifest.id.clone(),
-                        args: BTreeMap::from([(
-                            "path".into(),
-                            DataValue::String("initial-cas.txt".into()),
-                        )]),
-                    }]),
-                    usage: TokenUsage::default(),
-                    stop_reason: ModelStopReason::ToolCall,
-                },
-            )]])),
-        });
-        let capabilities = Arc::new(RecordingCapabilities {
-            manifest: capability_manifest,
-            calls: Mutex::new(vec![]),
-            completed: Mutex::new(None),
-        });
-        let engine = DurableAgentEngine::new(
-            store.clone(),
-            model,
-            Arc::new(StaticDefinitions(definition)),
-            Arc::new(AllowPolicy),
-            capabilities.clone(),
-            clock,
-            Arc::new(RecordingLiveSink::default()),
-            Arc::new(NeverCrash),
-            DurableEngineConfig::default(),
-        )
-        .unwrap();
+        for (control_offset, cancel_after_adoption) in [false, true].into_iter().enumerate() {
+            let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+            let mut definition = definition();
+            definition.resolved_capabilities = vec![ResolvedCapability {
+                capability_id: capability_manifest.id.clone(),
+                manifest_version: capability_manifest.version,
+                schema_digest: capability_manifest.schema_digest().into(),
+                override_config: None,
+                approval_policy_revision: 1,
+            }];
+            let clock = Arc::new(ManualExecutionClock::default());
+            let signal = MutableBoundarySignal::new();
+            let store =
+                RacingExecutionStore::new(clock.clone(), conflict, DispatchRaceBoundary::Initial);
+            let store = Arc::new(if cancel_after_adoption {
+                store.with_boundary_signal(signal.clone())
+            } else {
+                store
+            });
+            let seed = 0x850 + (offset as u128 * 0x20) + (control_offset as u128 * 0x10);
+            let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, &definition).await;
+            let model = Arc::new(StreamingModel {
+                turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                    ModelGenerateResponse {
+                        content: Content::default(),
+                        tool_calls: Some(vec![ToolCall {
+                            id: "initial-cas-tool".into(),
+                            name: capability_manifest.id.clone(),
+                            args: BTreeMap::from([(
+                                "path".into(),
+                                DataValue::String("initial-cas.txt".into()),
+                            )]),
+                        }]),
+                        usage: TokenUsage::default(),
+                        stop_reason: ModelStopReason::ToolCall,
+                    },
+                )]])),
+            });
+            let capabilities = Arc::new(RecordingCapabilities {
+                manifest: capability_manifest,
+                calls: Mutex::new(vec![]),
+                completed: Mutex::new(None),
+            });
+            let engine = DurableAgentEngine::new(
+                store.clone(),
+                model,
+                Arc::new(StaticDefinitions(definition)),
+                Arc::new(AllowPolicy),
+                capabilities.clone(),
+                clock,
+                Arc::new(RecordingLiveSink::default()),
+                Arc::new(NeverCrash),
+                DurableEngineConfig::default(),
+            )
+            .unwrap();
 
-        assert_eq!(
-            engine.run(owner_id, run_id, &ContinueSignal).await.unwrap(),
-            EngineRunOutcome::Denied
-        );
-        assert!(capabilities.calls.lock().unwrap().is_empty());
-        let winner = store.load_run(owner_id, run_id).await.unwrap().unwrap();
-        assert_eq!(winner.run().state(), RunState::Paused);
-        assert_eq!(
-            winner.run().pause_reason(),
-            Some(RunPauseReason::PolicyDenied)
-        );
-        assert!(store
-            .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
-            .await
-            .unwrap()
-            .is_empty());
+            let expected = if cancel_after_adoption {
+                EngineRunOutcome::Cancelled
+            } else {
+                EngineRunOutcome::Denied
+            };
+            assert_eq!(
+                engine.run(owner_id, run_id, &signal).await.unwrap(),
+                expected
+            );
+            assert!(capabilities.calls.lock().unwrap().is_empty());
+            let winner = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+            if cancel_after_adoption {
+                assert_eq!(winner.run().state(), RunState::Cancelled);
+                assert_eq!(winner.run().pause_reason(), None);
+            } else {
+                assert_eq!(winner.run().state(), RunState::Paused);
+                assert_eq!(
+                    winner.run().pause_reason(),
+                    Some(RunPauseReason::PolicyDenied)
+                );
+            }
+            assert!(store
+                .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
+                .await
+                .unwrap()
+                .is_empty());
+        }
     }
 }
 
 #[tokio::test]
-async fn recovery_dispatch_adopts_policy_denied_winner_after_real_run_or_checkpoint_cas_loss() {
+async fn recovery_dispatch_adopts_policy_denied_cas_winner_and_applies_late_cancel() {
     for (offset, conflict) in [
         InjectedCasConflict::RunVersion,
         InjectedCasConflict::CheckpointVersion,
@@ -2592,105 +2772,120 @@ async fn recovery_dispatch_adopts_policy_denied_winner_after_real_run_or_checkpo
     .into_iter()
     .enumerate()
     {
-        let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
-        let mut definition = definition();
-        definition.resolved_capabilities = vec![ResolvedCapability {
-            capability_id: capability_manifest.id.clone(),
-            manifest_version: capability_manifest.version,
-            schema_digest: capability_manifest.schema_digest().into(),
-            override_config: None,
-            approval_policy_revision: 1,
-        }];
-        let clock = Arc::new(ManualExecutionClock::default());
-        let store = Arc::new(RacingExecutionStore::new(
-            clock.clone(),
-            conflict,
-            DispatchRaceBoundary::Recovery,
-        ));
-        let seed = 0x870 + (offset as u128 * 0x10);
-        let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, &definition).await;
-        let model = Arc::new(StreamingModel {
-            turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
-                ModelGenerateResponse {
-                    content: Content::default(),
-                    tool_calls: Some(vec![ToolCall {
-                        id: "recovery-cas-tool".into(),
-                        name: capability_manifest.id.clone(),
-                        args: BTreeMap::from([(
-                            "path".into(),
-                            DataValue::String("recovery-cas.txt".into()),
-                        )]),
-                    }]),
-                    usage: TokenUsage::default(),
-                    stop_reason: ModelStopReason::ToolCall,
+        for (control_offset, cancel_after_adoption) in [false, true].into_iter().enumerate() {
+            let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+            let mut definition = definition();
+            definition.resolved_capabilities = vec![ResolvedCapability {
+                capability_id: capability_manifest.id.clone(),
+                manifest_version: capability_manifest.version,
+                schema_digest: capability_manifest.schema_digest().into(),
+                override_config: None,
+                approval_policy_revision: 1,
+            }];
+            let clock = Arc::new(ManualExecutionClock::default());
+            let signal = MutableBoundarySignal::new();
+            let store =
+                RacingExecutionStore::new(clock.clone(), conflict, DispatchRaceBoundary::Recovery);
+            let store = Arc::new(if cancel_after_adoption {
+                store.with_boundary_signal(signal.clone())
+            } else {
+                store
+            });
+            let seed = 0x8d0 + (offset as u128 * 0x20) + (control_offset as u128 * 0x10);
+            let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, &definition).await;
+            let model = Arc::new(StreamingModel {
+                turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                    ModelGenerateResponse {
+                        content: Content::default(),
+                        tool_calls: Some(vec![ToolCall {
+                            id: "recovery-cas-tool".into(),
+                            name: capability_manifest.id.clone(),
+                            args: BTreeMap::from([(
+                                "path".into(),
+                                DataValue::String("recovery-cas.txt".into()),
+                            )]),
+                        }]),
+                        usage: TokenUsage::default(),
+                        stop_reason: ModelStopReason::ToolCall,
+                    },
+                )]])),
+            });
+            let mut catalog = ManifestCatalog::default();
+            catalog
+                .register_manifest(capability_manifest.clone())
+                .unwrap();
+            let external_calls = Arc::new(Mutex::new(0));
+            let mut registry = CapabilityRegistry::new(catalog);
+            registry
+                .register_executor(Arc::new(AbsentThenSuccessfulExecutor {
+                    manifest: capability_manifest,
+                    calls: external_calls.clone(),
+                }))
+                .unwrap();
+            let engine = DurableAgentEngine::new(
+                store.clone(),
+                model,
+                Arc::new(StaticDefinitions(definition)),
+                Arc::new(AllowPolicy),
+                Arc::new(registry),
+                clock.clone(),
+                Arc::new(RecordingLiveSink::default()),
+                Arc::new(CrashOnceAfterDispatch(AtomicBool::new(true))),
+                DurableEngineConfig {
+                    lease_duration_ms: 1_000,
                 },
-            )]])),
-        });
-        let mut catalog = ManifestCatalog::default();
-        catalog
-            .register_manifest(capability_manifest.clone())
+            )
             .unwrap();
-        let external_calls = Arc::new(Mutex::new(0));
-        let mut registry = CapabilityRegistry::new(catalog);
-        registry
-            .register_executor(Arc::new(AbsentThenSuccessfulExecutor {
-                manifest: capability_manifest,
-                calls: external_calls.clone(),
-            }))
-            .unwrap();
-        let engine = DurableAgentEngine::new(
-            store.clone(),
-            model,
-            Arc::new(StaticDefinitions(definition)),
-            Arc::new(AllowPolicy),
-            Arc::new(registry),
-            clock.clone(),
-            Arc::new(RecordingLiveSink::default()),
-            Arc::new(CrashOnceAfterDispatch(AtomicBool::new(true))),
-            DurableEngineConfig {
-                lease_duration_ms: 1_000,
-            },
-        )
-        .unwrap();
 
-        assert_eq!(
-            engine
-                .run(owner_id, run_id, &ContinueSignal)
+            assert_eq!(
+                engine
+                    .run(owner_id, run_id, &ContinueSignal)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                EngineErrorCode::CrashInjected
+            );
+            let first_attempt = store
+                .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
                 .await
-                .unwrap_err()
-                .code(),
-            EngineErrorCode::CrashInjected
-        );
-        let first_attempt = store
-            .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
-            .await
-            .unwrap()
-            .items()[0]
-            .clone();
-        clock.advance_ms(1_001).unwrap();
+                .unwrap()
+                .items()[0]
+                .clone();
+            clock.advance_ms(1_001).unwrap();
 
-        assert_eq!(
-            engine.run(owner_id, run_id, &ContinueSignal).await.unwrap(),
-            EngineRunOutcome::Denied
-        );
-        assert_eq!(*external_calls.lock().unwrap(), 0);
-        let attempts = store
-            .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(attempts.items().len(), 1);
-        assert_eq!(attempts.items()[0].invocation(), first_attempt.invocation());
-        assert_eq!(attempts.items()[0].attempt_number(), 1);
-        assert_eq!(
-            attempts.items()[0].state(),
-            anima_core::AttemptRecordState::Uncertain
-        );
-        let winner = store.load_run(owner_id, run_id).await.unwrap().unwrap();
-        assert_eq!(winner.run().state(), RunState::Paused);
-        assert_eq!(
-            winner.run().pause_reason(),
-            Some(RunPauseReason::PolicyDenied)
-        );
+            let expected = if cancel_after_adoption {
+                EngineRunOutcome::Cancelled
+            } else {
+                EngineRunOutcome::Denied
+            };
+            assert_eq!(
+                engine.run(owner_id, run_id, &signal).await.unwrap(),
+                expected
+            );
+            assert_eq!(*external_calls.lock().unwrap(), 0);
+            let attempts = store
+                .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(attempts.items().len(), 1);
+            assert_eq!(attempts.items()[0].invocation(), first_attempt.invocation());
+            assert_eq!(attempts.items()[0].attempt_number(), 1);
+            assert_eq!(
+                attempts.items()[0].state(),
+                anima_core::AttemptRecordState::Uncertain
+            );
+            let winner = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+            if cancel_after_adoption {
+                assert_eq!(winner.run().state(), RunState::Cancelled);
+                assert_eq!(winner.run().pause_reason(), None);
+            } else {
+                assert_eq!(winner.run().state(), RunState::Paused);
+                assert_eq!(
+                    winner.run().pause_reason(),
+                    Some(RunPauseReason::PolicyDenied)
+                );
+            }
+        }
     }
 }
 
@@ -2900,6 +3095,238 @@ async fn approved_waiting_invocation_is_claimed_and_dispatched_exactly_once() {
         .events()
         .iter()
         .any(|event| event.kind() == RuntimeEventKind::ApprovalResolved));
+}
+
+#[tokio::test]
+async fn cancellation_flipped_during_approval_resolution_prevents_dispatch() {
+    let capability_manifest = manifest_with_risk(RecoveryMode::NonRetryable, RiskLevel::Medium);
+    let mut definition = definition();
+    definition.resolved_capabilities = vec![ResolvedCapability {
+        capability_id: capability_manifest.id.clone(),
+        manifest_version: capability_manifest.version,
+        schema_digest: capability_manifest.schema_digest().into(),
+        override_config: None,
+        approval_policy_revision: 1,
+    }];
+    let clock = Arc::new(ManualExecutionClock::default());
+    let store = Arc::new(InMemoryExecutionStore::with_clock(clock.clone()));
+    let (owner_id, run_id) = create_run_in_store(store.as_ref(), 0x6a0, &definition).await;
+    let model = Arc::new(StreamingModel {
+        turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+            ModelGenerateResponse {
+                content: Content::default(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "approval-cancel-step".into(),
+                    name: capability_manifest.id.clone(),
+                    args: BTreeMap::from([(
+                        "path".into(),
+                        DataValue::String("approval-cancel.txt".into()),
+                    )]),
+                }]),
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::ToolCall,
+            },
+        )]])),
+    });
+    let capabilities = Arc::new(RecordingCapabilities {
+        manifest: capability_manifest,
+        calls: Mutex::new(vec![]),
+        completed: Mutex::new(None),
+    });
+    let signal = MutableBoundarySignal::new();
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        model,
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(FlipApprovalPolicy {
+            signal: signal.clone(),
+        }),
+        capabilities.clone(),
+        clock.clone(),
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig {
+            lease_duration_ms: 1_000,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine.run(owner_id, run_id, &signal).await.unwrap(),
+        EngineRunOutcome::WaitingForApproval
+    );
+    clock.advance_ms(1_001).unwrap();
+
+    assert_eq!(
+        engine.run(owner_id, run_id, &signal).await.unwrap(),
+        EngineRunOutcome::Cancelled
+    );
+    assert!(capabilities.calls.lock().unwrap().is_empty());
+    let cancelled = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+    assert_eq!(cancelled.run().state(), RunState::Cancelled);
+}
+
+#[tokio::test]
+async fn control_flipped_during_policy_denial_has_deterministic_durable_outcome() {
+    for (offset, action, expected, expected_state, expected_pause) in [
+        (
+            0_u128,
+            EngineBoundaryAction::Cancel,
+            EngineRunOutcome::Cancelled,
+            RunState::Cancelled,
+            None,
+        ),
+        (
+            0x10,
+            EngineBoundaryAction::Pause,
+            EngineRunOutcome::PausedByRequest,
+            RunState::Paused,
+            Some(RunPauseReason::Requested),
+        ),
+    ] {
+        let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+        let mut definition = definition();
+        definition.resolved_capabilities = vec![ResolvedCapability {
+            capability_id: capability_manifest.id.clone(),
+            manifest_version: capability_manifest.version,
+            schema_digest: capability_manifest.schema_digest().into(),
+            override_config: None,
+            approval_policy_revision: 1,
+        }];
+        let store = Arc::new(InMemoryExecutionStore::default());
+        let (owner_id, run_id) =
+            create_run_in_store(store.as_ref(), 0x6c0 + offset, &definition).await;
+        let model = Arc::new(StreamingModel {
+            turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                ModelGenerateResponse {
+                    content: Content::default(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "denial-control-step".into(),
+                        name: capability_manifest.id.clone(),
+                        args: BTreeMap::from([(
+                            "path".into(),
+                            DataValue::String("denial-control.txt".into()),
+                        )]),
+                    }]),
+                    usage: TokenUsage::default(),
+                    stop_reason: ModelStopReason::ToolCall,
+                },
+            )]])),
+        });
+        let capabilities = Arc::new(RecordingCapabilities {
+            manifest: capability_manifest,
+            calls: Mutex::new(vec![]),
+            completed: Mutex::new(None),
+        });
+        let signal = MutableBoundarySignal::new();
+        let engine = DurableAgentEngine::new(
+            store.clone(),
+            model,
+            Arc::new(StaticDefinitions(definition)),
+            Arc::new(FlipDeniedPolicy {
+                signal: signal.clone(),
+                action,
+            }),
+            capabilities.clone(),
+            Arc::new(ManualExecutionClock::default()),
+            Arc::new(RecordingLiveSink::default()),
+            Arc::new(NeverCrash),
+            DurableEngineConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.run(owner_id, run_id, &signal).await.unwrap(),
+            expected
+        );
+        assert!(capabilities.calls.lock().unwrap().is_empty());
+        let stored = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+        assert_eq!(stored.run().state(), expected_state);
+        assert_eq!(stored.run().pause_reason(), expected_pause);
+    }
+}
+
+#[tokio::test]
+async fn cancellation_flipped_by_recovery_callback_uses_recovery_terminal_path() {
+    let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+    let mut definition = definition();
+    definition.resolved_capabilities = vec![ResolvedCapability {
+        capability_id: capability_manifest.id.clone(),
+        manifest_version: capability_manifest.version,
+        schema_digest: capability_manifest.schema_digest().into(),
+        override_config: None,
+        approval_policy_revision: 1,
+    }];
+    let clock = Arc::new(ManualExecutionClock::default());
+    let store = Arc::new(InMemoryExecutionStore::with_clock(clock.clone()));
+    let (owner_id, run_id) = create_run_in_store(store.as_ref(), 0x6e0, &definition).await;
+    let model = Arc::new(StreamingModel {
+        turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+            ModelGenerateResponse {
+                content: Content::default(),
+                tool_calls: Some(vec![ToolCall {
+                    id: "recovery-cancel-step".into(),
+                    name: capability_manifest.id.clone(),
+                    args: BTreeMap::from([(
+                        "path".into(),
+                        DataValue::String("recovery-cancel.txt".into()),
+                    )]),
+                }]),
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::ToolCall,
+            },
+        )]])),
+    });
+    let signal = MutableBoundarySignal::new();
+    let capabilities = Arc::new(FlipRecoveryCapabilities {
+        manifest: capability_manifest,
+        signal: signal.clone(),
+        recovery_action: RecoveryAction::RecoveryRequired,
+        recovery_calls: AtomicUsize::new(0),
+        retry_calls: AtomicUsize::new(0),
+    });
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        model,
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(AllowPolicy),
+        capabilities.clone(),
+        clock.clone(),
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(CrashOnceAfterDispatch(AtomicBool::new(true))),
+        DurableEngineConfig {
+            lease_duration_ms: 1_000,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine
+            .run(owner_id, run_id, &signal)
+            .await
+            .unwrap_err()
+            .code(),
+        EngineErrorCode::CrashInjected
+    );
+    clock.advance_ms(1_001).unwrap();
+
+    assert_eq!(
+        engine.run(owner_id, run_id, &signal).await.unwrap(),
+        EngineRunOutcome::Cancelled
+    );
+    assert_eq!(capabilities.recovery_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(capabilities.retry_calls.load(Ordering::SeqCst), 0);
+    let cancelled = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+    assert_eq!(cancelled.run().state(), RunState::Cancelled);
+    let attempts = store
+        .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(attempts.items().len(), 1);
+    assert_eq!(
+        attempts.items()[0].state(),
+        anima_core::AttemptRecordState::Uncertain
+    );
 }
 
 async fn assert_rejected_waiting_approval(stale: bool, seed: u128) {
