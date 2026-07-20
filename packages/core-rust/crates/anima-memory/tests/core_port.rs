@@ -30,18 +30,18 @@ fn legacy_kinds_and_scopes_map_without_a_reverse_core_dependency() {
         (MemoryType::Reflection, MemoryKind::Reflection),
     ] {
         let mapped = legacy_memory_to_core(&legacy(legacy_kind, LegacyScope::Private)).unwrap();
-        assert_eq!(mapped.kind, core_kind);
+        assert_eq!(mapped.kind(), core_kind);
     }
 
     let agent = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Private)).unwrap();
-    assert_eq!(agent.scope, MemoryScope::agent("agent-1").unwrap());
+    assert_eq!(agent.scope(), &MemoryScope::agent("agent-1").unwrap());
     let workspace = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Shared)).unwrap();
     assert_eq!(
-        workspace.scope,
-        MemoryScope::workspace("workspace-1").unwrap()
+        workspace.scope(),
+        &MemoryScope::workspace("workspace-1").unwrap()
     );
     let session = legacy_memory_to_core(&legacy(MemoryType::Fact, LegacyScope::Room)).unwrap();
-    assert_eq!(session.scope, MemoryScope::session("session-1").unwrap());
+    assert_eq!(session.scope(), &MemoryScope::session("session-1").unwrap());
 }
 
 #[test]
@@ -72,7 +72,10 @@ fn legacy_private_scope_round_trips_only_the_exact_agent_identity() {
         world_id: legacy.world_id,
         session_id: legacy.session_id,
     };
-    assert_eq!(legacy_memory_to_core(&stored).unwrap().scope, write.scope);
+    assert_eq!(
+        legacy_memory_to_core(&stored).unwrap().scope(),
+        write.scope()
+    );
 
     let different_agent = MemoryWrite::new(
         "core-other",
@@ -111,11 +114,11 @@ fn legacy_episode_provenance_preserves_observation_and_task_result_subtype() {
     let task_result =
         legacy_memory_to_core(&legacy(MemoryType::TaskResult, LegacyScope::Private)).unwrap();
     assert_eq!(
-        observation.provenance.source,
+        observation.provenance().source(),
         "anima-memory/legacy/observation"
     );
     assert_eq!(
-        task_result.provenance.source,
+        task_result.provenance().source(),
         "anima-memory/legacy/task_result"
     );
 }

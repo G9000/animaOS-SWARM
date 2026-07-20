@@ -47,7 +47,7 @@ fn memory_contract_supports_every_kind_and_scope() {
             provenance(),
         )
         .unwrap();
-        assert_eq!(write.kind, kind);
+        assert_eq!(write.kind(), kind);
     }
 
     let scopes = scopes();
@@ -86,12 +86,12 @@ fn memory_contract_serde_and_lifecycle_fields_are_fail_closed() {
     .is_err());
 
     let revision = MemoryRevision::correction("memory-1", 3, "memory-0", "new source").unwrap();
-    assert_eq!(revision.expected_revision, 3);
-    assert_eq!(revision.corrects.as_deref(), Some("memory-0"));
-    assert_eq!(revision.correction_reason.as_deref(), Some("new source"));
-    assert!(revision.supersedes.contains(&"memory-0".to_owned()));
+    assert_eq!(revision.expected_revision(), 3);
+    assert_eq!(revision.corrects(), Some("memory-0"));
+    assert_eq!(revision.correction_reason(), Some("new source"));
+    assert!(revision.supersedes().contains(&"memory-0".to_owned()));
     assert!(MemoryRevision::forget("memory-1", 3, "retention policy").is_ok());
-    assert!(record.retention.deadline_ms.is_some());
+    assert!(record.retention().deadline_ms().is_some());
 }
 
 #[test]
@@ -247,8 +247,8 @@ fn memory_query_requires_exact_authorized_scope_and_explains_hits() {
     )
     .unwrap();
     let hit = MemoryHit::new(record, 0.5, "matched provenance and content").unwrap();
-    assert_eq!(hit.explanation, "matched provenance and content");
-    assert!(MemoryHit::new(hit.record.clone(), f64::INFINITY, "bad score").is_err());
+    assert_eq!(hit.explanation(), "matched provenance and content");
+    assert!(MemoryHit::new(hit.record().clone(), f64::INFINITY, "bad score").is_err());
     assert_eq!(
         MemoryQueryResult::new(&access, &query, vec![hit])
             .unwrap()
@@ -267,10 +267,10 @@ fn evidence_contract_validates_hashes_locators_and_scope() {
     let citation = Citation::new("doc-1", Some("chunk-1"), "line:1-2").unwrap();
     let artifact =
         Artifact::new("artifact-1", scope.clone(), "report", HASH, provenance()).unwrap();
-    assert_eq!(document.content_sha256, HASH);
-    assert_eq!(chunk.content_sha256.len(), 64);
-    assert_eq!(artifact.content_sha256, HASH);
-    assert_eq!(citation.locator, "line:1-2");
+    assert_eq!(document.content_sha256(), HASH);
+    assert_eq!(chunk.content_sha256().len(), 64);
+    assert_eq!(artifact.content_sha256(), HASH);
+    assert_eq!(citation.locator(), "line:1-2");
     assert!(Document::new("doc-2", scope, "bad", "not-a-hash", provenance()).is_err());
 
     let query =
@@ -286,7 +286,7 @@ fn evidence_contract_validates_hashes_locators_and_scope() {
             .len(),
         1
     );
-    assert_eq!(hit.explanation, "lexical match");
+    assert_eq!(hit.explanation(), "lexical match");
 }
 
 #[test]
@@ -374,7 +374,7 @@ fn bounded_scope_and_citation_contracts_reject_overflow_and_duplicates() {
 fn document_chunks_and_artifact_bytes_are_verified_and_bounded() {
     let scope = MemoryScope::workspace("workspace-1").unwrap();
     let chunk = DocumentChunk::new("chunk-1", scope.clone(), "doc-1", 0, "body", "line:1").unwrap();
-    assert_ne!(chunk.content_sha256, HASH);
+    assert_ne!(chunk.content_sha256(), HASH);
     assert!(DocumentChunk::new("chunk-2", scope.clone(), "doc-1", 1, "", "line:2").is_err());
     let page = DocumentChunkPage::new("doc-1", &scope, vec![chunk], 1).unwrap();
     assert_eq!(page.chunks().len(), 1);
@@ -388,7 +388,7 @@ fn document_chunks_and_artifact_bytes_are_verified_and_bounded() {
     )
     .unwrap();
     assert_eq!(
-        artifact.content_sha256,
+        artifact.content_sha256(),
         "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"
     );
     let mut tampered = to_value(&artifact).unwrap();

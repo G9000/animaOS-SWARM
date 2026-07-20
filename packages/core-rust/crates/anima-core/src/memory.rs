@@ -28,6 +28,28 @@ pub enum MemoryKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct MemoryScopeId(String);
+
+impl MemoryScopeId {
+    pub fn new(id: impl Into<String>) -> Result<Self, MemoryPortError> {
+        Ok(Self(required(id.into(), "memory scope ID")?))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for MemoryScopeId {
+    type Error = MemoryPortError;
+
+    fn try_from(id: String) -> Result<Self, Self::Error> {
+        Self::new(id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
     content = "id",
@@ -35,27 +57,27 @@ pub enum MemoryKind {
     try_from = "MemoryScopeWire"
 )]
 pub enum MemoryScope {
-    Owner(String),
-    Agent(String),
-    Session(String),
-    Workspace(String),
+    Owner(MemoryScopeId),
+    Agent(MemoryScopeId),
+    Session(MemoryScopeId),
+    Workspace(MemoryScopeId),
 }
 
 impl MemoryScope {
     pub fn owner(id: impl Into<String>) -> Result<Self, MemoryPortError> {
-        Ok(Self::Owner(required(id.into(), "owner scope ID")?))
+        Ok(Self::Owner(MemoryScopeId::new(id)?))
     }
 
     pub fn agent(id: impl Into<String>) -> Result<Self, MemoryPortError> {
-        Ok(Self::Agent(required(id.into(), "agent scope ID")?))
+        Ok(Self::Agent(MemoryScopeId::new(id)?))
     }
 
     pub fn session(id: impl Into<String>) -> Result<Self, MemoryPortError> {
-        Ok(Self::Session(required(id.into(), "session scope ID")?))
+        Ok(Self::Session(MemoryScopeId::new(id)?))
     }
 
     pub fn workspace(id: impl Into<String>) -> Result<Self, MemoryPortError> {
-        Ok(Self::Workspace(required(id.into(), "workspace scope ID")?))
+        Ok(Self::Workspace(MemoryScopeId::new(id)?))
     }
 
     /// Authorization is deliberately exact: a session is not implicitly an owner or workspace.
@@ -65,7 +87,9 @@ impl MemoryScope {
 
     pub fn id(&self) -> &str {
         match self {
-            Self::Owner(id) | Self::Agent(id) | Self::Session(id) | Self::Workspace(id) => id,
+            Self::Owner(id) | Self::Agent(id) | Self::Session(id) | Self::Workspace(id) => {
+                id.as_str()
+            }
         }
     }
 }
@@ -73,9 +97,9 @@ impl MemoryScope {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryProvenanceWire")]
 pub struct MemoryProvenance {
-    pub source: String,
-    pub source_identity: String,
-    pub observed_at_ms: u64,
+    source: String,
+    source_identity: String,
+    observed_at_ms: u64,
 }
 
 impl MemoryProvenance {
@@ -90,6 +114,16 @@ impl MemoryProvenance {
             observed_at_ms,
         })
     }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+    pub fn source_identity(&self) -> &str {
+        &self.source_identity
+    }
+    pub fn observed_at_ms(&self) -> u64 {
+        self.observed_at_ms
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,8 +137,8 @@ pub enum RetentionPolicy {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryRetentionWire")]
 pub struct MemoryRetention {
-    pub policy: RetentionPolicy,
-    pub deadline_ms: Option<u64>,
+    policy: RetentionPolicy,
+    deadline_ms: Option<u64>,
 }
 
 impl Default for MemoryRetention {
@@ -117,6 +151,13 @@ impl Default for MemoryRetention {
 }
 
 impl MemoryRetention {
+    pub fn policy(&self) -> RetentionPolicy {
+        self.policy
+    }
+    pub fn deadline_ms(&self) -> Option<u64> {
+        self.deadline_ms
+    }
+
     pub fn deadline(deadline_ms: u64) -> Result<Self, MemoryPortError> {
         if deadline_ms == 0 {
             return Err(MemoryPortError::invalid(
@@ -152,14 +193,14 @@ impl MemoryRetention {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryWriteWire")]
 pub struct MemoryWrite {
-    pub id: String,
-    pub kind: MemoryKind,
-    pub scope: MemoryScope,
-    pub content: String,
-    pub confidence: f64,
-    pub provenance: MemoryProvenance,
+    id: String,
+    kind: MemoryKind,
+    scope: MemoryScope,
+    content: String,
+    confidence: f64,
+    provenance: MemoryProvenance,
     #[serde(default)]
-    pub retention: MemoryRetention,
+    retention: MemoryRetention,
 }
 
 impl MemoryWrite {
@@ -186,23 +227,45 @@ impl MemoryWrite {
         self.retention = MemoryRetention::deadline(deadline_ms)?;
         Ok(self)
     }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn kind(&self) -> MemoryKind {
+        self.kind
+    }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    pub fn confidence(&self) -> f64 {
+        self.confidence
+    }
+    pub fn provenance(&self) -> &MemoryProvenance {
+        &self.provenance
+    }
+    pub fn retention(&self) -> &MemoryRetention {
+        &self.retention
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryRecordWire")]
 pub struct MemoryRecord {
-    pub id: String,
-    pub kind: MemoryKind,
-    pub scope: MemoryScope,
-    pub content: String,
-    pub confidence: f64,
-    pub provenance: MemoryProvenance,
-    pub revision: u64,
-    pub supersedes: Vec<String>,
-    pub corrects: Option<String>,
-    pub forgotten_at_ms: Option<u64>,
-    pub forget_reason: Option<String>,
-    pub retention: MemoryRetention,
+    id: String,
+    kind: MemoryKind,
+    scope: MemoryScope,
+    content: String,
+    confidence: f64,
+    provenance: MemoryProvenance,
+    revision: u64,
+    supersedes: Vec<String>,
+    corrects: Option<String>,
+    forgotten_at_ms: Option<u64>,
+    forget_reason: Option<String>,
+    retention: MemoryRetention,
 }
 
 impl MemoryRecord {
@@ -265,17 +328,54 @@ impl MemoryRecord {
         }
         Ok(record)
     }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn kind(&self) -> MemoryKind {
+        self.kind
+    }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    pub fn confidence(&self) -> f64 {
+        self.confidence
+    }
+    pub fn provenance(&self) -> &MemoryProvenance {
+        &self.provenance
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn supersedes(&self) -> &[String] {
+        &self.supersedes
+    }
+    pub fn corrects(&self) -> Option<&str> {
+        self.corrects.as_deref()
+    }
+    pub fn forgotten_at_ms(&self) -> Option<u64> {
+        self.forgotten_at_ms
+    }
+    pub fn forget_reason(&self) -> Option<&str> {
+        self.forget_reason.as_deref()
+    }
+    pub fn retention(&self) -> &MemoryRetention {
+        &self.retention
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryRevisionWire")]
 pub struct MemoryRevision {
-    pub memory_id: String,
-    pub expected_revision: u64,
-    pub supersedes: Vec<String>,
-    pub corrects: Option<String>,
-    pub correction_reason: Option<String>,
-    pub forget_reason: Option<String>,
+    memory_id: String,
+    expected_revision: u64,
+    supersedes: Vec<String>,
+    corrects: Option<String>,
+    correction_reason: Option<String>,
+    forget_reason: Option<String>,
 }
 
 impl MemoryRevision {
@@ -370,14 +470,33 @@ impl MemoryRevision {
             )),
         }
     }
+
+    pub fn memory_id(&self) -> &str {
+        &self.memory_id
+    }
+    pub fn expected_revision(&self) -> u64 {
+        self.expected_revision
+    }
+    pub fn supersedes(&self) -> &[String] {
+        &self.supersedes
+    }
+    pub fn corrects(&self) -> Option<&str> {
+        self.corrects.as_deref()
+    }
+    pub fn correction_reason(&self) -> Option<&str> {
+        self.correction_reason.as_deref()
+    }
+    pub fn forget_reason(&self) -> Option<&str> {
+        self.forget_reason.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryQueryWire")]
 pub struct MemoryQuery {
-    pub text: String,
+    text: String,
     requested_scopes: Vec<MemoryScope>,
-    pub limit: usize,
+    limit: usize,
 }
 
 impl MemoryQuery {
@@ -406,6 +525,13 @@ impl MemoryQuery {
 
     pub fn requested_scopes(&self) -> &[MemoryScope] {
         &self.requested_scopes
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 }
 
@@ -475,9 +601,9 @@ impl MemoryQueryResult {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "MemoryHitWire")]
 pub struct MemoryHit {
-    pub record: MemoryRecord,
-    pub score: f64,
-    pub explanation: String,
+    record: MemoryRecord,
+    score: f64,
+    explanation: String,
 }
 
 impl MemoryHit {
@@ -495,6 +621,16 @@ impl MemoryHit {
                 MAX_EXPLANATION_BYTES,
             )?,
         })
+    }
+
+    pub fn record(&self) -> &MemoryRecord {
+        &self.record
+    }
+    pub fn score(&self) -> f64 {
+        self.score
+    }
+    pub fn explanation(&self) -> &str {
+        &self.explanation
     }
 }
 

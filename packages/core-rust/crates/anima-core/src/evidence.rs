@@ -21,11 +21,11 @@ pub const MAX_CITATIONS: usize = 64;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "DocumentWire")]
 pub struct Document {
-    pub id: String,
-    pub scope: MemoryScope,
-    pub title: String,
-    pub content_sha256: String,
-    pub provenance: MemoryProvenance,
+    id: String,
+    scope: MemoryScope,
+    title: String,
+    content_sha256: String,
+    provenance: MemoryProvenance,
 }
 
 impl Document {
@@ -44,19 +44,35 @@ impl Document {
             provenance,
         })
     }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+    pub fn provenance(&self) -> &MemoryProvenance {
+        &self.provenance
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "DocumentChunkWire")]
 pub struct DocumentChunk {
-    pub id: String,
-    pub scope: MemoryScope,
-    pub document_id: String,
-    pub index: u32,
+    id: String,
+    scope: MemoryScope,
+    document_id: String,
+    index: u32,
     /// Content is bounded plain text; credential material must never be passed to this API.
-    pub content: String,
-    pub content_sha256: String,
-    pub locator: String,
+    content: String,
+    content_sha256: String,
+    locator: String,
 }
 
 impl DocumentChunk {
@@ -84,14 +100,36 @@ impl DocumentChunk {
         self.content_sha256 = sha256_bytes(self.content.as_bytes());
         self
     }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn document_id(&self) -> &str {
+        &self.document_id
+    }
+    pub fn index(&self) -> u32 {
+        self.index
+    }
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+    pub fn locator(&self) -> &str {
+        &self.locator
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "CitationWire")]
 pub struct Citation {
-    pub document_id: String,
-    pub chunk_id: Option<String>,
-    pub locator: String,
+    document_id: String,
+    chunk_id: Option<String>,
+    locator: String,
 }
 
 impl Citation {
@@ -108,16 +146,26 @@ impl Citation {
             locator: bounded(locator.into(), "citation locator", MAX_LOCATOR_BYTES)?,
         })
     }
+
+    pub fn document_id(&self) -> &str {
+        &self.document_id
+    }
+    pub fn chunk_id(&self) -> Option<&str> {
+        self.chunk_id.as_deref()
+    }
+    pub fn locator(&self) -> &str {
+        &self.locator
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ArtifactWire")]
 pub struct Artifact {
-    pub id: String,
-    pub scope: MemoryScope,
-    pub name: String,
-    pub content_sha256: String,
-    pub provenance: MemoryProvenance,
+    id: String,
+    scope: MemoryScope,
+    name: String,
+    content_sha256: String,
+    provenance: MemoryProvenance,
 }
 
 impl Artifact {
@@ -136,17 +184,33 @@ impl Artifact {
             provenance,
         })
     }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+    pub fn provenance(&self) -> &MemoryProvenance {
+        &self.provenance
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "ArtifactWriteWire")]
 pub struct ArtifactWrite {
-    pub id: String,
-    pub scope: MemoryScope,
-    pub name: String,
-    pub content_sha256: String,
-    pub content: Vec<u8>,
-    pub provenance: MemoryProvenance,
+    id: String,
+    scope: MemoryScope,
+    name: String,
+    content_sha256: String,
+    content: Vec<u8>,
+    provenance: MemoryProvenance,
 }
 
 impl ArtifactWrite {
@@ -172,6 +236,25 @@ impl ArtifactWrite {
             provenance: artifact.provenance,
         })
     }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    pub fn scope(&self) -> &MemoryScope {
+        &self.scope
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn content_sha256(&self) -> &str {
+        &self.content_sha256
+    }
+    pub fn content(&self) -> &[u8] {
+        &self.content
+    }
+    pub fn provenance(&self) -> &MemoryProvenance {
+        &self.provenance
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,9 +278,9 @@ impl Evidence {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "RetrievalQueryWire")]
 pub struct RetrievalQuery {
-    pub text: String,
+    text: String,
     requested_scopes: Vec<MemoryScope>,
-    pub limit: usize,
+    limit: usize,
 }
 
 impl RetrievalQuery {
@@ -227,15 +310,22 @@ impl RetrievalQuery {
     pub fn requested_scopes(&self) -> &[MemoryScope] {
         &self.requested_scopes
     }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "RetrievalHitWire")]
 pub struct RetrievalHit {
-    pub evidence: Evidence,
-    pub score: f64,
-    pub explanation: String,
-    pub citations: Vec<Citation>,
+    evidence: Evidence,
+    score: f64,
+    explanation: String,
+    citations: Vec<Citation>,
 }
 
 impl RetrievalHit {
@@ -263,6 +353,19 @@ impl RetrievalHit {
 
     pub fn scope(&self) -> Option<&MemoryScope> {
         self.evidence.scope()
+    }
+
+    pub fn evidence(&self) -> &Evidence {
+        &self.evidence
+    }
+    pub fn score(&self) -> f64 {
+        self.score
+    }
+    pub fn explanation(&self) -> &str {
+        &self.explanation
+    }
+    pub fn citations(&self) -> &[Citation] {
+        &self.citations
     }
 }
 

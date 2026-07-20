@@ -112,17 +112,17 @@ pub fn core_memory_to_legacy(
     memory: &MemoryWrite,
     context: &LegacyMemoryContext,
 ) -> Result<NewMemory, LegacyBridgeError> {
-    if memory.retention != MemoryRetention::default() {
+    if memory.retention() != &MemoryRetention::default() {
         return Err(LegacyBridgeError::new(
             LegacyBridgeErrorCode::UnsupportedLifecycle,
             "legacy MemoryManager cannot honor core retention, correction, forgetting, or CAS semantics",
         ));
     }
 
-    let memory_type = match memory.kind {
+    let memory_type = match memory.kind() {
         CoreMemoryKind::Fact => MemoryType::Fact,
         CoreMemoryKind::Episode
-            if memory.provenance.source == "anima-memory/legacy/task_result" =>
+            if memory.provenance().source() == "anima-memory/legacy/task_result" =>
         {
             MemoryType::TaskResult
         }
@@ -133,20 +133,20 @@ pub fn core_memory_to_legacy(
                 LegacyBridgeErrorCode::UnsupportedKind,
                 format!(
                     "legacy MemoryManager cannot represent core {:?} memories",
-                    memory.kind
+                    memory.kind()
                 ),
             ));
         }
     };
 
-    let (scope, room_id, world_id, session_id) = match &memory.scope {
+    let (scope, room_id, world_id, session_id) = match memory.scope() {
         CoreMemoryScope::Owner(_) => {
             return Err(LegacyBridgeError::new(
                 LegacyBridgeErrorCode::UnsupportedScope,
                 "legacy MemoryManager has no owner scope and must not coerce it to private",
             ));
         }
-        CoreMemoryScope::Agent(agent_id) if agent_id == &context.agent_id => {
+        CoreMemoryScope::Agent(agent_id) if agent_id.as_str() == context.agent_id => {
             (MemoryScope::Private, None, None, None)
         }
         CoreMemoryScope::Agent(_) => {
@@ -157,21 +157,24 @@ pub fn core_memory_to_legacy(
         }
         CoreMemoryScope::Session(session_id) => (
             MemoryScope::Room,
-            Some(session_id.clone()),
+            Some(session_id.as_str().to_owned()),
             None,
-            Some(session_id.clone()),
+            Some(session_id.as_str().to_owned()),
         ),
-        CoreMemoryScope::Workspace(workspace_id) => {
-            (MemoryScope::Shared, None, Some(workspace_id.clone()), None)
-        }
+        CoreMemoryScope::Workspace(workspace_id) => (
+            MemoryScope::Shared,
+            None,
+            Some(workspace_id.as_str().to_owned()),
+            None,
+        ),
     };
 
     Ok(NewMemory {
         agent_id: context.agent_id.clone(),
         agent_name: context.agent_name.clone(),
         memory_type,
-        content: memory.content.clone(),
-        importance: memory.confidence,
+        content: memory.content().to_owned(),
+        importance: memory.confidence(),
         tags: None,
         scope: Some(scope),
         room_id,

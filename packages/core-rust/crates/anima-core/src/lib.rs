@@ -76,7 +76,7 @@ pub use execution::{
 pub use memory::{
     KnowledgeAccessContext, MemoryHit, MemoryKind, MemoryPort, MemoryPortError,
     MemoryPortErrorCode, MemoryProvenance, MemoryQuery, MemoryQueryResult, MemoryRecord,
-    MemoryRetention, MemoryRevision, MemoryScope, MemoryWrite, RetentionPolicy,
+    MemoryRetention, MemoryRevision, MemoryScope, MemoryScopeId, MemoryWrite, RetentionPolicy,
     MAX_KNOWLEDGE_HITS, MAX_KNOWLEDGE_SCOPES,
 };
 pub use model::{
