@@ -2436,11 +2436,7 @@ where
             format!("sha256:{}", "2".repeat(64)),
             RecoveryMode::KeyedIdempotent,
         ))?;
-        let first_number = if matches!(case, InvalidRetryAttemptCase::Overflow) {
-            u32::MAX
-        } else {
-            1
-        };
+        let first_number = 1;
         let first_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
             &invocation,
             first_number,
@@ -2504,9 +2500,8 @@ where
             manifest.clone()
         };
         let retry_number = match case {
-            InvalidRetryAttemptCase::SameAttempt | InvalidRetryAttemptCase::Overflow => {
-                first_number
-            }
+            InvalidRetryAttemptCase::SameAttempt => first_number,
+            InvalidRetryAttemptCase::Overflow => u32::MAX,
             InvalidRetryAttemptCase::SkippedAttempt => first_number + 2,
             InvalidRetryAttemptCase::DifferentInvocation
             | InvalidRetryAttemptCase::DifferentManifest
@@ -2519,6 +2514,52 @@ where
             retry_manifest,
             RecoveryMode::KeyedIdempotent,
         ))?;
+        if matches!(case, InvalidRetryAttemptCase::SkippedAttempt) {
+            let plain_skipped = store
+                .commit_execution(
+                    owner_id,
+                    ExecutionCommit::new(
+                        first.stored_run().run_version(),
+                        first.checkpoint_version(),
+                        lease.clone(),
+                        RuntimeCommand::prepare_dispatch(
+                            Uuid::from_u128(seed + 7),
+                            session.id(),
+                            queued.id(),
+                        )
+                        .map_err(ExecutionStoreError::from)?,
+                        vec![],
+                        vec![],
+                        vec![retry_dispatching.clone()],
+                        vec![],
+                        None,
+                        first.stored_run().run().clone(),
+                    )
+                    .with_policy_guard(conformance_dispatch_guard(
+                        owner_id,
+                        &session,
+                        &retry_invocation,
+                    )?),
+                )
+                .await;
+            if !matches!(
+                plain_skipped,
+                Err(error) if error.code() == ExecutionStoreErrorCode::LineageConflict
+            ) || store
+                .load_attempts_page(
+                    owner_id,
+                    queued.id(),
+                    StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+                )
+                .await?
+                .items()
+                != [first_dispatching.clone()]
+            {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::InvalidRequest,
+                ));
+            }
+        }
         let pause = conformance_value(super::RecoveryPauseRecord::new(
             invocation.binding(),
             first_number,

@@ -17,7 +17,8 @@ use anima_core::{
 };
 use anima_model_adapters::{ProviderAdapterConfig, ProviderCredential, ProviderModelAdapter};
 use async_trait::async_trait;
-use axum::{routing::post, Router};
+use axum::{extract::Json, routing::post, Router};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
@@ -143,14 +144,18 @@ async fn openai_and_anthropic_real_adapters_drive_the_durable_capability_loop() 
 
 async fn run_provider_loop(provider: &str, seed: u128) {
     let requests = Arc::new(AtomicUsize::new(0));
+    let request_bodies = Arc::new(Mutex::new(Vec::new()));
     let app = match provider {
         "openai" => Router::new().route(
             "/v1/chat/completions",
             post({
                 let requests = requests.clone();
-                move || {
+                let request_bodies = request_bodies.clone();
+                move |Json(request): Json<Value>| {
                     let requests = requests.clone();
+                    let request_bodies = request_bodies.clone();
                     async move {
+                        request_bodies.lock().unwrap().push(request);
                         let body = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
                             concat!(
                                 "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_\",\"type\":\"function\",\"function\":{\"name\":\"workspace.\",\"arguments\":\"{\\\"path\\\":\\\"provider\"}}]}}]}\n\n",
@@ -172,9 +177,12 @@ async fn run_provider_loop(provider: &str, seed: u128) {
             "/v1/messages",
             post({
                 let requests = requests.clone();
-                move || {
+                let request_bodies = request_bodies.clone();
+                move |Json(request): Json<Value>| {
                     let requests = requests.clone();
+                    let request_bodies = request_bodies.clone();
                     async move {
+                        request_bodies.lock().unwrap().push(request);
                         let body = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
                             concat!(
                                 "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n",
@@ -274,6 +282,54 @@ async fn run_provider_loop(provider: &str, seed: u128) {
         EngineRunOutcome::Completed { ref content } if content.text == "provider-complete"
     ));
     assert_eq!(requests.load(Ordering::SeqCst), 2);
+    let request_bodies = request_bodies.lock().unwrap();
+    assert_eq!(request_bodies.len(), 2);
+    match provider {
+        "openai" => {
+            assert_eq!(
+                request_bodies[0]["tools"][0]["function"]["name"],
+                "workspace.write"
+            );
+            assert!(request_bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "assistant"
+                        && message["tool_calls"][0]["id"] == "call_engine"
+                        && message["tool_calls"][0]["function"]["name"] == "workspace.write"
+                }));
+            assert!(request_bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "tool" && message["tool_call_id"] == "call_engine"
+                }));
+        }
+        "anthropic" => {
+            assert_eq!(request_bodies[0]["tools"][0]["name"], "workspace.write");
+            assert!(request_bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "assistant"
+                        && message["content"][0]["type"] == "tool_use"
+                        && message["content"][0]["id"] == "tool_engine"
+                }));
+            assert!(request_bodies[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "user"
+                        && message["content"][0]["type"] == "tool_result"
+                        && message["content"][0]["tool_use_id"] == "tool_engine"
+                }));
+        }
+        _ => unreachable!(),
+    }
     let calls = runtime.calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].invocation().capability_id(), "workspace.write");

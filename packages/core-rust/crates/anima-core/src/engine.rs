@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -423,6 +424,7 @@ where
             return Err(EngineError::new(EngineErrorCode::DefinitionUnavailable));
         }
         let mut manifest_pins = Vec::with_capacity(definition.resolved_capabilities.len());
+        let mut manifests = Vec::with_capacity(definition.resolved_capabilities.len());
         for pin in &definition.resolved_capabilities {
             let manifest = self
                 .capabilities
@@ -435,6 +437,7 @@ where
                 ManifestPin::from_manifest(&manifest)
                     .map_err(|_| EngineError::new(EngineErrorCode::ManifestUnavailable))?,
             );
+            manifests.push(manifest);
         }
         let mut lease = self
             .store
@@ -462,7 +465,7 @@ where
                         run_id,
                         definition_pin.clone(),
                         1,
-                        manifest_pins,
+                        manifest_pins.clone(),
                         Budget {
                             max_turns: Some(u64::from(definition.limits.max_turns)),
                             ..Budget::default()
@@ -475,6 +478,9 @@ where
                     false,
                 ),
             };
+        if checkpoint_was_loaded && checkpoint.manifests() != manifest_pins.as_slice() {
+            return Err(EngineError::new(EngineErrorCode::ManifestUnavailable));
+        }
         if current.run().state() == RunState::Queued {
             let running = current
                 .run()
@@ -603,6 +609,19 @@ where
                 RunState::Running => {}
                 _ => return Err(EngineError::new(EngineErrorCode::InvalidState)),
             }
+            match signal.at_boundary() {
+                EngineBoundaryAction::Continue => {}
+                EngineBoundaryAction::Pause => {
+                    return self
+                        .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
+                        .await
+                }
+                EngineBoundaryAction::Cancel => {
+                    return self
+                        .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
+                        .await
+                }
+            }
         } else if current.run().state() == RunState::WaitingForApproval {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
@@ -677,8 +696,11 @@ where
                 .await_with_lease_heartbeat(
                     owner_id,
                     lease,
-                    self.model
-                        .stream(&agent_config(&definition), &model_request, &collector),
+                    self.model.stream(
+                        &agent_config(&definition, &manifests),
+                        &model_request,
+                        &collector,
+                    ),
                 )
                 .await?;
             lease = renewed;
@@ -744,10 +766,30 @@ where
                 lease = self.renew(owner_id, lease).await?;
             }
 
+            match signal.at_boundary() {
+                EngineBoundaryAction::Continue => {}
+                EngineBoundaryAction::Pause => {
+                    return self
+                        .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
+                        .await
+                }
+                EngineBoundaryAction::Cancel => {
+                    return self
+                        .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
+                        .await
+                }
+            }
+
             let tool_calls = response.tool_calls.clone().unwrap_or_default();
             if tool_calls.is_empty() {
                 break response;
             }
+            messages.push(assistant_tool_call_message(
+                &definition,
+                current.run().session_id(),
+                self.clock.now_ms(),
+                &tool_calls,
+            ));
             for tool_call in tool_calls {
                 let executed = self
                     .execute_capability(
@@ -783,6 +825,19 @@ where
                         return Ok(EngineRunOutcome::Denied)
                     }
                     _ => {}
+                }
+                match signal.at_boundary() {
+                    EngineBoundaryAction::Continue => {}
+                    EngineBoundaryAction::Pause => {
+                        return self
+                            .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
+                            .await
+                    }
+                    EngineBoundaryAction::Cancel => {
+                        return self
+                            .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
+                            .await
+                    }
                 }
             }
             match signal.at_boundary() {
@@ -1093,7 +1148,7 @@ where
                     id: format!("approval:{}", invocation.id()),
                     agent_id: definition.id.clone(),
                     room_id: current.run().session_id().to_string(),
-                    content: Content::default(),
+                    content: tool_result_content(invocation.logical_step_id()),
                     role: MessageRole::Tool,
                     created_at_ms: self.clock.now_ms(),
                 },
@@ -1859,7 +1914,7 @@ where
                 id: format!("recovery:{}", invocation.id()),
                 agent_id: definition.id.clone(),
                 room_id: current.run().session_id().to_string(),
-                content: Content::default(),
+                content: tool_result_content(invocation.logical_step_id()),
                 role: MessageRole::Tool,
                 created_at_ms: self.clock.now_ms(),
             },
@@ -2032,7 +2087,7 @@ where
                 id: format!("denied:{}", invocation.id()),
                 agent_id: definition.id.clone(),
                 room_id: current.run().session_id().to_string(),
-                content: Content::default(),
+                content: tool_result_content(invocation.logical_step_id()),
                 role: MessageRole::Tool,
                 created_at_ms: self.clock.now_ms(),
             },
@@ -2177,7 +2232,7 @@ where
                 text: serde_json::to_string(&result.output.output)
                     .map_err(|_| EngineError::new(EngineErrorCode::Capability))?,
                 attachments: None,
-                metadata: None,
+                metadata: tool_result_content(invocation.logical_step_id()).metadata,
             },
             role: MessageRole::Tool,
             created_at_ms: self.clock.now_ms(),
@@ -2685,7 +2740,57 @@ fn json_to_data_value(value: &serde_json::Value) -> Option<crate::DataValue> {
     }
 }
 
-fn agent_config(definition: &AgentDefinition) -> AgentConfig {
+fn assistant_tool_call_message(
+    definition: &AgentDefinition,
+    session_id: Uuid,
+    now_ms: u64,
+    tool_calls: &[ToolCall],
+) -> Message {
+    let tool_calls = tool_calls
+        .iter()
+        .map(|tool_call| {
+            crate::DataValue::Object(BTreeMap::from([
+                ("id".into(), crate::DataValue::String(tool_call.id.clone())),
+                (
+                    "name".into(),
+                    crate::DataValue::String(tool_call.name.clone()),
+                ),
+                (
+                    "args".into(),
+                    crate::DataValue::Object(tool_call.args.clone()),
+                ),
+            ]))
+        })
+        .collect();
+    Message {
+        id: format!("assistant-tools:{now_ms}"),
+        agent_id: definition.id.clone(),
+        room_id: session_id.to_string(),
+        content: Content {
+            text: String::new(),
+            attachments: None,
+            metadata: Some(BTreeMap::from([(
+                "toolCalls".into(),
+                crate::DataValue::Array(tool_calls),
+            )])),
+        },
+        role: MessageRole::Assistant,
+        created_at_ms: now_ms,
+    }
+}
+
+fn tool_result_content(tool_call_id: &str) -> Content {
+    Content {
+        text: String::new(),
+        attachments: None,
+        metadata: Some(BTreeMap::from([(
+            "toolCallId".into(),
+            crate::DataValue::String(tool_call_id.to_owned()),
+        )])),
+    }
+}
+
+fn agent_config(definition: &AgentDefinition, manifests: &[CapabilityManifest]) -> AgentConfig {
     AgentConfig {
         name: definition.name.clone(),
         model: definition.model.model.clone(),
@@ -2697,7 +2802,20 @@ fn agent_config(definition: &AgentDefinition) -> AgentConfig {
         style: None,
         provider: Some(definition.model.provider.clone()),
         system: Some(definition.system.clone()),
-        tools: None,
+        tools: Some(
+            manifests
+                .iter()
+                .map(|manifest| crate::ToolDescriptor {
+                    name: manifest.id.clone(),
+                    description: manifest.description.clone(),
+                    parameters_schema: match json_to_data_value(&manifest.input_schema) {
+                        Some(crate::DataValue::Object(schema)) => schema,
+                        _ => BTreeMap::new(),
+                    },
+                    examples: None,
+                })
+                .collect(),
+        ),
         plugins: None,
         settings: None,
     }

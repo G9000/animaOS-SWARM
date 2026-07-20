@@ -596,6 +596,30 @@ impl EngineControlSignal for FixedSignal {
     }
 }
 
+struct CancelOnSecondBoundary(AtomicUsize);
+
+impl EngineControlSignal for CancelOnSecondBoundary {
+    fn at_boundary(&self) -> EngineBoundaryAction {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            EngineBoundaryAction::Continue
+        } else {
+            EngineBoundaryAction::Cancel
+        }
+    }
+}
+
+struct CancelAfterCapabilityResult(Arc<AtomicUsize>);
+
+impl EngineControlSignal for CancelAfterCapabilityResult {
+    fn at_boundary(&self) -> EngineBoundaryAction {
+        if self.0.load(Ordering::SeqCst) == 0 {
+            EngineBoundaryAction::Continue
+        } else {
+            EngineBoundaryAction::Cancel
+        }
+    }
+}
+
 fn definition() -> AgentDefinition {
     AgentDefinition {
         schema_version: 1,
@@ -1019,6 +1043,11 @@ struct AdvancingCapabilities {
     recovery_action: RecoveryAction,
 }
 
+struct CountingCapabilities {
+    manifest: CapabilityManifest,
+    calls: Arc<AtomicUsize>,
+}
+
 impl AdvancingCapabilities {
     fn completed_result(
         &self,
@@ -1071,6 +1100,49 @@ impl EngineCapabilityRuntime for AdvancingCapabilities {
         _authorization: CapabilityRetryAuthorization,
     ) -> Result<EngineCapabilityResult, CapabilityError> {
         self.execute(context).await
+    }
+}
+
+#[async_trait]
+impl EngineCapabilityRuntime for CountingCapabilities {
+    fn manifest(&self, id: &str, version: u32) -> Option<CapabilityManifest> {
+        (id == self.manifest.id && version == self.manifest.version).then(|| self.manifest.clone())
+    }
+
+    async fn execute(
+        &self,
+        context: CapabilityExecutionContext,
+    ) -> Result<EngineCapabilityResult, CapabilityError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let durable = DurableCapabilityResult::new(
+            CapabilityReferenceId::new(Uuid::new_v5(
+                &Uuid::NAMESPACE_OID,
+                context.invocation().id().as_bytes(),
+            )),
+            format!("jcs-v1:{}", "c".repeat(64)),
+            self.manifest.schema_digest(),
+            1,
+            anima_core::DurableCapabilityStatus::Completed,
+        )?;
+        Ok(EngineCapabilityResult {
+            output: CapabilityResult::new(serde_json::json!({"ok": true})),
+            durable,
+        })
+    }
+
+    async fn recover_dispatched(
+        &self,
+        _context: CapabilityExecutionContext,
+    ) -> Result<RecoveryAction, CapabilityError> {
+        Err(CapabilityError::reconciliation())
+    }
+
+    async fn execute_retry(
+        &self,
+        _context: CapabilityExecutionContext,
+        _authorization: CapabilityRetryAuthorization,
+    ) -> Result<EngineCapabilityResult, CapabilityError> {
+        Err(CapabilityError::reconciliation())
     }
 }
 
@@ -1676,6 +1748,132 @@ async fn cancellation_and_requested_pause_are_observed_before_model_entry() {
 }
 
 #[tokio::test]
+async fn cancellation_after_final_model_checkpoint_prevents_terminal_completion() {
+    let definition = definition();
+    let (owner_id, run_id, store) = create_engine_run(
+        0x650,
+        &definition,
+        Arc::new(ManualExecutionClock::default()),
+    )
+    .await;
+    let model = Arc::new(StreamingModel {
+        turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+            ModelGenerateResponse {
+                content: Content {
+                    text: "final".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::End,
+            },
+        )]])),
+    });
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        model,
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(NeverPolicy),
+        Arc::new(NoCapabilities),
+        Arc::new(ManualExecutionClock::default()),
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        engine
+            .run(
+                owner_id,
+                run_id,
+                &CancelOnSecondBoundary(AtomicUsize::new(0))
+            )
+            .await
+            .unwrap(),
+        EngineRunOutcome::Cancelled
+    );
+    assert_eq!(
+        store
+            .load_run(owner_id, run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run()
+            .state(),
+        RunState::Cancelled
+    );
+}
+
+#[tokio::test]
+async fn cancellation_after_first_durable_tool_result_prevents_second_dispatch() {
+    let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+    let mut definition = definition();
+    definition.resolved_capabilities = vec![ResolvedCapability {
+        capability_id: capability_manifest.id.clone(),
+        manifest_version: capability_manifest.version,
+        schema_digest: capability_manifest.schema_digest().into(),
+        override_config: None,
+        approval_policy_revision: 1,
+    }];
+    let clock = Arc::new(ManualExecutionClock::default());
+    let (owner_id, run_id, store) = create_engine_run(0x658, &definition, clock.clone()).await;
+    let call = |id: &str, path: &str| ToolCall {
+        id: id.into(),
+        name: capability_manifest.id.clone(),
+        args: BTreeMap::from([("path".into(), DataValue::String(path.into()))]),
+    };
+    let model = Arc::new(StreamingModel {
+        turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+            ModelGenerateResponse {
+                content: Content::default(),
+                tool_calls: Some(vec![call("tool-1", "one.txt"), call("tool-2", "two.txt")]),
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::ToolCall,
+            },
+        )]])),
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        model,
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(AllowPolicy),
+        Arc::new(CountingCapabilities {
+            manifest: capability_manifest,
+            calls: calls.clone(),
+        }),
+        clock,
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig::default(),
+    )
+    .unwrap();
+
+    let outcome = engine
+        .run(
+            owner_id,
+            run_id,
+            &CancelAfterCapabilityResult(calls.clone()),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, EngineRunOutcome::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .load_run(owner_id, run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run()
+            .state(),
+        RunState::Cancelled
+    );
+}
+
+#[tokio::test]
 async fn outer_lease_heartbeat_renews_during_long_model_execution() {
     let definition = definition();
     let clock = Arc::new(ManualExecutionClock::default());
@@ -1988,6 +2186,129 @@ async fn crash_after_external_completion_recovers_without_a_second_external_call
             attempts.items()[0].state(),
             anima_core::AttemptRecordState::Completed
         );
+    }
+}
+
+#[tokio::test]
+async fn restart_rejects_live_recovery_mode_drift_before_model_or_capability_recovery() {
+    for (offset, persisted_mode) in [RecoveryMode::NonRetryable, RecoveryMode::Manual]
+        .into_iter()
+        .enumerate()
+    {
+        let seed = 0x680 + (offset as u128 * 0x10);
+        let persisted_manifest = manifest(persisted_mode);
+        let live_manifest = manifest(RecoveryMode::KeyedIdempotent);
+        assert_eq!(persisted_manifest.id, live_manifest.id);
+        assert_eq!(persisted_manifest.version, live_manifest.version);
+        assert_eq!(
+            persisted_manifest.schema_digest(),
+            live_manifest.schema_digest()
+        );
+
+        let mut definition = definition();
+        definition.resolved_capabilities = vec![ResolvedCapability {
+            capability_id: persisted_manifest.id.clone(),
+            manifest_version: persisted_manifest.version,
+            schema_digest: persisted_manifest.schema_digest().into(),
+            override_config: None,
+            approval_policy_revision: 1,
+        }];
+        let clock = Arc::new(ManualExecutionClock::default());
+        let (owner_id, run_id, store) = create_engine_run(seed, &definition, clock.clone()).await;
+        let tool_call = ToolCall {
+            id: "mode-drift-step".into(),
+            name: persisted_manifest.id.clone(),
+            args: BTreeMap::from([("path".into(), DataValue::String("mode-drift.txt".into()))]),
+        };
+        let first_runtime = Arc::new(AdvancingCapabilities {
+            manifest: persisted_manifest,
+            clock: clock.clone(),
+            advances: vec![],
+            execute_calls: AtomicUsize::new(0),
+            recovery_calls: AtomicUsize::new(0),
+            recovery_action: RecoveryAction::RecoveryRequired,
+        });
+        let first_engine = DurableAgentEngine::new(
+            store.clone(),
+            Arc::new(StreamingModel {
+                turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                    ModelGenerateResponse {
+                        content: Content::default(),
+                        tool_calls: Some(vec![tool_call]),
+                        usage: TokenUsage::default(),
+                        stop_reason: ModelStopReason::ToolCall,
+                    },
+                )]])),
+            }),
+            Arc::new(StaticDefinitions(definition.clone())),
+            Arc::new(AllowPolicy),
+            first_runtime.clone(),
+            clock.clone(),
+            Arc::new(RecordingLiveSink::default()),
+            Arc::new(CrashOnceAfterDispatch(AtomicBool::new(true))),
+            DurableEngineConfig {
+                lease_duration_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        let crashed = first_engine
+            .run(owner_id, run_id, &ContinueSignal)
+            .await
+            .unwrap_err();
+        assert_eq!(crashed.code(), EngineErrorCode::CrashInjected);
+        assert_eq!(first_runtime.execute_calls.load(Ordering::SeqCst), 0);
+        clock.advance_ms(1_001).unwrap();
+
+        let restart_model = Arc::new(StreamingModel {
+            turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                ModelGenerateResponse {
+                    content: Content {
+                        text: "must-not-enter-model".into(),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    tool_calls: None,
+                    usage: TokenUsage::default(),
+                    stop_reason: ModelStopReason::End,
+                },
+            )]])),
+        });
+        let restart_runtime = Arc::new(AdvancingCapabilities {
+            manifest: live_manifest,
+            clock: clock.clone(),
+            advances: vec![],
+            execute_calls: AtomicUsize::new(0),
+            recovery_calls: AtomicUsize::new(0),
+            recovery_action: RecoveryAction::RecoveryRequired,
+        });
+        let restart_engine = DurableAgentEngine::new(
+            store,
+            restart_model.clone(),
+            Arc::new(StaticDefinitions(definition)),
+            Arc::new(NeverPolicy),
+            restart_runtime.clone(),
+            clock.clone(),
+            Arc::new(RecordingLiveSink::default()),
+            Arc::new(NeverCrash),
+            DurableEngineConfig {
+                lease_duration_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        let restarted = restart_engine.run(owner_id, run_id, &ContinueSignal).await;
+        assert_eq!(
+            restart_runtime.recovery_calls.load(Ordering::SeqCst),
+            0,
+            "persisted {persisted_mode:?} recovery mode must block live-mode recovery entry"
+        );
+        assert_eq!(restart_runtime.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(restart_model.turns.lock().unwrap().len(), 1);
+        assert!(matches!(
+            restarted,
+            Err(error) if error.code() == EngineErrorCode::ManifestUnavailable
+        ));
     }
 }
 

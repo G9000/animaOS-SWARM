@@ -1215,6 +1215,55 @@ fn build_commit_patch(
         attempt_patches.insert(key, (sequence, attempt.clone()));
     }
 
+    for (key, (_, dispatching)) in &attempt_patches {
+        if dispatching.state() != super::AttemptRecordState::Dispatching
+            || aggregate.attempts.contains_key(key)
+        {
+            continue;
+        }
+        let prior_dispatch = aggregate
+            .attempts
+            .iter()
+            .find(|((invocation_id, _), attempt)| {
+                *invocation_id == dispatching.invocation().id()
+                    && attempt.state() == super::AttemptRecordState::Dispatching
+            });
+        let Some(((prior_invocation_id, prior_number), prior)) = prior_dispatch else {
+            if dispatching.attempt_number() != 1
+                || aggregate
+                    .attempts
+                    .keys()
+                    .any(|(invocation_id, _)| *invocation_id == dispatching.invocation().id())
+            {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::LineageConflict,
+                ));
+            }
+            continue;
+        };
+        let expected_number = prior_number
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::LineageConflict))?;
+        let transitioned = attempt_patches
+            .get(&(*prior_invocation_id, *prior_number))
+            .map(|(_, attempt)| attempt);
+        if dispatching.attempt_number() != expected_number
+            || prior.invocation() != dispatching.invocation()
+            || prior.manifest() != dispatching.manifest()
+            || prior.recovery_mode() != dispatching.recovery_mode()
+            || !transitioned.is_some_and(|attempt| {
+                attempt.state() == super::AttemptRecordState::Uncertain
+                    && attempt.invocation() == prior.invocation()
+                    && attempt.manifest() == prior.manifest()
+                    && attempt.recovery_mode() == prior.recovery_mode()
+            })
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::LineageConflict,
+            ));
+        }
+    }
+
     let mut result_patches = BTreeMap::new();
     let mut completed_fingerprint = aggregate.completed_fingerprint;
     for mutation in commit.results() {
