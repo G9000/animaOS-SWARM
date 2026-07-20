@@ -103,6 +103,31 @@ fn memory_wire_contract_revalidates_every_domain_value() {
     assert_rejects::<MemoryRetention>(json!({ "policy": "deadline", "deadline_ms": null }));
     assert_rejects::<MemoryRetention>(json!({ "policy": "persistent", "deadline_ms": 1 }));
 
+    let write = MemoryWrite::new(
+        "memory-write",
+        MemoryKind::Fact,
+        MemoryScope::owner("owner-1").unwrap(),
+        "content",
+        0.5,
+        provenance(),
+    )
+    .unwrap();
+    for (field, value) in [
+        ("confidence", json!(1.1)),
+        ("content", json!("")),
+        ("content", json!("x".repeat(32 * 1024 + 1))),
+    ] {
+        let mut invalid = to_value(&write).unwrap();
+        invalid[field] = value;
+        assert_rejects::<MemoryWrite>(invalid);
+    }
+    let mut invalid_scope = to_value(&write).unwrap();
+    invalid_scope["scope"]["id"] = json!("");
+    assert_rejects::<MemoryWrite>(invalid_scope);
+    let mut invalid_retention = to_value(&write).unwrap();
+    invalid_retention["retention"] = json!({ "policy": "deadline", "deadline_ms": null });
+    assert_rejects::<MemoryWrite>(invalid_retention);
+
     let record = MemoryRecord::from_write(
         MemoryWrite::new(
             "memory-1",
