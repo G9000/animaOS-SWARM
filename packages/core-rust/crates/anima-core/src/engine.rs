@@ -1470,6 +1470,19 @@ where
             return Err(EngineError::new(EngineErrorCode::CrashInjected));
         }
         let renewed = self.renew(owner_id, lease).await?;
+        if let Some(outcome) = self
+            .observe_control_boundary(
+                signal,
+                owner_id,
+                prepared.stored_run(),
+                &renewed,
+                prepared.checkpoint_version(),
+                &dispatch_checkpoint,
+            )
+            .await?
+        {
+            return Ok(CapabilityStepOutcome::Adopted(outcome));
+        }
         let attempt = CapabilityAttempt::new(&invocation, 1)
             .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
         let context = CapabilityExecutionContext::for_attempt(invocation.clone(), attempt)
@@ -1825,6 +1838,19 @@ where
                     return Err(EngineError::new(EngineErrorCode::CrashInjected));
                 }
                 let lease = self.renew(owner_id, lease).await?;
+                if let Some(outcome) = self
+                    .observe_control_boundary(
+                        signal,
+                        owner_id,
+                        prepared.stored_run(),
+                        &lease,
+                        prepared.checkpoint_version(),
+                        &retry_checkpoint,
+                    )
+                    .await?
+                {
+                    return Ok(CapabilityStepOutcome::Adopted(outcome));
+                }
                 let retry = CapabilityAttempt::new(&invocation, retry_attempt_number)
                     .map_err(|_| EngineError::new(EngineErrorCode::Capability))?;
                 let retry_context =
