@@ -1,8 +1,9 @@
 use anima_core::{
-    Artifact, ArtifactPort, ArtifactWrite, Citation, Document, DocumentChunk, DocumentPort,
-    Evidence, MemoryHit, MemoryKind, MemoryPort, MemoryPortError, MemoryProvenance, MemoryQuery,
+    Artifact, ArtifactPort, ArtifactWrite, Citation, Document, DocumentChunk, DocumentChunkPage,
+    DocumentPort, Evidence, KnowledgeAccessContext, MemoryHit, MemoryKind, MemoryPort,
+    MemoryPortError, MemoryPortErrorCode, MemoryProvenance, MemoryQuery, MemoryQueryResult,
     MemoryRecord, MemoryRetention, MemoryRevision, MemoryScope, MemoryWrite, RetrievalHit,
-    RetrievalQuery, RetrieverPort,
+    RetrievalQuery, RetrievalResult, RetrieverPort,
 };
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
@@ -158,9 +159,9 @@ fn memory_wire_contract_revalidates_every_domain_value() {
     invalid_supersedes["supersedes"] = json!([""]);
     assert_rejects::<MemoryRecord>(invalid_supersedes);
 
-    assert_rejects::<MemoryQuery>(json!({ "text": "query", "authorized_scopes": [], "limit": 1 }));
+    assert_rejects::<MemoryQuery>(json!({ "text": "query", "requested_scopes": [], "limit": 1 }));
     assert_rejects::<MemoryQuery>(
-        json!({ "text": "query", "authorized_scopes": [{ "kind": "owner", "id": "owner-1" }], "limit": 0 }),
+        json!({ "text": "query", "requested_scopes": [{ "kind": "owner", "id": "owner-1" }], "limit": 0 }),
     );
     assert_rejects::<MemoryRevision>(json!({
         "memory_id": "memory-1", "expected_revision": 1, "supersedes": [],
@@ -180,21 +181,19 @@ fn memory_wire_contract_revalidates_every_domain_value() {
 fn evidence_wire_contract_revalidates_every_domain_value() {
     let scope = MemoryScope::workspace("workspace-1").unwrap();
     let document = Document::new("doc-1", scope.clone(), "title", HASH, provenance()).unwrap();
-    let chunk = DocumentChunk::new(
-        "chunk-1",
-        scope.clone(),
-        "doc-1",
-        0,
-        "content",
-        HASH,
-        "line:1",
-    )
-    .unwrap();
+    let chunk =
+        DocumentChunk::new("chunk-1", scope.clone(), "doc-1", 0, "content", "line:1").unwrap();
     let citation = Citation::new("doc-1", Some("chunk-1"), "line:1").unwrap();
     let artifact =
         Artifact::new("artifact-1", scope.clone(), "report", HASH, provenance()).unwrap();
-    let artifact_write =
-        ArtifactWrite::new("artifact-1", scope.clone(), "report", HASH, provenance()).unwrap();
+    let artifact_write = ArtifactWrite::new(
+        "artifact-1",
+        scope.clone(),
+        "report",
+        b"report".to_vec(),
+        provenance(),
+    )
+    .unwrap();
 
     for (field, value) in [("title", json!("")), ("content_sha256", json!("invalid"))] {
         let mut invalid = to_value(&document).unwrap();
@@ -214,10 +213,10 @@ fn evidence_wire_contract_revalidates_every_domain_value() {
     invalid_artifact_write["name"] = json!("");
     assert_rejects::<ArtifactWrite>(invalid_artifact_write);
     assert_rejects::<RetrievalQuery>(
-        json!({ "text": "query", "authorized_scopes": [], "limit": 1 }),
+        json!({ "text": "query", "requested_scopes": [], "limit": 1 }),
     );
     assert_rejects::<RetrievalQuery>(
-        json!({ "text": "query", "authorized_scopes": [{ "kind": "workspace", "id": "workspace-1" }], "limit": 0 }),
+        json!({ "text": "query", "requested_scopes": [{ "kind": "workspace", "id": "workspace-1" }], "limit": 0 }),
     );
     let hit =
         RetrievalHit::new(Evidence::Document(document), 0.4, "matched", vec![citation]).unwrap();
@@ -230,8 +229,9 @@ fn evidence_wire_contract_revalidates_every_domain_value() {
 fn memory_query_requires_exact_authorized_scope_and_explains_hits() {
     let owner = MemoryScope::owner("owner-1").unwrap();
     let query = MemoryQuery::new("evidence", vec![owner.clone()], 10).unwrap();
-    assert!(query.authorizes(&owner));
-    assert!(!query.authorizes(&MemoryScope::agent("owner-1").unwrap()));
+    let access = KnowledgeAccessContext::trusted(vec![owner.clone()]).unwrap();
+    assert!(access.allows(&owner));
+    assert!(!access.allows(&MemoryScope::agent("owner-1").unwrap()));
 
     let record = MemoryRecord::from_write(
         MemoryWrite::new(
@@ -249,40 +249,170 @@ fn memory_query_requires_exact_authorized_scope_and_explains_hits() {
     let hit = MemoryHit::new(record, 0.5, "matched provenance and content").unwrap();
     assert_eq!(hit.explanation, "matched provenance and content");
     assert!(MemoryHit::new(hit.record.clone(), f64::INFINITY, "bad score").is_err());
+    assert_eq!(
+        MemoryQueryResult::new(&access, &query, vec![hit])
+            .unwrap()
+            .hits()
+            .len(),
+        1
+    );
 }
 
 #[test]
 fn evidence_contract_validates_hashes_locators_and_scope() {
     let scope = MemoryScope::session("session-1").unwrap();
     let document = Document::new("doc-1", scope.clone(), "Plan", HASH, provenance()).unwrap();
-    let chunk = DocumentChunk::new(
-        "chunk-1",
-        scope.clone(),
-        "doc-1",
-        0,
-        "body",
-        HASH,
-        "line:1-2",
-    )
-    .unwrap();
+    let chunk =
+        DocumentChunk::new("chunk-1", scope.clone(), "doc-1", 0, "body", "line:1-2").unwrap();
     let citation = Citation::new("doc-1", Some("chunk-1"), "line:1-2").unwrap();
     let artifact =
         Artifact::new("artifact-1", scope.clone(), "report", HASH, provenance()).unwrap();
     assert_eq!(document.content_sha256, HASH);
-    assert_eq!(chunk.content_sha256, HASH);
+    assert_eq!(chunk.content_sha256.len(), 64);
     assert_eq!(artifact.content_sha256, HASH);
     assert_eq!(citation.locator, "line:1-2");
     assert!(Document::new("doc-2", scope, "bad", "not-a-hash", provenance()).is_err());
 
     let query =
         RetrievalQuery::new("plan", vec![MemoryScope::session("session-1").unwrap()], 5).unwrap();
+    let access =
+        KnowledgeAccessContext::trusted(vec![MemoryScope::session("session-1").unwrap()]).unwrap();
     let hit =
         RetrievalHit::new(Evidence::Chunk(chunk), 0.8, "lexical match", vec![citation]).unwrap();
-    assert!(query.authorizes(&hit.scope()));
+    assert_eq!(
+        RetrievalResult::new(&access, &query, vec![hit.clone()])
+            .unwrap()
+            .hits()
+            .len(),
+        1
+    );
     assert_eq!(hit.explanation, "lexical match");
 }
 
+#[test]
+fn knowledge_access_and_results_reject_a_deliberately_leaky_port() {
+    let owner = MemoryScope::owner("owner-1").unwrap();
+    let foreign = MemoryScope::owner("owner-2").unwrap();
+    let access = KnowledgeAccessContext::trusted(vec![owner.clone()]).unwrap();
+    let query = MemoryQuery::new("secret", vec![owner], 1).unwrap();
+    let foreign_record = MemoryRecord::from_write(
+        MemoryWrite::new(
+            "foreign",
+            MemoryKind::Fact,
+            foreign,
+            "leaked",
+            1.0,
+            provenance(),
+        )
+        .unwrap(),
+        1,
+    )
+    .unwrap();
+    let leaky = LeakyPort {
+        hit: MemoryHit::new(foreign_record, 1.0, "leak").unwrap(),
+    };
+    assert_eq!(
+        futures::executor::block_on(leaky.query(&access, query))
+            .unwrap_err()
+            .code,
+        MemoryPortErrorCode::UnauthorizedScope
+    );
+
+    let retrieval_query =
+        RetrievalQuery::new("secret", vec![MemoryScope::owner("owner-1").unwrap()], 1).unwrap();
+    let leaky_retriever = LeakyRetriever {
+        hit: RetrievalHit::new(
+            Evidence::Document(
+                Document::new(
+                    "foreign-doc",
+                    MemoryScope::owner("owner-2").unwrap(),
+                    "foreign",
+                    HASH,
+                    provenance(),
+                )
+                .unwrap(),
+            ),
+            1.0,
+            "leak",
+            Vec::new(),
+        )
+        .unwrap(),
+    };
+    assert_eq!(
+        futures::executor::block_on(leaky_retriever.retrieve(&access, retrieval_query))
+            .unwrap_err()
+            .code,
+        anima_core::EvidencePortErrorCode::UnauthorizedScope
+    );
+}
+
+#[test]
+fn bounded_scope_and_citation_contracts_reject_overflow_and_duplicates() {
+    let scope = MemoryScope::owner("owner-1").unwrap();
+    let scopes = (0..65)
+        .map(|index| json!({ "kind": "owner", "id": format!("owner-{index}") }))
+        .collect::<Vec<_>>();
+    assert_rejects::<MemoryQuery>(json!({ "text": "q", "requested_scopes": scopes, "limit": 1 }));
+    let deduped = MemoryQuery::new("q", vec![scope.clone(), scope], 1).unwrap();
+    assert_eq!(deduped.requested_scopes().len(), 1);
+
+    let citation = Citation::new("doc-1", Some("chunk-1"), "line:1").unwrap();
+    let evidence = Evidence::Document(
+        Document::new(
+            "doc-1",
+            MemoryScope::owner("owner-1").unwrap(),
+            "title",
+            HASH,
+            provenance(),
+        )
+        .unwrap(),
+    );
+    assert!(RetrievalHit::new(evidence, 1.0, "match", vec![citation.clone(), citation]).is_err());
+}
+
+#[test]
+fn document_chunks_and_artifact_bytes_are_verified_and_bounded() {
+    let scope = MemoryScope::workspace("workspace-1").unwrap();
+    let chunk = DocumentChunk::new("chunk-1", scope.clone(), "doc-1", 0, "body", "line:1").unwrap();
+    assert_ne!(chunk.content_sha256, HASH);
+    assert!(DocumentChunk::new("chunk-2", scope.clone(), "doc-1", 1, "", "line:2").is_err());
+    let page = DocumentChunkPage::new("doc-1", &scope, vec![chunk], 1).unwrap();
+    assert_eq!(page.chunks().len(), 1);
+
+    let artifact = ArtifactWrite::new(
+        "artifact-1",
+        scope.clone(),
+        "report",
+        b"bytes".to_vec(),
+        provenance(),
+    )
+    .unwrap();
+    assert_eq!(
+        artifact.content_sha256,
+        "277089d91c0bdf4f2e6862ba7e4a07605119431f5d13f726dd352b06f1b206a9"
+    );
+    let mut tampered = to_value(&artifact).unwrap();
+    tampered["content_sha256"] = json!(HASH);
+    assert_rejects::<ArtifactWrite>(tampered);
+    assert!(ArtifactWrite::new(
+        "artifact-2",
+        scope,
+        "large",
+        vec![0; 4 * 1024 * 1024 + 1],
+        provenance()
+    )
+    .is_err());
+}
+
 struct ContractPort;
+
+struct LeakyPort {
+    hit: MemoryHit,
+}
+
+struct LeakyRetriever {
+    hit: RetrievalHit,
+}
 
 #[async_trait]
 impl MemoryPort for ContractPort {
@@ -290,12 +420,44 @@ impl MemoryPort for ContractPort {
         Err(MemoryPortError::unsupported("test port"))
     }
 
-    async fn query(&self, _query: MemoryQuery) -> Result<Vec<MemoryHit>, MemoryPortError> {
-        Ok(Vec::new())
+    async fn query(
+        &self,
+        access: &KnowledgeAccessContext,
+        query: MemoryQuery,
+    ) -> Result<MemoryQueryResult, MemoryPortError> {
+        MemoryQueryResult::new(access, &query, Vec::new())
     }
 
     async fn revise(&self, _revision: MemoryRevision) -> Result<MemoryRecord, MemoryPortError> {
         Err(MemoryPortError::unsupported("test port"))
+    }
+}
+
+#[async_trait]
+impl MemoryPort for LeakyPort {
+    async fn write(&self, _write: MemoryWrite) -> Result<MemoryRecord, MemoryPortError> {
+        Err(MemoryPortError::unsupported("test"))
+    }
+    async fn query(
+        &self,
+        access: &KnowledgeAccessContext,
+        query: MemoryQuery,
+    ) -> Result<MemoryQueryResult, MemoryPortError> {
+        MemoryQueryResult::new(access, &query, vec![self.hit.clone()])
+    }
+    async fn revise(&self, _revision: MemoryRevision) -> Result<MemoryRecord, MemoryPortError> {
+        Err(MemoryPortError::unsupported("test"))
+    }
+}
+
+#[async_trait]
+impl RetrieverPort for LeakyRetriever {
+    async fn retrieve(
+        &self,
+        access: &KnowledgeAccessContext,
+        query: RetrievalQuery,
+    ) -> Result<RetrievalResult, anima_core::EvidencePortError> {
+        RetrievalResult::new(access, &query, vec![self.hit.clone()])
     }
 }
 
@@ -315,15 +477,38 @@ impl DocumentPort for ContractPort {
     ) -> Result<Option<Document>, anima_core::EvidencePortError> {
         Ok(None)
     }
+
+    async fn write_chunk(
+        &self,
+        _chunk: DocumentChunk,
+    ) -> Result<DocumentChunk, anima_core::EvidencePortError> {
+        Err(anima_core::EvidencePortError::unsupported("test"))
+    }
+    async fn get_chunk(
+        &self,
+        _id: &str,
+        _scope: &MemoryScope,
+    ) -> Result<Option<DocumentChunk>, anima_core::EvidencePortError> {
+        Ok(None)
+    }
+    async fn list_chunks(
+        &self,
+        document_id: &str,
+        scope: &MemoryScope,
+        limit: usize,
+    ) -> Result<DocumentChunkPage, anima_core::EvidencePortError> {
+        DocumentChunkPage::new(document_id, scope, Vec::new(), limit)
+    }
 }
 
 #[async_trait]
 impl RetrieverPort for ContractPort {
     async fn retrieve(
         &self,
-        _query: RetrievalQuery,
-    ) -> Result<Vec<RetrievalHit>, anima_core::EvidencePortError> {
-        Ok(Vec::new())
+        access: &KnowledgeAccessContext,
+        query: RetrievalQuery,
+    ) -> Result<RetrievalResult, anima_core::EvidencePortError> {
+        RetrievalResult::new(access, &query, Vec::new())
     }
 }
 

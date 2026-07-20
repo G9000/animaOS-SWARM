@@ -4,14 +4,18 @@
 //! only describe portable, validated intent and never carry credentials or storage details.
 
 use std::fmt;
+use std::marker::PhantomData;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_TEXT_BYTES: usize = 32 * 1024;
 const MAX_EXPLANATION_BYTES: usize = 4 * 1024;
 const MAX_SUPERSEDES: usize = 64;
+pub const MAX_KNOWLEDGE_SCOPES: usize = 64;
+pub const MAX_KNOWLEDGE_HITS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -372,17 +376,18 @@ impl MemoryRevision {
 #[serde(try_from = "MemoryQueryWire")]
 pub struct MemoryQuery {
     pub text: String,
-    pub authorized_scopes: Vec<MemoryScope>,
+    requested_scopes: Vec<MemoryScope>,
     pub limit: usize,
 }
 
 impl MemoryQuery {
     pub fn new(
         text: impl Into<String>,
-        authorized_scopes: Vec<MemoryScope>,
+        requested_scopes: Vec<MemoryScope>,
         limit: usize,
     ) -> Result<Self, MemoryPortError> {
-        if authorized_scopes.is_empty() {
+        let requested_scopes = dedup_scopes(requested_scopes)?;
+        if requested_scopes.is_empty() {
             return Err(MemoryPortError::invalid(
                 "at least one authorized scope is required",
             ));
@@ -394,15 +399,76 @@ impl MemoryQuery {
         }
         Ok(Self {
             text: bounded(text.into(), "memory query text", MAX_TEXT_BYTES)?,
-            authorized_scopes,
+            requested_scopes,
             limit,
         })
     }
 
-    pub fn authorizes(&self, scope: &MemoryScope) -> bool {
+    pub fn requested_scopes(&self) -> &[MemoryScope] {
+        &self.requested_scopes
+    }
+}
+
+/// Host-issued scope grant. It deliberately has no `Deserialize` implementation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KnowledgeAccessContext {
+    authorized_scopes: Vec<MemoryScope>,
+}
+
+impl KnowledgeAccessContext {
+    pub fn trusted(authorized_scopes: Vec<MemoryScope>) -> Result<Self, MemoryPortError> {
+        let authorized_scopes = dedup_scopes(authorized_scopes)?;
+        if authorized_scopes.is_empty() {
+            return Err(MemoryPortError::invalid(
+                "at least one trusted scope is required",
+            ));
+        }
+        Ok(Self { authorized_scopes })
+    }
+
+    pub fn allows(&self, scope: &MemoryScope) -> bool {
         self.authorized_scopes
             .iter()
             .any(|authorized| scope.is_authorized_by(authorized))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryQueryResult {
+    hits: Vec<MemoryHit>,
+}
+
+impl MemoryQueryResult {
+    pub fn new(
+        access: &KnowledgeAccessContext,
+        query: &MemoryQuery,
+        hits: Vec<MemoryHit>,
+    ) -> Result<Self, MemoryPortError> {
+        validate_query_access(access, query.requested_scopes())?;
+        if hits.len() > query.limit || hits.len() > MAX_KNOWLEDGE_HITS {
+            return Err(MemoryPortError::invalid(
+                "memory result exceeds query limit",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for hit in &hits {
+            if !ids.insert(hit.record.id.clone()) {
+                return Err(MemoryPortError::invalid(
+                    "memory result contains duplicate IDs",
+                ));
+            }
+            if !scope_allowed(access, query.requested_scopes(), &hit.record.scope) {
+                return Err(MemoryPortError {
+                    code: MemoryPortErrorCode::UnauthorizedScope,
+                    message: "memory result contains an unauthorized scope".into(),
+                });
+            }
+        }
+        Ok(Self { hits })
+    }
+
+    pub fn hits(&self) -> &[MemoryHit] {
+        &self.hits
     }
 }
 
@@ -564,7 +630,7 @@ struct MemoryRecordWire {
     confidence: f64,
     provenance: MemoryProvenance,
     revision: u64,
-    supersedes: Vec<String>,
+    supersedes: BoundedVec<String, MAX_SUPERSEDES>,
     corrects: Option<String>,
     forgotten_at_ms: Option<u64>,
     forget_reason: Option<String>,
@@ -586,7 +652,7 @@ impl TryFrom<MemoryRecordWire> for MemoryRecord {
         Self::validated(
             write,
             value.revision,
-            value.supersedes,
+            value.supersedes.0,
             value.corrects,
             value.forgotten_at_ms,
             value.forget_reason,
@@ -599,7 +665,7 @@ impl TryFrom<MemoryRecordWire> for MemoryRecord {
 struct MemoryRevisionWire {
     memory_id: String,
     expected_revision: u64,
-    supersedes: Vec<String>,
+    supersedes: BoundedVec<String, MAX_SUPERSEDES>,
     corrects: Option<String>,
     #[serde(default)]
     correction_reason: Option<String>,
@@ -612,7 +678,7 @@ impl TryFrom<MemoryRevisionWire> for MemoryRevision {
         Self::validated(
             value.memory_id,
             value.expected_revision,
-            value.supersedes,
+            value.supersedes.0,
             value.corrects,
             value.correction_reason,
             value.forget_reason,
@@ -624,14 +690,14 @@ impl TryFrom<MemoryRevisionWire> for MemoryRevision {
 #[serde(deny_unknown_fields)]
 struct MemoryQueryWire {
     text: String,
-    authorized_scopes: Vec<MemoryScope>,
+    requested_scopes: BoundedVec<MemoryScope, MAX_KNOWLEDGE_SCOPES>,
     limit: usize,
 }
 
 impl TryFrom<MemoryQueryWire> for MemoryQuery {
     type Error = MemoryPortError;
     fn try_from(value: MemoryQueryWire) -> Result<Self, Self::Error> {
-        Self::new(value.text, value.authorized_scopes, value.limit)
+        Self::new(value.text, value.requested_scopes.0, value.limit)
     }
 }
 
@@ -653,7 +719,11 @@ impl TryFrom<MemoryHitWire> for MemoryHit {
 #[async_trait]
 pub trait MemoryPort: Send + Sync {
     async fn write(&self, write: MemoryWrite) -> Result<MemoryRecord, MemoryPortError>;
-    async fn query(&self, query: MemoryQuery) -> Result<Vec<MemoryHit>, MemoryPortError>;
+    async fn query(
+        &self,
+        access: &KnowledgeAccessContext,
+        query: MemoryQuery,
+    ) -> Result<MemoryQueryResult, MemoryPortError>;
     /// Applies a CAS-guarded lifecycle mutation. Implementations must reject stale revisions.
     async fn revise(&self, revision: MemoryRevision) -> Result<MemoryRecord, MemoryPortError>;
 }
@@ -708,4 +778,82 @@ fn bounded_ids(values: Vec<String>, field: &str) -> Result<Vec<String>, MemoryPo
         .into_iter()
         .map(|value| required(value, field))
         .collect()
+}
+
+pub(crate) struct BoundedVec<T, const MAX: usize>(pub Vec<T>);
+
+impl<'de, T, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct BoundedVisitor<T, const MAX: usize>(PhantomData<T>);
+        impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVisitor<T, MAX>
+        where
+            T: Deserialize<'de>,
+        {
+            type Value = BoundedVec<T, MAX>;
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                write!(formatter, "at most {MAX} items")
+            }
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence.size_hint().is_some_and(|size| size > MAX) {
+                    return Err(de::Error::custom("collection exceeds limit"));
+                }
+                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(MAX));
+                while let Some(value) = sequence.next_element()? {
+                    if values.len() == MAX {
+                        return Err(de::Error::custom("collection exceeds limit"));
+                    }
+                    values.push(value);
+                }
+                Ok(BoundedVec(values))
+            }
+        }
+        deserializer.deserialize_seq(BoundedVisitor::<T, MAX>(PhantomData))
+    }
+}
+
+fn dedup_scopes(scopes: Vec<MemoryScope>) -> Result<Vec<MemoryScope>, MemoryPortError> {
+    if scopes.len() > MAX_KNOWLEDGE_SCOPES {
+        return Err(MemoryPortError::invalid("too many scopes"));
+    }
+    let mut unique = Vec::new();
+    for scope in scopes {
+        if !unique.contains(&scope) {
+            unique.push(scope);
+        }
+    }
+    Ok(unique)
+}
+
+fn validate_query_access(
+    access: &KnowledgeAccessContext,
+    requested: &[MemoryScope],
+) -> Result<(), MemoryPortError> {
+    if requested.iter().all(|scope| access.allows(scope)) {
+        Ok(())
+    } else {
+        Err(MemoryPortError {
+            code: MemoryPortErrorCode::UnauthorizedScope,
+            message: "requested scope is not authorized".into(),
+        })
+    }
+}
+
+fn scope_allowed(
+    access: &KnowledgeAccessContext,
+    requested: &[MemoryScope],
+    scope: &MemoryScope,
+) -> bool {
+    access.allows(scope)
+        && requested
+            .iter()
+            .any(|requested| scope.is_authorized_by(requested))
 }

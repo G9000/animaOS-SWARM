@@ -49,8 +49,8 @@ pub use engine::{
 pub use events::{EngineEvent, EventType};
 pub use evidence::{
     Artifact, ArtifactPort, ArtifactWrite, Citation, Document, DocumentChunk, DocumentPort,
-    Evidence, EvidencePortError, EvidencePortErrorCode, RetrievalHit, RetrievalQuery,
-    RetrieverPort,
+    DocumentChunkPage, Evidence, EvidencePortError, EvidencePortErrorCode, RetrievalHit,
+    RetrievalQuery, RetrievalResult, RetrieverPort, MAX_ARTIFACT_BYTES, MAX_CITATIONS,
 };
 pub use execution::{
     assert_execution_store_conformance, ApprovalGrantMutation, ApprovalResumeBinding,
@@ -74,9 +74,10 @@ pub use execution::{
     MAX_COMMIT_STEPS, MAX_STORE_READ_CURSOR_BYTES, MAX_STORE_READ_PAGE_SIZE,
 };
 pub use memory::{
-    MemoryHit, MemoryKind, MemoryPort, MemoryPortError, MemoryPortErrorCode, MemoryProvenance,
-    MemoryQuery, MemoryRecord, MemoryRetention, MemoryRevision, MemoryScope, MemoryWrite,
-    RetentionPolicy,
+    KnowledgeAccessContext, MemoryHit, MemoryKind, MemoryPort, MemoryPortError,
+    MemoryPortErrorCode, MemoryProvenance, MemoryQuery, MemoryQueryResult, MemoryRecord,
+    MemoryRetention, MemoryRevision, MemoryScope, MemoryWrite, RetentionPolicy,
+    MAX_KNOWLEDGE_HITS, MAX_KNOWLEDGE_SCOPES,
 };
 pub use model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,

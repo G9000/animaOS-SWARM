@@ -4,13 +4,19 @@ use std::fmt;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::memory::{MemoryProvenance, MemoryScope};
+use crate::memory::{
+    BoundedVec, KnowledgeAccessContext, MemoryProvenance, MemoryScope, MAX_KNOWLEDGE_HITS,
+    MAX_KNOWLEDGE_SCOPES,
+};
 
 const MAX_ID_BYTES: usize = 256;
 const MAX_LABEL_BYTES: usize = 4 * 1024;
 const MAX_LOCATOR_BYTES: usize = 4 * 1024;
 const MAX_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_ARTIFACT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_CITATIONS: usize = 64;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "DocumentWire")]
@@ -60,7 +66,6 @@ impl DocumentChunk {
         document_id: impl Into<String>,
         index: u32,
         content: impl Into<String>,
-        content_sha256: impl Into<String>,
         locator: impl Into<String>,
     ) -> Result<Self, EvidencePortError> {
         Ok(Self {
@@ -69,9 +74,15 @@ impl DocumentChunk {
             document_id: required(document_id.into(), "document ID")?,
             index,
             content: bounded(content.into(), "document chunk content", MAX_CHUNK_BYTES)?,
-            content_sha256: sha256(content_sha256.into())?,
+            content_sha256: String::new(),
             locator: bounded(locator.into(), "citation locator", MAX_LOCATOR_BYTES)?,
-        })
+        }
+        .with_content_hash())
+    }
+
+    fn with_content_hash(mut self) -> Self {
+        self.content_sha256 = sha256_bytes(self.content.as_bytes());
+        self
     }
 }
 
@@ -134,6 +145,7 @@ pub struct ArtifactWrite {
     pub scope: MemoryScope,
     pub name: String,
     pub content_sha256: String,
+    pub content: Vec<u8>,
     pub provenance: MemoryProvenance,
 }
 
@@ -142,15 +154,21 @@ impl ArtifactWrite {
         id: impl Into<String>,
         scope: MemoryScope,
         name: impl Into<String>,
-        content_sha256: impl Into<String>,
+        content: Vec<u8>,
         provenance: MemoryProvenance,
     ) -> Result<Self, EvidencePortError> {
-        let artifact = Artifact::new(id, scope, name, content_sha256, provenance)?;
+        if content.len() > MAX_ARTIFACT_BYTES {
+            return Err(EvidencePortError::invalid(
+                "artifact content exceeds byte limit",
+            ));
+        }
+        let artifact = Artifact::new(id, scope, name, sha256_bytes(&content), provenance)?;
         Ok(Self {
             id: artifact.id,
             scope: artifact.scope,
             name: artifact.name,
             content_sha256: artifact.content_sha256,
+            content,
             provenance: artifact.provenance,
         })
     }
@@ -178,17 +196,18 @@ impl Evidence {
 #[serde(try_from = "RetrievalQueryWire")]
 pub struct RetrievalQuery {
     pub text: String,
-    pub authorized_scopes: Vec<MemoryScope>,
+    requested_scopes: Vec<MemoryScope>,
     pub limit: usize,
 }
 
 impl RetrievalQuery {
     pub fn new(
         text: impl Into<String>,
-        authorized_scopes: Vec<MemoryScope>,
+        requested_scopes: Vec<MemoryScope>,
         limit: usize,
     ) -> Result<Self, EvidencePortError> {
-        if authorized_scopes.is_empty() {
+        let requested_scopes = dedup_scopes(requested_scopes)?;
+        if requested_scopes.is_empty() {
             return Err(EvidencePortError::invalid(
                 "at least one authorized scope is required",
             ));
@@ -200,17 +219,13 @@ impl RetrievalQuery {
         }
         Ok(Self {
             text: bounded(text.into(), "retrieval query text", MAX_LABEL_BYTES)?,
-            authorized_scopes,
+            requested_scopes,
             limit,
         })
     }
 
-    pub fn authorizes(&self, scope: &Option<&MemoryScope>) -> bool {
-        scope.is_some_and(|scope| {
-            self.authorized_scopes
-                .iter()
-                .any(|authorized| scope.is_authorized_by(authorized))
-        })
+    pub fn requested_scopes(&self) -> &[MemoryScope] {
+        &self.requested_scopes
     }
 }
 
@@ -233,6 +248,11 @@ impl RetrievalHit {
         if !score.is_finite() {
             return Err(EvidencePortError::invalid("retrieval score must be finite"));
         }
+        if citations.len() > MAX_CITATIONS || has_duplicate_citations(&citations) {
+            return Err(EvidencePortError::invalid(
+                "citations must be unique and within the limit",
+            ));
+        }
         Ok(Self {
             evidence,
             score,
@@ -243,6 +263,99 @@ impl RetrievalHit {
 
     pub fn scope(&self) -> Option<&MemoryScope> {
         self.evidence.scope()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentChunkPage {
+    chunks: Vec<DocumentChunk>,
+}
+
+impl DocumentChunkPage {
+    pub fn new(
+        document_id: &str,
+        scope: &MemoryScope,
+        chunks: Vec<DocumentChunk>,
+        limit: usize,
+    ) -> Result<Self, EvidencePortError> {
+        if limit == 0 || limit > MAX_KNOWLEDGE_HITS || chunks.len() > limit {
+            return Err(EvidencePortError::invalid("chunk page exceeds limit"));
+        }
+        let mut previous = None;
+        let mut ids = std::collections::BTreeSet::new();
+        for chunk in &chunks {
+            if chunk.document_id != document_id
+                || &chunk.scope != scope
+                || !ids.insert(chunk.id.clone())
+                || previous.is_some_and(|index| chunk.index <= index)
+            {
+                return Err(EvidencePortError::invalid(
+                    "chunk page must be scoped, unique, and ascending",
+                ));
+            }
+            previous = Some(chunk.index);
+        }
+        Ok(Self { chunks })
+    }
+    pub fn chunks(&self) -> &[DocumentChunk] {
+        &self.chunks
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RetrievalResult {
+    hits: Vec<RetrievalHit>,
+}
+
+impl RetrievalResult {
+    pub fn new(
+        access: &KnowledgeAccessContext,
+        query: &RetrievalQuery,
+        hits: Vec<RetrievalHit>,
+    ) -> Result<Self, EvidencePortError> {
+        if query
+            .requested_scopes()
+            .iter()
+            .any(|scope| !access.allows(scope))
+        {
+            return Err(EvidencePortError {
+                code: EvidencePortErrorCode::UnauthorizedScope,
+                message: "requested scope is not authorized".into(),
+            });
+        }
+        if hits.len() > query.limit || hits.len() > MAX_KNOWLEDGE_HITS {
+            return Err(EvidencePortError::invalid(
+                "retrieval result exceeds query limit",
+            ));
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for hit in &hits {
+            let Some(scope) = hit.scope() else {
+                return Err(EvidencePortError::invalid(
+                    "retrieval evidence must have a scope",
+                ));
+            };
+            if !ids.insert(evidence_id(&hit.evidence).to_owned()) {
+                return Err(EvidencePortError::invalid(
+                    "retrieval result contains duplicate evidence",
+                ));
+            }
+            if !access.allows(scope)
+                || !query
+                    .requested_scopes()
+                    .iter()
+                    .any(|requested| scope.is_authorized_by(requested))
+            {
+                return Err(EvidencePortError {
+                    code: EvidencePortErrorCode::UnauthorizedScope,
+                    message: "retrieval result contains an unauthorized scope".into(),
+                });
+            }
+        }
+        Ok(Self { hits })
+    }
+    pub fn hits(&self) -> &[RetrievalHit] {
+        &self.hits
     }
 }
 
@@ -328,9 +441,17 @@ impl TryFrom<DocumentChunkWire> for DocumentChunk {
             value.document_id,
             value.index,
             value.content,
-            value.content_sha256,
             value.locator,
         )
+        .and_then(|chunk| {
+            if chunk.content_sha256 == value.content_sha256 {
+                Ok(chunk)
+            } else {
+                Err(EvidencePortError::invalid(
+                    "document chunk hash does not match content",
+                ))
+            }
+        })
     }
 }
 
@@ -377,6 +498,7 @@ struct ArtifactWriteWire {
     scope: MemoryScope,
     name: String,
     content_sha256: String,
+    content: BoundedVec<u8, MAX_ARTIFACT_BYTES>,
     provenance: MemoryProvenance,
 }
 impl TryFrom<ArtifactWriteWire> for ArtifactWrite {
@@ -386,9 +508,18 @@ impl TryFrom<ArtifactWriteWire> for ArtifactWrite {
             value.id,
             value.scope,
             value.name,
-            value.content_sha256,
+            value.content.0,
             value.provenance,
         )
+        .and_then(|artifact| {
+            if artifact.content_sha256 == value.content_sha256 {
+                Ok(artifact)
+            } else {
+                Err(EvidencePortError::invalid(
+                    "artifact content hash does not match bytes",
+                ))
+            }
+        })
     }
 }
 
@@ -396,13 +527,13 @@ impl TryFrom<ArtifactWriteWire> for ArtifactWrite {
 #[serde(deny_unknown_fields)]
 struct RetrievalQueryWire {
     text: String,
-    authorized_scopes: Vec<MemoryScope>,
+    requested_scopes: BoundedVec<MemoryScope, MAX_KNOWLEDGE_SCOPES>,
     limit: usize,
 }
 impl TryFrom<RetrievalQueryWire> for RetrievalQuery {
     type Error = EvidencePortError;
     fn try_from(value: RetrievalQueryWire) -> Result<Self, Self::Error> {
-        Self::new(value.text, value.authorized_scopes, value.limit)
+        Self::new(value.text, value.requested_scopes.0, value.limit)
     }
 }
 
@@ -412,7 +543,7 @@ struct RetrievalHitWire {
     evidence: Evidence,
     score: f64,
     explanation: String,
-    citations: Vec<Citation>,
+    citations: BoundedVec<Citation, MAX_CITATIONS>,
 }
 impl TryFrom<RetrievalHitWire> for RetrievalHit {
     type Error = EvidencePortError;
@@ -421,7 +552,7 @@ impl TryFrom<RetrievalHitWire> for RetrievalHit {
             value.evidence,
             value.score,
             value.explanation,
-            value.citations,
+            value.citations.0,
         )
     }
 }
@@ -434,12 +565,27 @@ pub trait DocumentPort: Send + Sync {
         id: &str,
         scope: &MemoryScope,
     ) -> Result<Option<Document>, EvidencePortError>;
+    async fn write_chunk(&self, chunk: DocumentChunk) -> Result<DocumentChunk, EvidencePortError>;
+    async fn get_chunk(
+        &self,
+        id: &str,
+        scope: &MemoryScope,
+    ) -> Result<Option<DocumentChunk>, EvidencePortError>;
+    async fn list_chunks(
+        &self,
+        document_id: &str,
+        scope: &MemoryScope,
+        limit: usize,
+    ) -> Result<DocumentChunkPage, EvidencePortError>;
 }
 
 #[async_trait]
 pub trait RetrieverPort: Send + Sync {
-    async fn retrieve(&self, query: RetrievalQuery)
-        -> Result<Vec<RetrievalHit>, EvidencePortError>;
+    async fn retrieve(
+        &self,
+        access: &KnowledgeAccessContext,
+        query: RetrievalQuery,
+    ) -> Result<RetrievalResult, EvidencePortError>;
 }
 
 #[async_trait]
@@ -473,5 +619,41 @@ fn sha256(value: String) -> Result<String, EvidencePortError> {
         Err(EvidencePortError::invalid(
             "content SHA-256 must be 64 hexadecimal characters",
         ))
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn dedup_scopes(scopes: Vec<MemoryScope>) -> Result<Vec<MemoryScope>, EvidencePortError> {
+    if scopes.len() > MAX_KNOWLEDGE_SCOPES {
+        return Err(EvidencePortError::invalid("too many scopes"));
+    }
+    let mut unique = Vec::new();
+    for scope in scopes {
+        if !unique.contains(&scope) {
+            unique.push(scope);
+        }
+    }
+    Ok(unique)
+}
+
+fn has_duplicate_citations(citations: &[Citation]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    citations.iter().any(|citation| {
+        !seen.insert((
+            citation.document_id.clone(),
+            citation.chunk_id.clone(),
+            citation.locator.clone(),
+        ))
+    })
+}
+
+fn evidence_id(evidence: &Evidence) -> &str {
+    match evidence {
+        Evidence::Document(document) => &document.id,
+        Evidence::Chunk(chunk) => &chunk.id,
+        Evidence::Artifact(artifact) => &artifact.id,
     }
 }
