@@ -7,18 +7,21 @@ use anima_core::{
     AuthoritativeGrantState, AuthoritativePolicyChange, AuthoritativePolicyState, AutonomyGrant,
     CapabilityError, CapabilityExecutionContext, CapabilityExecutor, CapabilityKind,
     CapabilityManifest, CapabilityManifestInput, CapabilityReferenceId, CapabilityRegistry,
-    CapabilityResult, CapabilityRetryAuthorization, Content, CreateRun, CurrentPolicyResolution,
-    CurrentPolicyResolver, DataValue, DefinitionPin, DefinitionResolver, DurableAgentEngine,
-    DurableEngineConfig, EngineBoundaryAction, EngineCapabilityResult, EngineCapabilityRuntime,
-    EngineControlSignal, EngineCrashInjector, EngineCrashPoint, EngineError, EngineErrorCode,
-    EngineLiveEvent, EngineLiveEventSink, EnginePolicyRequest, EngineRunOutcome, ExecutionClock,
-    ExecutionStore, GrantScope, GrantStatus, InMemoryExecutionStore, LifecyclePolicy,
-    LogicalInvocation, ManifestCatalog, ManualExecutionClock, MemoryPolicy, ModelAdapter,
-    ModelGenerateRequest, ModelGenerateResponse, ModelPolicy, ModelStopReason, ModelStreamFrame,
-    ModelStreamSink, PolicyContext, PolicyRestrictions, ProfileRef, ReconcileOutcome,
-    RecoveryAction, RecoveryMode, ResolvedCapability, RiskLevel, Run, RuntimeCompatibility,
-    RuntimeEventKind, RuntimeLimits, Session, SessionConcurrencyPolicy, StoreReadPage, TokenUsage,
-    ToolCall,
+    CapabilityResult, CapabilityRetryAuthorization, CheckpointV1, CheckpointV1Builder, Content,
+    CreateRun, CurrentPolicyResolution, CurrentPolicyResolver, DataValue, DefinitionPin,
+    DefinitionResolver, DurableAgentEngine, DurableCapabilityResult, DurableEngineConfig,
+    EngineBoundaryAction, EngineCapabilityResult, EngineCapabilityRuntime, EngineControlSignal,
+    EngineCrashInjector, EngineCrashPoint, EngineError, EngineErrorCode, EngineLiveEvent,
+    EngineLiveEventSink, EnginePolicyRequest, EngineRunOutcome, EventReplayPage, ExecutionClock,
+    ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore,
+    ExecutionStoreError, GrantAuthorityKey, GrantScope, GrantStatus, InMemoryExecutionStore,
+    InvocationAttemptRecord, LifecyclePolicy, LogicalInvocation, ManifestCatalog,
+    ManualExecutionClock, MemoryPolicy, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse,
+    ModelPolicy, ModelStopReason, ModelStreamFrame, ModelStreamSink, PolicyContext,
+    PolicyRestrictions, ProfileRef, ReconcileOutcome, RecoveryAction, RecoveryMode,
+    ResolvedCapability, RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand,
+    RuntimeCompatibility, RuntimeEventKind, RuntimeLimits, Session, SessionConcurrencyPolicy,
+    StoreHistoryPage, StoreReadPage, StoredRun, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -93,6 +96,352 @@ impl EngineCapabilityRuntime for NoCapabilities {
         _authorization: CapabilityRetryAuthorization,
     ) -> Result<EngineCapabilityResult, CapabilityError> {
         Err(CapabilityError::unavailable())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InjectedCasConflict {
+    RunVersion,
+    CheckpointVersion,
+}
+
+#[derive(Clone, Copy)]
+enum DispatchRaceBoundary {
+    Initial,
+    Recovery,
+}
+
+struct RacingExecutionStore {
+    reference: InMemoryExecutionStore,
+    conflict: InjectedCasConflict,
+    boundary: DispatchRaceBoundary,
+    fired: AtomicBool,
+}
+
+impl RacingExecutionStore {
+    fn new(
+        clock: Arc<ManualExecutionClock>,
+        conflict: InjectedCasConflict,
+        boundary: DispatchRaceBoundary,
+    ) -> Self {
+        Self {
+            reference: InMemoryExecutionStore::with_clock(clock),
+            conflict,
+            boundary,
+            fired: AtomicBool::new(false),
+        }
+    }
+
+    fn should_race(&self, commit: &ExecutionCommit) -> bool {
+        commit.command().kind() == anima_core::RuntimeCommandKind::PrepareDispatch
+            && match self.boundary {
+                DispatchRaceBoundary::Initial => commit.command().recovery_record().is_none(),
+                DispatchRaceBoundary::Recovery => commit.command().recovery_record().is_some(),
+            }
+            && self
+                .fired
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+    }
+
+    async fn install_policy_denied_winner(
+        &self,
+        owner_id: Uuid,
+        incoming: &ExecutionCommit,
+    ) -> Result<ExecutionCommitOutcome, ExecutionStoreError> {
+        let run_id = incoming.lease().run_id();
+        let current = self
+            .reference
+            .load_run(owner_id, run_id)
+            .await?
+            .ok_or_else(|| {
+                ExecutionStoreError::new(anima_core::ExecutionStoreErrorCode::NotFound)
+            })?;
+        let (checkpoint_version, checkpoint) = self
+            .reference
+            .load_checkpoint(owner_id, run_id)
+            .await?
+            .ok_or_else(|| {
+                ExecutionStoreError::new(anima_core::ExecutionStoreErrorCode::NotFound)
+            })?;
+        let target = current
+            .run()
+            .transition(RunState::Paused, Some(RunPauseReason::PolicyDenied))
+            .map_err(ExecutionStoreError::from)?;
+        let mut attempts = checkpoint.attempts().to_vec();
+        let mut attempt_mutations = vec![];
+        let mut uncertain = checkpoint.uncertain_invocations().to_vec();
+        let command = if let Some(recovery) = incoming.command().recovery_record() {
+            let mutation = incoming
+                .attempts()
+                .iter()
+                .find(|attempt| {
+                    attempt.state() == anima_core::AttemptRecordState::Uncertain
+                        && attempt.invocation() == recovery.invocation()
+                        && attempt.attempt_number() == recovery.attempt_number()
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    ExecutionStoreError::new(anima_core::ExecutionStoreErrorCode::LineageConflict)
+                })?;
+            let stored = attempts
+                .iter_mut()
+                .find(|attempt| {
+                    attempt.invocation() == mutation.invocation()
+                        && attempt.attempt_number() == mutation.attempt_number()
+                })
+                .ok_or_else(|| {
+                    ExecutionStoreError::new(anima_core::ExecutionStoreErrorCode::LineageConflict)
+                })?;
+            *stored = mutation.clone();
+            attempt_mutations.push(mutation);
+            if !uncertain.iter().any(|record| {
+                record.invocation() == recovery.invocation()
+                    && record.attempt_number() == recovery.attempt_number()
+            }) {
+                uncertain.push(recovery.clone());
+            }
+            RuntimeCommand::pause_with_recovery(
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, run_id.as_bytes()),
+                current.run().session_id(),
+                run_id,
+                RunPauseReason::PolicyDenied,
+                recovery.clone(),
+            )
+            .map_err(ExecutionStoreError::from)?
+        } else {
+            RuntimeCommand::pause(
+                Uuid::new_v5(&Uuid::NAMESPACE_OID, run_id.as_bytes()),
+                current.run().session_id(),
+                run_id,
+                RunPauseReason::PolicyDenied,
+            )
+            .map_err(ExecutionStoreError::from)?
+        };
+        let winner_checkpoint = rebuild_test_checkpoint(
+            &checkpoint,
+            RunState::Paused,
+            Some(RunPauseReason::PolicyDenied),
+            attempts,
+            uncertain,
+        );
+        self.reference
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    current.run_version(),
+                    checkpoint_version,
+                    incoming.lease().clone(),
+                    command,
+                    vec![],
+                    vec![],
+                    attempt_mutations,
+                    vec![],
+                    None,
+                    target,
+                )
+                .with_checkpoint(winner_checkpoint),
+            )
+            .await
+    }
+}
+
+fn rebuild_test_checkpoint(
+    checkpoint: &CheckpointV1,
+    state: RunState,
+    pause_reason: Option<RunPauseReason>,
+    attempts: Vec<InvocationAttemptRecord>,
+    uncertain: Vec<anima_core::RecoveryRecord>,
+) -> CheckpointV1 {
+    CheckpointV1Builder::new(
+        checkpoint.session_id(),
+        checkpoint.run_id(),
+        checkpoint.definition().clone(),
+        checkpoint.last_durable_event_sequence(),
+        checkpoint.manifests().to_vec(),
+        checkpoint.budget().clone(),
+        checkpoint.usage().clone(),
+    )
+    .state(state, pause_reason)
+    .attempts(attempts)
+    .completed_invocations(checkpoint.completed_invocations().to_vec())
+    .uncertain_invocations(uncertain)
+    .pending_approval(None)
+    .message_context_refs(checkpoint.message_context_refs().to_vec())
+    .model_context_refs(checkpoint.model_context_refs().to_vec())
+    .memory_refs(checkpoint.memory_refs().to_vec())
+    .artifact_refs(checkpoint.artifact_refs().to_vec())
+    .cursor(checkpoint.cursor().cloned())
+    .build()
+    .unwrap()
+}
+
+fn rebuild_commit_with_run_version(commit: &ExecutionCommit, run_version: u64) -> ExecutionCommit {
+    let mut rebuilt = ExecutionCommit::new(
+        run_version,
+        commit.expected_checkpoint_version(),
+        commit.lease().clone(),
+        commit.command().clone(),
+        commit.events().to_vec(),
+        commit.steps().to_vec(),
+        commit.attempts().to_vec(),
+        commit.results().to_vec(),
+        commit.approval().cloned(),
+        commit.target_run().clone(),
+    )
+    .with_checkpoint_mutation(commit.checkpoint_mutation().clone());
+    if let Some(guard) = commit.policy_guard().cloned() {
+        rebuilt = rebuilt.with_policy_guard(guard);
+    }
+    if let Some(grant) = commit.dispatch_grant().cloned() {
+        rebuilt = rebuilt.with_dispatch_grant(grant);
+    }
+    rebuilt
+}
+
+#[async_trait]
+impl ExecutionStore for RacingExecutionStore {
+    async fn apply_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        change: AuthoritativePolicyChange,
+    ) -> Result<AuthoritativePolicyState, ExecutionStoreError> {
+        self.reference
+            .apply_authoritative_policy(owner_id, change)
+            .await
+    }
+
+    async fn load_authoritative_policy(
+        &self,
+        owner_id: Uuid,
+        definition_id: &str,
+        definition_version: u32,
+    ) -> Result<Option<AuthoritativePolicyState>, ExecutionStoreError> {
+        self.reference
+            .load_authoritative_policy(owner_id, definition_id, definition_version)
+            .await
+    }
+
+    async fn apply_authoritative_grant(
+        &self,
+        owner_id: Uuid,
+        change: AuthoritativeGrantChange,
+    ) -> Result<AuthoritativeGrantState, ExecutionStoreError> {
+        self.reference
+            .apply_authoritative_grant(owner_id, change)
+            .await
+    }
+
+    async fn load_authoritative_grant(
+        &self,
+        owner_id: Uuid,
+        key: &GrantAuthorityKey,
+    ) -> Result<Option<AuthoritativeGrantState>, ExecutionStoreError> {
+        self.reference.load_authoritative_grant(owner_id, key).await
+    }
+
+    async fn create_run(
+        &self,
+        owner_id: Uuid,
+        request: CreateRun,
+    ) -> Result<StoredRun, ExecutionStoreError> {
+        self.reference.create_run(owner_id, request).await
+    }
+
+    async fn acquire_lease(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        expected_run_version: u64,
+        duration_ms: u64,
+    ) -> Result<ExecutionLease, ExecutionStoreError> {
+        self.reference
+            .acquire_lease(owner_id, run_id, expected_run_version, duration_ms)
+            .await
+    }
+
+    async fn renew_lease(
+        &self,
+        owner_id: Uuid,
+        lease: ExecutionLease,
+        duration_ms: u64,
+    ) -> Result<ExecutionLease, ExecutionStoreError> {
+        self.reference
+            .renew_lease(owner_id, lease, duration_ms)
+            .await
+    }
+
+    async fn commit_execution(
+        &self,
+        owner_id: Uuid,
+        commit: ExecutionCommit,
+    ) -> Result<ExecutionCommitOutcome, ExecutionStoreError> {
+        if !self.should_race(&commit) {
+            return self.reference.commit_execution(owner_id, commit).await;
+        }
+        let winner = self.install_policy_denied_winner(owner_id, &commit).await?;
+        let commit = if matches!(self.conflict, InjectedCasConflict::CheckpointVersion) {
+            rebuild_commit_with_run_version(&commit, winner.stored_run().run_version())
+        } else {
+            commit
+        };
+        self.reference.commit_execution(owner_id, commit).await
+    }
+
+    async fn load_run(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<StoredRun>, ExecutionStoreError> {
+        self.reference.load_run(owner_id, run_id).await
+    }
+
+    async fn load_checkpoint(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Option<(u64, CheckpointV1)>, ExecutionStoreError> {
+        self.reference.load_checkpoint(owner_id, run_id).await
+    }
+
+    async fn load_steps_page(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        page: StoreReadPage,
+    ) -> Result<StoreHistoryPage<ExecutionStep>, ExecutionStoreError> {
+        self.reference.load_steps_page(owner_id, run_id, page).await
+    }
+
+    async fn load_attempts_page(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        page: StoreReadPage,
+    ) -> Result<StoreHistoryPage<InvocationAttemptRecord>, ExecutionStoreError> {
+        self.reference
+            .load_attempts_page(owner_id, run_id, page)
+            .await
+    }
+
+    async fn load_durable_result(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        invocation_id: Uuid,
+    ) -> Result<Option<DurableCapabilityResult>, ExecutionStoreError> {
+        self.reference
+            .load_durable_result(owner_id, run_id, invocation_id)
+            .await
+    }
+
+    async fn replay_events(
+        &self,
+        owner_id: Uuid,
+        run_id: Uuid,
+        page: StoreReadPage,
+    ) -> Result<EventReplayPage, ExecutionStoreError> {
+        self.reference.replay_events(owner_id, run_id, page).await
     }
 }
 
@@ -291,8 +640,8 @@ fn definition() -> AgentDefinition {
     }
 }
 
-async fn authorize_policy(
-    store: &InMemoryExecutionStore,
+async fn authorize_policy<S: ExecutionStore + ?Sized>(
+    store: &S,
     owner_id: Uuid,
     definition: &AgentDefinition,
 ) {
@@ -314,11 +663,11 @@ async fn authorize_policy(
         .unwrap();
 }
 
-async fn create_engine_run(
+async fn create_run_in_store<S: ExecutionStore + ?Sized>(
+    store: &S,
     seed: u128,
     definition: &AgentDefinition,
-    clock: Arc<ManualExecutionClock>,
-) -> (Uuid, Uuid, Arc<InMemoryExecutionStore>) {
+) -> (Uuid, Uuid) {
     let owner_id = Uuid::from_u128(seed + 1);
     let run_id = Uuid::from_u128(seed + 3);
     let session = Session::new_for_definition(
@@ -328,7 +677,6 @@ async fn create_engine_run(
     )
     .unwrap();
     let queued = Run::queued(run_id, session.id(), &definition.id, definition.version).unwrap();
-    let store = Arc::new(InMemoryExecutionStore::with_clock(clock));
     store
         .create_run(
             owner_id,
@@ -342,7 +690,17 @@ async fn create_engine_run(
         )
         .await
         .unwrap();
-    authorize_policy(store.as_ref(), owner_id, definition).await;
+    authorize_policy(store, owner_id, definition).await;
+    (owner_id, run_id)
+}
+
+async fn create_engine_run(
+    seed: u128,
+    definition: &AgentDefinition,
+    clock: Arc<ManualExecutionClock>,
+) -> (Uuid, Uuid, Arc<InMemoryExecutionStore>) {
+    let store = Arc::new(InMemoryExecutionStore::with_clock(clock));
+    let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, definition).await;
     (owner_id, run_id, store)
 }
 
@@ -1825,6 +2183,197 @@ async fn revoked_policy_before_recovery_retry_denies_without_calling_executor() 
 }
 
 #[tokio::test]
+async fn initial_dispatch_adopts_policy_denied_winner_after_real_run_or_checkpoint_cas_loss() {
+    for (offset, conflict) in [
+        InjectedCasConflict::RunVersion,
+        InjectedCasConflict::CheckpointVersion,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+        let mut definition = definition();
+        definition.resolved_capabilities = vec![ResolvedCapability {
+            capability_id: capability_manifest.id.clone(),
+            manifest_version: capability_manifest.version,
+            schema_digest: capability_manifest.schema_digest().into(),
+            override_config: None,
+            approval_policy_revision: 1,
+        }];
+        let clock = Arc::new(ManualExecutionClock::default());
+        let store = Arc::new(RacingExecutionStore::new(
+            clock.clone(),
+            conflict,
+            DispatchRaceBoundary::Initial,
+        ));
+        let seed = 0x850 + (offset as u128 * 0x10);
+        let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, &definition).await;
+        let model = Arc::new(StreamingModel {
+            turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                ModelGenerateResponse {
+                    content: Content::default(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "initial-cas-tool".into(),
+                        name: capability_manifest.id.clone(),
+                        args: BTreeMap::from([(
+                            "path".into(),
+                            DataValue::String("initial-cas.txt".into()),
+                        )]),
+                    }]),
+                    usage: TokenUsage::default(),
+                    stop_reason: ModelStopReason::ToolCall,
+                },
+            )]])),
+        });
+        let capabilities = Arc::new(RecordingCapabilities {
+            manifest: capability_manifest,
+            calls: Mutex::new(vec![]),
+            completed: Mutex::new(None),
+        });
+        let engine = DurableAgentEngine::new(
+            store.clone(),
+            model,
+            Arc::new(StaticDefinitions(definition)),
+            Arc::new(AllowPolicy),
+            capabilities.clone(),
+            clock,
+            Arc::new(RecordingLiveSink::default()),
+            Arc::new(NeverCrash),
+            DurableEngineConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine.run(owner_id, run_id, &ContinueSignal).await.unwrap(),
+            EngineRunOutcome::Denied
+        );
+        assert!(capabilities.calls.lock().unwrap().is_empty());
+        let winner = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+        assert_eq!(winner.run().state(), RunState::Paused);
+        assert_eq!(
+            winner.run().pause_reason(),
+            Some(RunPauseReason::PolicyDenied)
+        );
+        assert!(store
+            .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn recovery_dispatch_adopts_policy_denied_winner_after_real_run_or_checkpoint_cas_loss() {
+    for (offset, conflict) in [
+        InjectedCasConflict::RunVersion,
+        InjectedCasConflict::CheckpointVersion,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let capability_manifest = manifest(RecoveryMode::KeyedIdempotent);
+        let mut definition = definition();
+        definition.resolved_capabilities = vec![ResolvedCapability {
+            capability_id: capability_manifest.id.clone(),
+            manifest_version: capability_manifest.version,
+            schema_digest: capability_manifest.schema_digest().into(),
+            override_config: None,
+            approval_policy_revision: 1,
+        }];
+        let clock = Arc::new(ManualExecutionClock::default());
+        let store = Arc::new(RacingExecutionStore::new(
+            clock.clone(),
+            conflict,
+            DispatchRaceBoundary::Recovery,
+        ));
+        let seed = 0x870 + (offset as u128 * 0x10);
+        let (owner_id, run_id) = create_run_in_store(store.as_ref(), seed, &definition).await;
+        let model = Arc::new(StreamingModel {
+            turns: Mutex::new(VecDeque::from([vec![ModelStreamFrame::Final(
+                ModelGenerateResponse {
+                    content: Content::default(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "recovery-cas-tool".into(),
+                        name: capability_manifest.id.clone(),
+                        args: BTreeMap::from([(
+                            "path".into(),
+                            DataValue::String("recovery-cas.txt".into()),
+                        )]),
+                    }]),
+                    usage: TokenUsage::default(),
+                    stop_reason: ModelStopReason::ToolCall,
+                },
+            )]])),
+        });
+        let mut catalog = ManifestCatalog::default();
+        catalog
+            .register_manifest(capability_manifest.clone())
+            .unwrap();
+        let external_calls = Arc::new(Mutex::new(0));
+        let mut registry = CapabilityRegistry::new(catalog);
+        registry
+            .register_executor(Arc::new(AbsentThenSuccessfulExecutor {
+                manifest: capability_manifest,
+                calls: external_calls.clone(),
+            }))
+            .unwrap();
+        let engine = DurableAgentEngine::new(
+            store.clone(),
+            model,
+            Arc::new(StaticDefinitions(definition)),
+            Arc::new(AllowPolicy),
+            Arc::new(registry),
+            clock.clone(),
+            Arc::new(RecordingLiveSink::default()),
+            Arc::new(CrashOnceAfterDispatch(AtomicBool::new(true))),
+            DurableEngineConfig {
+                lease_duration_ms: 1_000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            engine
+                .run(owner_id, run_id, &ContinueSignal)
+                .await
+                .unwrap_err()
+                .code(),
+            EngineErrorCode::CrashInjected
+        );
+        let first_attempt = store
+            .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
+            .await
+            .unwrap()
+            .items()[0]
+            .clone();
+        clock.advance_ms(1_001).unwrap();
+
+        assert_eq!(
+            engine.run(owner_id, run_id, &ContinueSignal).await.unwrap(),
+            EngineRunOutcome::Denied
+        );
+        assert_eq!(*external_calls.lock().unwrap(), 0);
+        let attempts = store
+            .load_attempts_page(owner_id, run_id, StoreReadPage::first(8).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(attempts.items().len(), 1);
+        assert_eq!(attempts.items()[0].invocation(), first_attempt.invocation());
+        assert_eq!(attempts.items()[0].attempt_number(), 1);
+        assert_eq!(
+            attempts.items()[0].state(),
+            anima_core::AttemptRecordState::Uncertain
+        );
+        let winner = store.load_run(owner_id, run_id).await.unwrap().unwrap();
+        assert_eq!(winner.run().state(), RunState::Paused);
+        assert_eq!(
+            winner.run().pause_reason(),
+            Some(RunPauseReason::PolicyDenied)
+        );
+    }
+}
+
+#[tokio::test]
 async fn approval_required_capability_checkpoints_before_waiting_and_never_calls_executor() {
     let owner_id = Uuid::from_u128(0x661);
     let run_id = Uuid::from_u128(0x663);
@@ -2245,7 +2794,7 @@ async fn assert_dispatch_guard_rejection(mode: Option<GuardFailureMode>, seed: u
 }
 
 #[tokio::test]
-async fn dispatch_policy_guard_denies_revoke_expiry_argument_drift_and_lost_cas() {
+async fn dispatch_policy_guard_denies_revoke_revision_race_argument_drift_and_expiry() {
     assert_dispatch_guard_rejection(Some(GuardFailureMode::Revoke), 0x710).await;
     assert_dispatch_guard_rejection(Some(GuardFailureMode::AdvanceRevision), 0x720).await;
     assert_dispatch_guard_rejection(Some(GuardFailureMode::ArgumentDrift), 0x730).await;

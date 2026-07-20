@@ -861,6 +861,37 @@ fn build_commit_patch(
         ));
     }
 
+    if commit.command().kind() == super::RuntimeCommandKind::PrepareDispatch {
+        if let Some(recovery) = commit.command().recovery_record() {
+            let expected_retry_number =
+                recovery.attempt_number().checked_add(1).ok_or_else(|| {
+                    ExecutionStoreError::new(ExecutionStoreErrorCode::LineageConflict)
+                })?;
+            let exact_uncertain = commit.attempts().iter().filter(|attempt| {
+                attempt.state() == super::AttemptRecordState::Uncertain
+                    && attempt.invocation() == recovery.invocation()
+                    && attempt.attempt_number() == recovery.attempt_number()
+                    && attempt.manifest() == recovery.pause().manifest()
+                    && attempt.recovery_mode() == recovery.pause().manifest().recovery_mode()
+            });
+            let exact_dispatch = commit.attempts().iter().filter(|attempt| {
+                attempt.state() == super::AttemptRecordState::Dispatching
+                    && attempt.invocation() == recovery.invocation()
+                    && attempt.attempt_number() == expected_retry_number
+                    && attempt.manifest() == recovery.pause().manifest()
+                    && attempt.recovery_mode() == recovery.pause().manifest().recovery_mode()
+            });
+            if commit.attempts().len() != 2
+                || exact_uncertain.count() != 1
+                || exact_dispatch.count() != 1
+            {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::LineageConflict,
+                ));
+            }
+        }
+    }
+
     let dispatching_attempts = commit
         .attempts()
         .iter()

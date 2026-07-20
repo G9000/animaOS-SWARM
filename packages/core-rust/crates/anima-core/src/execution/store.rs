@@ -1987,6 +1987,7 @@ where
     assert_atomic_failure_contract(factory).await?;
     assert_authoritative_policy_contract(factory).await?;
     assert_dispatching_attempt_transition_contract(factory).await?;
+    assert_retry_attempt_adjacency_rejections(factory).await?;
     assert_retry_attempt_lineage_contract(factory).await?;
     assert_auto_allow_dispatch_grant_contract(factory).await?;
     assert_policy_denied_transition_contract(factory).await?;
@@ -2388,6 +2389,206 @@ where
         return Err(ExecutionStoreError::new(
             ExecutionStoreErrorCode::InvalidRequest,
         ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum InvalidRetryAttemptCase {
+    SameAttempt,
+    SkippedAttempt,
+    DifferentInvocation,
+    DifferentManifest,
+    UnexpectedAttempt,
+    Overflow,
+}
+
+async fn assert_retry_attempt_adjacency_rejections<F>(
+    factory: &F,
+) -> Result<(), ExecutionStoreError>
+where
+    F: ExecutionStoreFactory,
+{
+    for (offset, case) in [
+        InvalidRetryAttemptCase::SameAttempt,
+        InvalidRetryAttemptCase::SkippedAttempt,
+        InvalidRetryAttemptCase::DifferentInvocation,
+        InvalidRetryAttemptCase::DifferentManifest,
+        InvalidRetryAttemptCase::UnexpectedAttempt,
+        InvalidRetryAttemptCase::Overflow,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let seed = 0xd1_80 + (offset as u128 * 0x10);
+        let (store, owner_id, session, queued, started, lease) =
+            create_running_run(factory, seed).await?;
+        let invocation = conformance_value(LogicalInvocation::new(
+            queued.id(),
+            "retry-adjacency",
+            "workspace.write",
+            1,
+            serde_json::json!({"path": "adjacent.txt"}),
+        ))?;
+        let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
+            "workspace.write",
+            1,
+            format!("sha256:{}", "2".repeat(64)),
+            RecoveryMode::KeyedIdempotent,
+        ))?;
+        let first_number = if matches!(case, InvalidRetryAttemptCase::Overflow) {
+            u32::MAX
+        } else {
+            1
+        };
+        let first_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
+            &invocation,
+            first_number,
+            super::AttemptRecordState::Dispatching,
+            manifest.clone(),
+            RecoveryMode::KeyedIdempotent,
+        ))?;
+        let first = store
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    started.stored_run().run_version(),
+                    started.checkpoint_version(),
+                    lease.clone(),
+                    RuntimeCommand::prepare_dispatch(
+                        Uuid::from_u128(seed + 5),
+                        session.id(),
+                        queued.id(),
+                    )
+                    .map_err(ExecutionStoreError::from)?,
+                    vec![],
+                    vec![],
+                    vec![first_dispatching.clone()],
+                    vec![],
+                    None,
+                    started.stored_run().run().clone(),
+                )
+                .with_policy_guard(conformance_dispatch_guard(
+                    owner_id,
+                    &session,
+                    &invocation,
+                )?),
+            )
+            .await?;
+        let first_uncertain = conformance_value(InvocationAttemptRecord::new_durable(
+            &invocation,
+            first_number,
+            super::AttemptRecordState::Uncertain,
+            manifest.clone(),
+            RecoveryMode::KeyedIdempotent,
+        ))?;
+        let retry_invocation = if matches!(case, InvalidRetryAttemptCase::DifferentInvocation) {
+            conformance_value(LogicalInvocation::new(
+                queued.id(),
+                "retry-adjacency",
+                "workspace.write",
+                1,
+                serde_json::json!({"path": "different.txt"}),
+            ))?
+        } else {
+            invocation.clone()
+        };
+        let retry_manifest = if matches!(case, InvalidRetryAttemptCase::DifferentManifest) {
+            conformance_value(ManifestPin::new_with_recovery_mode(
+                "workspace.write",
+                1,
+                format!("sha256:{}", "3".repeat(64)),
+                RecoveryMode::KeyedIdempotent,
+            ))?
+        } else {
+            manifest.clone()
+        };
+        let retry_number = match case {
+            InvalidRetryAttemptCase::SameAttempt | InvalidRetryAttemptCase::Overflow => {
+                first_number
+            }
+            InvalidRetryAttemptCase::SkippedAttempt => first_number + 2,
+            InvalidRetryAttemptCase::DifferentInvocation
+            | InvalidRetryAttemptCase::DifferentManifest
+            | InvalidRetryAttemptCase::UnexpectedAttempt => first_number + 1,
+        };
+        let retry_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
+            &retry_invocation,
+            retry_number,
+            super::AttemptRecordState::Dispatching,
+            retry_manifest,
+            RecoveryMode::KeyedIdempotent,
+        ))?;
+        let pause = conformance_value(super::RecoveryPauseRecord::new(
+            invocation.binding(),
+            first_number,
+            manifest.clone(),
+            super::RecoveryPauseReason::AuthoritativeAbsence,
+        ))?;
+        let recovery = conformance_value(super::RecoveryRecord::new_with_pause(pause, None))?;
+        let mut recovery_attempts = vec![first_uncertain, retry_dispatching];
+        if matches!(case, InvalidRetryAttemptCase::UnexpectedAttempt) {
+            let unexpected_invocation = conformance_value(LogicalInvocation::new(
+                queued.id(),
+                "unexpected-retry-attempt",
+                "workspace.write",
+                1,
+                serde_json::json!({"path": "unexpected.txt"}),
+            ))?;
+            recovery_attempts.push(conformance_value(InvocationAttemptRecord::new_durable(
+                &unexpected_invocation,
+                1,
+                super::AttemptRecordState::Pending,
+                manifest.clone(),
+                RecoveryMode::KeyedIdempotent,
+            ))?);
+        }
+        let rejected = store
+            .commit_execution(
+                owner_id,
+                ExecutionCommit::new(
+                    first.stored_run().run_version(),
+                    first.checkpoint_version(),
+                    lease,
+                    RuntimeCommand::prepare_recovery_dispatch(
+                        Uuid::from_u128(seed + 6),
+                        session.id(),
+                        queued.id(),
+                        recovery,
+                    )
+                    .map_err(ExecutionStoreError::from)?,
+                    vec![],
+                    vec![],
+                    recovery_attempts,
+                    vec![],
+                    None,
+                    first.stored_run().run().clone(),
+                )
+                .with_policy_guard(conformance_dispatch_guard(
+                    owner_id,
+                    &session,
+                    &retry_invocation,
+                )?),
+            )
+            .await;
+        if !matches!(
+            rejected,
+            Err(error) if error.code() == ExecutionStoreErrorCode::LineageConflict
+        ) || store
+            .load_attempts_page(
+                owner_id,
+                queued.id(),
+                StoreReadPage::first(MAX_STORE_READ_PAGE_SIZE)?,
+            )
+            .await?
+            .items()
+            != [first_dispatching]
+            || store.load_run(owner_id, queued.id()).await?.as_ref() != Some(first.stored_run())
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
     }
     Ok(())
 }
