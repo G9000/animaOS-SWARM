@@ -22,6 +22,23 @@ use crate::{
     RiskLevel, RuntimeCompatibility, RuntimeLimits,
 };
 
+const CONFORMANCE_KEYED_MANIFEST_ID: &str = "workspace.write";
+const CONFORMANCE_KEYED_ALTERNATE_MANIFEST_ID: &str = "anima.conformance.workspace.keyed-alternate";
+const CONFORMANCE_RETRY_MANIFEST_ID: &str = "anima.conformance.workspace.retry";
+const CONFORMANCE_MANUAL_MANIFEST_ID: &str = "anima.conformance.workspace.manual";
+const CONFORMANCE_NON_RETRYABLE_MANIFEST_ID: &str = "anima.conformance.workspace.non-retryable";
+const CONFORMANCE_COMPENSATE_MANIFEST_ID: &str = "anima.conformance.workspace.compensate";
+
+#[derive(Clone, Copy)]
+enum ConformanceManifestKind {
+    Keyed,
+    KeyedAlternate,
+    Retry,
+    Manual,
+    NonRetryable,
+    Compensate,
+}
+
 pub const MAX_COMMIT_EVENTS: usize = 256;
 pub const MAX_COMMIT_STEPS: usize = 128;
 pub const MAX_COMMIT_ATTEMPTS: usize = 256;
@@ -1334,6 +1351,39 @@ impl StoredRun {
     }
 }
 
+/// Stable categories returned by an [`ExecutionStore`](crate::ExecutionStore).
+///
+/// New categories may be added during the crate's pre-1.0 evolution. Downstream
+/// callers must include a wildcard arm when matching this enum.
+///
+/// ```compile_fail
+/// use anima_core::ExecutionStoreErrorCode;
+///
+/// fn classify(code: ExecutionStoreErrorCode) -> &'static str {
+///     match code {
+///         ExecutionStoreErrorCode::NotFound => "not_found",
+///         ExecutionStoreErrorCode::VersionConflict => "version_conflict",
+///         ExecutionStoreErrorCode::ActiveRunConflict => "active_run_conflict",
+///         ExecutionStoreErrorCode::LeaseConflict => "lease_conflict",
+///         ExecutionStoreErrorCode::LeaseExpired => "lease_expired",
+///         ExecutionStoreErrorCode::CommandConflict => "command_conflict",
+///         ExecutionStoreErrorCode::EventConflict => "event_conflict",
+///         ExecutionStoreErrorCode::CheckpointConflict => "checkpoint_conflict",
+///         ExecutionStoreErrorCode::GrantAlreadyConsumed => "grant_already_consumed",
+///         ExecutionStoreErrorCode::GrantConflict => "grant_conflict",
+///         ExecutionStoreErrorCode::PolicyConflict => "policy_conflict",
+///         ExecutionStoreErrorCode::LineageConflict => "lineage_conflict",
+///         ExecutionStoreErrorCode::HistoryConflict => "history_conflict",
+///         ExecutionStoreErrorCode::BoundsExceeded => "bounds_exceeded",
+///         ExecutionStoreErrorCode::ArithmeticOverflow => "arithmetic_overflow",
+///         ExecutionStoreErrorCode::ResultConflict => "result_conflict",
+///         ExecutionStoreErrorCode::StorageUnavailable => "storage_unavailable",
+///         ExecutionStoreErrorCode::CorruptState => "corrupt_state",
+///         ExecutionStoreErrorCode::InvalidRequest => "invalid_request",
+///     }
+/// }
+/// ```
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionStoreErrorCode {
     NotFound,
@@ -1352,6 +1402,8 @@ pub enum ExecutionStoreErrorCode {
     BoundsExceeded,
     ArithmeticOverflow,
     ResultConflict,
+    StorageUnavailable,
+    CorruptState,
     InvalidRequest,
 }
 
@@ -1409,6 +1461,12 @@ impl fmt::Display for ExecutionStoreError {
                 "execution store version arithmetic overflowed"
             }
             ExecutionStoreErrorCode::ResultConflict => "durable invocation result conflicts",
+            ExecutionStoreErrorCode::StorageUnavailable => {
+                "execution store persistence is unavailable"
+            }
+            ExecutionStoreErrorCode::CorruptState => {
+                "execution store durable state failed integrity validation"
+            }
             ExecutionStoreErrorCode::InvalidRequest => "execution store request is invalid",
         })
     }
@@ -1697,12 +1755,7 @@ where
         1,
         serde_json::json!({"path": "contract.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "a".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let attempt = conformance_value(InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -1717,7 +1770,7 @@ where
         run.id(),
         DefinitionPin::new(1, "execution-store-contract", 1).map_err(ExecutionStoreError::from)?,
         2,
-        vec![manifest],
+        vec![manifest.clone()],
         Budget::default(),
         Usage::default(),
     )
@@ -2100,12 +2153,7 @@ where
         1,
         serde_json::json!({"path": "dispatching.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "d".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let dispatching = conformance_value(InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -2246,12 +2294,7 @@ where
         1,
         serde_json::json!({"path": "retry-lineage.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "f".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let first_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
         &invocation,
         1,
@@ -2470,12 +2513,7 @@ where
             1,
             serde_json::json!({"path": "lineage.txt"}),
         ))?;
-        let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-            "workspace.write",
-            1,
-            format!("sha256:{}", "4".repeat(64)),
-            RecoveryMode::KeyedIdempotent,
-        ))?;
+        let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
         let baseline = if matches!(case, PlainPrepareLineageCase::InitialAttemptTwo) {
             started
         } else {
@@ -2533,25 +2571,35 @@ where
                     serde_json::json!({"path": "changed.txt"}),
                 ))?
             }
+            PlainPrepareLineageCase::ChangedManifest => {
+                let alternate = conformance_manifest(ConformanceManifestKind::KeyedAlternate);
+                conformance_value(LogicalInvocation::new(
+                    queued.id(),
+                    "plain-prepare-lineage",
+                    alternate.id.clone(),
+                    alternate.version,
+                    serde_json::json!({"path": "lineage.txt"}),
+                ))?
+            }
+            PlainPrepareLineageCase::ChangedRecoveryMode => {
+                let retry = conformance_manifest(ConformanceManifestKind::Retry);
+                conformance_value(LogicalInvocation::new(
+                    queued.id(),
+                    "plain-prepare-lineage",
+                    retry.id.clone(),
+                    retry.version,
+                    serde_json::json!({"path": "lineage.txt"}),
+                ))?
+            }
             _ => invocation.clone(),
         };
         let (candidate_manifest, candidate_mode) = match case {
             PlainPrepareLineageCase::ChangedManifest => (
-                conformance_value(ManifestPin::new_with_recovery_mode(
-                    "workspace.write",
-                    1,
-                    format!("sha256:{}", "5".repeat(64)),
-                    RecoveryMode::KeyedIdempotent,
-                ))?,
+                conformance_manifest_pin(ConformanceManifestKind::KeyedAlternate)?,
                 RecoveryMode::KeyedIdempotent,
             ),
             PlainPrepareLineageCase::ChangedRecoveryMode => (
-                conformance_value(ManifestPin::new_with_recovery_mode(
-                    "workspace.write",
-                    1,
-                    format!("sha256:{}", "4".repeat(64)),
-                    RecoveryMode::Retry,
-                ))?,
+                conformance_manifest_pin(ConformanceManifestKind::Retry)?,
                 RecoveryMode::Retry,
             ),
             _ => (manifest, RecoveryMode::KeyedIdempotent),
@@ -2642,12 +2690,7 @@ where
             1,
             serde_json::json!({"path": "adjacent.txt"}),
         ))?;
-        let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-            "workspace.write",
-            1,
-            format!("sha256:{}", "2".repeat(64)),
-            RecoveryMode::KeyedIdempotent,
-        ))?;
+        let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
         let first_number = 1;
         let first_dispatching = conformance_value(InvocationAttemptRecord::new_durable(
             &invocation,
@@ -2690,24 +2733,30 @@ where
             manifest.clone(),
             RecoveryMode::KeyedIdempotent,
         ))?;
-        let retry_invocation = if matches!(case, InvalidRetryAttemptCase::DifferentInvocation) {
-            conformance_value(LogicalInvocation::new(
-                queued.id(),
-                "retry-adjacency",
-                "workspace.write",
-                1,
-                serde_json::json!({"path": "different.txt"}),
-            ))?
-        } else {
-            invocation.clone()
+        let retry_invocation = match case {
+            InvalidRetryAttemptCase::DifferentInvocation => {
+                conformance_value(LogicalInvocation::new(
+                    queued.id(),
+                    "retry-adjacency",
+                    "workspace.write",
+                    1,
+                    serde_json::json!({"path": "different.txt"}),
+                ))?
+            }
+            InvalidRetryAttemptCase::DifferentManifest => {
+                let alternate = conformance_manifest(ConformanceManifestKind::KeyedAlternate);
+                conformance_value(LogicalInvocation::new(
+                    queued.id(),
+                    "retry-adjacency",
+                    alternate.id.clone(),
+                    alternate.version,
+                    serde_json::json!({"path": "adjacent.txt"}),
+                ))?
+            }
+            _ => invocation.clone(),
         };
         let retry_manifest = if matches!(case, InvalidRetryAttemptCase::DifferentManifest) {
-            conformance_value(ManifestPin::new_with_recovery_mode(
-                "workspace.write",
-                1,
-                format!("sha256:{}", "3".repeat(64)),
-                RecoveryMode::KeyedIdempotent,
-            ))?
+            conformance_manifest_pin(ConformanceManifestKind::KeyedAlternate)?
         } else {
             manifest.clone()
         };
@@ -3274,19 +3323,25 @@ where
 {
     let (store, owner_id, session, queued, started, lease) =
         create_running_run(factory, seed).await?;
+    let manifest_kind = match recovery_mode {
+        RecoveryMode::Manual => ConformanceManifestKind::Manual,
+        RecoveryMode::NonRetryable => ConformanceManifestKind::NonRetryable,
+        RecoveryMode::Compensate => ConformanceManifestKind::Compensate,
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    };
+    let manifest_identity = conformance_manifest(manifest_kind);
     let invocation = conformance_value(LogicalInvocation::new(
         queued.id(),
         "blocked-recovery",
-        "workspace.write",
-        1,
+        manifest_identity.id.clone(),
+        manifest_identity.version,
         serde_json::json!({"path": "blocked.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "b".repeat(64)),
-        recovery_mode,
-    ))?;
+    let manifest = conformance_manifest_pin(manifest_kind)?;
     let pause = conformance_value(super::RecoveryPauseRecord::new(
         invocation.binding(),
         1,
@@ -3429,12 +3484,7 @@ where
         1,
         serde_json::json!({"path": "recover.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "c".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let pause = conformance_value(super::RecoveryPauseRecord::new(
         invocation.binding(),
         1,
@@ -3551,21 +3601,24 @@ where
         session.definition().version(),
     ))?;
     let running = conformance_value(queued.transition(RunState::Running, None))?;
-    let (invocation, context) = conformance_policy_context(queued.id())?;
+    let (_, context) = conformance_policy_context(queued.id())?;
     let grant = conformance_counted_grant(&context)?;
     let request = conformance_value(PolicyEngine::approval_request(&context, Some(&grant)))?;
     let waiting = conformance_value(running.wait_for_approval(request))?;
     let paused = conformance_value(
         running.transition(RunState::Paused, Some(super::RunPauseReason::Requested)),
     )?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        invocation.capability_id(),
-        invocation.manifest_version(),
-        format!("sha256:{}", "d".repeat(64)),
-        RecoveryMode::Manual,
+    let manual_manifest = conformance_manifest(ConformanceManifestKind::Manual);
+    let manual_invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "portable-create-run-manual-review",
+        manual_manifest.id.clone(),
+        manual_manifest.version,
+        serde_json::json!({"path": "manual-review.txt"}),
     ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Manual)?;
     let recovery_pause = conformance_value(super::RecoveryPauseRecord::new(
-        invocation.binding(),
+        manual_invocation.binding(),
         1,
         manifest,
         super::RecoveryPauseReason::ManualReview,
@@ -4009,12 +4062,7 @@ where
         1,
         serde_json::json!({"path": "history.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "e".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let pending = conformance_value(InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -4169,12 +4217,7 @@ where
             ),
         )
         .await?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "f".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let make_attempt = |value: u128, step: &str| -> Result<_, ExecutionStoreError> {
         let invocation = conformance_value(LogicalInvocation::new(
             queued.id(),
@@ -4444,12 +4487,7 @@ where
         1,
         serde_json::json!({"path": "checkpoint.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "1".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let pending = conformance_value(InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -5716,12 +5754,7 @@ where
         1,
         serde_json::json!({"path": "baseline.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "2".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let baseline_attempt = conformance_value(InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -5740,7 +5773,7 @@ where
     let result = conformance_value(DurableCapabilityResult::new(
         result_reference.clone(),
         format!("jcs-v1:{}", "a".repeat(64)),
-        format!("sha256:{}", "2".repeat(64)),
+        manifest.schema_digest(),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -5802,7 +5835,7 @@ where
         queued.id(),
         DefinitionPin::new(1, "execution-store-atomic", 1).map_err(ExecutionStoreError::from)?,
         2,
-        vec![manifest],
+        vec![manifest.clone()],
         Budget::default(),
         Usage::default(),
     )
@@ -5822,7 +5855,7 @@ where
     let conflicting_result = conformance_value(DurableCapabilityResult::new(
         result_reference,
         format!("jcs-v1:{}", "b".repeat(64)),
-        format!("sha256:{}", "2".repeat(64)),
+        manifest.schema_digest(),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -5892,10 +5925,56 @@ fn conformance_value<T, E>(result: Result<T, E>) -> Result<T, ExecutionStoreErro
     result.map_err(|_| ExecutionStoreError::new(ExecutionStoreErrorCode::InvalidRequest))
 }
 
-fn conformance_capability_manifest() -> CapabilityManifest {
+/// The complete immutable manifest inventory exercised by the portable execution-store suite.
+///
+/// Store adapters that seal durable snapshots must configure this exact inventory before running
+/// [`assert_execution_store_conformance`]. It intentionally uses distinct stable identities for
+/// recovery modes so a protected adapter never has to accept a pin assembled from test-only
+/// digest literals.
+pub fn execution_store_conformance_manifest_inventory() -> Vec<CapabilityManifest> {
+    [
+        ConformanceManifestKind::Keyed,
+        ConformanceManifestKind::KeyedAlternate,
+        ConformanceManifestKind::Retry,
+        ConformanceManifestKind::Manual,
+        ConformanceManifestKind::NonRetryable,
+        ConformanceManifestKind::Compensate,
+    ]
+    .into_iter()
+    .map(conformance_manifest)
+    .collect()
+}
+
+fn conformance_manifest(kind: ConformanceManifestKind) -> CapabilityManifest {
+    let (id, version, recovery_mode) = match kind {
+        ConformanceManifestKind::Keyed => (
+            CONFORMANCE_KEYED_MANIFEST_ID,
+            1,
+            RecoveryMode::KeyedIdempotent,
+        ),
+        ConformanceManifestKind::KeyedAlternate => (
+            CONFORMANCE_KEYED_ALTERNATE_MANIFEST_ID,
+            1,
+            RecoveryMode::KeyedIdempotent,
+        ),
+        ConformanceManifestKind::Retry => (CONFORMANCE_RETRY_MANIFEST_ID, 1, RecoveryMode::Retry),
+        ConformanceManifestKind::Manual => {
+            (CONFORMANCE_MANUAL_MANIFEST_ID, 1, RecoveryMode::Manual)
+        }
+        ConformanceManifestKind::NonRetryable => (
+            CONFORMANCE_NON_RETRYABLE_MANIFEST_ID,
+            1,
+            RecoveryMode::NonRetryable,
+        ),
+        ConformanceManifestKind::Compensate => (
+            CONFORMANCE_COMPENSATE_MANIFEST_ID,
+            1,
+            RecoveryMode::Compensate,
+        ),
+    };
     CapabilityManifest::new(crate::CapabilityManifestInput {
-        id: "workspace.write".into(),
-        version: 1,
+        id: id.into(),
+        version,
         kind: CapabilityKind::Workspace,
         label: "Write".into(),
         description: "Writes a workspace file".into(),
@@ -5910,7 +5989,7 @@ fn conformance_capability_manifest() -> CapabilityManifest {
         cancellation_supported: true,
         max_retries: 0,
         idempotent: false,
-        recovery_mode: RecoveryMode::NonRetryable,
+        recovery_mode,
         supports_streaming: false,
         supports_artifacts: false,
         supports_citations: false,
@@ -5923,12 +6002,33 @@ fn conformance_capability_manifest() -> CapabilityManifest {
     .expect("execution-store conformance manifest must be valid")
 }
 
+fn conformance_capability_manifest() -> CapabilityManifest {
+    conformance_manifest(ConformanceManifestKind::NonRetryable)
+}
+
+fn conformance_manifest_pin(
+    kind: ConformanceManifestKind,
+) -> Result<ManifestPin, ExecutionStoreError> {
+    conformance_value(ManifestPin::from_manifest(&conformance_manifest(kind)))
+}
+
 fn conformance_dispatch_guard(
     owner_id: Uuid,
     session: &Session,
     invocation: &LogicalInvocation,
 ) -> Result<DispatchPolicyGuard, ExecutionStoreError> {
-    let manifest = conformance_capability_manifest();
+    let manifest = match (invocation.capability_id(), invocation.manifest_version()) {
+        (CONFORMANCE_KEYED_MANIFEST_ID, 1) => conformance_manifest(ConformanceManifestKind::Keyed),
+        (CONFORMANCE_KEYED_ALTERNATE_MANIFEST_ID, 1) => {
+            conformance_manifest(ConformanceManifestKind::KeyedAlternate)
+        }
+        (CONFORMANCE_RETRY_MANIFEST_ID, 1) => conformance_manifest(ConformanceManifestKind::Retry),
+        _ => {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ))
+        }
+    };
     let context = conformance_value(PolicyContext::new(
         owner_id.to_string(),
         "contract-actor",
@@ -6659,12 +6759,7 @@ where
         1,
         serde_json::json!({"path": "contract.txt"}),
     ))?;
-    let manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "3".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
-    ))?;
+    let manifest = conformance_manifest_pin(ConformanceManifestKind::Keyed)?;
     let attempt = conformance_value(InvocationAttemptRecord::new(
         invocation.binding(),
         1,
@@ -6694,14 +6789,17 @@ where
         RecoveryMode::KeyedIdempotent,
         conformance_value(OpaqueReference::new(result_reference.handle()))?,
     ))?;
-    let cross_manifest = conformance_value(ManifestPin::new_with_recovery_mode(
-        "workspace.write",
-        1,
-        format!("sha256:{}", "4".repeat(64)),
-        RecoveryMode::KeyedIdempotent,
+    let alternate_manifest = conformance_manifest(ConformanceManifestKind::KeyedAlternate);
+    let cross_manifest_invocation = conformance_value(LogicalInvocation::new(
+        queued.id(),
+        "durable-result-step",
+        alternate_manifest.id.clone(),
+        alternate_manifest.version,
+        serde_json::json!({"path": "contract.txt"}),
     ))?;
+    let cross_manifest = conformance_manifest_pin(ConformanceManifestKind::KeyedAlternate)?;
     let cross_manifest_completed = conformance_value(CompletedInvocationRecord::new(
-        invocation.binding(),
+        cross_manifest_invocation.binding(),
         1,
         cross_manifest,
         RecoveryMode::KeyedIdempotent,
@@ -6710,7 +6808,7 @@ where
     let result = conformance_value(DurableCapabilityResult::new(
         result_reference.clone(),
         format!("jcs-v1:{}", "d".repeat(64)),
-        format!("sha256:{}", "3".repeat(64)),
+        manifest.schema_digest(),
         1,
         DurableCapabilityStatus::Completed,
     ))?;
@@ -6895,7 +6993,7 @@ where
     let conflicting_result = conformance_value(DurableCapabilityResult::new(
         result_reference,
         format!("jcs-v1:{}", "f".repeat(64)),
-        format!("sha256:{}", "3".repeat(64)),
+        manifest.schema_digest(),
         1,
         DurableCapabilityStatus::Completed,
     ))?;

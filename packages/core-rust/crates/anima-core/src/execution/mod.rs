@@ -15,7 +15,18 @@ pub use checkpoint::{
     UncertainInvocationRecord,
 };
 pub use event::{LiveRuntimeEvent, RuntimeEvent, RuntimeEventKind, SafeEventPayload};
-pub use memory_store::{InMemoryExecutionStore, ManualExecutionClock};
+pub use memory_store::{
+    ExecutionApprovalProjection, ExecutionAttemptProjection, ExecutionCheckpointProjection,
+    ExecutionCommandProjection, ExecutionDecisionProjection, ExecutionDefinitionPinProjection,
+    ExecutionDurableResultProjection, ExecutionEventProjection,
+    ExecutionGrantConsumptionProjection, ExecutionGrantProjection, ExecutionLeaseProjection,
+    ExecutionLogicalInvocationProjection, ExecutionOutcomeProjection, ExecutionPolicyProjection,
+    ExecutionReceiptProjection, ExecutionRunProjection, ExecutionSerialClaimProjection,
+    ExecutionSessionProjection, ExecutionStepProjection, ExecutionStoreProjection,
+    ExecutionStoreSnapshot, InMemoryExecutionStore, ManualExecutionClock,
+    PersistenceCapabilitySecretInventory, PersistenceProtection, PersistenceSecretMaterial,
+    PersistenceSnapshotSealKey,
+};
 pub use state::Step as ExecutionStep;
 pub use state::{
     ApprovalResumeBinding, ApprovalResumeClaim, ApprovalResumeOutcome, Attempt, Budget,
@@ -25,13 +36,13 @@ pub use state::{
     RuntimeCommand, RuntimeCommandKind, Session, SessionConcurrencyPolicy, Step, StepKind, Usage,
 };
 pub use store::{
-    assert_execution_store_conformance, ApprovalGrantMutation, AuthoritativeGrantChange,
-    AuthoritativeGrantChangeKind, AuthoritativeGrantState, AuthoritativeGrantStatus,
-    AuthoritativePolicyChange, AuthoritativePolicyState, AuthoritativePolicyStatus,
-    CheckpointMutation, CreateRun, DispatchGrantMutation, DispatchPolicyGuard,
-    DurableResultMutation, EventReplayPage, ExecutionClock, ExecutionCommit,
-    ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
-    ExecutionStoreFactory, StoreHistoryPage, StoreReadCursor, StoreReadPage, StoredRun,
-    MAX_COMMIT_ATTEMPTS, MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS, MAX_COMMIT_RESULTS,
-    MAX_COMMIT_STEPS, MAX_STORE_READ_CURSOR_BYTES, MAX_STORE_READ_PAGE_SIZE,
+    assert_execution_store_conformance, execution_store_conformance_manifest_inventory,
+    ApprovalGrantMutation, AuthoritativeGrantChange, AuthoritativeGrantChangeKind,
+    AuthoritativeGrantState, AuthoritativeGrantStatus, AuthoritativePolicyChange,
+    AuthoritativePolicyState, AuthoritativePolicyStatus, CheckpointMutation, CreateRun,
+    DispatchGrantMutation, DispatchPolicyGuard, DurableResultMutation, EventReplayPage,
+    ExecutionClock, ExecutionCommit, ExecutionCommitOutcome, ExecutionStore, ExecutionStoreError,
+    ExecutionStoreErrorCode, ExecutionStoreFactory, StoreHistoryPage, StoreReadCursor,
+    StoreReadPage, StoredRun, MAX_COMMIT_ATTEMPTS, MAX_COMMIT_BATCH_ITEMS, MAX_COMMIT_EVENTS,
+    MAX_COMMIT_RESULTS, MAX_COMMIT_STEPS, MAX_STORE_READ_CURSOR_BYTES, MAX_STORE_READ_PAGE_SIZE,
 };

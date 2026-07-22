@@ -951,6 +951,16 @@ pub struct ApprovalResumeBinding {
     decision: ApprovalDecision,
 }
 
+impl ApprovalResumeBinding {
+    /// Returns the exact validated decision this resume command carries.
+    ///
+    /// This is intentionally read-only: stores may record the winning decision as durable
+    /// audit/index state, but callers cannot alter the already-bound command payload.
+    pub fn decision(&self) -> &ApprovalDecision {
+        &self.decision
+    }
+}
+
 /// Exact counted-grant state validated with an approval claim and consumed by the store via CAS.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantConsumptionSnapshot {
