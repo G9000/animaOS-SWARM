@@ -73,15 +73,16 @@ What is missing is a secure runtime credential-management boundary. Today users 
 
 ### Boundary assumptions
 
-The initial implementation is a local-owner feature. Credential mutation is allowed only when all of these conditions hold:
+The initial implementation is a local-owner feature. Every provider-administration route that mutates state or causes an outbound request, including credential writes/deletes, connection writes, connection tests, and Ollama model discovery, is allowed only when all of these conditions hold:
 
 - The daemon is directly bound to a loopback interface.
 - The socket peer is loopback.
 - The request host is loopback.
 - No `Forwarded`, `X-Forwarded-For`, or equivalent forwarding metadata is present.
-- The request origin matches an explicitly allowed local animaOS UI origin, or the request is a non-browser local client using the host's explicit local-owner mechanism.
+- A browser request has an `Origin` header that exactly matches the daemon's startup allowlist. The allowlist comes from `ANIMA_ALLOWED_UI_ORIGINS`; when unset, it contains only the documented loopback Playground/Web development origins and any same-origin UI actually served by the daemon. Wildcards, suffix matching, `null`, and dynamically trusting the request `Host` are forbidden.
+- An originless non-browser request instead supplies `Authorization: Bearer <token>` matching `ANIMA_LOCAL_ADMIN_TOKEN`. If that variable is unset, originless administration is disabled. This token is compared in constant time and is subject to the same redaction and no-log rules as provider credentials.
 
-If the daemon is exposed remotely or placed behind a proxy, credential mutation and credential testing fail closed until an authenticated owner boundary is configured. Read-only provider summaries may remain available because they contain no secrets.
+Failure of any check rejects the request before reading a credential body, opening the vault, mutating state, resolving an outbound destination, or making an outbound request. If the daemon is exposed remotely or placed behind a proxy, all provider administration fails closed; enabling private Ollama destinations does not relax this owner boundary. Read-only provider summaries may remain available because they contain no secrets and cause no outbound traffic.
 
 The OS credential vault protects secrets at rest from casual file access and repository leakage. It does not claim to protect against malware already executing as the same operating-system user or a fully compromised daemon process.
 
@@ -91,12 +92,14 @@ The OS credential vault protects secrets at rest from casual file access and rep
 
 ### 1. Host-owned credential store
 
-Add a `ProviderCredentialStore` boundary owned by `hosts/rust-daemon`. Its operations are:
+Add a `ProviderCredentialStore` boundary owned by `hosts/rust-daemon`. A versioned provider record has two independently optional fields: `secret` and `base_url`. Its operations are:
 
 - `status(provider_id)`
 - `load(provider_id)`
-- `put(provider_id, secret, connection_metadata)`
-- `delete(provider_id)`
+- `put_secret(provider_id, secret)`
+- `delete_secret(provider_id)`
+- `put_base_url(provider_id, base_url)`
+- `delete_base_url(provider_id)`
 
 The production local implementation uses the operating system credential vault:
 
@@ -108,19 +111,21 @@ The daemon uses a stable service name and canonical provider identifier, for exa
 
 Tests use an in-memory fake implementation. If the platform vault is unavailable or locked, the API returns a stable safe error. It must never silently fall back to plaintext storage.
 
-For this release, the vault record may contain a small versioned payload with the secret and provider-specific connection metadata. This keeps Ollama's endpoint persistent without introducing a second local settings database. The serialized vault payload is never exposed through public APIs.
+Each operation performs an atomic read-modify-write of only its field. Removing one field preserves the other; the physical vault record is deleted only when both fields are absent. This permits an endpoint-only Ollama record, token replacement or deletion without losing the endpoint, and endpoint replacement without touching the token. The serialized vault payload is never exposed through public APIs.
 
 ### 2. Live credential resolver
 
-The current daemon constructs provider credentials from environment variables at startup. Replace that one-time snapshot with a shared resolver used by the provider adapter at request time.
+The current daemon constructs provider credentials from environment variables at startup. Replace that one-time snapshot with a host-owned resolver that creates an immutable effective configuration snapshot at the start of each provider operation.
 
-Resolution order is:
+Secret and base URL are resolved independently rather than selecting one whole record. For each field, resolution order is:
 
-1. Canonical provider record from the OS vault.
-2. Existing provider-specific environment variables.
-3. Catalog default base URL with no key.
+1. That field in the canonical provider record from the OS vault.
+2. The existing provider-specific environment variable for that field.
+3. For `base_url` only, the catalog default; for `secret`, no value.
 
-This order lets an explicit UI-managed credential replace an environment value. Deleting the vault record reveals the environment fallback again. The read-only provider response reports the effective source as `vault`, `environment`, or `none` without returning secret material.
+This field-level merge means adding an Ollama token cannot suppress an environment base URL, and saving an endpoint cannot suppress an environment token. Deleting a vault-managed field reveals only that field's environment fallback. The read-only provider response reports the effective source of each field without returning secret material.
+
+Dependency direction remains acyclic: `hosts/rust-daemon` owns the vault implementation, environment access, merge policy, and live resolver. It passes a per-operation `ProviderRequestConfig` value containing the resolved secret/base URL into `anima-model-adapters`. The reusable package defines or consumes that request snapshot but never imports the host, opens the vault, or reads host environment variables. All native Ollama, OpenAI-compatible tool, test, and discovery calls use this same snapshot and endpoint policy.
 
 Secrets are represented with a redacting secret type and are exposed as plaintext only at the narrow point where an outbound authorization header or provider request is constructed. Debug implementations, errors, and telemetry must remain redacted.
 
@@ -135,9 +140,12 @@ Return the existing provider catalog plus:
 - `configured: boolean`
 - `credentialSource: "vault" | "environment" | "none"`
 - `baseUrl`
+- `baseUrlSource: "vault" | "environment" | "catalog"`
+- `hasVaultCredential: boolean`
+- `hasVaultBaseUrl: boolean`
 - `supportsModelDiscovery: boolean`
 
-The response never contains a key, masked key, fingerprint, vault record identifier, or raw environment value.
+`configured` means the effective configuration is usable for that provider: keyed cloud providers require an effective secret, while key-optional Ollama requires an effective base URL. The response never contains a key, masked key, fingerprint, vault record identifier, or raw environment value.
 
 #### `PUT /api/providers/{providerId}/credential`
 
@@ -151,7 +159,7 @@ The key is required, trimmed only for surrounding whitespace, bounded in size, s
 
 #### `DELETE /api/providers/{providerId}/credential`
 
-Delete only the vault-managed record. An environment-provided credential cannot be deleted through the UI. The response reports the new effective configuration source.
+Delete only the vault-managed secret field, preserving any vault-managed base URL. An environment-provided credential cannot be deleted through the UI. The response reports the new effective credential source and the unchanged base-URL source. For Ollama this action removes its optional bearer token without removing its connection endpoint.
 
 #### `PUT /api/providers/ollama/connection`
 
@@ -161,7 +169,7 @@ Body:
 { "baseUrl": "http://127.0.0.1:11434" }
 ```
 
-The daemon canonicalizes the URL. Loopback is allowed by default. Private-network or remote Ollama endpoints require an explicit host-level opt-in. Userinfo, fragments, non-HTTP schemes, and ambiguous hosts are rejected.
+The daemon canonicalizes the URL and updates only the record's base-URL field. Loopback is allowed by default. Private-network or remote Ollama endpoints require an explicit host-level opt-in. Userinfo, fragments, non-HTTP schemes, and ambiguous hosts are rejected. An empty value is not deletion; a separate `DELETE /api/providers/ollama/connection` removes only the vault-managed base URL and reveals the environment or catalog fallback.
 
 #### `POST /api/providers/{providerId}/test`
 
@@ -169,9 +177,9 @@ Resolve the effective credential and perform a bounded provider-specific connect
 
 #### `GET /api/providers/ollama/models`
 
-Call Ollama's model-list endpoint with a short timeout and bounded response size. Return normalized model identifiers and optional non-secret metadata. A connection error is safe and actionable but must not include arbitrary upstream response bodies.
+After passing the local-owner guard, call Ollama's model-list endpoint with a short timeout and bounded response size. Return normalized model identifiers and optional non-secret metadata. A connection error is safe and actionable but must not include arbitrary upstream response bodies.
 
-All mutation and test responses set `Cache-Control: no-store`. Credential request bodies must be excluded from request logging.
+All provider-administration responses, including discovery, set `Cache-Control: no-store`. Credential request bodies and the local-admin bearer token must be excluded from request logging.
 
 ### 4. Browser UI
 
@@ -184,13 +192,15 @@ Each provider row shows:
 - Configuration source: UI vault, environment, or not configured.
 - Add/replace key action for keyed providers.
 - Test connection action.
-- Remove UI-managed key action when a vault record exists.
+- Remove UI-managed key action only when `hasVaultCredential` is true.
 
 The API-key input is a password field. Its value remains component-local, is cleared after submission or navigation, and is never placed in localStorage, sessionStorage, URL state, global application state, analytics, or error reporting.
 
 The Ollama section additionally shows:
 
 - Base URL input.
+- Base URL source and a remove-override action only when `hasVaultBaseUrl` is true.
+- Optional bearer-token add/replace/remove actions independent of the base URL.
 - Test connection action.
 - Refresh models action.
 - Installed-model list.
@@ -202,6 +212,8 @@ Agent creation continues to use the provider catalog. When Ollama is selected, i
 Ollama remains key-optional. A secured remote Ollama installation may store an optional bearer token through the ordinary credential endpoint.
 
 The configured base URL feeds both native Ollama generation and the existing OpenAI-compatible tool path. URL normalization must preserve the current behavior where `/v1` is used for OpenAI-compatible requests while native generation targets `/api/chat` and model discovery targets `/api/tags`.
+
+Every Ollama outbound operation uses one shared endpoint builder and enforcing HTTP client policy. At request time it resolves the hostname, normalizes IPv4-mapped IPv6 addresses, and rejects the destination unless every returned address is loopback or belongs to a host-level explicitly allowed CIDR. The client connects to an approved resolved address while preserving the canonical HTTP `Host` value and TLS SNI, so a second DNS lookup cannot change the destination. DNS is re-resolved and revalidated for every new operation and connection reuse may not cross a configuration change. Redirects are disabled; a 3xx response is an error. Mixed allowed/disallowed DNS results are rejected. Userinfo and URL credentials are always rejected. A bearer token may be sent over cleartext HTTP only to a loopback destination; allowed non-loopback destinations require HTTPS.
 
 Changing the Ollama URL or token takes effect for subsequent requests without restarting the daemon. In-flight requests continue with the credential snapshot they started with.
 
@@ -222,6 +234,7 @@ Provider administration uses stable host error codes:
 - `provider_url_invalid`
 - `provider_remote_admin_disabled`
 - `provider_origin_rejected`
+- `provider_owner_auth_required`
 
 Public messages describe the corrective action without including the submitted secret, upstream response body, authorization header, query credential, vault path, or internal platform error.
 
@@ -232,8 +245,8 @@ Credential-store failures do not mutate the live resolver. Connection-setting ch
 ## Data And Lifecycle Rules
 
 - Vault records are versioned so their payload can evolve without accepting malformed legacy data.
-- Credential replacement is atomic from the daemon's perspective.
-- Deletion removes the vault value and evicts any live cached value.
+- Credential and base-URL replacement are independently atomic from the daemon's perspective.
+- Field deletion preserves the other field, removes the physical vault record only when empty, and invalidates the affected effective configuration.
 - No daemon snapshot, agent definition, swarm definition, memory record, step log, or durable execution checkpoint contains a provider secret.
 - Provider configuration status may be persisted or logged; secret values may not.
 - Credential use may emit a safe audit event containing provider ID, operation, source, success/failure, and timestamp, but never the secret or request payload.
@@ -247,12 +260,12 @@ Credential-store failures do not mutate the live resolver. Connection-setting ch
 ### Rust unit tests
 
 - Canonical provider and alias resolution.
-- Vault-over-environment precedence and fallback after deletion.
+- Independent vault-over-environment precedence for secret and base URL, including fallback after each field is deleted.
 - Key bounds and empty-key rejection.
 - Redacted `Debug`, error, and telemetry output.
 - Versioned vault-record validation.
-- Atomic replacement and delete behavior.
-- Ollama URL normalization and SSRF-oriented rejection cases.
+- Atomic field replacement, endpoint-only records, independent token deletion, and whole-record cleanup when empty.
+- Ollama URL normalization plus rejection of mixed DNS results, IPv4-mapped IPv6 bypasses, redirects, DNS rebinding attempts, and cleartext tokens to non-loopback destinations.
 - Native, OpenAI-compatible, and discovery endpoint construction from one Ollama base URL.
 
 ### Host integration tests
@@ -260,11 +273,11 @@ Credential-store failures do not mutate the live resolver. Connection-setting ch
 - Provider list exposes status and source without secret material.
 - Put, replace, test, and delete against an in-memory credential store.
 - Restart simulation reloads a vault-managed credential.
-- Credential routes reject remote peers, forwarded metadata, and unapproved origins.
+- Provider-administration routes reject remote peers, forwarded metadata, unapproved/browserless origins, missing or invalid originless-client tokens, and disabled remote administration before side effects.
 - Request and response bodies remain bounded.
 - Sanitized errors do not contain a submitted sentinel secret or upstream body.
 - Environment credentials remain usable and cannot be deleted through the API.
-- Ollama discovery uses a mock `/api/tags` server and handles timeout, malformed data, and oversized data.
+- Ollama generation, testing, and discovery share the enforcing endpoint client; discovery uses a mock `/api/tags` server and handles timeout, redirects, malformed data, and oversized data.
 
 ### UI tests
 
@@ -306,4 +319,3 @@ The feature ships disabled for remote credential administration. A future authen
 - A user can connect to local Ollama, list installed models, choose one, create an agent, and run it.
 - Credential mutation fails closed outside the direct local-owner boundary.
 - Tests prove that sentinel secrets do not appear in public output or durable state.
-
