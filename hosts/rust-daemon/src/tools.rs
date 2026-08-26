@@ -445,19 +445,19 @@ impl ToolRegistry {
                     object_parameters(vec![
                         optional_parameter(
                             "to_agent_id",
-                            non_blank_string_parameter(
+                            non_empty_string_parameter(
                                 "Coordinator agent id to receive the message",
                             ),
                         ),
                         optional_parameter(
                             "to_agent_name",
-                            non_blank_string_parameter(
+                            non_empty_string_parameter(
                                 "Configured swarm agent name to receive the message",
                             ),
                         ),
                         required_parameter(
                             "message",
-                            non_blank_string_parameter("Message text to deliver"),
+                            non_empty_string_parameter("Message text to deliver"),
                         ),
                     ]),
                     &["to_agent_id", "to_agent_name"],

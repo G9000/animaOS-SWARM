@@ -288,11 +288,11 @@ fn registry_marks_trim_rejected_strings_as_non_blank() {
 }
 
 #[test]
-fn registry_send_message_rejects_blank_message_and_recipients() {
+fn registry_send_message_matches_empty_only_parser_semantics() {
     let registry = ToolRegistry::new();
 
     for property in ["message", "to_agent_id", "to_agent_name"] {
-        assert_non_blank_string(&parameter_schema(&registry, "send_message", property));
+        assert_non_empty_only_string(&parameter_schema(&registry, "send_message", property));
     }
 }
 
@@ -434,6 +434,11 @@ fn assert_non_empty_string(schema: &BTreeMap<String, DataValue>) {
         Some(&DataValue::String("string".into()))
     );
     assert_eq!(schema.get("minLength"), Some(&DataValue::Number(1.0)));
+}
+
+fn assert_non_empty_only_string(schema: &BTreeMap<String, DataValue>) {
+    assert_non_empty_string(schema);
+    assert_eq!(schema.get("pattern"), None);
 }
 
 fn assert_unconstrained_string(schema: &BTreeMap<String, DataValue>) {
