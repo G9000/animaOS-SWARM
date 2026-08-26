@@ -96,7 +96,7 @@ impl ToolRegistry {
                 object_parameters(vec![
                     required_parameter(
                         "query",
-                        string_parameter("Search query used to find relevant memories"),
+                        non_empty_string_parameter("Search query used to find relevant memories"),
                     ),
                     optional_parameter(
                         "limit",
@@ -111,7 +111,10 @@ impl ToolRegistry {
                 "memory_add",
                 "Store a durable memory for future agent runs",
                 object_parameters(vec![
-                    required_parameter("content", string_parameter("Memory content to persist")),
+                    required_parameter(
+                        "content",
+                        non_blank_string_parameter("Memory content to persist"),
+                    ),
                     optional_parameter(
                         "type",
                         string_enum_parameter(
@@ -143,7 +146,7 @@ impl ToolRegistry {
                 "web_fetch",
                 "Fetch readable text from a public HTTP or HTTPS URL",
                 object_parameters(vec![
-                    required_parameter("url", string_parameter("Public URL to fetch")),
+                    required_parameter("url", non_blank_string_parameter("Public URL to fetch")),
                     optional_parameter(
                         "max_length",
                         integer_parameter("Maximum number of characters to return", 1),
@@ -157,7 +160,7 @@ impl ToolRegistry {
                 "exa_search",
                 "Search the web with Exa and return ranked results",
                 object_parameters(vec![
-                    required_parameter("query", string_parameter("Web search query")),
+                    required_parameter("query", non_blank_string_parameter("Web search query")),
                     optional_parameter(
                         "num_results",
                         integer_parameter("Maximum number of search results", 1),
@@ -188,7 +191,7 @@ impl ToolRegistry {
                 "Evaluate a mathematical expression",
                 object_parameters(vec![required_parameter(
                     "expression",
-                    string_parameter("Mathematical expression to evaluate"),
+                    non_blank_string_parameter("Mathematical expression to evaluate"),
                 )]),
             ),
             utility::execute_calculate,
@@ -200,7 +203,7 @@ impl ToolRegistry {
                 object_parameters(vec![
                     required_parameter(
                         "file_path",
-                        string_parameter("Workspace-relative path of the file to read"),
+                        non_blank_string_parameter("Workspace-relative path of the file to read"),
                     ),
                     optional_parameter("offset", integer_parameter("Zero-based line offset", 0)),
                     optional_parameter(
@@ -217,7 +220,7 @@ impl ToolRegistry {
                 "List files and directories within a workspace path",
                 object_parameters(vec![required_parameter(
                     "path",
-                    string_parameter("Workspace-relative directory path"),
+                    non_blank_string_parameter("Workspace-relative directory path"),
                 )]),
             ),
             filesystem::execute_list_dir,
@@ -227,7 +230,10 @@ impl ToolRegistry {
                 "glob",
                 "Find workspace files whose paths match a glob pattern",
                 object_parameters(vec![
-                    required_parameter("pattern", string_parameter("Glob pattern to match")),
+                    required_parameter(
+                        "pattern",
+                        non_blank_string_parameter("Glob pattern to match"),
+                    ),
                     optional_parameter(
                         "path",
                         string_parameter("Workspace-relative directory to search"),
@@ -243,7 +249,7 @@ impl ToolRegistry {
                 object_parameters(vec![
                     required_parameter(
                         "pattern",
-                        string_parameter("Regular expression to search for"),
+                        non_blank_string_parameter("Regular expression to search for"),
                     ),
                     optional_parameter(
                         "path",
@@ -264,7 +270,7 @@ impl ToolRegistry {
                 object_parameters(vec![
                     required_parameter(
                         "file_path",
-                        string_parameter("Workspace-relative path of the file to write"),
+                        non_blank_string_parameter("Workspace-relative path of the file to write"),
                     ),
                     required_parameter("content", string_parameter("Complete file content")),
                 ]),
@@ -278,7 +284,7 @@ impl ToolRegistry {
                 object_parameters(vec![
                     required_parameter(
                         "file_path",
-                        string_parameter("Workspace-relative path of the file to edit"),
+                        non_blank_string_parameter("Workspace-relative path of the file to edit"),
                     ),
                     required_parameter(
                         "old_string",
@@ -296,7 +302,7 @@ impl ToolRegistry {
                 object_parameters(vec![
                     required_parameter(
                         "file_path",
-                        string_parameter("Workspace-relative path of the file to edit"),
+                        non_blank_string_parameter("Workspace-relative path of the file to edit"),
                     ),
                     required_parameter(
                         "edits",
@@ -328,7 +334,10 @@ impl ToolRegistry {
                     array_parameter(
                         "Complete todo list to persist",
                         object_parameter(vec![
-                            required_parameter("content", string_parameter("Todo description")),
+                            required_parameter(
+                                "content",
+                                non_blank_string_parameter("Todo description"),
+                            ),
                             required_parameter(
                                 "status",
                                 string_enum_parameter(
@@ -338,7 +347,9 @@ impl ToolRegistry {
                             ),
                             required_parameter(
                                 "activeForm",
-                                string_parameter("Present-tense description of active work"),
+                                non_blank_string_parameter(
+                                    "Present-tense description of active work",
+                                ),
                             ),
                         ]),
                         None,
@@ -360,7 +371,10 @@ impl ToolRegistry {
                 "bash",
                 "Run a foreground shell command in the workspace",
                 object_parameters(vec![
-                    required_parameter("command", string_parameter("Shell command to run")),
+                    required_parameter(
+                        "command",
+                        non_blank_string_parameter("Shell command to run"),
+                    ),
                     optional_parameter(
                         "timeout",
                         integer_parameter("Command timeout in milliseconds", 1),
@@ -378,7 +392,10 @@ impl ToolRegistry {
                 "bg_start",
                 "Start a background shell command in the workspace",
                 object_parameters(vec![
-                    required_parameter("command", string_parameter("Shell command to start")),
+                    required_parameter(
+                        "command",
+                        non_blank_string_parameter("Shell command to start"),
+                    ),
                     optional_parameter(
                         "cwd",
                         string_parameter("Workspace-relative working directory"),
@@ -392,7 +409,7 @@ impl ToolRegistry {
                 "bg_output",
                 "Read captured output from a background process",
                 object_parameters(vec![
-                    required_parameter("id", string_parameter("Background process id")),
+                    required_parameter("id", non_blank_string_parameter("Background process id")),
                     optional_parameter(
                         "all",
                         boolean_parameter("Return all captured output instead of unread output"),
@@ -407,7 +424,7 @@ impl ToolRegistry {
                 "Stop a running background process",
                 object_parameters(vec![required_parameter(
                     "id",
-                    string_parameter("Background process id"),
+                    non_blank_string_parameter("Background process id"),
                 )]),
             ),
             process::execute_bg_stop,
@@ -428,15 +445,19 @@ impl ToolRegistry {
                     object_parameters(vec![
                         optional_parameter(
                             "to_agent_id",
-                            string_parameter("Coordinator agent id to receive the message"),
+                            non_blank_string_parameter(
+                                "Coordinator agent id to receive the message",
+                            ),
                         ),
                         optional_parameter(
                             "to_agent_name",
-                            string_parameter("Configured swarm agent name to receive the message"),
+                            non_blank_string_parameter(
+                                "Configured swarm agent name to receive the message",
+                            ),
                         ),
                         required_parameter(
                             "message",
-                            string_parameter("Message text to deliver"),
+                            non_blank_string_parameter("Message text to deliver"),
                         ),
                     ]),
                     &["to_agent_id", "to_agent_name"],
@@ -450,7 +471,7 @@ impl ToolRegistry {
                 "Broadcast a message to every other live swarm agent",
                 object_parameters(vec![required_parameter(
                     "message",
-                    string_parameter("Message text to broadcast"),
+                    non_empty_string_parameter("Message text to broadcast"),
                 )]),
             ),
             execute_swarm_only_tool,
@@ -459,8 +480,13 @@ impl ToolRegistry {
     }
 
     fn register(&mut self, descriptor: ToolDescriptor, handler: ToolHandler) {
+        let name = descriptor.name.clone();
+        assert!(
+            !self.registrations.contains_key(&name),
+            "duplicate tool registration '{name}'"
+        );
         self.registrations.insert(
-            descriptor.name.clone(),
+            name,
             ToolRegistration {
                 descriptor,
                 handler,
@@ -596,6 +622,19 @@ fn with_any_required_parameter(
 
 fn string_parameter(description: &str) -> DataValue {
     typed_parameter("string", description)
+}
+
+fn non_empty_string_parameter(description: &str) -> DataValue {
+    let mut schema = typed_parameter_schema("string", description);
+    schema.insert("minLength".into(), DataValue::Number(1.0));
+    DataValue::Object(schema)
+}
+
+fn non_blank_string_parameter(description: &str) -> DataValue {
+    let mut schema = typed_parameter_schema("string", description);
+    schema.insert("minLength".into(), DataValue::Number(1.0));
+    schema.insert("pattern".into(), DataValue::String(r".*\S.*".into()));
+    DataValue::Object(schema)
 }
 
 fn integer_parameter(description: &str, minimum: u64) -> DataValue {

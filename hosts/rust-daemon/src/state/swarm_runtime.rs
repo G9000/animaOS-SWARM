@@ -347,14 +347,19 @@ fn with_swarm_messaging_tools(
         .resolve_descriptors(["send_message", "broadcast_message"])
         .expect("swarm messaging tools must be registered");
     for descriptor in messaging_tools {
-        push_tool_if_missing(&mut tools, descriptor);
+        replace_or_push_tool(&mut tools, descriptor);
     }
     config.tools = Some(tools);
     config
 }
 
-fn push_tool_if_missing(tools: &mut Vec<ToolDescriptor>, descriptor: ToolDescriptor) {
-    if !tools.iter().any(|tool| tool.name == descriptor.name) {
+fn replace_or_push_tool(tools: &mut Vec<ToolDescriptor>, descriptor: ToolDescriptor) {
+    let mut replaced = false;
+    for existing in tools.iter_mut().filter(|tool| tool.name == descriptor.name) {
+        *existing = descriptor.clone();
+        replaced = true;
+    }
+    if !replaced {
         tools.push(descriptor);
     }
 }
@@ -387,6 +392,13 @@ mod tests {
         let config = with_swarm_messaging_tools(config, &registry);
         let tools = config.tools.expect("swarm tools");
 
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["send_message", "broadcast_message"]
+        );
         for name in ["send_message", "broadcast_message"] {
             assert_eq!(
                 tools.iter().find(|tool| tool.name == name),
@@ -397,28 +409,48 @@ mod tests {
     }
 
     #[test]
-    fn swarm_messaging_tools_preserve_existing_entries() {
+    fn swarm_messaging_tools_replace_existing_entries_in_place() {
         let registry = ToolRegistry::new();
-        let existing = ToolDescriptor {
-            name: "send_message".into(),
-            description: "Caller-provided swarm descriptor".into(),
-            parameters_schema: Default::default(),
-            examples: None,
-        };
         let mut config = agent_config();
-        config.tools = Some(vec![existing.clone()]);
+        config.tools = Some(vec![
+            untrusted_descriptor("broadcast_message"),
+            untrusted_descriptor("custom_tool"),
+            untrusted_descriptor("send_message"),
+            untrusted_descriptor("send_message"),
+        ]);
 
         let config = with_swarm_messaging_tools(config, &registry);
         let tools = config.tools.expect("swarm tools");
 
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0], existing);
+        assert_eq!(tools.len(), 4);
         assert_eq!(
-            tools[1],
+            tools[0],
             registry
                 .descriptor("broadcast_message")
                 .expect("broadcast descriptor")
         );
+        assert_eq!(tools[1], untrusted_descriptor("custom_tool"));
+        assert_eq!(
+            tools[2],
+            registry
+                .descriptor("send_message")
+                .expect("send descriptor")
+        );
+        assert_eq!(
+            tools[3],
+            registry
+                .descriptor("send_message")
+                .expect("duplicate send descriptor")
+        );
+    }
+
+    fn untrusted_descriptor(name: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.into(),
+            description: "Caller-provided descriptor".into(),
+            parameters_schema: Default::default(),
+            examples: None,
+        }
     }
 
     fn agent_config() -> AgentConfig {

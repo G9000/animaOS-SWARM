@@ -4,6 +4,7 @@ use super::{
             edit_workspace_file_from_root, multi_edit_workspace_file_from_root,
             write_workspace_file_from_root,
         },
+        execute_read_file,
         search::{
             compile_glob_matcher, glob_workspace_paths_from_root, grep_workspace_files_from_root,
             list_workspace_dir_from_root, read_workspace_file_from_root,
@@ -83,6 +84,17 @@ fn registry_descriptor_returns_a_canonical_clone() {
     );
     assert_ne!(registry.descriptor("read_file"), Some(changed));
     assert_eq!(registry.descriptor("missing_tool"), None);
+}
+
+#[test]
+#[should_panic(expected = "duplicate tool registration 'read_file'")]
+fn registry_rejects_duplicate_registration() {
+    let mut registry = ToolRegistry::new();
+    let duplicate = registry
+        .descriptor("read_file")
+        .expect("read_file descriptor");
+
+    registry.register(duplicate, execute_read_file);
 }
 
 #[test]
@@ -237,6 +249,88 @@ fn registry_send_message_requires_a_recipient_alternative() {
     );
 }
 
+#[test]
+fn registry_marks_trim_rejected_strings_as_non_blank() {
+    let registry = ToolRegistry::new();
+
+    for (tool, property) in [
+        ("memory_add", "content"),
+        ("web_fetch", "url"),
+        ("exa_search", "query"),
+        ("calculate", "expression"),
+        ("read_file", "file_path"),
+        ("list_dir", "path"),
+        ("glob", "pattern"),
+        ("grep", "pattern"),
+        ("write_file", "file_path"),
+        ("edit_file", "file_path"),
+        ("multi_edit", "file_path"),
+        ("bash", "command"),
+        ("bg_start", "command"),
+        ("bg_output", "id"),
+        ("bg_stop", "id"),
+    ] {
+        assert_non_blank_string(&parameter_schema(&registry, tool, property));
+    }
+
+    let todo_write = registry
+        .descriptor("todo_write")
+        .expect("todo_write descriptor");
+    let todo_items = array_item_properties(&todo_write, "todos");
+    for property in ["content", "activeForm"] {
+        assert_non_blank_string(
+            todo_items
+                .get(property)
+                .and_then(data_object)
+                .expect("todo string schema"),
+        );
+    }
+}
+
+#[test]
+fn registry_send_message_rejects_blank_message_and_recipients() {
+    let registry = ToolRegistry::new();
+
+    for property in ["message", "to_agent_id", "to_agent_name"] {
+        assert_non_blank_string(&parameter_schema(&registry, "send_message", property));
+    }
+}
+
+#[test]
+fn registry_string_schemas_preserve_handler_empty_string_semantics() {
+    let registry = ToolRegistry::new();
+
+    for (tool, property) in [
+        ("glob", "path"),
+        ("grep", "path"),
+        ("grep", "include"),
+        ("write_file", "content"),
+        ("edit_file", "old_string"),
+        ("edit_file", "new_string"),
+        ("bash", "cwd"),
+        ("bg_start", "cwd"),
+    ] {
+        assert_unconstrained_string(&parameter_schema(&registry, tool, property));
+    }
+
+    for (tool, property) in [("memory_search", "query"), ("broadcast_message", "message")] {
+        assert_non_empty_string(&parameter_schema(&registry, tool, property));
+    }
+
+    let multi_edit = registry
+        .descriptor("multi_edit")
+        .expect("multi_edit descriptor");
+    let edit_items = array_item_properties(&multi_edit, "edits");
+    for property in ["old_string", "new_string"] {
+        assert_unconstrained_string(
+            edit_items
+                .get(property)
+                .and_then(data_object)
+                .expect("edit string schema"),
+        );
+    }
+}
+
 fn assert_required_parameters(descriptor: &ToolDescriptor, expected: &[&str]) {
     let Some(DataValue::Object(properties)) = descriptor.parameters_schema.get("properties") else {
         panic!("{} must define object properties", descriptor.name);
@@ -307,6 +401,48 @@ fn assert_property_schema(
         schema.get("maximum"),
         maximum.map(DataValue::Number).as_ref()
     );
+}
+
+fn parameter_schema(
+    registry: &ToolRegistry,
+    tool: &str,
+    property: &str,
+) -> BTreeMap<String, DataValue> {
+    registry
+        .descriptor(tool)
+        .expect("registered descriptor")
+        .parameters_schema
+        .get("properties")
+        .and_then(data_object)
+        .and_then(|properties| properties.get(property))
+        .and_then(data_object)
+        .cloned()
+        .expect("property schema")
+}
+
+fn assert_non_blank_string(schema: &BTreeMap<String, DataValue>) {
+    assert_non_empty_string(schema);
+    assert_eq!(
+        schema.get("pattern"),
+        Some(&DataValue::String(r".*\S.*".into()))
+    );
+}
+
+fn assert_non_empty_string(schema: &BTreeMap<String, DataValue>) {
+    assert_eq!(
+        schema.get("type"),
+        Some(&DataValue::String("string".into()))
+    );
+    assert_eq!(schema.get("minLength"), Some(&DataValue::Number(1.0)));
+}
+
+fn assert_unconstrained_string(schema: &BTreeMap<String, DataValue>) {
+    assert_eq!(
+        schema.get("type"),
+        Some(&DataValue::String("string".into()))
+    );
+    assert_eq!(schema.get("minLength"), None);
+    assert_eq!(schema.get("pattern"), None);
 }
 
 fn assert_string_enum(registry: &ToolRegistry, tool: &str, property: &str, expected: &[&str]) {
