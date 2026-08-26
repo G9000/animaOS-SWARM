@@ -122,7 +122,11 @@ The draft is held in onboarding component state for the current page session. Su
 
 ### Agent creation
 
-Extend the TypeScript daemon client so `createAgent` accepts `tools: string[]`. The Rust create contract already accepts tool names and validates them through the host tool registry.
+Extend the TypeScript daemon client so `createAgent` accepts `tools: string[]`. The browser sends only tool slugs; it does not duplicate descriptions or argument schemas.
+
+The daemon must expand every accepted slug into the host registry's canonical `ToolDescriptor` before constructing or updating an agent runtime. `ToolRegistry` therefore owns both the executable handler and its canonical model-facing descriptor: name, description, parameter schema, and examples when useful. Request-supplied metadata for a registered host tool is not trusted as the executable definition and is replaced by the canonical registry descriptor.
+
+This expansion is required for functional permission profiles. A name-only request currently parses into an empty description and parameter schema, which is insufficient for argument-taking tools such as `read_file`, `write_file`, and `bash`.
 
 ### Agent updates
 
@@ -130,12 +134,13 @@ Users must be able to change access later without deleting the agent or losing i
 
 - Add optional tools to `AgentConfigUpdate` in `anima-core`.
 - Add optional tools to the daemon `AgentUpdateRequest` contract.
-- Validate patched tool descriptors against `ToolRegistry` before mutating the runtime.
+- Resolve create and update tool slugs to canonical registry descriptors before mutating the runtime.
+- Reject unknown slugs before mutating the runtime.
 - Persist the updated agent config through the existing control-plane snapshot path.
 - Return the updated snapshot in the existing agent envelope.
 - Extend the TypeScript client and settings form to submit and derive access profiles.
 
-Unknown tools return a stable bad-request response. A missing agent remains a not-found response. An invalid patch must not partially mutate the runtime.
+Unknown tools return a stable bad-request response. A missing agent remains a not-found response. An invalid patch must not partially mutate the runtime. Canonical descriptors, rather than empty name-only descriptors, are stored in snapshots so restored runtimes expose the same usable tool definitions to model adapters.
 
 ### Agent view model
 
@@ -260,10 +265,12 @@ No generated bitmap asset is needed; the orb, glow, iconography, and depth are c
 
 ### Rust tests
 
+- Name-only create requests resolve every profile tool to its canonical description and argument schema.
+- Representative argument-taking tools such as `read_file`, `write_file`, and `bash` reach the model adapter with their expected parameter definitions.
 - Agent config update applies tools and preserves other config fields.
 - PATCH accepts known tool lists.
 - PATCH rejects unknown tools before mutation.
-- Updated tools survive control-plane snapshot persistence and restoration.
+- Updated canonical tool descriptors survive control-plane snapshot persistence and restoration.
 - Existing create, run, and update behavior remains intact.
 
 ### Workspace verification
@@ -279,6 +286,7 @@ No generated bitmap asset is needed; the orb, glow, iconography, and depth are c
 - With an online daemon and zero agents, the web app opens Guided Focus onboarding without the normal workspace shell.
 - The user can complete Identity, Intelligence, Access, and Review and create exactly one agent.
 - The created agent receives the exact tools for the selected profile.
+- Every selected tool reaches model adapters with the daemon-owned canonical description and argument schema.
 - The daemon rejects unknown tools without partially changing an agent.
 - A created or restored oldest agent opens as the main workspace agent.
 - Existing additional agents appear in Agents without changing the main chat target.
