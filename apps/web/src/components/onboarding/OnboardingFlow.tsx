@@ -41,6 +41,9 @@ const INITIAL_DRAFT: OnboardingDraft = {
   access: 'collaborate',
 };
 
+const PROVIDER_CATALOG_CHANGED_ERROR =
+  'Provider catalog changed. Review your provider and model before creating the agent.';
+
 function defaultModel(provider: string): string {
   return MODEL_SUGGESTIONS[provider]?.[0] ?? '__custom__';
 }
@@ -130,6 +133,42 @@ export function OnboardingFlow({
   const intelligenceReady =
     providerCatalogState === 'ready' && selectedProviderConfigured;
 
+  useEffect(() => {
+    if (currentStep < 2 || intelligenceReady) {
+      return;
+    }
+
+    setCreateError(null);
+    setBlockingError(PROVIDER_CATALOG_CHANGED_ERROR);
+    setCurrentStep(1);
+  }, [currentStep, intelligenceReady]);
+
+  useEffect(() => {
+    if (!blockingError) {
+      return;
+    }
+
+    if (currentStep === 0 && !draft.name.trim()) {
+      nameInputRef.current?.focus();
+      return;
+    }
+
+    if (currentStep === 1 && intelligenceReady && !resolvedModel) {
+      if (draft.model === '__custom__') {
+        customModelInputRef.current?.focus();
+      } else {
+        modelSelectRef.current?.focus();
+      }
+    }
+  }, [
+    blockingError,
+    currentStep,
+    draft.model,
+    draft.name,
+    intelligenceReady,
+    resolvedModel,
+  ]);
+
   const updateDraft = <Key extends keyof OnboardingDraft>(
     key: Key,
     value: OnboardingDraft[Key],
@@ -204,13 +243,35 @@ export function OnboardingFlow({
       return;
     }
 
+    const name = draft.name.trim();
+    if (!name) {
+      setCreateError(null);
+      setBlockingError('Enter an agent name.');
+      setCurrentStep(0);
+      return;
+    }
+
+    if (!intelligenceReady) {
+      setCreateError(null);
+      setBlockingError(PROVIDER_CATALOG_CHANGED_ERROR);
+      setCurrentStep(1);
+      return;
+    }
+
+    if (!resolvedModel) {
+      setCreateError(null);
+      setBlockingError('Enter a model.');
+      setCurrentStep(1);
+      return;
+    }
+
     submitInFlightRef.current = true;
     setCreating(true);
     setCreateError(null);
     try {
       const system = draft.system.trim();
       const response = await daemon.createAgent({
-        name: draft.name.trim(),
+        name,
         provider: draft.provider,
         model: resolvedModel,
         tools: toolNamesForProfile(draft.access),

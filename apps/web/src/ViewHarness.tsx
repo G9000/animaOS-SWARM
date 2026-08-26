@@ -54,6 +54,8 @@ export function ViewHarness() {
   const agentMutationEpochRef = useRef(0);
   const agentRequestTokenRef = useRef(0);
   const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
+  const agentRefreshPendingEpochRef = useRef<number | null>(null);
+  const providerRequestGenerationRef = useRef(0);
   sendingRef.current = sending;
 
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -65,40 +67,48 @@ export function ViewHarness() {
   };
 
   const refreshAgent = useCallback(() => {
-    const requestToken = ++agentRequestTokenRef.current;
-    const mutationEpoch = agentMutationEpochRef.current;
-    const previousRequest = agentRequestInFlightRef.current;
-    const request = (async () => {
-      if (previousRequest) {
-        await previousRequest;
-      }
-      if (
-        requestToken !== agentRequestTokenRef.current ||
-        mutationEpoch !== agentMutationEpochRef.current
-      ) {
-        return;
-      }
+    agentRefreshPendingEpochRef.current = agentMutationEpochRef.current;
+    if (agentRequestInFlightRef.current) {
+      return agentRequestInFlightRef.current;
+    }
 
-      try {
-        const { agents } = await daemon.listAgents();
-        if (
-          requestToken === agentRequestTokenRef.current &&
-          mutationEpoch === agentMutationEpochRef.current
-        ) {
-          setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
-          setOnline(true);
-          setLoaded(true);
-          if (agents.length > 0) {
-            scrollDown();
+    const request = (async () => {
+      while (true) {
+        while (agentRefreshPendingEpochRef.current !== null) {
+          const mutationEpoch = agentRefreshPendingEpochRef.current;
+          agentRefreshPendingEpochRef.current = null;
+          if (mutationEpoch !== agentMutationEpochRef.current) {
+            continue;
+          }
+          const requestToken = ++agentRequestTokenRef.current;
+
+          try {
+            const { agents } = await daemon.listAgents();
+            if (
+              requestToken === agentRequestTokenRef.current &&
+              mutationEpoch === agentMutationEpochRef.current
+            ) {
+              setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+              setOnline(true);
+              setLoaded(true);
+              if (agents.length > 0) {
+                scrollDown();
+              }
+            }
+          } catch {
+            if (
+              requestToken === agentRequestTokenRef.current &&
+              mutationEpoch === agentMutationEpochRef.current
+            ) {
+              setOnline(false);
+              setLoaded(true);
+            }
           }
         }
-      } catch {
-        if (
-          requestToken === agentRequestTokenRef.current &&
-          mutationEpoch === agentMutationEpochRef.current
-        ) {
-          setOnline(false);
-          setLoaded(true);
+
+        await Promise.resolve();
+        if (agentRefreshPendingEpochRef.current === null) {
+          break;
         }
       }
     })();
@@ -117,22 +127,30 @@ export function ViewHarness() {
   }, [refreshAgent]);
 
   const retryProviders = useCallback(async () => {
+    const requestGeneration = ++providerRequestGenerationRef.current;
     try {
       const response = await daemon.listProviders();
-      setProviders(response.providers);
-      setProvidersError(null);
+      if (requestGeneration === providerRequestGenerationRef.current) {
+        setProviders(response.providers);
+        setProvidersError(null);
+      }
     } catch (providerError) {
-      setProvidersError(
-        providerError instanceof Error
-          ? providerError.message
-          : String(providerError),
-      );
+      if (requestGeneration === providerRequestGenerationRef.current) {
+        setProvidersError(
+          providerError instanceof Error
+            ? providerError.message
+            : String(providerError),
+        );
+      }
     }
   }, []);
 
   // Load daemon provider catalog (which providers have keys configured).
   useEffect(() => {
     void retryProviders();
+    return () => {
+      providerRequestGenerationRef.current += 1;
+    };
   }, [retryProviders]);
 
   // Light polling so new messages appear while idle.

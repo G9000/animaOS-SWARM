@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -546,6 +547,42 @@ describe('OnboardingFlow', () => {
     expect(listAgents).not.toHaveBeenCalled();
   });
 
+  it('returns Review to Intelligence when the reviewed provider is invalidated', async () => {
+    const user = userEvent.setup();
+    const createAgent = vi.spyOn(daemon, 'createAgent');
+    const view = renderFlow();
+    await goToReview(user);
+    expect(screen.getByText('OpenAI / gpt-4o')).toBeVisible();
+
+    view.rerender(
+      <OnboardingFlow
+        providers={[
+          { ...configuredProviders[0], configured: false },
+          configuredProviders[2],
+        ]}
+        providersError={null}
+        retryProviders={vi.fn()}
+        onCreated={view.onCreated}
+      />,
+    );
+
+    expect(
+      await screen.findByRole('heading', { name: 'Intelligence' }),
+    ).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Provider catalog changed. Review your provider and model before creating the agent.',
+    );
+    const ollama = screen.getByRole('button', {
+      name: /Ollama.*configured/i,
+    });
+    await waitFor(() => expect(ollama).toHaveAttribute('aria-pressed', 'true'));
+    expect(ollama).toHaveFocus();
+    expect(
+      screen.queryByRole('button', { name: 'Create agent' }),
+    ).not.toBeInTheDocument();
+    expect(createAgent).not.toHaveBeenCalled();
+  });
+
   it('keeps a rejected non-default draft intact and prevents double submit on retry', async () => {
     const user = userEvent.setup();
     const firstCreate = deferred<{ agent: DaemonSnapshot }>();
@@ -608,14 +645,15 @@ describe('OnboardingFlow', () => {
     expect(createAgent).toHaveBeenCalledTimes(2);
   });
 
-  it('serializes same-epoch polls and applies only the newest queued response', async () => {
-    const olderPoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const newerPoll = deferred<{ agents: DaemonSnapshot[] }>();
+  it('coalesces sustained slow polls without starving valid responses or growing the queue', async () => {
+    const initialPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const followupPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const finalPoll = deferred<{ agents: DaemonSnapshot[] }>();
     const listAgents = vi
       .spyOn(daemon, 'listAgents')
-      .mockResolvedValueOnce({ agents: [] })
-      .mockReturnValueOnce(olderPoll.promise)
-      .mockReturnValueOnce(newerPoll.promise);
+      .mockReturnValueOnce(initialPoll.promise)
+      .mockReturnValueOnce(followupPoll.promise)
+      .mockReturnValueOnce(finalPoll.promise);
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
       providers: configuredProviders,
     });
@@ -631,38 +669,92 @@ describe('OnboardingFlow', () => {
     }) as typeof window.setInterval);
 
     render(<ViewHarness />);
+    expect(listAgents).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      runPoll?.();
+      runPoll?.();
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      initialPoll.resolve({
+        agents: [namedSnapshot('Initial', 'agent-initial')],
+      });
+      await initialPoll.promise;
+    });
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Initial' }),
+    ).toBeVisible();
+    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(2));
+
+    act(() => {
+      runPoll?.();
+      runPoll?.();
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      followupPoll.resolve({
+        agents: [namedSnapshot('Followup', 'agent-followup')],
+      });
+      await followupPoll.promise;
+    });
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Followup' }),
+    ).toBeVisible();
+    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(3));
+
+    await act(async () => {
+      finalPoll.resolve({ agents: [namedSnapshot('Final', 'agent-final')] });
+      await finalPoll.promise;
+    });
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Final' }),
+    ).toBeVisible();
+    expect(listAgents).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps the newest provider response when Strict Mode requests finish in reverse order', async () => {
+    const user = userEvent.setup();
+    const olderProviders = deferred<{ providers: DaemonProvider[] }>();
+    const newerProviders = deferred<{ providers: DaemonProvider[] }>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [] });
+    const listProviders = vi
+      .spyOn(daemon, 'listProviders')
+      .mockReturnValueOnce(olderProviders.promise)
+      .mockReturnValueOnce(newerProviders.promise);
+
+    render(
+      <StrictMode>
+        <ViewHarness />
+      </StrictMode>,
+    );
     expect(
       await screen.findByRole('heading', { name: 'Create your main agent' }),
     ).toBeVisible();
-
-    act(() => {
-      runPoll?.();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(2);
-
-    act(() => {
-      runPoll?.();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(listProviders).toHaveBeenCalledTimes(2));
+    await goToIntelligence(user);
 
     await act(async () => {
-      olderPoll.resolve({ agents: [namedSnapshot('Stale', 'agent-stale')] });
-      await olderPoll.promise;
+      newerProviders.resolve({ providers: configuredProviders });
+      await newerProviders.promise;
     });
-    expect(listAgents).toHaveBeenCalledTimes(3);
     expect(
-      screen.getByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('button', { name: /OpenAI.*configured/i }),
     ).toBeVisible();
 
     await act(async () => {
-      newerPoll.resolve({ agents: [namedSnapshot('Latest', 'agent-latest')] });
-      await newerPoll.promise;
+      olderProviders.reject(new Error('stale provider failure'));
+      await olderProviders.promise.catch(() => undefined);
     });
     expect(
-      screen.getByRole('heading', { name: 'Say something to Latest' }),
+      screen.getByRole('button', { name: /OpenAI.*configured/i }),
     ).toBeVisible();
     expect(
-      screen.queryByRole('heading', { name: 'Say something to Stale' }),
+      screen.queryByText('stale provider failure'),
     ).not.toBeInTheDocument();
   });
 
