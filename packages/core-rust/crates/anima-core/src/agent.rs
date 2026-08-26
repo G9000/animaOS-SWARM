@@ -62,6 +62,7 @@ pub struct AgentConfigUpdate {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub system: Option<String>,
+    pub tools: Option<Vec<ToolDescriptor>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

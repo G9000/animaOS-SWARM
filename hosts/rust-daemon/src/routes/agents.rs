@@ -9,6 +9,7 @@ use super::contracts::{
 use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::memory_store::save_memory_manager;
+use crate::state::UpdateAgentError;
 
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
@@ -98,8 +99,12 @@ pub(crate) async fn handle_update_agent(
 
     let (snapshot, persist_request) = {
         let mut guard = state.write().await;
-        let Some(snapshot) = guard.update_agent(agent_id, patch) else {
-            return Err(ApiError::not_found());
+        let snapshot = match guard.update_agent(agent_id, patch) {
+            Ok(snapshot) => snapshot,
+            Err(UpdateAgentError::InvalidTools(message)) => {
+                return Err(ApiError::bad_request(message));
+            }
+            Err(UpdateAgentError::NotFound) => return Err(ApiError::not_found()),
         };
         (snapshot, guard.control_plane_persist_request())
     };
@@ -252,7 +257,7 @@ pub(crate) async fn handle_run_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::handle_run_agent;
+    use super::{handle_create_agent, handle_run_agent, handle_update_agent};
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentSettings, AgentStatus, Content, ModelAdapter, ModelGenerateRequest,
@@ -263,11 +268,15 @@ mod tests {
     use futures::task::noop_waker;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
     use tokio::sync::RwLock;
 
     struct PendingModelAdapter;
+
+    struct CapturingModelAdapter {
+        configs: Arc<Mutex<Vec<AgentConfig>>>,
+    }
 
     struct PendingOnce<T> {
         value: Option<T>,
@@ -300,6 +309,34 @@ mod tests {
                 stop_reason: ModelStopReason::End,
             })
             .await)
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for CapturingModelAdapter {
+        fn provider(&self) -> &str {
+            "capturing"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.configs
+                .lock()
+                .expect("capture lock should not be poisoned")
+                .push(config.clone());
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: "captured".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::End,
+            })
         }
     }
 
@@ -361,6 +398,50 @@ mod tests {
     }
 
     #[test]
+    fn create_then_run_passes_canonical_tool_schemas_to_model_adapter() {
+        let configs = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            CapturingModelAdapter {
+                configs: Arc::clone(&configs),
+            },
+        ))));
+        let created = block_on(handle_create_agent(
+            br#"{"name":"Anima","model":"deterministic","tools":["read_file","write_file","bash"]}"#
+                .to_vec(),
+            &state,
+        ))
+        .expect("agent should be created through the request path");
+        let agent_id = created.agent.state.id;
+
+        block_on(handle_run_agent(
+            &agent_id,
+            br#"{"text":"exercise canonical tools"}"#.to_vec(),
+            &state,
+        ))
+        .expect("agent should run through the runtime path");
+
+        let configs = configs.lock().expect("capture lock should not be poisoned");
+        assert_eq!(configs.len(), 1);
+        let tools = configs[0]
+            .tools
+            .as_ref()
+            .expect("model adapter should receive tools");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read_file", "write_file", "bash"]
+        );
+        for tool in tools {
+            assert!(!tool.description.is_empty());
+            assert!(tool.parameters_schema.contains_key("type"));
+            assert!(tool.parameters_schema.contains_key("properties"));
+            assert!(tool.parameters_schema.contains_key("required"));
+        }
+    }
+
+    #[test]
     fn handle_run_agent_keeps_agent_visible_while_runtime_future_is_pending() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             PendingModelAdapter,
@@ -402,6 +483,54 @@ mod tests {
 
         let response = block_on(future);
         assert!(response.is_ok());
+    }
+
+    #[test]
+    fn update_agent_patch_survives_in_flight_runtime_restoration() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            PendingModelAdapter,
+        ))));
+        let agent_id = block_on(async {
+            let mut guard = state.write().await;
+            guard
+                .create_agent(test_config("operator"))
+                .expect("agent should be created")
+                .state
+                .id
+        });
+        let mut future = Box::pin(handle_run_agent(
+            &agent_id,
+            br#"{"text":"run pending task"}"#.to_vec(),
+            &state,
+        ));
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+
+        block_on(handle_update_agent(
+            &agent_id,
+            br#"{"name":"updated-operator","tools":["read_file"]}"#.to_vec(),
+            &state,
+        ))
+        .expect("patch should succeed while the run is pending");
+        block_on(future).expect("pending run should complete");
+
+        block_on(async {
+            let guard = state.read().await;
+            let snapshot = guard
+                .get_agent(&agent_id)
+                .expect("agent should be restored");
+            assert_eq!(snapshot.state.config.name, "updated-operator");
+            let tools = snapshot
+                .state
+                .config
+                .tools
+                .expect("patched tools should survive restoration");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].name, "read_file");
+            assert!(!tools[0].description.is_empty());
+            assert!(tools[0].parameters_schema.contains_key("required"));
+        });
     }
 
     fn test_config(name: &str) -> AgentConfig {

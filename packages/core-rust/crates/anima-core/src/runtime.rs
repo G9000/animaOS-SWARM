@@ -176,10 +176,21 @@ impl AgentRuntime {
             config.model = model;
         }
         if let Some(provider) = patch.provider {
-            config.provider = if provider.is_empty() { None } else { Some(provider) };
+            config.provider = if provider.is_empty() {
+                None
+            } else {
+                Some(provider)
+            };
         }
         if let Some(system) = patch.system {
-            config.system = if system.is_empty() { None } else { Some(system) };
+            config.system = if system.is_empty() {
+                None
+            } else {
+                Some(system)
+            };
+        }
+        if let Some(tools) = patch.tools {
+            config.tools = Some(tools);
         }
     }
 

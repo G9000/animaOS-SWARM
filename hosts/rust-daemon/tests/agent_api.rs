@@ -17,6 +17,47 @@ async fn run_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, Str
     send_json_request(app, "POST", &format!("/api/agents/{agent_id}/run"), body).await
 }
 
+async fn update_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, String) {
+    send_json_request(app, "PATCH", &format!("/api/agents/{agent_id}"), body).await
+}
+
+fn response_json(body: &str) -> Value {
+    serde_json::from_str(body).expect("response should be valid JSON")
+}
+
+fn agent_tools(response: &Value) -> &Vec<Value> {
+    response["agent"]["state"]["config"]["tools"]
+        .as_array()
+        .expect("agent tools should be an array")
+}
+
+fn assert_canonical_tool(tool: &Value, name: &str, required: &[&str]) {
+    assert_eq!(tool["name"], name);
+    assert!(
+        tool["description"]
+            .as_str()
+            .is_some_and(|description| !description.is_empty()),
+        "{name} should have a canonical description"
+    );
+    let parameters = tool["parameters"]
+        .as_object()
+        .expect("canonical parameters should be an object");
+    assert_eq!(
+        parameters.get("type"),
+        Some(&Value::String("object".into()))
+    );
+    assert!(parameters.contains_key("properties"));
+    assert_eq!(
+        parameters.get("required"),
+        Some(&Value::Array(
+            required
+                .iter()
+                .map(|name| Value::String((*name).into()))
+                .collect()
+        ))
+    );
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -106,9 +147,19 @@ async fn control_plane_store_recovers_agents_and_swarms_after_restart() {
     let first_app = app_with_configured_persistence(DaemonConfig::default())
         .await
         .expect("first app should configure persistence");
-    let (_, create_agent_response) =
-        create_agent(&first_app, r#"{"name":"restored-agent","model":"gpt-5.4"}"#).await;
+    let (_, create_agent_response) = create_agent(
+        &first_app,
+        r#"{"name":"restored-agent","model":"gpt-5.4","tools":["bash"]}"#,
+    )
+    .await;
     let agent_id = extract_json_string_field(&create_agent_response, "id");
+    let (update_status, _) = update_agent(
+        &first_app,
+        &agent_id,
+        r#"{"tools":["read_file","write_file","bash"]}"#,
+    )
+    .await;
+    assert_eq!(update_status, StatusCode::OK);
     let (_, create_swarm_response) = send_json_request(
         &first_app,
         "POST",
@@ -141,7 +192,15 @@ async fn control_plane_store_recovers_agents_and_swarms_after_restart() {
     .await;
 
     assert_eq!(agent_status, StatusCode::OK);
-    assert!(agent_response.contains("\"name\":\"restored-agent\""));
+    let restored_agent = response_json(&agent_response);
+    assert_eq!(
+        restored_agent["agent"]["state"]["config"]["name"],
+        "restored-agent"
+    );
+    let restored_tools = agent_tools(&restored_agent);
+    assert_canonical_tool(&restored_tools[0], "read_file", &["file_path"]);
+    assert_canonical_tool(&restored_tools[1], "write_file", &["file_path", "content"]);
+    assert_canonical_tool(&restored_tools[2], "bash", &["command"]);
     assert_eq!(swarm_status, StatusCode::OK);
     assert!(swarm_response.contains(&format!("\"id\":\"{swarm_id}\"")));
     assert!(swarm_response.contains("\"status\":\"idle\""));
@@ -205,6 +264,175 @@ async fn create_agent_rejects_unknown_tools() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(response.contains("\"error\":\"unknown tool: missing_tool\""));
+}
+
+#[tokio::test]
+async fn create_agent_resolves_string_tools_to_canonical_descriptors_in_request_order() {
+    let app = test_app();
+    let (status, response) = create_agent(
+        &app,
+        r#"{"name":"Anima","model":"deterministic","tools":["read_file","write_file","bash"]}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let response = response_json(&response);
+    let tools = agent_tools(&response);
+    assert_eq!(tools.len(), 3);
+    assert_canonical_tool(&tools[0], "read_file", &["file_path"]);
+    assert_canonical_tool(&tools[1], "write_file", &["file_path", "content"]);
+    assert_canonical_tool(&tools[2], "bash", &["command"]);
+}
+
+#[tokio::test]
+async fn update_agent_changes_only_tools_and_uses_canonical_descriptors() {
+    let app = test_app();
+    let (_, create_response) = create_agent(
+        &app,
+        r#"{"name":"Anima","model":"deterministic","provider":"local","system":"Stay exact","tools":["bash"]}"#,
+    )
+    .await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+    let _ = run_agent(&app, &agent_id, r#"{"text":"remember this turn"}"#).await;
+    let (_, before_response) =
+        send_empty_request(&app, "GET", &format!("/api/agents/{agent_id}")).await;
+
+    let (status, update_response) =
+        update_agent(&app, &agent_id, r#"{"tools":["read_file","grep"]}"#).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let before = response_json(&before_response);
+    let updated = response_json(&update_response);
+    for field in ["name", "model", "provider", "system"] {
+        assert_eq!(
+            updated["agent"]["state"]["config"][field], before["agent"]["state"]["config"][field],
+            "{field} should be preserved"
+        );
+    }
+    assert_eq!(updated["agent"]["messages"], before["agent"]["messages"]);
+    let tools = agent_tools(&updated);
+    assert_eq!(tools.len(), 2);
+    assert_canonical_tool(&tools[0], "read_file", &["file_path"]);
+    assert_canonical_tool(&tools[1], "grep", &["pattern"]);
+}
+
+#[tokio::test]
+async fn update_agent_rejects_unknown_tools_without_partial_mutation() {
+    let app = test_app();
+    let (_, create_response) = create_agent(
+        &app,
+        r#"{"name":"Anima","model":"deterministic","tools":["read_file"]}"#,
+    )
+    .await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (status, response) = update_agent(
+        &app,
+        &agent_id,
+        r#"{"name":"must-not-stick","tools":["not_registered"]}"#,
+    )
+    .await;
+    let (_, get_response) =
+        send_empty_request(&app, "GET", &format!("/api/agents/{agent_id}")).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(&response)["error"],
+        "unknown tool: not_registered"
+    );
+    let persisted = response_json(&get_response);
+    assert_eq!(persisted["agent"]["state"]["config"]["name"], "Anima");
+    assert_eq!(agent_tools(&persisted)[0]["name"], "read_file");
+}
+
+#[tokio::test]
+async fn detailed_tool_requests_cannot_forge_registry_metadata() {
+    let app = test_app();
+    let (status, response) = create_agent(
+        &app,
+        r#"{"name":"Anima","model":"deterministic","tools":[{"name":"read_file","description":"forged description","parameters":{"evil":{"type":"boolean"}},"parametersSchema":{"also_evil":{"type":"boolean"}},"examples":[{"input":"forged","args":{"evil":true},"output":"forged"}]}]}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let response = response_json(&response);
+    let tool = &agent_tools(&response)[0];
+    assert_canonical_tool(tool, "read_file", &["file_path"]);
+    assert_ne!(tool["description"], "forged description");
+    assert!(tool["parameters"].get("evil").is_none());
+    assert!(tool["parameters"].get("also_evil").is_none());
+    assert_eq!(tool["examples"], Value::Null);
+}
+
+#[tokio::test]
+async fn tool_request_names_are_trimmed_for_string_and_detailed_forms() {
+    let app = test_app();
+    let (status, response) = create_agent(
+        &app,
+        r#"{"name":"Anima","model":"deterministic","tools":[" read_file ",{"name":" write_file ","description":"forged"}]}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED);
+    let response = response_json(&response);
+    let tools = agent_tools(&response);
+    assert_canonical_tool(&tools[0], "read_file", &["file_path"]);
+    assert_canonical_tool(&tools[1], "write_file", &["file_path", "content"]);
+}
+
+#[tokio::test]
+async fn duplicate_tool_slugs_are_rejected_before_create_or_update_mutation() {
+    let app = test_app();
+    let (create_status, create_error) = create_agent(
+        &app,
+        r#"{"name":"duplicate","model":"deterministic","tools":["read_file"," read_file "]}"#,
+    )
+    .await;
+    let (_, list_response) = send_empty_request(&app, "GET", "/api/agents").await;
+
+    assert_eq!(create_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(&create_error)["error"],
+        "duplicate tool 'read_file'"
+    );
+    assert_eq!(
+        response_json(&list_response)["agents"],
+        Value::Array(Vec::new())
+    );
+
+    let (_, create_response) = create_agent(
+        &app,
+        r#"{"name":"Anima","model":"deterministic","tools":["bash"]}"#,
+    )
+    .await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+    let (update_status, update_error) = update_agent(
+        &app,
+        &agent_id,
+        r#"{"name":"must-not-stick","tools":["grep","grep"]}"#,
+    )
+    .await;
+    let (_, get_response) =
+        send_empty_request(&app, "GET", &format!("/api/agents/{agent_id}")).await;
+
+    assert_eq!(update_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(&update_error)["error"],
+        "duplicate tool 'grep'"
+    );
+    let persisted = response_json(&get_response);
+    assert_eq!(persisted["agent"]["state"]["config"]["name"], "Anima");
+    assert_eq!(agent_tools(&persisted)[0]["name"], "bash");
+}
+
+#[tokio::test]
+async fn update_agent_returns_not_found_for_unknown_runtime() {
+    let app = test_app();
+    let (status, response) =
+        update_agent(&app, "agent-missing", r#"{"tools":["read_file"]}"#).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(response_json(&response)["error"], "not found");
 }
 
 #[tokio::test]

@@ -200,6 +200,7 @@ pub(crate) struct AgentUpdateRequest {
     pub(crate) model: Option<String>,
     pub(crate) provider: Option<String>,
     pub(crate) system: Option<String>,
+    pub(crate) tools: Option<Vec<ToolDescriptorRequest>>,
 }
 
 impl AgentUpdateRequest {
@@ -215,7 +216,13 @@ impl AgentUpdateRequest {
         // Empty string clears provider/system back to the daemon default.
         let provider = self.provider.map(|value| value.trim().to_string());
         let system = self.system.map(|value| value.trim().to_string());
-        if name.is_none() && model.is_none() && provider.is_none() && system.is_none() {
+        let tools = parse_tool_requests(self.tools)?;
+        if name.is_none()
+            && model.is_none()
+            && provider.is_none()
+            && system.is_none()
+            && tools.is_none()
+        {
             return Err("at least one field must be provided");
         }
         Ok(AgentConfigUpdate {
@@ -223,6 +230,7 @@ impl AgentUpdateRequest {
             model,
             provider,
             system,
+            tools,
         })
     }
 }
@@ -247,15 +255,7 @@ impl AgentConfigRequest {
             style: self.style,
             provider: self.provider,
             system: self.system,
-            tools: self
-                .tools
-                .map(|tools| {
-                    tools
-                        .into_iter()
-                        .map(ToolDescriptorRequest::into_domain)
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()?,
+            tools: parse_tool_requests(self.tools)?,
             plugins: self
                 .plugins
                 .map(|plugins| {
@@ -275,52 +275,31 @@ impl AgentConfigRequest {
 
 impl ToolDescriptorRequest {
     fn into_domain(self) -> Result<ToolDescriptor, &'static str> {
-        match self {
-            Self::Name(name) if !name.is_empty() => Ok(ToolDescriptor {
-                name,
-                description: String::new(),
-                parameters_schema: BTreeMap::new(),
-                examples: None,
-            }),
-            Self::Name(_) => Err("tools must contain strings or objects"),
-            Self::Detailed(value) => Ok(ToolDescriptor {
-                name: required_string(value.name, "tool name is required")?,
-                description: value.description,
-                parameters_schema: value
-                    .parameters
-                    .into_iter()
-                    .map(|(key, value)| {
-                        Ok::<(String, DataValue), &'static str>((key, json_to_data_value(value)?))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, _>>()?,
-                examples: value
-                    .examples
-                    .map(|examples| {
-                        examples
-                            .into_iter()
-                            .map(ToolExampleRequestObject::into_domain)
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .transpose()?,
-            }),
-        }
+        let name = match self {
+            Self::Name(name) => name,
+            Self::Detailed(value) => value.name.unwrap_or_default(),
+        };
+        let name = required_string(Some(name.trim().to_string()), "tool name is required")?;
+        Ok(ToolDescriptor {
+            name,
+            description: String::new(),
+            parameters_schema: BTreeMap::new(),
+            examples: None,
+        })
     }
 }
 
-impl ToolExampleRequestObject {
-    fn into_domain(self) -> Result<ToolExample, &'static str> {
-        Ok(ToolExample {
-            input: required_string(self.input, "tool example input is required")?,
-            args: self
-                .args
+fn parse_tool_requests(
+    tools: Option<Vec<ToolDescriptorRequest>>,
+) -> Result<Option<Vec<ToolDescriptor>>, &'static str> {
+    tools
+        .map(|tools| {
+            tools
                 .into_iter()
-                .map(|(key, value)| {
-                    Ok::<(String, DataValue), &'static str>((key, json_to_data_value(value)?))
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?,
-            output: required_string(self.output, "tool example output is required")?,
+                .map(ToolDescriptorRequest::into_domain)
+                .collect::<Result<Vec<_>, _>>()
         })
-    }
+        .transpose()
 }
 
 impl PluginDescriptorRequest {

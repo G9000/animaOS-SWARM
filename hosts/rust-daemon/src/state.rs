@@ -3,12 +3,12 @@ mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anima_core::{
     AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentStatus,
-    DatabaseAdapter, ModelAdapter,
+    DatabaseAdapter, ModelAdapter, ToolDescriptor,
 };
 use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
 use anima_swarm::coordinator::CoordinatorMessageEventFn;
@@ -33,6 +33,12 @@ use crate::tools::{
 use self::swarm_relationships::{persist_swarm_message_relationship, swarm_agent_names};
 
 pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UpdateAgentError {
+    InvalidTools(String),
+    NotFound,
+}
 
 const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
 const MEMORY_TEXT_ANALYZER_ENV: &str = "ANIMAOS_RS_MEMORY_TEXT_ANALYZER";
@@ -248,7 +254,7 @@ impl DaemonState {
         let mut restored_swarms = 0;
 
         for agent_snapshot in snapshot.agents {
-            self.restore_agent_snapshot(agent_snapshot);
+            self.restore_agent_snapshot(agent_snapshot)?;
             restored_agents += 1;
         }
 
@@ -478,9 +484,9 @@ impl DaemonState {
 
     pub(crate) fn create_agent(
         &mut self,
-        config: AgentConfig,
+        mut config: AgentConfig,
     ) -> Result<AgentRuntimeSnapshot, String> {
-        self.tool_registry.validate_tools(config.tools.as_deref())?;
+        config.tools = self.resolve_agent_tools(config.tools)?;
         let mut runtime = AgentRuntime::new(config, Arc::clone(&self.model_adapter));
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
         runtime.set_evaluators(default_evaluators(
@@ -500,25 +506,35 @@ impl DaemonState {
         Ok(snapshot)
     }
 
-    /// Apply a partial config update to an existing agent and refresh its
-    /// snapshot. Returns `None` when the agent does not exist.
+    /// Apply a fully validated partial config update to an existing agent and
+    /// refresh its snapshot.
     pub(crate) fn update_agent(
         &mut self,
         agent_id: &str,
-        patch: AgentConfigUpdate,
-    ) -> Option<AgentRuntimeSnapshot> {
+        mut patch: AgentConfigUpdate,
+    ) -> Result<AgentRuntimeSnapshot, UpdateAgentError> {
+        if !self.agents.contains_key(agent_id) && !self.agent_snapshots.contains_key(agent_id) {
+            return Err(UpdateAgentError::NotFound);
+        }
+        patch.tools = self
+            .resolve_agent_tools(patch.tools)
+            .map_err(UpdateAgentError::InvalidTools)?;
+
         if let Some(runtime) = self.agents.get_mut(agent_id) {
             runtime.update_config(patch);
             let snapshot = runtime.snapshot();
             self.agent_snapshots
                 .insert(agent_id.to_string(), snapshot.clone());
-            return Some(snapshot);
+            return Ok(snapshot);
         }
 
         // The runtime can be checked out for an in-flight run; fall back to
         // patching the snapshot so the change still persists. The run itself
         // keeps the config it started with.
-        let snapshot = self.agent_snapshots.get_mut(agent_id)?;
+        let snapshot = self
+            .agent_snapshots
+            .get_mut(agent_id)
+            .expect("agent existence was checked before validation");
         if let Some(name) = patch.name {
             snapshot.state.name = name.clone();
             snapshot.state.config.name = name;
@@ -527,16 +543,27 @@ impl DaemonState {
             snapshot.state.config.model = model;
         }
         if let Some(provider) = patch.provider {
-            snapshot.state.config.provider =
-                if provider.is_empty() { None } else { Some(provider) };
+            snapshot.state.config.provider = if provider.is_empty() {
+                None
+            } else {
+                Some(provider)
+            };
         }
         if let Some(system) = patch.system {
-            snapshot.state.config.system = if system.is_empty() { None } else { Some(system) };
+            snapshot.state.config.system = if system.is_empty() {
+                None
+            } else {
+                Some(system)
+            };
         }
-        Some(snapshot.clone())
+        if let Some(tools) = patch.tools {
+            snapshot.state.config.tools = Some(tools);
+        }
+        Ok(snapshot.clone())
     }
 
-    fn restore_agent_snapshot(&mut self, snapshot: AgentRuntimeSnapshot) {
+    fn restore_agent_snapshot(&mut self, mut snapshot: AgentRuntimeSnapshot) -> Result<(), String> {
+        snapshot.state.config.tools = self.resolve_agent_tools(snapshot.state.config.tools)?;
         let agent_id = snapshot.state.id.clone();
         let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
@@ -556,6 +583,7 @@ impl DaemonState {
         self.agent_snapshots
             .insert(agent_id.clone(), restored_snapshot);
         self.agents.insert(agent_id, runtime);
+        Ok(())
     }
 
     pub(crate) fn list_agents(&self) -> Vec<AgentRuntimeSnapshot> {
@@ -619,7 +647,7 @@ impl DaemonState {
 
     pub(crate) fn restore_agent_runtime(
         &mut self,
-        runtime: AgentRuntime,
+        mut runtime: AgentRuntime,
     ) -> (
         AgentRuntimeSnapshot,
         String,
@@ -628,6 +656,19 @@ impl DaemonState {
         SharedMemoryEmbeddings,
         Option<MemoryStoreConfig>,
     ) {
+        if let Some(latest_config) = self
+            .agent_snapshots
+            .get(runtime.id())
+            .map(|snapshot| snapshot.state.config.clone())
+        {
+            runtime.update_config(AgentConfigUpdate {
+                name: Some(latest_config.name),
+                model: Some(latest_config.model),
+                provider: Some(latest_config.provider.unwrap_or_default()),
+                system: Some(latest_config.system.unwrap_or_default()),
+                tools: latest_config.tools,
+            });
+        }
         let snapshot = runtime.snapshot();
         let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;
@@ -655,5 +696,26 @@ impl DaemonState {
 
         Ok(())
     }
-}
 
+    fn resolve_agent_tools(
+        &self,
+        tools: Option<Vec<ToolDescriptor>>,
+    ) -> Result<Option<Vec<ToolDescriptor>>, String> {
+        let Some(tools) = tools else {
+            return Ok(None);
+        };
+        let mut names = Vec::with_capacity(tools.len());
+        let mut seen = HashSet::with_capacity(tools.len());
+        for tool in tools {
+            if !seen.insert(tool.name.clone()) {
+                return Err(format!("duplicate tool '{}'", tool.name));
+            }
+            if self.tool_registry.descriptor(&tool.name).is_none() {
+                return Err(format!("unknown tool: {}", tool.name));
+            }
+            names.push(tool.name);
+        }
+
+        self.tool_registry.resolve_descriptors(names).map(Some)
+    }
+}
