@@ -23,6 +23,7 @@ export interface AgentDetail {
   name: string;
   provider: string;
   model: string;
+  toolNames: string[];
   created_at_ms: number;
   status: 'Idle' | 'Running' | 'Completed' | 'Failed' | 'Terminated';
   token_usage: TokenUsage;

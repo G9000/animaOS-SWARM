@@ -1,6 +1,6 @@
 // Typed client for the anima-daemon server (hosts/rust-daemon).
-// Single-agent UX on top of the daemon's multi-agent runtime:
-// the UI drives the FIRST agent returned by GET /api/agents.
+// The daemon owns a collection of durable agent snapshots. UI surfaces choose
+// the agent they need instead of relying on GET /api/agents response order.
 // All URLs are relative so the Vite dev proxy owns the origin
 // (see vite.config.mts: '/api' -> UI_BACKEND_ORIGIN ?? http://localhost:8080).
 
@@ -30,6 +30,19 @@ interface DaemonMessage {
   createdAtMs: number;
 }
 
+export interface DaemonToolExample {
+  input: string;
+  args: Record<string, unknown>;
+  output: string;
+}
+
+export interface DaemonToolDescriptor {
+  name: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  examples?: DaemonToolExample[] | null;
+}
+
 export interface DaemonSnapshot {
   state: {
     id: string;
@@ -40,6 +53,7 @@ export interface DaemonSnapshot {
       model: string;
       provider?: string | null;
       system?: string | null;
+      tools?: DaemonToolDescriptor[] | null;
     };
     createdAtMs: number;
     tokenUsage: DaemonTokenUsage;
@@ -92,10 +106,11 @@ export const daemon = {
 
   getAgent: (id: string) => request<{ agent: DaemonSnapshot }>(`/agents/${id}`),
 
-  /** name and model are required by the daemon. */
+  /** name, model, and tool names are required by the daemon. */
   createAgent: (input: {
     name: string;
     model: string;
+    tools: string[];
     provider?: string;
     system?: string;
   }) =>
@@ -113,14 +128,20 @@ export const daemon = {
    */
   updateAgent: (
     id: string,
-    patch: { name?: string; model?: string; provider?: string; system?: string }
+    patch: {
+      name?: string;
+      model?: string;
+      provider?: string;
+      system?: string;
+      tools?: string[];
+    }
   ) =>
     request<{ agent: DaemonSnapshot }>(`/agents/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
     }),
 
-  /** The single-agent chat loop: user text in, task result out. */
+  /** Run one agent chat turn: user text in, task result out. */
   runAgent: (id: string, text: string, metadata?: Record<string, unknown>) =>
     request<{ agent: DaemonSnapshot; result: DaemonRunResult }>(
       `/agents/${id}/run`,
@@ -163,6 +184,7 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
     name: state.name,
     provider: state.config.provider ?? 'default',
     model: state.config.model,
+    toolNames: state.config.tools?.map((tool) => tool.name) ?? [],
     created_at_ms: state.createdAtMs,
     status: mapStatus(state.status),
     token_usage: {

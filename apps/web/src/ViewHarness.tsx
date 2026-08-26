@@ -6,6 +6,7 @@ import {
   type DaemonProvider,
 } from './lib/daemon-api';
 import type { AgentDetail } from './lib/types';
+import { toolNamesForProfile } from './lib/agent-access';
 import {
   CHECKIN_SENTINEL,
   clearCheckins,
@@ -197,6 +198,7 @@ export function ViewHarness() {
         provider,
         model: resolvedModel,
         system: system.trim() || undefined,
+        tools: toolNamesForProfile('collaborate'),
       });
       setName('');
       setCustomModel('');
