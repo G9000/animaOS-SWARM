@@ -417,9 +417,9 @@ describe('OnboardingFlow', () => {
     await goToReview(user);
     await user.click(screen.getByRole('button', { name: 'Create agent' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'daemon refused creation',
-    );
+    const createAlert = await screen.findByRole('alert');
+    expect(createAlert).toHaveTextContent('daemon refused creation');
+    expect(createAlert).toHaveFocus();
     expect(screen.getByRole('heading', { name: 'Review' })).toBeVisible();
     expect(screen.getByText('Anima')).toBeVisible();
     expect(screen.getByText('OpenAI / gpt-4o')).toBeVisible();

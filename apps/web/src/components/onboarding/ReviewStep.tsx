@@ -1,3 +1,5 @@
+import { useEffect, useRef } from 'react';
+
 import { ACCESS_PROFILES, type AccessProfile } from '../../lib/agent-access';
 import type { DaemonProvider } from '../../lib/daemon-api';
 
@@ -30,6 +32,13 @@ export function ReviewStep({
     providers?.find((candidate) => candidate.id === provider)?.label ??
     provider;
   const accessProfile = ACCESS_PROFILES[access];
+  const createErrorRef = useRef<HTMLParagraphElement>(null);
+
+  useEffect(() => {
+    if (createError) {
+      createErrorRef.current?.focus();
+    }
+  }, [createError]);
 
   return (
     <section aria-labelledby="onboarding-review-heading" className="space-y-5">
@@ -76,7 +85,9 @@ export function ReviewStep({
 
       {createError ? (
         <p
+          ref={createErrorRef}
           role="alert"
+          tabIndex={-1}
           className="rounded-xl border border-red-400/30 bg-red-400/5 p-3 text-sm text-red-300"
         >
           {createError}
