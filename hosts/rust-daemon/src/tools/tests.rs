@@ -34,6 +34,337 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
+fn registry_resolves_canonical_descriptors() {
+    let registry = ToolRegistry::new();
+
+    let descriptors = registry
+        .resolve_descriptors(["read_file", "write_file", "bash"])
+        .expect("canonical descriptors");
+
+    assert_eq!(
+        descriptors
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read_file", "write_file", "bash"]
+    );
+    assert!(descriptors
+        .iter()
+        .all(|descriptor| !descriptor.description.trim().is_empty()));
+    assert_required_parameters(&descriptors[0], &["file_path"]);
+    assert_required_parameters(&descriptors[1], &["file_path", "content"]);
+    assert_required_parameters(&descriptors[2], &["command"]);
+}
+
+#[test]
+fn registry_rejects_unknown_descriptor_without_partial_results() {
+    let registry = ToolRegistry::new();
+
+    let error = registry
+        .resolve_descriptors(["read_file", "missing_tool", "bash"])
+        .expect_err("unknown slug should reject the whole request");
+
+    assert_eq!(error, "unknown tool 'missing_tool'");
+}
+
+#[test]
+fn registry_descriptor_returns_a_canonical_clone() {
+    let registry = ToolRegistry::new();
+    let canonical = registry
+        .descriptor("read_file")
+        .expect("registered descriptor");
+    let mut changed = canonical.clone();
+    changed.description = "caller-owned mutation".into();
+
+    assert_eq!(
+        registry.descriptor("read_file"),
+        Some(canonical),
+        "mutating a returned descriptor must not alter the registry"
+    );
+    assert_ne!(registry.descriptor("read_file"), Some(changed));
+    assert_eq!(registry.descriptor("missing_tool"), None);
+}
+
+#[test]
+fn registry_defines_every_registered_tool_schema() {
+    let registry = ToolRegistry::new();
+    let expectations = [
+        ("memory_search", &["query"][..], &["limit"][..]),
+        ("memory_add", &["content"][..], &["type", "importance"][..]),
+        ("recent_memories", &[][..], &["limit"][..]),
+        ("web_fetch", &["url"][..], &["max_length"][..]),
+        (
+            "exa_search",
+            &["query"][..],
+            &["num_results", "include_text", "max_characters"][..],
+        ),
+        ("get_current_time", &[][..], &[][..]),
+        ("calculate", &["expression"][..], &[][..]),
+        ("read_file", &["file_path"][..], &["offset", "limit"][..]),
+        ("list_dir", &["path"][..], &[][..]),
+        ("glob", &["pattern"][..], &["path"][..]),
+        ("grep", &["pattern"][..], &["path", "include"][..]),
+        ("write_file", &["file_path", "content"][..], &[][..]),
+        (
+            "edit_file",
+            &["file_path", "old_string", "new_string"][..],
+            &[][..],
+        ),
+        ("multi_edit", &["file_path", "edits"][..], &[][..]),
+        ("todo_write", &["todos"][..], &[][..]),
+        ("todo_read", &[][..], &[][..]),
+        ("bash", &["command"][..], &["timeout", "cwd"][..]),
+        ("bg_start", &["command"][..], &["cwd"][..]),
+        ("bg_output", &["id"][..], &["all"][..]),
+        ("bg_stop", &["id"][..], &[][..]),
+        ("bg_list", &[][..], &[][..]),
+        (
+            "send_message",
+            &["message"][..],
+            &["to_agent_id", "to_agent_name"][..],
+        ),
+        ("broadcast_message", &["message"][..], &[][..]),
+    ];
+
+    assert_eq!(registry.tool_names().len(), expectations.len());
+    for (name, required, optional) in expectations {
+        let descriptor = registry.descriptor(name).expect("registered descriptor");
+        assert!(
+            !descriptor.description.trim().is_empty(),
+            "{name} must have a model-facing description"
+        );
+        assert_object_parameters(&descriptor, required, optional);
+    }
+}
+
+#[test]
+fn registry_encodes_parameter_constraints() {
+    let registry = ToolRegistry::new();
+
+    for (tool, property) in [
+        ("memory_search", "limit"),
+        ("recent_memories", "limit"),
+        ("web_fetch", "max_length"),
+        ("exa_search", "num_results"),
+        ("exa_search", "max_characters"),
+        ("bash", "timeout"),
+    ] {
+        assert_property_schema(&registry, tool, property, "integer", Some(1.0), None);
+    }
+    for property in ["offset", "limit"] {
+        assert_property_schema(&registry, "read_file", property, "integer", Some(0.0), None);
+    }
+    assert_property_schema(
+        &registry,
+        "memory_add",
+        "importance",
+        "number",
+        Some(0.0),
+        Some(1.0),
+    );
+    assert_string_enum(
+        &registry,
+        "memory_add",
+        "type",
+        &["fact", "observation", "task_result", "reflection"],
+    );
+    assert_property_schema(
+        &registry,
+        "exa_search",
+        "include_text",
+        "boolean",
+        None,
+        None,
+    );
+    assert_property_schema(&registry, "bg_output", "all", "boolean", None, None);
+    assert_array_items(
+        &registry,
+        "multi_edit",
+        "edits",
+        &["old_string", "new_string"],
+    );
+    assert_array_items(
+        &registry,
+        "todo_write",
+        "todos",
+        &["content", "status", "activeForm"],
+    );
+
+    let todo_write = registry
+        .descriptor("todo_write")
+        .expect("todo_write descriptor");
+    let todo_items = array_item_properties(&todo_write, "todos");
+    assert_eq!(
+        schema_strings(
+            todo_items
+                .get("status")
+                .and_then(data_object)
+                .and_then(|schema| schema.get("enum"))
+                .expect("todo status enum")
+        ),
+        vec!["pending", "in_progress", "completed"]
+    );
+}
+
+fn assert_required_parameters(descriptor: &ToolDescriptor, expected: &[&str]) {
+    let Some(DataValue::Object(properties)) = descriptor.parameters_schema.get("properties") else {
+        panic!("{} must define object properties", descriptor.name);
+    };
+    let Some(DataValue::Array(required)) = descriptor.parameters_schema.get("required") else {
+        panic!("{} must define required parameters", descriptor.name);
+    };
+
+    assert_eq!(
+        required,
+        &expected
+            .iter()
+            .map(|name| DataValue::String((*name).into()))
+            .collect::<Vec<_>>()
+    );
+    for name in expected {
+        assert!(
+            properties.contains_key(*name),
+            "{} is missing required property {name}",
+            descriptor.name
+        );
+    }
+}
+
+fn assert_object_parameters(descriptor: &ToolDescriptor, required: &[&str], optional: &[&str]) {
+    assert_eq!(
+        descriptor.parameters_schema.get("type"),
+        Some(&DataValue::String("object".into()))
+    );
+    assert_required_parameters(descriptor, required);
+    let properties = descriptor
+        .parameters_schema
+        .get("properties")
+        .and_then(data_object)
+        .expect("object properties");
+    assert_eq!(properties.len(), required.len() + optional.len());
+    for name in required.iter().chain(optional) {
+        assert!(properties.contains_key(*name), "missing {name}");
+    }
+}
+
+fn assert_property_schema(
+    registry: &ToolRegistry,
+    tool: &str,
+    property: &str,
+    expected_type: &str,
+    minimum: Option<f64>,
+    maximum: Option<f64>,
+) {
+    let descriptor = registry.descriptor(tool).expect("registered descriptor");
+    let schema = descriptor
+        .parameters_schema
+        .get("properties")
+        .and_then(data_object)
+        .and_then(|properties| properties.get(property))
+        .and_then(data_object)
+        .expect("property schema");
+
+    assert_eq!(
+        schema.get("type"),
+        Some(&DataValue::String(expected_type.into()))
+    );
+    assert_eq!(
+        schema.get("minimum"),
+        minimum.map(DataValue::Number).as_ref()
+    );
+    assert_eq!(
+        schema.get("maximum"),
+        maximum.map(DataValue::Number).as_ref()
+    );
+}
+
+fn assert_string_enum(registry: &ToolRegistry, tool: &str, property: &str, expected: &[&str]) {
+    let descriptor = registry.descriptor(tool).expect("registered descriptor");
+    let schema = descriptor
+        .parameters_schema
+        .get("properties")
+        .and_then(data_object)
+        .and_then(|properties| properties.get(property))
+        .and_then(data_object)
+        .expect("enum property schema");
+
+    assert_eq!(
+        schema.get("type"),
+        Some(&DataValue::String("string".into()))
+    );
+    assert_eq!(
+        schema_strings(schema.get("enum").expect("enum values")),
+        expected
+    );
+}
+
+fn assert_array_items(registry: &ToolRegistry, tool: &str, property: &str, required: &[&str]) {
+    let descriptor = registry.descriptor(tool).expect("registered descriptor");
+    let properties = array_item_properties(&descriptor, property);
+    let item_schema = descriptor
+        .parameters_schema
+        .get("properties")
+        .and_then(data_object)
+        .and_then(|properties| properties.get(property))
+        .and_then(data_object)
+        .and_then(|array| array.get("items"))
+        .and_then(data_object)
+        .expect("array item schema");
+
+    assert_eq!(properties.len(), required.len());
+    assert_eq!(
+        schema_strings(item_schema.get("required").expect("item required fields")),
+        required
+    );
+}
+
+fn array_item_properties<'a>(
+    descriptor: &'a ToolDescriptor,
+    property: &str,
+) -> &'a BTreeMap<String, DataValue> {
+    descriptor
+        .parameters_schema
+        .get("properties")
+        .and_then(data_object)
+        .and_then(|properties| properties.get(property))
+        .and_then(data_object)
+        .and_then(|array| array.get("items"))
+        .and_then(data_object)
+        .and_then(|item| item.get("properties"))
+        .and_then(data_object)
+        .expect("array item properties")
+}
+
+fn schema_strings(value: &DataValue) -> Vec<&str> {
+    data_array(value)
+        .expect("schema string array")
+        .iter()
+        .map(|value| data_string(value).expect("schema string"))
+        .collect()
+}
+
+fn data_object(value: &DataValue) -> Option<&BTreeMap<String, DataValue>> {
+    match value {
+        DataValue::Object(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn data_array(value: &DataValue) -> Option<&[DataValue]> {
+    match value {
+        DataValue::Array(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn data_string(value: &DataValue) -> Option<&str> {
+    match value {
+        DataValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+#[test]
 fn tool_registry_accepts_web_fetch_descriptor() {
     let registry = ToolRegistry::new();
     let tools = vec![ToolDescriptor {

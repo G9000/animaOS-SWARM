@@ -16,7 +16,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::components::{default_evaluators, default_providers};
 use crate::events::EventFanout;
 use crate::memory_embeddings::SharedMemoryEmbeddings;
-use crate::tools::ToolExecutionContext;
+use crate::tools::{ToolExecutionContext, ToolRegistry};
 
 use super::runtime_events::publish_runtime_event;
 use super::swarm_tools::execute_swarm_tool;
@@ -46,6 +46,7 @@ impl DaemonState {
             let db = db.clone();
 
             Box::pin(async move {
+                let config = with_swarm_messaging_tools(context.config.clone(), &tool_registry);
                 let tool_context = ToolExecutionContext::new(
                     Arc::clone(&memory),
                     Arc::clone(&memory_embeddings),
@@ -60,7 +61,6 @@ impl DaemonState {
                         publish_runtime_event(&event_stream, &agent_name, event);
                     }
                 });
-                let config = with_swarm_messaging_tools(context.config.clone());
                 let persistence_agent_id =
                     stable_swarm_persistence_agent_id(&context.swarm_id, &config.name);
                 let inbox = context.inbox.clone();
@@ -338,10 +338,17 @@ impl Provider for SwarmInboxProvider {
     }
 }
 
-fn with_swarm_messaging_tools(mut config: AgentConfig) -> AgentConfig {
+fn with_swarm_messaging_tools(
+    mut config: AgentConfig,
+    tool_registry: &ToolRegistry,
+) -> AgentConfig {
     let mut tools = config.tools.take().unwrap_or_default();
-    push_tool_if_missing(&mut tools, send_message_tool_descriptor());
-    push_tool_if_missing(&mut tools, broadcast_message_tool_descriptor());
+    let messaging_tools = tool_registry
+        .resolve_descriptors(["send_message", "broadcast_message"])
+        .expect("swarm messaging tools must be registered");
+    for descriptor in messaging_tools {
+        push_tool_if_missing(&mut tools, descriptor);
+    }
     config.tools = Some(tools);
     config
 }
@@ -352,68 +359,83 @@ fn push_tool_if_missing(tools: &mut Vec<ToolDescriptor>, descriptor: ToolDescrip
     }
 }
 
-fn send_message_tool_descriptor() -> ToolDescriptor {
-    ToolDescriptor {
-        name: "send_message".into(),
-        description: "Send a message to another live swarm agent by coordinator agent id or configured agent name".into(),
-        parameters_schema: send_message_parameters(),
-        examples: None,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::with_swarm_messaging_tools;
+    use crate::tools::ToolRegistry;
+    use anima_core::{AgentConfig, ToolDescriptor};
 
-fn send_message_parameters() -> BTreeMap<String, DataValue> {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "to_agent_id".into(),
-        string_parameter("Coordinator agent id to receive the message"),
-    );
-    properties.insert(
-        "to_agent_name".into(),
-        string_parameter("Configured swarm agent name to receive the message"),
-    );
-    properties.insert(
-        "message".into(),
-        string_parameter("Message text to deliver"),
-    );
+    #[test]
+    fn swarm_messaging_tools_use_registry_descriptors() {
+        let registry = ToolRegistry::new();
+        let config = AgentConfig {
+            name: "worker".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: None,
+        };
 
-    BTreeMap::from([
-        ("type".into(), DataValue::String("object".into())),
-        ("properties".into(), DataValue::Object(properties)),
-        (
-            "required".into(),
-            DataValue::Array(vec![DataValue::String("message".into())]),
-        ),
-    ])
-}
+        let config = with_swarm_messaging_tools(config, &registry);
+        let tools = config.tools.expect("swarm tools");
 
-fn broadcast_message_tool_descriptor() -> ToolDescriptor {
-    ToolDescriptor {
-        name: "broadcast_message".into(),
-        description: "Broadcast a message to every other live swarm agent".into(),
-        parameters_schema: object_parameters(vec![("message", "Message text to broadcast")]),
-        examples: None,
-    }
-}
-
-fn object_parameters(fields: Vec<(&str, &str)>) -> BTreeMap<String, DataValue> {
-    let mut properties = BTreeMap::new();
-    let mut required = Vec::with_capacity(fields.len());
-
-    for (name, description) in fields {
-        properties.insert(name.into(), string_parameter(description));
-        required.push(DataValue::String(name.into()));
+        for name in ["send_message", "broadcast_message"] {
+            assert_eq!(
+                tools.iter().find(|tool| tool.name == name),
+                registry.descriptor(name).as_ref(),
+                "swarm runtime descriptor for {name} drifted from the registry"
+            );
+        }
     }
 
-    BTreeMap::from([
-        ("type".into(), DataValue::String("object".into())),
-        ("properties".into(), DataValue::Object(properties)),
-        ("required".into(), DataValue::Array(required)),
-    ])
-}
+    #[test]
+    fn swarm_messaging_tools_preserve_existing_entries() {
+        let registry = ToolRegistry::new();
+        let existing = ToolDescriptor {
+            name: "send_message".into(),
+            description: "Caller-provided swarm descriptor".into(),
+            parameters_schema: Default::default(),
+            examples: None,
+        };
+        let mut config = agent_config();
+        config.tools = Some(vec![existing.clone()]);
 
-fn string_parameter(description: &str) -> DataValue {
-    DataValue::Object(BTreeMap::from([
-        ("type".into(), DataValue::String("string".into())),
-        ("description".into(), DataValue::String(description.into())),
-    ]))
+        let config = with_swarm_messaging_tools(config, &registry);
+        let tools = config.tools.expect("swarm tools");
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], existing);
+        assert_eq!(
+            tools[1],
+            registry
+                .descriptor("broadcast_message")
+                .expect("broadcast descriptor")
+        );
+    }
+
+    fn agent_config() -> AgentConfig {
+        AgentConfig {
+            name: "worker".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: None,
+        }
+    }
 }
