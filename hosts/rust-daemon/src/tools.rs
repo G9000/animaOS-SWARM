@@ -424,20 +424,23 @@ impl ToolRegistry {
             tool_descriptor(
                 "send_message",
                 "Send a message to another live swarm agent by coordinator agent id or configured agent name",
-                object_parameters(vec![
-                    optional_parameter(
-                        "to_agent_id",
-                        string_parameter("Coordinator agent id to receive the message"),
-                    ),
-                    optional_parameter(
-                        "to_agent_name",
-                        string_parameter("Configured swarm agent name to receive the message"),
-                    ),
-                    required_parameter(
-                        "message",
-                        string_parameter("Message text to deliver"),
-                    ),
-                ]),
+                with_any_required_parameter(
+                    object_parameters(vec![
+                        optional_parameter(
+                            "to_agent_id",
+                            string_parameter("Coordinator agent id to receive the message"),
+                        ),
+                        optional_parameter(
+                            "to_agent_name",
+                            string_parameter("Configured swarm agent name to receive the message"),
+                        ),
+                        required_parameter(
+                            "message",
+                            string_parameter("Message text to deliver"),
+                        ),
+                    ]),
+                    &["to_agent_id", "to_agent_name"],
+                ),
             ),
             execute_swarm_only_tool,
         );
@@ -568,6 +571,27 @@ fn object_parameters(parameters: Vec<SchemaParameter>) -> BTreeMap<String, DataV
 
 fn object_parameter(parameters: Vec<SchemaParameter>) -> DataValue {
     DataValue::Object(object_parameters(parameters))
+}
+
+fn with_any_required_parameter(
+    mut parameters_schema: BTreeMap<String, DataValue>,
+    alternatives: &[&str],
+) -> BTreeMap<String, DataValue> {
+    parameters_schema.insert(
+        "anyOf".into(),
+        DataValue::Array(
+            alternatives
+                .iter()
+                .map(|name| {
+                    DataValue::Object(BTreeMap::from([(
+                        "required".into(),
+                        DataValue::Array(vec![DataValue::String((*name).into())]),
+                    )]))
+                })
+                .collect(),
+        ),
+    );
+    parameters_schema
 }
 
 fn string_parameter(description: &str) -> DataValue {

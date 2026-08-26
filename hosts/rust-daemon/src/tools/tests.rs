@@ -206,6 +206,37 @@ fn registry_encodes_parameter_constraints() {
     );
 }
 
+#[test]
+fn registry_send_message_requires_a_recipient_alternative() {
+    let registry = ToolRegistry::new();
+    let descriptor = registry
+        .descriptor("send_message")
+        .expect("send_message descriptor");
+
+    assert_required_parameters(&descriptor, &["message"]);
+    let alternatives = descriptor
+        .parameters_schema
+        .get("anyOf")
+        .and_then(data_array)
+        .expect("send_message recipient alternatives");
+    let recipient_requirements = alternatives
+        .iter()
+        .map(|alternative| {
+            let schema = data_object(alternative).expect("recipient alternative schema");
+            schema_strings(
+                schema
+                    .get("required")
+                    .expect("recipient alternative required fields"),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        recipient_requirements,
+        vec![vec!["to_agent_id"], vec!["to_agent_name"]]
+    );
+}
+
 fn assert_required_parameters(descriptor: &ToolDescriptor, expected: &[&str]) {
     let Some(DataValue::Object(properties)) = descriptor.parameters_schema.get("properties") else {
         panic!("{} must define object properties", descriptor.name);
