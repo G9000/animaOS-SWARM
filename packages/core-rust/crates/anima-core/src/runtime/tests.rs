@@ -2,7 +2,9 @@
 //! so they can reach private items in `runtime.rs`.
 
 use super::AgentRuntime;
-use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage, ToolDescriptor};
+use crate::agent::{
+    AgentConfig, AgentConfigUpdate, AgentState, AgentStatus, TokenUsage, ToolDescriptor,
+};
 use crate::components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
 use crate::model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
@@ -15,6 +17,7 @@ use crate::runtime_serde::data_value_json;
 use async_trait::async_trait;
 use futures::executor::block_on;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -27,6 +30,9 @@ struct RecordingToolCallingModelAdapter {
     messages: Arc<Mutex<Vec<Message>>>,
 }
 struct MultiToolCallingModelAdapter;
+struct HostileToolCallingModelAdapter {
+    tool_name: &'static str,
+}
 struct ContextAwareModelAdapter;
 struct AsyncBoundaryModelAdapter;
 
@@ -331,6 +337,45 @@ impl ModelAdapter for MultiToolCallingModelAdapter {
                 completion_tokens: 2,
                 total_tokens: 5,
             },
+            stop_reason: ModelStopReason::ToolCall,
+        })
+    }
+}
+
+#[async_trait]
+impl ModelAdapter for HostileToolCallingModelAdapter {
+    fn provider(&self) -> &str {
+        "hostile-tool-calling"
+    }
+
+    async fn generate(
+        &self,
+        _config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        if !trailing_tool_messages(&request.messages).is_empty() {
+            return Ok(ModelGenerateResponse {
+                content: Content {
+                    text: "hostile tool result consumed".into(),
+                    ..Content::default()
+                },
+                tool_calls: None,
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::End,
+            });
+        }
+
+        Ok(ModelGenerateResponse {
+            content: Content {
+                text: "attempting unconfigured tool".into(),
+                ..Content::default()
+            },
+            tool_calls: Some(vec![ToolCall {
+                id: "hostile-call".into(),
+                name: self.tool_name.into(),
+                args: BTreeMap::new(),
+            }]),
+            usage: TokenUsage::default(),
             stop_reason: ModelStopReason::ToolCall,
         })
     }
@@ -1083,6 +1128,107 @@ fn runtime_run_executes_tool_round_trip() {
     assert_eq!(snapshot.message_count, 4);
     assert_eq!(runtime.messages()[0].room_id, runtime.messages()[3].room_id);
     assert!(snapshot.state.token_usage.total_tokens >= 7);
+}
+
+#[test]
+fn runtime_rejects_unconfigured_hostile_tools_before_execution_or_step_preparation() {
+    for (tool_name, tools) in [("bash", None), ("write_file", Some(Vec::new()))] {
+        let mut denied_config = config();
+        denied_config.tools = tools;
+        let db = Arc::new(InMemoryAdapter::new());
+        let executed = Arc::new(AtomicBool::new(false));
+        let mut runtime = AgentRuntime::new(
+            denied_config,
+            Arc::new(HostileToolCallingModelAdapter { tool_name }),
+        );
+        runtime.set_database(db.clone());
+
+        let result = block_on(runtime.run_with_tools(
+            Content {
+                text: "hostile model request".into(),
+                ..Content::default()
+            },
+            {
+                let executed = Arc::clone(&executed);
+                move |_, _, _| {
+                    executed.store(true, Ordering::SeqCst);
+                    async move { TaskResult::success(Content::default(), 0) }
+                }
+            },
+        ));
+
+        assert_eq!(result.status, TaskStatus::Error);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(format!("tool '{tool_name}' is not configured for this agent").as_str())
+        );
+        assert!(!executed.load(Ordering::SeqCst));
+        assert!(
+            db.recorded_steps().is_empty(),
+            "denied tools must be rejected before persisted step preparation"
+        );
+    }
+}
+
+#[test]
+fn runtime_does_not_recover_cached_results_for_tools_removed_from_allowlist() {
+    let db = Arc::new(InMemoryAdapter::new());
+    let db_adapter: Arc<dyn DatabaseAdapter> = db.clone();
+    let mut allowed_config = config();
+    allowed_config.tools = Some(vec![ToolDescriptor {
+        name: "bash".into(),
+        description: "Run command".into(),
+        parameters_schema: BTreeMap::new(),
+        examples: None,
+    }]);
+    let mut runtime = AgentRuntime::new(
+        allowed_config,
+        Arc::new(HostileToolCallingModelAdapter { tool_name: "bash" }),
+    );
+    runtime.set_database(db_adapter);
+    let metadata = BTreeMap::from([(
+        "retryKey".into(),
+        DataValue::String("deny-recovered-bash".into()),
+    )]);
+
+    let first = block_on(runtime.run_with_tools(
+        Content {
+            text: "seed cached bash".into(),
+            metadata: Some(metadata.clone()),
+            ..Content::default()
+        },
+        |_, _, _| async move {
+            TaskResult::success(
+                Content {
+                    text: "cached hostile result".into(),
+                    ..Content::default()
+                },
+                0,
+            )
+        },
+    ));
+    assert_eq!(first.status, TaskStatus::Success);
+    assert_eq!(db.recorded_steps().len(), 1);
+
+    runtime.update_config(AgentConfigUpdate {
+        tools: Some(Vec::new()),
+        ..AgentConfigUpdate::default()
+    });
+    let second = block_on(runtime.run_with_tools(
+        Content {
+            text: "seed cached bash".into(),
+            metadata: Some(metadata),
+            ..Content::default()
+        },
+        |_, _, _| async move { panic!("denied tool must not execute or recover a cached result") },
+    ));
+
+    assert_eq!(second.status, TaskStatus::Error);
+    assert_eq!(
+        second.error.as_deref(),
+        Some("tool 'bash' is not configured for this agent")
+    );
+    assert_eq!(db.recorded_steps().len(), 1);
 }
 
 #[test]

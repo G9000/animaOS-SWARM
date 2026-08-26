@@ -15,8 +15,8 @@ pub mod runtime;
 mod runtime_serde;
 
 pub use agent::{
-    AgentConfig, AgentConfigUpdate, AgentSettings, AgentState, AgentStatus, PluginDescriptor,
-    TokenUsage, ToolDescriptor, ToolExample,
+    tool_not_configured_error, AgentConfig, AgentConfigUpdate, AgentSettings, AgentState,
+    AgentStatus, PluginDescriptor, TokenUsage, ToolDescriptor, ToolExample,
 };
 pub use capability::{
     CapabilityAttempt, CapabilityAttemptLineageState, CapabilityContextError, CapabilityError,

@@ -156,7 +156,7 @@ async fn run_dispatches_tool_calls_then_returns_final_text() {
 }
 
 #[tokio::test]
-async fn unknown_tool_is_reported_back_to_the_model() {
+async fn unknown_tool_is_rejected_before_dispatch() {
     let adapter = ScriptedAdapter::with_responses(vec![
         tool_call_response("missing", BTreeMap::new()),
         text_response("recovered"),
@@ -165,13 +165,17 @@ async fn unknown_tool_is_reported_back_to_the_model() {
 
     let result = harness.run("use an unknown tool").await;
 
-    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("tool 'missing' is not configured for this agent")
+    );
     assert!(
         harness
             .messages()
             .iter()
-            .any(|message| message.content.text.contains("Unknown tool: missing")),
-        "expected a tool message reporting the unknown tool"
+            .all(|message| message.role != anima_core::MessageRole::Tool),
+        "denied tools must not reach harness dispatch"
     );
 }
 

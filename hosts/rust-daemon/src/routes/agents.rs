@@ -257,7 +257,8 @@ pub(crate) async fn handle_run_agent(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_create_agent, handle_run_agent, handle_update_agent};
+    use super::{handle_create_agent, handle_delete_agent, handle_run_agent, handle_update_agent};
+    use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentSettings, AgentStatus, Content, ModelAdapter, ModelGenerateRequest,
@@ -531,6 +532,55 @@ mod tests {
             assert!(!tools[0].description.is_empty());
             assert!(tools[0].parameters_schema.contains_key("required"));
         });
+    }
+
+    #[test]
+    fn deleting_agent_during_in_flight_run_stays_deleted_and_persisted() {
+        let store_path = std::env::temp_dir().join(format!(
+            "anima-delete-race-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        let store_config = ControlPlaneStoreConfig::Json(store_path.clone());
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            PendingModelAdapter,
+        ))));
+        let agent_id = block_on(async {
+            let mut guard = state.write().await;
+            guard.set_control_plane_store(Some(store_config.clone()));
+            guard
+                .create_agent(test_config("operator"))
+                .expect("agent should be created")
+                .state
+                .id
+        });
+        let mut future = Box::pin(handle_run_agent(
+            &agent_id,
+            br#"{"text":"run pending task"}"#.to_vec(),
+            &state,
+        ));
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+
+        block_on(handle_delete_agent(&agent_id, &state))
+            .expect("deleting the checked-out agent should succeed");
+        block_on(future).expect("the already-started request may finish");
+
+        block_on(async {
+            let guard = state.read().await;
+            assert!(guard.get_agent(&agent_id).is_none());
+            assert_eq!(guard.agent_count(), 0);
+        });
+        let persisted = block_on(load_control_plane_snapshot(&store_config))
+            .expect("control-plane snapshot should load")
+            .expect("control-plane snapshot should exist");
+        assert!(persisted.agents.is_empty());
+
+        let _ = std::fs::remove_file(store_path);
     }
 
     fn test_config(name: &str) -> AgentConfig {

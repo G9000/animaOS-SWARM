@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anima_core::{
     AgentRuntime, AgentState, Content, DataValue, EngineEvent, Message, StepStatus, TaskResult,
-    TaskStatus, ToolCall,
+    TaskStatus, ToolCall, ToolDescriptor,
 };
 
 use self::support::{
@@ -91,7 +91,17 @@ async fn public_runtime_boundary_runs_with_provider_evaluator_and_persistence() 
 
 #[tokio::test]
 async fn public_runtime_boundary_surfaces_unknown_tool_results_via_run() {
-    let mut runtime = AgentRuntime::new(config(), Arc::new(UnknownToolModelAdapter));
+    let mut runtime_config = config();
+    runtime_config
+        .tools
+        .get_or_insert_default()
+        .push(ToolDescriptor {
+            name: "missing_tool".into(),
+            description: "Synthetic allowed tool without a host implementation".into(),
+            parameters_schema: Default::default(),
+            examples: None,
+        });
+    let mut runtime = AgentRuntime::new(runtime_config, Arc::new(UnknownToolModelAdapter));
     runtime.init();
 
     let result = runtime

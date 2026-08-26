@@ -14,7 +14,7 @@ use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnal
 use anima_swarm::coordinator::CoordinatorMessageEventFn;
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
-use tokio::sync::RwLock as AsyncRwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
@@ -38,6 +38,206 @@ pub(crate) type SharedMemoryStore = Arc<AsyncRwLock<MemoryManager>>;
 pub(crate) enum UpdateAgentError {
     InvalidTools(String),
     NotFound,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DaemonState;
+    use crate::control_plane_store::{
+        load_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
+    };
+    use anima_core::{AgentConfig, AgentRuntime, AgentSettings, ToolDescriptor};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn stale_delayed_persist_request_cannot_overwrite_newer_snapshot() {
+        let store_path = std::env::temp_dir().join(format!(
+            "anima-persist-order-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        let store_config = ControlPlaneStoreConfig::Json(store_path.clone());
+        let mut state = DaemonState::new();
+        state.set_control_plane_store(Some(store_config.clone()));
+        state
+            .create_agent(test_config("older"))
+            .expect("first agent should be created");
+        let older_request = state.control_plane_persist_request();
+        state
+            .create_agent(test_config("newer"))
+            .expect("second agent should be created");
+        let newer_request = state.control_plane_persist_request();
+
+        let (release_older, wait_for_release) = tokio::sync::oneshot::channel();
+        let older_save = tokio::spawn(async move {
+            wait_for_release.await.expect("old save should be released");
+            older_request.save().await
+        });
+        newer_request
+            .save()
+            .await
+            .expect("newer snapshot should save first");
+        release_older
+            .send(())
+            .expect("old save task should still be waiting");
+        older_save
+            .await
+            .expect("old save task should join")
+            .expect("stale save should be a successful no-op");
+
+        let persisted = load_control_plane_snapshot(&store_config)
+            .await
+            .expect("snapshot should load")
+            .expect("snapshot should exist");
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(persisted)
+            .expect("newest snapshot should restore");
+        assert_eq!(restored.agent_count(), 2);
+        let mut restored_names = restored
+            .list_agents()
+            .into_iter()
+            .map(|snapshot| snapshot.state.config.name)
+            .collect::<Vec<_>>();
+        restored_names.sort();
+        assert_eq!(
+            restored_names,
+            ["newer", "older"],
+            "the newest persisted snapshot should retain both agents"
+        );
+
+        let _ = std::fs::remove_file(store_path);
+    }
+
+    #[tokio::test]
+    async fn failed_newer_persist_request_does_not_suppress_older_snapshot() {
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        );
+        let valid_path = std::env::temp_dir().join(format!("anima-persist-fallback-{unique}.json"));
+        let invalid_path = std::env::temp_dir().join(format!("anima-persist-failure-{unique}"));
+        std::fs::create_dir(&invalid_path)
+            .expect("invalid file target directory should be created");
+
+        let valid_store = ControlPlaneStoreConfig::Json(valid_path.clone());
+        let mut state = DaemonState::new();
+        state.set_control_plane_store(Some(valid_store.clone()));
+        state
+            .create_agent(test_config("durable-older"))
+            .expect("first agent should be created");
+        let older_request = state.control_plane_persist_request();
+
+        state.set_control_plane_store(Some(ControlPlaneStoreConfig::Json(invalid_path.clone())));
+        state
+            .create_agent(test_config("failed-newer"))
+            .expect("second agent should be created");
+        let newer_request = state.control_plane_persist_request();
+        assert!(
+            newer_request.save().await.is_err(),
+            "writing a snapshot to a directory should fail"
+        );
+        older_request
+            .save()
+            .await
+            .expect("an older pending snapshot should remain eligible after a newer save fails");
+
+        let persisted = load_control_plane_snapshot(&valid_store)
+            .await
+            .expect("fallback snapshot should load")
+            .expect("fallback snapshot should exist");
+        assert_eq!(persisted.agents.len(), 1);
+        assert_eq!(persisted.agents[0].state.config.name, "durable-older");
+
+        let _ = std::fs::remove_file(valid_path);
+        let _ = std::fs::remove_dir(invalid_path);
+    }
+
+    #[test]
+    fn restore_deduplicates_and_canonicalizes_legacy_agent_tools() {
+        let source = DaemonState::new();
+        let mut config = test_config("legacy");
+        config.tools = Some(vec![
+            forged_tool("read_file", "forged first"),
+            forged_tool("read_file", "forged duplicate"),
+            forged_tool("bash", "forged bash"),
+        ]);
+        let legacy_snapshot =
+            AgentRuntime::new(config, Arc::clone(&source.model_adapter)).snapshot();
+        let mut restored = DaemonState::new();
+
+        restored
+            .restore_control_plane_snapshot(ControlPlaneSnapshot::new(
+                vec![legacy_snapshot],
+                vec![],
+            ))
+            .expect("legacy duplicate descriptors should not abort daemon startup");
+
+        let snapshot = restored
+            .list_agents()
+            .pop()
+            .expect("legacy agent should restore");
+        let tools = snapshot
+            .state
+            .config
+            .tools
+            .expect("restored tools should exist");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read_file", "bash"]
+        );
+        assert_eq!(
+            tools[0],
+            restored
+                .tool_registry
+                .descriptor("read_file")
+                .expect("read_file should be registered")
+        );
+        assert_eq!(
+            tools[1],
+            restored
+                .tool_registry
+                .descriptor("bash")
+                .expect("bash should be registered")
+        );
+    }
+
+    fn forged_tool(name: &str, description: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.into(),
+            description: description.into(),
+            parameters_schema: Default::default(),
+            examples: None,
+        }
+    }
+
+    fn test_config(name: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: Some(AgentSettings::default()),
+        }
+    }
 }
 
 const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
@@ -93,8 +293,11 @@ pub(crate) struct DaemonState {
     pub(crate) memory_embeddings: SharedMemoryEmbeddings,
     pub(crate) memory_store: Option<MemoryStoreConfig>,
     pub(crate) control_plane_store: Option<ControlPlaneStoreConfig>,
+    control_plane_revision: u64,
+    control_plane_persist_order: Arc<ControlPlanePersistOrder>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
     pub(crate) agent_snapshots: HashMap<String, AgentRuntimeSnapshot>,
+    deleted_agent_ids: HashSet<String>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
@@ -109,11 +312,23 @@ pub(crate) struct DaemonState {
 pub(crate) struct ControlPlanePersistRequest {
     config: Option<ControlPlaneStoreConfig>,
     snapshot: ControlPlaneSnapshot,
+    revision: u64,
+    order: Arc<ControlPlanePersistOrder>,
+}
+
+struct ControlPlanePersistOrder {
+    latest_successful_revision: AsyncMutex<u64>,
 }
 
 impl ControlPlanePersistRequest {
     pub(crate) async fn save(self) -> std::io::Result<()> {
-        save_control_plane_snapshot(self.config.as_ref(), &self.snapshot).await
+        let mut latest_successful_revision = self.order.latest_successful_revision.lock().await;
+        if self.revision <= *latest_successful_revision {
+            return Ok(());
+        }
+        save_control_plane_snapshot(self.config.as_ref(), &self.snapshot).await?;
+        *latest_successful_revision = self.revision;
+        Ok(())
     }
 }
 
@@ -176,8 +391,13 @@ impl DaemonState {
             memory_embeddings,
             memory_store: None,
             control_plane_store: None,
+            control_plane_revision: 0,
+            control_plane_persist_order: Arc::new(ControlPlanePersistOrder {
+                latest_successful_revision: AsyncMutex::new(0),
+            }),
             agents: HashMap::new(),
             agent_snapshots: HashMap::new(),
+            deleted_agent_ids: HashSet::new(),
             swarms: HashMap::new(),
             swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
@@ -222,10 +442,16 @@ impl DaemonState {
         self.control_plane_store = control_plane_store;
     }
 
-    pub(crate) fn control_plane_persist_request(&self) -> ControlPlanePersistRequest {
+    pub(crate) fn control_plane_persist_request(&mut self) -> ControlPlanePersistRequest {
+        self.control_plane_revision = self
+            .control_plane_revision
+            .checked_add(1)
+            .expect("control-plane persistence revision overflowed");
         ControlPlanePersistRequest {
             config: self.control_plane_store.clone(),
             snapshot: self.control_plane_snapshot(),
+            revision: self.control_plane_revision,
+            order: Arc::clone(&self.control_plane_persist_order),
         }
     }
 
@@ -563,7 +789,8 @@ impl DaemonState {
     }
 
     fn restore_agent_snapshot(&mut self, mut snapshot: AgentRuntimeSnapshot) -> Result<(), String> {
-        snapshot.state.config.tools = self.resolve_agent_tools(snapshot.state.config.tools)?;
+        snapshot.state.config.tools =
+            self.resolve_restored_agent_tools(snapshot.state.config.tools)?;
         let agent_id = snapshot.state.id.clone();
         let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
@@ -610,9 +837,11 @@ impl DaemonState {
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: &str) {
-        self.agent_snapshots.remove(agent_id);
+        let had_snapshot = self.agent_snapshots.remove(agent_id).is_some();
         if let Some(mut runtime) = self.agents.remove(agent_id) {
             runtime.stop();
+        } else if had_snapshot {
+            self.deleted_agent_ids.insert(agent_id.to_string());
         }
     }
 
@@ -656,6 +885,8 @@ impl DaemonState {
         SharedMemoryEmbeddings,
         Option<MemoryStoreConfig>,
     ) {
+        let agent_id = runtime.id().to_string();
+        let was_deleted = self.deleted_agent_ids.remove(&agent_id);
         if let Some(latest_config) = self
             .agent_snapshots
             .get(runtime.id())
@@ -670,11 +901,12 @@ impl DaemonState {
             });
         }
         let snapshot = runtime.snapshot();
-        let agent_id = runtime.id().to_string();
         let agent_name = runtime.state().name;
-        self.agent_snapshots
-            .insert(agent_id.clone(), snapshot.clone());
-        self.agents.insert(agent_id.clone(), runtime);
+        if !was_deleted {
+            self.agent_snapshots
+                .insert(agent_id.clone(), snapshot.clone());
+            self.agents.insert(agent_id.clone(), runtime);
+        }
 
         (
             snapshot,
@@ -714,6 +946,24 @@ impl DaemonState {
                 return Err(format!("unknown tool: {}", tool.name));
             }
             names.push(tool.name);
+        }
+
+        self.tool_registry.resolve_descriptors(names).map(Some)
+    }
+
+    fn resolve_restored_agent_tools(
+        &self,
+        tools: Option<Vec<ToolDescriptor>>,
+    ) -> Result<Option<Vec<ToolDescriptor>>, String> {
+        let Some(tools) = tools else {
+            return Ok(None);
+        };
+        let mut names = Vec::with_capacity(tools.len());
+        let mut seen = HashSet::with_capacity(tools.len());
+        for tool in tools {
+            if seen.insert(tool.name.clone()) {
+                names.push(tool.name);
+            }
         }
 
         self.tool_registry.resolve_descriptors(names).map(Some)

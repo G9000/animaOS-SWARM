@@ -7,7 +7,9 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{AgentConfig, AgentConfigUpdate, AgentState, AgentStatus, TokenUsage};
+use crate::agent::{
+    tool_not_configured_error, AgentConfig, AgentConfigUpdate, AgentState, AgentStatus, TokenUsage,
+};
 use crate::components::{Evaluator, EvaluatorDecision, Provider};
 use crate::events::{EngineEvent, EventType};
 use crate::model::{ModelAdapter, ModelGenerateRequest, ModelStopReason, ToolCall};
@@ -456,6 +458,23 @@ impl AgentRuntime {
                                     )
                                 });
                             };
+
+                            if let Some(denied) = tool_calls
+                                .iter()
+                                .find(|tool_call| !self.state.config.allows_tool(&tool_call.name))
+                            {
+                                let duration_ms = now_millis().saturating_sub(start);
+                                self.mark_failed(
+                                    tool_not_configured_error(&denied.name),
+                                    duration_ms,
+                                );
+                                return self.last_task.clone().unwrap_or_else(|| {
+                                    TaskResult::error(
+                                        tool_not_configured_error(&denied.name),
+                                        duration_ms,
+                                    )
+                                });
+                            }
 
                             iterations += 1;
                             let assistant_content =

@@ -11,6 +11,7 @@ use super::{
         },
         FileEditOperation,
     },
+    new_shared_process_manager_with_limit,
     process::{
         background::{
             list_background_processes, new_shared_process_manager, read_background_process_output,
@@ -24,15 +25,109 @@ use super::{
     },
     utility::{current_time_iso_utc, evaluate_expression},
     web::{parse_exa_results, strip_html_text},
-    ToolRegistry,
+    ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
-use anima_core::{DataValue, ToolDescriptor};
+use crate::memory_embeddings::MemoryEmbeddingRuntime;
+use anima_core::{
+    AgentConfig, AgentState, AgentStatus, Content, DataValue, Message, MessageRole, TaskStatus,
+    ToolCall, ToolDescriptor,
+};
+use anima_memory::MemoryManager;
 use chrono::DateTime;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock as AsyncRwLock;
+
+#[tokio::test]
+async fn tool_execution_context_rejects_registered_but_unconfigured_write_tool() {
+    let relative_path = format!(
+        "target/denied-host-write-{}-{}.txt",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos()
+    );
+    let absolute_path = std::env::current_dir()
+        .expect("current directory")
+        .join(&relative_path);
+    assert!(
+        !absolute_path.exists(),
+        "test output path must start absent"
+    );
+    let context = ToolExecutionContext::new(
+        Arc::new(AsyncRwLock::new(MemoryManager::new())),
+        Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::disabled())),
+        None,
+        ToolRegistry::new(),
+        new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
+    );
+    let agent = AgentState {
+        id: "agent-denied".into(),
+        name: "denied".into(),
+        status: AgentStatus::Running,
+        config: AgentConfig {
+            name: "denied".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: None,
+        },
+        created_at_ms: 1,
+        token_usage: Default::default(),
+    };
+    let user_message = Message {
+        id: "message-denied".into(),
+        agent_id: agent.id.clone(),
+        room_id: "room-denied".into(),
+        content: Content {
+            text: "write outside permissions".into(),
+            ..Content::default()
+        },
+        role: MessageRole::User,
+        created_at_ms: 1,
+    };
+    let result = context
+        .execute_tool(
+            agent,
+            user_message,
+            ToolCall {
+                id: "write-denied".into(),
+                name: "write_file".into(),
+                args: BTreeMap::from([
+                    ("file_path".into(), DataValue::String(relative_path.into())),
+                    ("content".into(), DataValue::String("must not write".into())),
+                ]),
+            },
+        )
+        .await;
+    let wrote_file = absolute_path.exists();
+    if wrote_file {
+        std::fs::remove_file(&absolute_path).expect("clean up unauthorized test write");
+    }
+
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("tool 'write_file' is not configured for this agent")
+    );
+    assert!(
+        !wrote_file,
+        "host dispatch must not invoke the write handler"
+    );
+}
 
 #[test]
 fn registry_resolves_canonical_descriptors() {

@@ -10,7 +10,10 @@ mod workspace;
 
 use std::collections::{BTreeMap, HashMap};
 
-use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall, ToolDescriptor};
+use anima_core::{
+    tool_not_configured_error, AgentState, Content, DataValue, Message, TaskResult, ToolCall,
+    ToolDescriptor,
+};
 use futures::future::BoxFuture;
 
 use crate::memory_embeddings::SharedMemoryEmbeddings;
@@ -76,6 +79,9 @@ impl ToolExecutionContext {
         user_message: Message,
         tool_call: ToolCall,
     ) -> TaskResult<Content> {
+        if !agent.config.allows_tool(&tool_call.name) {
+            return TaskResult::error(tool_not_configured_error(&tool_call.name), 0);
+        }
         let handler = self.tool_registry.lookup(&tool_call.name);
         match handler {
             Some(handler) => handler(self, agent, user_message, tool_call).await,

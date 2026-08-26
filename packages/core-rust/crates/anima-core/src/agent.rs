@@ -54,6 +54,18 @@ pub struct AgentConfig {
     pub settings: Option<AgentSettings>,
 }
 
+impl AgentConfig {
+    pub fn allows_tool(&self, tool_name: &str) -> bool {
+        self.tools
+            .as_ref()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.name == tool_name))
+    }
+}
+
+pub fn tool_not_configured_error(tool_name: &str) -> String {
+    format!("tool '{tool_name}' is not configured for this agent")
+}
+
 /// Partial update for an existing agent's config. Only the fields that are
 /// `Some` are applied; everything else is left untouched.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
