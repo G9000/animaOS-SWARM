@@ -52,6 +52,8 @@ export function ViewHarness() {
 
   const sendingRef = useRef(false);
   const agentMutationEpochRef = useRef(0);
+  const agentRequestTokenRef = useRef(0);
+  const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
   sendingRef.current = sending;
 
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -62,30 +64,57 @@ export function ViewHarness() {
     });
   };
 
-  const refreshAgent = useCallback(async () => {
+  const refreshAgent = useCallback(() => {
+    const requestToken = ++agentRequestTokenRef.current;
     const mutationEpoch = agentMutationEpochRef.current;
-    try {
-      const { agents } = await daemon.listAgents();
-      if (mutationEpoch === agentMutationEpochRef.current) {
-        setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+    const previousRequest = agentRequestInFlightRef.current;
+    const request = (async () => {
+      if (previousRequest) {
+        await previousRequest;
       }
-      setOnline(true);
-      setLoaded(true);
       if (
-        mutationEpoch === agentMutationEpochRef.current &&
-        agents.length > 0
+        requestToken !== agentRequestTokenRef.current ||
+        mutationEpoch !== agentMutationEpochRef.current
       ) {
-        scrollDown();
+        return;
       }
-    } catch {
-      if (mutationEpoch === agentMutationEpochRef.current) {
-        setOnline(false);
+
+      try {
+        const { agents } = await daemon.listAgents();
+        if (
+          requestToken === agentRequestTokenRef.current &&
+          mutationEpoch === agentMutationEpochRef.current
+        ) {
+          setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+          setOnline(true);
+          setLoaded(true);
+          if (agents.length > 0) {
+            scrollDown();
+          }
+        }
+      } catch {
+        if (
+          requestToken === agentRequestTokenRef.current &&
+          mutationEpoch === agentMutationEpochRef.current
+        ) {
+          setOnline(false);
+          setLoaded(true);
+        }
       }
-      setLoaded(true);
-    }
+    })();
+
+    agentRequestInFlightRef.current = request;
+    void request.then(() => {
+      if (agentRequestInFlightRef.current === request) {
+        agentRequestInFlightRef.current = null;
+      }
+    });
+    return request;
   }, []);
 
-  useEffect(() => { refreshAgent(); }, [refreshAgent]);
+  useEffect(() => {
+    void refreshAgent();
+  }, [refreshAgent]);
 
   const retryProviders = useCallback(async () => {
     try {
@@ -110,29 +139,11 @@ export function ViewHarness() {
   useEffect(() => {
     const timer = setInterval(() => {
       if (!sendingRef.current) {
-        const mutationEpoch = agentMutationEpochRef.current;
-        daemon.listAgents()
-          .then(({ agents }) => {
-            if (mutationEpoch === agentMutationEpochRef.current) {
-              setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
-            }
-            setOnline(true);
-            if (
-              mutationEpoch === agentMutationEpochRef.current &&
-              agents.length > 0
-            ) {
-              scrollDown();
-            }
-          })
-          .catch(() => {
-            if (mutationEpoch === agentMutationEpochRef.current) {
-              setOnline(false);
-            }
-          });
+        void refreshAgent();
       }
     }, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [refreshAgent]);
 
   // ── Check-ins: local scheduler firing recurring prompts through the daemon ──
 

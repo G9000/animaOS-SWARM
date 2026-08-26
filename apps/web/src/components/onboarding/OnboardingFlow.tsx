@@ -12,7 +12,7 @@ import {
 } from '../../lib/daemon-api';
 import { AccessStep } from './AccessStep';
 import { IdentityStep } from './IdentityStep';
-import { ModelStep } from './ModelStep';
+import { ModelStep, type ProviderCatalogState } from './ModelStep';
 import { ONBOARDING_STEPS, OnboardingProgress } from './OnboardingProgress';
 import { ReviewStep } from './ReviewStep';
 
@@ -61,10 +61,13 @@ export function OnboardingFlow({
   const [createError, setCreateError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [providersRetrying, setProvidersRetrying] = useState(false);
+  const [providerRetryError, setProviderRetryError] = useState<string | null>(
+    null,
+  );
   const nameInputRef = useRef<HTMLInputElement>(null);
-  const providerGroupRef = useRef<HTMLDivElement>(null);
   const modelSelectRef = useRef<HTMLSelectElement>(null);
   const customModelInputRef = useRef<HTMLInputElement>(null);
+  const providerRetryInFlightRef = useRef(false);
   const submitInFlightRef = useRef(false);
 
   useEffect(() => {
@@ -72,36 +75,60 @@ export function OnboardingFlow({
       return;
     }
 
-    setDraft((current) => {
-      const selectedProvider = providers.find(
-        (candidate) =>
-          candidate.id === current.provider && candidate.configured,
-      );
-      if (selectedProvider) {
-        return current;
-      }
+    const selectedProvider = providers.find(
+      (candidate) => candidate.id === draft.provider && candidate.configured,
+    );
+    if (selectedProvider) {
+      return;
+    }
 
-      const firstConfigured = providers.find(
-        (candidate) => candidate.configured,
-      );
-      if (!firstConfigured) {
-        return current.provider || current.model
-          ? { ...current, provider: '', model: '' }
-          : current;
+    const firstConfigured = providers.find((candidate) => candidate.configured);
+    if (!firstConfigured) {
+      if (draft.provider || draft.model) {
+        setDraft((current) => ({ ...current, provider: '', model: '' }));
       }
+      return;
+    }
 
-      return {
-        ...current,
-        provider: firstConfigured.id,
-        model: defaultModel(firstConfigured.id),
-      };
-    });
-  }, [providers]);
+    setDraft((current) => ({
+      ...current,
+      provider: firstConfigured.id,
+      model: defaultModel(firstConfigured.id),
+    }));
+    if (currentStep === 1) {
+      setBlockingError(null);
+    }
+  }, [currentStep, draft.model, draft.provider, providers]);
+
+  useEffect(() => {
+    if (providersError) {
+      setProviderRetryError(null);
+    }
+  }, [providersError]);
 
   const resolvedModel =
     draft.model === '__custom__'
       ? draft.customModel.trim()
       : draft.model.trim();
+  const providerError = providerRetryError ?? providersError;
+  const selectedProviderConfigured =
+    providers?.some(
+      (candidate) => candidate.id === draft.provider && candidate.configured,
+    ) ?? false;
+  let providerCatalogState: ProviderCatalogState;
+  if (providersRetrying) {
+    providerCatalogState = 'retrying';
+  } else if (providerError) {
+    providerCatalogState = 'error';
+  } else if (providers === null) {
+    providerCatalogState = 'loading';
+  } else if (!providers.some((candidate) => candidate.configured)) {
+    providerCatalogState = 'empty';
+  } else {
+    providerCatalogState = 'ready';
+  }
+  const intelligenceReady =
+    providerCatalogState === 'ready' && selectedProviderConfigured;
 
   const updateDraft = <Key extends keyof OnboardingDraft>(
     key: Key,
@@ -136,12 +163,7 @@ export function OnboardingFlow({
     }
 
     if (currentStep === 1) {
-      const configuredProvider = providers?.some(
-        (candidate) => candidate.id === draft.provider && candidate.configured,
-      );
-      if (!configuredProvider) {
-        setBlockingError('Choose a configured provider.');
-        providerGroupRef.current?.focus();
+      if (!intelligenceReady) {
         return;
       }
 
@@ -160,10 +182,19 @@ export function OnboardingFlow({
   };
 
   const handleRetryProviders = async () => {
+    if (providerRetryInFlightRef.current) {
+      return;
+    }
+
+    providerRetryInFlightRef.current = true;
+    setProviderRetryError(null);
     setProvidersRetrying(true);
     try {
       await retryProviders();
+    } catch (error) {
+      setProviderRetryError(errorMessage(error));
     } finally {
+      providerRetryInFlightRef.current = false;
       setProvidersRetrying(false);
     }
   };
@@ -211,8 +242,8 @@ export function OnboardingFlow({
       stepContent = (
         <ModelStep
           providers={providers}
-          providersError={providersError}
-          providersRetrying={providersRetrying}
+          catalogState={providerCatalogState}
+          providerError={providerError}
           provider={draft.provider}
           model={draft.model}
           customModel={draft.customModel}
@@ -220,7 +251,6 @@ export function OnboardingFlow({
           onModelChange={(model) => updateDraft('model', model)}
           onCustomModelChange={(model) => updateDraft('customModel', model)}
           onRetryProviders={() => void handleRetryProviders()}
-          providerGroupRef={providerGroupRef}
           modelSelectRef={modelSelectRef}
           customModelInputRef={customModelInputRef}
         />
@@ -301,7 +331,8 @@ export function OnboardingFlow({
               )}
               <button
                 type="button"
-                className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white"
+                disabled={currentStep === 1 && !intelligenceReady}
+                className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
                 onClick={goNext}
               >
                 Next

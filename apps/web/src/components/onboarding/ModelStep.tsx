@@ -1,12 +1,12 @@
-import type { RefObject } from 'react';
+import { useEffect, useRef, type RefObject } from 'react';
 
 import { MODEL_SUGGESTIONS, type DaemonProvider } from '../../lib/daemon-api';
 import { labelCls } from '../ui-bits';
 
 export interface ModelStepProps {
   providers: DaemonProvider[] | null;
-  providersError: string | null;
-  providersRetrying: boolean;
+  catalogState: ProviderCatalogState;
+  providerError: string | null;
   provider: string;
   model: string;
   customModel: string;
@@ -14,10 +14,16 @@ export interface ModelStepProps {
   onModelChange(model: string): void;
   onCustomModelChange(model: string): void;
   onRetryProviders(): void;
-  providerGroupRef: RefObject<HTMLDivElement | null>;
   modelSelectRef: RefObject<HTMLSelectElement | null>;
   customModelInputRef: RefObject<HTMLInputElement | null>;
 }
+
+export type ProviderCatalogState =
+  | 'loading'
+  | 'retrying'
+  | 'error'
+  | 'empty'
+  | 'ready';
 
 function providerGuidance(provider: DaemonProvider): string {
   if (provider.configured) {
@@ -34,8 +40,8 @@ function providerGuidance(provider: DaemonProvider): string {
 
 export function ModelStep({
   providers,
-  providersError,
-  providersRetrying,
+  catalogState,
+  providerError,
   provider,
   model,
   customModel,
@@ -43,13 +49,25 @@ export function ModelStep({
   onModelChange,
   onCustomModelChange,
   onRetryProviders,
-  providerGroupRef,
   modelSelectRef,
   customModelInputRef,
 }: ModelStepProps) {
   const modelSuggestions = MODEL_SUGGESTIONS[provider] ?? [];
+  const selectedProviderRef = useRef<HTMLButtonElement>(null);
+  const retryButtonRef = useRef<HTMLButtonElement>(null);
   const providerCatalogBusy =
-    providersRetrying || (providers === null && !providersError);
+    catalogState === 'loading' || catalogState === 'retrying';
+
+  useEffect(() => {
+    if (catalogState === 'error' || catalogState === 'empty') {
+      retryButtonRef.current?.focus();
+      return;
+    }
+
+    if (catalogState === 'ready') {
+      selectedProviderRef.current?.focus();
+    }
+  }, [catalogState, provider]);
 
   return (
     <section aria-labelledby="onboarding-model-heading" className="space-y-5">
@@ -66,101 +84,143 @@ export function ModelStep({
       </div>
 
       <div
-        ref={providerGroupRef}
         role="group"
         aria-label="Provider catalog"
         aria-busy={providerCatalogBusy}
-        tabIndex={-1}
-        className="space-y-3 outline-none"
+        className="space-y-3"
       >
         <p className={labelCls}>Provider</p>
-        {providerCatalogBusy ? (
-          <p className="rounded-xl border border-dashed border-line px-4 py-3 text-sm text-ink-3">
+        {catalogState === 'loading' ? (
+          <p
+            role="status"
+            className="rounded-xl border border-dashed border-line px-4 py-3 text-sm text-ink-3"
+          >
             Loading provider catalog…
           </p>
-        ) : providersError ? (
+        ) : catalogState === 'retrying' ? (
+          <p
+            role="status"
+            className="rounded-xl border border-dashed border-line px-4 py-3 text-sm text-ink-3"
+          >
+            Retrying provider catalog…
+          </p>
+        ) : catalogState === 'error' ? (
           <div className="space-y-3 rounded-xl border border-red-400/30 bg-red-400/5 p-4">
-            <p role="alert" className="text-sm text-red-300">
-              {providersError}
+            <p
+              id="provider-catalog-error"
+              role="alert"
+              className="text-sm text-red-300"
+            >
+              {providerError}
             </p>
             <button
+              ref={retryButtonRef}
               type="button"
-              className="rounded-lg border border-line px-3 py-2 text-sm text-ink"
+              aria-describedby="provider-catalog-error"
+              className="rounded-lg border border-line px-3 py-2 text-sm text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
               onClick={onRetryProviders}
             >
               Retry providers
             </button>
           </div>
         ) : (
-          <div className="grid gap-2 sm:grid-cols-2">
-            {(providers ?? []).map((candidate) => {
-              const guidance = providerGuidance(candidate);
-              const selected = candidate.id === provider;
+          <>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {(providers ?? []).map((candidate) => {
+                const guidance = providerGuidance(candidate);
+                const selected = candidate.id === provider;
 
-              return (
+                return (
+                  <button
+                    ref={
+                      selected && candidate.configured
+                        ? selectedProviderRef
+                        : undefined
+                    }
+                    key={candidate.id}
+                    type="button"
+                    disabled={!candidate.configured}
+                    aria-pressed={selected}
+                    onClick={() => onProviderChange(candidate.id)}
+                    className={`rounded-xl border p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 disabled:cursor-not-allowed disabled:opacity-60 ${
+                      selected
+                        ? 'border-sky-400/60 bg-sky-400/10'
+                        : 'border-line bg-white/[0.02]'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium text-ink">
+                      {candidate.label}
+                    </span>
+                    <span className="mt-1 block text-xs text-ink-3">
+                      {guidance}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {catalogState === 'empty' ? (
+              <div className="space-y-3 rounded-xl border border-amber-300/30 bg-amber-300/5 p-4">
+                <p id="provider-catalog-empty" className="text-sm text-ink-2">
+                  No providers are configured. Add a provider credential to the
+                  daemon environment, then retry.
+                </p>
                 <button
-                  key={candidate.id}
+                  ref={retryButtonRef}
                   type="button"
-                  disabled={!candidate.configured}
-                  aria-pressed={selected}
-                  onClick={() => onProviderChange(candidate.id)}
-                  className={`rounded-xl border p-3 text-left disabled:cursor-not-allowed disabled:opacity-60 ${
-                    selected
-                      ? 'border-sky-400/60 bg-sky-400/10'
-                      : 'border-line bg-white/[0.02]'
-                  }`}
+                  aria-describedby="provider-catalog-empty"
+                  className="rounded-lg border border-line px-3 py-2 text-sm text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+                  onClick={onRetryProviders}
                 >
-                  <span className="block text-sm font-medium text-ink">
-                    {candidate.label}
-                  </span>
-                  <span className="mt-1 block text-xs text-ink-3">
-                    {guidance}
-                  </span>
+                  Retry providers
                 </button>
-              );
-            })}
-          </div>
+              </div>
+            ) : null}
+          </>
         )}
       </div>
 
-      <div>
-        <label htmlFor="onboarding-model" className={labelCls}>
-          Model
-        </label>
-        <select
-          ref={modelSelectRef}
-          id="onboarding-model"
-          className="field"
-          value={model}
-          disabled={!provider}
-          onChange={(event) => onModelChange(event.target.value)}
-        >
-          <option value="" disabled>
-            Choose a model
-          </option>
-          {modelSuggestions.map((suggestion) => (
-            <option key={suggestion} value={suggestion}>
-              {suggestion}
-            </option>
-          ))}
-          <option value="__custom__">Custom model</option>
-        </select>
-      </div>
+      {catalogState === 'ready' ? (
+        <>
+          <div>
+            <label htmlFor="onboarding-model" className={labelCls}>
+              Model
+            </label>
+            <select
+              ref={modelSelectRef}
+              id="onboarding-model"
+              className="field"
+              value={model}
+              disabled={!provider}
+              onChange={(event) => onModelChange(event.target.value)}
+            >
+              <option value="" disabled>
+                Choose a model
+              </option>
+              {modelSuggestions.map((suggestion) => (
+                <option key={suggestion} value={suggestion}>
+                  {suggestion}
+                </option>
+              ))}
+              <option value="__custom__">Custom model</option>
+            </select>
+          </div>
 
-      {model === '__custom__' ? (
-        <div>
-          <label htmlFor="onboarding-custom-model" className={labelCls}>
-            Custom model
-          </label>
-          <input
-            ref={customModelInputRef}
-            id="onboarding-custom-model"
-            className="field"
-            value={customModel}
-            onChange={(event) => onCustomModelChange(event.target.value)}
-            placeholder="Provider model identifier"
-          />
-        </div>
+          {model === '__custom__' ? (
+            <div>
+              <label htmlFor="onboarding-custom-model" className={labelCls}>
+                Custom model
+              </label>
+              <input
+                ref={customModelInputRef}
+                id="onboarding-custom-model"
+                className="field"
+                value={customModel}
+                onChange={(event) => onCustomModelChange(event.target.value)}
+                placeholder="Provider model identifier"
+              />
+            </div>
+          ) : null}
+        </>
       ) : null}
     </section>
   );

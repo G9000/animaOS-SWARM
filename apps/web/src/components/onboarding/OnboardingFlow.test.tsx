@@ -61,6 +61,19 @@ function snapshot(): DaemonSnapshot {
   };
 }
 
+function namedSnapshot(name: string, id: string): DaemonSnapshot {
+  const base = snapshot();
+  return {
+    ...base,
+    state: {
+      ...base.state,
+      id,
+      name,
+      config: { ...base.state.config, name },
+    },
+  };
+}
+
 function deferred<Value>() {
   let resolve!: (value: Value) => void;
   let reject!: (reason?: unknown) => void;
@@ -191,6 +204,7 @@ describe('OnboardingFlow', () => {
       name: /OpenAI.*configured/i,
     });
     expect(openai).toBeEnabled();
+    expect(openai).toHaveFocus();
     expect(openai).toHaveClass('border-sky-400/60', 'bg-sky-400/10');
     expect(
       screen.getByRole('button', { name: /Anthropic.*unavailable/i }),
@@ -232,7 +246,8 @@ describe('OnboardingFlow', () => {
 
   it('makes provider loading and retry explicit without discarding the identity draft', async () => {
     const user = userEvent.setup();
-    const retryProviders = vi.fn();
+    const retry = deferred<void>();
+    const retryProviders = vi.fn(() => retry.promise);
     const view = renderFlow({
       providers: null,
       providersError: null,
@@ -243,11 +258,15 @@ describe('OnboardingFlow', () => {
     await user.clear(name);
     await user.type(name, 'Persistent Anima');
     await goToIntelligence(user);
-    expect(screen.getByText('Loading provider catalog…')).toBeVisible();
+    expect(screen.getByText('Loading provider catalog…')).toHaveAttribute(
+      'role',
+      'status',
+    );
     expect(screen.getByLabelText('Provider catalog')).toHaveAttribute(
       'aria-busy',
       'true',
     );
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
 
     view.rerender(
       <OnboardingFlow
@@ -260,21 +279,143 @@ describe('OnboardingFlow', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(
       'provider catalog failed',
     );
-    await user.click(screen.getByRole('button', { name: 'Retry providers' }));
+    const retryButton = screen.getByRole('button', {
+      name: 'Retry providers',
+    });
+    expect(retryButton).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+    expect(
+      screen.queryByText('Choose a configured provider.'),
+    ).not.toBeInTheDocument();
+    act(() => {
+      retryButton.click();
+      retryButton.click();
+    });
     expect(retryProviders).toHaveBeenCalledTimes(1);
-
-    view.rerender(
-      <OnboardingFlow
-        providers={configuredProviders}
-        providersError={null}
-        retryProviders={retryProviders}
-        onCreated={vi.fn()}
-      />,
+    expect(screen.getByText('Retrying provider catalog…')).toHaveAttribute(
+      'role',
+      'status',
     );
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+
+    await act(async () => {
+      view.rerender(
+        <OnboardingFlow
+          providers={configuredProviders}
+          providersError={null}
+          retryProviders={retryProviders}
+          onCreated={vi.fn()}
+        />,
+      );
+      retry.resolve();
+      await retry.promise;
+    });
+    expect(screen.getByRole('button', { name: 'Next' })).toBeEnabled();
     await user.click(screen.getByRole('button', { name: 'Back' }));
     expect(screen.getByRole('textbox', { name: 'Agent name' })).toHaveValue(
       'Persistent Anima',
     );
+  });
+
+  it('explains when no providers are configured and routes focus to retry', async () => {
+    const user = userEvent.setup();
+    const unavailableProviders: DaemonProvider[] = [
+      {
+        id: 'anthropic',
+        label: 'Anthropic',
+        requiresKey: true,
+        configured: false,
+        apiKeyEnvs: ['ANTHROPIC_API_KEY'],
+      },
+    ];
+    renderFlow({ providers: unavailableProviders });
+
+    await goToIntelligence(user);
+
+    expect(
+      screen.getByText(
+        'No providers are configured. Add a provider credential to the daemon environment, then retry.',
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: /Anthropic.*unavailable/i }),
+    ).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Retry providers' }),
+    ).toHaveFocus();
+  });
+
+  it('catches a provider retry rejection, announces it, and preserves Identity', async () => {
+    const user = userEvent.setup();
+    const retryProviders = vi
+      .fn()
+      .mockRejectedValue(new Error('retry transport failed'));
+    renderFlow({
+      providers: null,
+      providersError: 'provider catalog failed',
+      retryProviders,
+    });
+
+    const name = screen.getByRole('textbox', { name: 'Agent name' });
+    await user.clear(name);
+    await user.type(name, 'Still Anima');
+    await goToIntelligence(user);
+    await user.click(screen.getByRole('button', { name: 'Retry providers' }));
+
+    await screen.findByText('retry transport failed');
+    const retryAlert = screen.getByRole('alert');
+    expect(retryAlert).toHaveTextContent('retry transport failed');
+    expect(
+      screen.getByRole('button', { name: 'Retry providers' }),
+    ).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(screen.getByRole('textbox', { name: 'Agent name' })).toHaveValue(
+      'Still Anima',
+    );
+  });
+
+  it('installs a deterministic configured fallback and clears stale model validation', async () => {
+    const user = userEvent.setup();
+    const customProvider: DaemonProvider = {
+      id: 'custom-provider',
+      label: 'Custom provider',
+      requiresKey: false,
+      configured: true,
+      apiKeyEnvs: [],
+    };
+    const view = renderFlow({ providers: [customProvider] });
+    await goToIntelligence(user);
+
+    const customModel = screen.getByRole('textbox', { name: 'Custom model' });
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Enter a model.');
+    expect(customModel).toHaveFocus();
+
+    view.rerender(
+      <OnboardingFlow
+        providers={[
+          { ...customProvider, configured: false },
+          configuredProviders[2],
+        ]}
+        providersError={null}
+        retryProviders={vi.fn()}
+        onCreated={vi.fn()}
+      />,
+    );
+
+    const ollama = await screen.findByRole('button', {
+      name: /Ollama.*configured/i,
+    });
+    await waitFor(() => expect(ollama).toHaveAttribute('aria-pressed', 'true'));
+    expect(ollama).toHaveFocus();
+    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
+      'llama3.1',
+    );
+    expect(screen.queryByText('Enter a model.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeEnabled();
   });
 
   it('defaults to Collaborate and explains every access profile in text', async () => {
@@ -405,41 +546,134 @@ describe('OnboardingFlow', () => {
     expect(listAgents).not.toHaveBeenCalled();
   });
 
-  it('keeps a rejected creation on Review with an alert and intact retryable choices', async () => {
+  it('keeps a rejected non-default draft intact and prevents double submit on retry', async () => {
     const user = userEvent.setup();
+    const firstCreate = deferred<{ agent: DaemonSnapshot }>();
+    const secondCreate = deferred<{ agent: DaemonSnapshot }>();
     const createAgent = vi
       .spyOn(daemon, 'createAgent')
-      .mockRejectedValueOnce(new Error('daemon refused creation'))
-      .mockResolvedValueOnce({ agent: snapshot() });
+      .mockReturnValueOnce(firstCreate.promise)
+      .mockReturnValueOnce(secondCreate.promise);
     const onCreated = vi.fn();
     renderFlow({ onCreated });
 
-    await goToReview(user);
+    const name = screen.getByRole('textbox', { name: 'Agent name' });
+    await user.clear(name);
+    await user.type(name, 'Nova');
+    await user.type(
+      screen.getByRole('textbox', { name: 'Instructions (optional)' }),
+      'Be precise',
+    );
+    await goToIntelligence(user);
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Model' }),
+      '__custom__',
+    );
+    await user.type(
+      screen.getByRole('textbox', { name: 'Custom model' }),
+      'custom/great-model',
+    );
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(screen.getByRole('radio', { name: /Operate/ }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    const creatingButton = screen.getByRole('button', {
+      name: 'Creating agent…',
+    });
+    expect(creatingButton).toBeDisabled();
+    await user.click(creatingButton);
+    expect(createAgent).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstCreate.reject(new Error('daemon refused creation'));
+    });
 
     const createAlert = await screen.findByRole('alert');
     expect(createAlert).toHaveTextContent('daemon refused creation');
     expect(createAlert).toHaveFocus();
     expect(screen.getByRole('heading', { name: 'Review' })).toBeVisible();
-    expect(screen.getByText('Anima')).toBeVisible();
-    expect(screen.getByText('OpenAI / gpt-4o')).toBeVisible();
-    expect(screen.getByText('Collaborate')).toBeVisible();
+    expect(screen.getByText('Nova')).toBeVisible();
+    expect(screen.getByText('OpenAI / custom/great-model')).toBeVisible();
+    expect(screen.getByText('Operate')).toBeVisible();
+    expect(screen.getByText('Be precise')).toBeVisible();
 
     await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(createAgent).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole('button', { name: 'Creating agent…' }));
+    expect(createAgent).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      secondCreate.resolve({ agent: snapshot() });
+    });
     await waitFor(() => expect(onCreated).toHaveBeenCalledWith(snapshot()));
     expect(createAgent).toHaveBeenCalledTimes(2);
+  });
+
+  it('serializes same-epoch polls and applies only the newest queued response', async () => {
+    const olderPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const newerPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const listAgents = vi
+      .spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [] })
+      .mockReturnValueOnce(olderPoll.promise)
+      .mockReturnValueOnce(newerPoll.promise);
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    let runPoll: (() => void) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+
+    act(() => {
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      olderPoll.resolve({ agents: [namedSnapshot('Stale', 'agent-stale')] });
+      await olderPoll.promise;
+    });
+    expect(listAgents).toHaveBeenCalledTimes(3);
+    expect(
+      screen.getByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+
+    await act(async () => {
+      newerPoll.resolve({ agents: [namedSnapshot('Latest', 'agent-latest')] });
+      await newerPoll.promise;
+    });
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Latest' }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('heading', { name: 'Say something to Stale' }),
+    ).not.toBeInTheDocument();
   });
 
   it('lets ViewHarness adopt the created snapshot without another agent-list request', async () => {
     const user = userEvent.setup();
     const created = snapshot();
     const stalePoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const staleFailure = deferred<{ agents: DaemonSnapshot[] }>();
     const listAgents = vi
       .spyOn(daemon, 'listAgents')
       .mockResolvedValueOnce({ agents: [] })
-      .mockReturnValueOnce(stalePoll.promise)
-      .mockReturnValueOnce(staleFailure.promise);
+      .mockReturnValueOnce(stalePoll.promise);
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
       providers: configuredProviders,
     });
@@ -460,7 +694,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Create your main agent' }),
     ).toBeVisible();
-    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(2));
     const listCallsBeforeCreate = listAgents.mock.calls.length;
 
     await goToReview(user);
@@ -474,8 +708,6 @@ describe('OnboardingFlow', () => {
     await act(async () => {
       stalePoll.resolve({ agents: [] });
       await stalePoll.promise;
-      staleFailure.reject(new Error('stale poll failed'));
-      await staleFailure.promise.catch(() => undefined);
     });
     expect(
       screen.getByRole('heading', { name: 'Say something to Nova' }),
