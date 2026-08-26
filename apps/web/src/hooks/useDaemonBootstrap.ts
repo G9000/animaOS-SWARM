@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import {
   daemon,
@@ -49,30 +49,72 @@ export function useDaemonBootstrap(): DaemonBootstrap {
   const [agents, setAgents] = useState<DaemonSnapshot[]>([]);
   const [providers, setProviders] = useState<DaemonProvider[] | null>(null);
   const [providersError, setProvidersError] = useState<string | null>(null);
+  const mountedRef = useRef(false);
+  const agentRequestGenerationRef = useRef(0);
+  const collectionMutationEpochRef = useRef(0);
+  const providerRequestGenerationRef = useRef(0);
 
   const refreshAgents = useCallback(async () => {
+    const requestGeneration = ++agentRequestGenerationRef.current;
+    const mutationEpoch = collectionMutationEpochRef.current;
+
     try {
       const response = await daemon.listAgents();
-      setAgents(sortAgentSnapshots(response.agents));
+      if (
+        !mountedRef.current ||
+        requestGeneration !== agentRequestGenerationRef.current
+      ) {
+        return;
+      }
+
+      if (mutationEpoch === collectionMutationEpochRef.current) {
+        setAgents(sortAgentSnapshots(response.agents));
+      }
       setConnection('online');
     } catch {
+      if (
+        !mountedRef.current ||
+        requestGeneration !== agentRequestGenerationRef.current
+      ) {
+        return;
+      }
       setConnection('offline');
     } finally {
-      setLoaded(true);
+      if (
+        mountedRef.current &&
+        requestGeneration === agentRequestGenerationRef.current
+      ) {
+        setLoaded(true);
+      }
     }
   }, []);
 
   const retryProviders = useCallback(async () => {
+    const requestGeneration = ++providerRequestGenerationRef.current;
+
     try {
       const response = await daemon.listProviders();
+      if (
+        !mountedRef.current ||
+        requestGeneration !== providerRequestGenerationRef.current
+      ) {
+        return;
+      }
       setProviders(response.providers);
       setProvidersError(null);
     } catch (error) {
+      if (
+        !mountedRef.current ||
+        requestGeneration !== providerRequestGenerationRef.current
+      ) {
+        return;
+      }
       setProvidersError(errorMessage(error));
     }
   }, []);
 
   const acceptAgentSnapshot = useCallback((snapshot: DaemonSnapshot) => {
+    collectionMutationEpochRef.current += 1;
     setAgents((current) => {
       const matchingIndex = current.findIndex(
         ({ state }) => state.id === snapshot.state.id,
@@ -90,52 +132,69 @@ export function useDaemonBootstrap(): DaemonBootstrap {
   }, []);
 
   const removeAgentSnapshot = useCallback((id: string) => {
+    collectionMutationEpochRef.current += 1;
     setAgents((current) =>
       sortAgentSnapshots(current.filter(({ state }) => state.id !== id)),
     );
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    mountedRef.current = true;
+    let active = true;
+    let pollTimer: number | undefined;
 
-    void Promise.allSettled([
-      daemon.health(),
-      daemon.listAgents(),
-      daemon.listProviders(),
-    ]).then(([healthResult, agentsResult, providersResult]) => {
-      if (cancelled) {
+    const schedulePoll = () => {
+      if (!active || !mountedRef.current) {
         return;
       }
 
-      if (agentsResult.status === 'fulfilled') {
-        setAgents(sortAgentSnapshots(agentsResult.value.agents));
+      pollTimer = window.setTimeout(() => {
+        pollTimer = undefined;
+        void refreshAgents().finally(schedulePoll);
+      }, 5_000);
+    };
+
+    const requestGeneration = ++agentRequestGenerationRef.current;
+    const mutationEpoch = collectionMutationEpochRef.current;
+    const availability = Promise.allSettled([
+      daemon.health(),
+      daemon.listAgents(),
+    ]).then(([healthResult, agentsResult]) => {
+      if (!active || !mountedRef.current) {
+        return;
       }
 
-      setConnection(
-        healthResult.status === 'fulfilled' &&
-          agentsResult.status === 'fulfilled'
-          ? 'online'
-          : 'offline',
-      );
+      if (requestGeneration === agentRequestGenerationRef.current) {
+        if (
+          agentsResult.status === 'fulfilled' &&
+          mutationEpoch === collectionMutationEpochRef.current
+        ) {
+          setAgents(sortAgentSnapshots(agentsResult.value.agents));
+        }
+
+        setConnection(
+          healthResult.status === 'fulfilled' &&
+            agentsResult.status === 'fulfilled'
+            ? 'online'
+            : 'offline',
+        );
+      }
       setLoaded(true);
-
-      if (providersResult.status === 'fulfilled') {
-        setProviders(providersResult.value.providers);
-        setProvidersError(null);
-      } else {
-        setProvidersError(errorMessage(providersResult.reason));
-      }
     });
 
-    const poll = window.setInterval(() => {
-      void refreshAgents();
-    }, 5_000);
+    void availability.finally(schedulePoll);
+    void retryProviders();
 
     return () => {
-      cancelled = true;
-      window.clearInterval(poll);
+      active = false;
+      mountedRef.current = false;
+      agentRequestGenerationRef.current += 1;
+      providerRequestGenerationRef.current += 1;
+      if (pollTimer !== undefined) {
+        window.clearTimeout(pollTimer);
+      }
     };
-  }, [refreshAgents]);
+  }, [refreshAgents, retryProviders]);
 
   return {
     connection,
