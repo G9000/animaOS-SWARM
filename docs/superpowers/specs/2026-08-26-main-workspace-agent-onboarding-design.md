@@ -1,8 +1,8 @@
 # Main Workspace Agent Onboarding and Spatial Web UI
 
-**Date:** 2026-08-26  
-**Status:** Approved design  
-**Primary surface:** `apps/web`  
+**Date:** 2026-08-26
+**Status:** Approved design
+**Primary surface:** `apps/web`
 **Runtime boundary:** `hosts/rust-daemon`
 
 ## Summary
