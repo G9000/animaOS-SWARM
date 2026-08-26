@@ -63,7 +63,9 @@ describe('workspace-dev orchestration', () => {
 
   it('reuses an already-running host and only starts the UI', () => {
     expect(
-      buildWorkspaceDevPlan('rust', { reuseExistingHost: true })
+      buildWorkspaceDevPlan('rust', {
+        reuseExistingHost: true,
+      })
     ).toEqual({
       host: {
         key: 'rust',

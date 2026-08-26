@@ -29,6 +29,7 @@ pub enum EngineBoundaryAction {
     Continue,
     Pause,
     Cancel,
+    Resume,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,7 +246,11 @@ impl fmt::Debug for EngineLiveEvent {
 
 #[async_trait]
 pub trait DefinitionResolver: Send + Sync {
-    async fn resolve(&self, pin: &DefinitionPin) -> Result<AgentDefinition, EngineError>;
+    async fn resolve(
+        &self,
+        owner_id: Uuid,
+        pin: &DefinitionPin,
+    ) -> Result<AgentDefinition, EngineError>;
 }
 
 #[async_trait]
@@ -326,6 +331,16 @@ pub trait EngineLiveEventSink: Send + Sync {
 
 pub trait EngineControlSignal: Send + Sync {
     fn at_boundary(&self) -> EngineBoundaryAction;
+
+    fn command_id(
+        &self,
+        _action: EngineBoundaryAction,
+        _owner_id: Uuid,
+        _session_id: Uuid,
+        _run_id: Uuid,
+    ) -> Option<Uuid> {
+        None
+    }
 }
 
 pub trait EngineCrashInjector: Send + Sync {
@@ -411,13 +426,14 @@ where
         if stored.owner_id() != owner_id {
             return Err(EngineError::new(EngineErrorCode::InvalidState));
         }
+        let initial_input = stored.initial_input().clone();
         let definition_pin = DefinitionPin::new(
             1,
             stored.run().definition_id(),
             stored.run().definition_version(),
         )
         .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
-        let definition = self.definitions.resolve(&definition_pin).await?;
+        let definition = self.definitions.resolve(owner_id, &definition_pin).await?;
         if DefinitionPin::from_definition(&definition)
             .map_err(|_| EngineError::new(EngineErrorCode::DefinitionUnavailable))?
             != definition_pin
@@ -481,6 +497,65 @@ where
             };
         if checkpoint_was_loaded && checkpoint.manifests() != manifest_pins.as_slice() {
             return Err(EngineError::new(EngineErrorCode::ManifestUnavailable));
+        }
+        if current.run().state() == RunState::Paused {
+            if signal.at_boundary() != EngineBoundaryAction::Resume || !checkpoint_was_loaded {
+                return Err(EngineError::new(EngineErrorCode::InvalidState));
+            }
+            let running = current
+                .run()
+                .resume(None, None)
+                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
+            let sequence = checkpoint.last_durable_event_sequence() + 1;
+            let event = self.event(
+                owner_id,
+                current.run(),
+                sequence,
+                RuntimeEventKind::RunResumed,
+            )?;
+            checkpoint = self.rebuild_checkpoint(
+                &checkpoint,
+                sequence,
+                RunState::Running,
+                checkpoint.usage().clone(),
+            )?;
+            let command_id = validated_external_command_id(signal.command_id(
+                EngineBoundaryAction::Resume,
+                owner_id,
+                current.run().session_id(),
+                current.run().id(),
+            ))
+            .unwrap_or_else(|| deterministic_id(run_id, "resume", sequence));
+            let outcome = self
+                .store
+                .commit_execution(
+                    owner_id,
+                    crate::ExecutionCommit::new(
+                        current.run_version(),
+                        checkpoint_version,
+                        lease.clone(),
+                        RuntimeCommand::resume(
+                            command_id,
+                            current.run().session_id(),
+                            current.run().id(),
+                        )
+                        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                        vec![event],
+                        vec![],
+                        vec![],
+                        vec![],
+                        None,
+                        running,
+                    )
+                    .with_checkpoint(checkpoint.clone()),
+                )
+                .await
+                .map_err(|_| EngineError::new(EngineErrorCode::Store))?;
+            self.emit_semantic(run_id, sequence, RuntimeEventKind::RunResumed)
+                .await;
+            current = outcome.stored_run().clone();
+            checkpoint_version = outcome.checkpoint_version();
+            lease = self.renew(owner_id, lease).await?;
         }
         if current.run().state() == RunState::Queued {
             let running = current
@@ -562,7 +637,7 @@ where
         if current.run().state() == RunState::RecoveryRequired {
             return Ok(EngineRunOutcome::RecoveryRequired);
         }
-        let mut messages = provider_transcript_messages(&checkpoint, &definition)?;
+        let mut messages = provider_transcript_messages(&checkpoint, &definition, &initial_input)?;
         if let Some(active) = checkpoint.attempts().iter().find(|attempt| {
             matches!(
                 attempt.state(),
@@ -598,7 +673,7 @@ where
             lease = executed.1;
             checkpoint_version = executed.2;
             checkpoint = executed.3;
-            messages = provider_transcript_messages(&checkpoint, &definition)?;
+            messages = provider_transcript_messages(&checkpoint, &definition, &initial_input)?;
             if let Some(outcome) = self
                 .observe_control_boundary(
                     signal,
@@ -785,16 +860,42 @@ where
             };
 
             match signal.at_boundary() {
-                EngineBoundaryAction::Continue => {}
+                EngineBoundaryAction::Continue | EngineBoundaryAction::Resume => {}
                 EngineBoundaryAction::Pause => {
+                    let command_id = signal.command_id(
+                        EngineBoundaryAction::Pause,
+                        owner_id,
+                        current.run().session_id(),
+                        current.run().id(),
+                    );
                     return self
-                        .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
-                        .await
+                        .pause(
+                            owner_id,
+                            current,
+                            lease,
+                            checkpoint_version,
+                            &checkpoint,
+                            command_id,
+                        )
+                        .await;
                 }
                 EngineBoundaryAction::Cancel => {
+                    let command_id = signal.command_id(
+                        EngineBoundaryAction::Cancel,
+                        owner_id,
+                        current.run().session_id(),
+                        current.run().id(),
+                    );
                     return self
-                        .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
-                        .await
+                        .cancel(
+                            owner_id,
+                            current,
+                            lease,
+                            checkpoint_version,
+                            &checkpoint,
+                            command_id,
+                        )
+                        .await;
                 }
             }
 
@@ -802,7 +903,7 @@ where
             if tool_calls.is_empty() {
                 break response;
             }
-            messages = provider_transcript_messages(&checkpoint, &definition)?;
+            messages = provider_transcript_messages(&checkpoint, &definition, &initial_input)?;
             for tool_call in pending_provider_tool_calls(&checkpoint, &tool_calls)? {
                 let executed = self
                     .execute_capability(
@@ -826,7 +927,7 @@ where
                 lease = executed.1;
                 checkpoint_version = executed.2;
                 checkpoint = executed.3;
-                messages = provider_transcript_messages(&checkpoint, &definition)?;
+                messages = provider_transcript_messages(&checkpoint, &definition, &initial_input)?;
                 if let Some(outcome) = self
                     .observe_control_boundary(
                         signal,
@@ -855,16 +956,42 @@ where
                 }
             }
             match signal.at_boundary() {
-                EngineBoundaryAction::Continue => {}
+                EngineBoundaryAction::Continue | EngineBoundaryAction::Resume => {}
                 EngineBoundaryAction::Pause => {
+                    let command_id = signal.command_id(
+                        EngineBoundaryAction::Pause,
+                        owner_id,
+                        current.run().session_id(),
+                        current.run().id(),
+                    );
                     return self
-                        .pause(owner_id, current, lease, checkpoint_version, &checkpoint)
-                        .await
+                        .pause(
+                            owner_id,
+                            current,
+                            lease,
+                            checkpoint_version,
+                            &checkpoint,
+                            command_id,
+                        )
+                        .await;
                 }
                 EngineBoundaryAction::Cancel => {
+                    let command_id = signal.command_id(
+                        EngineBoundaryAction::Cancel,
+                        owner_id,
+                        current.run().session_id(),
+                        current.run().id(),
+                    );
                     return self
-                        .cancel(owner_id, current, lease, checkpoint_version, &checkpoint)
-                        .await
+                        .cancel(
+                            owner_id,
+                            current,
+                            lease,
+                            checkpoint_version,
+                            &checkpoint,
+                            command_id,
+                        )
+                        .await;
                 }
             }
         };
@@ -1168,10 +1295,9 @@ where
                 )
                 .await;
             }
-            let renewed = self.renew(owner_id, lease).await?;
             return Ok(CapabilityStepOutcome::committed((
                 committed.stored_run().clone(),
-                renewed,
+                lease,
                 committed.checkpoint_version(),
                 waiting_checkpoint,
                 Message {
@@ -2774,7 +2900,7 @@ where
         checkpoint: &CheckpointV1,
     ) -> Result<Option<EngineRunOutcome>, EngineError> {
         match signal.at_boundary() {
-            EngineBoundaryAction::Continue => Ok(None),
+            EngineBoundaryAction::Continue | EngineBoundaryAction::Resume => Ok(None),
             EngineBoundaryAction::Pause => match current.run().state() {
                 RunState::Running | RunState::WaitingForApproval => self
                     .pause(
@@ -2783,6 +2909,12 @@ where
                         lease.clone(),
                         checkpoint_version,
                         checkpoint,
+                        signal.command_id(
+                            EngineBoundaryAction::Pause,
+                            owner_id,
+                            current.run().session_id(),
+                            current.run().id(),
+                        ),
                     )
                     .await
                     .map(Some),
@@ -2802,6 +2934,12 @@ where
                     lease.clone(),
                     checkpoint_version,
                     checkpoint,
+                    signal.command_id(
+                        EngineBoundaryAction::Cancel,
+                        owner_id,
+                        current.run().session_id(),
+                        current.run().id(),
+                    ),
                 )
                 .await
                 .map(Some),
@@ -2815,6 +2953,7 @@ where
         lease: crate::ExecutionLease,
         checkpoint_version: u64,
         checkpoint: &CheckpointV1,
+        external_command_id: Option<Uuid>,
     ) -> Result<EngineRunOutcome, EngineError> {
         let target = current
             .run()
@@ -2853,7 +2992,8 @@ where
         .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?;
         let command = if let Some(recovery) = command_recovery {
             RuntimeCommand::pause_with_recovery(
-                deterministic_id(current.run().id(), "pause", sequence),
+                validated_external_command_id(external_command_id)
+                    .unwrap_or_else(|| deterministic_id(current.run().id(), "pause", sequence)),
                 current.run().session_id(),
                 current.run().id(),
                 crate::RunPauseReason::Requested,
@@ -2861,7 +3001,8 @@ where
             )
         } else {
             RuntimeCommand::pause(
-                deterministic_id(current.run().id(), "pause", sequence),
+                validated_external_command_id(external_command_id)
+                    .unwrap_or_else(|| deterministic_id(current.run().id(), "pause", sequence)),
                 current.run().session_id(),
                 current.run().id(),
                 crate::RunPauseReason::Requested,
@@ -2899,6 +3040,7 @@ where
         lease: crate::ExecutionLease,
         checkpoint_version: u64,
         checkpoint: &CheckpointV1,
+        external_command_id: Option<Uuid>,
     ) -> Result<EngineRunOutcome, EngineError> {
         let target = current
             .run()
@@ -2913,7 +3055,8 @@ where
         )?;
         let (_, _, attempt_mutations, command_recovery) =
             self.mark_dispatching_attempts_uncertain(checkpoint)?;
-        let command_id = deterministic_id(current.run().id(), "cancel", sequence);
+        let command_id = validated_external_command_id(external_command_id)
+            .unwrap_or_else(|| deterministic_id(current.run().id(), "cancel", sequence));
         let command = if let Some(recovery) = command_recovery {
             RuntimeCommand::cancel_with_recovery(
                 command_id,
@@ -3064,6 +3207,10 @@ fn deterministic_id(run_id: Uuid, label: &str, sequence: u64) -> Uuid {
     )
 }
 
+fn validated_external_command_id(command_id: Option<Uuid>) -> Option<Uuid> {
+    command_id.filter(|command_id| !command_id.is_nil())
+}
+
 fn tool_call_from_invocation(invocation: &LogicalInvocation) -> Result<ToolCall, EngineError> {
     let arguments = invocation
         .normalized_arguments()
@@ -3125,39 +3272,60 @@ fn json_to_data_value(value: &serde_json::Value) -> Option<crate::DataValue> {
 fn provider_transcript_messages(
     checkpoint: &CheckpointV1,
     definition: &AgentDefinition,
+    initial_input: &crate::DurableRunInput,
 ) -> Result<Vec<Message>, EngineError> {
-    checkpoint
-        .provider_transcript()
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            if let Some((content, tool_calls, _)) = entry
-                .model_response()
-                .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
-            {
-                Ok(assistant_tool_call_message(
-                    definition,
-                    checkpoint.session_id(),
-                    u64::try_from(index).unwrap_or(u64::MAX),
-                    content,
-                    &tool_calls,
-                ))
-            } else if let Some((tool_call_id, content)) = entry.capability_result_parts() {
-                Ok(Message {
-                    id: format!("provider-tool:{index}:{tool_call_id}"),
-                    agent_id: definition.id.clone(),
-                    room_id: checkpoint.session_id().to_string(),
-                    content: content
-                        .to_content()
-                        .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
-                    role: MessageRole::Tool,
-                    created_at_ms: u64::try_from(index).unwrap_or(u64::MAX),
-                })
-            } else {
-                Err(EngineError::new(EngineErrorCode::InvalidState))
-            }
-        })
-        .collect()
+    let mut messages = Vec::with_capacity(
+        checkpoint.provider_transcript().len() + usize::from(!initial_input.is_empty()),
+    );
+    if !initial_input.is_empty() {
+        messages.push(Message {
+            id: format!("run-input:{}", initial_input.run_id()),
+            agent_id: definition.id.clone(),
+            room_id: initial_input.session_id().to_string(),
+            content: Content {
+                text: initial_input.text_value().to_owned(),
+                attachments: None,
+                metadata: None,
+            },
+            role: MessageRole::User,
+            created_at_ms: 0,
+        });
+    }
+    messages.extend(
+        checkpoint
+            .provider_transcript()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                if let Some((content, tool_calls, _)) = entry
+                    .model_response()
+                    .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?
+                {
+                    Ok(assistant_tool_call_message(
+                        definition,
+                        checkpoint.session_id(),
+                        u64::try_from(index).unwrap_or(u64::MAX),
+                        content,
+                        &tool_calls,
+                    ))
+                } else if let Some((tool_call_id, content)) = entry.capability_result_parts() {
+                    Ok(Message {
+                        id: format!("provider-tool:{index}:{tool_call_id}"),
+                        agent_id: definition.id.clone(),
+                        room_id: checkpoint.session_id().to_string(),
+                        content: content
+                            .to_content()
+                            .map_err(|_| EngineError::new(EngineErrorCode::InvalidState))?,
+                        role: MessageRole::Tool,
+                        created_at_ms: u64::try_from(index).unwrap_or(u64::MAX),
+                    })
+                } else {
+                    Err(EngineError::new(EngineErrorCode::InvalidState))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    Ok(messages)
 }
 
 fn pending_provider_response(

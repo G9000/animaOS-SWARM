@@ -90,7 +90,9 @@ export async function run(argv: string[]): Promise<void> {
   const hostName = parseHostArg(argv);
   const host = getHostDefinition(hostName);
   const reuseExistingHost = await isHostReachable(host.baseUrl);
-  const plan = buildWorkspaceDevPlan(hostName, { reuseExistingHost });
+  const plan = buildWorkspaceDevPlan(hostName, {
+    reuseExistingHost,
+  });
   await runManagedProcesses(plan.processes);
 }
 

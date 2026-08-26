@@ -30,7 +30,11 @@ struct StaticDefinition(AgentDefinition);
 
 #[async_trait]
 impl DefinitionResolver for StaticDefinition {
-    async fn resolve(&self, pin: &DefinitionPin) -> Result<AgentDefinition, EngineError> {
+    async fn resolve(
+        &self,
+        _owner_id: Uuid,
+        pin: &DefinitionPin,
+    ) -> Result<AgentDefinition, EngineError> {
         if pin.id() == self.0.id && pin.version() == self.0.version {
             Ok(self.0.clone())
         } else {

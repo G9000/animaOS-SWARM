@@ -11,7 +11,7 @@ Plain-text launch supports both one-shot and interactive flows. In interactive `
 Current CLI coverage includes:
 
 - single-agent and agency scaffolding through `create`
-- daemon-backed execution through `run`, `chat`, `launch`, and `agents`
+- daemon-backed execution through `run`, `chat`, `launch`, `agents`, and `assistant`
 - TUI and plain-text launch flows, including `/help` and `/health` in interactive `--no-tui` mode
 - provider and API-key forwarding into daemon-backed runs
 - exported commander entrypoints via `buildProgram()` and `main()`
@@ -28,6 +28,13 @@ bun run animaos run "Summarize the current agency setup"
 
 # Inspect daemon-backed agents
 bun run animaos agents list
+
+# Chat with the persistent assistant agent (requires the daemon to run
+# with ANIMAOS_RS_ASSISTANT_ENABLED=1)
+bun run animaos assistant chat --user-name Leo
+
+# Read proactive assistant messages
+bun run animaos assistant inbox --since 1756000000000 --limit 10
 ```
 
 ## Build

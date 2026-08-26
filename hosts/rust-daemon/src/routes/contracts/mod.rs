@@ -11,7 +11,7 @@ pub(crate) use agencies::{
 };
 pub(crate) use agents::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
-    AgentRuntimeSnapshotResponse, AgentsEnvelope,
+    AgentRuntimeSnapshotResponse, AgentUpdateRequest, AgentsEnvelope,
 };
 pub(crate) use memories::{
     AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,

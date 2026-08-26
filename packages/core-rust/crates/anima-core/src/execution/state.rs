@@ -937,6 +937,8 @@ pub enum RuntimeCommandKind {
     RequestApproval,
     RequireRecovery,
     Pause,
+    Resume,
+    Retry,
     ResumeApproval,
     ResumeRecovery,
     Complete,
@@ -1337,6 +1339,13 @@ enum RuntimeCommandPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<Box<RecoveryRecord>>,
     },
+    Resume {
+        run_id: Uuid,
+    },
+    Retry {
+        run_id: Uuid,
+        new_run_id: Uuid,
+    },
     ResumeApproval {
         run_id: Uuid,
         binding: ApprovalResumeBinding,
@@ -1366,6 +1375,8 @@ impl RuntimeCommandPayload {
             Self::RequestApproval { .. } => RuntimeCommandKind::RequestApproval,
             Self::RequireRecovery { .. } => RuntimeCommandKind::RequireRecovery,
             Self::Pause { .. } => RuntimeCommandKind::Pause,
+            Self::Resume { .. } => RuntimeCommandKind::Resume,
+            Self::Retry { .. } => RuntimeCommandKind::Retry,
             Self::ResumeApproval { .. } => RuntimeCommandKind::ResumeApproval,
             Self::ResumeRecovery { .. } => RuntimeCommandKind::ResumeRecovery,
             Self::Complete { .. } => RuntimeCommandKind::Complete,
@@ -1381,6 +1392,8 @@ impl RuntimeCommandPayload {
             | Self::RequestApproval { run_id, .. }
             | Self::RequireRecovery { run_id, .. }
             | Self::Pause { run_id, .. }
+            | Self::Resume { run_id }
+            | Self::Retry { run_id, .. }
             | Self::ResumeApproval { run_id, .. }
             | Self::ResumeRecovery { run_id, .. }
             | Self::Complete { run_id }
@@ -1430,6 +1443,12 @@ impl RuntimeCommandPayload {
                     .is_some_and(|record| record.invocation().run_id() != *run_id)
                 {
                     return Err(ExecutionError::new(ExecutionErrorCode::MissingPrerequisite));
+                }
+            }
+            Self::Retry { run_id, new_run_id } => {
+                valid_uuid(*new_run_id)?;
+                if run_id == new_run_id {
+                    return Err(ExecutionError::new(ExecutionErrorCode::InvalidState));
                 }
             }
             _ => {}
@@ -1565,6 +1584,21 @@ impl RuntimeCommand {
             },
         )
     }
+    pub fn resume(id: Uuid, session_id: Uuid, run_id: Uuid) -> Result<Self, ExecutionError> {
+        Self::new(id, session_id, RuntimeCommandPayload::Resume { run_id })
+    }
+    pub fn retry(
+        id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        new_run_id: Uuid,
+    ) -> Result<Self, ExecutionError> {
+        Self::new(
+            id,
+            session_id,
+            RuntimeCommandPayload::Retry { run_id, new_run_id },
+        )
+    }
     pub fn resume_approval(
         id: Uuid,
         session_id: Uuid,
@@ -1690,6 +1724,13 @@ impl RuntimeCommand {
     pub fn recovery_binding(&self) -> Option<&RecoveryResumeBinding> {
         match &self.payload {
             RuntimeCommandPayload::ResumeRecovery { binding, .. } => Some(binding),
+            _ => None,
+        }
+    }
+
+    pub fn retry_run_id(&self) -> Option<Uuid> {
+        match self.payload {
+            RuntimeCommandPayload::Retry { new_run_id, .. } => Some(new_run_id),
             _ => None,
         }
     }

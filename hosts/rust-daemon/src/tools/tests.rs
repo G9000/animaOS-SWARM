@@ -31,7 +31,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[test]
 fn tool_registry_accepts_web_fetch_descriptor() {
@@ -480,13 +480,18 @@ fn background_process_manager_tracks_process_lifecycle() {
         .expect("start background process");
     assert!(started.contains("bg-1"));
 
-    std::thread::sleep(Duration::from_millis(50));
-
     let listed = list_background_processes(&manager).expect("list background processes");
     assert!(listed.contains("bg-1"));
 
-    let output =
-        read_background_process_output(&manager, "bg-1", true).expect("read background output");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let output = loop {
+        let output =
+            read_background_process_output(&manager, "bg-1", true).expect("read background output");
+        if output.to_ascii_lowercase().contains("hello") || Instant::now() >= deadline {
+            break output;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
     assert!(output.to_ascii_lowercase().contains("hello"));
 
     let stopped = stop_background_process(&manager, "bg-1").expect("stop process");

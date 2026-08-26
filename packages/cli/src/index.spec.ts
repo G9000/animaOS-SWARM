@@ -16,6 +16,7 @@ describe('cli package root exports', () => {
       'launch',
       'agents',
       'mod',
+      'assistant',
     ]);
   });
 });

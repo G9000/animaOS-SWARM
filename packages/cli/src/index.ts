@@ -9,6 +9,7 @@ import { createCommand } from './commands/create.js';
 import { launchCommand } from './commands/launch.js';
 import { agentsCommand } from './commands/agents.js';
 import { modCommand } from './commands/mod.js';
+import { assistantCommand } from './commands/assistant.js';
 export { createCliDaemonClient } from './client.js';
 
 export function buildProgram(): Command {
@@ -25,6 +26,7 @@ export function buildProgram(): Command {
   program.addCommand(launchCommand);
   program.addCommand(agentsCommand);
   program.addCommand(modCommand);
+  program.addCommand(assistantCommand);
 
   return program;
 }

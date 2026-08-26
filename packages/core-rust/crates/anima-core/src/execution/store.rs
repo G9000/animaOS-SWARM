@@ -28,6 +28,80 @@ const CONFORMANCE_RETRY_MANIFEST_ID: &str = "anima.conformance.workspace.retry";
 const CONFORMANCE_MANUAL_MANIFEST_ID: &str = "anima.conformance.workspace.manual";
 const CONFORMANCE_NON_RETRYABLE_MANIFEST_ID: &str = "anima.conformance.workspace.non-retryable";
 const CONFORMANCE_COMPENSATE_MANIFEST_ID: &str = "anima.conformance.workspace.compensate";
+pub const MAX_DURABLE_RUN_INPUT_BYTES: usize = 32 * 1024;
+
+/// The owner/run/session-bound user input that starts one durable run.
+///
+/// The payload is deliberately bounded and text-only. Hosts that persist non-empty inputs must
+/// use a persistence protection mode that permits model payload surfaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableRunInput {
+    owner_id: Uuid,
+    session_id: Uuid,
+    run_id: Uuid,
+    text: String,
+}
+
+impl DurableRunInput {
+    pub fn text(
+        owner_id: Uuid,
+        session_id: Uuid,
+        run_id: Uuid,
+        text: impl Into<String>,
+    ) -> Result<Self, ExecutionStoreError> {
+        let value = Self {
+            owner_id,
+            session_id,
+            run_id,
+            text: text.into(),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn empty(owner_id: Uuid, session_id: Uuid, run_id: Uuid) -> Self {
+        Self {
+            owner_id,
+            session_id,
+            run_id,
+            text: String::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ExecutionStoreError> {
+        if self.owner_id.is_nil()
+            || self.session_id.is_nil()
+            || self.run_id.is_nil()
+            || self.text.len() > MAX_DURABLE_RUN_INPUT_BYTES
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn owner_id(&self) -> Uuid {
+        self.owner_id
+    }
+
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
+    }
+
+    pub fn run_id(&self) -> Uuid {
+        self.run_id
+    }
+
+    pub fn text_value(&self) -> &str {
+        &self.text
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ConformanceManifestKind {
@@ -861,6 +935,7 @@ pub struct CreateRun {
     run: Run,
     expected_session_version: u64,
     concurrency_policy: SessionConcurrencyPolicy,
+    initial_input: DurableRunInput,
 }
 
 impl CreateRun {
@@ -871,13 +946,32 @@ impl CreateRun {
         expected_session_version: u64,
         concurrency_policy: SessionConcurrencyPolicy,
     ) -> Self {
+        let initial_input = DurableRunInput::empty(owner_id, session.id(), run.id());
         Self {
             owner_id,
             session,
             run,
             expected_session_version,
             concurrency_policy,
+            initial_input,
         }
+    }
+
+    pub fn with_initial_input(
+        mut self,
+        initial_input: DurableRunInput,
+    ) -> Result<Self, ExecutionStoreError> {
+        initial_input.validate()?;
+        if initial_input.owner_id() != self.owner_id
+            || initial_input.session_id() != self.session.id()
+            || initial_input.run_id() != self.run.id()
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        self.initial_input = initial_input;
+        Ok(self)
     }
 
     pub fn owner_id(&self) -> Uuid {
@@ -899,6 +993,90 @@ impl CreateRun {
     pub fn concurrency_policy(&self) -> SessionConcurrencyPolicy {
         self.concurrency_policy
     }
+
+    pub fn initial_input(&self) -> &DurableRunInput {
+        &self.initial_input
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryRun {
+    command_id: Uuid,
+    source_run_id: Uuid,
+    new_run_id: Uuid,
+}
+
+impl RetryRun {
+    pub fn new(
+        command_id: Uuid,
+        source_run_id: Uuid,
+        new_run_id: Uuid,
+    ) -> Result<Self, ExecutionStoreError> {
+        if command_id.is_nil()
+            || source_run_id.is_nil()
+            || new_run_id.is_nil()
+            || source_run_id == new_run_id
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self {
+            command_id,
+            source_run_id,
+            new_run_id,
+        })
+    }
+
+    pub fn command_id(&self) -> Uuid {
+        self.command_id
+    }
+
+    pub fn source_run_id(&self) -> Uuid {
+        self.source_run_id
+    }
+
+    pub fn new_run_id(&self) -> Uuid {
+        self.new_run_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetryRunOutcome {
+    source_run_id: Uuid,
+    run: StoredRun,
+    receipt: CommandReceipt,
+}
+
+impl RetryRunOutcome {
+    pub fn new(
+        source_run_id: Uuid,
+        run: StoredRun,
+        receipt: CommandReceipt,
+    ) -> Result<Self, ExecutionStoreError> {
+        if source_run_id.is_nil() || source_run_id == run.run().id() {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        Ok(Self {
+            source_run_id,
+            run,
+            receipt,
+        })
+    }
+
+    pub fn source_run_id(&self) -> Uuid {
+        self.source_run_id
+    }
+
+    pub fn run(&self) -> &StoredRun {
+        &self.run
+    }
+
+    pub fn receipt(&self) -> &CommandReceipt {
+        &self.receipt
+    }
 }
 
 /// A versioned durable run returned by an execution-store adapter.
@@ -908,6 +1086,7 @@ pub struct StoredRun {
     run: Run,
     run_version: u64,
     session_version: u64,
+    initial_input: DurableRunInput,
 }
 
 /// A validated approval claim and its one-time grant consumption, committed together with a run.
@@ -1321,7 +1500,27 @@ impl StoredRun {
         run_version: u64,
         session_version: u64,
     ) -> Result<Self, ExecutionStoreError> {
+        let initial_input = DurableRunInput::empty(owner_id, run.session_id(), run.id());
+        Self::new_with_initial_input(owner_id, run, run_version, session_version, initial_input)
+    }
+
+    pub fn new_with_initial_input(
+        owner_id: Uuid,
+        run: Run,
+        run_version: u64,
+        session_version: u64,
+        initial_input: DurableRunInput,
+    ) -> Result<Self, ExecutionStoreError> {
         if owner_id.is_nil() || run_version == 0 || session_version == 0 {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        initial_input.validate()?;
+        if initial_input.owner_id() != owner_id
+            || initial_input.session_id() != run.session_id()
+            || initial_input.run_id() != run.id()
+        {
             return Err(ExecutionStoreError::new(
                 ExecutionStoreErrorCode::InvalidRequest,
             ));
@@ -1331,6 +1530,7 @@ impl StoredRun {
             run,
             run_version,
             session_version,
+            initial_input,
         })
     }
 
@@ -1348,6 +1548,10 @@ impl StoredRun {
 
     pub fn session_version(&self) -> u64 {
         self.session_version
+    }
+
+    pub fn initial_input(&self) -> &DurableRunInput {
+        &self.initial_input
     }
 }
 
@@ -1508,6 +1712,16 @@ pub trait ExecutionStore: Send + Sync {
         request: CreateRun,
     ) -> Result<StoredRun, ExecutionStoreError>;
 
+    async fn retry_run(
+        &self,
+        _owner_id: Uuid,
+        _request: RetryRun,
+    ) -> Result<RetryRunOutcome, ExecutionStoreError> {
+        Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ))
+    }
+
     /// Acquires a new fence only if no current lease is active under adapter-authoritative time.
     async fn acquire_lease(
         &self,
@@ -1613,6 +1827,12 @@ where
         1,
     )
     .map_err(ExecutionStoreError::from)?;
+    let initial_input = DurableRunInput::text(
+        owner_id,
+        session_id,
+        run.id(),
+        "portable execution store input",
+    )?;
     let created = store
         .create_run(
             owner_id,
@@ -1622,9 +1842,22 @@ where
                 run.clone(),
                 0,
                 SessionConcurrencyPolicy::Serial,
-            ),
+            )
+            .with_initial_input(initial_input.clone())?,
         )
         .await?;
+    if created.initial_input() != &initial_input
+        || store
+            .load_run(owner_id, run.id())
+            .await?
+            .as_ref()
+            .map(StoredRun::initial_input)
+            != Some(&initial_input)
+    {
+        return Err(ExecutionStoreError::new(
+            ExecutionStoreErrorCode::InvalidRequest,
+        ));
+    }
     store
         .apply_authoritative_policy(
             owner_id,
@@ -5052,7 +5285,15 @@ async fn create_waiting_run<S: ExecutionStore>(
             ),
         )
         .await?;
-    Ok((waiting_outcome.stored_run().clone(), lease))
+    let resume_lease = store
+        .acquire_lease(
+            owner_id,
+            queued.id(),
+            waiting_outcome.stored_run().run_version(),
+            1_000,
+        )
+        .await?;
+    Ok((waiting_outcome.stored_run().clone(), resume_lease))
 }
 
 fn conformance_definition(allows_concurrent_sessions: bool) -> AgentDefinition {

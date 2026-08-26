@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anima_core::{
-    AgentConfig, AgentRuntime, AgentRuntimeSnapshot, AgentStatus, DatabaseAdapter, ModelAdapter,
+    AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentStatus,
+    DatabaseAdapter, ModelAdapter,
 };
 use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
 use anima_swarm::coordinator::CoordinatorMessageEventFn;
@@ -497,6 +498,42 @@ impl DaemonState {
             .insert(agent_id.clone(), snapshot.clone());
         self.agents.insert(agent_id, runtime);
         Ok(snapshot)
+    }
+
+    /// Apply a partial config update to an existing agent and refresh its
+    /// snapshot. Returns `None` when the agent does not exist.
+    pub(crate) fn update_agent(
+        &mut self,
+        agent_id: &str,
+        patch: AgentConfigUpdate,
+    ) -> Option<AgentRuntimeSnapshot> {
+        if let Some(runtime) = self.agents.get_mut(agent_id) {
+            runtime.update_config(patch);
+            let snapshot = runtime.snapshot();
+            self.agent_snapshots
+                .insert(agent_id.to_string(), snapshot.clone());
+            return Some(snapshot);
+        }
+
+        // The runtime can be checked out for an in-flight run; fall back to
+        // patching the snapshot so the change still persists. The run itself
+        // keeps the config it started with.
+        let snapshot = self.agent_snapshots.get_mut(agent_id)?;
+        if let Some(name) = patch.name {
+            snapshot.state.name = name.clone();
+            snapshot.state.config.name = name;
+        }
+        if let Some(model) = patch.model {
+            snapshot.state.config.model = model;
+        }
+        if let Some(provider) = patch.provider {
+            snapshot.state.config.provider =
+                if provider.is_empty() { None } else { Some(provider) };
+        }
+        if let Some(system) = patch.system {
+            snapshot.state.config.system = if system.is_empty() { None } else { Some(system) };
+        }
+        Some(snapshot.clone())
     }
 
     fn restore_agent_snapshot(&mut self, snapshot: AgentRuntimeSnapshot) {

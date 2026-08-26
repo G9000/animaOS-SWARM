@@ -94,6 +94,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "anima-harness"
+version = "0.1.0"
+dependencies = [
+ "anima-core",
+ "anima-model-adapters",
+ "async-trait",
+ "tokio",
+]
+
+[[package]]
 name = "anima-memory"
 version = "0.1.0"
 dependencies = [
@@ -117,6 +127,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "anima-schedule"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "anima-swarm"
 version = "0.1.0"
 dependencies = [
@@ -125,6 +143,18 @@ dependencies = [
  "futures",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "anima-telegram-gateway"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

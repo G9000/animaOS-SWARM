@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anima_core::{
-    AgentConfig, AgentRuntimeSnapshot, AgentSettings, AgentState, DataValue, Message, MessageRole,
-    PluginDescriptor, ToolDescriptor, ToolExample,
+    AgentConfig, AgentConfigUpdate, AgentRuntimeSnapshot, AgentSettings, AgentState, DataValue,
+    Message, MessageRole, PluginDescriptor, ToolDescriptor, ToolExample,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -191,6 +191,40 @@ pub(crate) struct AgentConfigRequest {
     pub(crate) tools: Option<Vec<ToolDescriptorRequest>>,
     pub(crate) plugins: Option<Vec<PluginDescriptorRequest>>,
     pub(crate) settings: Option<AgentSettingsRequest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentUpdateRequest {
+    pub(crate) name: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) system: Option<String>,
+}
+
+impl AgentUpdateRequest {
+    pub(crate) fn into_domain(self) -> Result<AgentConfigUpdate, &'static str> {
+        let name = self
+            .name
+            .map(|value| required_string(Some(value), "name must not be empty"))
+            .transpose()?;
+        let model = self
+            .model
+            .map(|value| required_string(Some(value), "model must not be empty"))
+            .transpose()?;
+        // Empty string clears provider/system back to the daemon default.
+        let provider = self.provider.map(|value| value.trim().to_string());
+        let system = self.system.map(|value| value.trim().to_string());
+        if name.is_none() && model.is_none() && provider.is_none() && system.is_none() {
+            return Err("at least one field must be provided");
+        }
+        Ok(AgentConfigUpdate {
+            name,
+            model,
+            provider,
+            system,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, IntoParams, ToSchema, Default)]

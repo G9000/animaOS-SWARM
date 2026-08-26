@@ -5,13 +5,14 @@ use anima_core::{
     AuthoritativePolicyChange, AuthoritativePolicyState, AutonomyGrant, Budget, CapabilityKind,
     CapabilityManifest, CapabilityReferenceId, CheckpointCursor, CheckpointMutation,
     CheckpointV1Builder, CompletedInvocationRecord, CreateRun, DefinitionPin, DispatchPolicyGuard,
-    DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, ExecutionCommit,
-    ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
+    DurableCapabilityResult, DurableCapabilityStatus, DurableResultMutation, DurableRunInput,
+    ExecutionCommit, ExecutionStep, ExecutionStore, ExecutionStoreError, ExecutionStoreErrorCode,
     ExecutionStoreFactory, GrantAuthorityBinding, GrantEffect, GrantScope, GrantStatus,
     InMemoryExecutionStore, InvocationAttemptRecord, LogicalInvocation, ManifestPin,
-    ManualExecutionClock, OpaqueReference, PolicyContext, PolicyEngine, PolicyRestrictions,
-    RecoveryMode, RiskLevel, Run, RunState, RuntimeCommand, RuntimeCompatibility, RuntimeEvent,
-    RuntimeEventKind, Session, SessionConcurrencyPolicy, StoreReadPage, Usage, MAX_COMMIT_EVENTS,
+    ManualExecutionClock, OpaqueReference, PersistenceProtection, PersistenceSnapshotSealKey,
+    PolicyContext, PolicyEngine, PolicyRestrictions, RecoveryMode, RetryRun, RiskLevel, Run,
+    RunState, RuntimeCommand, RuntimeCompatibility, RuntimeEvent, RuntimeEventKind, Session,
+    SessionConcurrencyPolicy, StoreReadPage, Usage, MAX_COMMIT_EVENTS,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -96,6 +97,117 @@ async fn public_adapter_conformance_suite_runs_against_memory_store() {
     assert_execution_store_conformance(&MemoryFactory::default())
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn initial_run_input_is_bound_and_preserved_by_the_public_store_contract() {
+    let store = InMemoryExecutionStore::default();
+    let owner_id = id(0x7001);
+    let session_id = id(0x7002);
+    let run_id = id(0x7003);
+    let session = Session::new(
+        session_id,
+        "input-agent",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .unwrap();
+    let run = Run::queued(run_id, session_id, "input-agent", 1).unwrap();
+    let input = DurableRunInput::text(owner_id, session_id, run_id, "hello durable world").unwrap();
+    let created = store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(owner_id, session, run, 0, SessionConcurrencyPolicy::Serial)
+                .with_initial_input(input.clone())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(created.initial_input(), &input);
+    assert_eq!(
+        store
+            .load_run(owner_id, run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .initial_input(),
+        &input
+    );
+    let wrong_run = DurableRunInput::text(owner_id, session_id, id(0x7004), "wrong").unwrap();
+    assert_eq!(
+        CreateRun::new_for_owner(
+            owner_id,
+            Session::new(
+                session_id,
+                "input-agent",
+                1,
+                SessionConcurrencyPolicy::Serial,
+            )
+            .unwrap(),
+            Run::queued(run_id, session_id, "input-agent", 1).unwrap(),
+            0,
+            SessionConcurrencyPolicy::Serial,
+        )
+        .with_initial_input(wrong_run)
+        .unwrap_err()
+        .code(),
+        ExecutionStoreErrorCode::InvalidRequest
+    );
+}
+
+#[tokio::test]
+async fn initial_run_input_survives_protected_snapshot_restart_but_payload_free_mode_rejects_it() {
+    let store = InMemoryExecutionStore::default();
+    let owner_id = id(0x7101);
+    let session_id = id(0x7102);
+    let run_id = id(0x7103);
+    let session = Session::new(
+        session_id,
+        "snapshot-input-agent",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .unwrap();
+    let run = Run::queued(run_id, session_id, "snapshot-input-agent", 1).unwrap();
+    let input = DurableRunInput::text(owner_id, session_id, run_id, "restart me").unwrap();
+    store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(owner_id, session, run, 0, SessionConcurrencyPolicy::Serial)
+                .with_initial_input(input.clone())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let seal_key = PersistenceSnapshotSealKey::new([0x71; 32]).unwrap();
+    let payload_free = PersistenceProtection::payload_free(seal_key.clone()).unwrap();
+    assert_eq!(
+        store
+            .export_snapshot(&payload_free)
+            .await
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::InvalidRequest
+    );
+
+    let protected = PersistenceProtection::allow_model_payloads(seal_key, vec![]).unwrap();
+    let snapshot = store.export_snapshot(&protected).await.unwrap();
+    let restored = InMemoryExecutionStore::from_snapshot(
+        &snapshot,
+        &protected,
+        Arc::new(ManualExecutionClock::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .load_run(owner_id, run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .initial_input(),
+        &input
+    );
 }
 
 #[tokio::test]
@@ -565,6 +677,15 @@ async fn validated_approval_claim_and_grant_consumption_commit_once_with_command
         )
         .await
         .unwrap();
+    let lease = store
+        .acquire_lease(
+            owner_id,
+            queued.id(),
+            waiting_outcome.stored_run().run_version(),
+            1_000,
+        )
+        .await
+        .unwrap();
     let event = RuntimeEvent::new(
         id(64),
         id(65),
@@ -711,6 +832,135 @@ async fn terminal_commit_releases_the_serial_session_claim() {
         )
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn terminal_retry_creates_a_new_queued_run_with_exact_durable_lineage() {
+    let store = InMemoryExecutionStore::default();
+    let owner_id = id(0x7201);
+    let session = Session::new(
+        id(0x7202),
+        "retry-agent",
+        1,
+        SessionConcurrencyPolicy::Serial,
+    )
+    .unwrap();
+    let source_run = Run::queued(id(0x7203), session.id(), "retry-agent", 1).unwrap();
+    store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner_id,
+                session.clone(),
+                source_run.clone(),
+                0,
+                SessionConcurrencyPolicy::Serial,
+            )
+            .with_initial_input(
+                DurableRunInput::text(owner_id, session.id(), source_run.id(), "retry this input")
+                    .unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let lease = store
+        .acquire_lease(owner_id, source_run.id(), 1, 1_000)
+        .await
+        .unwrap();
+    let running = source_run.transition(RunState::Running, None).unwrap();
+    store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                1,
+                0,
+                lease.clone(),
+                RuntimeCommand::start(id(0x7204), session.id(), source_run.id()).unwrap(),
+                vec![RuntimeEvent::new(
+                    id(0x7205),
+                    owner_id,
+                    session.id(),
+                    source_run.id(),
+                    1,
+                    1,
+                    RuntimeEventKind::RunStarted,
+                )
+                .unwrap()],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running.clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .commit_execution(
+            owner_id,
+            ExecutionCommit::new(
+                2,
+                0,
+                store.renew_lease(owner_id, lease, 1_000).await.unwrap(),
+                RuntimeCommand::cancel(id(0x7206), session.id(), source_run.id()).unwrap(),
+                vec![RuntimeEvent::new(
+                    id(0x7207),
+                    owner_id,
+                    session.id(),
+                    source_run.id(),
+                    2,
+                    2,
+                    RuntimeEventKind::RunCancelled,
+                )
+                .unwrap()],
+                vec![],
+                vec![],
+                vec![],
+                None,
+                running.transition(RunState::Cancelled, None).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let command_id = id(0x7208);
+    let retry_run_id = id(0x7209);
+    let request = RetryRun::new(command_id, source_run.id(), retry_run_id).unwrap();
+    let first = store.retry_run(owner_id, request.clone()).await.unwrap();
+    assert_eq!(first.run().run().id(), retry_run_id);
+    assert_eq!(first.run().run().state(), RunState::Queued);
+    assert_eq!(first.source_run_id(), source_run.id());
+    assert_eq!(first.receipt().command_id(), command_id);
+    assert_eq!(first.run().initial_input().text_value(), "retry this input");
+    assert_eq!(
+        store.retry_run(owner_id, request.clone()).await.unwrap(),
+        first
+    );
+    let protection = PersistenceProtection::allow_model_payloads(
+        PersistenceSnapshotSealKey::new([0x72; 32]).unwrap(),
+        vec![],
+    )
+    .unwrap();
+    let snapshot = store.export_snapshot(&protection).await.unwrap();
+    let restored = InMemoryExecutionStore::from_snapshot(
+        &snapshot,
+        &protection,
+        Arc::new(ManualExecutionClock::default()),
+    )
+    .unwrap();
+    assert_eq!(restored.retry_run(owner_id, request).await.unwrap(), first);
+    assert_eq!(
+        store
+            .retry_run(
+                owner_id,
+                RetryRun::new(command_id, source_run.id(), id(0x7210)).unwrap(),
+            )
+            .await
+            .unwrap_err()
+            .code(),
+        ExecutionStoreErrorCode::CommandConflict
+    );
 }
 
 #[tokio::test]

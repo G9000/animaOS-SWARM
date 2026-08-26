@@ -3,8 +3,8 @@ use tracing::warn;
 
 use super::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
-    AgentRuntimeSnapshotResponse, AgentsEnvelope, DeleteResponse, MemoriesEnvelope, MemoryResponse,
-    TaskRequest, TaskResultResponse,
+    AgentRuntimeSnapshotResponse, AgentUpdateRequest, AgentsEnvelope, DeleteResponse,
+    MemoriesEnvelope, MemoryResponse, TaskRequest, TaskResultResponse,
 };
 use super::ApiError;
 use crate::app::SharedDaemonState;
@@ -84,6 +84,33 @@ pub(crate) async fn handle_delete_agent(
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     Ok(DeleteResponse { deleted: true })
+}
+
+pub(crate) async fn handle_update_agent(
+    agent_id: &str,
+    body: Vec<u8>,
+    state: &SharedDaemonState,
+) -> Result<AgentEnvelope, ApiError> {
+    let request: AgentUpdateRequest = super::parse_json_body(body)?;
+    let patch = request
+        .into_domain()
+        .map_err(ApiError::bad_request_static)?;
+
+    let (snapshot, persist_request) = {
+        let mut guard = state.write().await;
+        let Some(snapshot) = guard.update_agent(agent_id, patch) else {
+            return Err(ApiError::not_found());
+        };
+        (snapshot, guard.control_plane_persist_request())
+    };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+
+    Ok(AgentEnvelope {
+        agent: AgentRuntimeSnapshotResponse::from(&snapshot),
+    })
 }
 
 pub(crate) async fn handle_recent_agent_memories(

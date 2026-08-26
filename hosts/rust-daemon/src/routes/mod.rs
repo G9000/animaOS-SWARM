@@ -29,7 +29,8 @@ use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRelationshipCreateRequest,
     AgentRelationshipQuery, AgentRelationshipResponse, AgentRelationshipsEnvelope,
-    AgentRunEnvelope, AgentsEnvelope, DeleteResponse, ErrorBody, HealthResponse, MemoriesEnvelope,
+    AgentRunEnvelope, AgentUpdateRequest, AgentsEnvelope, DeleteResponse, ErrorBody,
+    HealthResponse, MemoriesEnvelope,
     MemoryCreateRequest, MemoryEntitiesEnvelope, MemoryEntityCreateRequest, MemoryEntityQuery,
     MemoryEntityResponse, MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest,
     MemoryEvaluationResponse, MemoryEvidenceTraceResponse, MemoryReadinessResponse,
@@ -66,6 +67,7 @@ use crate::runtime_model::provider_summaries;
         list_agents_entry,
         create_agent_entry,
         get_agent_entry,
+        update_agent_entry,
         delete_agent_entry,
         run_agent_entry,
         agent_recent_memories_entry,
@@ -210,7 +212,9 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         )
         .route(
             "/api/agents/{agent_id}",
-            get(get_agent_entry).delete(delete_agent_entry),
+            get(get_agent_entry)
+                .patch(update_agent_entry)
+                .delete(delete_agent_entry),
         )
         .route(
             "/api/agents/{agent_id}/memories/recent",
@@ -715,6 +719,32 @@ async fn delete_agent_entry(
     match agents::handle_delete_agent(&agent_id, &state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/agents/{agent_id}",
+    tag = "agents",
+    params(("agent_id" = String, Path, description = "Agent identifier")),
+    request_body = AgentUpdateRequest,
+    responses(
+        (status = 200, description = "Agent updated", body = AgentEnvelope),
+        (status = 400, description = "Invalid request", body = ErrorBody),
+        (status = 404, description = "Not found", body = ErrorBody)
+    )
+)]
+async fn update_agent_entry(
+    State(state): State<AppState>,
+    Path(agent_id): Path<String>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match agents::handle_update_agent(&agent_id, body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
     }
 }
 

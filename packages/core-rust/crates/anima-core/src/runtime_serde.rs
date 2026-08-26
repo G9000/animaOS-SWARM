@@ -8,9 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::model::ToolCall;
 use crate::persistence::{Step, StepStatus};
-use crate::primitives::{
-    Attachment, AttachmentType, Content, DataValue, TaskResult, TaskStatus,
-};
+use crate::primitives::{Attachment, AttachmentType, Content, DataValue, TaskResult, TaskStatus};
 
 pub(crate) fn tool_step_input_json(tool_call: &ToolCall) -> serde_json::Value {
     serde_json::json!({
@@ -23,9 +21,7 @@ pub(crate) fn tool_step_output_json(result: &TaskResult<Content>) -> serde_json:
     data_value_to_json(&task_result_data_value(result))
 }
 
-pub(crate) fn persisted_task_result(
-    step: &Step,
-) -> Result<Option<TaskResult<Content>>, String> {
+pub(crate) fn persisted_task_result(step: &Step) -> Result<Option<TaskResult<Content>>, String> {
     match step.status {
         StepStatus::Pending => Ok(None),
         StepStatus::Done | StepStatus::Failed => {

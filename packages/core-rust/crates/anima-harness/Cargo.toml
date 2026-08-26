@@ -1,0 +1,17 @@
+[package]
+name = "anima-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anima-core = { path = "../anima-core" }
+anima-model-adapters = { path = "../anima-model-adapters" }
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

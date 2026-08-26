@@ -2,7 +2,6 @@
 //! so they can reach private items in `runtime.rs`.
 
 use super::AgentRuntime;
-use crate::runtime_serde::data_value_json;
 use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage, ToolDescriptor};
 use crate::components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
 use crate::model::{
@@ -10,9 +9,9 @@ use crate::model::{
 };
 use crate::persistence::{in_memory::InMemoryAdapter, DatabaseAdapter, StepStatus};
 use crate::primitives::{
-    Attachment, AttachmentType, Content, DataValue, Message, MessageRole, TaskResult,
-    TaskStatus,
+    Attachment, AttachmentType, Content, DataValue, Message, MessageRole, TaskResult, TaskStatus,
 };
+use crate::runtime_serde::data_value_json;
 use async_trait::async_trait;
 use futures::executor::block_on;
 use std::collections::BTreeMap;
@@ -487,11 +486,7 @@ impl Evaluator for RecordingEvaluator {
         "Records evaluated responses"
     }
 
-    async fn validate(
-        &self,
-        _runtime: &AgentRuntime,
-        _message: &Message,
-    ) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -519,11 +514,7 @@ impl Evaluator for AsyncRecordingEvaluator {
         "Records evaluated responses through async hooks"
     }
 
-    async fn validate(
-        &self,
-        _runtime: &AgentRuntime,
-        _message: &Message,
-    ) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -555,11 +546,7 @@ impl Evaluator for OrderedEvaluator {
         self.priority
     }
 
-    async fn validate(
-        &self,
-        _runtime: &AgentRuntime,
-        _message: &Message,
-    ) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -623,11 +610,7 @@ impl Evaluator for RetryOnceEvaluator {
         "Requests one correction pass for draft answers"
     }
 
-    async fn validate(
-        &self,
-        _runtime: &AgentRuntime,
-        _message: &Message,
-    ) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -655,11 +638,7 @@ impl Evaluator for AbortEvaluator {
         "Rejects a response without retrying"
     }
 
-    async fn validate(
-        &self,
-        _runtime: &AgentRuntime,
-        _message: &Message,
-    ) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -683,11 +662,7 @@ impl Evaluator for AlwaysRetryEvaluator {
         "Always requests another attempt"
     }
 
-    async fn validate(
-        &self,
-        _runtime: &AgentRuntime,
-        _message: &Message,
-    ) -> Result<bool, String> {
+    async fn validate(&self, _runtime: &AgentRuntime, _message: &Message) -> Result<bool, String> {
         Ok(true)
     }
 
@@ -704,10 +679,7 @@ impl Evaluator for AlwaysRetryEvaluator {
 impl<T: Unpin> std::future::Future for PendingOnce<T> {
     type Output = T;
 
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Self::Output> {
+    fn poll(mut self: std::pin::Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         if self.pending {
             self.pending = false;
             context.waker().wake_by_ref();
@@ -1195,16 +1167,17 @@ fn runtime_reuses_persisted_tool_result_for_retried_task() {
             )
         },
     ));
-    let second = block_on(runtime.run_with_tools(
-        Content {
-            text: "search memory".into(),
-            metadata: Some(metadata),
-            ..Content::default()
-        },
-        |_, _, _| async move {
-            panic!("retried tool execution should be recovered from persistence")
-        },
-    ));
+    let second =
+        block_on(runtime.run_with_tools(
+            Content {
+                text: "search memory".into(),
+                metadata: Some(metadata),
+                ..Content::default()
+            },
+            |_, _, _| async move {
+                panic!("retried tool execution should be recovered from persistence")
+            },
+        ));
 
     assert_eq!(first.status, TaskStatus::Success);
     assert_eq!(second.status, TaskStatus::Success);

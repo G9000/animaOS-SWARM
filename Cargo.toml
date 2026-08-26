@@ -1,10 +1,13 @@
 [workspace]
 members = [
     "packages/core-rust/crates/anima-core",
+    "packages/core-rust/crates/anima-harness",
     "packages/core-rust/crates/anima-model-adapters",
     "packages/core-rust/crates/anima-memory",
+    "packages/core-rust/crates/anima-schedule",
     "packages/core-rust/crates/anima-swarm",
     "hosts/rust-daemon",
+    "hosts/telegram-gateway",
 ]
 resolver = "2"
 

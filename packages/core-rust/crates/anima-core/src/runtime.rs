@@ -7,7 +7,7 @@ use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::agent::{AgentConfig, AgentState, AgentStatus, TokenUsage};
+use crate::agent::{AgentConfig, AgentConfigUpdate, AgentState, AgentStatus, TokenUsage};
 use crate::components::{Evaluator, EvaluatorDecision, Provider};
 use crate::events::{EngineEvent, EventType};
 use crate::model::{ModelAdapter, ModelGenerateRequest, ModelStopReason, ToolCall};
@@ -159,6 +159,28 @@ impl AgentRuntime {
 
     pub fn config(&self) -> &AgentConfig {
         &self.state.config
+    }
+
+    /// Apply a partial config update in place. The conversation history and
+    /// runtime state are preserved; the new values take effect on the next run
+    /// (the system prompt is rebuilt from `state.config` for every run).
+    /// For `provider` and `system`, an empty string clears the field back to
+    /// `None` (the daemon default).
+    pub fn update_config(&mut self, patch: AgentConfigUpdate) {
+        let config = &mut self.state.config;
+        if let Some(name) = patch.name {
+            self.state.name = name.clone();
+            config.name = name;
+        }
+        if let Some(model) = patch.model {
+            config.model = model;
+        }
+        if let Some(provider) = patch.provider {
+            config.provider = if provider.is_empty() { None } else { Some(provider) };
+        }
+        if let Some(system) = patch.system {
+            config.system = if system.is_empty() { None } else { Some(system) };
+        }
     }
 
     pub fn state(&self) -> AgentState {

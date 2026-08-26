@@ -10,18 +10,18 @@ use anima_core::{
     CapabilityResult, CapabilityRetryAuthorization, CheckpointV1, CheckpointV1Builder, Content,
     CreateRun, CurrentPolicyResolution, CurrentPolicyResolver, DataValue, DefinitionPin,
     DefinitionResolver, DurableAgentEngine, DurableCapabilityResult, DurableEngineConfig,
-    EngineBoundaryAction, EngineCapabilityResult, EngineCapabilityRuntime, EngineControlSignal,
-    EngineCrashInjector, EngineCrashPoint, EngineError, EngineErrorCode, EngineLiveEvent,
-    EngineLiveEventSink, EnginePolicyRequest, EngineRunOutcome, EventReplayPage, ExecutionClock,
-    ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStep, ExecutionStore,
-    ExecutionStoreError, GrantAuthorityKey, GrantScope, GrantStatus, InMemoryExecutionStore,
-    InvocationAttemptRecord, LifecyclePolicy, LogicalInvocation, ManifestCatalog,
-    ManualExecutionClock, MemoryPolicy, ModelAdapter, ModelGenerateRequest, ModelGenerateResponse,
-    ModelPolicy, ModelStopReason, ModelStreamFrame, ModelStreamSink, PolicyContext,
-    PolicyRestrictions, ProfileRef, ReconcileOutcome, RecoveryAction, RecoveryMode,
-    ResolvedCapability, RiskLevel, Run, RunPauseReason, RunState, RuntimeCommand,
-    RuntimeCompatibility, RuntimeEventKind, RuntimeLimits, Session, SessionConcurrencyPolicy,
-    StoreHistoryPage, StoreReadPage, StoredRun, TokenUsage, ToolCall,
+    DurableRunInput, EngineBoundaryAction, EngineCapabilityResult, EngineCapabilityRuntime,
+    EngineControlSignal, EngineCrashInjector, EngineCrashPoint, EngineError, EngineErrorCode,
+    EngineLiveEvent, EngineLiveEventSink, EnginePolicyRequest, EngineRunOutcome, EventReplayPage,
+    ExecutionClock, ExecutionCommit, ExecutionCommitOutcome, ExecutionLease, ExecutionStep,
+    ExecutionStore, ExecutionStoreError, GrantAuthorityKey, GrantScope, GrantStatus,
+    InMemoryExecutionStore, InvocationAttemptRecord, LifecyclePolicy, LogicalInvocation,
+    ManifestCatalog, ManualExecutionClock, MemoryPolicy, Message, ModelAdapter,
+    ModelGenerateRequest, ModelGenerateResponse, ModelPolicy, ModelStopReason, ModelStreamFrame,
+    ModelStreamSink, PolicyContext, PolicyRestrictions, ProfileRef, ReconcileOutcome,
+    RecoveryAction, RecoveryMode, ResolvedCapability, RiskLevel, Run, RunPauseReason, RunState,
+    RuntimeCommand, RuntimeCompatibility, RuntimeEventKind, RuntimeLimits, Session,
+    SessionConcurrencyPolicy, StoreHistoryPage, StoreReadPage, StoredRun, TokenUsage, ToolCall,
 };
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -47,7 +47,11 @@ struct StaticDefinitions(AgentDefinition);
 
 #[async_trait]
 impl DefinitionResolver for StaticDefinitions {
-    async fn resolve(&self, pin: &DefinitionPin) -> Result<AgentDefinition, EngineError> {
+    async fn resolve(
+        &self,
+        _owner_id: Uuid,
+        pin: &DefinitionPin,
+    ) -> Result<AgentDefinition, EngineError> {
         if pin.id() == self.0.id && pin.version() == self.0.version {
             Ok(self.0.clone())
         } else {
@@ -525,6 +529,45 @@ struct StreamingModel {
     turns: Mutex<VecDeque<Vec<ModelStreamFrame>>>,
 }
 
+struct RecordingInputModel {
+    requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl ModelAdapter for RecordingInputModel {
+    fn provider(&self) -> &str {
+        "recording-input"
+    }
+
+    async fn generate(
+        &self,
+        _config: &AgentConfig,
+        _request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        Err("stream must be used".into())
+    }
+
+    async fn stream(
+        &self,
+        _config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        self.requests.lock().unwrap().push(request.messages.clone());
+        sink.emit(ModelStreamFrame::Final(ModelGenerateResponse {
+            content: Content {
+                text: "done".into(),
+                attachments: None,
+                metadata: None,
+            },
+            tool_calls: None,
+            usage: TokenUsage::default(),
+            stop_reason: ModelStopReason::End,
+        }))
+        .await
+    }
+}
+
 #[async_trait]
 impl ModelAdapter for StreamingModel {
     fn provider(&self) -> &str {
@@ -664,6 +707,60 @@ impl EngineControlSignal for ContinueSignal {
     }
 }
 
+struct BoundCancelSignal(Uuid);
+
+impl EngineControlSignal for BoundCancelSignal {
+    fn at_boundary(&self) -> EngineBoundaryAction {
+        EngineBoundaryAction::Cancel
+    }
+
+    fn command_id(
+        &self,
+        action: EngineBoundaryAction,
+        _owner_id: Uuid,
+        _session_id: Uuid,
+        _run_id: Uuid,
+    ) -> Option<Uuid> {
+        (action == EngineBoundaryAction::Cancel).then_some(self.0)
+    }
+}
+
+struct BoundPauseSignal(Uuid);
+
+impl EngineControlSignal for BoundPauseSignal {
+    fn at_boundary(&self) -> EngineBoundaryAction {
+        EngineBoundaryAction::Pause
+    }
+
+    fn command_id(
+        &self,
+        action: EngineBoundaryAction,
+        _owner_id: Uuid,
+        _session_id: Uuid,
+        _run_id: Uuid,
+    ) -> Option<Uuid> {
+        (action == EngineBoundaryAction::Pause).then_some(self.0)
+    }
+}
+
+struct BoundResumeSignal(Uuid);
+
+impl EngineControlSignal for BoundResumeSignal {
+    fn at_boundary(&self) -> EngineBoundaryAction {
+        EngineBoundaryAction::Resume
+    }
+
+    fn command_id(
+        &self,
+        action: EngineBoundaryAction,
+        _owner_id: Uuid,
+        _session_id: Uuid,
+        _run_id: Uuid,
+    ) -> Option<Uuid> {
+        (action == EngineBoundaryAction::Resume).then_some(self.0)
+    }
+}
+
 struct FixedSignal(EngineBoundaryAction);
 
 impl EngineControlSignal for FixedSignal {
@@ -714,6 +811,7 @@ impl MutableBoundarySignal {
                 EngineBoundaryAction::Continue => 0,
                 EngineBoundaryAction::Pause => 1,
                 EngineBoundaryAction::Cancel => 2,
+                EngineBoundaryAction::Resume => 3,
             },
             Ordering::SeqCst,
         );
@@ -725,7 +823,8 @@ impl EngineControlSignal for MutableBoundarySignal {
         match self.action.load(Ordering::SeqCst) {
             0 => EngineBoundaryAction::Continue,
             1 => EngineBoundaryAction::Pause,
-            _ => EngineBoundaryAction::Cancel,
+            2 => EngineBoundaryAction::Cancel,
+            _ => EngineBoundaryAction::Resume,
         }
     }
 }
@@ -1582,6 +1681,187 @@ async fn final_model_turn_emits_live_deltas_and_durable_semantic_events() {
             RuntimeEventKind::RunCompleted,
         ]
     );
+}
+
+#[tokio::test]
+async fn engine_delivers_the_authoritative_initial_input_once_to_the_model() {
+    let owner_id = Uuid::from_u128(0x681);
+    let session_id = Uuid::from_u128(0x682);
+    let run_id = Uuid::from_u128(0x683);
+    let definition = definition();
+    let session =
+        Session::new_for_definition(session_id, &definition, SessionConcurrencyPolicy::Serial)
+            .unwrap();
+    let queued = Run::queued(run_id, session_id, &definition.id, definition.version).unwrap();
+    let clock = Arc::new(ManualExecutionClock::default());
+    let store = Arc::new(InMemoryExecutionStore::with_clock(clock.clone()));
+    store
+        .create_run(
+            owner_id,
+            CreateRun::new_for_owner(
+                owner_id,
+                session,
+                queued,
+                0,
+                SessionConcurrencyPolicy::Serial,
+            )
+            .with_initial_input(
+                DurableRunInput::text(owner_id, session_id, run_id, "hello engine").unwrap(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    authorize_policy(store.as_ref(), owner_id, &definition).await;
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let engine = DurableAgentEngine::new(
+        store,
+        Arc::new(RecordingInputModel {
+            requests: requests.clone(),
+        }),
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(NeverPolicy),
+        Arc::new(NoCapabilities),
+        clock,
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig::default(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        engine.run(owner_id, run_id, &ContinueSignal).await.unwrap(),
+        EngineRunOutcome::Completed { .. }
+    ));
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].len(), 1);
+    assert_eq!(requests[0][0].role, anima_core::MessageRole::User);
+    assert_eq!(requests[0][0].content.text, "hello engine");
+}
+
+#[tokio::test]
+async fn engine_uses_the_exact_externally_supplied_cancel_command_identity() {
+    let owner_id = Uuid::from_u128(0x691);
+    let run_id = Uuid::from_u128(0x693);
+    let definition = definition();
+    let clock = Arc::new(ManualExecutionClock::default());
+    let (created_owner, created_run, store) =
+        create_engine_run(0x690, &definition, clock.clone()).await;
+    assert_eq!((created_owner, created_run), (owner_id, run_id));
+    let external_command_id = Uuid::from_u128(0x699);
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        Arc::new(RecordingInputModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(NeverPolicy),
+        Arc::new(NoCapabilities),
+        clock,
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine
+            .run(owner_id, run_id, &BoundCancelSignal(external_command_id),)
+            .await
+            .unwrap(),
+        EngineRunOutcome::Cancelled
+    );
+    let projection = store.export_projection().await;
+    assert!(projection.commands().iter().any(|command| {
+        command.command_id() == external_command_id
+            && command.kind() == anima_core::RuntimeCommandKind::Cancel
+    }));
+}
+
+#[tokio::test]
+async fn engine_uses_the_exact_externally_supplied_pause_command_identity() {
+    let owner_id = Uuid::from_u128(0x6a1);
+    let run_id = Uuid::from_u128(0x6a3);
+    let definition = definition();
+    let clock = Arc::new(ManualExecutionClock::default());
+    let (created_owner, created_run, store) =
+        create_engine_run(0x6a0, &definition, clock.clone()).await;
+    assert_eq!((created_owner, created_run), (owner_id, run_id));
+    let external_command_id = Uuid::from_u128(0x6a9);
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        Arc::new(RecordingInputModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(NeverPolicy),
+        Arc::new(NoCapabilities),
+        clock,
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine
+            .run(owner_id, run_id, &BoundPauseSignal(external_command_id))
+            .await
+            .unwrap(),
+        EngineRunOutcome::PausedByRequest
+    );
+    let projection = store.export_projection().await;
+    assert!(projection.commands().iter().any(|command| {
+        command.command_id() == external_command_id
+            && command.kind() == anima_core::RuntimeCommandKind::Pause
+    }));
+}
+
+#[tokio::test]
+async fn engine_resumes_a_requested_pause_with_the_exact_external_command_identity() {
+    let owner_id = Uuid::from_u128(0x6b1);
+    let run_id = Uuid::from_u128(0x6b3);
+    let definition = definition();
+    let clock = Arc::new(ManualExecutionClock::default());
+    let (created_owner, created_run, store) =
+        create_engine_run(0x6b0, &definition, clock.clone()).await;
+    assert_eq!((created_owner, created_run), (owner_id, run_id));
+    let engine = DurableAgentEngine::new(
+        store.clone(),
+        Arc::new(RecordingInputModel {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }),
+        Arc::new(StaticDefinitions(definition)),
+        Arc::new(NeverPolicy),
+        Arc::new(NoCapabilities),
+        clock.clone(),
+        Arc::new(RecordingLiveSink::default()),
+        Arc::new(NeverCrash),
+        DurableEngineConfig::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        engine
+            .run(owner_id, run_id, &BoundPauseSignal(Uuid::from_u128(0x6b8)))
+            .await
+            .unwrap(),
+        EngineRunOutcome::PausedByRequest
+    );
+    let resume_command_id = Uuid::from_u128(0x6b9);
+    assert!(matches!(
+        engine
+            .run(owner_id, run_id, &BoundResumeSignal(resume_command_id),)
+            .await
+            .unwrap(),
+        EngineRunOutcome::Completed { .. }
+    ));
+    let projection = store.export_projection().await;
+    assert!(projection.commands().iter().any(|command| {
+        command.command_id() == resume_command_id
+            && command.kind() == anima_core::RuntimeCommandKind::Resume
+    }));
 }
 
 #[tokio::test]

@@ -54,6 +54,16 @@ pub struct AgentConfig {
     pub settings: Option<AgentSettings>,
 }
 
+/// Partial update for an existing agent's config. Only the fields that are
+/// `Some` are applied; everything else is left untouched.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentConfigUpdate {
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub system: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
     Idle,

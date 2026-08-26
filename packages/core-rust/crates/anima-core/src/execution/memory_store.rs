@@ -16,7 +16,8 @@ use super::{
     AuthoritativeGrantChange, AuthoritativeGrantState, AuthoritativePolicyChange,
     AuthoritativePolicyState, CheckpointMutation, CreateRun, ExecutionClock, ExecutionCommit,
     ExecutionCommitOutcome, ExecutionLease, ExecutionStore, ExecutionStoreError,
-    ExecutionStoreErrorCode, RuntimeEvent, SessionConcurrencyPolicy, StoredRun,
+    ExecutionStoreErrorCode, RetryRun, RetryRunOutcome, RuntimeEvent, SessionConcurrencyPolicy,
+    StoredRun,
 };
 use crate::{CommandReceipt, DurableCapabilityResult, RunState};
 
@@ -944,6 +945,7 @@ pub struct PersistenceProtection {
     seal_key: PersistenceSnapshotSealKey,
     secrets: Arc<BTreeMap<PersistenceSecretLocator, PersistenceSecretMaterial>>,
     manifests: Arc<BTreeMap<(String, u32), (String, crate::RecoveryMode)>>,
+    model_payloads_allowed: bool,
 }
 
 impl PersistenceProtection {
@@ -986,8 +988,22 @@ impl PersistenceProtection {
         Ok(Self {
             seal_key,
             secrets: Arc::new(secrets),
+            model_payloads_allowed: false,
             manifests: Arc::new(manifests),
         })
+    }
+
+    /// Explicitly permits bounded model input/transcript payloads in the protected snapshot.
+    ///
+    /// Capability payloads still require their exact manifest inventories. This flag only
+    /// enables model-owned payload surfaces and does not weaken manifest validation.
+    pub fn allow_model_payloads(
+        seal_key: PersistenceSnapshotSealKey,
+        inventories: Vec<PersistenceCapabilitySecretInventory>,
+    ) -> Result<Self, ExecutionStoreError> {
+        let mut protection = Self::new(seal_key, inventories)?;
+        protection.model_payloads_allowed = true;
+        Ok(protection)
     }
 
     /// Builds protection for state that contains no capability or model payload surfaces.
@@ -1115,6 +1131,7 @@ struct PersistenceSnapshotWire {
 struct PersistenceRunSnapshot {
     owner_id: Uuid,
     run: super::Run,
+    initial_input: PersistedJsonValue,
     run_version: u64,
     session_version: u64,
     lease: Option<ExecutionLease>,
@@ -1138,6 +1155,7 @@ struct PersistenceOutcomeSnapshot {
     owner_id: Uuid,
     command_id: Uuid,
     run: super::Run,
+    initial_input: PersistedJsonValue,
     run_version: u64,
     session_version: u64,
     receipt: CommandReceipt,
@@ -1223,6 +1241,7 @@ struct SessionSnapshot {
 struct RunSnapshot {
     owner_id: Uuid,
     run: super::Run,
+    initial_input: super::DurableRunInput,
     run_version: u64,
     session_version: u64,
     lease: Option<ExecutionLease>,
@@ -1246,6 +1265,7 @@ struct OutcomeSnapshot {
     owner_id: Uuid,
     command_id: Uuid,
     run: super::Run,
+    initial_input: super::DurableRunInput,
     run_version: u64,
     session_version: u64,
     receipt: CommandReceipt,
@@ -1670,6 +1690,7 @@ fn encode_snapshot(state: &State, cursor_key: [u8; 16]) -> SnapshotWire {
             .map(|((owner_id, _), aggregate)| RunSnapshot {
                 owner_id: *owner_id,
                 run: aggregate.stored.run().clone(),
+                initial_input: aggregate.stored.initial_input().clone(),
                 run_version: aggregate.stored.run_version(),
                 session_version: aggregate.stored.session_version(),
                 lease: aggregate.lease.clone(),
@@ -1738,6 +1759,7 @@ fn encode_snapshot(state: &State, cursor_key: [u8; 16]) -> SnapshotWire {
                 owner_id: *owner_id,
                 command_id: *command_id,
                 run: outcome.stored_run().run().clone(),
+                initial_input: outcome.stored_run().initial_input().clone(),
                 run_version: outcome.stored_run().run_version(),
                 session_version: outcome.stored_run().session_version(),
                 receipt: outcome.receipt().clone(),
@@ -1769,6 +1791,13 @@ fn protect_snapshot(
             Ok(PersistenceRunSnapshot {
                 owner_id: run.owner_id,
                 run: run.run,
+                initial_input: protect_json(
+                    &serde_json::to_value(&run.initial_input).map_err(|_| invalid_snapshot())?,
+                    "/initial_input",
+                    protection,
+                    None,
+                    cursor_key,
+                )?,
                 run_version: run.run_version,
                 session_version: run.session_version,
                 lease: run.lease,
@@ -1802,6 +1831,14 @@ fn protect_snapshot(
                 owner_id: outcome.owner_id,
                 command_id: outcome.command_id,
                 run: outcome.run,
+                initial_input: protect_json(
+                    &serde_json::to_value(&outcome.initial_input)
+                        .map_err(|_| invalid_snapshot())?,
+                    "/initial_input",
+                    protection,
+                    None,
+                    cursor_key,
+                )?,
                 run_version: outcome.run_version,
                 session_version: outcome.session_version,
                 receipt: outcome.receipt,
@@ -1834,18 +1871,32 @@ fn validate_snapshot_payload_surfaces(
     wire: &SnapshotWire,
     protection: &PersistenceProtection,
 ) -> Result<(), ExecutionStoreError> {
-    let payload_free = protection.manifests.is_empty();
+    let capability_payload_free = protection.manifests.is_empty();
     for run in &wire.runs {
-        if payload_free && !run.attempts.is_empty() {
+        if !protection.model_payloads_allowed && !run.initial_input.is_empty() {
+            return Err(invalid_snapshot());
+        }
+        if capability_payload_free && !run.attempts.is_empty() {
             return Err(invalid_snapshot());
         }
         if let Some(checkpoint) = &run.checkpoint {
-            validate_checkpoint_payload_surfaces(checkpoint, payload_free)?;
+            validate_checkpoint_payload_surfaces(
+                checkpoint,
+                capability_payload_free,
+                protection.model_payloads_allowed,
+            )?;
         }
     }
     for outcome in &wire.outcomes {
+        if !protection.model_payloads_allowed && !outcome.initial_input.is_empty() {
+            return Err(invalid_snapshot());
+        }
         if let Some(checkpoint) = &outcome.checkpoint {
-            validate_checkpoint_payload_surfaces(checkpoint, payload_free)?;
+            validate_checkpoint_payload_surfaces(
+                checkpoint,
+                capability_payload_free,
+                protection.model_payloads_allowed,
+            )?;
         }
     }
     Ok(())
@@ -1853,14 +1904,13 @@ fn validate_snapshot_payload_surfaces(
 
 fn validate_checkpoint_payload_surfaces(
     checkpoint: &super::CheckpointV1,
-    payload_free: bool,
+    capability_payload_free: bool,
+    model_payloads_allowed: bool,
 ) -> Result<(), ExecutionStoreError> {
-    if payload_free && !checkpoint.attempts().is_empty() {
+    if capability_payload_free && !checkpoint.attempts().is_empty() {
         return Err(invalid_snapshot());
     }
-    // Capability inventories cannot account for provider/model secrets when no capability
-    // manifest is pinned. Model-only transcripts need a future explicit host/model inventory.
-    if checkpoint.manifests().is_empty() && !checkpoint.provider_transcript().is_empty() {
+    if !model_payloads_allowed && !checkpoint.provider_transcript().is_empty() {
         return Err(invalid_snapshot());
     }
     Ok(())
@@ -1879,6 +1929,13 @@ fn restore_snapshot(
             Ok(RunSnapshot {
                 owner_id: run.owner_id,
                 run: run.run,
+                initial_input: serde_json::from_value(restore_json(
+                    run.initial_input,
+                    "/initial_input",
+                    protection,
+                    cursor_key,
+                )?)
+                .map_err(|_| invalid_snapshot())?,
                 run_version: run.run_version,
                 session_version: run.session_version,
                 lease: run.lease,
@@ -1911,6 +1968,13 @@ fn restore_snapshot(
                 owner_id: outcome.owner_id,
                 command_id: outcome.command_id,
                 run: outcome.run,
+                initial_input: serde_json::from_value(restore_json(
+                    outcome.initial_input,
+                    "/initial_input",
+                    protection,
+                    cursor_key,
+                )?)
+                .map_err(|_| invalid_snapshot())?,
                 run_version: outcome.run_version,
                 session_version: outcome.session_version,
                 receipt: outcome.receipt,
@@ -2658,7 +2722,13 @@ fn decode_snapshot_wire(wire: SnapshotWire) -> Result<(State, [u8; 16]), Executi
     }
     for run in wire.runs {
         let run_id = run.run.id();
-        let stored = StoredRun::new(run.owner_id, run.run, run.run_version, run.session_version)?;
+        let stored = StoredRun::new_with_initial_input(
+            run.owner_id,
+            run.run,
+            run.run_version,
+            run.session_version,
+            run.initial_input,
+        )?;
         let session = state
             .sessions
             .get(&(run.owner_id, stored.run().session_id()))
@@ -2789,11 +2859,12 @@ fn decode_snapshot_wire(wire: SnapshotWire) -> Result<(State, [u8; 16]), Executi
         }
     }
     for outcome in wire.outcomes {
-        let stored = StoredRun::new(
+        let stored = StoredRun::new_with_initial_input(
             outcome.owner_id,
             outcome.run,
             outcome.run_version,
             outcome.session_version,
+            outcome.initial_input,
         )?;
         if outcome.command_id != outcome.receipt.command_id()
             || state
@@ -3444,7 +3515,13 @@ impl ExecutionStore for InMemoryExecutionStore {
         if request.concurrency_policy() == SessionConcurrencyPolicy::Serial {
             state.serial_claims.insert(session_key, request.run().id());
         }
-        let stored = StoredRun::new(owner_id, request.run().clone(), 1, session_version)?;
+        let stored = StoredRun::new_with_initial_input(
+            owner_id,
+            request.run().clone(),
+            1,
+            session_version,
+            request.initial_input().clone(),
+        )?;
         state.runs.insert(
             (owner_id, request.run().id()),
             RunAggregate {
@@ -3465,6 +3542,166 @@ impl ExecutionStore for InMemoryExecutionStore {
             },
         );
         Ok(stored)
+    }
+
+    async fn retry_run(
+        &self,
+        owner_id: Uuid,
+        request: RetryRun,
+    ) -> Result<RetryRunOutcome, ExecutionStoreError> {
+        if owner_id.is_nil() {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::InvalidRequest,
+            ));
+        }
+        let mut state = self.state.lock().await;
+        let (
+            source_stored,
+            source_checkpoint_version,
+            session_id,
+            definition_id,
+            definition_version,
+            initial_text,
+        ) = {
+            let source = state
+                .runs
+                .get(&(owner_id, request.source_run_id()))
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+            if !matches!(
+                source.stored.run().state(),
+                RunState::Failed | RunState::Cancelled
+            ) {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::InvalidRequest,
+                ));
+            }
+            (
+                source.stored.clone(),
+                source.checkpoint_version,
+                source.stored.run().session_id(),
+                source.stored.run().definition_id().to_owned(),
+                source.stored.run().definition_version(),
+                source.stored.initial_input().text_value().to_owned(),
+            )
+        };
+        let command = super::RuntimeCommand::retry(
+            request.command_id(),
+            session_id,
+            request.source_run_id(),
+            request.new_run_id(),
+        )
+        .map_err(ExecutionStoreError::from)?;
+        let command_key = (owner_id, request.command_id());
+        if let Some(existing) = state.commands.get(&command_key) {
+            if existing.session_id != session_id
+                || existing.run_id != request.source_run_id()
+                || existing.kind != super::RuntimeCommandKind::Retry
+                || existing.payload_digest != command.payload_digest()
+            {
+                return Err(ExecutionStoreError::new(
+                    ExecutionStoreErrorCode::CommandConflict,
+                ));
+            }
+            let run = state
+                .runs
+                .get(&(owner_id, request.new_run_id()))
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict))?
+                .stored
+                .clone();
+            let receipt = state
+                .receipts
+                .get(&command_key)
+                .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::HistoryConflict))?
+                .clone();
+            return RetryRunOutcome::new(request.source_run_id(), run, receipt);
+        }
+        if state.runs.contains_key(&(owner_id, request.new_run_id())) {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::VersionConflict,
+            ));
+        }
+        let session_key = (owner_id, session_id);
+        let session = state
+            .sessions
+            .get(&session_key)
+            .cloned()
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::NotFound))?;
+        if session.definition.id() != definition_id
+            || session.definition.version() != definition_version
+            || (session.policy == SessionConcurrencyPolicy::Serial
+                && state.serial_claims.contains_key(&session_key))
+        {
+            return Err(ExecutionStoreError::new(
+                ExecutionStoreErrorCode::ActiveRunConflict,
+            ));
+        }
+        let session_version = session
+            .version
+            .checked_add(1)
+            .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
+        let run = super::Run::queued(
+            request.new_run_id(),
+            session_id,
+            definition_id,
+            definition_version,
+        )
+        .map_err(ExecutionStoreError::from)?;
+        let input =
+            super::DurableRunInput::text(owner_id, session_id, request.new_run_id(), initial_text)?;
+        let stored = StoredRun::new_with_initial_input(owner_id, run, 1, session_version, input)?;
+        state.sessions.insert(
+            session_key,
+            StoredSession {
+                version: session_version,
+                ..session
+            },
+        );
+        if session.policy == SessionConcurrencyPolicy::Serial {
+            state
+                .serial_claims
+                .insert(session_key, request.new_run_id());
+        }
+        state.runs.insert(
+            (owner_id, request.new_run_id()),
+            RunAggregate {
+                stored: stored.clone(),
+                lease: None,
+                checkpoint_version: 0,
+                checkpoint: None,
+                events: vec![],
+                steps: BTreeMap::new(),
+                step_order: BTreeMap::new(),
+                next_step_sequence: 1,
+                attempts: BTreeMap::new(),
+                attempt_order: BTreeMap::new(),
+                next_attempt_sequence: 1,
+                attempts_fingerprint: super::checkpoint::HistoryFingerprint::default(),
+                results: BTreeMap::new(),
+                completed_fingerprint: super::checkpoint::HistoryFingerprint::default(),
+            },
+        );
+        let receipt = CommandReceipt::accepted(&command).map_err(ExecutionStoreError::from)?;
+        state.receipts.insert(command_key, receipt.clone());
+        state.outcomes.insert(
+            command_key,
+            ExecutionCommitOutcome::new(
+                source_stored,
+                receipt.clone(),
+                source_checkpoint_version,
+                None,
+                None,
+            ),
+        );
+        state.commands.insert(
+            command_key,
+            CommandIndexRecord {
+                session_id,
+                run_id: request.source_run_id(),
+                kind: super::RuntimeCommandKind::Retry,
+                payload_digest: command.payload_digest(),
+            },
+        );
+        RetryRunOutcome::new(request.source_run_id(), stored, receipt)
     }
 
     async fn acquire_lease(
@@ -4419,17 +4656,23 @@ fn build_commit_patch(
         .run_version()
         .checked_add(1)
         .ok_or_else(|| ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow))?;
-    let mut stored = StoredRun::new(
+    let mut stored = StoredRun::new_with_initial_input(
         owner_id,
         commit.target_run().clone(),
         run_version,
         aggregate.stored.session_version(),
+        aggregate.stored.initial_input().clone(),
     )?;
     let mut lease = aggregate.lease.clone();
     let mut session_update = None;
     let mut release_serial_claim = false;
-    if commit.target_run().state().is_terminal() {
+    if commit.target_run().state() == RunState::WaitingForApproval
+        || (commit.target_run().state() == RunState::Paused
+            && commit.target_run().pause_reason() == Some(super::RunPauseReason::Requested))
+    {
         lease = None;
+    }
+    if commit.target_run().state().is_terminal() {
         if state
             .serial_claims
             .get(&(owner_id, commit.target_run().session_id()))
@@ -4439,11 +4682,12 @@ fn build_commit_patch(
             session.version = session.version.checked_add(1).ok_or_else(|| {
                 ExecutionStoreError::new(ExecutionStoreErrorCode::ArithmeticOverflow)
             })?;
-            stored = StoredRun::new(
+            stored = StoredRun::new_with_initial_input(
                 owner_id,
                 commit.target_run().clone(),
                 run_version,
                 session.version,
+                aggregate.stored.initial_input().clone(),
             )?;
             session_update = Some(session);
             release_serial_claim = true;
@@ -4729,6 +4973,17 @@ fn valid_command_transition(
                         .is_ok_and(|expected| &expected == target)
                 })
         }
+        super::RuntimeCommandKind::Resume => {
+            approval.is_none()
+                && dispatch_grant.is_none()
+                && attempts
+                    .iter()
+                    .all(|attempt| attempt.state() != super::AttemptRecordState::Dispatching)
+                && current
+                    .resume(None, None)
+                    .is_ok_and(|expected| &expected == target)
+        }
+        super::RuntimeCommandKind::Retry => false,
         super::RuntimeCommandKind::ResumeApproval => current
             .apply_resume_command(command, approval.map(|mutation| mutation.claim()), None)
             .is_ok_and(|outcome| outcome.run() == target),
@@ -4848,7 +5103,7 @@ mod snapshot_tests {
     }
 
     fn persistence_protection(values: [&str; 5]) -> PersistenceProtection {
-        PersistenceProtection::new(
+        PersistenceProtection::allow_model_payloads(
             snapshot_seal_key(),
             vec![PersistenceCapabilitySecretInventory::new(
                 &persistence_manifest(
@@ -4864,6 +5119,58 @@ mod snapshot_tests {
             .expect("secret inventory")],
         )
         .expect("persistence protection")
+    }
+
+    #[tokio::test]
+    async fn capability_inventory_does_not_implicitly_enable_model_payload_persistence() {
+        let owner_id = Uuid::from_u128(0x51a1);
+        let session_id = Uuid::from_u128(0x51a2);
+        let run_id = Uuid::from_u128(0x51a3);
+        let store = InMemoryExecutionStore::default();
+        let session = super::super::Session::new(
+            session_id,
+            "explicit-model-opt-in",
+            1,
+            SessionConcurrencyPolicy::Serial,
+        )
+        .unwrap();
+        store
+            .create_run(
+                owner_id,
+                super::super::CreateRun::new_for_owner(
+                    owner_id,
+                    session,
+                    super::super::Run::queued(run_id, session_id, "explicit-model-opt-in", 1)
+                        .unwrap(),
+                    0,
+                    SessionConcurrencyPolicy::Serial,
+                )
+                .with_initial_input(
+                    super::super::DurableRunInput::text(
+                        owner_id,
+                        session_id,
+                        run_id,
+                        "must be explicitly permitted",
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let protection = PersistenceProtection::new(
+            snapshot_seal_key(),
+            vec![
+                PersistenceCapabilitySecretInventory::new(&persistence_manifest(vec![]), vec![])
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.export_snapshot(&protection).await.unwrap_err().code(),
+            ExecutionStoreErrorCode::InvalidRequest
+        );
     }
 
     async fn sensitive_run_store() -> (
@@ -5574,6 +5881,15 @@ mod snapshot_tests {
             .expect("resume target")
             .run()
             .clone();
+        let lease = store
+            .acquire_lease(
+                owner_id,
+                run_id,
+                waiting_outcome.stored_run().run_version(),
+                10_000,
+            )
+            .await
+            .expect("resume lease");
         let resumed_checkpoint = CheckpointV1Builder::new(
             checkpoint.session_id(),
             checkpoint.run_id(),
