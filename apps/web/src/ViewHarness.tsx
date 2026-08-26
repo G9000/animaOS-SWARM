@@ -2,11 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   daemon,
   toAgentDetail,
-  MODEL_SUGGESTIONS,
   type DaemonProvider,
 } from './lib/daemon-api';
 import type { AgentDetail } from './lib/types';
-import { toolNamesForProfile } from './lib/agent-access';
 import {
   CHECKIN_SENTINEL,
   clearCheckins,
@@ -17,7 +15,7 @@ import {
   wrapPrompt,
   type Checkin,
 } from './lib/checkins';
-import { SetupScreen } from './components/SetupScreen';
+import { OnboardingFlow } from './components/onboarding/OnboardingFlow';
 import { ChatHeader, Composer, MessageList } from './components/ChatScreen';
 import { SettingsPanel } from './components/SettingsPanel';
 import { CheckinsView } from './components/CheckinsView';
@@ -38,12 +36,7 @@ export function ViewHarness() {
   const [error, setError] = useState<string | null>(null);
 
   const [providers, setProviders] = useState<DaemonProvider[] | null>(null);
-  const [name, setName] = useState('');
-  const [provider, setProvider] = useState<string>('anthropic');
-  const [model, setModel] = useState(MODEL_SUGGESTIONS['anthropic'][0]);
-  const [customModel, setCustomModel] = useState('');
-  const [system, setSystem] = useState('');
-  const [creating, setCreating] = useState(false);
+  const [providersError, setProvidersError] = useState<string | null>(null);
 
   // Settings panel state
   const [showSettings, setShowSettings] = useState(false);
@@ -57,8 +50,8 @@ export function ViewHarness() {
   const [ciPrompt, setCiPrompt] = useState('');
   const [ciIntervalMin, setCiIntervalMin] = useState(30);
 
-  const resolvedModel = model === '__custom__' ? customModel.trim() : model;
   const sendingRef = useRef(false);
+  const agentMutationEpochRef = useRef(0);
   sendingRef.current = sending;
 
   const scrollerRef = useRef<HTMLDivElement>(null);
@@ -70,38 +63,72 @@ export function ViewHarness() {
   };
 
   const refreshAgent = useCallback(async () => {
+    const mutationEpoch = agentMutationEpochRef.current;
     try {
       const { agents } = await daemon.listAgents();
-      setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+      if (mutationEpoch === agentMutationEpochRef.current) {
+        setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+      }
       setOnline(true);
       setLoaded(true);
-      if (agents.length > 0) scrollDown();
+      if (
+        mutationEpoch === agentMutationEpochRef.current &&
+        agents.length > 0
+      ) {
+        scrollDown();
+      }
     } catch {
-      setOnline(false);
+      if (mutationEpoch === agentMutationEpochRef.current) {
+        setOnline(false);
+      }
       setLoaded(true);
     }
   }, []);
 
   useEffect(() => { refreshAgent(); }, [refreshAgent]);
 
+  const retryProviders = useCallback(async () => {
+    try {
+      const response = await daemon.listProviders();
+      setProviders(response.providers);
+      setProvidersError(null);
+    } catch (providerError) {
+      setProvidersError(
+        providerError instanceof Error
+          ? providerError.message
+          : String(providerError),
+      );
+    }
+  }, []);
+
   // Load daemon provider catalog (which providers have keys configured).
   useEffect(() => {
-    daemon.listProviders()
-      .then(({ providers }) => setProviders(providers))
-      .catch(() => setProviders(null));
-  }, []);
+    void retryProviders();
+  }, [retryProviders]);
 
   // Light polling so new messages appear while idle.
   useEffect(() => {
     const timer = setInterval(() => {
       if (!sendingRef.current) {
+        const mutationEpoch = agentMutationEpochRef.current;
         daemon.listAgents()
           .then(({ agents }) => {
-            setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+            if (mutationEpoch === agentMutationEpochRef.current) {
+              setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+            }
             setOnline(true);
-            if (agents.length > 0) scrollDown();
+            if (
+              mutationEpoch === agentMutationEpochRef.current &&
+              agents.length > 0
+            ) {
+              scrollDown();
+            }
           })
-          .catch(() => setOnline(false));
+          .catch(() => {
+            if (mutationEpoch === agentMutationEpochRef.current) {
+              setOnline(false);
+            }
+          });
       }
     }, 5000);
     return () => clearInterval(timer);
@@ -188,29 +215,6 @@ export function ViewHarness() {
     });
   };
 
-  const createAgent = async () => {
-    if (!resolvedModel) { setError('model is required'); return; }
-    setCreating(true);
-    setError(null);
-    try {
-      await daemon.createAgent({
-        name: name.trim() || resolvedModel,
-        provider,
-        model: resolvedModel,
-        system: system.trim() || undefined,
-        tools: toolNamesForProfile('collaborate'),
-      });
-      setName('');
-      setCustomModel('');
-      setSystem('');
-      await refreshAgent();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setCreating(false);
-    }
-  };
-
   const toggleSettings = () => setShowSettings((v) => !v);
 
   /** PATCH the daemon config in place; conversation is preserved. */
@@ -240,6 +244,7 @@ export function ViewHarness() {
     setError(null);
     try {
       await daemon.deleteAgent(agent.id);
+      agentMutationEpochRef.current += 1;
       clearCheckins(agent.id);
       setCheckins([]);
       setAgent(null);
@@ -313,23 +318,17 @@ export function ViewHarness() {
             </div>
           </div>
         ) : !agent ? (
-          /* ── Setup screen: no agent yet ── */
-          <SetupScreen
+          /* ── Guided onboarding: no agent yet ── */
+          <OnboardingFlow
             providers={providers}
-            name={name}
-            setName={setName}
-            provider={provider}
-            setProvider={setProvider}
-            model={model}
-            setModel={setModel}
-            customModel={customModel}
-            setCustomModel={setCustomModel}
-            system={system}
-            setSystem={setSystem}
-            creating={creating}
-            error={error}
-            online={online}
-            createAgent={createAgent}
+            providersError={providersError}
+            retryProviders={retryProviders}
+            onCreated={(snapshot) => {
+              agentMutationEpochRef.current += 1;
+              setAgent(toAgentDetail(snapshot));
+              setOnline(true);
+              scrollDown();
+            }}
           />
         ) : view === 'checkins' ? (
           /* ── Check-ins view ── */
