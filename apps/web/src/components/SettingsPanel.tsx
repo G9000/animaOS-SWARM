@@ -36,6 +36,7 @@ function InfoRow({
       </span>
       <span
         className={`min-w-0 break-all text-right text-xs text-ink ${mono ? 'font-mono' : ''}`}
+        title={value}
       >
         {value}
       </span>
@@ -194,11 +195,19 @@ export function SettingsPanel({
         className="animate-fade-in absolute inset-0 z-10 bg-black/50 backdrop-blur-[2px]"
         onClick={requestClose}
       />
-      <aside className="animate-slide-in-right absolute inset-y-0 right-0 z-20 flex w-full max-w-md flex-col border-l border-line bg-panel/95 shadow-2xl shadow-black/60 backdrop-blur-2xl">
+      <aside
+        data-surface="settings-sheet-drawer"
+        aria-labelledby="settings-heading"
+        aria-busy={controlsDisabled}
+        className="animate-slide-in-right absolute inset-0 z-20 flex w-full flex-col bg-panel/95 shadow-2xl shadow-black/70 backdrop-blur-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-md sm:border-l sm:border-line"
+      >
         {/* Panel header */}
-        <div className="flex items-center justify-between border-b border-line px-6 py-4">
+        <div className="flex items-center justify-between border-b border-line px-5 py-4 sm:px-6">
           <div>
-            <h3 className="font-display text-base font-semibold tracking-tight text-ink">
+            <h3
+              id="settings-heading"
+              className="font-display text-base font-semibold tracking-tight text-ink"
+            >
               Agent settings
             </h3>
             <p className="mt-0.5 font-mono text-[11px] text-ink-3">
@@ -218,7 +227,7 @@ export function SettingsPanel({
           </button>
         </div>
 
-        <div className="flex flex-1 flex-col gap-7 overflow-y-auto px-6 py-6">
+        <div className="flex flex-1 flex-col gap-7 overflow-y-auto px-5 py-6 sm:px-6">
           {/* Runtime info (read-only) */}
           <section className="space-y-2.5">
             <SectionTitle>Runtime</SectionTitle>
@@ -319,7 +328,7 @@ export function SettingsPanel({
           <section className="space-y-2.5">
             <SectionTitle>Workspace access</SectionTitle>
             {derivedAccess === 'custom' ? (
-              <div className="rounded-xl border border-amber-300/25 bg-amber-300/[0.05] p-3.5">
+              <div className="rounded-xl border border-amber/25 bg-amber/[0.05] p-3.5">
                 <p className="text-sm font-semibold text-ink">Custom access</p>
                 <p className="mt-1 text-xs leading-relaxed text-ink-2">
                   This agent has a custom tool set. Choose a standard profile to
@@ -342,7 +351,11 @@ export function SettingsPanel({
                 return (
                   <div
                     key={profileName}
-                    className="rounded-xl border border-line p-3.5"
+                    className={`rounded-xl border p-3.5 transition ${
+                      accessSelection === profileName
+                        ? 'border-accent/50 bg-accent/[0.07]'
+                        : 'border-line bg-white/[0.015] hover:border-line-strong'
+                    }`}
                   >
                     <input
                       id={inputId}
@@ -354,7 +367,7 @@ export function SettingsPanel({
                         setAccessSelection(profileName);
                         setAccessChanged(true);
                       }}
-                      className="mr-3 align-top"
+                      className="mr-3 h-4 w-4 align-top"
                     />
                     <label htmlFor={inputId} className="inline cursor-pointer">
                       <span className="font-medium text-ink">
@@ -445,13 +458,13 @@ export function SettingsPanel({
           </button>
 
           {/* Danger zone */}
-          <section className="rounded-xl border border-red-400/20 bg-red-400/[0.04] p-4">
+          <section className="rounded-xl border border-danger/20 bg-danger/[0.04] p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <div className="text-xs font-semibold text-red-300">
+                <div className="text-xs font-semibold text-danger">
                   Reset agent
                 </div>
-                <div className="mt-0.5 text-[11px] leading-relaxed text-red-300/60">
+                <div className="mt-0.5 text-[11px] leading-relaxed text-danger/65">
                   deletes the agent and its entire conversation
                 </div>
               </div>
@@ -461,7 +474,7 @@ export function SettingsPanel({
                   resetError ? 'settings-reset-error' : undefined
                 }
                 disabled={resetting || saving}
-                className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-50"
+                className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-danger/30 bg-danger/10 px-3 py-1.5 text-xs font-medium text-danger transition hover:bg-danger/20 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <TrashIcon size={12} />
                 {resetting ? 'Resetting…' : 'Reset'}

@@ -76,7 +76,7 @@ export function ModelStep({
       <div>
         <h2
           id="onboarding-model-heading"
-          className="font-display text-2xl font-semibold text-ink"
+          className="font-display text-2xl font-semibold tracking-tight text-ink"
         >
           Intelligence
         </h2>
@@ -107,11 +107,11 @@ export function ModelStep({
             Retrying provider catalog…
           </p>
         ) : catalogState === 'error' ? (
-          <div className="space-y-3 rounded-xl border border-red-400/30 bg-red-400/5 p-4">
+          <div className="space-y-3 rounded-xl border border-danger/30 bg-danger/5 p-4">
             <p
               id="provider-catalog-error"
               role="alert"
-              className="text-sm text-red-300"
+              className="text-sm text-danger"
             >
               {providerError}
             </p>
@@ -119,7 +119,7 @@ export function ModelStep({
               ref={retryButtonRef}
               type="button"
               aria-describedby="provider-catalog-error"
-              className="rounded-lg border border-line px-3 py-2 text-sm text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+              className="rounded-xl border border-line bg-white/[0.02] px-3 py-2 text-sm text-ink transition hover:border-line-strong"
               onClick={onRetryProviders}
             >
               Retry providers
@@ -144,10 +144,10 @@ export function ModelStep({
                     disabled={!candidate.configured}
                     aria-pressed={selected}
                     onClick={() => onProviderChange(candidate.id)}
-                    className={`rounded-xl border p-3 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 disabled:cursor-not-allowed disabled:opacity-60 ${
+                    className={`rounded-xl border p-3.5 text-left transition disabled:cursor-not-allowed disabled:opacity-55 ${
                       selected
-                        ? 'border-sky-400/60 bg-sky-400/10'
-                        : 'border-line bg-white/[0.02]'
+                        ? 'border-accent/60 bg-accent/[0.08] shadow-[0_14px_36px_-28px_rgba(255,57,127,0.8)]'
+                        : 'border-line bg-white/[0.02] hover:border-line-strong hover:bg-white/[0.035]'
                     }`}
                   >
                     <span className="block text-sm font-medium text-ink">
@@ -161,7 +161,7 @@ export function ModelStep({
               })}
             </div>
             {catalogState === 'empty' ? (
-              <div className="space-y-3 rounded-xl border border-amber-300/30 bg-amber-300/5 p-4">
+              <div className="space-y-3 rounded-xl border border-amber/30 bg-amber/5 p-4">
                 <p id="provider-catalog-empty" className="text-sm text-ink-2">
                   No providers are configured. Add a provider credential to the
                   daemon environment, then retry.
@@ -170,7 +170,7 @@ export function ModelStep({
                   ref={retryButtonRef}
                   type="button"
                   aria-describedby="provider-catalog-empty"
-                  className="rounded-lg border border-line px-3 py-2 text-sm text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400"
+                  className="rounded-xl border border-line bg-white/[0.02] px-3 py-2 text-sm text-ink transition hover:border-line-strong"
                   onClick={onRetryProviders}
                 >
                   Retry providers

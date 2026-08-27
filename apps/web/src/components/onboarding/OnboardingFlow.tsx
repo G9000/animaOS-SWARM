@@ -154,8 +154,7 @@ export function OnboardingFlow({
     blockingError === MODEL_REQUIRED_ERROR
       ? CUSTOM_MODEL_ERROR_ID
       : undefined;
-  const blockingErrorId =
-    nameValidationErrorId ?? customModelValidationErrorId;
+  const blockingErrorId = nameValidationErrorId ?? customModelValidationErrorId;
 
   useEffect(() => {
     if (currentStep < 2 || intelligenceReady) {
@@ -371,13 +370,16 @@ export function OnboardingFlow({
   }
 
   return (
-    <div className="flex flex-1 items-center justify-center overflow-y-auto px-6 py-10">
+    <div className="relative z-[1] flex flex-1 items-center justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10">
       <div className="w-full max-w-2xl space-y-6">
-        <header className="space-y-2">
-          <h1 className="font-display text-3xl font-bold text-ink">
+        <header className="space-y-2 text-center">
+          <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-accent">
+            Guided Focus · Main agent
+          </p>
+          <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
             Create your main agent
           </h1>
-          <p className="text-sm text-ink-2">
+          <p className="mx-auto max-w-lg text-sm leading-relaxed text-ink-2">
             Set the identity, intelligence, and workspace access for your agent.
           </p>
         </header>
@@ -393,14 +395,14 @@ export function OnboardingFlow({
           {ONBOARDING_STEPS[currentStep]}
         </p>
 
-        <div className="glass-strong rounded-3xl p-7 shadow-2xl shadow-black/50">
+        <div className="glass-strong rounded-3xl p-5 shadow-2xl shadow-black/60 sm:p-8">
           {stepContent}
 
           {blockingError ? (
             <p
               id={blockingErrorId}
               role="alert"
-              className="mt-5 rounded-xl border border-red-400/30 bg-red-400/5 p-3 text-sm text-red-300"
+              className="mt-5 rounded-xl border border-danger/30 bg-danger/5 p-3 text-sm text-danger"
             >
               {blockingError}
             </p>
@@ -411,7 +413,7 @@ export function OnboardingFlow({
               {currentStep > 0 ? (
                 <button
                   type="button"
-                  className="rounded-lg border border-line px-4 py-2 text-sm text-ink"
+                  className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink"
                   onClick={goBack}
                 >
                   Back
@@ -422,7 +424,7 @@ export function OnboardingFlow({
               <button
                 type="button"
                 disabled={currentStep === 1 && !intelligenceReady}
-                className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50"
+                className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
                 onClick={goNext}
               >
                 Next

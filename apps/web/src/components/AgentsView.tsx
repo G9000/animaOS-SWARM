@@ -44,18 +44,27 @@ export function AgentsView({
               <article
                 key={agent.id}
                 aria-label={`${agent.name} agent`}
-                className="glass rounded-2xl p-4"
+                className="glass rounded-2xl p-4 transition hover:border-line-strong"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 items-center gap-3">
-                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-500/15 text-sky-300">
+                    <div
+                      className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${
+                        isMain
+                          ? 'bg-accent/15 text-accent'
+                          : 'bg-white/[0.04] text-ink-2'
+                      }`}
+                    >
                       <SparkIcon size={16} />
                     </div>
                     <div className="min-w-0">
                       <h3 className="truncate font-display text-sm font-semibold text-ink">
                         {agent.name}
                       </h3>
-                      <p className="truncate font-mono text-[10px] text-ink-3">
+                      <p
+                        className="truncate font-mono text-[10px] text-ink-3"
+                        title={`${agent.provider}/${agent.model}`}
+                      >
                         {agent.provider}/{agent.model}
                       </p>
                     </div>

@@ -53,7 +53,7 @@ describe('WorkspaceShell', () => {
     const navigation = screen.getByRole('navigation', {
       name: 'Workspace navigation',
     });
-    expect(navigation).toHaveAttribute('data-placement', 'top');
+    expect(navigation).toHaveAttribute('data-placement', 'top-shell');
     expect(navigation.previousElementSibling?.tagName).toBe('HEADER');
     expect(navigation.nextElementSibling?.tagName).toBe('MAIN');
     expect(

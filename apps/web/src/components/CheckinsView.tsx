@@ -8,8 +8,8 @@ const OUTCOME_STYLE: Record<
   { dot: string; label: string }
 > = {
   silent: { dot: 'bg-zinc-500', label: 'stayed silent' },
-  spoke: { dot: 'bg-sky-400', label: 'sent a message' },
-  error: { dot: 'bg-red-400', label: 'run failed' },
+  spoke: { dot: 'bg-mint', label: 'sent a message' },
+  error: { dot: 'bg-danger', label: 'run failed' },
 };
 
 export function CheckinsView({
@@ -41,7 +41,7 @@ export function CheckinsView({
       {/* View header */}
       <header className="flex items-center justify-between gap-3 border-b border-line bg-panel/60 px-6 py-3 backdrop-blur-xl">
         <div className="flex items-center gap-3">
-          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-sky-500/10 text-sky-400">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-mint/10 text-mint">
             <PulseIcon size={17} />
           </div>
           <div>
@@ -64,7 +64,7 @@ export function CheckinsView({
             Your agent wakes up on a timer and messages you first when it has
             something to say. Each proactive prompt runs on a schedule — a reply
             of exactly{' '}
-            <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[11px] text-sky-300">
+            <code className="rounded bg-white/5 px-1.5 py-0.5 font-mono text-[11px] text-mint">
               CHECKIN_OK
             </code>{' '}
             keeps the run silent.
@@ -137,7 +137,7 @@ export function CheckinsView({
                   className="group glass animate-fade-in rounded-xl px-4 py-3.5 transition hover:border-line-strong"
                 >
                   <div className="flex items-center gap-3.5">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-sky-500/10 text-sky-400">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-mint/10 text-mint">
                       <PulseIcon size={14} />
                     </div>
                     <div className="min-w-0 flex-1">
@@ -166,7 +166,7 @@ export function CheckinsView({
                     </span>
                     <button
                       onClick={() => removeCheckin(c.id)}
-                      className="shrink-0 cursor-pointer text-ink-3 opacity-0 transition group-hover:opacity-100 hover:text-red-400"
+                      className="shrink-0 cursor-pointer text-ink-3 opacity-0 transition focus-visible:opacity-100 group-hover:opacity-100 hover:text-danger"
                       aria-label="Remove check-in"
                     >
                       <TrashIcon size={14} />

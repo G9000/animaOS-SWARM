@@ -27,11 +27,11 @@ export function IdentityStep({
       <div>
         <h2
           id="onboarding-identity-heading"
-          className="font-display text-2xl font-semibold text-ink"
+          className="font-display text-2xl font-semibold tracking-tight text-ink"
         >
           Identity
         </h2>
-        <p className="mt-1 text-sm text-ink-2">
+        <p className="mt-1 max-w-xl text-sm leading-relaxed text-ink-2">
           Give your main agent a name and optional standing instructions.
         </p>
       </div>

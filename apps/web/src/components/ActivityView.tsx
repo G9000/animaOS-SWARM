@@ -53,8 +53,11 @@ export function ActivityView(props: ActivityViewProps) {
         </h2>
         <div className="mt-5 grid grid-cols-3 gap-2">
           {summaries.map((summary) => (
-            <div key={summary.label} className="glass rounded-xl px-3 py-3">
-              <div className="flex items-center gap-1.5 text-sky-400">
+            <div
+              key={summary.label}
+              className="glass rounded-xl px-3 py-3 sm:px-4"
+            >
+              <div className="flex items-center gap-1.5 text-mint">
                 {summary.icon}
                 <span className="font-mono text-[9px] uppercase tracking-wider text-ink-3">
                   {summary.label}

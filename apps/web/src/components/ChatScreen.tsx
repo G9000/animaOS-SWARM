@@ -33,7 +33,7 @@ function Bubble({ message }: { message: ChatMessage }) {
         <div
           className={`whitespace-pre-wrap break-words px-4 py-2.5 text-sm leading-relaxed ${
             isUser
-              ? 'rounded-2xl rounded-br-md bg-sky-600 text-white shadow-lg shadow-sky-600/15'
+              ? 'rounded-2xl rounded-br-md border border-accent/30 bg-panel-2/90 text-ink shadow-lg shadow-accent/10'
               : 'glass rounded-2xl rounded-bl-md text-ink'
           }`}
         >
@@ -67,14 +67,14 @@ function EmptyState({
   return (
     <div className="animate-rise-in flex flex-col items-center pt-[14vh]">
       <div className="relative mb-6 flex h-20 w-20 items-center justify-center">
-        <span className="animate-ripple absolute inset-0 rounded-full border border-sky-400/30" />
+        <span className="animate-ripple absolute inset-0 rounded-full border border-accent/30" />
         <span
-          className="animate-ripple absolute inset-0 rounded-full border border-sky-400/20"
-          style={{ animationDelay: '1.3s' }}
+          className="animate-ripple absolute inset-0 rounded-full border border-accent/20"
+          style={{ animationDelay: '2.6s' }}
         />
         <div
           data-motion="agent-orb"
-          className="animate-orb flex h-16 w-16 items-center justify-center rounded-full bg-sky-500 shadow-2xl shadow-sky-500/30"
+          className="agent-orb animate-orb flex h-16 w-16 items-center justify-center rounded-full"
         >
           <span className="font-display text-2xl font-bold text-white">
             {agentName.charAt(0).toUpperCase()}
@@ -90,9 +90,9 @@ function EmptyState({
           <button
             key={s.text}
             onClick={() => onPick(s.text)}
-            className="glass flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs text-ink-2 transition-all duration-150 hover:border-sky-400/40 hover:text-ink hover:shadow-[0_0_16px_-4px_rgba(56,189,248,0.4)]"
+            className="glass flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs text-ink-2 transition-all duration-150 hover:border-accent/40 hover:text-ink hover:shadow-[0_0_16px_-4px_rgba(255,57,127,0.4)]"
           >
-            <span className="text-sky-400">{s.icon}</span>
+            <span className="text-accent">{s.icon}</span>
             {s.text}
           </button>
         ))}
@@ -108,7 +108,7 @@ function ThinkingIndicator({ name }: { name: string }) {
         {[0, 1, 2].map((i) => (
           <span
             key={i}
-            className="typing-dot h-1.5 w-1.5 rounded-full bg-sky-400"
+            className="typing-dot h-1.5 w-1.5 rounded-full bg-accent"
             style={{ animationDelay: `${i * 150}ms` }}
           />
         ))}
@@ -140,7 +140,7 @@ export function MessageList({
       {agent.messages.length === 0 && !sending ? (
         <EmptyState agentName={agent.name} onPick={onSuggestion} />
       ) : (
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-6 py-6">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6 sm:px-6">
           {agent.messages.map((m) => (
             <Bubble key={m.id} message={m} />
           ))}
@@ -181,7 +181,7 @@ export function Composer({
   }, [draft]);
 
   return (
-    <div className="relative z-10 px-6 pb-5 pt-2">
+    <div className="safe-composer sticky bottom-0 z-10 bg-gradient-to-t from-abyss via-abyss/95 to-transparent px-4 pt-3 sm:px-6">
       <div className="mx-auto w-full max-w-3xl">
         {error && (
           <div className="mb-2.5">
@@ -192,7 +192,7 @@ export function Composer({
             />
           </div>
         )}
-        <div className="glass-strong focus-glow flex items-end gap-2 rounded-2xl p-2 shadow-xl shadow-black/30 transition-all duration-200">
+        <div className="glass-strong focus-glow flex items-end gap-2 rounded-2xl p-2 shadow-xl shadow-black/40 transition-all duration-200">
           <textarea
             ref={taRef}
             value={draft}
@@ -212,7 +212,7 @@ export function Composer({
             onClick={onSend}
             disabled={disabled || sending || !draft.trim()}
             aria-label="Send"
-            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-sky-500 text-white shadow-lg shadow-sky-500/25 transition hover:bg-sky-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
+            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-white shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
           >
             <SendIcon size={15} />
           </button>

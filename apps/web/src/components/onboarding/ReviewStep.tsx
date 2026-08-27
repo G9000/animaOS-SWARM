@@ -45,7 +45,7 @@ export function ReviewStep({
       <div>
         <h2
           id="onboarding-review-heading"
-          className="font-display text-2xl font-semibold text-ink"
+          className="font-display text-2xl font-semibold tracking-tight text-ink"
         >
           Review
         </h2>
@@ -54,7 +54,7 @@ export function ReviewStep({
         </p>
       </div>
 
-      <dl className="grid gap-3 rounded-xl border border-line p-4 sm:grid-cols-[10rem_1fr]">
+      <dl className="grid gap-3 rounded-2xl border border-line bg-abyss/35 p-4 sm:grid-cols-[10rem_1fr] sm:p-5">
         <dt className="text-xs uppercase tracking-wide text-ink-3">Name</dt>
         <dd className="text-sm text-ink">{name.trim()}</dd>
 
@@ -88,7 +88,7 @@ export function ReviewStep({
           ref={createErrorRef}
           role="alert"
           tabIndex={-1}
-          className="rounded-xl border border-red-400/30 bg-red-400/5 p-3 text-sm text-red-300"
+          className="rounded-xl border border-danger/30 bg-danger/5 p-3 text-sm text-danger"
         >
           {createError}
         </p>
@@ -97,7 +97,7 @@ export function ReviewStep({
       <div className="flex items-center justify-between gap-3">
         <button
           type="button"
-          className="rounded-lg border border-line px-4 py-2 text-sm text-ink"
+          className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink"
           onClick={onBack}
           disabled={creating}
         >
@@ -105,7 +105,7 @@ export function ReviewStep({
         </button>
         <button
           type="button"
-          className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-medium text-white disabled:opacity-60"
+          className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:opacity-60 disabled:shadow-none"
           onClick={onSubmit}
           disabled={creating}
         >

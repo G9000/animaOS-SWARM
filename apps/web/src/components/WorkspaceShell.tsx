@@ -46,16 +46,16 @@ function DestinationNavigation({
 }: {
   destination: WorkspaceDestination;
   setDestination: (destination: WorkspaceDestination) => void;
-  placement: 'top' | 'bottom-dock';
+  placement: 'top-shell' | 'bottom-dock';
 }) {
   return (
     <nav
       aria-label="Workspace navigation"
       data-placement={placement}
       className={
-        placement === 'top'
-          ? 'flex items-center justify-center gap-1 border-b border-line bg-panel/35 p-1.5 backdrop-blur-xl'
-          : 'fixed inset-x-3 bottom-3 z-30 flex items-center justify-around gap-1 rounded-2xl border border-line bg-panel/95 p-1.5 shadow-2xl shadow-black/40 backdrop-blur-xl'
+        placement === 'top-shell'
+          ? 'glass relative z-20 mx-auto mt-2 flex w-[min(calc(100%-2rem),40rem)] items-center justify-center gap-1 rounded-2xl p-1.5'
+          : 'safe-bottom-dock glass-strong fixed inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
       }
     >
       {DESTINATIONS.map((item) => {
@@ -68,7 +68,7 @@ function DestinationNavigation({
             aria-current={active ? 'page' : undefined}
             className={`inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition md:max-w-40 ${
               active
-                ? 'bg-sky-500/12 text-sky-300'
+                ? 'bg-accent/12 text-accent shadow-[inset_0_0_0_1px_rgba(255,57,127,0.18)]'
                 : 'text-ink-3 hover:bg-white/[0.04] hover:text-ink'
             }`}
           >
@@ -112,13 +112,11 @@ export function WorkspaceShell({
         <DestinationNavigation
           destination={destination}
           setDestination={setDestination}
-          placement="top"
+          placement="top-shell"
         />
       ) : null}
 
-      <main
-        className={`relative min-h-0 flex-1 ${desktopNavigation ? 'pb-0' : 'pb-20'}`}
-      >
+      <main className="spatial-canvas workspace-mobile-safe relative min-h-0 flex-1">
         {destination === 'workspace' ? (
           workspace
         ) : destination === 'activity' ? (

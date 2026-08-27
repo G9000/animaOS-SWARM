@@ -19,15 +19,17 @@ function titleCase(value: string) {
 function StatusLabel({
   icon,
   iconLabel,
+  iconClassName = 'text-ink-3',
   children,
 }: {
   icon: React.ReactNode;
   iconLabel: string;
+  iconClassName?: string;
   children: React.ReactNode;
 }) {
   return (
     <span className="inline-flex items-center gap-1.5 rounded-full border border-line bg-white/[0.025] px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-2">
-      <span role="img" aria-label={iconLabel} className="text-sky-400">
+      <span role="img" aria-label={iconLabel} className={iconClassName}>
         {icon}
       </span>
       {children}
@@ -50,38 +52,43 @@ export function AgentPresence({
   const online = connection === 'online';
 
   return (
-    <header className="flex min-w-0 items-center justify-between gap-4 border-b border-line bg-panel/50 px-4 py-3 backdrop-blur-xl sm:px-6">
+    <header className="relative flex min-w-0 items-center justify-between gap-4 border-b border-line bg-abyss/65 px-4 py-2.5 backdrop-blur-2xl sm:px-6">
       <div className="flex min-w-0 items-center gap-3">
         <div
           className="relative flex h-11 w-11 shrink-0 items-center justify-center"
           aria-hidden
         >
-          <span className="absolute inset-0 rounded-full border border-sky-400/20" />
-          <span className="absolute inset-1 rounded-full bg-sky-500/15" />
-          <span className="relative h-3 w-3 rounded-full bg-sky-300 shadow-[0_0_18px_rgba(125,211,252,0.8)]" />
+          <span className="absolute inset-0 rounded-full border border-accent/20" />
+          <span className="absolute inset-1.5 rounded-full border border-accent/25 bg-accent/[0.08]" />
+          <span className="agent-orb-core relative h-3 w-3 rounded-full" />
         </div>
         <div className="min-w-0">
           <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
             Welcome back
           </p>
           <div className="mt-0.5 flex min-w-0 items-baseline gap-2">
-            <h1 className="truncate font-display text-base font-semibold tracking-tight text-ink">
+            <h1
+              className="truncate font-display text-base font-semibold tracking-tight text-ink"
+              title={agent.name}
+            >
               {agent.name}
             </h1>
-            <span className="rounded-full border border-sky-400/30 bg-sky-400/10 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-sky-300">
+            <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-accent">
               Main
             </span>
           </div>
-          <div className="mt-2 flex flex-wrap gap-1.5">
+          <div className="mt-2 hidden flex-wrap gap-1.5 sm:flex">
             <StatusLabel
               icon={online ? <BoltIcon size={11} /> : <AlertIcon size={11} />}
               iconLabel={`Daemon ${online ? 'online' : 'offline'}`}
+              iconClassName={online ? 'text-mint' : 'text-danger'}
             >
               Daemon {online ? 'Online' : 'Offline'}
             </StatusLabel>
             <StatusLabel
               icon={<SparkIcon size={11} />}
               iconLabel={`Agent ${agentStatus.toLowerCase()}`}
+              iconClassName="text-accent"
             >
               Agent {agentStatus}
             </StatusLabel>

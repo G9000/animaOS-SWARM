@@ -50,7 +50,7 @@ function ConnectingState() {
           {[0, 1, 2].map((index) => (
             <span
               key={index}
-              className="typing-dot h-2 w-2 rounded-full bg-sky-400"
+              className="typing-dot h-2 w-2 rounded-full bg-accent shadow-[0_0_12px_rgba(255,57,127,0.7)]"
               style={{ animationDelay: `${index * 150}ms` }}
             />
           ))}
@@ -71,9 +71,9 @@ function OfflineRetry({ retry }: { retry: () => Promise<void> }) {
     <main className="relative z-[1] flex min-h-0 flex-1 items-center justify-center px-5">
       <section
         role="alert"
-        className="glass-strong w-full max-w-lg rounded-3xl p-7 text-center"
+        className="glass-strong w-full max-w-lg rounded-3xl p-7 text-center sm:p-9"
       >
-        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-red-400/10 text-red-300">
+        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-danger/10 text-danger">
           <AlertIcon size={20} />
         </div>
         <h1 className="mt-4 font-display text-2xl font-semibold tracking-tight text-ink">
@@ -83,7 +83,7 @@ function OfflineRetry({ retry }: { retry: () => Promise<void> }) {
           The workspace cannot reach anima-daemon yet. Start the Rust host, then
           retry this connection.
         </p>
-        <code className="mt-4 inline-block rounded-xl border border-line bg-black/20 px-3 py-2 font-mono text-xs text-sky-300">
+        <code className="mt-4 inline-block rounded-xl border border-line bg-abyss/60 px-3 py-2 font-mono text-xs text-mint">
           bun dev --host rust
         </code>
         <div className="mt-5">
@@ -91,7 +91,7 @@ function OfflineRetry({ retry }: { retry: () => Promise<void> }) {
             type="button"
             autoFocus
             onClick={() => void retry()}
-            className="rounded-xl bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400"
+            className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90"
           >
             Retry connection
           </button>

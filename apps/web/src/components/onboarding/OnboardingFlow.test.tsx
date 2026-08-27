@@ -288,7 +288,7 @@ describe('OnboardingFlow', () => {
     });
     expect(openai).toBeEnabled();
     expect(openai).toHaveFocus();
-    expect(openai).toHaveClass('border-sky-400/60', 'bg-sky-400/10');
+    expect(openai).toHaveAttribute('aria-pressed', 'true');
     expect(
       screen.getByRole('button', { name: /Anthropic.*unavailable/i }),
     ).toBeDisabled();
@@ -303,8 +303,8 @@ describe('OnboardingFlow', () => {
       name: /Ollama.*configured/i,
     });
     await user.click(ollama);
-    expect(ollama).toHaveClass('border-sky-400/60', 'bg-sky-400/10');
-    expect(openai).not.toHaveClass('border-sky-400/60', 'bg-sky-400/10');
+    expect(ollama).toHaveAttribute('aria-pressed', 'true');
+    expect(openai).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
       'llama3.1',
     );
