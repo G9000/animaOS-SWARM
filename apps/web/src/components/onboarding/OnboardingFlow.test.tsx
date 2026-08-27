@@ -75,6 +75,32 @@ function namedSnapshot(name: string, id: string): DaemonSnapshot {
   };
 }
 
+function snapshotWithReply(text: string): DaemonSnapshot {
+  const base = snapshot();
+  return {
+    ...base,
+    messageCount: 2,
+    messages: [
+      {
+        id: 'message-user',
+        agentId: base.state.id,
+        roomId: 'room-1',
+        content: { text: 'Hello' },
+        role: 'user',
+        createdAtMs: 2,
+      },
+      {
+        id: 'message-assistant',
+        agentId: base.state.id,
+        roomId: 'room-1',
+        content: { text },
+        role: 'assistant',
+        createdAtMs: 3,
+      },
+    ],
+  };
+}
+
 function deferred<Value>() {
   let resolve!: (value: Value) => void;
   let reject!: (reason?: unknown) => void;
@@ -121,6 +147,7 @@ async function goToReview(user: ReturnType<typeof userEvent.setup>) {
 }
 
 afterEach(() => {
+  localStorage.clear();
   vi.restoreAllMocks();
 });
 
@@ -645,7 +672,7 @@ describe('OnboardingFlow', () => {
     expect(createAgent).toHaveBeenCalledTimes(2);
   });
 
-  it('coalesces sustained slow polls without starving valid responses or growing the queue', async () => {
+  it('skips sustained polling ticks while a refresh is active', async () => {
     const initialPoll = deferred<{ agents: DaemonSnapshot[] }>();
     const followupPoll = deferred<{ agents: DaemonSnapshot[] }>();
     const finalPoll = deferred<{ agents: DaemonSnapshot[] }>();
@@ -687,7 +714,12 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Initial' }),
     ).toBeVisible();
-    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(2));
+    expect(listAgents).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
 
     act(() => {
       runPoll?.();
@@ -705,7 +737,12 @@ describe('OnboardingFlow', () => {
     expect(
       screen.getByRole('heading', { name: 'Say something to Followup' }),
     ).toBeVisible();
-    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(3));
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(3);
 
     await act(async () => {
       finalPoll.resolve({ agents: [namedSnapshot('Final', 'agent-final')] });
@@ -717,7 +754,183 @@ describe('OnboardingFlow', () => {
     expect(listAgents).toHaveBeenCalledTimes(3);
   });
 
-  it('drains a refresh requested after settlement but before ownership cleanup', async () => {
+  it('settles a settings save from its snapshot while a slow poll continues', async () => {
+    const user = userEvent.setup();
+    const slowPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const listAgents = vi
+      .spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [snapshot()] })
+      .mockReturnValue(slowPoll.promise);
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const updated = namedSnapshot('Nova Saved', 'agent-1');
+    const updateAgent = vi
+      .spyOn(daemon, 'updateAgent')
+      .mockResolvedValue({ agent: updated });
+    let runPoll: (() => void) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+
+    act(() => {
+      runPoll?.();
+      runPoll?.();
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    const name = screen.getByDisplayValue('Nova');
+    await user.clear(name);
+    await user.type(name, 'Nova Saved');
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    expect(updateAgent).toHaveBeenCalledWith('agent-1', {
+      name: 'Nova Saved',
+    });
+    expect(
+      await screen.findByRole('button', { name: 'Saved ✓' }),
+    ).toBeVisible();
+    expect(screen.getByDisplayValue('Nova Saved')).toBeVisible();
+    expect(listAgents).toHaveBeenCalledTimes(2);
+  });
+
+  it('settles a chat run from its snapshot while a slow poll continues', async () => {
+    const user = userEvent.setup();
+    const slowPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const listAgents = vi
+      .spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [snapshot()] })
+      .mockReturnValue(slowPoll.promise);
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+      agent: snapshotWithReply('Hello back'),
+      result: {
+        status: 'success',
+        durationMs: 1,
+        data: { text: 'Hello back' },
+      },
+    });
+    let runPoll: (() => void) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+
+    act(() => {
+      runPoll?.();
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    await user.type(screen.getByPlaceholderText('Message Nova…'), 'Hello');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+
+    expect(await screen.findByText('Hello back')).toBeVisible();
+    await user.type(screen.getByPlaceholderText('Message Nova…'), 'Again');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+    expect(listAgents).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases the due check-in lock from its snapshot while a slow poll continues', async () => {
+    const now = 100_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    localStorage.setItem(
+      'animaos.checkins.agent-1',
+      JSON.stringify([
+        {
+          id: 'checkin-1',
+          prompt: 'Check my goals',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    const slowPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const listAgents = vi
+      .spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [snapshot()] })
+      .mockReturnValue(slowPoll.promise);
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+      agent: snapshotWithReply('Focus on Task 5'),
+      result: {
+        status: 'success',
+        durationMs: 1,
+        data: { text: 'Focus on Task 5' },
+      },
+    });
+    let runPoll: (() => void) | undefined;
+    let runCheckins: (() => unknown) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
+      }
+      if (typeof handler === 'function' && timeout === 10_000) {
+        runCheckins = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+    await userEvent.click(
+      screen.getByRole('button', { name: /^Proactive/ }),
+    );
+    expect(await screen.findByText('Check my goals')).toBeVisible();
+
+    act(() => {
+      runPoll?.();
+      runPoll?.();
+    });
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      void runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(/sent a message/)).toBeVisible();
+
+    vi.mocked(Date.now).mockReturnValue(now + 2_000);
+    act(() => {
+      void runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(2));
+    expect(listAgents).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts a fresh poll after prior request ownership is released', async () => {
     const initialPoll = deferred<{ agents: DaemonSnapshot[] }>();
     const followupPoll = deferred<{ agents: DaemonSnapshot[] }>();
     const listAgents = vi
@@ -821,14 +1034,13 @@ describe('OnboardingFlow', () => {
       providers: configuredProviders,
     });
     vi.spyOn(daemon, 'createAgent').mockResolvedValue({ agent: created });
+    let runPoll: (() => void) | undefined;
     vi.spyOn(window, 'setInterval').mockImplementation(((
       handler: TimerHandler,
+      timeout?: number,
     ) => {
-      if (typeof handler === 'function') {
-        queueMicrotask(() => {
-          handler();
-          handler();
-        });
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
       }
       return 1;
     }) as typeof window.setInterval);
@@ -837,6 +1049,9 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Create your main agent' }),
     ).toBeVisible();
+    act(() => {
+      runPoll?.();
+    });
     await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(2));
     const listCallsBeforeCreate = listAgents.mock.calls.length;
 

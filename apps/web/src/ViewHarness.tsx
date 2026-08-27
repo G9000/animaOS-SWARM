@@ -54,7 +54,6 @@ export function ViewHarness() {
   const agentMutationEpochRef = useRef(0);
   const agentRequestTokenRef = useRef(0);
   const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
-  const agentRefreshPendingEpochRef = useRef<number | null>(null);
   const providerRequestGenerationRef = useRef(0);
   sendingRef.current = sending;
 
@@ -67,55 +66,44 @@ export function ViewHarness() {
   };
 
   const refreshAgent = useCallback(() => {
-    agentRefreshPendingEpochRef.current = agentMutationEpochRef.current;
     if (agentRequestInFlightRef.current) {
       return agentRequestInFlightRef.current;
     }
 
+    const mutationEpoch = agentMutationEpochRef.current;
+    const requestToken = ++agentRequestTokenRef.current;
     const request = (async () => {
-      while (true) {
-        while (agentRefreshPendingEpochRef.current !== null) {
-          const mutationEpoch = agentRefreshPendingEpochRef.current;
-          agentRefreshPendingEpochRef.current = null;
-          if (mutationEpoch !== agentMutationEpochRef.current) {
-            continue;
-          }
-          const requestToken = ++agentRequestTokenRef.current;
-
-          try {
-            const { agents } = await daemon.listAgents();
-            if (
-              requestToken === agentRequestTokenRef.current &&
-              mutationEpoch === agentMutationEpochRef.current
-            ) {
-              setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
-              setOnline(true);
-              setLoaded(true);
-              if (agents.length > 0) {
-                scrollDown();
-              }
-            }
-          } catch {
-            if (
-              requestToken === agentRequestTokenRef.current &&
-              mutationEpoch === agentMutationEpochRef.current
-            ) {
-              setOnline(false);
-              setLoaded(true);
-            }
+      try {
+        const { agents } = await daemon.listAgents();
+        if (
+          requestToken === agentRequestTokenRef.current &&
+          mutationEpoch === agentMutationEpochRef.current
+        ) {
+          setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+          setOnline(true);
+          setLoaded(true);
+          if (agents.length > 0) {
+            scrollDown();
           }
         }
-
-        await Promise.resolve();
-        if (agentRefreshPendingEpochRef.current === null) {
-          agentRequestInFlightRef.current = null;
-          break;
+      } catch {
+        if (
+          requestToken === agentRequestTokenRef.current &&
+          mutationEpoch === agentMutationEpochRef.current
+        ) {
+          setOnline(false);
+          setLoaded(true);
         }
       }
     })();
 
-    agentRequestInFlightRef.current = request;
-    return request;
+    const ownedRequest = request.finally(() => {
+      if (agentRequestInFlightRef.current === ownedRequest) {
+        agentRequestInFlightRef.current = null;
+      }
+    });
+    agentRequestInFlightRef.current = ownedRequest;
+    return ownedRequest;
   }, []);
 
   useEffect(() => {
@@ -152,7 +140,7 @@ export function ViewHarness() {
   // Light polling so new messages appear while idle.
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!sendingRef.current) {
+      if (!sendingRef.current && !agentRequestInFlightRef.current) {
         void refreshAgent();
       }
     }, 5000);
@@ -179,10 +167,18 @@ export function ViewHarness() {
         return next;
       });
     try {
-      const { result } = await daemon.runAgent(targetAgentId, wrapPrompt(c), {
-        kind: 'checkin',
-        id: c.id,
-      });
+      const { agent: updatedAgent, result } = await daemon.runAgent(
+        targetAgentId,
+        wrapPrompt(c),
+        {
+          kind: 'checkin',
+          id: c.id,
+        },
+      );
+      agentMutationEpochRef.current += 1;
+      setAgent(toAgentDetail(updatedAgent));
+      setOnline(true);
+      setLoaded(true);
       const reply = result.data?.text?.trim() ?? '';
       if (result.status === 'error') {
         stamp({ lastRunAtMs: Date.now(), lastOutcome: 'error', lastReply: result.error ?? 'run failed' });
@@ -212,13 +208,12 @@ export function ViewHarness() {
         for (const c of due) {
           await runCheckin(agentId, c);
         }
-        await refreshAgent();
       } finally {
         checkinRunningRef.current = false;
       }
     }, 10_000);
     return () => clearInterval(timer);
-  }, [agentId, runCheckin, refreshAgent]);
+  }, [agentId, runCheckin]);
 
   const addCheckin = () => {
     const text = ciPrompt.trim();
@@ -253,8 +248,11 @@ export function ViewHarness() {
     setSavingSettings(true);
     setError(null);
     try {
-      await daemon.updateAgent(agent.id, patch);
-      await refreshAgent();
+      const { agent: updatedAgent } = await daemon.updateAgent(agent.id, patch);
+      agentMutationEpochRef.current += 1;
+      setAgent(toAgentDetail(updatedAgent));
+      setOnline(true);
+      setLoaded(true);
       return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -287,9 +285,13 @@ export function ViewHarness() {
     setError(null);
     setDraft('');
     try {
-      const { result } = await daemon.runAgent(agent.id, text);
+      const { agent: updatedAgent, result } = await daemon.runAgent(agent.id, text);
+      agentMutationEpochRef.current += 1;
+      setAgent(toAgentDetail(updatedAgent));
+      setOnline(true);
+      setLoaded(true);
       if (result.status === 'error') setError(result.error ?? 'run failed');
-      await refreshAgent();
+      scrollDown();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
