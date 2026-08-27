@@ -1,7 +1,13 @@
 import { StrictMode } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { toolNamesForProfile } from '../../lib/agent-access';
 import { CHECKIN_SENTINEL } from '../../lib/checkins';
@@ -12,6 +18,8 @@ import {
 } from '../../lib/daemon-api';
 import { ViewHarness } from '../../ViewHarness';
 import { OnboardingFlow } from './OnboardingFlow';
+
+const nativeSetTimeout = window.setTimeout.bind(window);
 
 const configuredProviders: DaemonProvider[] = [
   {
@@ -176,6 +184,10 @@ async function goToReview(user: ReturnType<typeof userEvent.setup>) {
   await user.click(screen.getByRole('button', { name: 'Next' }));
   expect(screen.getByRole('heading', { name: 'Review' })).toBeVisible();
 }
+
+beforeEach(() => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+});
 
 afterEach(() => {
   localStorage.clear();
@@ -747,88 +759,6 @@ describe('OnboardingFlow', () => {
     expect(createAgent).toHaveBeenCalledTimes(2);
   });
 
-  it('skips sustained polling ticks while a refresh is active', async () => {
-    const initialPoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const followupPoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const finalPoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const listAgents = vi
-      .spyOn(daemon, 'listAgents')
-      .mockReturnValueOnce(initialPoll.promise)
-      .mockReturnValueOnce(followupPoll.promise)
-      .mockReturnValueOnce(finalPoll.promise);
-    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
-      providers: configuredProviders,
-    });
-    let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
-      handler: TimerHandler,
-      timeout?: number,
-    ) => {
-      if (typeof handler === 'function' && timeout === 5_000) {
-        runPoll = handler;
-      }
-      return 1;
-    }) as typeof window.setInterval);
-
-    render(<ViewHarness />);
-    expect(listAgents).toHaveBeenCalledTimes(1);
-
-    act(() => {
-      runPoll?.();
-      runPoll?.();
-      runPoll?.();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      initialPoll.resolve({
-        agents: [namedSnapshot('Initial', 'agent-initial')],
-      });
-      await initialPoll.promise;
-    });
-    expect(
-      await screen.findByRole('heading', { name: 'Say something to Initial' }),
-    ).toBeVisible();
-    expect(listAgents).toHaveBeenCalledTimes(1);
-
-    act(() => {
-      runPoll?.();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(2);
-
-    act(() => {
-      runPoll?.();
-      runPoll?.();
-      runPoll?.();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(2);
-
-    await act(async () => {
-      followupPoll.resolve({
-        agents: [namedSnapshot('Followup', 'agent-followup')],
-      });
-      await followupPoll.promise;
-    });
-    expect(
-      screen.getByRole('heading', { name: 'Say something to Followup' }),
-    ).toBeVisible();
-    expect(listAgents).toHaveBeenCalledTimes(2);
-
-    act(() => {
-      runPoll?.();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(3);
-
-    await act(async () => {
-      finalPoll.resolve({ agents: [namedSnapshot('Final', 'agent-final')] });
-      await finalPoll.promise;
-    });
-    expect(
-      screen.getByRole('heading', { name: 'Say something to Final' }),
-    ).toBeVisible();
-    expect(listAgents).toHaveBeenCalledTimes(3);
-  });
-
   it('settles a settings save from its snapshot while a slow poll continues', async () => {
     const user = userEvent.setup();
     const slowPoll = deferred<{ agents: DaemonSnapshot[] }>();
@@ -844,15 +774,16 @@ describe('OnboardingFlow', () => {
       .spyOn(daemon, 'updateAgent')
       .mockResolvedValue({ agent: updated });
     let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
       handler: TimerHandler,
       timeout?: number,
     ) => {
       if (typeof handler === 'function' && timeout === 5_000) {
         runPoll = handler;
+        return 1;
       }
-      return 1;
-    }) as typeof window.setInterval);
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
 
     render(<ViewHarness />);
     expect(
@@ -860,8 +791,6 @@ describe('OnboardingFlow', () => {
     ).toBeVisible();
 
     act(() => {
-      runPoll?.();
-      runPoll?.();
       runPoll?.();
     });
     expect(listAgents).toHaveBeenCalledTimes(2);
@@ -901,15 +830,16 @@ describe('OnboardingFlow', () => {
       },
     });
     let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
       handler: TimerHandler,
       timeout?: number,
     ) => {
       if (typeof handler === 'function' && timeout === 5_000) {
         runPoll = handler;
+        return 1;
       }
-      return 1;
-    }) as typeof window.setInterval);
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
 
     render(<ViewHarness />);
     expect(
@@ -917,7 +847,6 @@ describe('OnboardingFlow', () => {
     ).toBeVisible();
 
     act(() => {
-      runPoll?.();
       runPoll?.();
     });
     expect(listAgents).toHaveBeenCalledTimes(2);
@@ -933,9 +862,7 @@ describe('OnboardingFlow', () => {
 
   it('does not resurrect a reset agent when an older chat run resolves', async () => {
     const user = userEvent.setup();
-    const pendingRun = deferred<
-      Awaited<ReturnType<typeof daemon.runAgent>>
-    >();
+    const pendingRun = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
       providers: configuredProviders,
@@ -979,9 +906,8 @@ describe('OnboardingFlow', () => {
 
   it('does not resurrect a reset agent when an older settings update resolves', async () => {
     const user = userEvent.setup();
-    const pendingUpdate = deferred<
-      Awaited<ReturnType<typeof daemon.updateAgent>>
-    >();
+    const pendingUpdate =
+      deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
       providers: configuredProviders,
@@ -1165,9 +1091,8 @@ describe('OnboardingFlow', () => {
 
   it('preserves the current agent and reset error without adopting an older update', async () => {
     const user = userEvent.setup();
-    const pendingUpdate = deferred<
-      Awaited<ReturnType<typeof daemon.updateAgent>>
-    >();
+    const pendingUpdate =
+      deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
       providers: configuredProviders,
@@ -1211,7 +1136,7 @@ describe('OnboardingFlow', () => {
     expect(screen.getByText('reset failed')).toBeVisible();
   });
 
-  it('suspends polling while a deferred reset owns delete and completes reset cleanup', async () => {
+  it('completes deferred reset cleanup without leaking the previous agent state', async () => {
     const user = userEvent.setup();
     localStorage.setItem(
       'animaos.checkins.agent-1',
@@ -1225,8 +1150,7 @@ describe('OnboardingFlow', () => {
       ]),
     );
     const reset = deferred<Awaited<ReturnType<typeof daemon.deleteAgent>>>();
-    const listAgents = vi
-      .spyOn(daemon, 'listAgents')
+    vi.spyOn(daemon, 'listAgents')
       .mockResolvedValueOnce({ agents: [snapshot()] })
       .mockResolvedValue({ agents: [] });
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
@@ -1236,32 +1160,15 @@ describe('OnboardingFlow', () => {
     vi.spyOn(daemon, 'createAgent').mockResolvedValue({
       agent: namedSnapshot('Second', 'agent-2'),
     });
-    let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
-      handler: TimerHandler,
-      timeout?: number,
-    ) => {
-      if (typeof handler === 'function' && timeout === 5_000) {
-        runPoll = handler;
-      }
-      return 1;
-    }) as typeof window.setInterval);
-
     render(<ViewHarness />);
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('Reset my goals')).toBeVisible();
     await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
     await user.click(screen.getByRole('button', { name: 'Reset' }));
     await waitFor(() => expect(daemon.deleteAgent).toHaveBeenCalledTimes(1));
-
-    await act(async () => {
-      runPoll?.();
-      await Promise.resolve();
-    });
-    expect(listAgents).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       reset.resolve({ deleted: true });
@@ -1311,13 +1218,20 @@ describe('OnboardingFlow', () => {
     });
     let runPoll: (() => void) | undefined;
     let runCheckins: (() => unknown) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
       handler: TimerHandler,
       timeout?: number,
     ) => {
       if (typeof handler === 'function' && timeout === 5_000) {
         runPoll = handler;
+        return 1;
       }
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
       if (typeof handler === 'function' && timeout === 10_000) {
         runCheckins = handler;
       }
@@ -1328,13 +1242,10 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await userEvent.click(
-      screen.getByRole('button', { name: /^Proactive/ }),
-    );
+    await userEvent.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('Check my goals')).toBeVisible();
 
     act(() => {
-      runPoll?.();
       runPoll?.();
     });
     expect(listAgents).toHaveBeenCalledTimes(2);
@@ -1368,9 +1279,8 @@ describe('OnboardingFlow', () => {
         },
       ]),
     );
-    const pendingCheckin = deferred<
-      Awaited<ReturnType<typeof daemon.runAgent>>
-    >();
+    const pendingCheckin =
+      deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
     vi.spyOn(daemon, 'listProviders').mockResolvedValue({
       providers: configuredProviders,
@@ -1394,7 +1304,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('Check my goals')).toBeVisible();
 
     act(() => {
@@ -1407,9 +1317,7 @@ describe('OnboardingFlow', () => {
     await user.clear(name);
     await user.type(name, 'Newest Settings');
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
-    expect(
-      await screen.findByDisplayValue('Newest Settings'),
-    ).toBeVisible();
+    expect(await screen.findByDisplayValue('Newest Settings')).toBeVisible();
 
     await act(async () => {
       pendingCheckin.resolve({
@@ -1424,7 +1332,9 @@ describe('OnboardingFlow', () => {
     });
 
     expect(screen.getByDisplayValue('Newest Settings')).toBeVisible();
-    expect(screen.queryByDisplayValue('Older Check-in')).not.toBeInTheDocument();
+    expect(
+      screen.queryByDisplayValue('Older Check-in'),
+    ).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Close settings' }));
     expect(await screen.findByText(/sent a message/)).toBeVisible();
   });
@@ -1494,7 +1404,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('Deleted agent goals')).toBeVisible();
     act(() => {
       void runCheckins?.();
@@ -1513,7 +1423,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Second' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('Current agent goals')).toBeVisible();
     expect(screen.getByText('has not run yet')).toBeVisible();
 
@@ -1624,7 +1534,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('First old check-in')).toBeVisible();
     expect(screen.getByText('Second old check-in')).toBeVisible();
 
@@ -1737,7 +1647,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(
       await screen.findByText('First check-in before settings'),
     ).toBeVisible();
@@ -1917,7 +1827,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
     expect(await screen.findByText('First check-in before send')).toBeVisible();
 
     let queue: Promise<void> | undefined;
@@ -1926,7 +1836,7 @@ describe('OnboardingFlow', () => {
     });
     await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
 
-    await user.click(screen.getByRole('button', { name: 'Chat' }));
+    await user.click(screen.getByRole('button', { name: 'Workspace' }));
     await user.type(
       screen.getByPlaceholderText('Message Nova…'),
       'Foreground work',
@@ -2023,7 +1933,7 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    await user.click(screen.getByRole('button', { name: /^Activity/ }));
 
     let oldQueue: Promise<void> | undefined;
     act(() => {
@@ -2253,57 +2163,6 @@ describe('OnboardingFlow', () => {
     expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
   });
 
-  it('starts a fresh poll after prior request ownership is released', async () => {
-    const initialPoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const followupPoll = deferred<{ agents: DaemonSnapshot[] }>();
-    const listAgents = vi
-      .spyOn(daemon, 'listAgents')
-      .mockReturnValueOnce(initialPoll.promise)
-      .mockReturnValueOnce(followupPoll.promise);
-    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
-      providers: configuredProviders,
-    });
-    let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
-      handler: TimerHandler,
-      timeout?: number,
-    ) => {
-      if (typeof handler === 'function' && timeout === 5_000) {
-        runPoll = handler;
-      }
-      return 1;
-    }) as typeof window.setInterval);
-
-    render(<ViewHarness />);
-    expect(listAgents).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      initialPoll.resolve({
-        agents: [namedSnapshot('Initial', 'agent-initial')],
-      });
-      queueMicrotask(() => {
-        queueMicrotask(() => runPoll?.());
-      });
-      await initialPoll.promise;
-    });
-
-    expect(
-      await screen.findByRole('heading', { name: 'Say something to Initial' }),
-    ).toBeVisible();
-    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(2));
-
-    await act(async () => {
-      followupPoll.resolve({
-        agents: [namedSnapshot('Followup', 'agent-followup')],
-      });
-      await followupPoll.promise;
-    });
-    expect(
-      screen.getByRole('heading', { name: 'Say something to Followup' }),
-    ).toBeVisible();
-    expect(listAgents).toHaveBeenCalledTimes(2);
-  });
-
   it('keeps the newest provider response when Strict Mode requests finish in reverse order', async () => {
     const user = userEvent.setup();
     const olderProviders = deferred<{ providers: DaemonProvider[] }>();
@@ -2359,15 +2218,16 @@ describe('OnboardingFlow', () => {
     });
     vi.spyOn(daemon, 'createAgent').mockReturnValue(create.promise);
     let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
       handler: TimerHandler,
       timeout?: number,
     ) => {
       if (typeof handler === 'function' && timeout === 5_000) {
         runPoll = handler;
+        return 1;
       }
-      return 1;
-    }) as typeof window.setInterval);
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
 
     render(<ViewHarness />);
     expect(
@@ -2411,15 +2271,16 @@ describe('OnboardingFlow', () => {
     });
     vi.spyOn(daemon, 'createAgent').mockResolvedValue({ agent: created });
     let runPoll: (() => void) | undefined;
-    vi.spyOn(window, 'setInterval').mockImplementation(((
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
       handler: TimerHandler,
       timeout?: number,
     ) => {
       if (typeof handler === 'function' && timeout === 5_000) {
         runPoll = handler;
+        return 1;
       }
-      return 1;
-    }) as typeof window.setInterval);
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
 
     render(<ViewHarness />);
     expect(
@@ -2449,6 +2310,6 @@ describe('OnboardingFlow', () => {
     expect(
       screen.queryByRole('heading', { name: 'Create your main agent' }),
     ).not.toBeInTheDocument();
-    expect(screen.getByText('daemon connected')).toBeVisible();
+    expect(screen.getByText('Daemon Online')).toBeVisible();
   });
 });

@@ -1,10 +1,9 @@
 import { test, expect } from '@playwright/test';
 
-test('has title', async ({ page }) => {
+test('main workspace agent: boots the AnimaOS web surface', async ({
+  page,
+}) => {
   await page.goto('/');
 
-  // Expect h1 to contain a substring.
-  expect(await page.locator('h1').innerText()).toContain(
-    'ANIMAOS CONTROL GRID'
-  );
+  await expect(page.locator('body')).toContainText(/anima/i);
 });

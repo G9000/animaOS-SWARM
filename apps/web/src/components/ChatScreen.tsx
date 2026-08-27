@@ -1,9 +1,19 @@
 import { useEffect, useRef } from 'react';
 import type { AgentDetail, ChatMessage } from '../lib/types';
-import { AlertIcon, BoltIcon, ChipIcon, GearIcon, PulseIcon, SendIcon } from './icons';
+import {
+  AlertIcon,
+  BoltIcon,
+  ChipIcon,
+  GearIcon,
+  PulseIcon,
+  SendIcon,
+} from './icons';
 import { ErrorBanner, formatTime, formatTokens, ghostBtnCls } from './ui-bits';
 
-const STATUS_STYLE: Record<AgentDetail['status'], { dot: string; ping: boolean; label: string }> = {
+const STATUS_STYLE: Record<
+  AgentDetail['status'],
+  { dot: string; ping: boolean; label: string }
+> = {
   Idle: { dot: 'bg-mint', ping: false, label: 'idle' },
   Running: { dot: 'bg-sky-400', ping: true, label: 'thinking' },
   Completed: { dot: 'bg-violet-400', ping: false, label: 'done' },
@@ -15,13 +25,23 @@ function StatusDot({ status }: { status: AgentDetail['status'] }) {
   const s = STATUS_STYLE[status] ?? STATUS_STYLE.Idle;
   return (
     <span className="relative flex h-2 w-2">
-      {s.ping && <span className={`animate-status-ping absolute inline-flex h-full w-full rounded-full ${s.dot}`} />}
+      {s.ping && (
+        <span
+          className={`animate-status-ping absolute inline-flex h-full w-full rounded-full ${s.dot}`}
+        />
+      )}
       <span className={`relative inline-flex h-2 w-2 rounded-full ${s.dot}`} />
     </span>
   );
 }
 
-function AgentAvatar({ name, size = 'md' }: { name: string; size?: 'sm' | 'md' }) {
+function AgentAvatar({
+  name,
+  size = 'md',
+}: {
+  name: string;
+  size?: 'sm' | 'md';
+}) {
   const dims = size === 'sm' ? 'h-7 w-7 text-xs' : 'h-9 w-9 text-sm';
   return (
     <div
@@ -55,7 +75,9 @@ export function ChatHeader({
               {agent.name}
             </span>
             <StatusDot status={agent.status} />
-            <span className={`font-mono text-[10px] uppercase tracking-wider ${agent.status === 'Running' ? 'text-shimmer' : 'text-ink-3'}`}>
+            <span
+              className={`font-mono text-[10px] uppercase tracking-wider ${agent.status === 'Running' ? 'text-shimmer' : 'text-ink-3'}`}
+            >
               {online === false ? 'offline' : status.label}
             </span>
           </div>
@@ -64,7 +86,10 @@ export function ChatHeader({
               {agent.provider}/{agent.model}
             </span>
             {totalTokens > 0 && (
-              <span className="flex items-center gap-1" title="total tokens used">
+              <span
+                className="flex items-center gap-1"
+                title="total tokens used"
+              >
                 <ChipIcon size={11} />
                 {formatTokens(totalTokens)}
               </span>
@@ -101,8 +126,12 @@ function Bubble({ message }: { message: ChatMessage }) {
   }
   const isUser = message.role === 'User';
   return (
-    <div className={`animate-msg-in flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className={`flex max-w-[85%] flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+    <div
+      className={`animate-msg-in flex ${isUser ? 'justify-end' : 'justify-start'}`}
+    >
+      <div
+        className={`flex max-w-[85%] flex-col ${isUser ? 'items-end' : 'items-start'}`}
+      >
         <div
           className={`whitespace-pre-wrap break-words px-4 py-2.5 text-sm leading-relaxed ${
             isUser
@@ -183,7 +212,9 @@ function ThinkingIndicator({ name }: { name: string }) {
           />
         ))}
       </div>
-      <span className="text-shimmer font-mono text-[11px]">{name} is thinking</span>
+      <span className="text-shimmer font-mono text-[11px]">
+        {name} is thinking
+      </span>
     </div>
   );
 }
@@ -200,7 +231,11 @@ export function MessageList({
   onSuggestion: (text: string) => void;
 }) {
   return (
-    <div ref={scrollerRef} className="relative z-[1] flex-1 overflow-y-auto">
+    <div
+      ref={scrollerRef}
+      className="relative z-[1] min-h-0 flex-1 overflow-y-auto"
+      aria-label={`Conversation with ${agent.name}`}
+    >
       {agent.messages.length === 0 && !sending ? (
         <EmptyState agentName={agent.name} onPick={onSuggestion} />
       ) : (
@@ -249,7 +284,11 @@ export function Composer({
       <div className="mx-auto w-full max-w-3xl">
         {error && (
           <div className="mb-2.5">
-            <ErrorBanner message={error} onDismiss={onDismissError} icon={<AlertIcon size={14} />} />
+            <ErrorBanner
+              message={error}
+              onDismiss={onDismissError}
+              icon={<AlertIcon size={14} />}
+            />
           </div>
         )}
         <div className="glass-strong focus-glow flex items-end gap-2 rounded-2xl p-2 shadow-xl shadow-black/30 transition-all duration-200">
