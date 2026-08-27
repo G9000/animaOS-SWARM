@@ -233,6 +233,44 @@ describe('ViewHarness workspace controller', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
+  it('promotes the next agent and keeps its controller usable when local cleanup fails after DELETE', async () => {
+    const user = userEvent.setup();
+    const first = snapshot('agent-first', 'First', 1);
+    const next = snapshot('agent-next', 'Next', 2);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [next, first] });
+    mockProviders();
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+    const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+      agent: withMessage(next, 'Next is responsive'),
+      result: {
+        status: 'success',
+        durationMs: 1,
+        data: { text: 'Next is responsive' },
+      },
+    });
+    const removeItem = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation(() => {
+        throw new DOMException('Storage access denied', 'SecurityError');
+      });
+
+    render(<ViewHarness />);
+
+    await screen.findByRole('heading', { name: 'Say something to First' });
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Next' }),
+    ).toBeVisible();
+    expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-first');
+    await user.type(screen.getByPlaceholderText('Message Next…'), 'Continue');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(runAgent).toHaveBeenCalledWith('agent-next', 'Continue');
+    expect(await screen.findByText('Next is responsive')).toBeVisible();
+  });
+
   it('patches main identity, provider, model, and system while preserving its messages', async () => {
     const user = userEvent.setup();
     const nova = snapshot('agent-main', 'Nova', 1);
@@ -304,6 +342,32 @@ describe('ViewHarness workspace controller', () => {
     expect(
       await screen.findByRole('heading', { name: 'Create your main agent' }),
     ).toBeVisible();
+    expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
+  });
+
+  it('returns to onboarding when local cleanup fails after the final DELETE', async () => {
+    const user = userEvent.setup();
+    const only = snapshot('agent-only', 'Only', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [only] });
+    mockProviders();
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+    const removeItem = vi
+      .spyOn(Storage.prototype, 'removeItem')
+      .mockImplementation(() => {
+        throw new DOMException('Storage access denied', 'SecurityError');
+      });
+
+    render(<ViewHarness />);
+
+    await screen.findByRole('heading', { name: 'Say something to Only' });
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+    expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-only');
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });
 

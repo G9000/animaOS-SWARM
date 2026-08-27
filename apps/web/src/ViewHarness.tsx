@@ -386,18 +386,26 @@ export function ViewHarness() {
     setResetting(true);
     setError(null);
     try {
-      await daemon.deleteAgent(targetAgentId);
+      try {
+        await daemon.deleteAgent(targetAgentId);
+      } catch (caught) {
+        if (isCurrentResetOperation(operation)) {
+          setError(caught instanceof Error ? caught.message : String(caught));
+        }
+        return;
+      }
+
       const ownsSelectedMain = isCurrentResetOperation(operation);
       if (ownsSelectedMain) {
         agentLifecycleGenerationRef.current += 1;
         agentOperationGenerationRef.current += 1;
         currentAgentIdRef.current = null;
       }
-      clearCheckins(targetAgentId);
       removeAgentSnapshot(targetAgentId);
-    } catch (caught) {
-      if (isCurrentResetOperation(operation)) {
-        setError(caught instanceof Error ? caught.message : String(caught));
+      try {
+        clearCheckins(targetAgentId);
+      } catch {
+        // The daemon deletion is authoritative; local cleanup is best-effort.
       }
     } finally {
       if (resetInFlightRef.current === operation) {
