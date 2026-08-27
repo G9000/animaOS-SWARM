@@ -102,6 +102,36 @@ function snapshotWithReply(text: string): DaemonSnapshot {
   };
 }
 
+function namedSnapshotWithReply(
+  name: string,
+  id: string,
+  text: string,
+): DaemonSnapshot {
+  const base = namedSnapshot(name, id);
+  return {
+    ...base,
+    messageCount: 2,
+    messages: [
+      {
+        id: 'message-user',
+        agentId: id,
+        roomId: 'room-1',
+        content: { text: 'New work' },
+        role: 'user',
+        createdAtMs: 2,
+      },
+      {
+        id: 'message-assistant',
+        agentId: id,
+        roomId: 'room-1',
+        content: { text },
+        role: 'assistant',
+        createdAtMs: 3,
+      },
+    ],
+  };
+}
+
 function deferred<Value>() {
   let resolve!: (value: Value) => void;
   let reject!: (reason?: unknown) => void;
@@ -1446,6 +1476,287 @@ describe('OnboardingFlow', () => {
     });
     await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(3));
     expect(localStorage.getItem('animaos.checkins.agent-1')).toBeNull();
+  });
+
+  it('stops a captured due queue before an old check-in can invalidate new agent work', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    localStorage.setItem(
+      'animaos.checkins.agent-1',
+      JSON.stringify([
+        {
+          id: 'old-checkin-1',
+          prompt: 'First old check-in',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+        {
+          id: 'old-checkin-2',
+          prompt: 'Second old check-in',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    const firstOldCheckin =
+      deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    const newAgentRun = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const runAgent = vi
+      .spyOn(daemon, 'runAgent')
+      .mockReturnValueOnce(firstOldCheckin.promise)
+      .mockReturnValueOnce(newAgentRun.promise)
+      .mockResolvedValue({
+        agent: snapshot(),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: CHECKIN_SENTINEL },
+        },
+      });
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+    vi.spyOn(daemon, 'createAgent').mockResolvedValue({
+      agent: namedSnapshot('Second', 'agent-2'),
+    });
+    let runCheckins: (() => Promise<void>) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 10_000) {
+        runCheckins = handler as () => Promise<void>;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    expect(await screen.findByText('First old check-in')).toBeVisible();
+    expect(screen.getByText('Second old check-in')).toBeVisible();
+
+    let oldQueue: Promise<void> | undefined;
+    act(() => {
+      oldQueue = runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+    await goToReview(user);
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Second' }),
+    ).toBeVisible();
+
+    await user.type(screen.getByPlaceholderText('Message Second…'), 'New work');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      firstOldCheckin.resolve({
+        agent: snapshot(),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: CHECKIN_SENTINEL },
+        },
+      });
+      await oldQueue;
+    });
+
+    expect(runAgent).toHaveBeenCalledTimes(2);
+    expect(runAgent).not.toHaveBeenCalledWith(
+      'agent-1',
+      expect.stringContaining('Second old check-in'),
+      expect.anything(),
+    );
+
+    await act(async () => {
+      newAgentRun.resolve({
+        agent: namedSnapshotWithReply('Second', 'agent-2', 'Current reply'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Current reply' },
+        },
+      });
+      await newAgentRun.promise;
+    });
+    expect(await screen.findByText('Current reply')).toBeVisible();
+  });
+
+  it('stops an active due queue as soon as reset owns the agent lifecycle', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    localStorage.setItem(
+      'animaos.checkins.agent-1',
+      JSON.stringify([
+        {
+          id: 'checkin-1',
+          prompt: 'First pending check-in',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+        {
+          id: 'checkin-2',
+          prompt: 'Second blocked check-in',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    const firstCheckin =
+      deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    const reset = deferred<Awaited<ReturnType<typeof daemon.deleteAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const runAgent = vi
+      .spyOn(daemon, 'runAgent')
+      .mockReturnValueOnce(firstCheckin.promise)
+      .mockResolvedValue({
+        agent: snapshot(),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: CHECKIN_SENTINEL },
+        },
+      });
+    vi.spyOn(daemon, 'deleteAgent').mockReturnValue(reset.promise);
+    let runCheckins: (() => Promise<void>) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 10_000) {
+        runCheckins = handler as () => Promise<void>;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+
+    let oldQueue: Promise<void> | undefined;
+    act(() => {
+      oldQueue = runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    await waitFor(() => expect(daemon.deleteAgent).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      firstCheckin.resolve({
+        agent: snapshot(),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: CHECKIN_SENTINEL },
+        },
+      });
+      await oldQueue;
+    });
+
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(runAgent).not.toHaveBeenCalledWith(
+      'agent-1',
+      expect.stringContaining('Second blocked check-in'),
+      expect.anything(),
+    );
+
+    await act(async () => {
+      reset.reject(new Error('reset failed'));
+      await reset.promise.catch(() => undefined);
+    });
+    expect((await screen.findAllByText('reset failed')).length).toBeGreaterThan(
+      0,
+    );
+  });
+
+  it('does not start a check-in while a failing reset owns the agent lifecycle', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    localStorage.setItem(
+      'animaos.checkins.agent-1',
+      JSON.stringify([
+        {
+          id: 'checkin-1',
+          prompt: 'Do not run during reset',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    const reset = deferred<Awaited<ReturnType<typeof daemon.deleteAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+      agent: snapshot(),
+      result: {
+        status: 'success',
+        durationMs: 1,
+        data: { text: CHECKIN_SENTINEL },
+      },
+    });
+    vi.spyOn(daemon, 'deleteAgent').mockReturnValue(reset.promise);
+    let runCheckins: (() => unknown) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 10_000) {
+        runCheckins = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    await waitFor(() => expect(daemon.deleteAgent).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await runCheckins?.();
+    });
+    expect(runAgent).not.toHaveBeenCalled();
+
+    await act(async () => {
+      reset.reject(new Error('reset failed'));
+      await reset.promise.catch(() => undefined);
+    });
+
+    expect((await screen.findAllByText('reset failed')).length).toBeGreaterThan(
+      0,
+    );
+    await user.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+
+    act(() => {
+      void runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
   });
 
   it('starts a fresh poll after prior request ownership is released', async () => {

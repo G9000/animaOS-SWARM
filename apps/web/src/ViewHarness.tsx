@@ -63,6 +63,7 @@ export function ViewHarness() {
   const agentLifecycleGenerationRef = useRef(0);
   const sendingOperationGenerationRef = useRef<number | null>(null);
   const settingsOperationGenerationRef = useRef<number | null>(null);
+  const resetOperationGenerationRef = useRef<number | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
   const agentRequestTokenRef = useRef(0);
   const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
@@ -267,13 +268,25 @@ export function ViewHarness() {
   useEffect(() => {
     if (!agentId) return;
     const timer = setInterval(async () => {
-      if (checkinRunningRef.current || sendingRef.current) return;
+      if (
+        checkinRunningRef.current ||
+        sendingRef.current ||
+        resetOperationGenerationRef.current !== null
+      )
+        return;
       const due = checkinsRef.current.filter((c) => isDue(c, Date.now()));
       if (due.length === 0) return;
       const runGeneration = ++checkinRunGenerationRef.current;
+      const lifecycleGeneration = agentLifecycleGenerationRef.current;
       checkinRunningRef.current = true;
       try {
         for (const c of due) {
+          if (
+            runGeneration !== checkinRunGenerationRef.current ||
+            lifecycleGeneration !== agentLifecycleGenerationRef.current ||
+            resetOperationGenerationRef.current !== null
+          )
+            break;
           await runCheckin(agentId, c);
         }
       } finally {
@@ -343,6 +356,7 @@ export function ViewHarness() {
     if (!agent) return;
     const targetAgentId = agent.id;
     const operation = beginAgentOperation(targetAgentId);
+    resetOperationGenerationRef.current = operation.generation;
     const sendingGeneration = sendingOperationGenerationRef.current;
     const settingsGeneration = settingsOperationGenerationRef.current;
     setError(null);
@@ -370,6 +384,10 @@ export function ViewHarness() {
     } catch (e) {
       if (isCurrentAgentOperation(operation)) {
         setError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (resetOperationGenerationRef.current === operation.generation) {
+        resetOperationGenerationRef.current = null;
       }
     }
   };
