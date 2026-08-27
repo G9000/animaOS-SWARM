@@ -32,6 +32,13 @@ function between(source: string, start: string, end: string): string {
   return source.slice(startIndex, endIndex);
 }
 
+function cssRule(source: string, selector: string): string {
+  const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const rule = source.match(new RegExp(`${escapedSelector}\\s*{([^}]*)}`))?.[1];
+  expect(rule).toBeDefined();
+  return rule ?? '';
+}
+
 function cssHexToken(styles: string, token: string): string {
   const value = styles.match(
     new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, 'i'),
@@ -110,23 +117,42 @@ describe('Neon Rose spatial visual contract', () => {
     );
   });
 
-  it('owns viewport and bottom safe areas without double-padding', () => {
+  it('binds every safe-area edge to active surfaces without double-padding', () => {
     const index = readFileSync(resolve(sourceRoot, '../index.html'), 'utf8');
-    const composer = between(styles, '.safe-composer {', '.safe-bottom-dock');
+    const appFrame = cssRule(styles, '.safe-app-frame');
+    const composer = cssRule(styles, '.safe-composer');
+    const dock = cssRule(styles, '.safe-bottom-dock');
+    const workspace = cssRule(styles, '.workspace-mobile-safe');
+    const settings = cssRule(styles, '.safe-settings-sheet');
     const orbPulse = between(styles, '@keyframes orb-pulse', '.animate-orb');
 
     expect(index).toContain('viewport-fit=cover');
-    expect(read('app/app.tsx')).toContain('app-viewport');
+    expect(read('app/app.tsx')).toContain('app-viewport safe-app-frame');
     expect(styles).toMatch(
       /\.app-viewport\s*{[^}]*height:\s*100vh;[^}]*height:\s*100dvh;/s,
     );
-    expect(styles).toContain('.safe-settings-sheet');
+    expect(appFrame).toContain('padding-top: var(--safe-area-top)');
+    expect(appFrame).toContain('padding-right: var(--safe-area-right)');
+    expect(appFrame).toContain('padding-bottom: var(--safe-area-bottom)');
+    expect(appFrame).toContain('padding-left: var(--safe-area-left)');
+    expect(read('components/onboarding/OnboardingFlow.tsx')).toContain(
+      'flex flex-1',
+    );
+    expect(read('components/WorkspaceShell.tsx')).toContain(
+      "'safe-bottom-dock glass-strong absolute",
+    );
     expect(read('components/SettingsPanel.tsx')).toContain(
       'safe-settings-sheet',
     );
+    expect(settings).toContain('padding-top: var(--safe-area-top)');
+    expect(settings).toContain('padding-right: var(--safe-area-right)');
+    expect(settings).toContain('padding-bottom: var(--safe-area-bottom)');
+    expect(settings).toContain('padding-left: var(--safe-area-left)');
     expect(styles.match(/env\(safe-area-inset-bottom/g)).toHaveLength(1);
-    expect(composer).not.toContain('safe-area-inset-bottom');
-    expect(composer).not.toContain('--safe-area-');
+    for (const workspaceBottomConsumer of [composer, dock, workspace]) {
+      expect(workspaceBottomConsumer).not.toContain('--safe-area-bottom');
+      expect(workspaceBottomConsumer).not.toContain('--safe-area-navigation');
+    }
     expect(orbPulse).not.toContain('filter:');
   });
 
@@ -140,8 +166,9 @@ describe('Neon Rose spatial visual contract', () => {
   it('exposes focus, safe-area, responsive shell, and motion semantics', () => {
     expect(styles).toContain(':focus-visible');
     expect(styles).toContain('--safe-area-top');
+    expect(styles).toContain('--safe-area-right');
     expect(styles).toContain('--safe-area-bottom');
-    expect(styles).toContain('--safe-area-navigation');
+    expect(styles).toContain('--safe-area-left');
     expect(styles).toContain('@media (prefers-reduced-motion: reduce)');
     expect(styles).toContain('.agent-orb');
 

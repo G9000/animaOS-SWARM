@@ -30,8 +30,9 @@
 :root {
   --color-accent-rgb: 255 57 127;
   --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-right: env(safe-area-inset-right, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
-  --safe-area-navigation: var(--safe-area-bottom);
+  --safe-area-left: env(safe-area-inset-left, 0px);
 }
 
 * {
@@ -47,6 +48,13 @@ body,
 .app-viewport {
   height: 100vh;
   height: 100dvh;
+}
+
+.safe-app-frame {
+  padding-top: var(--safe-area-top);
+  padding-right: var(--safe-area-right);
+  padding-bottom: var(--safe-area-bottom);
+  padding-left: var(--safe-area-left);
 }
 
 body {
@@ -242,23 +250,18 @@ select.field option {
 }
 
 .safe-bottom-dock {
-  bottom: max(0.75rem, var(--safe-area-navigation));
+  bottom: 0.75rem;
 }
 
 .workspace-mobile-safe {
-  padding-bottom: calc(5.5rem + var(--safe-area-navigation));
+  padding-bottom: 5.5rem;
 }
 
 .safe-settings-sheet {
   padding-top: var(--safe-area-top);
+  padding-right: var(--safe-area-right);
   padding-bottom: var(--safe-area-bottom);
-}
-
-@media (min-width: 640px) {
-  .safe-settings-sheet {
-    padding-top: 0;
-    padding-bottom: 0;
-  }
+  padding-left: var(--safe-area-left);
 }
 
 @media (min-width: 768px) {

@@ -55,7 +55,7 @@ function DestinationNavigation({
       className={
         placement === 'top-shell'
           ? 'glass relative z-20 mx-auto mt-2 flex w-[min(calc(100%-2rem),40rem)] items-center justify-center gap-1 rounded-2xl p-1.5'
-          : 'safe-bottom-dock glass-strong fixed inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
+          : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
       }
     >
       {DESTINATIONS.map((item) => {

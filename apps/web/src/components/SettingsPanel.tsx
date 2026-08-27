@@ -241,7 +241,7 @@ export function SettingsPanel({
       ) : null}
       <div
         data-testid="settings-backdrop"
-        className="animate-fade-in absolute inset-0 z-10 bg-black/50 backdrop-blur-[2px]"
+        className="animate-fade-in fixed inset-0 z-10 bg-black/50 backdrop-blur-[2px]"
         onClick={requestClose}
       />
       <aside
@@ -252,7 +252,7 @@ export function SettingsPanel({
         aria-labelledby="settings-heading"
         aria-busy={controlsDisabled}
         tabIndex={-1}
-        className="safe-settings-sheet animate-slide-in-right absolute inset-0 z-20 flex w-full flex-col bg-panel/95 shadow-2xl shadow-black/70 backdrop-blur-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-md sm:border-l sm:border-line"
+        className="safe-settings-sheet animate-slide-in-right fixed inset-0 z-20 flex w-full flex-col bg-panel/95 shadow-2xl shadow-black/70 backdrop-blur-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-md sm:border-l sm:border-line"
       >
         {/* Panel header */}
         <div className="flex items-center justify-between border-b border-line px-5 py-4 sm:px-6">

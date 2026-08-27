@@ -16,6 +16,10 @@ interface BrowserElement {
         animationDuration: string;
         animationIterationCount: string;
         height: string;
+        paddingBottom: string;
+        paddingLeft: string;
+        paddingRight: string;
+        paddingTop: string;
         transitionDuration: string;
       };
     } | null;
@@ -503,6 +507,63 @@ test('main workspace agent: 390x844 viewport places the same destinations in a b
     'Daemon Offline',
     { timeout: 7_000 },
   );
+});
+
+test('main workspace agent: landscape safe-area insets protect workspace and settings chrome', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 844, height: 390 });
+  await installApiFixture(page, {
+    agents: [agentSnapshot('agent-main', 'Nova', 1)],
+  });
+  await page.goto('/');
+  await page.locator('html').evaluate((element) => {
+    const style = (
+      element as unknown as {
+        style: { setProperty(property: string, value: string): void };
+      }
+    ).style;
+    style.setProperty('--safe-area-top', '13px');
+    style.setProperty('--safe-area-right', '29px');
+    style.setProperty('--safe-area-bottom', '17px');
+    style.setProperty('--safe-area-left', '23px');
+  });
+
+  const safePadding = async (selector: string) =>
+    page.locator(selector).evaluate((element) => {
+      const browserElement = element as unknown as BrowserElement;
+      const style =
+        browserElement.ownerDocument.defaultView?.getComputedStyle(
+          browserElement,
+        );
+      if (!style) throw new Error('safe-area surface has no browser view');
+      return [
+        style.paddingTop,
+        style.paddingRight,
+        style.paddingBottom,
+        style.paddingLeft,
+      ];
+    });
+
+  expect(await safePadding('.app-viewport')).toEqual([
+    '13px',
+    '29px',
+    '17px',
+    '23px',
+  ]);
+  const headerBox = await page.locator('header').boundingBox();
+  expect(headerBox?.x).toBeGreaterThanOrEqual(23);
+  expect((headerBox?.x ?? 0) + (headerBox?.width ?? 0)).toBeLessThanOrEqual(
+    844 - 29,
+  );
+
+  await page.getByRole('button', { name: 'Settings' }).click();
+  expect(await safePadding('[role="dialog"]')).toEqual([
+    '13px',
+    '29px',
+    '17px',
+    '23px',
+  ]);
 });
 
 test('main workspace agent: reduced motion keeps the workspace operable with near-instant motion', async ({
