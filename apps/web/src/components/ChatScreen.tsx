@@ -33,7 +33,7 @@ function Bubble({ message }: { message: ChatMessage }) {
         <div
           className={`whitespace-pre-wrap break-words px-4 py-2.5 text-sm leading-relaxed ${
             isUser
-              ? 'rounded-2xl rounded-br-md border border-accent/30 bg-panel-2/90 text-ink shadow-lg shadow-accent/10'
+              ? 'rounded-2xl rounded-br-md border border-line-strong bg-panel-2/90 text-ink shadow-lg shadow-black/25'
               : 'glass rounded-2xl rounded-bl-md text-ink'
           }`}
         >
@@ -90,9 +90,11 @@ function EmptyState({
           <button
             key={s.text}
             onClick={() => onPick(s.text)}
-            className="glass flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs text-ink-2 transition-all duration-150 hover:border-accent/40 hover:text-ink hover:shadow-[0_0_16px_-4px_rgba(255,57,127,0.4)]"
+            className="glass group flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs text-ink-2 transition-all duration-150 hover:border-accent/40 hover:text-ink hover:shadow-[0_0_16px_-4px_rgba(255,57,127,0.4)] focus-visible:border-accent/40"
           >
-            <span className="text-accent">{s.icon}</span>
+            <span className="text-ink-3 transition group-hover:text-accent group-focus-visible:text-accent">
+              {s.icon}
+            </span>
             {s.text}
           </button>
         ))}

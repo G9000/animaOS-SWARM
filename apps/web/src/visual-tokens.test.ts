@@ -22,6 +22,16 @@ function read(relativePath: string): string {
   return readFileSync(join(sourceRoot, relativePath), 'utf8');
 }
 
+function between(source: string, start: string, end: string): string {
+  const startIndex = source.indexOf(start);
+  const endIndex = source.indexOf(end, startIndex + start.length);
+
+  expect(startIndex).toBeGreaterThanOrEqual(0);
+  expect(endIndex).toBeGreaterThan(startIndex);
+
+  return source.slice(startIndex, endIndex);
+}
+
 describe('Neon Rose spatial visual contract', () => {
   const styles = read('styles.css');
   const production = productionSources(sourceRoot)
@@ -59,5 +69,48 @@ describe('Neon Rose spatial visual contract', () => {
       'data-surface="settings-sheet-drawer"',
     );
     expect(production).toContain('data-motion="agent-orb"');
+  });
+
+  it('keeps unknown connection feedback neutral', () => {
+    const connecting = between(
+      read('ViewHarness.tsx'),
+      'function ConnectingState()',
+      'function OfflineRetry',
+    );
+
+    expect(connecting).toContain('bg-ink-3');
+    expect(connecting).not.toMatch(
+      /(?:bg|text|shadow)-accent|255,\s*57,\s*127/,
+    );
+    expect(connecting).not.toMatch(/(?:bg|text|shadow)-mint/);
+  });
+
+  it('keeps ordinary conversation surfaces neutral until interaction', () => {
+    const chat = read('components/ChatScreen.tsx');
+    const bubble = between(chat, 'function Bubble', 'const SUGGESTIONS');
+    const suggestions = between(
+      chat,
+      '{SUGGESTIONS.map',
+      'function ThinkingIndicator',
+    );
+
+    expect(bubble).toContain('bg-panel-2/90');
+    expect(bubble).not.toContain('accent');
+    expect(suggestions).toContain('text-ink-3');
+    expect(suggestions).not.toContain('className="text-accent"');
+    expect(suggestions).toContain('group-hover:text-accent');
+    expect(suggestions).toContain('group-focus-visible:text-accent');
+  });
+
+  it('keeps onboarding decorative copy neutral', () => {
+    const onboarding = read('components/onboarding/OnboardingFlow.tsx');
+    const header = between(
+      onboarding,
+      '<header className="space-y-2 text-center">',
+      '<OnboardingProgress',
+    );
+
+    expect(header).toContain('text-ink-3');
+    expect(header).not.toContain('text-accent');
   });
 });

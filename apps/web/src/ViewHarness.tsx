@@ -50,7 +50,7 @@ function ConnectingState() {
           {[0, 1, 2].map((index) => (
             <span
               key={index}
-              className="typing-dot h-2 w-2 rounded-full bg-accent shadow-[0_0_12px_rgba(255,57,127,0.7)]"
+              className="typing-dot h-2 w-2 rounded-full bg-ink-3"
               style={{ animationDelay: `${index * 150}ms` }}
             />
           ))}

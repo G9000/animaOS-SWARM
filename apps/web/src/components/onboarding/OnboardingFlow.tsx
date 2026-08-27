@@ -373,7 +373,7 @@ export function OnboardingFlow({
     <div className="relative z-[1] flex flex-1 items-center justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10">
       <div className="w-full max-w-2xl space-y-6">
         <header className="space-y-2 text-center">
-          <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-accent">
+          <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-ink-3">
             Guided Focus · Main agent
           </p>
           <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
