@@ -34,7 +34,7 @@ export function OnboardingProgress({ currentStep }: OnboardingProgressProps) {
             <span
               className={`mx-auto flex h-5 w-5 items-center justify-center rounded-full font-mono text-[9px] ${
                 active
-                  ? 'bg-accent text-white'
+                  ? 'bg-accent text-abyss'
                   : complete
                     ? 'bg-mint/15 text-mint'
                     : 'bg-white/[0.04] text-ink-3'

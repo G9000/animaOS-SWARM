@@ -107,6 +107,12 @@ describe('WorkspaceShell', () => {
     expect(screen.getByLabelText('Agent running')).toBeVisible();
     expect(screen.getByText('Access Custom')).toBeVisible();
     expect(screen.getByLabelText('Custom access profile')).toBeVisible();
+    expect(screen.getByTestId('compact-daemon-status')).toHaveTextContent(
+      'Daemon Offline',
+    );
+    expect(screen.getByTestId('compact-daemon-status')).toHaveClass(
+      'sm:hidden',
+    );
   });
 
   it('marks the selected agent as Main and keeps additional agents read-only', async () => {

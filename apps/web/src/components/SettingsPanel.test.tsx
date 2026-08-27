@@ -77,6 +77,30 @@ function renderPanel(
 }
 
 describe('SettingsPanel access', () => {
+  it('opens as a labelled modal and keeps keyboard focus inside it', async () => {
+    const user = userEvent.setup();
+    renderPanel(agent());
+
+    const dialog = screen.getByRole('dialog', { name: 'Agent settings' });
+    const close = screen.getByRole('button', { name: 'Close settings' });
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog).toHaveAttribute('aria-labelledby', 'settings-heading');
+    expect(close).toHaveFocus();
+
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    const last = focusable.at(-1);
+    expect(last).toBeDefined();
+
+    await user.tab({ shift: true });
+    expect(last).toHaveFocus();
+    await user.tab();
+    expect(close).toHaveFocus();
+  });
+
   it.each<AccessProfile>(['observe', 'collaborate', 'operate'])(
     'derives and displays the %s profile regardless of tool order',
     (profileName) => {

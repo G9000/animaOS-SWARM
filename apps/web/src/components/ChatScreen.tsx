@@ -39,7 +39,7 @@ function Bubble({ message }: { message: ChatMessage }) {
         >
           {message.content.text}
         </div>
-        <span className="mt-1 px-1 font-mono text-[10px] text-ink-3/60">
+        <span className="mt-1 px-1 font-mono text-[10px] text-ink-3">
           {formatTime(message.created_at_ms)}
         </span>
       </div>
@@ -214,12 +214,12 @@ export function Composer({
             onClick={onSend}
             disabled={disabled || sending || !draft.trim()}
             aria-label="Send"
-            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-white shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
+            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-abyss shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
           >
             <SendIcon size={15} />
           </button>
         </div>
-        <div className="mt-2 flex items-center justify-between px-2 font-mono text-[10px] text-ink-3/60">
+        <div className="mt-2 flex items-center justify-between px-2 font-mono text-[10px] text-ink-3">
           <span>⏎ send · ⇧⏎ new line</span>
           <span>anima-daemon</span>
         </div>

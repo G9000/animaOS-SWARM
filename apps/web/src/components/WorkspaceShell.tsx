@@ -68,7 +68,7 @@ function DestinationNavigation({
             aria-current={active ? 'page' : undefined}
             className={`inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition md:max-w-40 ${
               active
-                ? 'bg-accent/12 text-accent shadow-[inset_0_0_0_1px_rgba(255,57,127,0.18)]'
+                ? 'bg-accent/12 text-accent shadow-[inset_0_0_0_1px_rgb(var(--color-accent-rgb)/0.18)]'
                 : 'text-ink-3 hover:bg-white/[0.04] hover:text-ink'
             }`}
           >

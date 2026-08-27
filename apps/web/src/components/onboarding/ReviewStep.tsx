@@ -105,7 +105,7 @@ export function ReviewStep({
         </button>
         <button
           type="button"
-          className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:opacity-60 disabled:shadow-none"
+          className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-abyss shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:opacity-60 disabled:shadow-none"
           onClick={onSubmit}
           disabled={creating}
         >

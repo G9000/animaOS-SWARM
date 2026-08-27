@@ -424,7 +424,7 @@ export function OnboardingFlow({
               <button
                 type="button"
                 disabled={currentStep === 1 && !intelligenceReady}
-                className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
+                className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-abyss shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
                 onClick={goNext}
               >
                 Next

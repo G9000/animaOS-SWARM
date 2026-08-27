@@ -126,6 +126,36 @@ afterEach(() => {
 });
 
 describe('ViewHarness workspace controller', () => {
+  it('makes the workspace inert while settings are open and restores trigger focus on close', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+
+    render(<ViewHarness />);
+
+    const trigger = await screen.findByRole('button', { name: 'Settings' });
+    await user.click(trigger);
+    expect(screen.getByTestId('workspace-background')).toHaveAttribute(
+      'aria-hidden',
+      'true',
+    );
+    expect(screen.getByTestId('workspace-background')).toHaveAttribute('inert');
+    expect(
+      screen.getByRole('dialog', { name: 'Agent settings' }),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Close settings' }));
+    await waitFor(() => expect(trigger).toHaveFocus());
+    expect(screen.getByTestId('workspace-background')).not.toHaveAttribute(
+      'aria-hidden',
+    );
+    expect(screen.getByTestId('workspace-background')).not.toHaveAttribute(
+      'inert',
+    );
+  });
+
   it('renders neutral connecting copy for unknown connection state and never claims connected', () => {
     vi.spyOn(daemon, 'health').mockReturnValue(new Promise(() => undefined));
     vi.spyOn(daemon, 'listAgents').mockReturnValue(
@@ -381,7 +411,7 @@ describe('ViewHarness workspace controller', () => {
       name: 'Nova Prime',
       tools: toolNamesForProfile('operate'),
     });
-    const panel = screen.getByRole('complementary');
+    const panel = screen.getByRole('dialog', { name: 'Agent settings' });
     expect(within(panel).getByDisplayValue('Nova Prime')).toBeDisabled();
     expect(
       within(panel).getByRole('radio', { name: /^Operate/ }),
@@ -462,7 +492,7 @@ describe('ViewHarness workspace controller', () => {
     ).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Settings' }));
 
-    const panel = screen.getByRole('complementary');
+    const panel = screen.getByRole('dialog', { name: 'Agent settings' });
     expect(
       within(panel).queryByText('workspace connection failed'),
     ).not.toBeInTheDocument();

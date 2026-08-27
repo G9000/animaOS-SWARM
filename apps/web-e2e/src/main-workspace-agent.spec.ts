@@ -15,6 +15,7 @@ interface BrowserElement {
       getComputedStyle(target: unknown): {
         animationDuration: string;
         animationIterationCount: string;
+        height: string;
         transitionDuration: string;
       };
     } | null;
@@ -92,6 +93,7 @@ async function installApiFixture(
     failFirstCreate?: boolean;
     failFirstProviders?: boolean;
     failFirstPatch?: boolean;
+    failAgentListsAfterFirst?: boolean;
   } = {},
 ) {
   const state = {
@@ -99,6 +101,7 @@ async function installApiFixture(
     createAttempts: 0,
     patchAttempts: 0,
     providerAttempts: 0,
+    agentListAttempts: 0,
   };
 
   await page.route('**/api/**', async (route) => {
@@ -128,6 +131,11 @@ async function installApiFixture(
       return;
     }
     if (path === '/agents' && request.method() === 'GET') {
+      state.agentListAttempts += 1;
+      if (options.failAgentListsAfterFirst && state.agentListAttempts > 1) {
+        await fulfillJson(route, { error: 'daemon unavailable' }, 503);
+        return;
+      }
       await fulfillJson(route, { agents: state.agents });
       return;
     }
@@ -316,7 +324,7 @@ test('main workspace agent: successful POST transitions directly into the center
   await expect(
     page.getByRole('navigation', { name: 'Workspace navigation' }),
   ).toBeVisible();
-  await expect(page.getByText('Daemon Online')).toBeVisible();
+  await expect(page.getByLabel('Daemon online')).toBeVisible();
   await expect(page.getByText('Agent Idle')).toBeVisible();
   await expect(page.getByText('Access Collaborate')).toBeVisible();
 });
@@ -348,7 +356,18 @@ test('main workspace agent: failed PATCH keeps settings draft and prior main-age
 
   await expect(page.getByText('Existing conversation')).toBeVisible();
   await page.getByRole('button', { name: 'Settings' }).click();
-  const settings = page.locator('aside');
+  const settings = page.getByRole('dialog', { name: 'Agent settings' });
+  await expect(settings).toHaveAttribute('aria-modal', 'true');
+  const closeSettings = page.getByRole('button', { name: 'Close settings' });
+  await expect(closeSettings).toBeFocused();
+  await expect(page.getByTestId('workspace-background')).toHaveAttribute(
+    'aria-hidden',
+    'true',
+  );
+  await page.keyboard.press('Shift+Tab');
+  await expect(settings.getByRole('button', { name: 'Reset' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(closeSettings).toBeFocused();
   const name = settings.locator('input.field').first();
   const provider = settings.getByRole('combobox').nth(0);
   const model = settings.getByRole('combobox').nth(1);
@@ -373,6 +392,12 @@ test('main workspace agent: failed PATCH keeps settings draft and prior main-age
   await expect(model).toHaveValue('__custom__');
   await expect(customModel).toHaveValue('claude-settings-custom');
   await expect(system).toHaveValue('Draft system prompt');
+  await closeSettings.click();
+  await expect(page.getByRole('button', { name: 'Settings' })).toBeFocused();
+  await expect(page.getByTestId('workspace-background')).not.toHaveAttribute(
+    'aria-hidden',
+    'true',
+  );
   await expect(
     page.getByRole('heading', { name: 'Nova', exact: true }),
   ).toBeVisible();
@@ -438,8 +463,23 @@ test('main workspace agent: 390x844 viewport places the same destinations in a b
   await page.setViewportSize({ width: 390, height: 844 });
   await installApiFixture(page, {
     agents: [agentSnapshot('agent-main', 'Nova', 1)],
+    failAgentListsAfterFirst: true,
   });
   await page.goto('/');
+
+  await expect(page.getByTestId('compact-daemon-status')).toContainText(
+    'Daemon Online',
+  );
+  const appHeight = await page.locator('.app-viewport').evaluate((element) => {
+    const browserElement = element as unknown as BrowserElement;
+    const style =
+      browserElement.ownerDocument.defaultView?.getComputedStyle(
+        browserElement,
+      );
+    if (!style) throw new Error('app viewport has no browser view');
+    return Number.parseFloat(style.height);
+  });
+  expect(appHeight).toBe(844);
 
   const navigation = page.getByRole('navigation', {
     name: 'Workspace navigation',
@@ -458,6 +498,11 @@ test('main workspace agent: 390x844 viewport places the same destinations in a b
   ).toBeVisible();
   const box = await navigation.boundingBox();
   expect(box?.y).toBeGreaterThan(740);
+  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(844);
+  await expect(page.getByTestId('compact-daemon-status')).toContainText(
+    'Daemon Offline',
+    { timeout: 7_000 },
+  );
 });
 
 test('main workspace agent: reduced motion keeps the workspace operable with near-instant motion', async ({

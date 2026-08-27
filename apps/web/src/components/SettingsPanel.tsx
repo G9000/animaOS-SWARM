@@ -20,6 +20,14 @@ import {
   primaryBtnCls,
 } from './ui-bits';
 
+const FOCUSABLE_SETTINGS_SELECTOR = [
+  'button:not([disabled])',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
 function InfoRow({
   label,
   value,
@@ -97,6 +105,9 @@ export function SettingsPanel({
   const [savedFlash, setSavedFlash] = useState(false);
   const saveErrorRef = useRef<HTMLDivElement>(null);
   const resetErrorRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
   const controlsDisabled = saving || resetting;
 
   const requestClose = () => {
@@ -139,13 +150,51 @@ export function SettingsPanel({
   }, [resetError]);
 
   useEffect(() => {
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || saving || resetting) return;
-      close();
+    const closeButton = closeButtonRef.current;
+    if (closeButton && !closeButton.disabled) {
+      closeButton.focus();
+    } else {
+      headingRef.current?.focus();
+    }
+  }, []);
+
+  useEffect(() => {
+    const handleDialogKeyboard = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        if (!saving && !resetting) close();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SETTINGS_SELECTOR),
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement;
+      const activeIndex = focusable.indexOf(active as HTMLElement);
+      if (event.shiftKey && activeIndex <= 0) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && activeIndex === focusable.length - 1) {
+        event.preventDefault();
+        first.focus();
+      } else if (!dialog.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      }
     };
 
-    document.addEventListener('keydown', handleEscape);
-    return () => document.removeEventListener('keydown', handleEscape);
+    document.addEventListener('keydown', handleDialogKeyboard);
+    return () => document.removeEventListener('keydown', handleDialogKeyboard);
   }, [close, resetting, saving]);
 
   const resolvedModel = model === '__custom__' ? customModel.trim() : model;
@@ -196,16 +245,22 @@ export function SettingsPanel({
         onClick={requestClose}
       />
       <aside
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
         data-surface="settings-sheet-drawer"
         aria-labelledby="settings-heading"
         aria-busy={controlsDisabled}
-        className="animate-slide-in-right absolute inset-0 z-20 flex w-full flex-col bg-panel/95 shadow-2xl shadow-black/70 backdrop-blur-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-md sm:border-l sm:border-line"
+        tabIndex={-1}
+        className="safe-settings-sheet animate-slide-in-right absolute inset-0 z-20 flex w-full flex-col bg-panel/95 shadow-2xl shadow-black/70 backdrop-blur-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-md sm:border-l sm:border-line"
       >
         {/* Panel header */}
         <div className="flex items-center justify-between border-b border-line px-5 py-4 sm:px-6">
           <div>
             <h3
+              ref={headingRef}
               id="settings-heading"
+              tabIndex={-1}
               className="font-display text-base font-semibold tracking-tight text-ink"
             >
               Agent settings
@@ -215,6 +270,7 @@ export function SettingsPanel({
             </p>
           </div>
           <button
+            ref={closeButtonRef}
             onClick={requestClose}
             disabled={controlsDisabled}
             aria-describedby={
@@ -290,7 +346,7 @@ export function SettingsPanel({
                   ))}
               </select>
               {providers && (
-                <p className="mt-1.5 font-mono text-[10px] text-ink-3/70">
+                <p className="mt-1.5 font-mono text-[10px] text-ink-3">
                   {providers.find((p) => p.id === provider)?.configured
                     ? 'key configured on the daemon'
                     : 'no key configured for this provider on the daemon'}
@@ -397,7 +453,7 @@ export function SettingsPanel({
               placeholder="Leave empty for the daemon default."
               className="field resize-y leading-relaxed"
             />
-            <p className="font-mono text-[10px] text-ink-3/70">
+            <p className="font-mono text-[10px] text-ink-3">
               cleared = daemon builds its default prompt from the agent profile
             </p>
           </section>
@@ -464,7 +520,7 @@ export function SettingsPanel({
                 <div className="text-xs font-semibold text-danger">
                   Reset agent
                 </div>
-                <div className="mt-0.5 text-[11px] leading-relaxed text-danger/65">
+                <div className="mt-0.5 text-[11px] leading-relaxed text-danger">
                   deletes the agent and its entire conversation
                 </div>
               </div>

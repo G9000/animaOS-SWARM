@@ -99,6 +99,17 @@ export function AgentPresence({
               Access {accessLabel}
             </StatusLabel>
           </div>
+          <div
+            data-testid="compact-daemon-status"
+            className="mt-1.5 inline-flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.08em] text-ink-2 sm:hidden"
+          >
+            <span aria-hidden className={online ? 'text-mint' : 'text-danger'}>
+              {online ? <BoltIcon size={11} /> : <AlertIcon size={11} />}
+            </span>
+            <span>
+              <span>Daemon</span> <span>{online ? 'Online' : 'Offline'}</span>
+            </span>
+          </div>
         </div>
       </div>
       <button

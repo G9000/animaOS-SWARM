@@ -4,7 +4,7 @@ export const labelCls =
   'mb-1.5 block font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-ink-3';
 
 export const primaryBtnCls =
-  'inline-flex items-center justify-center gap-2 rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90 hover:shadow-accent/30 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:active:scale-100';
+  'inline-flex items-center justify-center gap-2 rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-abyss shadow-lg shadow-accent/20 transition hover:bg-accent/90 hover:shadow-accent/30 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 disabled:shadow-none disabled:active:scale-100';
 
 export const ghostBtnCls =
   'inline-flex items-center gap-1.5 rounded-lg border border-line bg-white/[0.02] px-3 py-1.5 text-xs font-medium text-ink-2 transition hover:border-line-strong hover:bg-white/[0.05] hover:text-ink';
@@ -65,7 +65,7 @@ export function ErrorBanner({
       {onDismiss && (
         <button
           onClick={onDismiss}
-          className="shrink-0 cursor-pointer text-danger/60 transition hover:text-danger"
+          className="shrink-0 cursor-pointer text-danger transition hover:text-ink"
           aria-label="Dismiss"
         >
           ✕

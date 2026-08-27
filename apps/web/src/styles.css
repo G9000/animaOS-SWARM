@@ -18,7 +18,7 @@
   --color-line-strong: rgba(214, 211, 209, 0.22);
   --color-ink: #f4f1ec;
   --color-ink-2: #b6b2ac;
-  --color-ink-3: #77746f;
+  --color-ink-3: #a8a29e;
   /* prettier-ignore */
   --color-accent: #FF397F;
   /* prettier-ignore */
@@ -28,8 +28,10 @@
 }
 
 :root {
-  --safe-area-composer: env(safe-area-inset-bottom, 0px);
-  --safe-area-navigation: env(safe-area-inset-bottom, 0px);
+  --color-accent-rgb: 255 57 127;
+  --safe-area-top: env(safe-area-inset-top, 0px);
+  --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-area-navigation: var(--safe-area-bottom);
 }
 
 * {
@@ -40,6 +42,11 @@ html,
 body,
 #root {
   height: 100%;
+}
+
+.app-viewport {
+  height: 100vh;
+  height: 100dvh;
 }
 
 body {
@@ -72,7 +79,7 @@ a {
 }
 
 ::selection {
-  background: rgba(255, 57, 127, 0.3);
+  background: rgb(var(--color-accent-rgb) / 0.3);
   color: var(--color-ink);
 }
 
@@ -127,7 +134,7 @@ input[type='radio'] {
   left: calc(50% - 14rem);
   top: -19rem;
   border-radius: 999px;
-  background: rgba(255, 57, 127, 0.08);
+  background: rgb(var(--color-accent-rgb) / 0.08);
   filter: blur(90px);
   animation: ambient-drift 18s ease-in-out infinite alternate;
 }
@@ -167,10 +174,10 @@ input[type='radio'] {
 }
 
 .focus-glow:focus-within {
-  border-color: rgba(255, 57, 127, 0.48);
+  border-color: rgb(var(--color-accent-rgb) / 0.48);
   box-shadow:
-    0 0 0 3px rgba(255, 57, 127, 0.11),
-    0 18px 52px -26px rgba(255, 57, 127, 0.42);
+    0 0 0 3px rgb(var(--color-accent-rgb) / 0.11),
+    0 18px 52px -26px rgb(var(--color-accent-rgb) / 0.42);
 }
 
 .spatial-canvas {
@@ -211,14 +218,14 @@ input[type='radio'] {
 }
 
 .field:focus-visible {
-  border-color: rgba(255, 57, 127, 0.58);
-  box-shadow: 0 0 0 3px rgba(255, 57, 127, 0.12);
+  border-color: rgb(var(--color-accent-rgb) / 0.58);
+  box-shadow: 0 0 0 3px rgb(var(--color-accent-rgb) / 0.12);
   background: rgba(9, 10, 15, 0.76);
 }
 
 select.field {
   appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%2377746F' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23A8A29E' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 0.8rem center;
   padding-right: 2.2rem;
@@ -231,7 +238,7 @@ select.field option {
 
 /* Responsive safe areas */
 .safe-composer {
-  padding-bottom: max(1.25rem, calc(var(--safe-area-composer) + 0.75rem));
+  padding-bottom: 1.25rem;
 }
 
 .safe-bottom-dock {
@@ -242,11 +249,19 @@ select.field option {
   padding-bottom: calc(5.5rem + var(--safe-area-navigation));
 }
 
-@media (min-width: 768px) {
-  .safe-composer {
-    padding-bottom: 1.25rem;
-  }
+.safe-settings-sheet {
+  padding-top: var(--safe-area-top);
+  padding-bottom: var(--safe-area-bottom);
+}
 
+@media (min-width: 640px) {
+  .safe-settings-sheet {
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+}
+
+@media (min-width: 768px) {
   .workspace-mobile-safe {
     padding-bottom: 0;
   }
@@ -268,16 +283,16 @@ select.field option {
     );
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow:
-    0 0 0 8px rgba(255, 57, 127, 0.055),
-    0 0 42px -8px rgba(255, 57, 127, 0.72),
+    0 0 0 8px rgb(var(--color-accent-rgb) / 0.055),
+    0 0 42px -8px rgb(var(--color-accent-rgb) / 0.72),
     inset -8px -10px 18px rgba(80, 0, 28, 0.35);
 }
 
 .agent-orb-core {
   background: var(--color-accent);
   box-shadow:
-    0 0 18px rgba(255, 57, 127, 0.9),
-    0 0 36px rgba(255, 57, 127, 0.36);
+    0 0 18px rgb(var(--color-accent-rgb) / 0.9),
+    0 0 36px rgb(var(--color-accent-rgb) / 0.36);
 }
 
 /* Motion */
@@ -354,11 +369,11 @@ select.field option {
   0%,
   100% {
     transform: scale(0.985);
-    filter: saturate(0.94);
+    opacity: 0.94;
   }
   50% {
     transform: scale(1.025);
-    filter: saturate(1.06);
+    opacity: 1;
   }
 }
 

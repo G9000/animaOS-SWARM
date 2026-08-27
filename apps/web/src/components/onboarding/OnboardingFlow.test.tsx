@@ -2104,7 +2104,7 @@ describe('OnboardingFlow', () => {
       screen.getByRole('heading', { name: 'Agent settings' }),
     ).toBeVisible();
     await user.type(screen.getByPlaceholderText(/Message/), 'Blocked send');
-    await user.click(screen.getByRole('button', { name: 'Send' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send', hidden: true }));
 
     await act(async () => {
       reset.reject(new Error('exclusive reset failed'));
@@ -2115,7 +2115,10 @@ describe('OnboardingFlow', () => {
     expect(updateAgent).not.toHaveBeenCalled();
     expect(runAgent).not.toHaveBeenCalled();
     expect(
-      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+      await screen.findByRole('heading', {
+        name: 'Say something to Nova',
+        hidden: true,
+      }),
     ).toBeVisible();
     expect(await screen.findByText('exclusive reset failed')).toBeVisible();
     expect(screen.getByRole('alert')).toHaveFocus();
@@ -2155,7 +2158,9 @@ describe('OnboardingFlow', () => {
 
     await user.click(screen.getByRole('button', { name: 'Close settings' }));
     expect(composer).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Send', hidden: true }),
+    ).toBeDisabled();
 
     await act(async () => {
       reset.reject(new Error('reset interrupted'));
@@ -2163,7 +2168,9 @@ describe('OnboardingFlow', () => {
     });
 
     expect(composer).toBeEnabled();
-    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+    expect(
+      screen.getByRole('button', { name: 'Send', hidden: true }),
+    ).toBeEnabled();
   });
 
   it('keeps the newest provider response when Strict Mode requests finish in reverse order', async () => {

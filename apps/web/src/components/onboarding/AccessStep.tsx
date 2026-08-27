@@ -37,7 +37,7 @@ export function AccessStep({ access, onAccessChange }: AccessStepProps) {
               key={profileName}
               className={`rounded-xl border p-4 transition ${
                 access === profileName
-                  ? 'border-accent/55 bg-accent/[0.07] shadow-[0_14px_36px_-30px_rgba(255,57,127,0.75)]'
+                  ? 'border-accent/55 bg-accent/[0.07] shadow-[0_14px_36px_-30px_rgb(var(--color-accent-rgb)/0.75)]'
                   : 'border-line bg-white/[0.015] hover:border-line-strong'
               }`}
             >

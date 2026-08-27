@@ -91,7 +91,7 @@ function OfflineRetry({ retry }: { retry: () => Promise<void> }) {
             type="button"
             autoFocus
             onClick={() => void retry()}
-            className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-white shadow-lg shadow-accent/20 transition hover:bg-accent/90"
+            className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-abyss shadow-lg shadow-accent/20 transition hover:bg-accent/90"
           >
             Retry connection
           </button>
@@ -140,6 +140,7 @@ export function ViewHarness() {
   const sendingOperationGenerationRef = useRef<number | null>(null);
   const settingsOperationGenerationRef = useRef<number | null>(null);
   const resetInFlightRef = useRef<AgentOperation | null>(null);
+  const settingsTriggerRef = useRef<HTMLElement | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
   const previousSelectedMainIdRef = useRef<string | null>(null);
   const checkinsRef = useRef<Checkin[]>([]);
@@ -159,6 +160,7 @@ export function ViewHarness() {
     sendingOperationGenerationRef.current = null;
     settingsOperationGenerationRef.current = null;
     resetInFlightRef.current = null;
+    settingsTriggerRef.current = null;
     checkinRunGenerationRef.current += 1;
     checkinRunningRef.current = false;
     sendingRef.current = false;
@@ -352,11 +354,24 @@ export function ViewHarness() {
     });
   };
 
-  const openSettings = () => setShowSettings(true);
+  const openSettings = () => {
+    settingsTriggerRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    setShowSettings(true);
+  };
   const closeSettings = () => {
     if (savingSettingsRef.current || resetInFlightRef.current !== null) return;
     setShowSettings(false);
   };
+
+  useEffect(() => {
+    if (showSettings || !settingsTriggerRef.current) return;
+    const trigger = settingsTriggerRef.current;
+    settingsTriggerRef.current = null;
+    trigger.focus();
+  }, [showSettings]);
 
   const saveSettings = async (patch: AgentUpdateInput): Promise<boolean> => {
     if (
@@ -531,49 +546,56 @@ export function ViewHarness() {
 
   return (
     <>
-      <WorkspaceShell
-        key={agent.id}
-        mainAgent={agent}
-        agents={agents}
-        connection={connection}
-        onOpenSettings={openSettings}
-        workspace={
-          <section
-            className="flex h-full min-h-0 flex-col"
-            aria-label="Workspace"
-          >
-            <MessageList
+      <div
+        data-testid="workspace-background"
+        className="contents"
+        aria-hidden={showSettings || undefined}
+        inert={showSettings || undefined}
+      >
+        <WorkspaceShell
+          key={agent.id}
+          mainAgent={agent}
+          agents={agents}
+          connection={connection}
+          onOpenSettings={openSettings}
+          workspace={
+            <section
+              className="flex h-full min-h-0 flex-col"
+              aria-label="Workspace"
+            >
+              <MessageList
+                agent={agent}
+                sending={sending}
+                scrollerRef={scrollerRef}
+                onSuggestion={setDraft}
+              />
+              <Composer
+                agentName={agent.name}
+                draft={draft}
+                setDraft={setDraft}
+                sending={sending}
+                disabled={resetting}
+                onSend={send}
+                error={workspaceError}
+                onDismissError={() => setWorkspaceError(null)}
+              />
+            </section>
+          }
+          activity={
+            <ActivityView
               agent={agent}
-              sending={sending}
-              scrollerRef={scrollerRef}
-              onSuggestion={setDraft}
-            />
-            <Composer
-              agentName={agent.name}
-              draft={draft}
-              setDraft={setDraft}
-              sending={sending}
-              disabled={resetting}
-              onSend={send}
+              checkins={checkins}
+              prompt={ciPrompt}
+              setPrompt={setCiPrompt}
+              intervalMin={ciIntervalMin}
+              setIntervalMin={setCiIntervalMin}
+              addCheckin={addCheckin}
+              removeCheckin={removeCheckin}
               error={workspaceError}
-              onDismissError={() => setWorkspaceError(null)}
             />
-          </section>
-        }
-        activity={
-          <ActivityView
-            agent={agent}
-            checkins={checkins}
-            prompt={ciPrompt}
-            setPrompt={setCiPrompt}
-            intervalMin={ciIntervalMin}
-            setIntervalMin={setCiIntervalMin}
-            addCheckin={addCheckin}
-            removeCheckin={removeCheckin}
-            error={workspaceError}
-          />
-        }
-      />
+          }
+        />
+      </div>
       {settingsPanel}
     </>
   );

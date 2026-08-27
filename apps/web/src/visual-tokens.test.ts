@@ -1,5 +1,5 @@
 import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, extname, join } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
@@ -11,7 +11,7 @@ function productionSources(directory: string): string[] {
     const path = join(directory, entry.name);
 
     if (entry.isDirectory()) return productionSources(path);
-    if (!['.css', '.tsx'].includes(extname(entry.name))) return [];
+    if (!['.css', '.ts', '.tsx'].includes(extname(entry.name))) return [];
     if (entry.name.includes('.test.')) return [];
 
     return [path];
@@ -32,9 +32,46 @@ function between(source: string, start: string, end: string): string {
   return source.slice(startIndex, endIndex);
 }
 
+function cssHexToken(styles: string, token: string): string {
+  const value = styles.match(
+    new RegExp(`--color-${token}:\\s*(#[0-9a-f]{6})`, 'i'),
+  )?.[1];
+  expect(value).toBeDefined();
+  return value ?? '#000000';
+}
+
+function relativeLuminance(hex: string): number {
+  const channels = hex
+    .slice(1)
+    .match(/.{2}/g)
+    ?.map((channel) => Number.parseInt(channel, 16) / 255)
+    .map((channel) =>
+      channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
+    );
+  if (!channels) throw new Error(`Invalid hex color: ${hex}`);
+  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+}
+
+function contrastRatio(foreground: string, background: string): number {
+  const lighter = Math.max(
+    relativeLuminance(foreground),
+    relativeLuminance(background),
+  );
+  const darker = Math.min(
+    relativeLuminance(foreground),
+    relativeLuminance(background),
+  );
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 describe('Neon Rose spatial visual contract', () => {
   const styles = read('styles.css');
-  const production = productionSources(sourceRoot)
+  const productionPaths = [
+    ...productionSources(sourceRoot),
+    ...productionSources(resolve(sourceRoot, '../../../packages/ui/src')),
+    resolve(sourceRoot, '../index.html'),
+  ];
+  const production = productionPaths
     .map((path) => `${path}\n${readFileSync(path, 'utf8')}`)
     .join('\n');
 
@@ -53,9 +90,57 @@ describe('Neon Rose spatial visual contract', () => {
     );
   });
 
+  it('keeps core text and primary action pairs at AA contrast', () => {
+    const abyss = cssHexToken(styles, 'abyss');
+    const panel = cssHexToken(styles, 'panel');
+    const accent = cssHexToken(styles, 'accent');
+
+    for (const [foreground, background] of [
+      [cssHexToken(styles, 'ink'), abyss],
+      [cssHexToken(styles, 'ink-2'), abyss],
+      [cssHexToken(styles, 'ink-3'), abyss],
+      [cssHexToken(styles, 'ink-3'), panel],
+      [abyss, accent],
+    ]) {
+      expect(contrastRatio(foreground, background)).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(production).not.toMatch(/bg-accent[^'"\r\n]*text-white/);
+    expect(read('components/ui-bits.tsx')).toMatch(
+      /bg-accent[^'"\r\n]*text-abyss/,
+    );
+  });
+
+  it('owns viewport and bottom safe areas without double-padding', () => {
+    const index = readFileSync(resolve(sourceRoot, '../index.html'), 'utf8');
+    const composer = between(styles, '.safe-composer {', '.safe-bottom-dock');
+    const orbPulse = between(styles, '@keyframes orb-pulse', '.animate-orb');
+
+    expect(index).toContain('viewport-fit=cover');
+    expect(read('app/app.tsx')).toContain('app-viewport');
+    expect(styles).toMatch(
+      /\.app-viewport\s*{[^}]*height:\s*100vh;[^}]*height:\s*100dvh;/s,
+    );
+    expect(styles).toContain('.safe-settings-sheet');
+    expect(read('components/SettingsPanel.tsx')).toContain(
+      'safe-settings-sheet',
+    );
+    expect(styles.match(/env\(safe-area-inset-bottom/g)).toHaveLength(1);
+    expect(composer).not.toContain('safe-area-inset-bottom');
+    expect(composer).not.toContain('--safe-area-');
+    expect(orbPulse).not.toContain('filter:');
+  });
+
+  it('uses one shared Neon Rose RGB token for authored glow values', () => {
+    expect(styles).toContain('--color-accent-rgb: 255 57 127;');
+    expect(production).not.toMatch(
+      /rgba?\(\s*255\s*,\s*57\s*,\s*127(?:\s*,|\s*\))/i,
+    );
+  });
+
   it('exposes focus, safe-area, responsive shell, and motion semantics', () => {
     expect(styles).toContain(':focus-visible');
-    expect(styles).toContain('--safe-area-composer');
+    expect(styles).toContain('--safe-area-top');
+    expect(styles).toContain('--safe-area-bottom');
     expect(styles).toContain('--safe-area-navigation');
     expect(styles).toContain('@media (prefers-reduced-motion: reduce)');
     expect(styles).toContain('.agent-orb');

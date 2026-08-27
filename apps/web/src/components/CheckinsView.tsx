@@ -69,7 +69,7 @@ export function CheckinsView({
             </code>{' '}
             keeps the run silent.
           </p>
-          <p className="mt-2 font-mono text-[11px] text-ink-3/80">
+          <p className="mt-2 font-mono text-[11px] text-ink-3">
             runs while this tab is open · stored locally per agent
           </p>
 

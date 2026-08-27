@@ -146,7 +146,7 @@ export function ModelStep({
                     onClick={() => onProviderChange(candidate.id)}
                     className={`rounded-xl border p-3.5 text-left transition disabled:cursor-not-allowed disabled:opacity-55 ${
                       selected
-                        ? 'border-accent/60 bg-accent/[0.08] shadow-[0_14px_36px_-28px_rgba(255,57,127,0.8)]'
+                        ? 'border-accent/60 bg-accent/[0.08] shadow-[0_14px_36px_-28px_rgb(var(--color-accent-rgb)/0.8)]'
                         : 'border-line bg-white/[0.02] hover:border-line-strong hover:bg-white/[0.035]'
                     }`}
                   >
