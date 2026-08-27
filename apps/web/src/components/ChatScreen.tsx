@@ -174,7 +174,10 @@ function EmptyState({
           className="animate-ripple absolute inset-0 rounded-full border border-sky-400/20"
           style={{ animationDelay: '1.3s' }}
         />
-        <div className="animate-orb flex h-16 w-16 items-center justify-center rounded-full bg-sky-500 shadow-2xl shadow-sky-500/30">
+        <div
+          data-motion="agent-orb"
+          className="animate-orb flex h-16 w-16 items-center justify-center rounded-full bg-sky-500 shadow-2xl shadow-sky-500/30"
+        >
           <span className="font-display text-2xl font-bold text-white">
             {agentName.charAt(0).toUpperCase()}
           </span>
