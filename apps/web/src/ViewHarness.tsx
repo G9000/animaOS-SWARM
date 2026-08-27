@@ -24,6 +24,7 @@ import { Sidebar } from './components/Sidebar';
 
 interface AgentOperation {
   generation: number;
+  lifecycleGeneration: number;
   targetAgentId: string;
 }
 
@@ -59,6 +60,9 @@ export function ViewHarness() {
   const sendingRef = useRef(false);
   const agentMutationEpochRef = useRef(0);
   const agentOperationGenerationRef = useRef(0);
+  const agentLifecycleGenerationRef = useRef(0);
+  const sendingOperationGenerationRef = useRef<number | null>(null);
+  const settingsOperationGenerationRef = useRef<number | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
   const agentRequestTokenRef = useRef(0);
   const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
@@ -70,6 +74,7 @@ export function ViewHarness() {
       agentMutationEpochRef.current += 1;
       return {
         generation: ++agentOperationGenerationRef.current,
+        lifecycleGeneration: agentLifecycleGenerationRef.current,
         targetAgentId,
       };
     },
@@ -79,6 +84,14 @@ export function ViewHarness() {
   const isCurrentAgentOperation = useCallback(
     (operation: AgentOperation) =>
       operation.generation === agentOperationGenerationRef.current &&
+      operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
+      operation.targetAgentId === currentAgentIdRef.current,
+    [],
+  );
+
+  const isCurrentAgentLifecycle = useCallback(
+    (operation: AgentOperation) =>
+      operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
       operation.targetAgentId === currentAgentIdRef.current,
     [],
   );
@@ -127,6 +140,9 @@ export function ViewHarness() {
         ) {
           const refreshedAgent =
             agents.length > 0 ? toAgentDetail(agents[0]) : null;
+          if (refreshedAgent?.id !== currentAgentIdRef.current) {
+            agentLifecycleGenerationRef.current += 1;
+          }
           currentAgentIdRef.current = refreshedAgent?.id ?? null;
           setAgent(refreshedAgent);
           setOnline(true);
@@ -202,6 +218,7 @@ export function ViewHarness() {
   const checkinsRef = useRef<Checkin[]>([]);
   checkinsRef.current = checkins;
   const checkinRunningRef = useRef(false);
+  const checkinRunGenerationRef = useRef(0);
 
   // Load this agent's check-ins whenever the agent changes.
   useEffect(() => {
@@ -210,12 +227,15 @@ export function ViewHarness() {
 
   const runCheckin = useCallback(async (targetAgentId: string, c: Checkin) => {
     const operation = beginAgentOperation(targetAgentId);
-    const stamp = (patch: Partial<Checkin>) =>
+    const stamp = (patch: Partial<Checkin>) => {
+      if (!isCurrentAgentLifecycle(operation)) return;
       setCheckins((prev) => {
+        if (!isCurrentAgentLifecycle(operation)) return prev;
         const next = prev.map((x) => (x.id === c.id ? { ...x, ...patch } : x));
         saveCheckins(targetAgentId, next);
         return next;
       });
+    };
     try {
       const { agent: updatedAgent, result } = await daemon.runAgent(
         targetAgentId,
@@ -241,7 +261,7 @@ export function ViewHarness() {
         lastReply: e instanceof Error ? e.message : String(e),
       });
     }
-  }, [adoptAgentSnapshot, beginAgentOperation]);
+  }, [adoptAgentSnapshot, beginAgentOperation, isCurrentAgentLifecycle]);
 
   // 10s ticker: fire whichever check-ins are due, one at a time.
   useEffect(() => {
@@ -250,16 +270,23 @@ export function ViewHarness() {
       if (checkinRunningRef.current || sendingRef.current) return;
       const due = checkinsRef.current.filter((c) => isDue(c, Date.now()));
       if (due.length === 0) return;
+      const runGeneration = ++checkinRunGenerationRef.current;
       checkinRunningRef.current = true;
       try {
         for (const c of due) {
           await runCheckin(agentId, c);
         }
       } finally {
-        checkinRunningRef.current = false;
+        if (runGeneration === checkinRunGenerationRef.current) {
+          checkinRunningRef.current = false;
+        }
       }
     }, 10_000);
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      checkinRunGenerationRef.current += 1;
+      checkinRunningRef.current = false;
+    };
   }, [agentId, runCheckin]);
 
   const addCheckin = () => {
@@ -293,6 +320,7 @@ export function ViewHarness() {
   }): Promise<boolean> => {
     if (!agent) return false;
     const operation = beginAgentOperation(agent.id);
+    settingsOperationGenerationRef.current = operation.generation;
     setSavingSettings(true);
     setError(null);
     try {
@@ -304,7 +332,10 @@ export function ViewHarness() {
       }
       return false;
     } finally {
-      setSavingSettings(false);
+      if (settingsOperationGenerationRef.current === operation.generation) {
+        settingsOperationGenerationRef.current = null;
+        setSavingSettings(false);
+      }
     }
   };
 
@@ -312,12 +343,24 @@ export function ViewHarness() {
     if (!agent) return;
     const targetAgentId = agent.id;
     const operation = beginAgentOperation(targetAgentId);
+    const sendingGeneration = sendingOperationGenerationRef.current;
+    const settingsGeneration = settingsOperationGenerationRef.current;
     setError(null);
     try {
       await daemon.deleteAgent(targetAgentId);
       agentMutationEpochRef.current += 1;
+      agentLifecycleGenerationRef.current += 1;
       clearCheckins(targetAgentId);
       if (currentAgentIdRef.current === targetAgentId) {
+        if (sendingOperationGenerationRef.current === sendingGeneration) {
+          sendingOperationGenerationRef.current = null;
+          sendingRef.current = false;
+          setSending(false);
+        }
+        if (settingsOperationGenerationRef.current === settingsGeneration) {
+          settingsOperationGenerationRef.current = null;
+          setSavingSettings(false);
+        }
         currentAgentIdRef.current = null;
         setCheckins([]);
         setAgent(null);
@@ -335,6 +378,7 @@ export function ViewHarness() {
     const text = draft.trim();
     if (!text || !agent || sending) return;
     const operation = beginAgentOperation(agent.id);
+    sendingOperationGenerationRef.current = operation.generation;
     setSending(true);
     setError(null);
     setDraft('');
@@ -349,7 +393,10 @@ export function ViewHarness() {
         setError(e instanceof Error ? e.message : String(e));
       }
     } finally {
-      setSending(false);
+      if (sendingOperationGenerationRef.current === operation.generation) {
+        sendingOperationGenerationRef.current = null;
+        setSending(false);
+      }
     }
   };
 
@@ -407,6 +454,7 @@ export function ViewHarness() {
             onCreated={(snapshot) => {
               agentMutationEpochRef.current += 1;
               agentOperationGenerationRef.current += 1;
+              agentLifecycleGenerationRef.current += 1;
               const createdAgent = toAgentDetail(snapshot);
               currentAgentIdRef.current = createdAgent.id;
               setAgent(createdAgent);

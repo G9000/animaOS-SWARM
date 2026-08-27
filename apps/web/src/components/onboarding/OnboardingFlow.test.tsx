@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { toolNamesForProfile } from '../../lib/agent-access';
+import { CHECKIN_SENTINEL } from '../../lib/checkins';
 import {
   daemon,
   type DaemonProvider,
@@ -967,6 +968,151 @@ describe('OnboardingFlow', () => {
     expect(screen.queryByDisplayValue('Stale Saved')).not.toBeInTheDocument();
   });
 
+  it('keeps a newer chat run busy when the reset agent run resolves', async () => {
+    const user = userEvent.setup();
+    const olderRun = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    const newerRun = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const runAgent = vi
+      .spyOn(daemon, 'runAgent')
+      .mockReturnValueOnce(olderRun.promise)
+      .mockReturnValueOnce(newerRun.promise);
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+    vi.spyOn(daemon, 'createAgent').mockResolvedValue({
+      agent: namedSnapshot('Second', 'agent-2'),
+    });
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+
+    await user.type(screen.getByPlaceholderText('Message Nova…'), 'Older run');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+
+    await goToReview(user);
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    await waitFor(() => expect(daemon.createAgent).toHaveBeenCalledTimes(1));
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Second' }),
+    ).toBeVisible();
+
+    await user.type(
+      screen.getByPlaceholderText('Message Second…'),
+      'Newer run',
+    );
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+
+    await act(async () => {
+      olderRun.resolve({
+        agent: namedSnapshot('Nova', 'agent-1'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Too late' },
+        },
+      });
+      await olderRun.promise;
+    });
+
+    expect(screen.getByPlaceholderText('Message Second…')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+
+    await act(async () => {
+      newerRun.resolve({
+        agent: namedSnapshot('Second', 'agent-2'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Current reply' },
+        },
+      });
+      await newerRun.promise;
+    });
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Second' }),
+    ).toBeVisible();
+  });
+
+  it('keeps a newer settings update busy when the reset agent update rejects', async () => {
+    const user = userEvent.setup();
+    const olderUpdate =
+      deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
+    const newerUpdate =
+      deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const updateAgent = vi
+      .spyOn(daemon, 'updateAgent')
+      .mockReturnValueOnce(olderUpdate.promise)
+      .mockReturnValueOnce(newerUpdate.promise);
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+    vi.spyOn(daemon, 'createAgent').mockResolvedValue({
+      agent: namedSnapshot('Second', 'agent-2'),
+    });
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    const olderName = screen.getByDisplayValue('Nova');
+    await user.clear(olderName);
+    await user.type(olderName, 'Older saved');
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+
+    await goToReview(user);
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Second' }),
+    ).toBeVisible();
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    const newerName = screen.getByDisplayValue('Second');
+    await user.clear(newerName);
+    await user.type(newerName, 'Second saved');
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+
+    await act(async () => {
+      olderUpdate.reject(new Error('stale update failed'));
+      await olderUpdate.promise.catch(() => undefined);
+    });
+
+    expect(screen.getByDisplayValue('Second saved')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
+    expect(screen.queryByText('stale update failed')).not.toBeInTheDocument();
+
+    await act(async () => {
+      newerUpdate.resolve({
+        agent: namedSnapshot('Second saved', 'agent-2'),
+      });
+      await newerUpdate.promise;
+    });
+    expect(
+      await screen.findByRole('button', { name: 'Saved ✓' }),
+    ).toBeVisible();
+  });
+
   it('preserves the current agent and reset error without adopting an older update', async () => {
     const user = userEvent.setup();
     const pendingUpdate = deferred<
@@ -1163,6 +1309,143 @@ describe('OnboardingFlow', () => {
     expect(screen.queryByDisplayValue('Older Check-in')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Close settings' }));
     expect(await screen.findByText(/sent a message/)).toBeVisible();
+  });
+
+  it('does not stamp or unlock newer agent check-ins when a reset check-in resolves', async () => {
+    const user = userEvent.setup();
+    const now = 100_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    localStorage.setItem(
+      'animaos.checkins.agent-1',
+      JSON.stringify([
+        {
+          id: 'shared-checkin',
+          prompt: 'Deleted agent goals',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    localStorage.setItem(
+      'animaos.checkins.agent-2',
+      JSON.stringify([
+        {
+          id: 'shared-checkin',
+          prompt: 'Current agent goals',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    const olderCheckin =
+      deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    const newerCheckin =
+      deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    const runAgent = vi
+      .spyOn(daemon, 'runAgent')
+      .mockReturnValueOnce(olderCheckin.promise)
+      .mockReturnValueOnce(newerCheckin.promise)
+      .mockResolvedValue({
+        agent: namedSnapshot('Second', 'agent-2'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: CHECKIN_SENTINEL },
+        },
+      });
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+    vi.spyOn(daemon, 'createAgent').mockResolvedValue({
+      agent: namedSnapshot('Second', 'agent-2'),
+    });
+    let runCheckins: (() => unknown) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 10_000) {
+        runCheckins = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    expect(await screen.findByText('Deleted agent goals')).toBeVisible();
+    act(() => {
+      void runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+    expect(localStorage.getItem('animaos.checkins.agent-1')).toBeNull();
+
+    await goToReview(user);
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Second' }),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: /^Proactive/ }));
+    expect(await screen.findByText('Current agent goals')).toBeVisible();
+    expect(screen.getByText('has not run yet')).toBeVisible();
+
+    act(() => {
+      void runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      olderCheckin.resolve({
+        agent: namedSnapshot('Nova', 'agent-1'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Stale reply' },
+        },
+      });
+      await olderCheckin.promise;
+    });
+
+    expect(localStorage.getItem('animaos.checkins.agent-1')).toBeNull();
+    expect(screen.getByText('Current agent goals')).toBeVisible();
+    expect(screen.getByText('has not run yet')).toBeVisible();
+    expect(screen.queryByText('Stale reply')).not.toBeInTheDocument();
+
+    vi.mocked(Date.now).mockReturnValue(now + 2_000);
+    act(() => {
+      void runCheckins?.();
+    });
+    expect(runAgent).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      newerCheckin.resolve({
+        agent: namedSnapshot('Second', 'agent-2'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: CHECKIN_SENTINEL },
+        },
+      });
+      await newerCheckin.promise;
+    });
+    expect(await screen.findByText(/stayed silent/)).toBeVisible();
+
+    vi.mocked(Date.now).mockReturnValue(now + 4_000);
+    act(() => {
+      void runCheckins?.();
+    });
+    await waitFor(() => expect(runAgent).toHaveBeenCalledTimes(3));
+    expect(localStorage.getItem('animaos.checkins.agent-1')).toBeNull();
   });
 
   it('starts a fresh poll after prior request ownership is released', async () => {
