@@ -629,6 +629,26 @@ describe('OnboardingFlow', () => {
     expect(listAgents).not.toHaveBeenCalled();
   });
 
+  it('does not publish a deferred create after onboarding unmounts', async () => {
+    const user = userEvent.setup();
+    const create = deferred<{ agent: DaemonSnapshot }>();
+    vi.spyOn(daemon, 'createAgent').mockReturnValue(create.promise);
+    const onCreated = vi.fn();
+    const view = renderFlow({ onCreated });
+
+    await goToReview(user);
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    await waitFor(() => expect(daemon.createAgent).toHaveBeenCalledTimes(1));
+    view.unmount();
+
+    await act(async () => {
+      create.resolve({ agent: snapshot() });
+      await create.promise;
+    });
+
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
   it('returns Review to Intelligence when the reviewed provider is invalidated', async () => {
     const user = userEvent.setup();
     const createAgent = vi.spyOn(daemon, 'createAgent');
@@ -2169,7 +2189,7 @@ describe('OnboardingFlow', () => {
     await user.click(screen.getByRole('button', { name: 'Reset' }));
     await waitFor(() => expect(deleteAgent).toHaveBeenCalledTimes(1));
 
-    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    await user.click(screen.getByRole('button', { name: 'Resetting…' }));
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
     act(() => {
       void runCheckins?.();
@@ -2190,6 +2210,47 @@ describe('OnboardingFlow', () => {
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
     expect(await screen.findByText('exclusive reset failed')).toBeVisible();
+  });
+
+  it('disables and announces reset controls and the composer while delete is pending', async () => {
+    const user = userEvent.setup();
+    const reset = deferred<Awaited<ReturnType<typeof daemon.deleteAgent>>>();
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [snapshot()] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    vi.spyOn(daemon, 'deleteAgent').mockReturnValue(reset.promise);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Nova' }),
+    ).toBeVisible();
+    const composer = screen.getByPlaceholderText('Message Nova…');
+    await user.type(composer, 'Keep this draft');
+    await user.click(screen.getAllByRole('button', { name: 'Settings' })[0]);
+    const name = screen.getByDisplayValue('Nova');
+    await user.clear(name);
+    await user.type(name, 'Changed name');
+    const save = screen.getByRole('button', { name: 'Save changes' });
+
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    await waitFor(() => expect(daemon.deleteAgent).toHaveBeenCalledTimes(1));
+
+    expect(save).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Resetting…' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Resetting agent…');
+
+    await user.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(composer).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+
+    await act(async () => {
+      reset.reject(new Error('reset interrupted'));
+      await reset.promise.catch(() => undefined);
+    });
+
+    expect(composer).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled();
   });
 
   it('starts a fresh poll after prior request ownership is released', async () => {
@@ -2281,6 +2342,59 @@ describe('OnboardingFlow', () => {
     ).toBeVisible();
     expect(
       screen.queryByText('stale provider failure'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps a polled existing agent when a deferred onboarding create resolves later', async () => {
+    const user = userEvent.setup();
+    const existing = namedSnapshot('Existing', 'agent-existing');
+    const created = namedSnapshot('Late create', 'agent-created');
+    const create = deferred<{ agent: DaemonSnapshot }>();
+    const listAgents = vi
+      .spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [] })
+      .mockResolvedValue({ agents: [existing] });
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    vi.spyOn(daemon, 'createAgent').mockReturnValue(create.promise);
+    let runPoll: (() => void) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+    await goToReview(user);
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+    await waitFor(() => expect(daemon.createAgent).toHaveBeenCalledTimes(1));
+
+    act(() => {
+      runPoll?.();
+    });
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Existing' }),
+    ).toBeVisible();
+    expect(listAgents).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      create.resolve({ agent: created });
+      await create.promise;
+    });
+
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Existing' }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('heading', { name: 'Say something to Late create' }),
     ).not.toBeInTheDocument();
   });
 

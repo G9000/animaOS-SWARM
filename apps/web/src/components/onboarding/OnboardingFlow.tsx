@@ -76,6 +76,14 @@ export function OnboardingFlow({
   const customModelInputRef = useRef<HTMLInputElement>(null);
   const providerRetryInFlightRef = useRef(false);
   const submitInFlightRef = useRef(false);
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!providers) {
@@ -293,7 +301,9 @@ export function OnboardingFlow({
         tools: toolNamesForProfile(draft.access),
         ...(system ? { system } : {}),
       });
-      onCreated(response.agent);
+      if (mountedRef.current) {
+        onCreated(response.agent);
+      }
     } catch (error) {
       setCreateError(errorMessage(error));
     } finally {

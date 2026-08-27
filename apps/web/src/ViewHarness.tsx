@@ -48,6 +48,7 @@ export function ViewHarness() {
   // Settings panel state
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [view, setView] = useState<'chat' | 'checkins'>('chat');
@@ -380,6 +381,7 @@ export function ViewHarness() {
     const targetAgentId = agent.id;
     const operation = beginAgentOperation(targetAgentId);
     resetInFlightRef.current = operation;
+    setResetting(true);
     const sendingGeneration = sendingOperationGenerationRef.current;
     const settingsGeneration = settingsOperationGenerationRef.current;
     setError(null);
@@ -412,6 +414,7 @@ export function ViewHarness() {
     } finally {
       if (resetInFlightRef.current === operation) {
         resetInFlightRef.current = null;
+        setResetting(false);
       }
     }
   };
@@ -459,12 +462,14 @@ export function ViewHarness() {
       agent={agent}
       providers={providers}
       saving={savingSettings}
+      resetting={resetting}
       error={error}
       saveSettings={saveSettings}
       resetAgent={resetAgent}
       close={toggleSettings}
     />
   );
+  const onboardingLifecycleGeneration = agentLifecycleGenerationRef.current;
 
   return (
     <div className="relative z-[1] flex min-h-0 flex-1">
@@ -502,6 +507,13 @@ export function ViewHarness() {
             providersError={providersError}
             retryProviders={retryProviders}
             onCreated={(snapshot) => {
+              if (
+                currentAgentIdRef.current !== null ||
+                agentLifecycleGenerationRef.current !==
+                  onboardingLifecycleGeneration
+              ) {
+                return;
+              }
               agentMutationEpochRef.current += 1;
               agentOperationGenerationRef.current += 1;
               agentLifecycleGenerationRef.current += 1;
@@ -546,6 +558,7 @@ export function ViewHarness() {
               draft={draft}
               setDraft={setDraft}
               sending={sending}
+              disabled={resetting}
               onSend={send}
               error={error}
               onDismissError={() => setError(null)}

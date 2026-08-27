@@ -221,6 +221,7 @@ export function Composer({
   draft,
   setDraft,
   sending,
+  disabled,
   onSend,
   error,
   onDismissError,
@@ -229,6 +230,7 @@ export function Composer({
   draft: string;
   setDraft: (v: string) => void;
   sending: boolean;
+  disabled: boolean;
   onSend: () => void;
   error: string | null;
   onDismissError: () => void;
@@ -254,6 +256,7 @@ export function Composer({
           <textarea
             ref={taRef}
             value={draft}
+            disabled={disabled}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
@@ -267,7 +270,7 @@ export function Composer({
           />
           <button
             onClick={onSend}
-            disabled={sending || !draft.trim()}
+            disabled={disabled || sending || !draft.trim()}
             aria-label="Send"
             className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-sky-500 text-white shadow-lg shadow-sky-500/25 transition hover:bg-sky-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
           >

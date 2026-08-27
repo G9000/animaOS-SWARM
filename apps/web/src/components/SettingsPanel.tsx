@@ -31,6 +31,7 @@ export function SettingsPanel({
   agent,
   providers,
   saving,
+  resetting,
   error,
   saveSettings,
   resetAgent,
@@ -39,6 +40,7 @@ export function SettingsPanel({
   agent: AgentDetail;
   providers: DaemonProvider[] | null;
   saving: boolean;
+  resetting: boolean;
   error: string | null;
   saveSettings: (patch: AgentConfigPatch) => Promise<boolean>;
   resetAgent: () => void;
@@ -217,10 +219,17 @@ export function SettingsPanel({
           </section>
 
           {error && <ErrorBanner message={error} icon={<AlertIcon size={14} />} />}
+          {resetting ? (
+            <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+              Resetting agent…
+            </p>
+          ) : null}
 
           <button
             onClick={save}
-            disabled={saving || !dirty || !resolvedModel || !name.trim()}
+            disabled={
+              saving || resetting || !dirty || !resolvedModel || !name.trim()
+            }
             className={`${primaryBtnCls} w-full py-2.5`}
           >
             {saving ? 'Saving…' : savedFlash ? 'Saved ✓' : dirty ? 'Save changes' : 'No changes'}
@@ -237,10 +246,11 @@ export function SettingsPanel({
               </div>
               <button
                 onClick={resetAgent}
-                className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-400/20"
+                disabled={resetting}
+                className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <TrashIcon size={12} />
-                Reset
+                {resetting ? 'Resetting…' : 'Reset'}
               </button>
             </div>
           </section>
