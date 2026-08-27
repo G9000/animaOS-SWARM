@@ -3,6 +3,7 @@ import {
   daemon,
   toAgentDetail,
   type DaemonProvider,
+  type DaemonSnapshot,
 } from './lib/daemon-api';
 import type { AgentDetail } from './lib/types';
 import {
@@ -20,6 +21,11 @@ import { ChatHeader, Composer, MessageList } from './components/ChatScreen';
 import { SettingsPanel } from './components/SettingsPanel';
 import { CheckinsView } from './components/CheckinsView';
 import { Sidebar } from './components/Sidebar';
+
+interface AgentOperation {
+  generation: number;
+  targetAgentId: string;
+}
 
 /**
  * Single-agent console on top of the anima-daemon.
@@ -52,10 +58,50 @@ export function ViewHarness() {
 
   const sendingRef = useRef(false);
   const agentMutationEpochRef = useRef(0);
+  const agentOperationGenerationRef = useRef(0);
+  const currentAgentIdRef = useRef<string | null>(null);
   const agentRequestTokenRef = useRef(0);
   const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
   const providerRequestGenerationRef = useRef(0);
   sendingRef.current = sending;
+
+  const beginAgentOperation = useCallback(
+    (targetAgentId: string): AgentOperation => {
+      agentMutationEpochRef.current += 1;
+      return {
+        generation: ++agentOperationGenerationRef.current,
+        targetAgentId,
+      };
+    },
+    [],
+  );
+
+  const isCurrentAgentOperation = useCallback(
+    (operation: AgentOperation) =>
+      operation.generation === agentOperationGenerationRef.current &&
+      operation.targetAgentId === currentAgentIdRef.current,
+    [],
+  );
+
+  const adoptAgentSnapshot = useCallback(
+    (operation: AgentOperation, snapshot: DaemonSnapshot) => {
+      if (
+        !isCurrentAgentOperation(operation) ||
+        snapshot.state.id !== operation.targetAgentId
+      ) {
+        return false;
+      }
+
+      const updatedAgent = toAgentDetail(snapshot);
+      agentMutationEpochRef.current += 1;
+      currentAgentIdRef.current = updatedAgent.id;
+      setAgent(updatedAgent);
+      setOnline(true);
+      setLoaded(true);
+      return true;
+    },
+    [isCurrentAgentOperation],
+  );
 
   const scrollerRef = useRef<HTMLDivElement>(null);
   const scrollDown = () => {
@@ -79,7 +125,10 @@ export function ViewHarness() {
           requestToken === agentRequestTokenRef.current &&
           mutationEpoch === agentMutationEpochRef.current
         ) {
-          setAgent(agents.length > 0 ? toAgentDetail(agents[0]) : null);
+          const refreshedAgent =
+            agents.length > 0 ? toAgentDetail(agents[0]) : null;
+          currentAgentIdRef.current = refreshedAgent?.id ?? null;
+          setAgent(refreshedAgent);
           setOnline(true);
           setLoaded(true);
           if (agents.length > 0) {
@@ -160,6 +209,7 @@ export function ViewHarness() {
   }, [agentId]);
 
   const runCheckin = useCallback(async (targetAgentId: string, c: Checkin) => {
+    const operation = beginAgentOperation(targetAgentId);
     const stamp = (patch: Partial<Checkin>) =>
       setCheckins((prev) => {
         const next = prev.map((x) => (x.id === c.id ? { ...x, ...patch } : x));
@@ -175,10 +225,7 @@ export function ViewHarness() {
           id: c.id,
         },
       );
-      agentMutationEpochRef.current += 1;
-      setAgent(toAgentDetail(updatedAgent));
-      setOnline(true);
-      setLoaded(true);
+      adoptAgentSnapshot(operation, updatedAgent);
       const reply = result.data?.text?.trim() ?? '';
       if (result.status === 'error') {
         stamp({ lastRunAtMs: Date.now(), lastOutcome: 'error', lastReply: result.error ?? 'run failed' });
@@ -194,7 +241,7 @@ export function ViewHarness() {
         lastReply: e instanceof Error ? e.message : String(e),
       });
     }
-  }, []);
+  }, [adoptAgentSnapshot, beginAgentOperation]);
 
   // 10s ticker: fire whichever check-ins are due, one at a time.
   useEffect(() => {
@@ -245,17 +292,16 @@ export function ViewHarness() {
     system?: string;
   }): Promise<boolean> => {
     if (!agent) return false;
+    const operation = beginAgentOperation(agent.id);
     setSavingSettings(true);
     setError(null);
     try {
       const { agent: updatedAgent } = await daemon.updateAgent(agent.id, patch);
-      agentMutationEpochRef.current += 1;
-      setAgent(toAgentDetail(updatedAgent));
-      setOnline(true);
-      setLoaded(true);
-      return true;
+      return adoptAgentSnapshot(operation, updatedAgent);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (isCurrentAgentOperation(operation)) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
       return false;
     } finally {
       setSavingSettings(false);
@@ -264,36 +310,44 @@ export function ViewHarness() {
 
   const resetAgent = async () => {
     if (!agent) return;
+    const targetAgentId = agent.id;
+    const operation = beginAgentOperation(targetAgentId);
     setError(null);
     try {
-      await daemon.deleteAgent(agent.id);
+      await daemon.deleteAgent(targetAgentId);
       agentMutationEpochRef.current += 1;
-      clearCheckins(agent.id);
-      setCheckins([]);
-      setAgent(null);
-      setShowSettings(false);
-      setView('chat');
+      clearCheckins(targetAgentId);
+      if (currentAgentIdRef.current === targetAgentId) {
+        currentAgentIdRef.current = null;
+        setCheckins([]);
+        setAgent(null);
+        setShowSettings(false);
+        setView('chat');
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (isCurrentAgentOperation(operation)) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     }
   };
 
   const send = async () => {
     const text = draft.trim();
     if (!text || !agent || sending) return;
+    const operation = beginAgentOperation(agent.id);
     setSending(true);
     setError(null);
     setDraft('');
     try {
       const { agent: updatedAgent, result } = await daemon.runAgent(agent.id, text);
-      agentMutationEpochRef.current += 1;
-      setAgent(toAgentDetail(updatedAgent));
-      setOnline(true);
-      setLoaded(true);
-      if (result.status === 'error') setError(result.error ?? 'run failed');
-      scrollDown();
+      if (adoptAgentSnapshot(operation, updatedAgent)) {
+        if (result.status === 'error') setError(result.error ?? 'run failed');
+        scrollDown();
+      }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (isCurrentAgentOperation(operation)) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
       setSending(false);
     }
@@ -352,7 +406,10 @@ export function ViewHarness() {
             retryProviders={retryProviders}
             onCreated={(snapshot) => {
               agentMutationEpochRef.current += 1;
-              setAgent(toAgentDetail(snapshot));
+              agentOperationGenerationRef.current += 1;
+              const createdAgent = toAgentDetail(snapshot);
+              currentAgentIdRef.current = createdAgent.id;
+              setAgent(createdAgent);
               setOnline(true);
               scrollDown();
             }}

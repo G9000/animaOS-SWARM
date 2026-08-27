@@ -16,6 +16,7 @@ export interface ModelStepProps {
   onRetryProviders(): void;
   modelSelectRef: RefObject<HTMLSelectElement | null>;
   customModelInputRef: RefObject<HTMLInputElement | null>;
+  customModelValidationErrorId?: string;
 }
 
 export type ProviderCatalogState =
@@ -51,6 +52,7 @@ export function ModelStep({
   onRetryProviders,
   modelSelectRef,
   customModelInputRef,
+  customModelValidationErrorId,
 }: ModelStepProps) {
   const modelSuggestions = MODEL_SUGGESTIONS[provider] ?? [];
   const selectedProviderRef = useRef<HTMLButtonElement>(null);
@@ -217,6 +219,9 @@ export function ModelStep({
                 value={customModel}
                 onChange={(event) => onCustomModelChange(event.target.value)}
                 placeholder="Provider model identifier"
+                required
+                aria-invalid={Boolean(customModelValidationErrorId)}
+                aria-describedby={customModelValidationErrorId}
               />
             </div>
           ) : null}

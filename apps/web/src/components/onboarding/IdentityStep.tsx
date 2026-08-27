@@ -8,6 +8,7 @@ export interface IdentityStepProps {
   onNameChange(value: string): void;
   onSystemChange(value: string): void;
   nameInputRef: RefObject<HTMLInputElement | null>;
+  validationErrorId?: string;
 }
 
 export function IdentityStep({
@@ -16,6 +17,7 @@ export function IdentityStep({
   onNameChange,
   onSystemChange,
   nameInputRef,
+  validationErrorId,
 }: IdentityStepProps) {
   return (
     <section
@@ -45,6 +47,9 @@ export function IdentityStep({
           value={name}
           onChange={(event) => onNameChange(event.target.value)}
           autoComplete="off"
+          required
+          aria-invalid={Boolean(validationErrorId)}
+          aria-describedby={validationErrorId}
         />
       </div>
 

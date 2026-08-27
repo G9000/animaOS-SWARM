@@ -43,6 +43,10 @@ const INITIAL_DRAFT: OnboardingDraft = {
 
 const PROVIDER_CATALOG_CHANGED_ERROR =
   'Provider catalog changed. Review your provider and model before creating the agent.';
+const NAME_REQUIRED_ERROR = 'Enter an agent name.';
+const MODEL_REQUIRED_ERROR = 'Enter a model.';
+const NAME_ERROR_ID = 'onboarding-agent-name-error';
+const CUSTOM_MODEL_ERROR_ID = 'onboarding-custom-model-error';
 
 function defaultModel(provider: string): string {
   return MODEL_SUGGESTIONS[provider]?.[0] ?? '__custom__';
@@ -132,6 +136,18 @@ export function OnboardingFlow({
   }
   const intelligenceReady =
     providerCatalogState === 'ready' && selectedProviderConfigured;
+  const nameValidationErrorId =
+    currentStep === 0 && blockingError === NAME_REQUIRED_ERROR
+      ? NAME_ERROR_ID
+      : undefined;
+  const customModelValidationErrorId =
+    currentStep === 1 &&
+    draft.model === '__custom__' &&
+    blockingError === MODEL_REQUIRED_ERROR
+      ? CUSTOM_MODEL_ERROR_ID
+      : undefined;
+  const blockingErrorId =
+    nameValidationErrorId ?? customModelValidationErrorId;
 
   useEffect(() => {
     if (currentStep < 2 || intelligenceReady) {
@@ -196,7 +212,7 @@ export function OnboardingFlow({
     setBlockingError(null);
 
     if (currentStep === 0 && !draft.name.trim()) {
-      setBlockingError('Enter an agent name.');
+      setBlockingError(NAME_REQUIRED_ERROR);
       nameInputRef.current?.focus();
       return;
     }
@@ -207,7 +223,7 @@ export function OnboardingFlow({
       }
 
       if (!resolvedModel) {
-        setBlockingError('Enter a model.');
+        setBlockingError(MODEL_REQUIRED_ERROR);
         if (draft.model === '__custom__') {
           customModelInputRef.current?.focus();
         } else {
@@ -246,7 +262,7 @@ export function OnboardingFlow({
     const name = draft.name.trim();
     if (!name) {
       setCreateError(null);
-      setBlockingError('Enter an agent name.');
+      setBlockingError(NAME_REQUIRED_ERROR);
       setCurrentStep(0);
       return;
     }
@@ -260,7 +276,7 @@ export function OnboardingFlow({
 
     if (!resolvedModel) {
       setCreateError(null);
-      setBlockingError('Enter a model.');
+      setBlockingError(MODEL_REQUIRED_ERROR);
       setCurrentStep(1);
       return;
     }
@@ -296,6 +312,7 @@ export function OnboardingFlow({
           onNameChange={(name) => updateDraft('name', name)}
           onSystemChange={(system) => updateDraft('system', system)}
           nameInputRef={nameInputRef}
+          validationErrorId={nameValidationErrorId}
         />
       );
       break;
@@ -314,6 +331,7 @@ export function OnboardingFlow({
           onRetryProviders={() => void handleRetryProviders()}
           modelSelectRef={modelSelectRef}
           customModelInputRef={customModelInputRef}
+          customModelValidationErrorId={customModelValidationErrorId}
         />
       );
       break;
@@ -370,6 +388,7 @@ export function OnboardingFlow({
 
           {blockingError ? (
             <p
+              id={blockingErrorId}
               role="alert"
               className="mt-5 rounded-xl border border-red-400/30 bg-red-400/5 p-3 text-sm text-red-300"
             >
