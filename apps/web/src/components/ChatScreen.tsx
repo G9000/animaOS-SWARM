@@ -90,9 +90,9 @@ function EmptyState({
           <button
             key={s.text}
             onClick={() => onPick(s.text)}
-            className="glass group flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs text-ink-2 transition-all duration-150 hover:border-accent/40 hover:text-ink hover:shadow-[0_0_16px_-4px_rgba(255,57,127,0.4)] focus-visible:border-accent/40"
+            className="glass group flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs text-ink-2 transition-all duration-150 hover:border-line-strong hover:bg-white/[0.035] hover:text-ink hover:shadow-lg hover:shadow-black/30"
           >
-            <span className="text-ink-3 transition group-hover:text-accent group-focus-visible:text-accent">
+            <span className="text-ink-3 transition group-hover:text-ink-2">
               {s.icon}
             </span>
             {s.text}

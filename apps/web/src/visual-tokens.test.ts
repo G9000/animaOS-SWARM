@@ -85,7 +85,7 @@ describe('Neon Rose spatial visual contract', () => {
     expect(connecting).not.toMatch(/(?:bg|text|shadow)-mint/);
   });
 
-  it('keeps ordinary conversation surfaces neutral until interaction', () => {
+  it('keeps ordinary conversation surfaces and secondary hover neutral', () => {
     const chat = read('components/ChatScreen.tsx');
     const bubble = between(chat, 'function Bubble', 'const SUGGESTIONS');
     const suggestions = between(
@@ -97,9 +97,12 @@ describe('Neon Rose spatial visual contract', () => {
     expect(bubble).toContain('bg-panel-2/90');
     expect(bubble).not.toContain('accent');
     expect(suggestions).toContain('text-ink-3');
-    expect(suggestions).not.toContain('className="text-accent"');
-    expect(suggestions).toContain('group-hover:text-accent');
-    expect(suggestions).toContain('group-focus-visible:text-accent');
+    expect(suggestions).toContain('hover:border-line-strong');
+    expect(suggestions).toContain('hover:bg-white/[0.035]');
+    expect(suggestions).toContain('hover:shadow-black/30');
+    expect(suggestions).toContain('group-hover:text-ink-2');
+    expect(suggestions).not.toContain('accent');
+    expect(suggestions).not.toMatch(/255,\s*57,\s*127/);
   });
 
   it('keeps onboarding decorative copy neutral', () => {
