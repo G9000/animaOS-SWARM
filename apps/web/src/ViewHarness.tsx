@@ -352,7 +352,11 @@ export function ViewHarness() {
     });
   };
 
-  const toggleSettings = () => setShowSettings((visible) => !visible);
+  const openSettings = () => setShowSettings(true);
+  const closeSettings = () => {
+    if (savingSettingsRef.current || resetInFlightRef.current !== null) return;
+    setShowSettings(false);
+  };
 
   const saveSettings = async (patch: AgentUpdateInput): Promise<boolean> => {
     if (
@@ -521,7 +525,7 @@ export function ViewHarness() {
       resetError={resetError}
       saveSettings={saveSettings}
       resetAgent={resetAgent}
-      close={toggleSettings}
+      close={closeSettings}
     />
   ) : null;
 
@@ -532,7 +536,7 @@ export function ViewHarness() {
         mainAgent={agent}
         agents={agents}
         connection={connection}
-        onOpenSettings={toggleSettings}
+        onOpenSettings={openSettings}
         workspace={
           <section
             className="flex h-full min-h-0 flex-col"

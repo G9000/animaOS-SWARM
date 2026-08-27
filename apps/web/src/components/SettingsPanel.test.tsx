@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -257,4 +257,42 @@ describe('SettingsPanel access', () => {
     }
     expect(screen.getByRole('status')).toHaveTextContent('Resetting agent…');
   });
+
+  it.each([
+    { busyProp: 'saving', buttonName: 'Saving…', description: /saving/i },
+    {
+      busyProp: 'resetting',
+      buttonName: 'Resetting…',
+      description: /resetting/i,
+    },
+  ] as const)(
+    'blocks every close trigger while $busyProp and restores them after settlement',
+    async ({ busyProp, buttonName, description }) => {
+      const user = userEvent.setup();
+      const close = vi.fn();
+      const view = renderPanel(agent(), { [busyProp]: true, close });
+
+      expect(screen.getByRole('button', { name: buttonName })).toBeDisabled();
+      const closeButton = screen.getByRole('button', {
+        name: 'Close settings',
+      });
+      expect(closeButton).toBeDisabled();
+      expect(closeButton).toHaveAccessibleDescription(description);
+
+      await user.click(closeButton);
+      fireEvent.click(screen.getByTestId('settings-backdrop'));
+      await user.keyboard('{Escape}');
+      expect(close).not.toHaveBeenCalled();
+
+      view.rerender(
+        <SettingsPanel {...view.props} saving={false} resetting={false} />,
+      );
+
+      expect(closeButton).toBeEnabled();
+      await user.keyboard('{Escape}');
+      fireEvent.click(screen.getByTestId('settings-backdrop'));
+      await user.click(closeButton);
+      expect(close).toHaveBeenCalledTimes(3);
+    },
+  );
 });

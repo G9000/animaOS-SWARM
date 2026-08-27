@@ -38,10 +38,12 @@ const nativeSetTimeout = window.setTimeout.bind(window);
 
 function deferred<Value>() {
   let resolve!: (value: Value) => void;
-  const promise = new Promise<Value>((resolvePromise) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function snapshot(
@@ -470,36 +472,77 @@ describe('ViewHarness workspace controller', () => {
     ).not.toHaveAttribute('aria-describedby');
   });
 
-  it('focuses and associates a reset failure only with Reset', async () => {
+  it('keeps the full draft mounted through a deferred reset failure, then allows close', async () => {
     const user = userEvent.setup();
     const nova = snapshot('agent-main', 'Nova', 1);
+    const deletion = deferred<Awaited<ReturnType<typeof daemon.deleteAgent>>>();
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
-    vi.spyOn(daemon, 'deleteAgent').mockRejectedValue(
-      new Error('DELETE denied'),
-    );
+    vi.spyOn(daemon, 'deleteAgent').mockReturnValue(deletion.promise);
 
     render(<ViewHarness />);
 
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const name = screen.getByDisplayValue('Nova');
+    await user.clear(name);
+    await user.type(name, 'Unsaved Nova');
+    const [provider, model] = screen.getAllByRole('combobox');
+    await user.selectOptions(provider, 'anthropic');
+    await user.selectOptions(model, '__custom__');
+    await user.type(
+      screen.getByPlaceholderText('model id, e.g. llama3.1'),
+      'anthropic/unsaved-model',
+    );
+    const system = screen.getByPlaceholderText(
+      'Leave empty for the daemon default.',
+    );
+    await user.clear(system);
+    await user.type(system, 'Unsaved system');
+    await user.click(screen.getByRole('radio', { name: /^Operate/ }));
     await user.click(screen.getByRole('button', { name: 'Reset' }));
+
+    const close = screen.getByRole('button', { name: 'Close settings' });
+    expect(close).toBeDisabled();
+    expect(close).toHaveAccessibleDescription(/resetting/i);
+    await user.click(close);
+    fireEvent.click(screen.getByTestId('settings-backdrop'));
+    await user.keyboard('{Escape}');
+    expect(
+      screen.getByRole('heading', { name: 'Agent settings' }),
+    ).toBeVisible();
+
+    await act(async () => {
+      deletion.reject(new Error('DELETE denied'));
+      await deletion.promise.catch(() => undefined);
+    });
 
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('DELETE denied');
     expect(alert).toHaveAttribute('id', 'settings-reset-error');
+    expect(alert).toHaveAttribute('aria-live', 'assertive');
     expect(alert).toHaveFocus();
     expect(screen.getByRole('button', { name: 'Reset' })).toHaveAttribute(
       'aria-describedby',
       'settings-reset-error',
     );
     expect(
-      screen.getByRole('button', { name: 'No changes' }),
+      screen.getByRole('button', { name: 'Save changes' }),
     ).not.toHaveAttribute('aria-describedby');
+    expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
+    expect(screen.getAllByRole('combobox')[0]).toHaveValue('anthropic');
+    expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
+    expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
+    expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
+    expect(close).toBeEnabled();
+    await user.click(close);
+    expect(
+      screen.queryByRole('heading', { name: 'Agent settings' }),
+    ).not.toBeInTheDocument();
   });
 
-  it('keeps failed access and identity edits in the open panel without changing the current agent', async () => {
+  it('keeps the full draft mounted through a deferred save failure, then allows close', async () => {
     const user = userEvent.setup();
     const nova = snapshot('agent-main', 'Nova', 1);
     nova.messages = [
@@ -513,12 +556,13 @@ describe('ViewHarness workspace controller', () => {
       },
     ];
     nova.messageCount = 1;
+    const update = deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
     const updateAgent = vi
       .spyOn(daemon, 'updateAgent')
-      .mockRejectedValue(new Error('PATCH denied'));
+      .mockReturnValue(update.promise);
 
     render(<ViewHarness />);
 
@@ -550,10 +594,27 @@ describe('ViewHarness workspace controller', () => {
       system: 'Unsaved system',
       tools: toolNamesForProfile('operate'),
     });
+    const close = screen.getByRole('button', { name: 'Close settings' });
+    expect(close).toBeDisabled();
+    expect(close).toHaveAccessibleDescription(/saving/i);
+    await user.click(close);
+    fireEvent.click(screen.getByTestId('settings-backdrop'));
+    await user.keyboard('{Escape}');
+    expect(
+      screen.getByRole('heading', { name: 'Agent settings' }),
+    ).toBeVisible();
+
+    await act(async () => {
+      update.reject(new Error('PATCH denied'));
+      await update.promise.catch(() => undefined);
+    });
+
     const alert = await screen.findByRole('alert');
     expect(alert).toHaveTextContent('PATCH denied');
+    expect(alert).toHaveAttribute('aria-live', 'assertive');
     expect(alert).toHaveFocus();
     expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
+    expect(screen.getAllByRole('combobox')[0]).toHaveValue('anthropic');
     expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
     expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
     expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
@@ -562,6 +623,11 @@ describe('ViewHarness workspace controller', () => {
     expect(
       screen.getByRole('heading', { name: 'Agent settings' }),
     ).toBeVisible();
+    expect(close).toBeEnabled();
+    await user.click(close);
+    expect(
+      screen.queryByRole('heading', { name: 'Agent settings' }),
+    ).not.toBeInTheDocument();
   });
 
   it('returns to onboarding after deleting the final agent', async () => {

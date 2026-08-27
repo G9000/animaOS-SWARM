@@ -2100,6 +2100,9 @@ describe('OnboardingFlow', () => {
       void runCheckins?.();
     });
     await user.click(screen.getByRole('button', { name: 'Close settings' }));
+    expect(
+      screen.getByRole('heading', { name: 'Agent settings' }),
+    ).toBeVisible();
     await user.type(screen.getByPlaceholderText(/Message/), 'Blocked send');
     await user.click(screen.getByRole('button', { name: 'Send' }));
 
@@ -2114,12 +2117,12 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
+    expect(await screen.findByText('exclusive reset failed')).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveFocus();
+    await user.click(screen.getByRole('button', { name: 'Close settings' }));
     expect(
       screen.queryByText('exclusive reset failed'),
     ).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Settings' }));
-    expect(await screen.findByText('exclusive reset failed')).toBeVisible();
-    expect(screen.getByRole('alert')).toHaveFocus();
   });
 
   it('disables and announces reset controls and the composer while delete is pending', async () => {

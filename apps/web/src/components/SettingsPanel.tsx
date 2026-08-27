@@ -96,6 +96,12 @@ export function SettingsPanel({
   const [savedFlash, setSavedFlash] = useState(false);
   const saveErrorRef = useRef<HTMLDivElement>(null);
   const resetErrorRef = useRef<HTMLDivElement>(null);
+  const controlsDisabled = saving || resetting;
+
+  const requestClose = () => {
+    if (controlsDisabled) return;
+    close();
+  };
 
   // Re-seed after an accepted agent update or a main-agent transition. Tool
   // order alone is not a config change and must not clobber an in-progress draft.
@@ -131,6 +137,16 @@ export function SettingsPanel({
     }
   }, [resetError]);
 
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || saving || resetting) return;
+      close();
+    };
+
+    document.addEventListener('keydown', handleEscape);
+    return () => document.removeEventListener('keydown', handleEscape);
+  }, [close, resetting, saving]);
+
   const resolvedModel = model === '__custom__' ? customModel.trim() : model;
   const accessDirty =
     accessChanged &&
@@ -160,13 +176,23 @@ export function SettingsPanel({
       setTimeout(() => setSavedFlash(false), 2000);
     }
   };
-  const controlsDisabled = saving || resetting;
+  const closeBusyDescription = saving
+    ? 'Settings cannot be closed while changes are saving.'
+    : resetting
+      ? 'Settings cannot be closed while the agent is resetting.'
+      : null;
 
   return (
     <>
+      {closeBusyDescription ? (
+        <p id="settings-close-busy" className="sr-only">
+          {closeBusyDescription}
+        </p>
+      ) : null}
       <div
+        data-testid="settings-backdrop"
         className="animate-fade-in absolute inset-0 z-10 bg-black/50 backdrop-blur-[2px]"
-        onClick={close}
+        onClick={requestClose}
       />
       <aside className="animate-slide-in-right absolute inset-y-0 right-0 z-20 flex w-full max-w-md flex-col border-l border-line bg-panel/95 shadow-2xl shadow-black/60 backdrop-blur-2xl">
         {/* Panel header */}
@@ -180,8 +206,12 @@ export function SettingsPanel({
             </p>
           </div>
           <button
-            onClick={close}
-            className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-line text-ink-3 transition hover:border-line-strong hover:text-ink"
+            onClick={requestClose}
+            disabled={controlsDisabled}
+            aria-describedby={
+              closeBusyDescription ? 'settings-close-busy' : undefined
+            }
+            className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg border border-line text-ink-3 transition hover:border-line-strong hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
             aria-label="Close settings"
           >
             <XIcon size={14} />
