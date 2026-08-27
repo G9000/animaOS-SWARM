@@ -271,7 +271,7 @@ describe('ViewHarness workspace controller', () => {
     expect(await screen.findByText('Next is responsive')).toBeVisible();
   });
 
-  it('patches main identity, provider, model, and system while preserving its messages', async () => {
+  it('patches main identity, provider, model, system, and deliberate access while preserving its messages', async () => {
     const user = userEvent.setup();
     const nova = snapshot('agent-main', 'Nova', 1);
     nova.messages = [
@@ -291,6 +291,11 @@ describe('ViewHarness workspace controller', () => {
     updated.state.config.provider = 'anthropic';
     updated.state.config.model = 'claude-sonnet-4-6';
     updated.state.config.system = 'Be concise';
+    updated.state.config.tools = toolNamesForProfile('operate').map((tool) => ({
+      name: tool,
+      description: tool,
+      parameters: {},
+    }));
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
@@ -313,6 +318,7 @@ describe('ViewHarness workspace controller', () => {
     );
     await user.clear(system);
     await user.type(system, 'Be concise');
+    await user.click(screen.getByRole('radio', { name: /^Operate/ }));
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
 
     expect(updateAgent).toHaveBeenCalledWith('agent-main', {
@@ -320,9 +326,79 @@ describe('ViewHarness workspace controller', () => {
       provider: 'anthropic',
       model: 'claude-sonnet-4-6',
       system: 'Be concise',
+      tools: toolNamesForProfile('operate'),
     });
     expect(await screen.findByDisplayValue('Nova Prime')).toBeVisible();
     expect(screen.getByText('Existing conversation')).toBeVisible();
+    expect(screen.getByText('Access Operate')).toBeVisible();
+    expect(
+      screen.getByRole('heading', { name: 'Agent settings' }),
+    ).toBeVisible();
+  });
+
+  it('keeps failed access and identity edits in the open panel without changing the current agent', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    nova.messages = [
+      {
+        id: 'message-1',
+        agentId: 'agent-main',
+        roomId: 'room-1',
+        role: 'assistant',
+        content: { text: 'Existing conversation' },
+        createdAtMs: 2,
+      },
+    ];
+    nova.messageCount = 1;
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    const updateAgent = vi
+      .spyOn(daemon, 'updateAgent')
+      .mockRejectedValue(new Error('PATCH denied'));
+
+    render(<ViewHarness />);
+
+    await screen.findByText('Existing conversation');
+    expect(screen.getByText('Access Collaborate')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const name = screen.getByDisplayValue('Nova');
+    await user.clear(name);
+    await user.type(name, 'Unsaved Nova');
+    const [provider, model] = screen.getAllByRole('combobox');
+    await user.selectOptions(provider, 'anthropic');
+    await user.selectOptions(model, '__custom__');
+    await user.type(
+      screen.getByPlaceholderText('model id, e.g. llama3.1'),
+      'anthropic/unsaved-model',
+    );
+    const system = screen.getByPlaceholderText(
+      'Leave empty for the daemon default.',
+    );
+    await user.clear(system);
+    await user.type(system, 'Unsaved system');
+    await user.click(screen.getByRole('radio', { name: /^Operate/ }));
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    expect(updateAgent).toHaveBeenCalledWith('agent-main', {
+      name: 'Unsaved Nova',
+      provider: 'anthropic',
+      model: 'anthropic/unsaved-model',
+      system: 'Unsaved system',
+      tools: toolNamesForProfile('operate'),
+    });
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('PATCH denied');
+    expect(alert).toHaveFocus();
+    expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
+    expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
+    expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
+    expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
+    expect(screen.getByText('Access Collaborate')).toBeVisible();
+    expect(screen.getByText('Existing conversation')).toBeVisible();
+    expect(
+      screen.getByRole('heading', { name: 'Agent settings' }),
+    ).toBeVisible();
   });
 
   it('returns to onboarding after deleting the final agent', async () => {

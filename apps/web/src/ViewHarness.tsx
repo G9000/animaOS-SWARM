@@ -348,6 +348,7 @@ export function ViewHarness() {
     model?: string;
     provider?: string;
     system?: string;
+    tools?: string[];
   }): Promise<boolean> => {
     if (
       !agent ||

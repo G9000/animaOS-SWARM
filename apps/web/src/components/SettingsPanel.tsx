@@ -1,14 +1,38 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ACCESS_PROFILES,
+  deriveAccessProfile,
+  toolNamesForProfile,
+  type AccessProfile,
+} from '../lib/agent-access';
 import type { AgentDetail } from '../lib/types';
 import { MODEL_SUGGESTIONS, type DaemonProvider } from '../lib/daemon-api';
 import { AlertIcon, TrashIcon, XIcon } from './icons';
-import { ErrorBanner, SectionTitle, formatTokens, labelCls, primaryBtnCls } from './ui-bits';
+import {
+  ErrorBanner,
+  SectionTitle,
+  formatTokens,
+  labelCls,
+  primaryBtnCls,
+} from './ui-bits';
 
-function InfoRow({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
+function InfoRow({
+  label,
+  value,
+  mono = true,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
   return (
     <div className="flex items-start justify-between gap-4 rounded-lg border border-line bg-white/[0.02] px-3.5 py-2.5">
-      <span className="shrink-0 font-mono text-[11px] uppercase tracking-wider text-ink-3">{label}</span>
-      <span className={`min-w-0 break-all text-right text-xs text-ink ${mono ? 'font-mono' : ''}`}>
+      <span className="shrink-0 font-mono text-[11px] uppercase tracking-wider text-ink-3">
+        {label}
+      </span>
+      <span
+        className={`min-w-0 break-all text-right text-xs text-ink ${mono ? 'font-mono' : ''}`}
+      >
         {value}
       </span>
     </div>
@@ -20,7 +44,14 @@ export interface AgentConfigPatch {
   model?: string;
   provider?: string;
   system?: string;
+  tools?: string[];
 }
+
+const ACCESS_ORDER: readonly AccessProfile[] = [
+  'observe',
+  'collaborate',
+  'operate',
+];
 
 /**
  * Editable agent settings. Saves through the daemon's
@@ -50,17 +81,25 @@ export function SettingsPanel({
     const options = MODEL_SUGGESTIONS[agent.provider] ?? [];
     return options.includes(agent.model) ? agent.model : '__custom__';
   }, [agent.provider, agent.model]);
+  const agentToolsKey = JSON.stringify([...agent.toolNames].sort());
+  const derivedAccess = deriveAccessProfile(agent.toolNames);
 
   const [name, setName] = useState(agent.name);
   const [provider, setProvider] = useState(agent.provider);
   const [model, setModel] = useState(seedModel);
   const [customModel, setCustomModel] = useState(
-    seedModel === '__custom__' ? agent.model : ''
+    seedModel === '__custom__' ? agent.model : '',
   );
   const [system, setSystem] = useState(agent.system ?? '');
+  const [accessSelection, setAccessSelection] = useState<AccessProfile | null>(
+    derivedAccess === 'custom' ? null : derivedAccess,
+  );
+  const [accessChanged, setAccessChanged] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
+  const errorRef = useRef<HTMLDivElement>(null);
 
-  // Re-seed the form whenever a different agent is shown.
+  // Re-seed after an accepted agent update or a main-agent transition. Tool
+  // order alone is not a config change and must not clobber an in-progress draft.
   useEffect(() => {
     const options = MODEL_SUGGESTIONS[agent.provider] ?? [];
     const seeded = options.includes(agent.model) ? agent.model : '__custom__';
@@ -69,22 +108,47 @@ export function SettingsPanel({
     setModel(seeded);
     setCustomModel(seeded === '__custom__' ? agent.model : '');
     setSystem(agent.system ?? '');
-  }, [agent.id, agent.name, agent.provider, agent.model, agent.system]);
+    setAccessSelection(derivedAccess === 'custom' ? null : derivedAccess);
+    setAccessChanged(false);
+  }, [
+    agent.id,
+    agent.name,
+    agent.provider,
+    agent.model,
+    agent.system,
+    agentToolsKey,
+    derivedAccess,
+  ]);
+
+  useEffect(() => {
+    if (error) {
+      errorRef.current?.focus();
+    }
+  }, [error]);
 
   const resolvedModel = model === '__custom__' ? customModel.trim() : model;
+  const accessDirty =
+    accessChanged &&
+    accessSelection !== null &&
+    accessSelection !== derivedAccess;
   const dirty =
     name.trim() !== agent.name ||
     provider !== agent.provider ||
     resolvedModel !== agent.model ||
-    system !== (agent.system ?? '');
+    system !== (agent.system ?? '') ||
+    accessDirty;
 
   const save = async () => {
     const patch: AgentConfigPatch = {};
     if (name.trim() && name.trim() !== agent.name) patch.name = name.trim();
     if (provider !== agent.provider) patch.provider = provider;
-    if (resolvedModel && resolvedModel !== agent.model) patch.model = resolvedModel;
+    if (resolvedModel && resolvedModel !== agent.model)
+      patch.model = resolvedModel;
     // Empty string clears the prompt back to the daemon default.
     if (system !== (agent.system ?? '')) patch.system = system;
+    if (accessDirty && accessSelection) {
+      patch.tools = toolNamesForProfile(accessSelection);
+    }
     if (Object.keys(patch).length === 0) return;
     if (await saveSettings(patch)) {
       setSavedFlash(true);
@@ -132,7 +196,10 @@ export function SettingsPanel({
                 minute: '2-digit',
               })}
             />
-            <InfoRow label="Tokens" value={formatTokens(agent.token_usage.total_tokens)} />
+            <InfoRow
+              label="Tokens"
+              value={formatTokens(agent.token_usage.total_tokens)}
+            />
           </section>
 
           {/* Editable identity */}
@@ -163,13 +230,16 @@ export function SettingsPanel({
                 {(providers ?? [])
                   .map((p) => p.id)
                   .concat(
-                    providers?.some((p) => p.id === agent.provider) || !agent.provider
+                    providers?.some((p) => p.id === agent.provider) ||
+                      !agent.provider
                       ? []
-                      : [agent.provider]
+                      : [agent.provider],
                   )
                   .filter((id, i, all) => all.indexOf(id) === i)
                   .map((id) => (
-                    <option key={id} value={id}>{id}</option>
+                    <option key={id} value={id}>
+                      {id}
+                    </option>
                   ))}
               </select>
               {providers && (
@@ -188,7 +258,9 @@ export function SettingsPanel({
                 className="field"
               >
                 {(MODEL_SUGGESTIONS[provider] ?? []).map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
                 ))}
                 <option value="__custom__">custom…</option>
               </select>
@@ -201,6 +273,64 @@ export function SettingsPanel({
                 className="field animate-fade-in"
               />
             )}
+          </section>
+
+          {/* Workspace access */}
+          <section className="space-y-2.5">
+            <SectionTitle>Workspace access</SectionTitle>
+            {derivedAccess === 'custom' ? (
+              <div className="rounded-xl border border-amber-300/25 bg-amber-300/[0.05] p-3.5">
+                <p className="text-sm font-semibold text-ink">Custom access</p>
+                <p className="mt-1 text-xs leading-relaxed text-ink-2">
+                  This agent has a custom tool set. Choose a standard profile to
+                  replace it when you save.
+                </p>
+                <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-ink-3">
+                  {agent.toolNames.length} tools configured
+                </p>
+                <p className="mt-1 break-words font-mono text-[10px] leading-relaxed text-ink-3">
+                  {agent.toolNames.join(', ') || 'No tools configured'}
+                </p>
+              </div>
+            ) : null}
+            <fieldset className="space-y-2">
+              <legend className={labelCls}>Access profile</legend>
+              {ACCESS_ORDER.map((profileName) => {
+                const profile = ACCESS_PROFILES[profileName];
+                const inputId = `settings-access-${profileName}`;
+
+                return (
+                  <div
+                    key={profileName}
+                    className="rounded-xl border border-line p-3.5"
+                  >
+                    <input
+                      id={inputId}
+                      type="radio"
+                      name="settings-access"
+                      value={profileName}
+                      checked={accessSelection === profileName}
+                      onChange={() => {
+                        setAccessSelection(profileName);
+                        setAccessChanged(true);
+                      }}
+                      className="mr-3 align-top"
+                    />
+                    <label htmlFor={inputId} className="inline cursor-pointer">
+                      <span className="font-medium text-ink">
+                        {profile.label}
+                      </span>
+                      <span className="mt-1 block pl-7 text-sm text-ink-2">
+                        {profile.summary}
+                      </span>
+                      <span className="mt-1 block pl-7 text-xs text-ink-3">
+                        {profile.risk}
+                      </span>
+                    </label>
+                  </div>
+                );
+              })}
+            </fieldset>
           </section>
 
           {/* System prompt */}
@@ -218,28 +348,53 @@ export function SettingsPanel({
             </p>
           </section>
 
-          {error && <ErrorBanner message={error} icon={<AlertIcon size={14} />} />}
+          {error ? (
+            <div
+              id="settings-save-error"
+              ref={errorRef}
+              role="alert"
+              aria-live="assertive"
+              aria-atomic="true"
+              tabIndex={-1}
+            >
+              <ErrorBanner message={error} icon={<AlertIcon size={14} />} />
+            </div>
+          ) : null}
           {resetting ? (
-            <p role="status" aria-live="polite" aria-atomic="true" className="sr-only">
+            <p
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="sr-only"
+            >
               Resetting agent…
             </p>
           ) : null}
 
           <button
             onClick={save}
+            aria-describedby={error ? 'settings-save-error' : undefined}
             disabled={
               saving || resetting || !dirty || !resolvedModel || !name.trim()
             }
             className={`${primaryBtnCls} w-full py-2.5`}
           >
-            {saving ? 'Saving…' : savedFlash ? 'Saved ✓' : dirty ? 'Save changes' : 'No changes'}
+            {saving
+              ? 'Saving…'
+              : savedFlash
+                ? 'Saved ✓'
+                : dirty
+                  ? 'Save changes'
+                  : 'No changes'}
           </button>
 
           {/* Danger zone */}
           <section className="rounded-xl border border-red-400/20 bg-red-400/[0.04] p-4">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <div className="text-xs font-semibold text-red-300">Reset agent</div>
+                <div className="text-xs font-semibold text-red-300">
+                  Reset agent
+                </div>
                 <div className="mt-0.5 text-[11px] leading-relaxed text-red-300/60">
                   deletes the agent and its entire conversation
                 </div>
