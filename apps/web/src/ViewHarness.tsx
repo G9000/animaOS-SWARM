@@ -58,12 +58,13 @@ export function ViewHarness() {
   const [ciIntervalMin, setCiIntervalMin] = useState(30);
 
   const sendingRef = useRef(false);
+  const savingSettingsRef = useRef(false);
   const agentMutationEpochRef = useRef(0);
   const agentOperationGenerationRef = useRef(0);
   const agentLifecycleGenerationRef = useRef(0);
   const sendingOperationGenerationRef = useRef<number | null>(null);
   const settingsOperationGenerationRef = useRef<number | null>(null);
-  const resetOperationGenerationRef = useRef<number | null>(null);
+  const resetInFlightRef = useRef<AgentOperation | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
   const agentRequestTokenRef = useRef(0);
   const agentRequestInFlightRef = useRef<Promise<void> | null>(null);
@@ -92,6 +93,14 @@ export function ViewHarness() {
 
   const isCurrentAgentLifecycle = useCallback(
     (operation: AgentOperation) =>
+      operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
+      operation.targetAgentId === currentAgentIdRef.current,
+    [],
+  );
+
+  const isCurrentResetOperation = useCallback(
+    (operation: AgentOperation) =>
+      resetInFlightRef.current === operation &&
       operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
       operation.targetAgentId === currentAgentIdRef.current,
     [],
@@ -206,7 +215,11 @@ export function ViewHarness() {
   // Light polling so new messages appear while idle.
   useEffect(() => {
     const timer = setInterval(() => {
-      if (!sendingRef.current && !agentRequestInFlightRef.current) {
+      if (
+        !sendingRef.current &&
+        !resetInFlightRef.current &&
+        !agentRequestInFlightRef.current
+      ) {
         void refreshAgent();
       }
     }, 5000);
@@ -271,7 +284,8 @@ export function ViewHarness() {
       if (
         checkinRunningRef.current ||
         sendingRef.current ||
-        resetOperationGenerationRef.current !== null
+        savingSettingsRef.current ||
+        resetInFlightRef.current !== null
       )
         return;
       const due = checkinsRef.current.filter((c) => isDue(c, Date.now()));
@@ -284,7 +298,9 @@ export function ViewHarness() {
           if (
             runGeneration !== checkinRunGenerationRef.current ||
             lifecycleGeneration !== agentLifecycleGenerationRef.current ||
-            resetOperationGenerationRef.current !== null
+            resetInFlightRef.current !== null ||
+            sendingRef.current ||
+            savingSettingsRef.current
           )
             break;
           await runCheckin(agentId, c);
@@ -331,9 +347,15 @@ export function ViewHarness() {
     provider?: string;
     system?: string;
   }): Promise<boolean> => {
-    if (!agent) return false;
+    if (
+      !agent ||
+      savingSettingsRef.current ||
+      resetInFlightRef.current !== null
+    )
+      return false;
     const operation = beginAgentOperation(agent.id);
     settingsOperationGenerationRef.current = operation.generation;
+    savingSettingsRef.current = true;
     setSavingSettings(true);
     setError(null);
     try {
@@ -347,16 +369,17 @@ export function ViewHarness() {
     } finally {
       if (settingsOperationGenerationRef.current === operation.generation) {
         settingsOperationGenerationRef.current = null;
+        savingSettingsRef.current = false;
         setSavingSettings(false);
       }
     }
   };
 
   const resetAgent = async () => {
-    if (!agent) return;
+    if (!agent || resetInFlightRef.current !== null) return;
     const targetAgentId = agent.id;
     const operation = beginAgentOperation(targetAgentId);
-    resetOperationGenerationRef.current = operation.generation;
+    resetInFlightRef.current = operation;
     const sendingGeneration = sendingOperationGenerationRef.current;
     const settingsGeneration = settingsOperationGenerationRef.current;
     setError(null);
@@ -373,6 +396,7 @@ export function ViewHarness() {
         }
         if (settingsOperationGenerationRef.current === settingsGeneration) {
           settingsOperationGenerationRef.current = null;
+          savingSettingsRef.current = false;
           setSavingSettings(false);
         }
         currentAgentIdRef.current = null;
@@ -382,21 +406,28 @@ export function ViewHarness() {
         setView('chat');
       }
     } catch (e) {
-      if (isCurrentAgentOperation(operation)) {
+      if (isCurrentResetOperation(operation)) {
         setError(e instanceof Error ? e.message : String(e));
       }
     } finally {
-      if (resetOperationGenerationRef.current === operation.generation) {
-        resetOperationGenerationRef.current = null;
+      if (resetInFlightRef.current === operation) {
+        resetInFlightRef.current = null;
       }
     }
   };
 
   const send = async () => {
     const text = draft.trim();
-    if (!text || !agent || sending) return;
+    if (
+      !text ||
+      !agent ||
+      sendingRef.current ||
+      resetInFlightRef.current !== null
+    )
+      return;
     const operation = beginAgentOperation(agent.id);
     sendingOperationGenerationRef.current = operation.generation;
+    sendingRef.current = true;
     setSending(true);
     setError(null);
     setDraft('');
@@ -413,6 +444,7 @@ export function ViewHarness() {
     } finally {
       if (sendingOperationGenerationRef.current === operation.generation) {
         sendingOperationGenerationRef.current = null;
+        sendingRef.current = false;
         setSending(false);
       }
     }
