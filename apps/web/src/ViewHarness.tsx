@@ -24,7 +24,12 @@ import {
   wrapPrompt,
   type Checkin,
 } from './lib/checkins';
-import { daemon, toAgentDetail, type DaemonSnapshot } from './lib/daemon-api';
+import {
+  daemon,
+  toAgentDetail,
+  type AgentUpdateInput,
+  type DaemonSnapshot,
+} from './lib/daemon-api';
 import { selectMainAgent } from './lib/agent-access';
 
 interface AgentOperation {
@@ -116,7 +121,11 @@ export function ViewHarness() {
 
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
+    null,
+  );
+  const [resetError, setResetError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [resetting, setResetting] = useState(false);
@@ -158,7 +167,9 @@ export function ViewHarness() {
     setDraft('');
     setCiPrompt('');
     setCiIntervalMin(30);
-    setError(null);
+    setWorkspaceError(null);
+    setSettingsSaveError(null);
+    setResetError(null);
     setShowSettings(false);
     setSending(false);
     setSavingSettings(false);
@@ -343,13 +354,7 @@ export function ViewHarness() {
 
   const toggleSettings = () => setShowSettings((visible) => !visible);
 
-  const saveSettings = async (patch: {
-    name?: string;
-    model?: string;
-    provider?: string;
-    system?: string;
-    tools?: string[];
-  }): Promise<boolean> => {
+  const saveSettings = async (patch: AgentUpdateInput): Promise<boolean> => {
     if (
       !agent ||
       savingSettingsRef.current ||
@@ -361,13 +366,20 @@ export function ViewHarness() {
     settingsOperationGenerationRef.current = operation.generation;
     savingSettingsRef.current = true;
     setSavingSettings(true);
-    setError(null);
+    setSettingsSaveError(null);
+    setResetError(null);
     try {
       const { agent: updatedAgent } = await daemon.updateAgent(agent.id, patch);
-      return adoptAgentSnapshot(operation, updatedAgent);
+      const adopted = adoptAgentSnapshot(operation, updatedAgent);
+      if (adopted) {
+        setSettingsSaveError(null);
+      }
+      return adopted;
     } catch (caught) {
       if (isCurrentAgentOperation(operation)) {
-        setError(caught instanceof Error ? caught.message : String(caught));
+        setSettingsSaveError(
+          caught instanceof Error ? caught.message : String(caught),
+        );
       }
       return false;
     } finally {
@@ -380,18 +392,27 @@ export function ViewHarness() {
   };
 
   const resetAgent = async () => {
-    if (!agent || resetInFlightRef.current !== null) return;
+    if (
+      !agent ||
+      savingSettingsRef.current ||
+      resetInFlightRef.current !== null
+    ) {
+      return;
+    }
     const targetAgentId = agent.id;
     const operation = beginAgentOperation(targetAgentId);
     resetInFlightRef.current = operation;
     setResetting(true);
-    setError(null);
+    setResetError(null);
+    setSettingsSaveError(null);
     try {
       try {
         await daemon.deleteAgent(targetAgentId);
       } catch (caught) {
         if (isCurrentResetOperation(operation)) {
-          setError(caught instanceof Error ? caught.message : String(caught));
+          setResetError(
+            caught instanceof Error ? caught.message : String(caught),
+          );
         }
         return;
       }
@@ -430,7 +451,7 @@ export function ViewHarness() {
     sendingOperationGenerationRef.current = operation.generation;
     sendingRef.current = true;
     setSending(true);
-    setError(null);
+    setWorkspaceError(null);
     setDraft('');
     try {
       const { agent: updatedAgent, result } = await daemon.runAgent(
@@ -439,13 +460,15 @@ export function ViewHarness() {
       );
       if (adoptAgentSnapshot(operation, updatedAgent)) {
         if (result.status === 'error') {
-          setError(result.error ?? 'run failed');
+          setWorkspaceError(result.error ?? 'run failed');
         }
         scrollDown();
       }
     } catch (caught) {
       if (isCurrentAgentOperation(operation)) {
-        setError(caught instanceof Error ? caught.message : String(caught));
+        setWorkspaceError(
+          caught instanceof Error ? caught.message : String(caught),
+        );
       }
     } finally {
       if (sendingOperationGenerationRef.current === operation.generation) {
@@ -494,7 +517,8 @@ export function ViewHarness() {
       providers={providers}
       saving={savingSettings}
       resetting={resetting}
-      error={error}
+      saveError={settingsSaveError}
+      resetError={resetError}
       saveSettings={saveSettings}
       resetAgent={resetAgent}
       close={toggleSettings}
@@ -527,8 +551,8 @@ export function ViewHarness() {
               sending={sending}
               disabled={resetting}
               onSend={send}
-              error={error}
-              onDismissError={() => setError(null)}
+              error={workspaceError}
+              onDismissError={() => setWorkspaceError(null)}
             />
           </section>
         }
@@ -542,7 +566,7 @@ export function ViewHarness() {
             setIntervalMin={setCiIntervalMin}
             addCheckin={addCheckin}
             removeCheckin={removeCheckin}
-            error={error}
+            error={workspaceError}
           />
         }
       />

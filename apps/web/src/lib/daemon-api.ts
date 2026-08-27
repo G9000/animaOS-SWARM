@@ -70,6 +70,14 @@ export interface DaemonRunResult {
   data?: { text: string } | null;
 }
 
+export interface AgentUpdateInput {
+  name?: string;
+  model?: string;
+  provider?: string;
+  system?: string;
+  tools?: string[];
+}
+
 /** Model suggestions keyed by daemon provider id. */
 export const MODEL_SUGGESTIONS: Record<string, string[]> = {
   ...PROVIDER_MODELS,
@@ -126,16 +134,7 @@ export const daemon = {
    * Partial config update; the conversation is kept. Empty string for
    * provider/system clears the field back to the daemon default.
    */
-  updateAgent: (
-    id: string,
-    patch: {
-      name?: string;
-      model?: string;
-      provider?: string;
-      system?: string;
-      tools?: string[];
-    }
-  ) =>
+  updateAgent: (id: string, patch: AgentUpdateInput) =>
     request<{ agent: DaemonSnapshot }>(`/agents/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(patch),
@@ -145,7 +144,7 @@ export const daemon = {
   runAgent: (id: string, text: string, metadata?: Record<string, unknown>) =>
     request<{ agent: DaemonSnapshot; result: DaemonRunResult }>(
       `/agents/${id}/run`,
-      { method: 'POST', body: JSON.stringify({ text, ...(metadata ? { metadata } : {}) }) }
+      { method: 'POST', body: JSON.stringify({ text, ...(metadata ? { metadata } : {}) }) },
     ),
 };
 

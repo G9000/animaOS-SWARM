@@ -6,7 +6,11 @@ import {
   type AccessProfile,
 } from '../lib/agent-access';
 import type { AgentDetail } from '../lib/types';
-import { MODEL_SUGGESTIONS, type DaemonProvider } from '../lib/daemon-api';
+import {
+  MODEL_SUGGESTIONS,
+  type AgentUpdateInput,
+  type DaemonProvider,
+} from '../lib/daemon-api';
 import { AlertIcon, TrashIcon, XIcon } from './icons';
 import {
   ErrorBanner,
@@ -39,14 +43,6 @@ function InfoRow({
   );
 }
 
-export interface AgentConfigPatch {
-  name?: string;
-  model?: string;
-  provider?: string;
-  system?: string;
-  tools?: string[];
-}
-
 const ACCESS_ORDER: readonly AccessProfile[] = [
   'observe',
   'collaborate',
@@ -63,7 +59,8 @@ export function SettingsPanel({
   providers,
   saving,
   resetting,
-  error,
+  saveError,
+  resetError,
   saveSettings,
   resetAgent,
   close,
@@ -72,8 +69,9 @@ export function SettingsPanel({
   providers: DaemonProvider[] | null;
   saving: boolean;
   resetting: boolean;
-  error: string | null;
-  saveSettings: (patch: AgentConfigPatch) => Promise<boolean>;
+  saveError: string | null;
+  resetError: string | null;
+  saveSettings: (patch: AgentUpdateInput) => Promise<boolean>;
   resetAgent: () => void;
   close: () => void;
 }) {
@@ -96,7 +94,8 @@ export function SettingsPanel({
   );
   const [accessChanged, setAccessChanged] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
-  const errorRef = useRef<HTMLDivElement>(null);
+  const saveErrorRef = useRef<HTMLDivElement>(null);
+  const resetErrorRef = useRef<HTMLDivElement>(null);
 
   // Re-seed after an accepted agent update or a main-agent transition. Tool
   // order alone is not a config change and must not clobber an in-progress draft.
@@ -121,10 +120,16 @@ export function SettingsPanel({
   ]);
 
   useEffect(() => {
-    if (error) {
-      errorRef.current?.focus();
+    if (saveError) {
+      saveErrorRef.current?.focus();
     }
-  }, [error]);
+  }, [saveError]);
+
+  useEffect(() => {
+    if (resetError) {
+      resetErrorRef.current?.focus();
+    }
+  }, [resetError]);
 
   const resolvedModel = model === '__custom__' ? customModel.trim() : model;
   const accessDirty =
@@ -139,7 +144,7 @@ export function SettingsPanel({
     accessDirty;
 
   const save = async () => {
-    const patch: AgentConfigPatch = {};
+    const patch: AgentUpdateInput = {};
     if (name.trim() && name.trim() !== agent.name) patch.name = name.trim();
     if (provider !== agent.provider) patch.provider = provider;
     if (resolvedModel && resolvedModel !== agent.model)
@@ -155,6 +160,7 @@ export function SettingsPanel({
       setTimeout(() => setSavedFlash(false), 2000);
     }
   };
+  const controlsDisabled = saving || resetting;
 
   return (
     <>
@@ -210,6 +216,7 @@ export function SettingsPanel({
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
+                disabled={controlsDisabled}
                 className="field"
               />
             </div>
@@ -217,6 +224,7 @@ export function SettingsPanel({
               <label className={labelCls}>Provider</label>
               <select
                 value={provider}
+                disabled={controlsDisabled}
                 onChange={(e) => {
                   const next = e.target.value;
                   setProvider(next);
@@ -255,6 +263,7 @@ export function SettingsPanel({
               <select
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
+                disabled={controlsDisabled}
                 className="field"
               >
                 {(MODEL_SUGGESTIONS[provider] ?? []).map((m) => (
@@ -269,6 +278,7 @@ export function SettingsPanel({
               <input
                 value={customModel}
                 onChange={(e) => setCustomModel(e.target.value)}
+                disabled={controlsDisabled}
                 placeholder="model id, e.g. llama3.1"
                 className="field animate-fade-in"
               />
@@ -293,7 +303,7 @@ export function SettingsPanel({
                 </p>
               </div>
             ) : null}
-            <fieldset className="space-y-2">
+            <fieldset disabled={controlsDisabled} className="space-y-2">
               <legend className={labelCls}>Access profile</legend>
               {ACCESS_ORDER.map((profileName) => {
                 const profile = ACCESS_PROFILES[profileName];
@@ -339,6 +349,7 @@ export function SettingsPanel({
             <textarea
               value={system}
               onChange={(e) => setSystem(e.target.value)}
+              disabled={controlsDisabled}
               rows={6}
               placeholder="Leave empty for the daemon default."
               className="field resize-y leading-relaxed"
@@ -348,16 +359,31 @@ export function SettingsPanel({
             </p>
           </section>
 
-          {error ? (
+          {saveError ? (
             <div
               id="settings-save-error"
-              ref={errorRef}
+              ref={saveErrorRef}
               role="alert"
               aria-live="assertive"
               aria-atomic="true"
               tabIndex={-1}
             >
-              <ErrorBanner message={error} icon={<AlertIcon size={14} />} />
+              <ErrorBanner message={saveError} icon={<AlertIcon size={14} />} />
+            </div>
+          ) : null}
+          {resetError ? (
+            <div
+              id="settings-reset-error"
+              ref={resetErrorRef}
+              role="alert"
+              aria-live="assertive"
+              aria-atomic="true"
+              tabIndex={-1}
+            >
+              <ErrorBanner
+                message={resetError}
+                icon={<AlertIcon size={14} />}
+              />
             </div>
           ) : null}
           {resetting ? (
@@ -373,7 +399,7 @@ export function SettingsPanel({
 
           <button
             onClick={save}
-            aria-describedby={error ? 'settings-save-error' : undefined}
+            aria-describedby={saveError ? 'settings-save-error' : undefined}
             disabled={
               saving || resetting || !dirty || !resolvedModel || !name.trim()
             }
@@ -401,7 +427,10 @@ export function SettingsPanel({
               </div>
               <button
                 onClick={resetAgent}
-                disabled={resetting}
+                aria-describedby={
+                  resetError ? 'settings-reset-error' : undefined
+                }
+                disabled={resetting || saving}
                 className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-red-400/30 bg-red-400/10 px-3 py-1.5 text-xs font-medium text-red-300 transition hover:bg-red-400/20 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <TrashIcon size={12} />

@@ -7,9 +7,9 @@ import {
   toolNamesForProfile,
   type AccessProfile,
 } from '../lib/agent-access';
-import type { DaemonProvider } from '../lib/daemon-api';
+import type { AgentUpdateInput, DaemonProvider } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
-import { SettingsPanel, type AgentConfigPatch } from './SettingsPanel';
+import { SettingsPanel } from './SettingsPanel';
 
 const providers: DaemonProvider[] = [
   {
@@ -53,8 +53,9 @@ function renderPanel(
   overrides: Partial<{
     saving: boolean;
     resetting: boolean;
-    error: string | null;
-    saveSettings: (patch: AgentConfigPatch) => Promise<boolean>;
+    saveError: string | null;
+    resetError: string | null;
+    saveSettings: (patch: AgentUpdateInput) => Promise<boolean>;
     resetAgent: () => void;
     close: () => void;
   }> = {},
@@ -64,7 +65,8 @@ function renderPanel(
     providers,
     saving: false,
     resetting: false,
-    error: null,
+    saveError: null,
+    resetError: null,
     saveSettings: vi.fn(async () => true),
     resetAgent: vi.fn(),
     close: vi.fn(),
@@ -172,7 +174,7 @@ describe('SettingsPanel access', () => {
     await user.click(screen.getByRole('radio', { name: /^Observe/ }));
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
 
-    view.rerender(<SettingsPanel {...view.props} error="PATCH failed" />);
+    view.rerender(<SettingsPanel {...view.props} saveError="PATCH failed" />);
 
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent('PATCH failed');
@@ -184,6 +186,24 @@ describe('SettingsPanel access', () => {
     ).toHaveAttribute('aria-describedby', 'settings-save-error');
     expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
     expect(screen.getByRole('radio', { name: /^Observe/ })).toBeChecked();
+  });
+
+  it('focuses and associates reset failures only with Reset', () => {
+    const view = renderPanel(agent());
+
+    view.rerender(<SettingsPanel {...view.props} resetError="DELETE failed" />);
+
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('DELETE failed');
+    expect(alert).toHaveAttribute('id', 'settings-reset-error');
+    expect(alert).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Reset' })).toHaveAttribute(
+      'aria-describedby',
+      'settings-reset-error',
+    );
+    expect(
+      screen.getByRole('button', { name: 'No changes' }),
+    ).not.toHaveAttribute('aria-describedby');
   });
 
   it('does not clobber an unsaved draft when a known tool set is reordered', async () => {
@@ -210,17 +230,31 @@ describe('SettingsPanel access', () => {
     expect(screen.getByRole('radio', { name: /^Collaborate/ })).toBeChecked();
   });
 
-  it('preserves save and reset busy states', () => {
+  it('locks every editable control and reset while saving or resetting', () => {
     const currentAgent = agent({ name: 'Nova draft' });
     const view = renderPanel(currentAgent, { saving: true });
 
     expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Reset' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Reset' })).toBeDisabled();
+    for (const control of [
+      ...screen.getAllByRole('textbox'),
+      ...screen.getAllByRole('combobox'),
+      ...screen.getAllByRole('radio'),
+    ]) {
+      expect(control).toBeDisabled();
+    }
 
     view.rerender(<SettingsPanel {...view.props} saving={false} resetting />);
 
     expect(screen.getByRole('button', { name: 'No changes' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Resetting…' })).toBeDisabled();
+    for (const control of [
+      ...screen.getAllByRole('textbox'),
+      ...screen.getAllByRole('combobox'),
+      ...screen.getAllByRole('radio'),
+    ]) {
+      expect(control).toBeDisabled();
+    }
     expect(screen.getByRole('status')).toHaveTextContent('Resetting agent…');
   });
 });

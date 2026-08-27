@@ -904,7 +904,7 @@ describe('OnboardingFlow', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('does not resurrect a reset agent when an older settings update resolves', async () => {
+  it('allows reset only after the pending settings update is adopted', async () => {
     const user = userEvent.setup();
     const pendingUpdate =
       deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
@@ -925,11 +925,8 @@ describe('OnboardingFlow', () => {
     await user.clear(name);
     await user.type(name, 'Stale Saved');
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
-    await user.click(screen.getByRole('button', { name: 'Reset' }));
-
-    expect(
-      await screen.findByRole('heading', { name: 'Create your main agent' }),
-    ).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Reset' })).toBeDisabled();
+    expect(daemon.deleteAgent).not.toHaveBeenCalled();
 
     await act(async () => {
       pendingUpdate.resolve({
@@ -938,8 +935,10 @@ describe('OnboardingFlow', () => {
       await pendingUpdate.promise;
     });
 
+    expect(await screen.findByDisplayValue('Stale Saved')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
     expect(
-      screen.getByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
     ).toBeVisible();
     expect(screen.queryByDisplayValue('Stale Saved')).not.toBeInTheDocument();
   });
@@ -1021,7 +1020,7 @@ describe('OnboardingFlow', () => {
     ).toBeVisible();
   });
 
-  it('keeps a newer settings update busy when the reset agent update rejects', async () => {
+  it('keeps a newer agent settings update busy after the prior update settles', async () => {
     const user = userEvent.setup();
     const olderUpdate =
       deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
@@ -1050,6 +1049,14 @@ describe('OnboardingFlow', () => {
     await user.clear(olderName);
     await user.type(olderName, 'Older saved');
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
+    expect(screen.getByRole('button', { name: 'Reset' })).toBeDisabled();
+    await act(async () => {
+      olderUpdate.resolve({
+        agent: namedSnapshot('Older saved', 'agent-1'),
+      });
+      await olderUpdate.promise;
+    });
+    expect(await screen.findByDisplayValue('Older saved')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Reset' }));
     expect(
       await screen.findByRole('heading', { name: 'Create your main agent' }),
@@ -1069,14 +1076,8 @@ describe('OnboardingFlow', () => {
     await waitFor(() => expect(updateAgent).toHaveBeenCalledTimes(2));
     expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
 
-    await act(async () => {
-      olderUpdate.reject(new Error('stale update failed'));
-      await olderUpdate.promise.catch(() => undefined);
-    });
-
     expect(screen.getByDisplayValue('Second saved')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Saving…' })).toBeDisabled();
-    expect(screen.queryByText('stale update failed')).not.toBeInTheDocument();
 
     await act(async () => {
       newerUpdate.resolve({
@@ -1089,7 +1090,7 @@ describe('OnboardingFlow', () => {
     ).toBeVisible();
   });
 
-  it('preserves the current agent and reset error without adopting an older update', async () => {
+  it('reports a reset error only in settings after the prior update settles', async () => {
     const user = userEvent.setup();
     const pendingUpdate =
       deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
@@ -1112,11 +1113,6 @@ describe('OnboardingFlow', () => {
     await user.clear(name);
     await user.type(name, 'Stale Saved');
     await user.click(screen.getByRole('button', { name: 'Save changes' }));
-    await user.click(screen.getByRole('button', { name: 'Reset' }));
-
-    expect((await screen.findAllByText('reset failed')).length).toBeGreaterThan(
-      0,
-    );
 
     await act(async () => {
       pendingUpdate.resolve({
@@ -1125,15 +1121,14 @@ describe('OnboardingFlow', () => {
       await pendingUpdate.promise;
     });
 
-    expect(screen.getAllByText('reset failed').length).toBeGreaterThan(0);
+    expect(await screen.findByDisplayValue('Stale Saved')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+    expect(await screen.findByText('reset failed')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Close settings' }));
     expect(
-      screen.getByRole('heading', { name: 'Say something to Nova' }),
+      screen.getByRole('heading', { name: 'Say something to Stale Saved' }),
     ).toBeVisible();
-    expect(
-      screen.queryByRole('heading', { name: 'Say something to Stale Saved' }),
-    ).not.toBeInTheDocument();
-    expect(screen.getByText('reset failed')).toBeVisible();
+    expect(screen.queryByText('reset failed')).not.toBeInTheDocument();
   });
 
   it('completes deferred reset cleanup without leaking the previous agent state', async () => {
@@ -2119,7 +2114,12 @@ describe('OnboardingFlow', () => {
     expect(
       await screen.findByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
+    expect(
+      screen.queryByText('exclusive reset failed'),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
     expect(await screen.findByText('exclusive reset failed')).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveFocus();
   });
 
   it('disables and announces reset controls and the composer while delete is pending', async () => {

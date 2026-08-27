@@ -1,4 +1,11 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -334,6 +341,162 @@ describe('ViewHarness workspace controller', () => {
     expect(
       screen.getByRole('heading', { name: 'Agent settings' }),
     ).toBeVisible();
+  });
+
+  it('locks the settings transaction and ignores Reset until a deferred PATCH is adopted', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    const updated = structuredClone(nova);
+    updated.state.name = 'Nova Prime';
+    updated.state.config.name = 'Nova Prime';
+    updated.state.config.tools = toolNamesForProfile('operate').map((tool) => ({
+      name: tool,
+      description: tool,
+      parameters: {},
+    }));
+    const update = deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    const updateAgent = vi
+      .spyOn(daemon, 'updateAgent')
+      .mockReturnValue(update.promise);
+    const deleteAgent = vi
+      .spyOn(daemon, 'deleteAgent')
+      .mockResolvedValue({ deleted: true });
+
+    render(<ViewHarness />);
+
+    await screen.findByRole('heading', { name: 'Say something to Nova' });
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const name = screen.getByDisplayValue('Nova');
+    await user.clear(name);
+    await user.type(name, 'Nova Prime');
+    await user.click(screen.getByRole('radio', { name: /^Operate/ }));
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    expect(updateAgent).toHaveBeenCalledWith('agent-main', {
+      name: 'Nova Prime',
+      tools: toolNamesForProfile('operate'),
+    });
+    const panel = screen.getByRole('complementary');
+    expect(within(panel).getByDisplayValue('Nova Prime')).toBeDisabled();
+    expect(
+      within(panel).getByRole('radio', { name: /^Operate/ }),
+    ).toBeDisabled();
+    const reset = within(panel).getByRole('button', { name: 'Reset' });
+    expect(reset).toBeDisabled();
+    reset.removeAttribute('disabled');
+    fireEvent.click(reset);
+    expect(deleteAgent).not.toHaveBeenCalled();
+
+    await act(async () => {
+      update.resolve({ agent: updated });
+      await update.promise;
+    });
+
+    expect(await screen.findByDisplayValue('Nova Prime')).toBeEnabled();
+    expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /^Operate/ })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Reset' })).toBeEnabled();
+  });
+
+  it('locks settings during reset and rejects a forced save until DELETE settles', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    const deletion = deferred<Awaited<ReturnType<typeof daemon.deleteAgent>>>();
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    vi.spyOn(daemon, 'deleteAgent').mockReturnValue(deletion.promise);
+    const updateAgent = vi.spyOn(daemon, 'updateAgent');
+
+    render(<ViewHarness />);
+
+    await screen.findByRole('heading', { name: 'Say something to Nova' });
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const name = screen.getByDisplayValue('Nova');
+    await user.clear(name);
+    await user.type(name, 'Unsaved Nova');
+    const save = screen.getByRole('button', { name: 'Save changes' });
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+
+    expect(screen.getByRole('button', { name: 'Resetting…' })).toBeDisabled();
+    expect(screen.getByDisplayValue('Unsaved Nova')).toBeDisabled();
+    expect(save).toBeDisabled();
+    save.removeAttribute('disabled');
+    fireEvent.click(save);
+    expect(updateAgent).not.toHaveBeenCalled();
+
+    await act(async () => {
+      deletion.resolve({ deleted: true });
+      await deletion.promise;
+    });
+    expect(
+      await screen.findByRole('heading', { name: 'Create your main agent' }),
+    ).toBeVisible();
+  });
+
+  it('does not surface a pre-existing workspace error as a settings failure', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    vi.spyOn(daemon, 'runAgent').mockRejectedValue(
+      new Error('workspace connection failed'),
+    );
+
+    render(<ViewHarness />);
+
+    await screen.findByRole('heading', { name: 'Say something to Nova' });
+    await user.type(
+      screen.getByPlaceholderText('Message Nova…'),
+      'Trigger failure',
+    );
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(
+      await screen.findByText('workspace connection failed'),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+
+    const panel = screen.getByRole('complementary');
+    expect(
+      within(panel).queryByText('workspace connection failed'),
+    ).not.toBeInTheDocument();
+    expect(within(panel).queryByRole('alert')).not.toBeInTheDocument();
+    expect(
+      within(panel).getByRole('button', { name: 'No changes' }),
+    ).not.toHaveAttribute('aria-describedby');
+  });
+
+  it('focuses and associates a reset failure only with Reset', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    vi.spyOn(daemon, 'deleteAgent').mockRejectedValue(
+      new Error('DELETE denied'),
+    );
+
+    render(<ViewHarness />);
+
+    await screen.findByRole('heading', { name: 'Say something to Nova' });
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('DELETE denied');
+    expect(alert).toHaveAttribute('id', 'settings-reset-error');
+    expect(alert).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Reset' })).toHaveAttribute(
+      'aria-describedby',
+      'settings-reset-error',
+    );
+    expect(
+      screen.getByRole('button', { name: 'No changes' }),
+    ).not.toHaveAttribute('aria-describedby');
   });
 
   it('keeps failed access and identity edits in the open panel without changing the current agent', async () => {
