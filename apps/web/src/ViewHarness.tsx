@@ -108,17 +108,13 @@ export function ViewHarness() {
 
         await Promise.resolve();
         if (agentRefreshPendingEpochRef.current === null) {
+          agentRequestInFlightRef.current = null;
           break;
         }
       }
     })();
 
     agentRequestInFlightRef.current = request;
-    void request.then(() => {
-      if (agentRequestInFlightRef.current === request) {
-        agentRequestInFlightRef.current = null;
-      }
-    });
     return request;
   }, []);
 

@@ -717,6 +717,57 @@ describe('OnboardingFlow', () => {
     expect(listAgents).toHaveBeenCalledTimes(3);
   });
 
+  it('drains a refresh requested after settlement but before ownership cleanup', async () => {
+    const initialPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const followupPoll = deferred<{ agents: DaemonSnapshot[] }>();
+    const listAgents = vi
+      .spyOn(daemon, 'listAgents')
+      .mockReturnValueOnce(initialPoll.promise)
+      .mockReturnValueOnce(followupPoll.promise);
+    vi.spyOn(daemon, 'listProviders').mockResolvedValue({
+      providers: configuredProviders,
+    });
+    let runPoll: (() => void) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 5_000) {
+        runPoll = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    expect(listAgents).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      initialPoll.resolve({
+        agents: [namedSnapshot('Initial', 'agent-initial')],
+      });
+      queueMicrotask(() => {
+        queueMicrotask(() => runPoll?.());
+      });
+      await initialPoll.promise;
+    });
+
+    expect(
+      await screen.findByRole('heading', { name: 'Say something to Initial' }),
+    ).toBeVisible();
+    await waitFor(() => expect(listAgents).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      followupPoll.resolve({
+        agents: [namedSnapshot('Followup', 'agent-followup')],
+      });
+      await followupPoll.promise;
+    });
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Followup' }),
+    ).toBeVisible();
+    expect(listAgents).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps the newest provider response when Strict Mode requests finish in reverse order', async () => {
     const user = userEvent.setup();
     const olderProviders = deferred<{ providers: DaemonProvider[] }>();
