@@ -1,6 +1,6 @@
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { toolNamesForProfile } from '../lib/agent-access';
 import type { AgentDetail } from '../lib/types';
@@ -30,6 +30,10 @@ function agent(
   };
 }
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe('WorkspaceShell', () => {
   it('owns one responsive navigation with Workspace, Activity, and Agents destinations', async () => {
     const user = userEvent.setup();
@@ -49,8 +53,9 @@ describe('WorkspaceShell', () => {
     const navigation = screen.getByRole('navigation', {
       name: 'Workspace navigation',
     });
-    expect(navigation).toHaveAttribute('data-desktop-placement', 'top');
-    expect(navigation).toHaveAttribute('data-mobile-placement', 'bottom-dock');
+    expect(navigation).toHaveAttribute('data-placement', 'top');
+    expect(navigation.previousElementSibling?.tagName).toBe('HEADER');
+    expect(navigation.nextElementSibling?.tagName).toBe('MAIN');
     expect(
       within(navigation).getByRole('button', { name: 'Workspace' }),
     ).toHaveAttribute('aria-current', 'page');
@@ -154,5 +159,47 @@ describe('WorkspaceShell', () => {
     expect(settings).toHaveAttribute('title', 'Settings for Nova');
     await user.click(settings);
     expect(onOpenSettings).toHaveBeenCalledOnce();
+  });
+
+  it('places mobile navigation after workspace content in DOM and tab order', () => {
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({
+        matches: false,
+        media: '(min-width: 768px)',
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    );
+    const nova = agent('agent-main', 'Nova', 1);
+
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<button type="button">Workspace action</button>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    const content = screen.getByRole('main');
+    const navigation = screen.getByRole('navigation', {
+      name: 'Workspace navigation',
+    });
+    expect(navigation).toHaveAttribute('data-placement', 'bottom-dock');
+    expect(content.nextElementSibling).toBe(navigation);
+    expect(
+      screen
+        .getByRole('button', { name: 'Workspace action' })
+        .compareDocumentPosition(
+          screen.getByRole('button', { name: 'Workspace' }),
+        ) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
   });
 });

@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -74,6 +74,40 @@ function snapshot(
 
 function mockProviders() {
   vi.spyOn(daemon, 'listProviders').mockResolvedValue({ providers });
+}
+
+function withMessage(source: DaemonSnapshot, text: string): DaemonSnapshot {
+  const updated = structuredClone(source);
+  updated.messages = [
+    {
+      id: `message-${source.state.id}`,
+      agentId: source.state.id,
+      roomId: `room-${source.state.id}`,
+      role: 'assistant',
+      content: { text },
+      createdAtMs: source.state.createdAtMs + 1,
+    },
+  ];
+  updated.messageCount = 1;
+  return updated;
+}
+
+function capturePollTimer() {
+  let poll: (() => void) | undefined;
+  vi.spyOn(window, 'setTimeout').mockImplementation(((
+    handler: TimerHandler,
+    timeout?: number,
+  ) => {
+    if (typeof handler === 'function' && timeout === 5_000) {
+      poll = handler;
+      return 1;
+    }
+    return nativeSetTimeout(handler, timeout);
+  }) as typeof window.setTimeout);
+  return () => {
+    if (!poll) throw new Error('poll timer was not scheduled');
+    poll();
+  };
 }
 
 afterEach(() => {
@@ -352,5 +386,294 @@ describe('ViewHarness workspace controller', () => {
     ).toBeVisible();
     expect(screen.getByRole('navigation')).toBeVisible();
     expect(daemon.listAgents).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not re-add the previous main when its pending run resolves after poll replacement', async () => {
+    const user = userEvent.setup();
+    const first = snapshot('agent-a', 'Alpha', 1);
+    const next = snapshot('agent-b', 'Beta', 2);
+    const replacement = deferred<{ agents: DaemonSnapshot[] }>();
+    const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [first] })
+      .mockReturnValueOnce(replacement.promise);
+    mockProviders();
+    vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+    const poll = capturePollTimer();
+
+    render(<ViewHarness />);
+    await screen.findByRole('heading', { name: 'Say something to Alpha' });
+    await user.type(
+      screen.getByPlaceholderText('Message Alpha…'),
+      'Alpha work',
+    );
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(daemon.runAgent).toHaveBeenCalledWith('agent-a', 'Alpha work');
+
+    act(() => poll());
+    await act(async () => {
+      replacement.resolve({ agents: [next] });
+      await replacement.promise;
+    });
+    await screen.findByRole('heading', { name: 'Say something to Beta' });
+
+    await act(async () => {
+      run.resolve({
+        agent: withMessage(first, 'Stale Alpha reply'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Stale Alpha reply' },
+        },
+      });
+      await run.promise;
+    });
+
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Beta' }),
+    ).toBeVisible();
+    expect(screen.queryByText('Stale Alpha reply')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Agents' }));
+    expect(screen.getByRole('article', { name: 'Beta agent' })).toBeVisible();
+    expect(
+      screen.queryByRole('article', { name: 'Alpha agent' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not re-add the previous main when its pending PATCH resolves after poll replacement', async () => {
+    const user = userEvent.setup();
+    const first = snapshot('agent-a', 'Alpha', 1);
+    const next = snapshot('agent-b', 'Beta', 2);
+    const replacement = deferred<{ agents: DaemonSnapshot[] }>();
+    const update = deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [first] })
+      .mockReturnValueOnce(replacement.promise);
+    mockProviders();
+    vi.spyOn(daemon, 'updateAgent').mockReturnValue(update.promise);
+    const poll = capturePollTimer();
+
+    render(<ViewHarness />);
+    await screen.findByRole('heading', { name: 'Say something to Alpha' });
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const name = screen.getByDisplayValue('Alpha');
+    await user.clear(name);
+    await user.type(name, 'Alpha draft');
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    act(() => poll());
+    await act(async () => {
+      replacement.resolve({ agents: [next] });
+      await replacement.promise;
+    });
+    await screen.findByRole('heading', { name: 'Say something to Beta' });
+
+    const staleUpdate = structuredClone(first);
+    staleUpdate.state.name = 'Alpha draft';
+    staleUpdate.state.config.name = 'Alpha draft';
+    await act(async () => {
+      update.resolve({ agent: staleUpdate });
+      await update.promise;
+    });
+
+    expect(
+      screen.getByRole('heading', { name: 'Say something to Beta' }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole('heading', { name: 'Agent settings' }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Agents' }));
+    expect(
+      screen.queryByRole('article', { name: 'Alpha draft agent' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('does not stamp Beta check-ins or re-add Alpha when an Alpha check-in resolves after poll replacement', async () => {
+    const user = userEvent.setup();
+    const now = 100_000;
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    const first = snapshot('agent-a', 'Alpha', 1);
+    const next = snapshot('agent-b', 'Beta', 2);
+    localStorage.setItem(
+      'animaos.checkins.agent-a',
+      JSON.stringify([
+        {
+          id: 'alpha-checkin',
+          prompt: 'Alpha private goals',
+          intervalSecs: 1,
+          createdAtMs: 0,
+        },
+      ]),
+    );
+    localStorage.setItem(
+      'animaos.checkins.agent-b',
+      JSON.stringify([
+        {
+          id: 'beta-checkin',
+          prompt: 'Beta saved goals',
+          intervalSecs: 60,
+          createdAtMs: now,
+        },
+      ]),
+    );
+    const replacement = deferred<{ agents: DaemonSnapshot[] }>();
+    const checkin = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [first] })
+      .mockReturnValueOnce(replacement.promise);
+    mockProviders();
+    vi.spyOn(daemon, 'runAgent').mockReturnValue(checkin.promise);
+    const poll = capturePollTimer();
+    let runCheckins: (() => unknown) | undefined;
+    vi.spyOn(window, 'setInterval').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === 10_000) {
+        runCheckins = handler;
+      }
+      return 1;
+    }) as typeof window.setInterval);
+
+    render(<ViewHarness />);
+    await screen.findByRole('heading', { name: 'Say something to Alpha' });
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByText('Alpha private goals');
+    act(() => void runCheckins?.());
+    await waitFor(() => expect(daemon.runAgent).toHaveBeenCalledTimes(1));
+
+    act(() => poll());
+    await act(async () => {
+      replacement.resolve({ agents: [next] });
+      await replacement.promise;
+    });
+    await screen.findByRole('heading', { name: 'Say something to Beta' });
+
+    await act(async () => {
+      checkin.resolve({
+        agent: withMessage(first, 'Stale Alpha check-in reply'),
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Stale Alpha check-in reply' },
+        },
+      });
+      await checkin.promise;
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    expect(await screen.findByText('Beta saved goals')).toBeVisible();
+    expect(screen.getByText('has not run yet')).toBeVisible();
+    expect(screen.queryByText('Alpha private goals')).not.toBeInTheDocument();
+    expect(localStorage.getItem('animaos.checkins.agent-b')).not.toContain(
+      'lastOutcome',
+    );
+    await user.click(screen.getByRole('button', { name: 'Agents' }));
+    expect(
+      screen.queryByRole('article', { name: 'Alpha agent' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('clears Alpha-scoped draft, prompt, error, settings, and view when polling selects Beta', async () => {
+    const user = userEvent.setup();
+    const first = snapshot('agent-a', 'Alpha', 1);
+    const next = snapshot('agent-b', 'Beta', 2);
+    localStorage.setItem(
+      'animaos.checkins.agent-b',
+      JSON.stringify([
+        {
+          id: 'beta-saved',
+          prompt: 'Beta stored check-in',
+          intervalSecs: 60,
+          createdAtMs: Date.now(),
+        },
+      ]),
+    );
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents')
+      .mockResolvedValueOnce({ agents: [first] })
+      .mockResolvedValueOnce({ agents: [next] });
+    mockProviders();
+    vi.spyOn(daemon, 'runAgent').mockRejectedValue(new Error('Alpha failed'));
+    const poll = capturePollTimer();
+
+    render(<ViewHarness />);
+    await screen.findByRole('heading', { name: 'Say something to Alpha' });
+    await user.type(screen.getByPlaceholderText('Message Alpha…'), 'fail');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(await screen.findByText('Alpha failed')).toBeVisible();
+    await user.type(
+      screen.getByPlaceholderText('Message Alpha…'),
+      'Alpha private draft',
+    );
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    await user.type(
+      screen.getByPlaceholderText(/Check my goals/),
+      'Alpha private prompt',
+    );
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+
+    act(() => poll());
+    await screen.findByRole('heading', { name: 'Say something to Beta' });
+
+    expect(
+      screen.queryByRole('heading', { name: 'Agent settings' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText('Alpha failed')).not.toBeInTheDocument();
+    expect(screen.getByPlaceholderText('Message Beta…')).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    expect(screen.getByPlaceholderText(/Check my goals/)).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Add prompt' })).toBeDisabled();
+    expect(await screen.findByText('Beta stored check-in')).toBeVisible();
+  });
+
+  it('clears First-scoped draft and prompt while preserving Next check-ins on reset promotion', async () => {
+    const user = userEvent.setup();
+    const first = snapshot('agent-first', 'First', 1);
+    const next = snapshot('agent-next', 'Next', 2);
+    localStorage.setItem(
+      'animaos.checkins.agent-next',
+      JSON.stringify([
+        {
+          id: 'next-saved',
+          prompt: 'Next stored check-in',
+          intervalSecs: 60,
+          createdAtMs: Date.now(),
+        },
+      ]),
+    );
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [next, first] });
+    mockProviders();
+    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+
+    render(<ViewHarness />);
+    await screen.findByRole('heading', { name: 'Say something to First' });
+    await user.type(
+      screen.getByPlaceholderText('Message First…'),
+      'First private draft',
+    );
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    await user.type(
+      screen.getByPlaceholderText(/Check my goals/),
+      'First private prompt',
+    );
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    await user.click(screen.getByRole('button', { name: 'Reset' }));
+
+    await screen.findByRole('heading', { name: 'Say something to Next' });
+    expect(screen.getByPlaceholderText('Message Next…')).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    expect(
+      screen.queryByRole('heading', { name: 'Agent settings' }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Activity' }));
+    expect(screen.getByPlaceholderText(/Check my goals/)).toHaveValue('');
+    expect(screen.getByRole('button', { name: 'Add prompt' })).toBeDisabled();
+    expect(await screen.findByText('Next stored check-in')).toBeVisible();
   });
 });

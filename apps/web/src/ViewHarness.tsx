@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 
 import { ActivityView } from './components/ActivityView';
 import { Composer, MessageList } from './components/ChatScreen';
@@ -125,16 +132,38 @@ export function ViewHarness() {
   const settingsOperationGenerationRef = useRef<number | null>(null);
   const resetInFlightRef = useRef<AgentOperation | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
+  const previousSelectedMainIdRef = useRef<string | null>(null);
+  const checkinsRef = useRef<Checkin[]>([]);
+  const checkinRunningRef = useRef(false);
+  const checkinRunGenerationRef = useRef(0);
   sendingRef.current = sending;
+  checkinsRef.current = checkins;
 
   const agentId = agent?.id ?? null;
-  useEffect(() => {
-    if (currentAgentIdRef.current !== agentId) {
-      agentLifecycleGenerationRef.current += 1;
-      agentOperationGenerationRef.current += 1;
-      currentAgentIdRef.current = agentId;
-      setShowSettings(false);
-    }
+  useLayoutEffect(() => {
+    if (previousSelectedMainIdRef.current === agentId) return;
+
+    previousSelectedMainIdRef.current = agentId;
+    agentLifecycleGenerationRef.current += 1;
+    agentOperationGenerationRef.current += 1;
+    currentAgentIdRef.current = agentId;
+    sendingOperationGenerationRef.current = null;
+    settingsOperationGenerationRef.current = null;
+    resetInFlightRef.current = null;
+    checkinRunGenerationRef.current += 1;
+    checkinRunningRef.current = false;
+    sendingRef.current = false;
+    savingSettingsRef.current = false;
+
+    setDraft('');
+    setCiPrompt('');
+    setCiIntervalMin(30);
+    setError(null);
+    setShowSettings(false);
+    setSending(false);
+    setSavingSettings(false);
+    setResetting(false);
+    setCheckins(agentId ? loadCheckins(agentId) : []);
   }, [agentId]);
 
   const beginAgentOperation = useCallback(
@@ -191,15 +220,6 @@ export function ViewHarness() {
       if (element) element.scrollTop = element.scrollHeight;
     });
   };
-
-  const checkinsRef = useRef<Checkin[]>([]);
-  checkinsRef.current = checkins;
-  const checkinRunningRef = useRef(false);
-  const checkinRunGenerationRef = useRef(0);
-
-  useEffect(() => {
-    setCheckins(agentId ? loadCheckins(agentId) : []);
-  }, [agentId]);
 
   const runCheckin = useCallback(
     async (targetAgentId: string, checkin: Checkin) => {
@@ -364,34 +384,17 @@ export function ViewHarness() {
     const operation = beginAgentOperation(targetAgentId);
     resetInFlightRef.current = operation;
     setResetting(true);
-    const sendingGeneration = sendingOperationGenerationRef.current;
-    const settingsGeneration = settingsOperationGenerationRef.current;
     setError(null);
     try {
       await daemon.deleteAgent(targetAgentId);
-      const remainingAgents = agents.filter(
-        (candidate) => candidate.id !== targetAgentId,
-      );
-      const promotedMain = selectMainAgent(remainingAgents);
-      agentLifecycleGenerationRef.current += 1;
-      agentOperationGenerationRef.current += 1;
+      const ownsSelectedMain = isCurrentResetOperation(operation);
+      if (ownsSelectedMain) {
+        agentLifecycleGenerationRef.current += 1;
+        agentOperationGenerationRef.current += 1;
+        currentAgentIdRef.current = null;
+      }
       clearCheckins(targetAgentId);
       removeAgentSnapshot(targetAgentId);
-      if (currentAgentIdRef.current === targetAgentId) {
-        if (sendingOperationGenerationRef.current === sendingGeneration) {
-          sendingOperationGenerationRef.current = null;
-          sendingRef.current = false;
-          setSending(false);
-        }
-        if (settingsOperationGenerationRef.current === settingsGeneration) {
-          settingsOperationGenerationRef.current = null;
-          savingSettingsRef.current = false;
-          setSavingSettings(false);
-        }
-        currentAgentIdRef.current = promotedMain?.id ?? null;
-        setCheckins([]);
-        setShowSettings(false);
-      }
     } catch (caught) {
       if (isCurrentResetOperation(operation)) {
         setError(caught instanceof Error ? caught.message : String(caught));

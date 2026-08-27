@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 
 import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
 import type { AgentDetail } from '../lib/types';
@@ -18,6 +18,69 @@ const DESTINATIONS: Array<{
   { id: 'agents', label: 'Agents', icon: <AgentsIcon size={15} /> },
 ];
 
+const DESKTOP_NAVIGATION_QUERY = '(min-width: 768px)';
+
+function useDesktopNavigation() {
+  const [desktop, setDesktop] = useState(
+    () =>
+      typeof window.matchMedia !== 'function' ||
+      window.matchMedia(DESKTOP_NAVIGATION_QUERY).matches,
+  );
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const media = window.matchMedia(DESKTOP_NAVIGATION_QUERY);
+    const update = () => setDesktop(media.matches);
+    update();
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+
+  return desktop;
+}
+
+function DestinationNavigation({
+  destination,
+  setDestination,
+  placement,
+}: {
+  destination: WorkspaceDestination;
+  setDestination: (destination: WorkspaceDestination) => void;
+  placement: 'top' | 'bottom-dock';
+}) {
+  return (
+    <nav
+      aria-label="Workspace navigation"
+      data-placement={placement}
+      className={
+        placement === 'top'
+          ? 'flex items-center justify-center gap-1 border-b border-line bg-panel/35 p-1.5 backdrop-blur-xl'
+          : 'fixed inset-x-3 bottom-3 z-30 flex items-center justify-around gap-1 rounded-2xl border border-line bg-panel/95 p-1.5 shadow-2xl shadow-black/40 backdrop-blur-xl'
+      }
+    >
+      {DESTINATIONS.map((item) => {
+        const active = destination === item.id;
+        return (
+          <button
+            key={item.id}
+            type="button"
+            onClick={() => setDestination(item.id)}
+            aria-current={active ? 'page' : undefined}
+            className={`inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition md:max-w-40 ${
+              active
+                ? 'bg-sky-500/12 text-sky-300'
+                : 'text-ink-3 hover:bg-white/[0.04] hover:text-ink'
+            }`}
+          >
+            {item.icon}
+            <span>{item.label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 export function WorkspaceShell({
   mainAgent,
   agents,
@@ -35,6 +98,7 @@ export function WorkspaceShell({
 }) {
   const [destination, setDestination] =
     useState<WorkspaceDestination>('workspace');
+  const desktopNavigation = useDesktopNavigation();
 
   return (
     <div className="relative z-[1] flex min-h-0 flex-1 flex-col">
@@ -44,34 +108,17 @@ export function WorkspaceShell({
         onOpenSettings={onOpenSettings}
       />
 
-      <nav
-        aria-label="Workspace navigation"
-        data-desktop-placement="top"
-        data-mobile-placement="bottom-dock"
-        className="fixed inset-x-3 bottom-3 z-30 flex items-center justify-around gap-1 rounded-2xl border border-line bg-panel/95 p-1.5 shadow-2xl shadow-black/40 backdrop-blur-xl md:static md:inset-auto md:bottom-auto md:justify-center md:rounded-none md:border-x-0 md:border-t-0 md:bg-panel/35 md:shadow-none"
-      >
-        {DESTINATIONS.map((item) => {
-          const active = destination === item.id;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => setDestination(item.id)}
-              aria-current={active ? 'page' : undefined}
-              className={`inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition md:max-w-40 ${
-                active
-                  ? 'bg-sky-500/12 text-sky-300'
-                  : 'text-ink-3 hover:bg-white/[0.04] hover:text-ink'
-              }`}
-            >
-              {item.icon}
-              <span>{item.label}</span>
-            </button>
-          );
-        })}
-      </nav>
+      {desktopNavigation ? (
+        <DestinationNavigation
+          destination={destination}
+          setDestination={setDestination}
+          placement="top"
+        />
+      ) : null}
 
-      <main className="relative min-h-0 flex-1 pb-20 md:pb-0">
+      <main
+        className={`relative min-h-0 flex-1 ${desktopNavigation ? 'pb-0' : 'pb-20'}`}
+      >
         {destination === 'workspace' ? (
           workspace
         ) : destination === 'activity' ? (
@@ -80,6 +127,14 @@ export function WorkspaceShell({
           <AgentsView agents={agents} mainAgent={mainAgent} />
         )}
       </main>
+
+      {!desktopNavigation ? (
+        <DestinationNavigation
+          destination={destination}
+          setDestination={setDestination}
+          placement="bottom-dock"
+        />
+      ) : null}
     </div>
   );
 }

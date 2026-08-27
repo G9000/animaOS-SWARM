@@ -445,6 +445,9 @@ test('main workspace agent: 390x844 viewport places the same destinations in a b
     name: 'Workspace navigation',
   });
   await expect(
+    page.locator('main + nav[data-placement="bottom-dock"]'),
+  ).toBeVisible();
+  await expect(
     navigation.getByRole('button', { name: 'Workspace' }),
   ).toBeVisible();
   await expect(
@@ -513,24 +516,71 @@ test('main workspace agent: keyboard steps announce progress, focus invalid fiel
   await page.goto('/');
 
   const name = page.getByRole('textbox', { name: 'Agent name' });
-  await name.fill('');
-  await page.getByRole('button', { name: 'Next' }).click();
+  await expect(name).toBeVisible();
+  await page.keyboard.press('Tab');
+  await expect(name).toBeFocused();
+  await page.keyboard.press('Control+A');
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
+  await page.keyboard.press('Enter');
   await expect(name).toBeFocused();
   await expect(page.getByRole('alert')).toContainText('Enter an agent name.');
 
-  await name.fill('Nova');
-  await page.getByRole('button', { name: 'Next' }).focus();
+  await page.keyboard.type('Nova');
+  await page.keyboard.press('Tab');
+  await page.keyboard.type('Keyboard-only instructions');
+  await page.keyboard.press('Shift+Tab');
+  await expect(name).toBeFocused();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
   await page.keyboard.press('Enter');
   await expect(page.getByRole('status')).toContainText(
     'Step 2 of 4: Intelligence',
   );
-  await page.getByRole('button', { name: 'Next' }).click();
+  await expect(page.getByRole('button', { name: /^OpenAI/ })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: /^Anthropic/ })).toBeFocused();
+  await page.keyboard.press('Space');
+  await page.keyboard.press('Tab');
+  await expect(page.getByLabel('Model')).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
+  await page.keyboard.press('Enter');
   await expect(page.getByRole('status')).toContainText('Step 3 of 4: Access');
-  await page.getByRole('button', { name: 'Next' }).click();
+
+  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(page.getByRole('radio', { name: /^Collaborate/ })).toBeFocused();
+  await page.keyboard.press('ArrowDown');
+  await expect(page.getByRole('radio', { name: /^Operate/ })).toBeFocused();
+  await page.keyboard.press('Space');
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
+  await page.keyboard.press('Enter');
   await expect(page.getByRole('status')).toContainText('Step 4 of 4: Review');
-  await page.getByRole('button', { name: 'Create agent' }).click();
+  await expect(page.getByText('Keyboard-only instructions')).toBeVisible();
+  await expect(page.getByText('Operate', { exact: true })).toBeVisible();
+
+  await page.keyboard.press('Tab');
+  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await expect(
+    page.getByRole('button', { name: 'Create agent' }),
+  ).toBeFocused();
+  await page.keyboard.press('Shift+Tab');
+  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Enter');
 
   await expect(page.getByLabel('Daemon online')).toBeVisible();
   await expect(page.getByLabel('Agent idle')).toBeVisible();
-  await expect(page.getByLabel('Collaborate access profile')).toBeVisible();
+  await expect(page.getByLabel('Operate access profile')).toBeVisible();
 });
