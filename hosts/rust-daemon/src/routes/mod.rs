@@ -707,10 +707,13 @@ async fn list_agents_entry(State(state): State<AppState>) -> AxumResponse {
 )]
 async fn create_agent_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => match agents::handle_create_agent(body, &state.daemon).await {
-            Ok(response) => json_response(StatusCode::CREATED, &response),
-            Err(error) => error.into_response(),
-        },
+        Ok(body) => {
+            let _transaction = state.agent_runs.control_plane_transaction().await;
+            match agents::handle_create_agent(body, &state.daemon).await {
+                Ok(response) => json_response(StatusCode::CREATED, &response),
+                Err(error) => error.into_response(),
+            }
+        }
         Err(response) => response,
     }
 }
@@ -746,16 +749,9 @@ async fn delete_agent_entry(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> AxumResponse {
-    if let Err(error) = state
-        .connector_manager
-        .delete_for_agent(agent_id.clone())
-        .await
-    {
-        return ApiError::service_unavailable(error.to_string()).into_response();
-    }
-    match agents::handle_delete_agent(&agent_id, &state.daemon).await {
-        Ok(response) => json_response(StatusCode::OK, &response),
-        Err(error) => error.into_response(),
+    match state.connector_manager.delete_agent(agent_id).await {
+        Ok(()) => json_response(StatusCode::OK, &DeleteResponse { deleted: true }),
+        Err(error) => ApiError::service_unavailable(error.to_string()).into_response(),
     }
 }
 
@@ -777,10 +773,13 @@ async fn update_agent_entry(
     request: AxumRequest,
 ) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => match agents::handle_update_agent(&agent_id, body, &state.daemon).await {
-            Ok(response) => json_response(StatusCode::OK, &response),
-            Err(error) => error.into_response(),
-        },
+        Ok(body) => {
+            let _transaction = state.agent_runs.control_plane_transaction().await;
+            match agents::handle_update_agent(&agent_id, body, &state.daemon).await {
+                Ok(response) => json_response(StatusCode::OK, &response),
+                Err(error) => error.into_response(),
+            }
+        }
         Err(response) => response,
     }
 }
@@ -876,10 +875,13 @@ async fn list_swarms_entry(State(state): State<AppState>) -> AxumResponse {
 )]
 async fn create_swarm_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => match swarms::handle_create_swarm(body, &state.daemon).await {
-            Ok(response) => json_response(StatusCode::CREATED, &response),
-            Err(error) => error.into_response(),
-        },
+        Ok(body) => {
+            let _transaction = state.agent_runs.control_plane_transaction().await;
+            match swarms::handle_create_swarm(body, &state.daemon).await {
+                Ok(response) => json_response(StatusCode::CREATED, &response),
+                Err(error) => error.into_response(),
+            }
+        }
         Err(response) => response,
     }
 }
@@ -930,10 +932,13 @@ async fn run_swarm_entry(
     };
 
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => match swarms::handle_run_swarm(&swarm_id, body, &state.daemon).await {
-            Ok(response) => json_response(StatusCode::OK, &response),
-            Err(error) => error.into_response(),
-        },
+        Ok(body) => {
+            let _transaction = state.agent_runs.control_plane_transaction().await;
+            match swarms::handle_run_swarm(&swarm_id, body, &state.daemon).await {
+                Ok(response) => json_response(StatusCode::OK, &response),
+                Err(error) => error.into_response(),
+            }
+        }
         Err(response) => response,
     }
 }

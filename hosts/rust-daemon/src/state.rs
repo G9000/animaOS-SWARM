@@ -5,6 +5,8 @@ mod swarm_tools;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 
 use anima_core::{
     AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentStatus,
@@ -14,6 +16,8 @@ use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnal
 use anima_swarm::coordinator::CoordinatorMessageEventFn;
 use anima_swarm::strategies::resolve_strategy;
 use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tracing::warn;
 
@@ -1098,6 +1102,16 @@ pub(crate) struct ControlPlanePersistRequest {
 
 struct ControlPlanePersistOrder {
     latest_successful_revision: AsyncMutex<u64>,
+    #[cfg(test)]
+    test_save_gate: StdMutex<Option<TestControlPlaneSaveGate>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestControlPlaneSaveGate {
+    pub(crate) entered: Arc<Semaphore>,
+    pub(crate) release: Arc<Semaphore>,
+    fail: bool,
 }
 
 impl ControlPlanePersistRequest {
@@ -1105,6 +1119,26 @@ impl ControlPlanePersistRequest {
         let mut latest_successful_revision = self.order.latest_successful_revision.lock().await;
         if self.revision <= *latest_successful_revision {
             return Ok(());
+        }
+        #[cfg(test)]
+        let test_save_gate = {
+            self.order
+                .test_save_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        };
+        #[cfg(test)]
+        if let Some(gate) = test_save_gate {
+            gate.entered.add_permits(1);
+            gate.release
+                .acquire()
+                .await
+                .map_err(|_| std::io::Error::other("test save gate closed"))?
+                .forget();
+            if gate.fail {
+                return Err(std::io::Error::other("injected control-plane save failure"));
+            }
         }
         save_control_plane_snapshot(self.config.as_ref(), &self.snapshot).await?;
         *latest_successful_revision = self.revision;
@@ -1174,6 +1208,8 @@ impl DaemonState {
             control_plane_revision: 0,
             control_plane_persist_order: Arc::new(ControlPlanePersistOrder {
                 latest_successful_revision: AsyncMutex::new(0),
+                #[cfg(test)]
+                test_save_gate: StdMutex::new(None),
             }),
             agents: HashMap::new(),
             agent_snapshots: HashMap::new(),
@@ -1237,6 +1273,24 @@ impl DaemonState {
             revision: self.control_plane_revision,
             order: Arc::clone(&self.control_plane_persist_order),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_control_plane_save_gate(
+        &mut self,
+        fail: bool,
+    ) -> TestControlPlaneSaveGate {
+        let gate = TestControlPlaneSaveGate {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+            fail,
+        };
+        *self
+            .control_plane_persist_order
+            .test_save_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
+        gate
     }
 
     pub(crate) fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
@@ -1975,6 +2029,14 @@ impl DaemonState {
         } else if had_snapshot {
             self.deleted_agent_ids.insert(agent_id.to_string());
         }
+    }
+
+    pub(crate) fn restore_removed_agent(
+        &mut self,
+        snapshot: AgentRuntimeSnapshot,
+    ) -> Result<(), String> {
+        self.deleted_agent_ids.remove(&snapshot.state.id);
+        self.restore_agent_snapshot(snapshot)
     }
 
     pub(crate) fn agent_runtime_id(&self, agent_id: &str) -> Option<String> {

@@ -69,6 +69,7 @@ pub(crate) async fn handle_get_agent(
     }
 }
 
+#[allow(dead_code)] // HTTP deletion is coordinated by ConnectorManager; retained for unit coverage.
 pub(crate) async fn handle_delete_agent(
     agent_id: &str,
     state: &SharedDaemonState,

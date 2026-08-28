@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::{AgentRuntimeSnapshot, Content, DataValue, TaskResult};
 use anima_memory::{MemoryType, NewMemory};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::app::SharedDaemonState;
@@ -63,6 +63,7 @@ pub(crate) struct AgentRunCoordinator {
     state: SharedDaemonState,
     run_limiter: Arc<Semaphore>,
     agent_locks: AgentLockMap,
+    control_plane_transactions: Arc<Mutex<()>>,
 }
 
 impl AgentRunCoordinator {
@@ -71,7 +72,21 @@ impl AgentRunCoordinator {
             state,
             run_limiter,
             agent_locks: Arc::new(StdMutex::new(HashMap::new())),
+            control_plane_transactions: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Serializes every in-memory control-plane mutation through its durable
+    /// publish or rollback. Connector and route publishers share this exact
+    /// boundary with agent-run final commits.
+    pub(crate) async fn control_plane_transaction(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.control_plane_transactions)
+            .lock_owned()
+            .await
+    }
+
+    pub(crate) fn control_plane_transactions(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.control_plane_transactions)
     }
 
     #[allow(dead_code)] // Used by daemon-owned connector and scheduler workers.
@@ -243,6 +258,7 @@ impl AgentRunCoordinator {
                 .insert("idempotencyKey".into(), DataValue::String(idempotency_key));
         }
 
+        let transaction = self.control_plane_transaction().await;
         let Some((mut runtime, tool_context, running_persist_request, mut rollback_baseline)) = ({
             let mut guard = self.state.write().await;
             let rollback_baseline = if rollback.is_some() {
@@ -272,6 +288,7 @@ impl AgentRunCoordinator {
             guard.restore_agent_runtime(runtime);
             return Err(ApiError::service_unavailable(error.to_string()));
         }
+        drop(transaction);
 
         let result = match request.room {
             RunRoom::Generated => {
@@ -311,6 +328,7 @@ impl AgentRunCoordinator {
             }
         };
 
+        let transaction = self.control_plane_transaction().await;
         let (
             snapshot,
             runtime_id,
@@ -346,6 +364,7 @@ impl AgentRunCoordinator {
             apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
+        drop(transaction);
 
         persist_task_result_memory(
             &result,
@@ -472,6 +491,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
     use tokio::sync::{RwLock, Semaphore};
 
     struct GateModelAdapter {
@@ -792,6 +812,22 @@ mod tests {
             metadata.get("source"),
             Some(&DataValue::String("telegram".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn control_plane_transaction_is_shared_by_coordinator_clones() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(1)));
+        let first = coordinator.control_plane_transaction().await;
+        let contender = coordinator.clone();
+        let waiting = tokio::spawn(async move {
+            let _guard = contender.control_plane_transaction().await;
+        });
+
+        assert!(tokio::time::timeout(Duration::from_millis(20), waiting)
+            .await
+            .is_err());
+        drop(first);
     }
 
     #[tokio::test]
