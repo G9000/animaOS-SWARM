@@ -25,6 +25,7 @@ use utoipa_scalar::Scalar;
 
 use crate::agent_runs::AgentRunCoordinator;
 use crate::app::{DaemonConfig, SharedDaemonState};
+use crate::connectors::runtime::ConnectorManager;
 
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
@@ -98,6 +99,7 @@ struct AppState {
     config: DaemonConfig,
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
+    connector_manager: ConnectorManager,
 }
 
 #[derive(Debug)]
@@ -148,13 +150,19 @@ impl IntoResponse for ApiError {
     }
 }
 
-pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
-    let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
+pub(crate) fn router_with_services(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    run_limiter: Arc<Semaphore>,
+    agent_runs: AgentRunCoordinator,
+    connector_manager: ConnectorManager,
+) -> Router {
     let app_state = AppState {
         daemon: Arc::clone(&state),
         config,
         run_limiter: Arc::clone(&run_limiter),
-        agent_runs: AgentRunCoordinator::new(state, run_limiter),
+        agent_runs,
+        connector_manager,
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -262,6 +270,22 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         .fallback(not_found_entry)
         .layer(request_middleware)
         .with_state(app_state)
+}
+
+#[cfg(test)]
+pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
+    use crate::connectors::credentials::InMemoryCredentialStore;
+    use crate::connectors::telegram::TelegramClient;
+
+    let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let connector_manager = ConnectorManager::new(
+        Arc::clone(&state),
+        agent_runs.clone(),
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(TelegramClient::new().expect("test Telegram client should configure")),
+    );
+    router_with_services(state, config, run_limiter, agent_runs, connector_manager)
 }
 
 async fn health_entry() -> AxumResponse {
@@ -722,6 +746,13 @@ async fn delete_agent_entry(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
 ) -> AxumResponse {
+    if let Err(error) = state
+        .connector_manager
+        .delete_for_agent(agent_id.clone())
+        .await
+    {
+        return ApiError::service_unavailable(error.to_string()).into_response();
+    }
     match agents::handle_delete_agent(&agent_id, &state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),

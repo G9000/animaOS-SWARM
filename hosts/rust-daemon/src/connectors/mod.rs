@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod credentials;
+pub(crate) mod runtime;
 pub(crate) mod telegram;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +19,8 @@ pub(crate) struct TelegramConnectorRecord {
     pub(crate) next_update_id: i64,
     #[serde(default = "default_enabled")]
     pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) deleted_at_ms: Option<u64>,
     pub(crate) created_at_ms: u64,
     pub(crate) updated_at_ms: u64,
 }
@@ -104,6 +107,8 @@ pub(crate) struct TelegramOutboundRecord {
     pub(crate) text: String,
     pub(crate) created_at_ms: u64,
     #[serde(default)]
+    pub(crate) delivered_at_ms: Option<u64>,
+    #[serde(default)]
     pub(crate) attempts: u32,
     pub(crate) delivery_state: OutboundDeliveryState,
 }
@@ -118,4 +123,10 @@ pub(crate) enum OutboundDeliveryState {
 
 fn default_enabled() -> bool {
     true
+}
+
+impl TelegramConnectorRecord {
+    pub(crate) fn is_active(&self) -> bool {
+        self.enabled && self.deleted_at_ms.is_none()
+    }
 }

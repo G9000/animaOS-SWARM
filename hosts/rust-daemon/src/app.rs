@@ -8,9 +8,13 @@ use std::time::Duration;
 use anima_core::DatabaseAdapter;
 use axum::Router;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use self::{lifecycle::shutdown_signal, persistence::configure_persistence};
+use crate::agent_runs::AgentRunCoordinator;
+use crate::connectors::credentials::OsKeyringCredentialStore;
+use crate::connectors::runtime::ConnectorManager;
+use crate::connectors::telegram::TelegramClient;
 use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::routes;
 use crate::runtime_model::RuntimeModelAdapter;
@@ -18,6 +22,12 @@ use crate::state::DaemonState;
 use crate::tools::DEFAULT_MAX_BACKGROUND_PROCESSES;
 
 pub(crate) type SharedDaemonState = Arc<RwLock<DaemonState>>;
+
+struct DaemonRuntime {
+    run_limiter: Arc<Semaphore>,
+    agent_runs: AgentRunCoordinator,
+    connectors: ConnectorManager,
+}
 
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
 const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
@@ -107,7 +117,9 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 }
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
-    routes::router(state, config)
+    let runtime = daemon_runtime(Arc::clone(&state), &config)
+        .expect("default Telegram transport configuration should be valid");
+    router_with_runtime(state, config, runtime)
 }
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
@@ -117,7 +129,9 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
         config.max_background_processes,
     )));
     configure_persistence(&state, &config).await?;
-    Ok(app_with_state(state, config))
+    let runtime = daemon_runtime(Arc::clone(&state), &config)?;
+    runtime.connectors.start_restored().await;
+    Ok(router_with_runtime(state, config, runtime))
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
@@ -140,7 +154,46 @@ pub(crate) async fn serve_with_state(
     state: SharedDaemonState,
     config: DaemonConfig,
 ) -> io::Result<()> {
-    axum::serve(listener, app_with_state(state, config))
-        .with_graceful_shutdown(shutdown_signal())
+    let runtime = daemon_runtime(Arc::clone(&state), &config)?;
+    runtime.connectors.start_restored().await;
+    let connectors = runtime.connectors.clone();
+    let router = router_with_runtime(state, config, runtime);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            connectors.shutdown().await;
+        })
         .await
+}
+
+fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result<DaemonRuntime> {
+    let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let transport = TelegramClient::new()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let connectors = ConnectorManager::new(
+        state,
+        agent_runs.clone(),
+        Arc::new(OsKeyringCredentialStore::new()),
+        Arc::new(transport),
+    );
+    Ok(DaemonRuntime {
+        run_limiter,
+        agent_runs,
+        connectors,
+    })
+}
+
+fn router_with_runtime(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    runtime: DaemonRuntime,
+) -> Router {
+    routes::router_with_services(
+        state,
+        config,
+        runtime.run_limiter,
+        runtime.agent_runs,
+        runtime.connectors,
+    )
 }

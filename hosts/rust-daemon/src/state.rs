@@ -18,7 +18,10 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
-use crate::connectors::{TelegramConnectorRecord, TelegramInboundRecord, TelegramOutboundRecord};
+use crate::connectors::{
+    InboundProcessingState, OutboundDeliveryState, TelegramConnectorRecord, TelegramInboundRecord,
+    TelegramOutboundRecord,
+};
 use crate::control_plane_store::{
     save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, StoredSwarmSnapshot,
 };
@@ -736,6 +739,40 @@ mod tests {
         assert!(state.inbound.is_empty());
     }
 
+    #[test]
+    fn tombstoned_connector_history_restores_after_its_agent_is_deleted() {
+        let (mut snapshot, _) = valid_connector_snapshot();
+        snapshot.connectors[0].enabled = false;
+        snapshot.connectors[0].deleted_at_ms = Some(20);
+        snapshot.connectors[0].updated_at_ms = 20;
+        snapshot.inbound[0].processing_state = InboundProcessingState::Processed;
+        snapshot.outbound[0].delivery_state = OutboundDeliveryState::Delivered;
+        snapshot.outbound[0].delivered_at_ms = Some(19);
+        snapshot.schedules[0].enabled = false;
+        snapshot.schedules[0].updated_at_ms = 20;
+        snapshot.agents.clear();
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("archived Telegram history should not keep a deleted agent alive");
+        assert_eq!(restored.connectors.len(), 1);
+        assert_eq!(restored.inbound.len(), 1);
+        assert_eq!(restored.outbound.len(), 1);
+        assert_eq!(restored.schedules.len(), 1);
+    }
+
+    #[test]
+    fn enabled_schedule_cannot_target_a_tombstoned_connector() {
+        let (mut snapshot, _) = valid_connector_snapshot();
+        snapshot.connectors[0].enabled = false;
+        snapshot.connectors[0].deleted_at_ms = Some(20);
+        snapshot.connectors[0].updated_at_ms = 20;
+
+        let mut restored = DaemonState::new();
+        assert!(restored.restore_control_plane_snapshot(snapshot).is_err());
+    }
+
     fn valid_connector_snapshot() -> (ControlPlaneSnapshot, String) {
         let mut source = DaemonState::new();
         let agent_id = source
@@ -834,6 +871,7 @@ mod tests {
             }),
             next_update_id: 43,
             enabled: true,
+            deleted_at_ms: None,
             created_at_ms: 10,
             updated_at_ms: 11,
         }
@@ -876,6 +914,7 @@ mod tests {
             assistant_message_id: "assistant-message-1".into(),
             text: "hello user".into(),
             created_at_ms: 13,
+            delivered_at_ms: None,
             attempts: 1,
             delivery_state: OutboundDeliveryState::Pending,
         }
@@ -1288,7 +1327,22 @@ impl DaemonState {
                     connector.id
                 ));
             }
-            if !agent_ids.contains(&connector.agent_id) {
+            let tombstoned = connector.deleted_at_ms.is_some() && !connector.enabled;
+            if connector.deleted_at_ms.is_some_and(|deleted_at_ms| {
+                deleted_at_ms < connector.created_at_ms || deleted_at_ms < connector.updated_at_ms
+            }) {
+                return Err(format!(
+                    "connector '{}' has invalid deletion timing",
+                    connector.id
+                ));
+            }
+            if connector.deleted_at_ms.is_some() && connector.enabled {
+                return Err(format!(
+                    "connector '{}' cannot be enabled after deletion",
+                    connector.id
+                ));
+            }
+            if !agent_ids.contains(&connector.agent_id) && !tombstoned {
                 return Err(format!(
                     "connector '{}' references missing agent '{}'",
                     connector.id, connector.agent_id
@@ -1313,7 +1367,12 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
-            if !agent_ids.contains(&record.agent_id) {
+            let archived = !connector.is_active()
+                && matches!(
+                    record.processing_state,
+                    InboundProcessingState::Processed | InboundProcessingState::Rejected
+                );
+            if !agent_ids.contains(&record.agent_id) && !archived {
                 return Err(format!(
                     "inbound update references missing agent '{}'",
                     record.agent_id
@@ -1351,7 +1410,9 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
-            if !agent_ids.contains(&record.agent_id) {
+            let archived =
+                !connector.is_active() && record.delivery_state == OutboundDeliveryState::Delivered;
+            if !agent_ids.contains(&record.agent_id) && !archived {
                 return Err(format!(
                     "outbound delivery references missing agent '{}'",
                     record.agent_id
@@ -1374,22 +1435,23 @@ impl DaemonState {
                     record.id
                 ));
             }
-            let agent = persisted_agents.get(&record.agent_id).ok_or_else(|| {
-                format!(
+            if let Some(agent) = persisted_agents.get(&record.agent_id) {
+                let assistant_message_exists = agent.messages.iter().any(|message| {
+                    message.id == record.assistant_message_id
+                        && message.agent_id == record.agent_id
+                        && message.room_id == connector.room_id
+                        && message.role == MessageRole::Assistant
+                });
+                if !assistant_message_exists {
+                    return Err(format!(
+                        "outbound delivery '{}' references a missing, non-assistant, or wrong-room assistant message '{}'",
+                        record.id, record.assistant_message_id
+                    ));
+                }
+            } else if !archived {
+                return Err(format!(
                     "outbound delivery '{}' has no persisted snapshot for agent '{}'",
                     record.id, record.agent_id
-                )
-            })?;
-            let assistant_message_exists = agent.messages.iter().any(|message| {
-                message.id == record.assistant_message_id
-                    && message.agent_id == record.agent_id
-                    && message.room_id == connector.room_id
-                    && message.role == MessageRole::Assistant
-            });
-            if !assistant_message_exists {
-                return Err(format!(
-                    "outbound delivery '{}' references a missing, non-assistant, or wrong-room assistant message '{}'",
-                    record.id, record.assistant_message_id
                 ));
             }
         }
@@ -1403,7 +1465,14 @@ impl DaemonState {
                     schedule.id
                 ));
             }
-            if !agent_ids.contains(&schedule.agent_id) {
+            let archived_connector = match &schedule.target {
+                ScheduleTarget::Connector { connector_id } => connectors
+                    .get(connector_id)
+                    .is_some_and(|connector| !connector.is_active()),
+                ScheduleTarget::Workspace => false,
+            };
+            if !agent_ids.contains(&schedule.agent_id) && (schedule.enabled || !archived_connector)
+            {
                 return Err(format!(
                     "schedule '{}' references missing agent '{}'",
                     schedule.id, schedule.agent_id
@@ -1480,6 +1549,12 @@ impl DaemonState {
                 if connector.agent_id != schedule.agent_id {
                     return Err(format!(
                         "schedule '{}' conflicts with connector agent ownership",
+                        schedule.id
+                    ));
+                }
+                if schedule.enabled && !connector.is_active() {
+                    return Err(format!(
+                        "schedule '{}' is enabled for archived connector '{connector_id}'",
                         schedule.id
                     ));
                 }
