@@ -23,21 +23,24 @@ use tracing::Level;
 use utoipa::OpenApi;
 use utoipa_scalar::Scalar;
 
+use crate::agent_runs::AgentRunCoordinator;
 use crate::app::{DaemonConfig, SharedDaemonState};
 
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRelationshipCreateRequest,
     AgentRelationshipQuery, AgentRelationshipResponse, AgentRelationshipsEnvelope,
-    AgentRunEnvelope, AgentUpdateRequest, AgentsEnvelope, DeleteResponse, ErrorBody,
-    HealthResponse, MemoriesEnvelope,
-    MemoryCreateRequest, MemoryEntitiesEnvelope, MemoryEntityCreateRequest, MemoryEntityQuery,
-    MemoryEntityResponse, MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest,
-    MemoryEvaluationResponse, MemoryEvidenceTraceResponse, MemoryReadinessResponse,
-    MemoryRecallEnvelope, MemoryRecallQuery, MemoryResponse, MemoryRetentionReportResponse,
-    MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery, ProviderResponse,
-    ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery, SwarmCreateRequest, SwarmEnvelope,
-    SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
+    AgentUpdateRequest, AgentsEnvelope, DeleteResponse, ErrorBody, HealthResponse,
+    MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope, MemoryEntityCreateRequest,
+    MemoryEntityQuery, MemoryEntityResponse, MemoryEvaluationOutcomeResponse,
+    MemoryEvaluationRequest, MemoryEvaluationResponse, MemoryEvidenceTraceResponse,
+    MemoryReadinessResponse, MemoryRecallEnvelope, MemoryRecallQuery, MemoryResponse,
+    MemoryRetentionReportResponse, MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery,
+    ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
+    SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
+};
+pub(crate) use self::contracts::{
+    AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
 };
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
 pub(super) use self::http::{parse_json_body, serialize_json};
@@ -94,6 +97,7 @@ struct AppState {
     daemon: SharedDaemonState,
     config: DaemonConfig,
     run_limiter: Arc<Semaphore>,
+    agent_runs: AgentRunCoordinator,
 }
 
 #[derive(Debug)]
@@ -145,10 +149,12 @@ impl IntoResponse for ApiError {
 }
 
 pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
+    let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
     let app_state = AppState {
-        daemon: state,
+        daemon: Arc::clone(&state),
         config,
-        run_limiter: Arc::new(Semaphore::new(config.max_concurrent_runs)),
+        run_limiter: Arc::clone(&run_limiter),
+        agent_runs: AgentRunCoordinator::new(state, run_limiter),
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -765,16 +771,8 @@ async fn run_agent_entry(
     Path(agent_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
-    let _permit = match state.run_limiter.clone().try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return ApiError::service_unavailable("too many concurrent run requests")
-                .into_response();
-        }
-    };
-
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => match agents::handle_run_agent(&agent_id, body, &state.daemon).await {
+        Ok(body) => match agents::handle_run_agent(&agent_id, body, &state.agent_runs).await {
             Ok(response) => json_response(StatusCode::OK, &response),
             Err(error) => error.into_response(),
         },

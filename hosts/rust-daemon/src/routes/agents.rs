@@ -1,14 +1,13 @@
-use anima_memory::{MemoryType, NewMemory, RecentMemoryOptions};
-use tracing::warn;
+use anima_memory::RecentMemoryOptions;
 
 use super::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
     AgentRuntimeSnapshotResponse, AgentUpdateRequest, AgentsEnvelope, DeleteResponse,
-    MemoriesEnvelope, MemoryResponse, TaskRequest, TaskResultResponse,
+    MemoriesEnvelope, MemoryResponse, TaskRequest,
 };
 use super::ApiError;
+use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
-use crate::memory_store::save_memory_manager;
 use crate::state::UpdateAgentError;
 
 pub(crate) async fn handle_create_agent(
@@ -148,116 +147,31 @@ pub(crate) async fn handle_recent_agent_memories(
 pub(crate) async fn handle_run_agent(
     agent_id: &str,
     body: Vec<u8>,
-    state: &SharedDaemonState,
+    coordinator: &AgentRunCoordinator,
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let content = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let Some((mut runtime, tool_context, persist_request)) = ({
-        let mut guard = state.write().await;
-        let taken = guard.take_agent_runtime(agent_id);
-        taken.map(|(runtime, tool_context)| {
-            (runtime, tool_context, guard.control_plane_persist_request())
+    coordinator
+        .run(AgentRunRequest {
+            agent_id: agent_id.to_string(),
+            content,
+            room: RunRoom::Generated,
+            idempotency_key: None,
         })
-    }) else {
-        return Err(ApiError::not_found());
-    };
-    persist_request
-        .save()
         .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-
-    let result = runtime
-        .run_with_tools(content, |agent, user_message, tool_call| {
-            let tool_context = tool_context.clone();
-            async move {
-                tool_context
-                    .execute_tool(agent, user_message, tool_call)
-                    .await
-            }
-        })
-        .await;
-    let (
-        snapshot,
-        runtime_id,
-        runtime_name,
-        memory,
-        memory_embeddings,
-        memory_store,
-        persist_request,
-    ) = {
-        let mut guard = state.write().await;
-        let restored = guard.restore_agent_runtime(runtime);
-        (
-            restored.0,
-            restored.1,
-            restored.2,
-            restored.3,
-            restored.4,
-            restored.5,
-            guard.control_plane_persist_request(),
-        )
-    };
-    persist_request
-        .save()
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
-
-    if let Some(content) = result.data.as_ref() {
-        let persist_result: Result<_, String> = {
-            let mut memory_guard = memory.write().await;
-            match memory_guard.add(NewMemory {
-                agent_id: runtime_id.clone(),
-                agent_name: runtime_name.clone(),
-                memory_type: MemoryType::TaskResult,
-                content: content.text.clone(),
-                importance: 0.8,
-                tags: Some(vec!["runtime".into(), "task-result".into()]),
-                scope: None,
-                room_id: None,
-                world_id: None,
-                session_id: None,
-            }) {
-                Ok(memory) => match save_memory_manager(memory_store.as_ref(), &memory_guard).await
-                {
-                    Ok(()) => Ok(memory),
-                    Err(error) => Err(format!("failed to persist memory: {error}")),
-                },
-                Err(error) => Err(error.message().to_string()),
-            }
-        };
-        match persist_result {
-            Ok(memory) => {
-                if let Err(error) = memory_embeddings.write().await.upsert_memory(&memory) {
-                    warn!(
-                        agent_id = %runtime_id,
-                        memory_id = %memory.id,
-                        error = %error,
-                        "failed to index runtime task result memory embedding"
-                    );
-                }
-            }
-            Err(error) => {
-                warn!(
-                    agent_id = %runtime_id,
-                    error = %error,
-                    "failed to persist runtime task result memory"
-                );
-            }
-        }
-    }
-
-    Ok(AgentRunEnvelope {
-        agent: AgentRuntimeSnapshotResponse::from(&snapshot),
-        result: TaskResultResponse::from(&result),
-    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_create_agent, handle_delete_agent, handle_run_agent, handle_update_agent};
+    use super::{
+        handle_create_agent, handle_delete_agent,
+        handle_run_agent as handle_run_agent_with_coordinator, handle_update_agent,
+    };
+    use crate::agent_runs::AgentRunCoordinator;
+    use crate::app::SharedDaemonState;
     use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
     use crate::state::DaemonState;
     use anima_core::{
@@ -271,7 +185,16 @@ mod tests {
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
+
+    async fn handle_run_agent(
+        agent_id: &str,
+        body: Vec<u8>,
+        state: &SharedDaemonState,
+    ) -> Result<crate::routes::AgentRunEnvelope, crate::routes::ApiError> {
+        let coordinator = AgentRunCoordinator::new(Arc::clone(state), Arc::new(Semaphore::new(8)));
+        handle_run_agent_with_coordinator(agent_id, body, &coordinator).await
+    }
 
     struct PendingModelAdapter;
 
