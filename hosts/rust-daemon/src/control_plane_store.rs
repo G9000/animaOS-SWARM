@@ -1,9 +1,10 @@
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anima_core::AgentRuntimeSnapshot;
 use anima_swarm::{SwarmConfig, SwarmState};
+use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
@@ -92,9 +93,23 @@ pub(crate) async fn load_control_plane_snapshot(
 }
 
 fn save_json_snapshot(path: &Path, snapshot: &ControlPlaneSnapshot) -> io::Result<()> {
+    save_json_snapshot_with_writer(path, snapshot, |file, payload| {
+        file.write_all(payload)?;
+        file.sync_all()
+    })
+}
+
+fn save_json_snapshot_with_writer(
+    path: &Path,
+    snapshot: &ControlPlaneSnapshot,
+    write: impl FnOnce(&mut File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
     ensure_parent_dir(path)?;
     let payload = serde_json::to_string_pretty(snapshot).map_err(serde_error)?;
-    fs::write(path, payload)
+    AtomicFile::new(path, AllowOverwrite)
+        .write(|file| write(file, payload.as_bytes()))
+        .map_err(atomic_write_error)?;
+    sync_snapshot_parent(path)
 }
 
 fn load_json_snapshot(path: &Path) -> io::Result<Option<ControlPlaneSnapshot>> {
@@ -190,6 +205,29 @@ fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn snapshot_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn sync_snapshot_parent(path: &Path) -> io::Result<()> {
+    File::open(snapshot_parent(path))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_snapshot_parent(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn atomic_write_error(error: atomicwrites::Error<io::Error>) -> io::Error {
+    match error {
+        atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
+    }
+}
+
 fn serde_error(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
@@ -227,6 +265,85 @@ impl ControlPlaneSnapshot {
 #[cfg(test)]
 mod tests {
     use super::ControlPlaneSnapshot;
+
+    #[test]
+    fn json_snapshot_replaces_an_existing_snapshot_only_after_a_synced_temp_write() {
+        let path = test_snapshot_path("atomic-replace");
+        let mut previous = ControlPlaneSnapshot::new(vec![], vec![]);
+        previous.version = 1;
+        let replacement = ControlPlaneSnapshot::new(vec![], vec![]);
+        let previous_payload = serde_json::to_string_pretty(&previous).expect("serializes");
+        std::fs::write(&path, &previous_payload).expect("previous snapshot should be written");
+
+        super::save_json_snapshot_with_writer(&path, &replacement, |file, payload| {
+            use std::io::Write;
+
+            file.write_all(payload)?;
+            file.sync_all()?;
+            assert_eq!(
+                std::fs::read_to_string(&path)?,
+                previous_payload,
+                "the prior snapshot remains intact until the complete temp write finishes"
+            );
+            Ok(())
+        })
+        .expect("atomic replacement should succeed");
+
+        let loaded = super::load_json_snapshot(&path)
+            .expect("replacement should load")
+            .expect("replacement should exist");
+        assert_eq!(loaded.version, 2);
+        assert_no_temp_residue(&path);
+        let _ = std::fs::remove_dir_all(path.parent().expect("snapshot path has a parent"));
+    }
+
+    #[test]
+    fn json_snapshot_replacement_failure_preserves_prior_snapshot_and_cleans_temp_file() {
+        let path = test_snapshot_path("atomic-failure");
+        let mut previous = ControlPlaneSnapshot::new(vec![], vec![]);
+        previous.version = 1;
+        let replacement = ControlPlaneSnapshot::new(vec![], vec![]);
+        let previous_payload = serde_json::to_string_pretty(&previous).expect("serializes");
+        std::fs::write(&path, &previous_payload).expect("previous snapshot should be written");
+
+        let error = super::save_json_snapshot_with_writer(&path, &replacement, |file, _| {
+            use std::io::Write;
+
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("simulated replacement failure"))
+        })
+        .expect_err("replacement failure should be returned");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("prior snapshot remains readable"),
+            previous_payload
+        );
+        assert_no_temp_residue(&path);
+        let _ = std::fs::remove_dir_all(path.parent().expect("snapshot path has a parent"));
+    }
+
+    fn test_snapshot_path(label: &str) -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "anima-control-plane-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("snapshot test directory should be created");
+        directory.join("control-plane.json")
+    }
+
+    fn assert_no_temp_residue(path: &std::path::Path) {
+        let parent = path.parent().expect("snapshot path should have a parent");
+        let temp_prefix = ".atomicwrite";
+        let residue = std::fs::read_dir(parent)
+            .expect("snapshot parent should be readable")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().starts_with(temp_prefix));
+        assert!(!residue, "temporary snapshot files must be cleaned up");
+    }
 
     #[test]
     fn snapshot_serializes_version_two_with_empty_connector_collections() {

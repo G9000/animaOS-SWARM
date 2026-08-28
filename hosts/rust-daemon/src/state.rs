@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anima_core::{
     AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentStatus,
-    DatabaseAdapter, ModelAdapter, ToolDescriptor,
+    DatabaseAdapter, MessageRole, ModelAdapter, ToolDescriptor,
 };
 use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
 use anima_swarm::coordinator::CoordinatorMessageEventFn;
@@ -57,7 +57,9 @@ mod tests {
         ScheduleLastFired, ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget,
         ScheduleTrigger, ScheduledPromptRecord,
     };
-    use anima_core::{AgentConfig, AgentRuntime, AgentSettings, ToolDescriptor};
+    use anima_core::{
+        AgentConfig, AgentRuntime, AgentSettings, Content, Message, MessageRole, ToolDescriptor,
+    };
     use std::sync::Arc;
 
     #[tokio::test]
@@ -275,6 +277,12 @@ mod tests {
         let inbound = test_inbound(&agent_id);
         let outbound = test_outbound(&agent_id);
         let schedule = test_schedule(&agent_id);
+        add_persisted_room_assistant_message(
+            &mut source,
+            &agent_id,
+            "room-1",
+            &outbound.assistant_message_id,
+        );
         source
             .connectors
             .insert(connector.id.clone(), connector.clone());
@@ -295,6 +303,8 @@ mod tests {
             !serialized.contains(SENTINEL_TOKEN),
             "credentials held outside non-secret records must never serialize"
         );
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(&serialized).expect("snapshot should deserialize");
 
         let mut restored = DaemonState::new();
         restored
@@ -559,6 +569,139 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_invalid_durable_identities_and_schedule_invariants_without_mutation() {
+        let (snapshot, _) = valid_connector_snapshot();
+
+        let mut empty_inbound_idempotency = snapshot.clone();
+        empty_inbound_idempotency.inbound[0].run_idempotency_key = " ".into();
+
+        let mut duplicate_inbound_idempotency = snapshot.clone();
+        let mut duplicate_inbound = duplicate_inbound_idempotency.inbound[0].clone();
+        duplicate_inbound.update_id = 43;
+        duplicate_inbound_idempotency.inbound.push(duplicate_inbound);
+
+        let mut blank_import_idempotency = snapshot.clone();
+        blank_import_idempotency.schedules[0].import_idempotency_key = Some(" ".into());
+
+        let mut duplicate_import_idempotency = snapshot.clone();
+        let mut duplicate_schedule = duplicate_import_idempotency.schedules[0].clone();
+        duplicate_schedule.id = "schedule-2".into();
+        duplicate_import_idempotency.schedules.push(duplicate_schedule);
+
+        let mut dangling_assistant = snapshot.clone();
+        dangling_assistant.outbound[0].assistant_message_id = "missing-message".into();
+
+        let mut wrong_role_assistant = snapshot.clone();
+        assistant_message_for_outbound(&mut wrong_role_assistant).role = MessageRole::User;
+
+        let mut wrong_room_assistant = snapshot.clone();
+        assistant_message_for_outbound(&mut wrong_room_assistant).room_id = "other-room".into();
+
+        let mut duplicate_delivery_identity = snapshot.clone();
+        let mut duplicate_delivery = duplicate_delivery_identity.outbound[0].clone();
+        duplicate_delivery.id = "outbound-2".into();
+        duplicate_delivery_identity.outbound.push(duplicate_delivery);
+
+        let mut blank_prompt = snapshot.clone();
+        blank_prompt.schedules[0].prompt = " \t".into();
+
+        let mut zero_interval = snapshot.clone();
+        zero_interval.schedules[0].trigger = ScheduleTrigger::Interval { interval_ms: 0 };
+
+        let mut invalid_daily_hour = snapshot.clone();
+        invalid_daily_hour.schedules[0].trigger = ScheduleTrigger::Daily {
+            hour: 24,
+            minute: 0,
+            time_zone: "UTC".into(),
+        };
+
+        let mut invalid_daily_minute = snapshot.clone();
+        invalid_daily_minute.schedules[0].trigger = ScheduleTrigger::Daily {
+            hour: 0,
+            minute: 60,
+            time_zone: "UTC".into(),
+        };
+
+        let mut blank_daily_time_zone = snapshot.clone();
+        blank_daily_time_zone.schedules[0].trigger = ScheduleTrigger::Daily {
+            hour: 0,
+            minute: 0,
+            time_zone: " ".into(),
+        };
+
+        let mut invalid_schedule_timing = snapshot.clone();
+        invalid_schedule_timing.schedules[0].updated_at_ms = 9;
+
+        let mut zero_next_due = snapshot.clone();
+        zero_next_due.schedules[0].next_due_at_ms = 0;
+
+        let mut zero_last_fired_time = snapshot.clone();
+        zero_last_fired_time.schedules[0]
+            .last_fired
+            .as_mut()
+            .expect("fixture has a last-fired record")
+            .fired_at_ms = 0;
+
+        let mut zero_outcome_time = snapshot.clone();
+        zero_outcome_time.schedules[0]
+            .last_safe_outcome
+            .as_mut()
+            .expect("fixture has an outcome")
+            .occurred_at_ms = 0;
+
+        let mut empty_last_fired_key = snapshot;
+        empty_last_fired_key.schedules[0]
+            .last_fired
+            .as_mut()
+            .expect("fixture has a last-fired record")
+            .run_idempotency_key = " ".into();
+
+        for invalid_snapshot in [
+            empty_inbound_idempotency,
+            duplicate_inbound_idempotency,
+            blank_import_idempotency,
+            duplicate_import_idempotency,
+            dangling_assistant,
+            wrong_role_assistant,
+            wrong_room_assistant,
+            duplicate_delivery_identity,
+            blank_prompt,
+            zero_interval,
+            invalid_daily_hour,
+            invalid_daily_minute,
+            blank_daily_time_zone,
+            invalid_schedule_timing,
+            zero_next_due,
+            zero_last_fired_time,
+            zero_outcome_time,
+            empty_last_fired_key,
+        ] {
+            let mut state = DaemonState::new();
+            assert!(
+                state.restore_control_plane_snapshot(invalid_snapshot).is_err(),
+                "invalid durable identity or schedule state must reject the full restore"
+            );
+            assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
+            assert!(state.connectors.is_empty());
+            assert!(state.inbound.is_empty());
+            assert!(state.outbound.is_empty());
+            assert!(state.schedules.is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_allows_an_overdue_schedule_next_due_time() {
+        let (mut snapshot, _) = valid_connector_snapshot();
+        snapshot.schedules[0].next_due_at_ms = 1;
+
+        let mut state = DaemonState::new();
+        state
+            .restore_control_plane_snapshot(snapshot)
+            .expect("an overdue next due time remains a valid schedule");
+        assert_eq!(state.schedules.len(), 1);
+    }
+
+    #[test]
     fn restore_does_not_validate_inbound_against_a_connector_absent_from_snapshot() {
         let mut state = DaemonState::new();
         let agent_id = state
@@ -609,6 +752,12 @@ mod tests {
         let inbound = test_inbound(&agent_id);
         let outbound = test_outbound(&agent_id);
         let schedule = test_schedule(&agent_id);
+        add_persisted_room_assistant_message(
+            &mut source,
+            &agent_id,
+            "room-1",
+            &outbound.assistant_message_id,
+        );
         source.connectors.insert(connector.id.clone(), connector);
         source
             .inbound
@@ -617,6 +766,55 @@ mod tests {
         source.schedules.insert(schedule.id.clone(), schedule);
 
         (source.control_plane_snapshot(), other_agent_id)
+    }
+
+    fn add_persisted_room_assistant_message(
+        state: &mut DaemonState,
+        agent_id: &str,
+        room_id: &str,
+        message_id: &str,
+    ) {
+        state.agents.remove(agent_id);
+        let snapshot = state
+            .agent_snapshots
+            .get_mut(agent_id)
+            .expect("fixture agent snapshot should exist");
+        snapshot.messages.push(Message {
+            id: message_id.into(),
+            agent_id: agent_id.into(),
+            room_id: room_id.into(),
+            content: Content {
+                text: "persisted assistant response".into(),
+                ..Content::default()
+            },
+            role: MessageRole::Assistant,
+            created_at_ms: 13,
+        });
+        snapshot.message_count = snapshot.messages.len();
+    }
+
+    fn assistant_message_for_outbound(snapshot: &mut ControlPlaneSnapshot) -> &mut Message {
+        let (agent_id, assistant_message_id) = snapshot
+            .outbound
+            .first()
+            .map(|outbound| {
+                (
+                    outbound.agent_id.clone(),
+                    outbound.assistant_message_id.clone(),
+                )
+            })
+            .expect("fixture has an outbound delivery");
+        snapshot
+            .agents
+            .iter_mut()
+            .find(|agent| agent.state.id == agent_id)
+            .and_then(|agent| {
+                agent
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.id == assistant_message_id)
+            })
+            .expect("fixture has the referenced assistant message")
     }
 
     fn test_connector(id: &str, agent_id: &str) -> TelegramConnectorRecord {
@@ -664,7 +862,7 @@ mod tests {
             },
             chat: test_chat(),
             received_at_ms: 12,
-            processing_state: InboundProcessingState::Processed,
+            processing_state: InboundProcessingState::Processing,
             run_idempotency_key: "telegram-a:update:42".into(),
         }
     }
@@ -678,8 +876,8 @@ mod tests {
             assistant_message_id: "assistant-message-1".into(),
             text: "hello user".into(),
             created_at_ms: 13,
-            attempts: 2,
-            delivery_state: OutboundDeliveryState::Delivered,
+            attempts: 1,
+            delivery_state: OutboundDeliveryState::Pending,
         }
     }
 
@@ -1044,6 +1242,14 @@ impl DaemonState {
         &self,
         snapshot: &ControlPlaneSnapshot,
     ) -> Result<(), String> {
+        let mut persisted_agents = self
+            .list_agents()
+            .into_iter()
+            .map(|agent| (agent.state.id.clone(), agent))
+            .collect::<HashMap<_, _>>();
+        for agent in &snapshot.agents {
+            persisted_agents.insert(agent.state.id.clone(), agent.clone());
+        }
         let mut agent_ids = self
             .agent_snapshots
             .keys()
@@ -1092,6 +1298,7 @@ impl DaemonState {
         }
 
         let mut inbound_keys = HashSet::new();
+        let mut inbound_idempotency_keys = HashSet::new();
         for record in &snapshot.inbound {
             let key = (record.connector_id.clone(), record.update_id);
             if record.connector_id.is_empty() || !inbound_keys.insert(key) {
@@ -1118,9 +1325,19 @@ impl DaemonState {
                     record.connector_id, record.update_id
                 ));
             }
+            let idempotency_key = record.run_idempotency_key.trim();
+            if idempotency_key.is_empty()
+                || !inbound_idempotency_keys.insert(idempotency_key.to_string())
+            {
+                return Err(format!(
+                    "inbound update {}:{} has a duplicate or empty run idempotency key",
+                    record.connector_id, record.update_id
+                ));
+            }
         }
 
         let mut outbound_ids = HashSet::new();
+        let mut outbound_delivery_identities = HashSet::new();
         for record in &snapshot.outbound {
             if record.id.is_empty() || !outbound_ids.insert(record.id.clone()) {
                 return Err(format!(
@@ -1146,9 +1363,39 @@ impl DaemonState {
                     record.id
                 ));
             }
+            if record.assistant_message_id.trim().is_empty()
+                || !outbound_delivery_identities.insert((
+                    record.connector_id.clone(),
+                    record.assistant_message_id.clone(),
+                ))
+            {
+                return Err(format!(
+                    "outbound delivery '{}' has a duplicate or empty connector/assistant-message identity",
+                    record.id
+                ));
+            }
+            let agent = persisted_agents.get(&record.agent_id).ok_or_else(|| {
+                format!(
+                    "outbound delivery '{}' has no persisted snapshot for agent '{}'",
+                    record.id, record.agent_id
+                )
+            })?;
+            let assistant_message_exists = agent.messages.iter().any(|message| {
+                message.id == record.assistant_message_id
+                    && message.agent_id == record.agent_id
+                    && message.room_id == connector.room_id
+                    && message.role == MessageRole::Assistant
+            });
+            if !assistant_message_exists {
+                return Err(format!(
+                    "outbound delivery '{}' references a missing, non-assistant, or wrong-room assistant message '{}'",
+                    record.id, record.assistant_message_id
+                ));
+            }
         }
 
         let mut schedule_ids = HashSet::new();
+        let mut import_idempotency_keys = HashSet::new();
         for schedule in &snapshot.schedules {
             if schedule.id.is_empty() || !schedule_ids.insert(schedule.id.clone()) {
                 return Err(format!(
@@ -1161,6 +1408,67 @@ impl DaemonState {
                     "schedule '{}' references missing agent '{}'",
                     schedule.id, schedule.agent_id
                 ));
+            }
+            if schedule.prompt.trim().is_empty() {
+                return Err(format!("schedule '{}' has a blank prompt", schedule.id));
+            }
+            if schedule.next_due_at_ms == 0
+                || schedule.created_at_ms == 0
+                || schedule.updated_at_ms == 0
+                || schedule.updated_at_ms < schedule.created_at_ms
+            {
+                return Err(format!(
+                    "schedule '{}' has invalid next-due or created/updated timing",
+                    schedule.id
+                ));
+            }
+            if let Some(import_idempotency_key) = &schedule.import_idempotency_key {
+                let import_idempotency_key = import_idempotency_key.trim();
+                if import_idempotency_key.is_empty()
+                    || !import_idempotency_keys.insert(import_idempotency_key.to_string())
+                {
+                    return Err(format!(
+                        "schedule '{}' has a duplicate or empty import idempotency key",
+                        schedule.id
+                    ));
+                }
+            }
+            match &schedule.trigger {
+                crate::schedules::ScheduleTrigger::Interval { interval_ms } if *interval_ms == 0 => {
+                    return Err(format!("schedule '{}' has a zero interval", schedule.id));
+                }
+                crate::schedules::ScheduleTrigger::Daily {
+                    hour,
+                    minute,
+                    time_zone,
+                } if *hour > 23 || *minute > 59 || time_zone.trim().is_empty() => {
+                    return Err(format!(
+                        "schedule '{}' has an invalid daily trigger",
+                        schedule.id
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(last_fired) = &schedule.last_fired {
+                if last_fired.fired_at_ms == 0
+                    || last_fired.fired_at_ms > schedule.updated_at_ms
+                    || last_fired.run_idempotency_key.trim().is_empty()
+                {
+                    return Err(format!(
+                        "schedule '{}' has invalid last-fired state",
+                        schedule.id
+                    ));
+                }
+            }
+            if let Some(last_safe_outcome) = &schedule.last_safe_outcome {
+                if last_safe_outcome.occurred_at_ms == 0
+                    || last_safe_outcome.occurred_at_ms > schedule.updated_at_ms
+                {
+                    return Err(format!(
+                        "schedule '{}' has invalid last safe outcome timing",
+                        schedule.id
+                    ));
+                }
             }
             if let ScheduleTarget::Connector { connector_id } = &schedule.target {
                 let connector = connectors.get(connector_id).ok_or_else(|| {

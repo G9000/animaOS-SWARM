@@ -10,6 +10,7 @@ anima-core = { path = "../../packages/core-rust/crates/anima-core" }
 anima-model-adapters = { path = "../../packages/core-rust/crates/anima-model-adapters" }
 anima-memory = { path = "../../packages/core-rust/crates/anima-memory", features = ["locomo-eval"] }
 anima-swarm = { path = "../../packages/core-rust/crates/anima-swarm" }
+atomicwrites = "0.4.4"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
