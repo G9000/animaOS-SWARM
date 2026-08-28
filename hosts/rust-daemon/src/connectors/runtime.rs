@@ -298,78 +298,146 @@ impl ConnectorManager {
                 return Err(mapped);
             }
         };
-        self.stop_worker(&connector_id).await?;
-        let _mutation = self.mutation_lock.lock().await;
         let worker_token = token.clone();
         if let Err(error) = self.credentials.put(&connector_id, token).await {
             let mapped = map_credential_error(error);
             if mapped == ConnectorManagerError::CredentialStateUncertain {
+                self.stop_worker(&connector_id).await?;
                 self.statuses
                     .lock()
                     .await
                     .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
-            } else {
-                drop(_mutation);
-                self.start_worker(connector_id.clone(), previous_token)
-                    .await?;
-                self.statuses
-                    .lock()
-                    .await
-                    .insert(connector_id, previous_status);
             }
             return Err(mapped);
         }
 
-        let (previous, updated, persist) = {
+        if let Err(error) = self.stop_worker(&connector_id).await {
+            return match self
+                .restore_previous_worker(connector_id, previous_token, previous_status)
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(compensation_error) => Err(compensation_error),
+            };
+        }
+        let _mutation = self.mutation_lock.lock().await;
+
+        let transaction = {
             let mut state = self.state.write().await;
-            let previous = state
+            state
                 .connectors
                 .get(&connector_id)
                 .cloned()
-                .ok_or(ConnectorManagerError::ConnectorNotFound)?;
-            let connector = state
-                .connectors
-                .get_mut(&connector_id)
-                .expect("connector was prevalidated");
-            connector.bot = bot;
-            connector.updated_at_ms = now_ms();
-            let updated = connector.clone();
-            let persist = state.control_plane_persist_request();
-            (previous, updated, persist)
+                .map(|previous| {
+                    let connector = state
+                        .connectors
+                        .get_mut(&connector_id)
+                        .expect("connector was just found");
+                    connector.bot = bot;
+                    connector.updated_at_ms = now_ms();
+                    let updated = connector.clone();
+                    let persist = state.control_plane_persist_request();
+                    (previous, updated, persist)
+                })
+        };
+        let Some((previous, updated, persist)) = transaction else {
+            let rollback = {
+                let mut state = self.state.write().await;
+                state
+                    .connectors
+                    .insert(connector_id.clone(), preflight_connector);
+                state.control_plane_persist_request()
+            };
+            drop(_mutation);
+            if rollback.save().await.is_err() {
+                let _ = self.credentials.put(&connector_id, previous_token).await;
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+                return Err(ConnectorManagerError::Persistence);
+            }
+            self.restore_previous_worker(connector_id, previous_token, previous_status)
+                .await?;
+            return Err(ConnectorManagerError::ConnectorNotFound);
         };
         if persist.save().await.is_err() {
             self.state
                 .write()
                 .await
                 .connectors
-                .insert(connector_id.clone(), previous);
-            match self
-                .credentials
-                .put(&connector_id, previous_token.clone())
-                .await
-            {
-                Ok(()) => {
-                    drop(_mutation);
-                    self.start_worker(connector_id.clone(), previous_token)
-                        .await?;
-                    self.statuses
-                        .lock()
-                        .await
-                        .insert(connector_id, previous_status);
-                    return Err(ConnectorManagerError::Persistence);
-                }
-                Err(_) => {
-                    self.statuses
-                        .lock()
-                        .await
-                        .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
-                    return Err(ConnectorManagerError::CredentialStateUncertain);
-                }
-            }
+                .insert(connector_id.clone(), previous.clone());
+            drop(_mutation);
+            self.restore_previous_worker(connector_id, previous_token, previous_status)
+                .await?;
+            return Err(ConnectorManagerError::Persistence);
         }
         drop(_mutation);
-        self.start_worker(connector_id, worker_token).await?;
+        if let Err(error) = self.start_worker(connector_id.clone(), worker_token).await {
+            let rollback = {
+                let mut state = self.state.write().await;
+                state
+                    .connectors
+                    .insert(connector_id.clone(), previous.clone());
+                state.control_plane_persist_request()
+            };
+            if rollback.save().await.is_err() {
+                let _ = self.credentials.put(&connector_id, previous_token).await;
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+                return Err(ConnectorManagerError::Persistence);
+            }
+            return match self
+                .restore_previous_worker(connector_id, previous_token, previous_status)
+                .await
+            {
+                Ok(()) => Err(error),
+                Err(compensation_error) => Err(compensation_error),
+            };
+        }
+        self.statuses
+            .lock()
+            .await
+            .insert(connector_id, connector_operational_status(&updated));
         Ok(updated)
+    }
+
+    async fn restore_previous_worker(
+        &self,
+        connector_id: String,
+        previous_token: TelegramBotToken,
+        previous_status: ConnectorRuntimeStatus,
+    ) -> Result<(), ConnectorManagerError> {
+        if self
+            .credentials
+            .put(&connector_id, previous_token.clone())
+            .await
+            .is_err()
+        {
+            self.statuses
+                .lock()
+                .await
+                .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+            return Err(ConnectorManagerError::CredentialStateUncertain);
+        }
+        if self
+            .start_worker(connector_id.clone(), previous_token)
+            .await
+            .is_err()
+        {
+            self.statuses
+                .lock()
+                .await
+                .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+            return Err(ConnectorManagerError::WorkerStopped);
+        }
+        self.statuses
+            .lock()
+            .await
+            .insert(connector_id, previous_status);
+        Ok(())
     }
 
     pub(crate) async fn accept_batch(
@@ -614,12 +682,6 @@ impl ConnectorManager {
         };
 
         let key = (inbound.connector_id.clone(), inbound.update_id);
-        let previous_agent = self
-            .state
-            .read()
-            .await
-            .get_agent(&inbound.agent_id)
-            .ok_or(ConnectorManagerError::AgentNotFound)?;
         let commit_connector_id = inbound.connector_id.clone();
         let commit_agent_id = inbound.agent_id.clone();
         let commit_room_id = inbound.room_id.clone();
@@ -653,75 +715,88 @@ impl ConnectorManager {
 
         let run = self
             .runs
-            .run_with_commit_waiting(request, move |state, snapshot, result| {
-                let current = state
-                    .inbound
-                    .get(&commit_key)
-                    .ok_or_else(|| ApiError::bad_request("durable inbound disappeared"))?;
-                if current.processing_state != InboundProcessingState::Processing
-                    || current.agent_id != commit_agent_id
-                    || current.room_id != commit_room_id
-                {
-                    return Err(ApiError::bad_request("durable inbound changed during run"));
-                }
+            .run_with_commit_waiting(
+                request,
+                move |state, snapshot, result| {
+                    let current = state
+                        .inbound
+                        .get(&commit_key)
+                        .ok_or_else(|| ApiError::bad_request("durable inbound disappeared"))?;
+                    if current.processing_state != InboundProcessingState::Processing
+                        || current.agent_id != commit_agent_id
+                        || current.room_id != commit_room_id
+                    {
+                        return Err(ApiError::bad_request("durable inbound changed during run"));
+                    }
 
-                if result.status == TaskStatus::Error {
+                    if result.status == TaskStatus::Error {
+                        state
+                            .inbound
+                            .get_mut(&commit_key)
+                            .expect("inbound was prevalidated")
+                            .processing_state = InboundProcessingState::Rejected;
+                        return Ok(());
+                    }
+
+                    let assistant = snapshot
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| {
+                            message.room_id == commit_room_id
+                                && message.role == MessageRole::Assistant
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            ApiError::bad_request("agent produced no assistant message")
+                        })?;
+                    let candidate = TelegramOutboundRecord {
+                        id: commit_outbound_id.clone(),
+                        connector_id: commit_connector_id.clone(),
+                        agent_id: commit_agent_id.clone(),
+                        room_id: commit_room_id.clone(),
+                        assistant_message_id: assistant.id,
+                        text: assistant.content.text,
+                        created_at_ms: now_ms(),
+                        delivered_at_ms: None,
+                        attempts: 0,
+                        delivery_state: OutboundDeliveryState::Pending,
+                    };
+                    if let Some(existing) = state.outbound.get(&commit_outbound_id) {
+                        if existing.connector_id != candidate.connector_id
+                            || existing.agent_id != candidate.agent_id
+                            || existing.room_id != candidate.room_id
+                            || existing.assistant_message_id != candidate.assistant_message_id
+                            || existing.text != candidate.text
+                        {
+                            return Err(ApiError::bad_request(
+                                "durable outbound conflicts with run",
+                            ));
+                        }
+                    }
+
                     state
                         .inbound
                         .get_mut(&commit_key)
                         .expect("inbound was prevalidated")
-                        .processing_state = InboundProcessingState::Rejected;
-                    return Ok(());
-                }
-
-                let assistant = snapshot
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|message| {
-                        message.room_id == commit_room_id && message.role == MessageRole::Assistant
-                    })
-                    .cloned()
-                    .ok_or_else(|| ApiError::bad_request("agent produced no assistant message"))?;
-                let candidate = TelegramOutboundRecord {
-                    id: commit_outbound_id.clone(),
-                    connector_id: commit_connector_id.clone(),
-                    agent_id: commit_agent_id.clone(),
-                    room_id: commit_room_id.clone(),
-                    assistant_message_id: assistant.id,
-                    text: assistant.content.text,
-                    created_at_ms: now_ms(),
-                    delivered_at_ms: None,
-                    attempts: 0,
-                    delivery_state: OutboundDeliveryState::Pending,
-                };
-                if let Some(existing) = state.outbound.get(&commit_outbound_id) {
-                    if existing.connector_id != candidate.connector_id
-                        || existing.agent_id != candidate.agent_id
-                        || existing.room_id != candidate.room_id
-                        || existing.assistant_message_id != candidate.assistant_message_id
-                        || existing.text != candidate.text
-                    {
-                        return Err(ApiError::bad_request("durable outbound conflicts with run"));
-                    }
-                }
-
-                state
-                    .inbound
-                    .get_mut(&commit_key)
-                    .expect("inbound was prevalidated")
-                    .processing_state = InboundProcessingState::Processed;
-                state
-                    .outbound
-                    .entry(commit_outbound_id.clone())
-                    .or_insert(candidate);
-                Ok(())
-            })
+                        .processing_state = InboundProcessingState::Processed;
+                    state
+                        .outbound
+                        .entry(commit_outbound_id.clone())
+                        .or_insert(candidate);
+                    Ok(())
+                },
+                |state, baseline| {
+                    state
+                        .rollback_agent_runtime(baseline)
+                        .map(|_| ())
+                        .map_err(ApiError::service_unavailable)
+                },
+            )
             .await;
         if run.is_err() {
             let _mutation = self.mutation_lock.lock().await;
             let mut state = self.state.write().await;
-            let _ = state.rollback_agent_runtime(previous_agent);
             if let Some(record) = state.inbound.get_mut(&key) {
                 record.processing_state = InboundProcessingState::Processing;
             }
@@ -1400,7 +1475,7 @@ mod tests {
     use tokio::sync::{RwLock, Semaphore};
 
     use super::{ConnectorManager, ConnectorRuntimeStatus, TelegramTransport};
-    use crate::agent_runs::AgentRunCoordinator;
+    use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
     use crate::app::SharedDaemonState;
     use crate::connectors::credentials::{
         ConnectorCredentialStore, CredentialStoreError, InMemoryCredentialStore, TelegramBotToken,
@@ -1418,6 +1493,7 @@ mod tests {
     struct FakeTransport {
         calls: Mutex<Vec<&'static str>>,
         sent: Mutex<Vec<(String, String)>>,
+        poll_calls: AtomicUsize,
         remaining_poll_failures: AtomicUsize,
         remaining_send_failures: AtomicUsize,
     }
@@ -1440,6 +1516,14 @@ mod tests {
     struct GateLoadCredentialStore {
         inner: InMemoryCredentialStore,
         gate_load: AtomicBool,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    struct GatePutCredentialStore {
+        inner: InMemoryCredentialStore,
+        gate_put: AtomicBool,
+        fail_put: AtomicBool,
         entered: Arc<Semaphore>,
         release: Arc<Semaphore>,
     }
@@ -1581,6 +1665,39 @@ mod tests {
     }
 
     #[async_trait]
+    impl ConnectorCredentialStore for GatePutCredentialStore {
+        async fn load(
+            &self,
+            connector_id: &str,
+        ) -> Result<Option<TelegramBotToken>, CredentialStoreError> {
+            self.inner.load(connector_id).await
+        }
+
+        async fn put(
+            &self,
+            connector_id: &str,
+            token: TelegramBotToken,
+        ) -> Result<(), CredentialStoreError> {
+            if self.gate_put.swap(false, Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| CredentialStoreError::OperationCancelled)?
+                    .forget();
+            }
+            if self.fail_put.swap(false, Ordering::SeqCst) {
+                return Err(CredentialStoreError::BackendUnavailable);
+            }
+            self.inner.put(connector_id, token).await
+        }
+
+        async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError> {
+            self.inner.delete(connector_id).await
+        }
+    }
+
+    #[async_trait]
     impl TelegramTransport for FakeTransport {
         async fn get_me(
             &self,
@@ -1599,6 +1716,7 @@ mod tests {
             _token: &TelegramBotToken,
             offset: i64,
         ) -> Result<TelegramUpdateBatch, TelegramTransportError> {
+            self.poll_calls.fetch_add(1, Ordering::SeqCst);
             if self
                 .remaining_poll_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -2142,6 +2260,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serialized_rollback_preserves_a_turn_committed_while_connector_waited() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let limiter = Arc::new(Semaphore::new(2));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:serialized-token").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.shutdown().await;
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(1, "101", "pair")],
+                    next_update_id: 2,
+                },
+            )
+            .await
+            .unwrap();
+        manager.approve_pending(connector.id.clone()).await.unwrap();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(2, "101", "connector run")],
+                    next_update_id: 3,
+                },
+            )
+            .await
+            .unwrap();
+        let original = state.read().await.get_agent(&agent_id).unwrap();
+
+        let temporary = std::env::temp_dir().join(format!(
+            "anima-connector-serialized-rollback-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let snapshot_path = temporary.join("control-plane.json");
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
+        ));
+
+        let intervening_runs = runs.clone();
+        let intervening_agent_id = agent_id.clone();
+        let intervening = tokio::spawn(async move {
+            intervening_runs
+                .run(AgentRunRequest {
+                    agent_id: intervening_agent_id,
+                    content: Content {
+                        text: "intervening turn".into(),
+                        ..Content::default()
+                    },
+                    room: RunRoom::Generated,
+                    idempotency_key: None,
+                })
+                .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("intervening turn should hold the per-agent lock")
+            .forget();
+
+        let processing_manager = manager.clone();
+        let connector_id = connector.id.clone();
+        let processing =
+            tokio::spawn(
+                async move { processing_manager.process_pending_once(connector_id).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while limiter.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connector should acquire global admission and wait on the agent lock");
+
+        release.add_permits(1);
+        intervening.await.unwrap().unwrap();
+        entered
+            .acquire()
+            .await
+            .expect("connector should enter only after the intervening turn commits")
+            .forget();
+        let committed_intervening = state.read().await.get_agent(&agent_id).unwrap();
+        assert_eq!(
+            committed_intervening.messages.len(),
+            original.messages.len() + 2
+        );
+
+        std::fs::remove_file(&snapshot_path).unwrap();
+        std::fs::create_dir(&snapshot_path).unwrap();
+        release.add_permits(1);
+        assert_eq!(
+            processing.await.unwrap().unwrap_err(),
+            super::ConnectorManagerError::Persistence
+        );
+
+        let rolled_back = state.read().await.get_agent(&agent_id).unwrap();
+        assert_eq!(rolled_back.messages, committed_intervening.messages);
+        assert_eq!(
+            state
+                .read()
+                .await
+                .inbound
+                .get(&(connector.id.clone(), 2))
+                .unwrap()
+                .processing_state,
+            InboundProcessingState::Processing
+        );
+        assert!(state
+            .read()
+            .await
+            .outbound
+            .values()
+            .all(|record| record.connector_id != connector.id));
+
+        std::fs::remove_dir(&snapshot_path).unwrap();
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[tokio::test]
     async fn background_processing_waits_for_global_admission_instead_of_failing() {
         let state = state_with_agent();
         let agent_id = state.read().await.list_agents()[0].state.id.clone();
@@ -2649,6 +2907,145 @@ mod tests {
             "42:old-token"
         );
         assert_eq!(state.read().await.connectors[&connector.id], connector);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn slow_failed_replacement_put_never_interrupts_the_previous_worker() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let credentials = Arc::new(GatePutCredentialStore {
+            inner: InMemoryCredentialStore::default(),
+            gate_put: AtomicBool::new(false),
+            fail_put: AtomicBool::new(false),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let transport = Arc::new(FakeTransport::default());
+        let manager = manager(Arc::clone(&state), credentials.clone(), transport.clone());
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:old-token").unwrap())
+            .await
+            .unwrap();
+        credentials.gate_put.store(true, Ordering::SeqCst);
+        credentials.fail_put.store(true, Ordering::SeqCst);
+
+        let replacing_manager = manager.clone();
+        let connector_id = connector.id.clone();
+        let replacement = tokio::spawn(async move {
+            replacing_manager
+                .replace_token(
+                    connector_id,
+                    TelegramBotToken::parse("84:new-token").unwrap(),
+                )
+                .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("replacement should enter the credential write")
+            .forget();
+
+        assert_eq!(
+            manager.worker_count().await,
+            1,
+            "the old poller must remain registered throughout credential preflight"
+        );
+        let observed_polls = transport.poll_calls.load(Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while transport.poll_calls.load(Ordering::SeqCst) == observed_polls {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old poller should keep polling while the vault write is blocked");
+        assert_eq!(
+            manager.status(&connector.id).await,
+            Some(ConnectorRuntimeStatus::Pairing)
+        );
+
+        release.add_permits(1);
+        assert_eq!(
+            replacement.await.unwrap().unwrap_err(),
+            super::ConnectorManagerError::Credential
+        );
+        assert_eq!(manager.worker_count().await, 1);
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:old-token"
+        );
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_state_failure_restores_old_metadata_credential_and_worker() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let credentials = Arc::new(GatePutCredentialStore {
+            inner: InMemoryCredentialStore::default(),
+            gate_put: AtomicBool::new(false),
+            fail_put: AtomicBool::new(false),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:old-token").unwrap())
+            .await
+            .unwrap();
+        credentials.gate_put.store(true, Ordering::SeqCst);
+
+        let replacing_manager = manager.clone();
+        let connector_id = connector.id.clone();
+        let replacement = tokio::spawn(async move {
+            replacing_manager
+                .replace_token(
+                    connector_id,
+                    TelegramBotToken::parse("84:new-token").unwrap(),
+                )
+                .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("replacement should enter the credential write")
+            .forget();
+        state.write().await.connectors.remove(&connector.id);
+        release.add_permits(1);
+
+        assert_eq!(
+            replacement.await.unwrap().unwrap_err(),
+            super::ConnectorManagerError::ConnectorNotFound
+        );
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:old-token"
+        );
+        assert_eq!(manager.worker_count().await, 1);
+        assert_eq!(
+            manager.status(&connector.id).await,
+            Some(ConnectorRuntimeStatus::Pairing)
+        );
         manager.shutdown().await;
     }
 

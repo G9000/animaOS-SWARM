@@ -14,6 +14,9 @@ use crate::state::DaemonState;
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
 
 type AgentLockMap = Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>;
+type AgentRunRollback = Box<
+    dyn FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
+>;
 
 struct AgentLockCleanup {
     agent_id: String,
@@ -114,10 +117,11 @@ impl AgentRunCoordinator {
     /// Interactive callers deliberately fail fast when the daemon is saturated,
     /// but daemon-owned workers must not turn temporary saturation into a durable
     /// connector error.
-    pub(crate) async fn run_with_commit_waiting<F>(
+    pub(crate) async fn run_with_commit_waiting<F, R>(
         &self,
         request: AgentRunRequest,
         commit: F,
+        rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
         F: FnOnce(
@@ -127,6 +131,7 @@ impl AgentRunCoordinator {
             ) -> Result<(), ApiError>
             + Send
             + 'static,
+        R: FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
     {
         let permit = self
             .run_limiter
@@ -135,7 +140,8 @@ impl AgentRunCoordinator {
             .await
             .map(AgentRunPermit)
             .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?;
-        self.run_with_commit_admitted(request, permit, commit).await
+        self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
+            .await
     }
 
     pub(crate) async fn run_with_commit_admitted<F>(
@@ -153,13 +159,37 @@ impl AgentRunCoordinator {
             + Send
             + 'static,
     {
-        let coordinator = self.clone();
-        tokio::spawn(async move { coordinator.run_serialized(request, permit, commit).await })
+        self.run_transaction_admitted(request, permit, commit, None)
             .await
-            .map_err(|error| {
-                warn!(error = %error, "agent run worker stopped unexpectedly");
-                ApiError::service_unavailable("agent run worker stopped unexpectedly")
-            })?
+    }
+
+    async fn run_transaction_admitted<F>(
+        &self,
+        request: AgentRunRequest,
+        permit: AgentRunPermit,
+        commit: F,
+        rollback: Option<AgentRunRollback>,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(
+                &mut DaemonState,
+                &AgentRuntimeSnapshot,
+                &TaskResult<Content>,
+            ) -> Result<(), ApiError>
+            + Send
+            + 'static,
+    {
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            coordinator
+                .run_serialized(request, permit, commit, rollback)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            warn!(error = %error, "agent run worker stopped unexpectedly");
+            ApiError::service_unavailable("agent run worker stopped unexpectedly")
+        })?
     }
 
     async fn run_serialized<F>(
@@ -167,6 +197,7 @@ impl AgentRunCoordinator {
         request: AgentRunRequest,
         permit: AgentRunPermit,
         commit: F,
+        rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
         F: FnOnce(
@@ -184,7 +215,7 @@ impl AgentRunCoordinator {
             agent_locks: Arc::clone(&self.agent_locks),
         };
         let _agent_guard = agent_lock.lock_owned().await;
-        self.run_locked(request, permit, commit).await
+        self.run_locked(request, permit, commit, rollback).await
     }
 
     async fn run_locked<F>(
@@ -192,6 +223,7 @@ impl AgentRunCoordinator {
         mut request: AgentRunRequest,
         permit: AgentRunPermit,
         commit: F,
+        mut rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
         F: FnOnce(
@@ -211,11 +243,25 @@ impl AgentRunCoordinator {
                 .insert("idempotencyKey".into(), DataValue::String(idempotency_key));
         }
 
-        let Some((mut runtime, tool_context, running_persist_request)) = ({
+        let Some((mut runtime, tool_context, running_persist_request, mut rollback_baseline)) = ({
             let mut guard = self.state.write().await;
+            let rollback_baseline = if rollback.is_some() {
+                Some(
+                    guard
+                        .get_agent(&request.agent_id)
+                        .ok_or_else(ApiError::not_found)?,
+                )
+            } else {
+                None
+            };
             let taken = guard.take_agent_runtime(&request.agent_id);
             taken.map(|(runtime, tool_context)| {
-                (runtime, tool_context, guard.control_plane_persist_request())
+                (
+                    runtime,
+                    tool_context,
+                    guard.control_plane_persist_request(),
+                    rollback_baseline,
+                )
             })
         }) else {
             return Err(ApiError::not_found());
@@ -281,7 +327,10 @@ impl AgentRunCoordinator {
             // validation before their first mutation and then mutate as one
             // infallible unit. In particular, connector hooks must prevalidate
             // the inbound/outbound transition before changing either record.
-            commit(&mut guard, &restored.0, &result)?;
+            if let Err(error) = commit(&mut guard, &restored.0, &result) {
+                apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
+                return Err(error);
+            }
             (
                 restored.0,
                 restored.1,
@@ -292,10 +341,11 @@ impl AgentRunCoordinator {
                 guard.control_plane_persist_request(),
             )
         };
-        persist_request
-            .save()
-            .await
-            .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+        if let Err(error) = persist_request.save().await {
+            let mut guard = self.state.write().await;
+            apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
+            return Err(ApiError::service_unavailable(error.to_string()));
+        }
 
         persist_task_result_memory(
             &result,
@@ -337,6 +387,20 @@ impl AgentRunCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .len()
     }
+}
+
+fn apply_run_rollback(
+    state: &mut DaemonState,
+    rollback: &mut Option<AgentRunRollback>,
+    baseline: &mut Option<AgentRuntimeSnapshot>,
+) -> Result<(), ApiError> {
+    let Some(rollback) = rollback.take() else {
+        return Ok(());
+    };
+    let baseline = baseline.take().ok_or_else(|| {
+        ApiError::service_unavailable("agent run rollback baseline is unavailable")
+    })?;
+    rollback(state, baseline)
 }
 
 async fn persist_task_result_memory(
