@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -15,6 +16,15 @@ const TELEGRAM_API_BASE: &str = "https://api.telegram.org/";
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEFAULT_LONG_POLL_SECONDS: u64 = 30;
 const MAX_CHAT_ID_LENGTH: usize = 32;
+// Telegram text messages are limited to 4096 Unicode scalars. The daemon applies the same
+// conservative ceiling to connector input before it can enter durable state or an agent room.
+const MAX_TELEGRAM_INPUT_TEXT_SCALARS: usize = 4096;
+// Explicit metadata ceilings keep a valid-sized HTTP response from becoming oversized durable
+// connector metadata if an upstream response does not follow Telegram's documented field limits.
+const MAX_TELEGRAM_NAME_SCALARS: usize = 128;
+const MAX_TELEGRAM_DISPLAY_NAME_SCALARS: usize = MAX_TELEGRAM_NAME_SCALARS * 2 + 1;
+const MAX_TELEGRAM_USERNAME_SCALARS: usize = 64;
+const MAX_TELEGRAM_TITLE_SCALARS: usize = 256;
 
 pub(crate) const TELEGRAM_MESSAGE_CHARACTER_LIMIT: usize = 4096;
 
@@ -127,7 +137,7 @@ impl TelegramClient {
             )
             .await?;
         response
-            .into_bot_identity()
+            .into_bot_identity()?
             .ok_or(TelegramTransportError::InvalidResponse)
     }
 
@@ -135,7 +145,10 @@ impl TelegramClient {
         &self,
         token: &TelegramBotToken,
         offset: i64,
-    ) -> Result<Vec<TelegramTextUpdate>, TelegramTransportError> {
+    ) -> Result<TelegramUpdateBatch, TelegramTransportError> {
+        if offset < 0 {
+            return Err(TelegramTransportError::InvalidOffset);
+        }
         let updates: Vec<TelegramUpdate> = self
             .post(
                 token,
@@ -148,10 +161,35 @@ impl TelegramClient {
                 self.config.long_poll_request_timeout,
             )
             .await?;
-        Ok(updates
-            .into_iter()
-            .filter_map(TelegramUpdate::into_text_update)
-            .collect())
+
+        let mut seen_update_ids = HashSet::with_capacity(updates.len());
+        let mut maximum_update_id = None;
+        let mut normalized = Vec::new();
+        for update in updates {
+            if update.update_id <= 0
+                || update.update_id < offset
+                || !seen_update_ids.insert(update.update_id)
+            {
+                return Err(TelegramTransportError::InvalidResponse);
+            }
+            maximum_update_id = Some(maximum_update_id.map_or(update.update_id, |current: i64| {
+                current.max(update.update_id)
+            }));
+            if let Some(update) = update.into_text_update()? {
+                normalized.push(update);
+            }
+        }
+        normalized.sort_by_key(|update| update.update_id);
+        let next_update_id = match maximum_update_id {
+            Some(update_id) => update_id
+                .checked_add(1)
+                .ok_or(TelegramTransportError::InvalidResponse)?,
+            None => offset,
+        };
+        Ok(TelegramUpdateBatch {
+            updates: normalized,
+            next_update_id,
+        })
     }
 
     pub(crate) async fn send_message(
@@ -160,7 +198,7 @@ impl TelegramClient {
         chat_id: &str,
         text: &str,
     ) -> Result<Vec<TelegramSentMessage>, TelegramTransportError> {
-        validate_chat_id(chat_id)?;
+        let requested_chat_id = validate_chat_id(chat_id)?;
         let chunks = chunk_telegram_text(text);
         if chunks.is_empty() {
             return Err(TelegramTransportError::InvalidMessage);
@@ -179,11 +217,14 @@ impl TelegramClient {
                     self.config.request_timeout,
                 )
                 .await?;
+            if message.message_id <= 0 || message.chat.id != requested_chat_id {
+                return Err(TelegramTransportError::InvalidResponse);
+            }
             sent.push(TelegramSentMessage {
                 message_id: message.message_id.to_string(),
                 chat: message
                     .chat
-                    .into_metadata()
+                    .into_metadata()?
                     .ok_or(TelegramTransportError::InvalidResponse)?,
             });
         }
@@ -284,6 +325,7 @@ pub(crate) enum TelegramTransportError {
     InvalidResponse,
     UpstreamApi { code: Option<i64> },
     InvalidChatId,
+    InvalidOffset,
     InvalidMessage,
 }
 
@@ -298,6 +340,7 @@ impl TelegramTransportError {
         Self::InvalidResponse,
         Self::UpstreamApi { code: Some(401) },
         Self::InvalidChatId,
+        Self::InvalidOffset,
         Self::InvalidMessage,
     ];
 }
@@ -323,6 +366,7 @@ impl fmt::Display for TelegramTransportError {
                 formatter.write_str("Telegram API rejected the request")
             }
             Self::InvalidChatId => formatter.write_str("Telegram chat identifier is invalid"),
+            Self::InvalidOffset => formatter.write_str("Telegram update offset is invalid"),
             Self::InvalidMessage => formatter.write_str("Telegram message is empty"),
         }
     }
@@ -336,6 +380,12 @@ pub(crate) struct TelegramTextUpdate {
     pub(crate) text: String,
     pub(crate) sender: TelegramSenderMetadata,
     pub(crate) chat: TelegramChatMetadata,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TelegramUpdateBatch {
+    pub(crate) updates: Vec<TelegramTextUpdate>,
+    pub(crate) next_update_id: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,11 +415,17 @@ pub(crate) fn chunk_telegram_text(text: &str) -> Vec<&str> {
     chunks
 }
 
-fn validate_chat_id(chat_id: &str) -> Result<(), TelegramTransportError> {
-    if chat_id.is_empty() || chat_id.len() > MAX_CHAT_ID_LENGTH || chat_id.parse::<i64>().is_err() {
+fn validate_chat_id(chat_id: &str) -> Result<i64, TelegramTransportError> {
+    if chat_id.is_empty() || chat_id.len() > MAX_CHAT_ID_LENGTH {
         return Err(TelegramTransportError::InvalidChatId);
     }
-    Ok(())
+    let chat_id = chat_id
+        .parse::<i64>()
+        .map_err(|_| TelegramTransportError::InvalidChatId)?;
+    if chat_id == 0 {
+        return Err(TelegramTransportError::InvalidChatId);
+    }
+    Ok(chat_id)
 }
 
 fn map_reqwest_error(error: reqwest::Error) -> TelegramTransportError {
@@ -417,17 +473,30 @@ struct TelegramUpdate {
 }
 
 impl TelegramUpdate {
-    fn into_text_update(self) -> Option<TelegramTextUpdate> {
-        let message = self.message?;
-        let text = message.text?;
-        let sender = message.sender?.into_sender_identity();
-        let chat = message.chat.into_metadata()?;
-        Some(TelegramTextUpdate {
+    fn into_text_update(self) -> Result<Option<TelegramTextUpdate>, TelegramTransportError> {
+        let Some(message) = self.message else {
+            return Ok(None);
+        };
+        let Some(text) = message.text else {
+            return Ok(None);
+        };
+        if message.message_id <= 0 || !is_bounded_nonempty(&text, MAX_TELEGRAM_INPUT_TEXT_SCALARS) {
+            return Err(TelegramTransportError::InvalidResponse);
+        }
+        let sender = message
+            .sender
+            .ok_or(TelegramTransportError::InvalidResponse)?
+            .into_sender_identity()?;
+        let chat = message
+            .chat
+            .into_metadata()?
+            .ok_or(TelegramTransportError::InvalidResponse)?;
+        Ok(Some(TelegramTextUpdate {
             update_id: self.update_id,
             text,
             sender,
             chat,
-        })
+        }))
     }
 }
 
@@ -454,29 +523,40 @@ struct TelegramUser {
 }
 
 impl TelegramUser {
-    fn display_name(&self) -> Option<String> {
-        join_name(Some(self.first_name.as_str()), self.last_name.as_deref())
+    fn validate(&self) -> Result<(), TelegramTransportError> {
+        if self.id <= 0
+            || !is_bounded_nonempty(&self.first_name, MAX_TELEGRAM_NAME_SCALARS)
+            || !is_bounded_optional(self.last_name.as_deref(), MAX_TELEGRAM_NAME_SCALARS)
+            || !is_bounded_optional(self.username.as_deref(), MAX_TELEGRAM_USERNAME_SCALARS)
+        {
+            return Err(TelegramTransportError::InvalidResponse);
+        }
+        Ok(())
     }
 
-    fn into_bot_identity(self) -> Option<TelegramBotIdentity> {
+    fn into_bot_identity(self) -> Result<Option<TelegramBotIdentity>, TelegramTransportError> {
+        self.validate()?;
         if !self.is_bot {
-            return None;
+            return Ok(None);
         }
-        let display_name = self.display_name();
-        Some(TelegramBotIdentity {
+        let display_name =
+            bounded_join_name(Some(self.first_name.as_str()), self.last_name.as_deref())?;
+        Ok(Some(TelegramBotIdentity {
             id: self.id.to_string(),
-            username: self.username,
+            username: normalize_optional(self.username),
+            display_name,
+        }))
+    }
+
+    fn into_sender_identity(self) -> Result<TelegramSenderMetadata, TelegramTransportError> {
+        self.validate()?;
+        let display_name =
+            bounded_join_name(Some(self.first_name.as_str()), self.last_name.as_deref())?;
+        Ok(TelegramSenderMetadata {
+            id: self.id.to_string(),
+            username: normalize_optional(self.username),
             display_name,
         })
-    }
-
-    fn into_sender_identity(self) -> TelegramSenderMetadata {
-        let display_name = self.display_name();
-        TelegramSenderMetadata {
-            id: self.id.to_string(),
-            username: self.username,
-            display_name,
-        }
     }
 }
 
@@ -496,27 +576,39 @@ struct TelegramChat {
 }
 
 impl TelegramChat {
-    fn into_metadata(self) -> Option<TelegramChatMetadata> {
+    fn into_metadata(self) -> Result<Option<TelegramChatMetadata>, TelegramTransportError> {
+        if self.id == 0
+            || !is_bounded_optional(self.title.as_deref(), MAX_TELEGRAM_TITLE_SCALARS)
+            || !is_bounded_optional(self.username.as_deref(), MAX_TELEGRAM_USERNAME_SCALARS)
+            || !is_bounded_optional(self.first_name.as_deref(), MAX_TELEGRAM_NAME_SCALARS)
+            || !is_bounded_optional(self.last_name.as_deref(), MAX_TELEGRAM_NAME_SCALARS)
+        {
+            return Err(TelegramTransportError::InvalidResponse);
+        }
         let kind = match self.kind.as_str() {
             "private" => TelegramChatKind::Private,
             "group" => TelegramChatKind::Group,
             "supergroup" => TelegramChatKind::Supergroup,
             "channel" => TelegramChatKind::Channel,
-            _ => return None,
+            _ => return Ok(None),
         };
-        let title = self
-            .title
-            .or_else(|| join_name(self.first_name.as_deref(), self.last_name.as_deref()));
-        Some(TelegramChatMetadata {
+        let title = match normalize_optional(self.title) {
+            Some(title) => Some(title),
+            None => bounded_join_name(self.first_name.as_deref(), self.last_name.as_deref())?,
+        };
+        Ok(Some(TelegramChatMetadata {
             id: self.id.to_string(),
             kind,
             title,
-            username: self.username,
-        })
+            username: normalize_optional(self.username),
+        }))
     }
 }
 
-fn join_name(first_name: Option<&str>, last_name: Option<&str>) -> Option<String> {
+fn bounded_join_name(
+    first_name: Option<&str>,
+    last_name: Option<&str>,
+) -> Result<Option<String>, TelegramTransportError> {
     let mut name = String::new();
     if let Some(first_name) = first_name.filter(|value| !value.is_empty()) {
         name.push_str(first_name);
@@ -527,7 +619,24 @@ fn join_name(first_name: Option<&str>, last_name: Option<&str>) -> Option<String
         }
         name.push_str(last_name);
     }
-    (!name.is_empty()).then_some(name)
+    if name.chars().count() > MAX_TELEGRAM_DISPLAY_NAME_SCALARS {
+        return Err(TelegramTransportError::InvalidResponse);
+    }
+    Ok((!name.is_empty()).then_some(name))
+}
+
+fn is_bounded_nonempty(value: &str, maximum_scalars: usize) -> bool {
+    !value.is_empty() && value.chars().take(maximum_scalars + 1).count() <= maximum_scalars
+}
+
+fn is_bounded_optional(value: Option<&str>, maximum_scalars: usize) -> bool {
+    value.is_none_or(|value| {
+        value.is_empty() || value.chars().take(maximum_scalars + 1).count() <= maximum_scalars
+    })
+}
+
+fn normalize_optional(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -548,7 +657,8 @@ mod tests {
 
     use super::{
         chunk_telegram_text, TelegramClient, TelegramClientConfig, TelegramTransportError,
-        TELEGRAM_MESSAGE_CHARACTER_LIMIT,
+        MAX_TELEGRAM_INPUT_TEXT_SCALARS, MAX_TELEGRAM_NAME_SCALARS, MAX_TELEGRAM_TITLE_SCALARS,
+        MAX_TELEGRAM_USERNAME_SCALARS, TELEGRAM_MESSAGE_CHARACTER_LIMIT,
     };
 
     const SENTINEL: &str = "telegram-secret-sentinel";
@@ -592,6 +702,14 @@ mod tests {
         TelegramClient::for_test_base(&base, TelegramClientConfig::test_defaults()).unwrap()
     }
 
+    async fn client_for_response(response: String) -> TelegramClient {
+        client_for(Router::new().fallback(any(move || {
+            let response = response.clone();
+            async move { Response::new(Body::from(response)) }
+        })))
+        .await
+    }
+
     #[test]
     fn production_client_has_only_the_fixed_telegram_origin() {
         let client = TelegramClient::new().unwrap();
@@ -620,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_updates_sends_offset_and_normalizes_only_text_messages() {
-        let response = r#"{"ok":true,"result":[{"update_id":10,"message":{"message_id":2,"from":{"id":7,"first_name":"Ada","last_name":"Lovelace","username":"ada"},"chat":{"id":9,"type":"private","first_name":"Ada","username":"ada"},"text":"hello"}},{"update_id":11,"message":{"message_id":3,"chat":{"id":9,"type":"private"},"photo":[{}]}},{"update_id":12,"callback_query":{"id":"x"}}]}"#;
+        let response = r#"{"ok":true,"result":[{"update_id":12,"callback_query":{"id":"x"}},{"update_id":10,"message":{"message_id":2,"from":{"id":7,"first_name":"Ada","last_name":"Lovelace","username":"ada"},"chat":{"id":9,"type":"private","first_name":"Ada","username":"ada"},"text":"hello"}},{"update_id":11,"message":{"message_id":3,"chat":{"id":9,"type":"private"},"photo":[{}]}},{"update_id":9,"message":{"message_id":1,"from":{"id":8,"first_name":"Grace"},"chat":{"id":8,"type":"private","first_name":"Grace"},"text":"first"}}]}"#;
         let capture = Capture::default();
         let response = response.to_owned();
         let app = Router::new()
@@ -641,22 +759,72 @@ mod tests {
             .with_state(capture.clone());
         let client = client_for(app).await;
 
-        let updates = client.get_updates(&token(), 8).await.unwrap();
-        assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].update_id, 10);
-        assert_eq!(updates[0].text, "hello");
-        assert_eq!(updates[0].sender.id, "7");
+        let batch = client.get_updates(&token(), 8).await.unwrap();
+        assert_eq!(batch.next_update_id, 13);
+        assert_eq!(batch.updates.len(), 2);
+        assert_eq!(batch.updates[0].update_id, 9);
+        assert_eq!(batch.updates[0].text, "first");
+        assert_eq!(batch.updates[1].update_id, 10);
+        assert_eq!(batch.updates[1].text, "hello");
+        assert_eq!(batch.updates[1].sender.id, "7");
         assert_eq!(
-            updates[0].sender.display_name.as_deref(),
+            batch.updates[1].sender.display_name.as_deref(),
             Some("Ada Lovelace")
         );
-        assert_eq!(updates[0].chat.id, "9");
+        assert_eq!(batch.updates[1].chat.id, "9");
         let request = &capture.0.lock().await[0];
         assert!(request.path_and_query.ends_with("/getUpdates"));
         let json: serde_json::Value = serde_json::from_str(&request.body).unwrap();
         assert_eq!(json["offset"], 8);
         assert!(json["timeout"].as_u64().unwrap() > 0);
         assert_eq!(json["allowed_updates"], serde_json::json!(["message"]));
+    }
+
+    #[tokio::test]
+    async fn get_updates_advances_over_nontext_only_and_preserves_empty_offset() {
+        let nontext = client_for_response(
+            r#"{"ok":true,"result":[{"update_id":21,"message":{"message_id":1,"chat":{"id":9,"type":"private"},"photo":[{}]}},{"update_id":20,"callback_query":{"id":"x"}}]}"#.into(),
+        )
+        .await;
+        let batch = nontext.get_updates(&token(), 20).await.unwrap();
+        assert!(batch.updates.is_empty());
+        assert_eq!(batch.next_update_id, 22);
+
+        let empty = client_for_response(r#"{"ok":true,"result":[]}"#.into()).await;
+        let batch = empty.get_updates(&token(), 42).await.unwrap();
+        assert!(batch.updates.is_empty());
+        assert_eq!(batch.next_update_id, 42);
+    }
+
+    #[tokio::test]
+    async fn get_updates_rejects_unsafe_cursor_batches_without_returning_a_cursor() {
+        for response in [
+            r#"{"ok":true,"result":[{"update_id":7},{"update_id":7}]}"#.to_owned(),
+            r#"{"ok":true,"result":[{"update_id":0}]}"#.to_owned(),
+            r#"{"ok":true,"result":[{"update_id":-1}]}"#.to_owned(),
+            format!(r#"{{"ok":true,"result":[{{"update_id":{}}}]}}"#, i64::MAX),
+        ] {
+            let client = client_for_response(response).await;
+            let error = client.get_updates(&token(), 0).await.unwrap_err();
+            assert_eq!(error, TelegramTransportError::InvalidResponse);
+            assert_sanitized(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn get_updates_rejects_a_negative_input_offset_before_request() {
+        let capture = Capture::default();
+        let client = client_for(
+            Router::new()
+                .fallback(any(capture_request))
+                .with_state(capture.clone()),
+        )
+        .await;
+
+        let error = client.get_updates(&token(), -1).await.unwrap_err();
+        assert_eq!(error, TelegramTransportError::InvalidOffset);
+        assert!(capture.0.lock().await.is_empty());
+        assert_sanitized(&error);
     }
 
     #[tokio::test]
@@ -687,6 +855,63 @@ mod tests {
         assert!(requests
             .iter()
             .all(|item| item.path_and_query.ends_with("/sendMessage")));
+    }
+
+    #[tokio::test]
+    async fn send_message_rejects_nonpositive_message_id_and_wrong_response_chat() {
+        let nonpositive = client_for_response(
+            r#"{"ok":true,"result":{"message_id":0,"chat":{"id":9,"type":"private"}}}"#.into(),
+        )
+        .await;
+        let error = nonpositive
+            .send_message(&token(), "9", "hello")
+            .await
+            .unwrap_err();
+        assert_eq!(error, TelegramTransportError::InvalidResponse);
+
+        let wrong_chat = client_for_response(
+            r#"{"ok":true,"result":{"message_id":1,"chat":{"id":10,"type":"private"}}}"#.into(),
+        )
+        .await;
+        let error = wrong_chat
+            .send_message(&token(), "9", "hello")
+            .await
+            .unwrap_err();
+        assert_eq!(error, TelegramTransportError::InvalidResponse);
+    }
+
+    #[tokio::test]
+    async fn oversized_upstream_text_and_identity_fields_are_rejected() {
+        let oversized_name = "n".repeat(MAX_TELEGRAM_NAME_SCALARS + 1);
+        let client = client_for_response(format!(
+            r#"{{"ok":true,"result":{{"id":42,"is_bot":true,"first_name":"{oversized_name}"}}}}"#
+        ))
+        .await;
+        assert_eq!(
+            client.get_me(&token()).await.unwrap_err(),
+            TelegramTransportError::InvalidResponse
+        );
+
+        for response in [
+            format!(
+                r#"{{"ok":true,"result":[{{"update_id":1,"message":{{"message_id":1,"from":{{"id":7,"first_name":"Ada"}},"chat":{{"id":9,"type":"private"}},"text":"{}"}}}}]}}"#,
+                "x".repeat(MAX_TELEGRAM_INPUT_TEXT_SCALARS + 1)
+            ),
+            format!(
+                r#"{{"ok":true,"result":[{{"update_id":1,"message":{{"message_id":1,"from":{{"id":7,"first_name":"Ada","username":"{}"}},"chat":{{"id":9,"type":"private"}},"text":"hello"}}}}]}}"#,
+                "u".repeat(MAX_TELEGRAM_USERNAME_SCALARS + 1)
+            ),
+            format!(
+                r#"{{"ok":true,"result":[{{"update_id":1,"message":{{"message_id":1,"from":{{"id":7,"first_name":"Ada"}},"chat":{{"id":-9,"type":"group","title":"{}"}},"text":"hello"}}}}]}}"#,
+                "t".repeat(MAX_TELEGRAM_TITLE_SCALARS + 1)
+            ),
+        ] {
+            let client = client_for_response(response).await;
+            assert_eq!(
+                client.get_updates(&token(), 0).await.unwrap_err(),
+                TelegramTransportError::InvalidResponse
+            );
+        }
     }
 
     #[tokio::test]

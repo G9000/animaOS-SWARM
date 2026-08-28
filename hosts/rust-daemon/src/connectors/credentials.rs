@@ -66,6 +66,7 @@ pub(crate) enum CredentialStoreError {
     InvalidToken,
     InvalidConnectorId,
     BackendUnavailable,
+    CredentialStateUncertain,
     InvalidPayload,
     UnsupportedPayloadVersion,
     OperationCancelled,
@@ -77,6 +78,7 @@ impl CredentialStoreError {
         Self::InvalidToken,
         Self::InvalidConnectorId,
         Self::BackendUnavailable,
+        Self::CredentialStateUncertain,
         Self::InvalidPayload,
         Self::UnsupportedPayloadVersion,
         Self::OperationCancelled,
@@ -89,6 +91,7 @@ impl fmt::Display for CredentialStoreError {
             Self::InvalidToken => "invalid Telegram bot token",
             Self::InvalidConnectorId => "invalid connector identifier",
             Self::BackendUnavailable => "credential vault unavailable",
+            Self::CredentialStateUncertain => "credential vault state could not be confirmed",
             Self::InvalidPayload => "credential payload is invalid",
             Self::UnsupportedPayloadVersion => "credential payload version is unsupported",
             Self::OperationCancelled => "credential vault operation did not complete",
@@ -104,6 +107,11 @@ pub(crate) trait ConnectorCredentialStore: Send + Sync {
         &self,
         connector_id: &str,
     ) -> Result<Option<TelegramBotToken>, CredentialStoreError>;
+    /// Stores a credential in the OS vault.
+    ///
+    /// The Task 5 connector manager must own this mutation future to completion rather than
+    /// attaching it directly to an HTTP request task. Once the blocking vault operation starts,
+    /// dropping the caller future cannot cancel the OS mutation and also discards its outcome.
     async fn put(
         &self,
         connector_id: &str,
@@ -216,24 +224,49 @@ impl ConnectorCredentialStore for OsKeyringCredentialStore {
             .map_err(|_| CredentialStoreError::InvalidPayload)?,
         );
         let backend = Arc::clone(&self.backend);
-        tokio::task::spawn_blocking(move || {
-            let previous = backend.load(KEYRING_SERVICE, &account)?;
-            if let Err(error) = backend.put(KEYRING_SERVICE, &account, &payload) {
-                match previous {
-                    Some(previous) => {
-                        let _ = backend.put(KEYRING_SERVICE, &account, &previous);
-                    }
-                    None => {
-                        let _ = backend.delete(KEYRING_SERVICE, &account);
+        tokio::task::spawn_blocking(move || -> Result<(), CredentialStoreError> {
+            let previous = backend
+                .load(KEYRING_SERVICE, &account)
+                .map_err(map_backend_error)?;
+            match backend.put(KEYRING_SERVICE, &account, &payload) {
+                Ok(()) => {
+                    let observed = backend
+                        .load(KEYRING_SERVICE, &account)
+                        .map_err(|_| CredentialStoreError::CredentialStateUncertain)?;
+                    if credential_payload_matches(&observed, Some(payload.as_str())) {
+                        Ok(())
+                    } else {
+                        Err(CredentialStoreError::CredentialStateUncertain)
                     }
                 }
-                return Err(error);
+                Err(_) => {
+                    let compensated = match previous.as_ref() {
+                        Some(previous) => backend.put(KEYRING_SERVICE, &account, previous),
+                        None => match backend.delete(KEYRING_SERVICE, &account) {
+                            Ok(()) | Err(BackendError::NotFound) => Ok(()),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    if compensated.is_err() {
+                        return Err(CredentialStoreError::CredentialStateUncertain);
+                    }
+
+                    let observed = backend
+                        .load(KEYRING_SERVICE, &account)
+                        .map_err(|_| CredentialStoreError::CredentialStateUncertain)?;
+                    if credential_payload_matches(
+                        &observed,
+                        previous.as_ref().map(|value| value.as_str()),
+                    ) {
+                        Err(CredentialStoreError::BackendUnavailable)
+                    } else {
+                        Err(CredentialStoreError::CredentialStateUncertain)
+                    }
+                }
             }
-            Ok(())
         })
         .await
-        .map_err(|_| CredentialStoreError::OperationCancelled)?
-        .map_err(map_backend_error)
+        .map_err(|_| CredentialStoreError::CredentialStateUncertain)?
     }
 
     async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError> {
@@ -241,7 +274,7 @@ impl ConnectorCredentialStore for OsKeyringCredentialStore {
         let backend = Arc::clone(&self.backend);
         match tokio::task::spawn_blocking(move || backend.delete(KEYRING_SERVICE, &account))
             .await
-            .map_err(|_| CredentialStoreError::OperationCancelled)?
+            .map_err(|_| CredentialStoreError::CredentialStateUncertain)?
         {
             Ok(()) | Err(BackendError::NotFound) => Ok(()),
             Err(error) => Err(map_backend_error(error)),
@@ -322,10 +355,18 @@ fn map_backend_error(_error: BackendError) -> CredentialStoreError {
     CredentialStoreError::BackendUnavailable
 }
 
+fn credential_payload_matches(
+    observed: &Option<Zeroizing<String>>,
+    expected: Option<&str>,
+) -> bool {
+    observed.as_ref().map(|value| value.as_str()) == expected
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{mpsc, Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     use super::{
         BackendError, ConnectorCredentialStore, CredentialBackend, CredentialStoreError,
@@ -456,10 +497,10 @@ mod tests {
         let store = OsKeyringCredentialStore::with_backend(backend.clone());
         store.put("primary", token("prior-token")).await.unwrap();
         backend
-            .fail_writes_after_mutation
+            .write_behaviors
             .lock()
             .unwrap()
-            .push(true);
+            .push_back(WriteBehavior::FailAfterMutation);
 
         let error = store.put("primary", token(SENTINEL)).await.unwrap_err();
         assert_eq!(error, CredentialStoreError::BackendUnavailable);
@@ -474,16 +515,128 @@ mod tests {
     async fn failed_initial_write_does_not_leave_an_orphaned_credential() {
         let backend = Arc::new(FakeBackend::default());
         backend
-            .fail_writes_after_mutation
+            .write_behaviors
             .lock()
             .unwrap()
-            .push(true);
+            .push_back(WriteBehavior::FailAfterMutation);
         let store = OsKeyringCredentialStore::with_backend(backend);
 
         let error = store.put("primary", token(SENTINEL)).await.unwrap_err();
         assert_eq!(error, CredentialStoreError::BackendUnavailable);
         assert_eq!(store.load("primary").await.unwrap(), None);
         assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn rollback_write_failure_reports_uncertain_credential_state() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend.write_behaviors.lock().unwrap().extend([
+            WriteBehavior::FailAfterMutation,
+            WriteBehavior::FailBeforeMutation,
+        ]);
+
+        let error = store.put("primary", token(SENTINEL)).await.unwrap_err();
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn rollback_delete_failure_reports_uncertain_credential_state() {
+        let backend = Arc::new(FakeBackend::default());
+        backend
+            .write_behaviors
+            .lock()
+            .unwrap()
+            .push_back(WriteBehavior::FailAfterMutation);
+        backend
+            .delete_behaviors
+            .lock()
+            .unwrap()
+            .push_back(DeleteBehavior::FailBeforeMutation);
+        let store = OsKeyringCredentialStore::with_backend(backend);
+
+        let error = store.put("primary", token(SENTINEL)).await.unwrap_err();
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn rollback_verification_read_failure_reports_uncertain_state() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend
+            .read_behaviors
+            .lock()
+            .unwrap()
+            .extend([ReadBehavior::Actual, ReadBehavior::Fail]);
+        backend
+            .write_behaviors
+            .lock()
+            .unwrap()
+            .extend([WriteBehavior::FailAfterMutation, WriteBehavior::Succeed]);
+
+        let error = store.put("primary", token(SENTINEL)).await.unwrap_err();
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn rollback_verification_mismatch_reports_uncertain_state() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend.read_behaviors.lock().unwrap().extend([
+            ReadBehavior::Actual,
+            ReadBehavior::Override(Some(format!(r#"{{"version":1,"token":"{SENTINEL}"}}"#))),
+        ]);
+        backend
+            .write_behaviors
+            .lock()
+            .unwrap()
+            .extend([WriteBehavior::FailAfterMutation, WriteBehavior::Succeed]);
+
+        let error = store.put("primary", token(SENTINEL)).await.unwrap_err();
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_caller_does_not_cancel_an_in_flight_vault_mutation() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let backend = Arc::new(BlockingBackend {
+            value: Mutex::new(None),
+            started_tx: Mutex::new(Some(started_tx)),
+            finished_tx: Mutex::new(Some(finished_tx)),
+            release: Arc::clone(&release),
+        });
+        let store = Arc::new(OsKeyringCredentialStore::with_backend(backend.clone()));
+        let mutation = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.put("primary", token(SENTINEL)).await }
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        mutation.abort();
+        {
+            let (released, condition) = &*release;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+        }
+        tokio::task::spawn_blocking(move || finished_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let stored = backend.value.lock().unwrap().clone().unwrap();
+        assert!(stored.contains(SENTINEL));
     }
 
     #[test]
@@ -503,7 +656,28 @@ mod tests {
     struct FakeBackend {
         values: Mutex<HashMap<String, Zeroizing<String>>>,
         calls: Mutex<Vec<(String, String, Option<String>)>>,
-        fail_writes_after_mutation: Mutex<Vec<bool>>,
+        read_behaviors: Mutex<VecDeque<ReadBehavior>>,
+        write_behaviors: Mutex<VecDeque<WriteBehavior>>,
+        delete_behaviors: Mutex<VecDeque<DeleteBehavior>>,
+    }
+
+    #[derive(Clone)]
+    enum ReadBehavior {
+        Actual,
+        Fail,
+        Override(Option<String>),
+    }
+
+    #[derive(Clone, Copy)]
+    enum WriteBehavior {
+        Succeed,
+        FailBeforeMutation,
+        FailAfterMutation,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DeleteBehavior {
+        FailBeforeMutation,
     }
 
     impl CredentialBackend for FakeBackend {
@@ -516,6 +690,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((service.into(), account.into(), None));
+            match self
+                .read_behaviors
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(ReadBehavior::Actual)
+            {
+                ReadBehavior::Actual => {}
+                ReadBehavior::Fail => return Err(BackendError::Unavailable),
+                ReadBehavior::Override(value) => return Ok(value.map(Zeroizing::new)),
+            }
             Ok(self.values.lock().unwrap().get(account).cloned())
         }
 
@@ -524,17 +709,20 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((service.into(), account.into(), Some(payload.into())));
+            let behavior = self
+                .write_behaviors
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(WriteBehavior::Succeed);
+            if matches!(behavior, WriteBehavior::FailBeforeMutation) {
+                return Err(BackendError::Unavailable);
+            }
             self.values
                 .lock()
                 .unwrap()
                 .insert(account.into(), Zeroizing::new(payload.into()));
-            if self
-                .fail_writes_after_mutation
-                .lock()
-                .unwrap()
-                .pop()
-                .unwrap_or(false)
-            {
+            if matches!(behavior, WriteBehavior::FailAfterMutation) {
                 return Err(BackendError::Unavailable);
             }
             Ok(())
@@ -545,7 +733,51 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((service.into(), account.into(), None));
+            if matches!(
+                self.delete_behaviors.lock().unwrap().pop_front(),
+                Some(DeleteBehavior::FailBeforeMutation)
+            ) {
+                return Err(BackendError::Unavailable);
+            }
             self.values.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    struct BlockingBackend {
+        value: Mutex<Option<Zeroizing<String>>>,
+        started_tx: Mutex<Option<mpsc::Sender<()>>>,
+        finished_tx: Mutex<Option<mpsc::Sender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl CredentialBackend for BlockingBackend {
+        fn load(
+            &self,
+            _service: &str,
+            _account: &str,
+        ) -> Result<Option<Zeroizing<String>>, BackendError> {
+            Ok(self.value.lock().unwrap().clone())
+        }
+
+        fn put(&self, _service: &str, _account: &str, payload: &str) -> Result<(), BackendError> {
+            if let Some(started_tx) = self.started_tx.lock().unwrap().take() {
+                started_tx.send(()).unwrap();
+                let (released, condition) = &*self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            *self.value.lock().unwrap() = Some(Zeroizing::new(payload.to_owned()));
+            if let Some(finished_tx) = self.finished_tx.lock().unwrap().take() {
+                finished_tx.send(()).unwrap();
+            }
+            Ok(())
+        }
+
+        fn delete(&self, _service: &str, _account: &str) -> Result<(), BackendError> {
+            *self.value.lock().unwrap() = None;
             Ok(())
         }
     }
