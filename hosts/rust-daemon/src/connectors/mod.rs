@@ -6,17 +6,17 @@ pub(crate) struct TelegramConnectorRecord {
     pub(crate) id: String,
     pub(crate) agent_id: String,
     pub(crate) room_id: String,
-    pub(crate) bot_identity: TelegramBotIdentity,
+    pub(crate) bot: TelegramBotIdentity,
     #[serde(default)]
     pub(crate) approved_chat: Option<TelegramChatMetadata>,
     #[serde(default)]
-    pub(crate) latest_pending_pairing: Option<TelegramPendingPairing>,
+    pub(crate) pending_pairing: Option<TelegramPendingPairing>,
     #[serde(default)]
     pub(crate) next_update_id: i64,
     #[serde(default = "default_enabled")]
     pub(crate) enabled: bool,
-    pub(crate) created_at_ms: i64,
-    pub(crate) updated_at_ms: i64,
+    pub(crate) created_at_ms: u64,
+    pub(crate) updated_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,7 +53,7 @@ pub(crate) enum TelegramChatKind {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TelegramPendingPairing {
     pub(crate) chat: TelegramChatMetadata,
-    pub(crate) requested_at_ms: i64,
+    pub(crate) requested_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +76,7 @@ pub(crate) struct TelegramInboundRecord {
     pub(crate) normalized_text: String,
     pub(crate) sender: TelegramSenderMetadata,
     pub(crate) chat: TelegramChatMetadata,
-    pub(crate) received_at_ms: i64,
+    pub(crate) received_at_ms: u64,
     pub(crate) processing_state: InboundProcessingState,
     pub(crate) run_idempotency_key: String,
 }
@@ -99,7 +99,7 @@ pub(crate) struct TelegramOutboundRecord {
     pub(crate) room_id: String,
     pub(crate) assistant_message_id: String,
     pub(crate) text: String,
-    pub(crate) created_at_ms: i64,
+    pub(crate) created_at_ms: u64,
     #[serde(default)]
     pub(crate) attempts: u32,
     pub(crate) delivery_state: OutboundDeliveryState,

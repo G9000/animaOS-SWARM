@@ -237,9 +237,9 @@ mod tests {
                 "id": "telegram-1",
                 "agentId": "missing-agent",
                 "roomId": "room-1",
-                "botIdentity": { "id": "bot-1", "username": "test-bot" },
+                "bot": { "id": "bot-1", "username": "test-bot" },
                 "approvedChat": null,
-                "latestPendingPairing": null,
+                "pendingPairing": null,
                 "nextUpdateId": 0,
                 "enabled": true,
                 "createdAtMs": 1,
@@ -332,6 +332,162 @@ mod tests {
                 .map(|connector| connector.id.as_str())
                 .collect::<Vec<_>>(),
             ["telegram-a", "telegram-z"]
+        );
+    }
+
+    #[test]
+    fn snapshot_sorts_inbound_outbound_and_schedules_deterministically() {
+        let mut state = DaemonState::new();
+        let agent_id = state
+            .create_agent(test_config("connector-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        state
+            .connectors
+            .insert("telegram-z".into(), test_connector("telegram-z", &agent_id));
+        state
+            .connectors
+            .insert("telegram-a".into(), test_connector("telegram-a", &agent_id));
+
+        let mut inbound_z = test_inbound(&agent_id);
+        inbound_z.connector_id = "telegram-z".into();
+        inbound_z.update_id = 9;
+        let mut inbound_a_later = test_inbound(&agent_id);
+        inbound_a_later.update_id = 7;
+        let inbound_a_earlier = test_inbound(&agent_id);
+        state.inbound.insert(
+            (inbound_z.connector_id.clone(), inbound_z.update_id),
+            inbound_z,
+        );
+        state.inbound.insert(
+            (
+                inbound_a_later.connector_id.clone(),
+                inbound_a_later.update_id,
+            ),
+            inbound_a_later,
+        );
+        state.inbound.insert(
+            (
+                inbound_a_earlier.connector_id.clone(),
+                inbound_a_earlier.update_id,
+            ),
+            inbound_a_earlier,
+        );
+
+        let mut outbound_z = test_outbound(&agent_id);
+        outbound_z.id = "outbound-z".into();
+        outbound_z.connector_id = "telegram-z".into();
+        let outbound_a = test_outbound(&agent_id);
+        state.outbound.insert(outbound_z.id.clone(), outbound_z);
+        state.outbound.insert(outbound_a.id.clone(), outbound_a);
+
+        let mut schedule_z = test_schedule(&agent_id);
+        schedule_z.id = "schedule-z".into();
+        schedule_z.target = ScheduleTarget::Workspace;
+        let schedule_a = test_schedule(&agent_id);
+        state.schedules.insert(schedule_z.id.clone(), schedule_z);
+        state.schedules.insert(schedule_a.id.clone(), schedule_a);
+
+        let snapshot = state.control_plane_snapshot();
+        assert_eq!(
+            snapshot
+                .inbound
+                .iter()
+                .map(|record| (record.connector_id.as_str(), record.update_id))
+                .collect::<Vec<_>>(),
+            [("telegram-a", 7), ("telegram-a", 42), ("telegram-z", 9)]
+        );
+        assert_eq!(
+            snapshot
+                .outbound
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["outbound-1", "outbound-z"]
+        );
+        assert_eq!(
+            snapshot
+                .schedules
+                .iter()
+                .map(|record| record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["schedule-1", "schedule-z"]
+        );
+    }
+
+    #[test]
+    fn persisted_connector_and_schedule_contract_uses_required_json_names() {
+        let connector = test_connector("telegram-a", "agent-a");
+        let inbound = test_inbound("agent-a");
+        let outbound = test_outbound("agent-a");
+        let schedule = test_schedule("agent-a");
+        assert_u64(connector.created_at_ms);
+        assert_u64(connector.updated_at_ms);
+        assert_u64(
+            connector
+                .pending_pairing
+                .as_ref()
+                .expect("test connector has a pairing")
+                .requested_at_ms,
+        );
+        assert_u64(inbound.received_at_ms);
+        assert_u64(outbound.created_at_ms);
+        assert_u64(schedule.next_due_at_ms);
+        assert_u64(schedule.created_at_ms);
+        assert_u64(schedule.updated_at_ms);
+        assert_u64(
+            schedule
+                .last_fired
+                .as_ref()
+                .expect("test schedule has a last-fired record")
+                .fired_at_ms,
+        );
+        assert_u64(
+            schedule
+                .last_safe_outcome
+                .as_ref()
+                .expect("test schedule has an outcome")
+                .occurred_at_ms,
+        );
+        let connector_json = serde_json::to_value(&connector).expect("connector should serialize");
+        assert!(connector_json.get("bot").is_some());
+        assert!(connector_json.get("pendingPairing").is_some());
+        assert!(connector_json.get("botIdentity").is_none());
+        assert!(connector_json.get("latestPendingPairing").is_none());
+
+        let interval_trigger = ScheduleTrigger::Interval {
+            interval_ms: 60_000,
+        };
+        let ScheduleTrigger::Interval { interval_ms } = &interval_trigger else {
+            unreachable!("test trigger must be interval");
+        };
+        assert_u64(*interval_ms);
+        assert_eq!(
+            serde_json::to_value(interval_trigger).expect("interval trigger should serialize"),
+            serde_json::json!({"interval": {"intervalMs": 60_000}})
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 30,
+                time_zone: "Asia/Kuala_Lumpur".into(),
+            })
+            .expect("daily trigger should serialize"),
+            serde_json::json!({
+                "daily": {
+                    "hour": 9,
+                    "minute": 30,
+                    "timeZone": "Asia/Kuala_Lumpur"
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleTarget::Connector {
+                connector_id: "telegram-a".into(),
+            })
+            .expect("connector target should serialize"),
+            serde_json::json!({"connector": {"connectorId": "telegram-a"}})
         );
     }
 
@@ -468,13 +624,13 @@ mod tests {
             id: id.into(),
             agent_id: agent_id.into(),
             room_id: "room-1".into(),
-            bot_identity: TelegramBotIdentity {
+            bot: TelegramBotIdentity {
                 id: "bot-1".into(),
                 username: Some("test_bot".into()),
                 display_name: Some("Test Bot".into()),
             },
             approved_chat: Some(test_chat()),
-            latest_pending_pairing: Some(TelegramPendingPairing {
+            pending_pairing: Some(TelegramPendingPairing {
                 chat: test_chat(),
                 requested_at_ms: 9,
             }),
@@ -555,6 +711,8 @@ mod tests {
             updated_at_ms: 14,
         }
     }
+
+    fn assert_u64(_: u64) {}
 
     fn forged_tool(name: &str, description: &str) -> ToolDescriptor {
         ToolDescriptor {
