@@ -48,7 +48,8 @@ Add a daemon-owned `AgentRunCoordinator` used by HTTP chat, Telegram polling, an
 The coordinator accepts an execution target:
 
 - generated room for the existing ordinary run API;
-- stable room for connector and schedule execution.
+- generated room for a workspace-targeted scheduled prompt, preserving the existing behavior where a non-sentinel response becomes visible in the ordinary agent transcript without inheriting a prior short-term thread; and
+- stable room for connector-thread and connector-targeted schedule execution.
 
 It owns runtime restoration, control-plane persistence, task-result memory persistence, and safe result projection so every caller follows one execution path.
 
@@ -74,10 +75,10 @@ Wire `anima-schedule` into a daemon scheduler service. Telegram knowledge stays 
 
 Each scheduled prompt targets either:
 
-- `workspace`, which runs the agent without external delivery; or
+- `workspace`, which runs the agent in a newly generated room without external delivery; or
 - `connector`, identified by connector ID, which runs inside that connector's stable room and queues the response for Telegram delivery.
 
-Persist enough firing state to prevent every-interval jobs from firing immediately again after restart and daily jobs from firing twice on the same local day.
+New interval schedules first fire after one complete interval, not immediately. New daily schedules first fire at the next matching local wall-clock time. Persist `next_due_at_ms` and the last-fired state so interval jobs do not fire immediately again after restart and daily jobs do not fire twice on the same local day. Legacy imports preserve their valid `nextRunAtMs` and `lastRunAtMs` anchors exactly; an overdue imported job becomes due after import, while a future job keeps its remaining delay.
 
 ### Web application
 
@@ -135,6 +136,12 @@ Deleting a connector disables schedules targeting it and records a visible reaso
 
 An outbound record contains a stable ID, connector ID, room ID, assistant message ID, text, creation time, attempt count, and delivery state. The agent result is committed before Telegram delivery begins. Retries resend the stored response and never rerun the agent.
 
+### Durable inbound delivery
+
+An inbound record is keyed by connector ID and Telegram update ID and contains the normalized authorized text, stable room, safe sender/chat metadata, receipt time, processing state, and a stable run idempotency key. Accepting an update atomically inserts the inbound record and advances the connector offset in one control-plane snapshot. A separate worker processes durable pending inbound records.
+
+The connector run uses the stable inbound idempotency key through runtime and tool execution. On success, restoring the agent snapshot, marking the inbound item complete, and creating the outbound response are captured by one control-plane persistence request. After a crash, a pending inbound item is resumed with the same key; already committed completed items are never rerun.
+
 ## HTTP API
 
 ### Connectors
@@ -154,7 +161,7 @@ Connector responses include safe metadata and status only. Credential mutation r
 
 ### Connector thread
 
-- `GET /api/agents/{agent_id}/connectors/{connector_id}/messages`
+- `GET /api/agents/{agent_id}/connectors/{connector_id}/messages?before={message_id}&limit={1..100}`
 - `POST /api/agents/{agent_id}/connectors/{connector_id}/messages`
   - Body: `{ "text": "..." }`
   - Runs the agent in the connector room, returns the updated messages/result, and queues the assistant result for Telegram delivery when a chat is approved.
@@ -189,10 +196,11 @@ Create accepts an optional import idempotency key. Repeating an import returns t
 ### Conversation
 
 1. The poller persists progress past each consumed Telegram update so restart does not replay accepted messages.
-2. An approved text message is recorded as connector-room input with Telegram metadata.
-3. `AgentRunCoordinator` runs the assigned agent with that room's history.
-4. The assistant result is persisted in the room and added to the durable outbound queue.
-5. The delivery worker sends the stored text in UTF-8-safe Telegram-sized chunks and marks it delivered.
+2. The same persistence request inserts a durable inbound item keyed by Telegram update ID; duplicate updates reuse the existing item.
+3. The inbound worker records the message as connector-room input with Telegram metadata and its stable run idempotency key.
+4. `AgentRunCoordinator` runs the assigned agent with that room's history.
+5. The assistant result, completed inbound state, and durable outbound item are captured together before delivery starts.
+6. The delivery worker sends the stored text in UTF-8-safe Telegram-sized chunks and marks it delivered.
 
 Non-text updates are ignored in v1. Messages that exceed the daemon input bound receive a safe rejection without invoking the agent.
 
@@ -219,6 +227,8 @@ At startup the daemon:
 
 Connector creation, credential replacement, connection testing, pairing approval, restart, and deletion are local-owner administration operations. They fail closed unless the daemon is directly serving a loopback peer and the browser origin is in the daemon's explicit local UI origin allowlist. Originless clients require the configured local-admin bearer token. Forwarding headers are rejected rather than trusted.
 
+Connector-thread sends and every schedule mutation use the same local-owner guard because they can trigger agent tools or external Telegram delivery. Read-only connector summaries, paginated thread messages, and schedule summaries remain available through the daemon's ordinary read boundary and never expose credentials.
+
 Telegram transport rules:
 
 - fixed `https://api.telegram.org` origin;
@@ -239,6 +249,7 @@ The OS credential vault protects secrets from casual file access and repository 
 - Pending pairing candidates expire and are capped to one latest candidate in v1.
 - Connector-thread turns are serialized with every other turn for the same agent.
 - Delivery failures retain the outbound item and expose a degraded connector status.
+- Delivered outbound records are compacted after seven days while pending and failed records are retained; compaction also enforces a bounded maximum of 1,000 delivered records per connector.
 - Deleting a connector cancels its tasks, deletes its vault credential, removes active metadata, archives its room history, and disables connector-targeted schedules.
 - Agent deletion removes its connectors and schedules and attempts credential cleanup before the agent deletion becomes durable; cleanup failure aborts the destructive operation.
 
@@ -260,7 +271,7 @@ Messages give a corrective action without including tokens, credential identifie
 
 ## Browser Migration
 
-When the web loads daemon schedules for an agent, it checks the existing `animaos.checkins.{agentId}` local-storage record. Each valid legacy check-in is submitted with a deterministic import idempotency key. The browser removes the legacy record only after every item is confirmed by the daemon. Partial failure keeps the source record so retry is safe.
+When the web loads daemon schedules for an agent, it checks the existing `animaos.checkins.{agentId}` local-storage record. Each valid legacy check-in is submitted with a deterministic import idempotency key plus its existing `lastRunAtMs` and `nextRunAtMs` timing anchors. The browser removes the legacy record only after every item is confirmed by the daemon. Partial failure keeps the source record so retry is safe.
 
 The token remains component-local in a password field, is cleared after every submission attempt and when settings closes, and is never written to local storage, session storage, URL state, global React state, analytics, or error reporting.
 
