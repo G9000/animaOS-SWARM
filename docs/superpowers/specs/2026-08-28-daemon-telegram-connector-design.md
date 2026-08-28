@@ -78,7 +78,7 @@ Each scheduled prompt targets either:
 - `workspace`, which runs the agent in a newly generated room without external delivery; or
 - `connector`, identified by connector ID, which runs inside that connector's stable room and queues the response for Telegram delivery.
 
-New interval schedules first fire after one complete interval, not immediately. New daily schedules first fire at the next matching local wall-clock time. Persist `next_due_at_ms` and the last-fired state so interval jobs do not fire immediately again after restart and daily jobs do not fire twice on the same local day. Legacy imports preserve their valid `nextRunAtMs` and `lastRunAtMs` anchors exactly; an overdue imported job becomes due after import, while a future job keeps its remaining delay.
+New interval schedules first fire after one complete interval, not immediately. New daily schedules first fire at the next matching local wall-clock time. Persist `next_due_at_ms` and the last-fired state so interval jobs do not fire immediately again after restart and daily jobs do not fire twice on the same local day. Legacy imports derive the same next-due instant as the browser from `lastRunAtMs`, `createdAtMs`, and the interval; an overdue imported job becomes due after import, while a future job keeps its remaining delay.
 
 ### Web application
 
@@ -127,10 +127,13 @@ The daemon control-plane snapshot stores:
 - interval or daily trigger
 - enabled state
 - delivery target
+- persisted `next_due_at_ms`
 - last-fired state and last safe outcome
 - created and updated timestamps
 
 Deleting a connector disables schedules targeting it and records a visible reason instead of silently retargeting them.
+
+Changing a schedule trigger recalculates `next_due_at_ms` from the successful update time. Disabling preserves the prior timing record for history, while re-enabling schedules the next full interval or next matching daily wall-clock time from the re-enable time; it does not perform catch-up runs. Changing only the prompt or target preserves the current next-due time.
 
 ### Durable outbound delivery
 
@@ -207,21 +210,23 @@ Non-text updates are ignored in v1. Messages that exceed the daemon input bound 
 ### Scheduled delivery
 
 1. The daemon scheduler claims a due prompt and persists its firing state.
-2. A connector-targeted prompt runs in the connector room through the same coordinator.
-3. A silent sentinel response produces no outbound item; any other assistant response is queued for Telegram.
-4. Telegram delivery retries independently of schedule execution.
+2. Before executing a connector-targeted prompt, the daemon requires an enabled connector with a usable credential and approved chat. An unavailable target records `schedule_target_unavailable` and advances to the next ordinary occurrence without running the agent or queueing a stale prompt.
+3. The daemon wraps the stored user prompt with the existing check-in silence instruction, using the exact `CHECKIN_OK` sentinel, and supplies input metadata `{ "kind": "checkin", "id": scheduleId }` so UI transcript filtering remains compatible.
+4. A connector-targeted prompt runs in the connector room through the same coordinator; a workspace-targeted prompt uses a generated room.
+5. The daemon trims the assistant result and treats only an exact `CHECKIN_OK` match as silent. The tagged input and silent response stay hidden by existing UI rules. Any other successful response is recorded as `spoke`; connector-targeted responses are queued for Telegram.
+6. Telegram delivery retries independently of schedule execution.
 
 ## Persistence and Startup
 
-Connector, schedule, and outbound records extend the versioned control-plane snapshot with serde defaults for backward compatibility. JSON and Postgres snapshot modes use the same non-secret schema. Tokens never enter either backend.
+Connector, durable inbound, schedule, and outbound records extend the versioned control-plane snapshot with serde defaults for backward compatibility. JSON and Postgres snapshot modes use the same non-secret schema. Tokens never enter either backend.
 
 At startup the daemon:
 
-1. restores agents, connectors, schedules, and outbound items;
+1. restores agents, connectors, durable inbound items, schedules, and outbound items;
 2. loads available connector credentials from the vault;
 3. starts one supervised poller/delivery worker per enabled connector with a usable credential;
 4. marks missing-vault connectors `credential_required` without preventing daemon startup;
-5. starts the scheduler loop and resumes pending outbound delivery.
+5. starts the scheduler loop, resumes pending inbound execution using its stable idempotency keys, and resumes pending outbound delivery.
 
 ## Local-Owner and Secret Boundary
 
@@ -271,7 +276,7 @@ Messages give a corrective action without including tokens, credential identifie
 
 ## Browser Migration
 
-When the web loads daemon schedules for an agent, it checks the existing `animaos.checkins.{agentId}` local-storage record. Each valid legacy check-in is submitted with a deterministic import idempotency key plus its existing `lastRunAtMs` and `nextRunAtMs` timing anchors. The browser removes the legacy record only after every item is confirmed by the daemon. Partial failure keeps the source record so retry is safe.
+When the web loads daemon schedules for an agent, it checks the existing `animaos.checkins.{agentId}` local-storage record. Each valid legacy check-in is submitted with a deterministic import idempotency key plus its existing `createdAtMs` and optional `lastRunAtMs`. The daemon derives `next_due_at_ms` as `(lastRunAtMs ?? createdAtMs) + intervalSecs * 1000`, using checked arithmetic and rejecting malformed records. This exactly preserves the browser's current `isDue` timing rule. The browser removes the legacy record only after every item is confirmed by the daemon. Partial failure keeps the source record so retry is safe.
 
 The token remains component-local in a password field, is cleared after every submission attempt and when settings closes, and is never written to local storage, session storage, URL state, global React state, analytics, or error reporting.
 
