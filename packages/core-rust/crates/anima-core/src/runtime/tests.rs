@@ -890,7 +890,7 @@ fn run_in_room_with_context_uses_supplied_room_for_new_messages() {
         host_message("host-assistant", MessageRole::Assistant, "Nice to meet you"),
     ];
 
-    let result = block_on(runtime.run_in_room_with_context(
+    let first_result = block_on(runtime.run_in_room_with_context(
         "stable-room".into(),
         history.clone(),
         Content {
@@ -899,7 +899,7 @@ fn run_in_room_with_context_uses_supplied_room_for_new_messages() {
         },
     ));
 
-    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(first_result.status, TaskStatus::Success);
     assert_eq!(
         captured
             .lock()
@@ -912,6 +912,22 @@ fn run_in_room_with_context_uses_supplied_room_for_new_messages() {
         ]
     );
     assert_eq!(runtime.messages().len(), 2);
+    assert!(runtime
+        .messages()
+        .iter()
+        .all(|message| message.room_id == "stable-room"));
+
+    let second_result = block_on(runtime.run_in_room_with_context(
+        "stable-room".into(),
+        Vec::new(),
+        Content {
+            text: "What else should I remember?".into(),
+            ..Content::default()
+        },
+    ));
+
+    assert_eq!(second_result.status, TaskStatus::Success);
+    assert_eq!(runtime.messages().len(), 4);
     assert!(runtime
         .messages()
         .iter()
@@ -1182,13 +1198,21 @@ fn runtime_run_reuses_one_room_for_conversation_messages() {
     let mut runtime = runtime();
     runtime.init();
 
-    block_on(runtime.run(Content {
+    let first = block_on(runtime.run(Content {
         text: "Keep one room".into(),
         ..Content::default()
     }));
+    let second = block_on(runtime.run(Content {
+        text: "Keep another room".into(),
+        ..Content::default()
+    }));
 
-    assert_eq!(runtime.messages().len(), 2);
+    assert_eq!(first.status, TaskStatus::Success);
+    assert_eq!(second.status, TaskStatus::Success);
+    assert_eq!(runtime.messages().len(), 4);
     assert_eq!(runtime.messages()[0].room_id, runtime.messages()[1].room_id);
+    assert_eq!(runtime.messages()[2].room_id, runtime.messages()[3].room_id);
+    assert_ne!(runtime.messages()[0].room_id, runtime.messages()[2].room_id);
 }
 
 #[test]
