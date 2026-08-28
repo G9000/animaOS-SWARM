@@ -1,5 +1,6 @@
 mod app;
 mod components;
+mod connectors;
 mod control_plane_store;
 mod events;
 mod memory_embeddings;
@@ -7,6 +8,7 @@ mod memory_store;
 mod model;
 mod routes;
 mod runtime_model;
+mod schedules;
 mod state;
 mod tools;
 

@@ -7,7 +7,10 @@ use anima_swarm::{SwarmConfig, SwarmState};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
-const CONTROL_PLANE_STORE_VERSION: u32 = 1;
+use crate::connectors::{TelegramConnectorRecord, TelegramInboundRecord, TelegramOutboundRecord};
+use crate::schedules::ScheduledPromptRecord;
+
+const CONTROL_PLANE_STORE_VERSION: u32 = 2;
 const CONTROL_PLANE_SNAPSHOT_KEY: &str = "control_plane";
 
 #[derive(Clone, Debug)]
@@ -48,6 +51,14 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) agents: Vec<AgentRuntimeSnapshot>,
     #[serde(default)]
     pub(crate) swarms: Vec<StoredSwarmSnapshot>,
+    #[serde(default)]
+    pub(crate) connectors: Vec<TelegramConnectorRecord>,
+    #[serde(default)]
+    pub(crate) inbound: Vec<TelegramInboundRecord>,
+    #[serde(default)]
+    pub(crate) outbound: Vec<TelegramOutboundRecord>,
+    #[serde(default)]
+    pub(crate) schedules: Vec<ScheduledPromptRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,11 +199,102 @@ fn postgres_error(error: sqlx::Error) -> io::Error {
 }
 
 impl ControlPlaneSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(agents: Vec<AgentRuntimeSnapshot>, swarms: Vec<StoredSwarmSnapshot>) -> Self {
+        Self::with_connector_state(agents, swarms, vec![], vec![], vec![], vec![])
+    }
+
+    pub(crate) fn with_connector_state(
+        agents: Vec<AgentRuntimeSnapshot>,
+        swarms: Vec<StoredSwarmSnapshot>,
+        connectors: Vec<TelegramConnectorRecord>,
+        inbound: Vec<TelegramInboundRecord>,
+        outbound: Vec<TelegramOutboundRecord>,
+        schedules: Vec<ScheduledPromptRecord>,
+    ) -> Self {
         Self {
             version: CONTROL_PLANE_STORE_VERSION,
             agents,
             swarms,
+            connectors,
+            inbound,
+            outbound,
+            schedules,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ControlPlaneSnapshot;
+
+    #[test]
+    fn snapshot_serializes_version_two_with_empty_connector_collections() {
+        let snapshot = ControlPlaneSnapshot::new(vec![], vec![]);
+        let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
+
+        assert_eq!(payload["version"], 2);
+        assert_eq!(payload["connectors"], serde_json::json!([]));
+        assert_eq!(payload["inbound"], serde_json::json!([]));
+        assert_eq!(payload["outbound"], serde_json::json!([]));
+        assert_eq!(payload["schedules"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn version_one_payload_round_trips_new_collections_as_empty() {
+        let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "agents": [],
+            "swarms": []
+        }))
+        .expect("version-one snapshot should deserialize");
+
+        let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
+        assert_eq!(payload["connectors"], serde_json::json!([]));
+        assert_eq!(payload["inbound"], serde_json::json!([]));
+        assert_eq!(payload["outbound"], serde_json::json!([]));
+        assert_eq!(payload["schedules"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn version_one_json_file_loads_new_collections_as_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "anima-control-plane-v1-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&path, r#"{"version":1,"agents":[],"swarms":[]}"#)
+            .expect("version-one snapshot should be written");
+
+        let snapshot = super::load_json_snapshot(&path)
+            .expect("version-one snapshot should load")
+            .expect("version-one snapshot should exist");
+        assert!(snapshot.connectors.is_empty());
+        assert!(snapshot.inbound.is_empty());
+        assert!(snapshot.outbound.is_empty());
+        assert!(snapshot.schedules.is_empty());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_one_postgres_payload_deserializes_new_collections_as_empty() {
+        let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "agents": [],
+            "swarms": []
+        }))
+        .expect("version-one postgres payload should deserialize");
+
+        assert_eq!(
+            snapshot.version, 0,
+            "the row version supplies v1 when absent"
+        );
+        assert!(snapshot.connectors.is_empty());
+        assert!(snapshot.inbound.is_empty());
+        assert!(snapshot.outbound.is_empty());
+        assert!(snapshot.schedules.is_empty());
     }
 }

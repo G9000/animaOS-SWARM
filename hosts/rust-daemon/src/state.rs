@@ -18,6 +18,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
+use crate::connectors::{TelegramConnectorRecord, TelegramInboundRecord, TelegramOutboundRecord};
 use crate::control_plane_store::{
     save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, StoredSwarmSnapshot,
 };
@@ -25,6 +26,7 @@ use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::memory_embeddings::{MemoryEmbeddingRuntime, SharedMemoryEmbeddings};
 use crate::memory_store::MemoryStoreConfig;
 use crate::model::DeterministicModelAdapter;
+use crate::schedules::{ScheduleTarget, ScheduledPromptRecord};
 use crate::tools::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
     ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
@@ -43,8 +45,17 @@ pub(crate) enum UpdateAgentError {
 #[cfg(test)]
 mod tests {
     use super::DaemonState;
+    use crate::connectors::{
+        InboundProcessingState, OutboundDeliveryState, TelegramBotIdentity, TelegramChatKind,
+        TelegramChatMetadata, TelegramConnectorRecord, TelegramInboundRecord,
+        TelegramOutboundRecord, TelegramPendingPairing, TelegramSenderMetadata,
+    };
     use crate::control_plane_store::{
         load_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
+    };
+    use crate::schedules::{
+        ScheduleLastFired, ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget,
+        ScheduleTrigger, ScheduledPromptRecord,
     };
     use anima_core::{AgentConfig, AgentRuntime, AgentSettings, ToolDescriptor};
     use std::sync::Arc;
@@ -212,6 +223,339 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restore_rejects_unknown_connector_without_mutating_existing_agents() {
+        let mut state = DaemonState::new();
+        state
+            .create_agent(test_config("existing"))
+            .expect("existing agent should be created");
+        let invalid_snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "agents": [],
+            "swarms": [],
+            "connectors": [{
+                "id": "telegram-1",
+                "agentId": "missing-agent",
+                "roomId": "room-1",
+                "botIdentity": { "id": "bot-1", "username": "test-bot" },
+                "approvedChat": null,
+                "latestPendingPairing": null,
+                "nextUpdateId": 0,
+                "enabled": true,
+                "createdAtMs": 1,
+                "updatedAtMs": 1
+            }]
+        }))
+        .expect("invalid connector snapshot should deserialize");
+
+        assert!(
+            state
+                .restore_control_plane_snapshot(invalid_snapshot)
+                .is_err(),
+            "an unknown connector agent must reject the full restore"
+        );
+        assert_eq!(
+            state.agent_count(),
+            1,
+            "failed restores must not mutate state"
+        );
+    }
+
+    #[test]
+    fn connector_and_schedule_records_round_trip_without_serializing_secrets() {
+        const SENTINEL_TOKEN: &str = "never-persist-a-telegram-token";
+
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("connector-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let connector = test_connector("telegram-a", &agent_id);
+        let inbound = test_inbound(&agent_id);
+        let outbound = test_outbound(&agent_id);
+        let schedule = test_schedule(&agent_id);
+        source
+            .connectors
+            .insert(connector.id.clone(), connector.clone());
+        source.inbound.insert(
+            (inbound.connector_id.clone(), inbound.update_id),
+            inbound.clone(),
+        );
+        source
+            .outbound
+            .insert(outbound.id.clone(), outbound.clone());
+        source
+            .schedules
+            .insert(schedule.id.clone(), schedule.clone());
+
+        let snapshot = source.control_plane_snapshot();
+        let serialized = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        assert!(
+            !serialized.contains(SENTINEL_TOKEN),
+            "credentials held outside non-secret records must never serialize"
+        );
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("connector state should restore");
+        assert_eq!(restored.connectors.get("telegram-a"), Some(&connector));
+        assert_eq!(
+            restored.inbound.get(&(String::from("telegram-a"), 42)),
+            Some(&inbound)
+        );
+        assert_eq!(restored.outbound.get("outbound-1"), Some(&outbound));
+        assert_eq!(restored.schedules.get("schedule-1"), Some(&schedule));
+    }
+
+    #[test]
+    fn snapshot_sorts_connector_records_deterministically() {
+        let mut state = DaemonState::new();
+        let agent_id = state
+            .create_agent(test_config("connector-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        state
+            .connectors
+            .insert("telegram-z".into(), test_connector("telegram-z", &agent_id));
+        state
+            .connectors
+            .insert("telegram-a".into(), test_connector("telegram-a", &agent_id));
+
+        let snapshot = state.control_plane_snapshot();
+        assert_eq!(
+            snapshot
+                .connectors
+                .iter()
+                .map(|connector| connector.id.as_str())
+                .collect::<Vec<_>>(),
+            ["telegram-a", "telegram-z"]
+        );
+    }
+
+    #[test]
+    fn version_one_snapshot_restores_with_empty_connector_state() {
+        let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "agents": [],
+            "swarms": []
+        }))
+        .expect("version-one snapshot should deserialize");
+        let mut state = DaemonState::new();
+
+        state
+            .restore_control_plane_snapshot(snapshot)
+            .expect("version-one snapshot should restore");
+        assert!(state.connectors.is_empty());
+        assert!(state.inbound.is_empty());
+        assert!(state.outbound.is_empty());
+        assert!(state.schedules.is_empty());
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_and_inconsistent_connector_records_without_mutation() {
+        let (snapshot, other_agent_id) = valid_connector_snapshot();
+        let mut duplicate_connector = snapshot.clone();
+        duplicate_connector
+            .connectors
+            .push(duplicate_connector.connectors[0].clone());
+
+        let mut connector_missing_agent = snapshot.clone();
+        connector_missing_agent.connectors[0].agent_id = "missing-agent".into();
+
+        let mut inbound_missing_connector = snapshot.clone();
+        inbound_missing_connector.inbound[0].connector_id = "missing-connector".into();
+
+        let mut outbound_missing_agent = snapshot.clone();
+        outbound_missing_agent.outbound[0].agent_id = "missing-agent".into();
+
+        let mut outbound_wrong_owner = snapshot.clone();
+        outbound_wrong_owner.outbound[0].agent_id = other_agent_id;
+
+        let mut schedule_missing_connector = snapshot;
+        schedule_missing_connector.schedules[0].target = ScheduleTarget::Connector {
+            connector_id: "missing-connector".into(),
+        };
+
+        for invalid_snapshot in [
+            duplicate_connector,
+            connector_missing_agent,
+            inbound_missing_connector,
+            outbound_missing_agent,
+            outbound_wrong_owner,
+            schedule_missing_connector,
+        ] {
+            let mut state = DaemonState::new();
+            assert!(
+                state
+                    .restore_control_plane_snapshot(invalid_snapshot)
+                    .is_err(),
+                "invalid connector records must reject the full restore"
+            );
+            assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
+            assert!(state.connectors.is_empty());
+            assert!(state.inbound.is_empty());
+            assert!(state.outbound.is_empty());
+            assert!(state.schedules.is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_does_not_validate_inbound_against_a_connector_absent_from_snapshot() {
+        let mut state = DaemonState::new();
+        let agent_id = state
+            .create_agent(test_config("connector-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let existing_connector = test_connector("telegram-a", &agent_id);
+        state
+            .connectors
+            .insert(existing_connector.id.clone(), existing_connector);
+        let inbound = test_inbound(&agent_id);
+        let snapshot = ControlPlaneSnapshot::with_connector_state(
+            vec![],
+            vec![],
+            vec![],
+            vec![inbound],
+            vec![],
+            vec![],
+        );
+
+        assert!(state.restore_control_plane_snapshot(snapshot).is_err());
+        assert_eq!(
+            state.agent_count(),
+            1,
+            "failed restores cannot add or remove agents"
+        );
+        assert!(
+            state.connectors.contains_key("telegram-a"),
+            "failed restores cannot clear existing connector state"
+        );
+        assert!(state.inbound.is_empty());
+    }
+
+    fn valid_connector_snapshot() -> (ControlPlaneSnapshot, String) {
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("connector-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let other_agent_id = source
+            .create_agent(test_config("other-agent"))
+            .expect("other agent should be created")
+            .state
+            .id;
+        let connector = test_connector("telegram-a", &agent_id);
+        let inbound = test_inbound(&agent_id);
+        let outbound = test_outbound(&agent_id);
+        let schedule = test_schedule(&agent_id);
+        source.connectors.insert(connector.id.clone(), connector);
+        source
+            .inbound
+            .insert((inbound.connector_id.clone(), inbound.update_id), inbound);
+        source.outbound.insert(outbound.id.clone(), outbound);
+        source.schedules.insert(schedule.id.clone(), schedule);
+
+        (source.control_plane_snapshot(), other_agent_id)
+    }
+
+    fn test_connector(id: &str, agent_id: &str) -> TelegramConnectorRecord {
+        TelegramConnectorRecord {
+            id: id.into(),
+            agent_id: agent_id.into(),
+            room_id: "room-1".into(),
+            bot_identity: TelegramBotIdentity {
+                id: "bot-1".into(),
+                username: Some("test_bot".into()),
+                display_name: Some("Test Bot".into()),
+            },
+            approved_chat: Some(test_chat()),
+            latest_pending_pairing: Some(TelegramPendingPairing {
+                chat: test_chat(),
+                requested_at_ms: 9,
+            }),
+            next_update_id: 43,
+            enabled: true,
+            created_at_ms: 10,
+            updated_at_ms: 11,
+        }
+    }
+
+    fn test_chat() -> TelegramChatMetadata {
+        TelegramChatMetadata {
+            id: "chat-1".into(),
+            kind: TelegramChatKind::Private,
+            title: None,
+            username: Some("safe_chat".into()),
+        }
+    }
+
+    fn test_inbound(agent_id: &str) -> TelegramInboundRecord {
+        TelegramInboundRecord {
+            connector_id: "telegram-a".into(),
+            update_id: 42,
+            agent_id: agent_id.into(),
+            room_id: "room-1".into(),
+            normalized_text: "hello daemon".into(),
+            sender: TelegramSenderMetadata {
+                id: "sender-1".into(),
+                username: Some("safe_sender".into()),
+                display_name: Some("Safe Sender".into()),
+            },
+            chat: test_chat(),
+            received_at_ms: 12,
+            processing_state: InboundProcessingState::Processed,
+            run_idempotency_key: "telegram-a:update:42".into(),
+        }
+    }
+
+    fn test_outbound(agent_id: &str) -> TelegramOutboundRecord {
+        TelegramOutboundRecord {
+            id: "outbound-1".into(),
+            connector_id: "telegram-a".into(),
+            agent_id: agent_id.into(),
+            room_id: "room-1".into(),
+            assistant_message_id: "assistant-message-1".into(),
+            text: "hello user".into(),
+            created_at_ms: 13,
+            attempts: 2,
+            delivery_state: OutboundDeliveryState::Delivered,
+        }
+    }
+
+    fn test_schedule(agent_id: &str) -> ScheduledPromptRecord {
+        ScheduledPromptRecord {
+            id: "schedule-1".into(),
+            import_idempotency_key: Some("import-1".into()),
+            agent_id: agent_id.into(),
+            prompt: "Review the workspace".into(),
+            trigger: ScheduleTrigger::Daily {
+                hour: 9,
+                minute: 30,
+                time_zone: "Asia/Kuala_Lumpur".into(),
+            },
+            enabled: true,
+            target: ScheduleTarget::Connector {
+                connector_id: "telegram-a".into(),
+            },
+            next_due_at_ms: 14,
+            last_fired: Some(ScheduleLastFired {
+                fired_at_ms: 13,
+                run_idempotency_key: "schedule-1:13".into(),
+            }),
+            last_safe_outcome: Some(ScheduleSafeOutcome {
+                status: ScheduleOutcomeStatus::Succeeded,
+                occurred_at_ms: 13,
+            }),
+            created_at_ms: 10,
+            updated_at_ms: 14,
+        }
+    }
+
     fn forged_tool(name: &str, description: &str) -> ToolDescriptor {
         ToolDescriptor {
             name: name.into(),
@@ -302,6 +646,10 @@ pub(crate) struct DaemonState {
     pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
     pub(crate) swarm_snapshots: HashMap<String, SwarmState>,
+    pub(crate) connectors: HashMap<String, TelegramConnectorRecord>,
+    pub(crate) inbound: HashMap<(String, i64), TelegramInboundRecord>,
+    pub(crate) outbound: HashMap<String, TelegramOutboundRecord>,
+    pub(crate) schedules: HashMap<String, ScheduledPromptRecord>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) process_manager: SharedProcessManager,
@@ -402,6 +750,10 @@ impl DaemonState {
             swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
             swarm_snapshots: HashMap::new(),
+            connectors: HashMap::new(),
+            inbound: HashMap::new(),
+            outbound: HashMap::new(),
+            schedules: HashMap::new(),
             model_adapter,
             tool_registry: ToolRegistry::new(),
             process_manager: new_shared_process_manager_with_limit(max_background_processes),
@@ -468,14 +820,29 @@ impl DaemonState {
             })
             .collect::<Vec<_>>();
         swarms.sort_by(|left, right| left.state.id.cmp(&right.state.id));
+        let mut connectors = self.connectors.values().cloned().collect::<Vec<_>>();
+        connectors.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut inbound = self.inbound.values().cloned().collect::<Vec<_>>();
+        inbound.sort_by(|left, right| {
+            left.connector_id
+                .cmp(&right.connector_id)
+                .then_with(|| left.update_id.cmp(&right.update_id))
+        });
+        let mut outbound = self.outbound.values().cloned().collect::<Vec<_>>();
+        outbound.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut schedules = self.schedules.values().cloned().collect::<Vec<_>>();
+        schedules.sort_by(|left, right| left.id.cmp(&right.id));
 
-        ControlPlaneSnapshot::new(agents, swarms)
+        ControlPlaneSnapshot::with_connector_state(
+            agents, swarms, connectors, inbound, outbound, schedules,
+        )
     }
 
     pub(crate) fn restore_control_plane_snapshot(
         &mut self,
         snapshot: ControlPlaneSnapshot,
     ) -> Result<(usize, usize), String> {
+        self.validate_control_plane_snapshot(&snapshot)?;
         let mut restored_agents = 0;
         let mut restored_swarms = 0;
 
@@ -491,7 +858,169 @@ impl DaemonState {
             restored_swarms += 1;
         }
 
+        self.connectors = snapshot
+            .connectors
+            .into_iter()
+            .map(|connector| (connector.id.clone(), connector))
+            .collect();
+        self.inbound = snapshot
+            .inbound
+            .into_iter()
+            .map(|record| ((record.connector_id.clone(), record.update_id), record))
+            .collect();
+        self.outbound = snapshot
+            .outbound
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        self.schedules = snapshot
+            .schedules
+            .into_iter()
+            .map(|schedule| (schedule.id.clone(), schedule))
+            .collect();
+
         Ok((restored_agents, restored_swarms))
+    }
+
+    fn validate_control_plane_snapshot(
+        &self,
+        snapshot: &ControlPlaneSnapshot,
+    ) -> Result<(), String> {
+        let mut agent_ids = self
+            .agent_snapshots
+            .keys()
+            .chain(self.agents.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut snapshot_agent_ids = HashSet::new();
+        for agent in &snapshot.agents {
+            let agent_id = &agent.state.id;
+            if agent_id.is_empty() || !snapshot_agent_ids.insert(agent_id.clone()) {
+                return Err(format!(
+                    "duplicate or empty agent id in snapshot: {agent_id}"
+                ));
+            }
+            self.resolve_restored_agent_tools(agent.state.config.tools.clone())?;
+            agent_ids.insert(agent_id.clone());
+        }
+
+        let mut swarm_ids = HashSet::new();
+        for swarm in &snapshot.swarms {
+            let swarm_id = &swarm.state.id;
+            if swarm_id.is_empty() || !swarm_ids.insert(swarm_id.clone()) {
+                return Err(format!(
+                    "duplicate or empty swarm id in snapshot: {swarm_id}"
+                ));
+            }
+            self.validate_swarm_tools(&swarm.config)?;
+        }
+
+        let mut connectors = HashMap::new();
+        let mut connector_ids = HashSet::new();
+        for connector in &snapshot.connectors {
+            if connector.id.is_empty() || !connector_ids.insert(connector.id.clone()) {
+                return Err(format!(
+                    "duplicate or empty connector id in snapshot: {}",
+                    connector.id
+                ));
+            }
+            if !agent_ids.contains(&connector.agent_id) {
+                return Err(format!(
+                    "connector '{}' references missing agent '{}'",
+                    connector.id, connector.agent_id
+                ));
+            }
+            connectors.insert(connector.id.clone(), connector.clone());
+        }
+
+        let mut inbound_keys = HashSet::new();
+        for record in &snapshot.inbound {
+            let key = (record.connector_id.clone(), record.update_id);
+            if record.connector_id.is_empty() || !inbound_keys.insert(key) {
+                return Err(format!(
+                    "duplicate or empty inbound connector/update key: {}:{}",
+                    record.connector_id, record.update_id
+                ));
+            }
+            let connector = connectors.get(&record.connector_id).ok_or_else(|| {
+                format!(
+                    "inbound update references missing connector '{}'",
+                    record.connector_id
+                )
+            })?;
+            if !agent_ids.contains(&record.agent_id) {
+                return Err(format!(
+                    "inbound update references missing agent '{}'",
+                    record.agent_id
+                ));
+            }
+            if connector.agent_id != record.agent_id || connector.room_id != record.room_id {
+                return Err(format!(
+                    "inbound update {}:{} conflicts with connector room or agent ownership",
+                    record.connector_id, record.update_id
+                ));
+            }
+        }
+
+        let mut outbound_ids = HashSet::new();
+        for record in &snapshot.outbound {
+            if record.id.is_empty() || !outbound_ids.insert(record.id.clone()) {
+                return Err(format!(
+                    "duplicate or empty outbound id in snapshot: {}",
+                    record.id
+                ));
+            }
+            let connector = connectors.get(&record.connector_id).ok_or_else(|| {
+                format!(
+                    "outbound delivery references missing connector '{}'",
+                    record.connector_id
+                )
+            })?;
+            if !agent_ids.contains(&record.agent_id) {
+                return Err(format!(
+                    "outbound delivery references missing agent '{}'",
+                    record.agent_id
+                ));
+            }
+            if connector.agent_id != record.agent_id || connector.room_id != record.room_id {
+                return Err(format!(
+                    "outbound delivery '{}' conflicts with connector room or agent ownership",
+                    record.id
+                ));
+            }
+        }
+
+        let mut schedule_ids = HashSet::new();
+        for schedule in &snapshot.schedules {
+            if schedule.id.is_empty() || !schedule_ids.insert(schedule.id.clone()) {
+                return Err(format!(
+                    "duplicate or empty schedule id in snapshot: {}",
+                    schedule.id
+                ));
+            }
+            if !agent_ids.contains(&schedule.agent_id) {
+                return Err(format!(
+                    "schedule '{}' references missing agent '{}'",
+                    schedule.id, schedule.agent_id
+                ));
+            }
+            if let ScheduleTarget::Connector { connector_id } = &schedule.target {
+                let connector = connectors.get(connector_id).ok_or_else(|| {
+                    format!(
+                        "schedule '{}' references missing connector '{connector_id}'",
+                        schedule.id
+                    )
+                })?;
+                if connector.agent_id != schedule.agent_id {
+                    return Err(format!(
+                        "schedule '{}' conflicts with connector agent ownership",
+                        schedule.id
+                    ));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn replace_memory_embeddings(&mut self, embeddings: MemoryEmbeddingRuntime) {
