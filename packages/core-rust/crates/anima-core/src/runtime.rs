@@ -268,7 +268,9 @@ impl AgentRuntime {
     }
 
     pub async fn run(&mut self, input: Content) -> TaskResult<Content> {
-        self.run_with_context(Vec::new(), input).await
+        let room_id = next_id("room", &NEXT_ROOM_ID);
+        self.run_in_room_with_context(room_id, Vec::new(), input)
+            .await
     }
 
     pub async fn run_with_context(
@@ -276,7 +278,17 @@ impl AgentRuntime {
         history: Vec<Message>,
         input: Content,
     ) -> TaskResult<Content> {
-        self.run_with_context_and_tools(history, input, |_, _, tool_call| {
+        let room_id = next_id("room", &NEXT_ROOM_ID);
+        self.run_in_room_with_context(room_id, history, input).await
+    }
+
+    pub async fn run_in_room_with_context(
+        &mut self,
+        room_id: String,
+        history: Vec<Message>,
+        input: Content,
+    ) -> TaskResult<Content> {
+        self.run_in_room_with_context_and_tools(room_id, history, input, |_, _, tool_call| {
             let tool_name = tool_call.name.clone();
             async move { TaskResult::error(format!("Unknown tool: {tool_name}"), 0) }
         })
@@ -292,7 +304,8 @@ impl AgentRuntime {
         F: Fn(AgentState, Message, ToolCall) -> Fut,
         Fut: Future<Output = TaskResult<Content>>,
     {
-        self.run_with_context_and_tools(Vec::new(), input, execute_tool)
+        let room_id = next_id("room", &NEXT_ROOM_ID);
+        self.run_in_room_with_context_and_tools(room_id, Vec::new(), input, execute_tool)
             .await
     }
 
@@ -306,8 +319,38 @@ impl AgentRuntime {
         F: Fn(AgentState, Message, ToolCall) -> Fut,
         Fut: Future<Output = TaskResult<Content>>,
     {
-        let start = now_millis();
         let room_id = next_id("room", &NEXT_ROOM_ID);
+        self.run_in_room_with_context_and_tools(room_id, history, input, execute_tool)
+            .await
+    }
+
+    pub async fn run_in_room_with_context_and_tools<F, Fut>(
+        &mut self,
+        room_id: String,
+        history: Vec<Message>,
+        input: Content,
+        execute_tool: F,
+    ) -> TaskResult<Content>
+    where
+        F: Fn(AgentState, Message, ToolCall) -> Fut,
+        Fut: Future<Output = TaskResult<Content>>,
+    {
+        self.run_with_context_and_tools_impl(room_id, history, input, execute_tool)
+            .await
+    }
+
+    async fn run_with_context_and_tools_impl<F, Fut>(
+        &mut self,
+        room_id: String,
+        history: Vec<Message>,
+        input: Content,
+        execute_tool: F,
+    ) -> TaskResult<Content>
+    where
+        F: Fn(AgentState, Message, ToolCall) -> Fut,
+        Fut: Future<Output = TaskResult<Content>>,
+    {
+        let start = now_millis();
         self.mark_running();
         let user_message = self.record_message_in_room(room_id.clone(), MessageRole::User, input);
         let context_parts = match self.build_provider_context(&user_message).await {

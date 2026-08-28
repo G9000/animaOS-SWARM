@@ -877,6 +877,48 @@ fn run_with_context_places_history_before_current_input() {
 }
 
 #[test]
+fn run_in_room_with_context_uses_supplied_room_for_new_messages() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = AgentRuntime::new(
+        config(),
+        Arc::new(RecordingModelAdapter {
+            messages: Arc::clone(&captured),
+        }),
+    );
+    let history = vec![
+        host_message("host-user", MessageRole::User, "My name is Leo"),
+        host_message("host-assistant", MessageRole::Assistant, "Nice to meet you"),
+    ];
+
+    let result = block_on(runtime.run_in_room_with_context(
+        "stable-room".into(),
+        history.clone(),
+        Content {
+            text: "What is my name?".into(),
+            ..Content::default()
+        },
+    ));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        captured
+            .lock()
+            .expect("recording model mutex should not be poisoned")
+            .as_slice(),
+        [
+            history[0].clone(),
+            history[1].clone(),
+            runtime.messages()[0].clone(),
+        ]
+    );
+    assert_eq!(runtime.messages().len(), 2);
+    assert!(runtime
+        .messages()
+        .iter()
+        .all(|message| message.room_id == "stable-room"));
+}
+
+#[test]
 fn run_remains_the_empty_context_compatibility_wrapper() {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let mut runtime = AgentRuntime::new(
@@ -948,6 +990,60 @@ fn run_with_context_and_tools_keeps_history_before_tool_loop_messages() {
     );
     assert_eq!(runtime.messages()[1].role, MessageRole::Assistant);
     assert_eq!(runtime.messages()[2].role, MessageRole::Tool);
+}
+
+#[test]
+fn run_in_room_with_context_and_tools_keeps_history_order_and_room_across_tool_loop() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let mut runtime = AgentRuntime::new(
+        tool_config(),
+        Arc::new(RecordingToolCallingModelAdapter {
+            messages: Arc::clone(&captured),
+        }),
+    );
+    let history = vec![
+        host_message("host-user", MessageRole::User, "My name is Leo"),
+        host_message("host-assistant", MessageRole::Assistant, "Nice to meet you"),
+    ];
+
+    let result = block_on(runtime.run_in_room_with_context_and_tools(
+        "stable-room".into(),
+        history.clone(),
+        Content {
+            text: "What is my name?".into(),
+            ..Content::default()
+        },
+        |_, _, _| async move {
+            TaskResult::success(
+                Content {
+                    text: "Leo".into(),
+                    ..Content::default()
+                },
+                1,
+            )
+        },
+    ));
+
+    assert_eq!(result.status, TaskStatus::Success);
+    assert_eq!(
+        captured
+            .lock()
+            .expect("recording tool model mutex should not be poisoned")
+            .as_slice(),
+        [
+            history[0].clone(),
+            history[1].clone(),
+            runtime.messages()[0].clone(),
+            runtime.messages()[1].clone(),
+            runtime.messages()[2].clone(),
+        ]
+    );
+    assert_eq!(runtime.messages()[1].role, MessageRole::Assistant);
+    assert_eq!(runtime.messages()[2].role, MessageRole::Tool);
+    assert!(runtime
+        .messages()
+        .iter()
+        .all(|message| message.room_id == "stable-room"));
 }
 
 #[test]
