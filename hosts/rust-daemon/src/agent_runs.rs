@@ -11,6 +11,32 @@ use crate::memory_store::save_memory_manager;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::state::DaemonState;
 
+pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
+
+type AgentLockMap = Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>;
+
+struct AgentLockCleanup {
+    agent_id: String,
+    agent_lock: Arc<Mutex<()>>,
+    agent_locks: AgentLockMap,
+}
+
+impl Drop for AgentLockCleanup {
+    fn drop(&mut self) {
+        let mut locks = self
+            .agent_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.agent_lock) == 2
+            && locks
+                .get(&self.agent_id)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.agent_lock))
+        {
+            locks.remove(&self.agent_id);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum RunRoom {
@@ -33,7 +59,7 @@ pub(crate) struct AgentRunRequest {
 pub(crate) struct AgentRunCoordinator {
     state: SharedDaemonState,
     run_limiter: Arc<Semaphore>,
-    agent_locks: Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>,
+    agent_locks: AgentLockMap,
 }
 
 impl AgentRunCoordinator {
@@ -45,10 +71,26 @@ impl AgentRunCoordinator {
         }
     }
 
+    #[allow(dead_code)] // Used by daemon-owned connector and scheduler workers.
     pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
-        self.run_with_commit(request, |_, _, _| Ok(())).await
+        let permit = self.try_admit()?;
+        self.run_admitted(request, permit).await
     }
 
+    pub(crate) async fn run_admitted(
+        &self,
+        request: AgentRunRequest,
+        permit: AgentRunPermit,
+    ) -> Result<AgentRunEnvelope, ApiError> {
+        self.run_with_commit_admitted(request, permit, |_, _, _| Ok(()))
+            .await
+    }
+
+    /// Runs with a state commit captured in the same final control-plane snapshot.
+    ///
+    /// A hook that can fail must finish all validation before its first mutation;
+    /// arbitrary `DaemonState` changes cannot be rolled back generically.
+    #[allow(dead_code)] // Used by durable connector inbound processing.
     pub(crate) async fn run_with_commit<F>(
         &self,
         request: AgentRunRequest,
@@ -60,20 +102,66 @@ impl AgentRunCoordinator {
                 &AgentRuntimeSnapshot,
                 &TaskResult<Content>,
             ) -> Result<(), ApiError>
-            + Send,
+            + Send
+            + 'static,
+    {
+        let permit = self.try_admit()?;
+        self.run_with_commit_admitted(request, permit, commit).await
+    }
+
+    pub(crate) async fn run_with_commit_admitted<F>(
+        &self,
+        request: AgentRunRequest,
+        permit: AgentRunPermit,
+        commit: F,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(
+                &mut DaemonState,
+                &AgentRuntimeSnapshot,
+                &TaskResult<Content>,
+            ) -> Result<(), ApiError>
+            + Send
+            + 'static,
+    {
+        let coordinator = self.clone();
+        tokio::spawn(async move { coordinator.run_serialized(request, permit, commit).await })
+            .await
+            .map_err(|error| {
+                warn!(error = %error, "agent run worker stopped unexpectedly");
+                ApiError::service_unavailable("agent run worker stopped unexpectedly")
+            })?
+    }
+
+    async fn run_serialized<F>(
+        &self,
+        request: AgentRunRequest,
+        permit: AgentRunPermit,
+        commit: F,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(
+                &mut DaemonState,
+                &AgentRuntimeSnapshot,
+                &TaskResult<Content>,
+            ) -> Result<(), ApiError>
+            + Send
+            + 'static,
     {
         let agent_lock = self.agent_lock(&request.agent_id);
-        let result = {
-            let _agent_guard = agent_lock.lock().await;
-            self.run_locked(request, commit).await
+        let _cleanup = AgentLockCleanup {
+            agent_id: request.agent_id.clone(),
+            agent_lock: Arc::clone(&agent_lock),
+            agent_locks: Arc::clone(&self.agent_locks),
         };
-        self.remove_agent_lock_if_idle(&agent_lock);
-        result
+        let _agent_guard = agent_lock.lock_owned().await;
+        self.run_locked(request, permit, commit).await
     }
 
     async fn run_locked<F>(
         &self,
         mut request: AgentRunRequest,
+        permit: AgentRunPermit,
         commit: F,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
@@ -84,7 +172,7 @@ impl AgentRunCoordinator {
             ) -> Result<(), ApiError>
             + Send,
     {
-        let _run_permit = self.acquire_run_permit()?;
+        let _run_permit = permit.0;
 
         if let Some(idempotency_key) = request.idempotency_key.take() {
             request
@@ -159,6 +247,11 @@ impl AgentRunCoordinator {
         ) = {
             let mut guard = self.state.write().await;
             let restored = guard.restore_agent_runtime(runtime);
+            // Hooks may fail, but arbitrary `DaemonState` mutation cannot be
+            // rolled back generically. Callers must perform all fallible
+            // validation before their first mutation and then mutate as one
+            // infallible unit. In particular, connector hooks must prevalidate
+            // the inbound/outbound transition before changing either record.
             commit(&mut guard, &restored.0, &result)?;
             (
                 restored.0,
@@ -200,21 +293,20 @@ impl AgentRunCoordinator {
             .clone()
     }
 
-    fn remove_agent_lock_if_idle(&self, agent_lock: &Arc<Mutex<()>>) {
-        let mut locks = self
-            .agent_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::strong_count(agent_lock) == 2 {
-            locks.retain(|_, candidate| !Arc::ptr_eq(candidate, agent_lock));
-        }
-    }
-
-    fn acquire_run_permit(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+    pub(crate) fn try_admit(&self) -> Result<AgentRunPermit, ApiError> {
         self.run_limiter
             .clone()
             .try_acquire_owned()
+            .map(AgentRunPermit)
             .map_err(|_| ApiError::service_unavailable("too many concurrent run requests"))
+    }
+
+    #[cfg(test)]
+    fn lock_count(&self) -> usize {
+        self.agent_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -384,6 +476,72 @@ mod tests {
         assert!(first.await.expect("first task should join").is_ok());
         assert!(second.await.expect("second task should join").is_ok());
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn aborted_caller_does_not_cancel_restore_or_leave_a_stale_agent_lock() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("cancel-safe"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
+
+        let caller_coordinator = coordinator.clone();
+        let caller_request = request(&agent_id, "first");
+        let caller = tokio::spawn(async move { caller_coordinator.run(caller_request).await });
+        entered
+            .acquire()
+            .await
+            .expect("first run should enter model")
+            .forget();
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller should be aborted")
+                .is_cancelled(),
+            "aborting the waiter should not abort the owned run"
+        );
+        release.add_permits(1);
+
+        for _ in 0..100 {
+            if coordinator.lock_count() == 0
+                && state
+                    .read()
+                    .await
+                    .get_agent(&agent_id)
+                    .is_some_and(|snapshot| snapshot.state.status == AgentStatus::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(coordinator.lock_count(), 0);
+        assert!(state.read().await.agents.contains_key(&agent_id));
+
+        let retry_coordinator = coordinator.clone();
+        let retry_request = request(&agent_id, "second");
+        let retry = tokio::spawn(async move { retry_coordinator.run(retry_request).await });
+        entered
+            .acquire()
+            .await
+            .expect("subsequent run should enter model")
+            .forget();
+        release.add_permits(1);
+        assert!(retry.await.expect("retry should join").is_ok());
     }
 
     #[tokio::test]

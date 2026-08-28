@@ -6,7 +6,7 @@ use super::contracts::{
     MemoriesEnvelope, MemoryResponse, TaskRequest,
 };
 use super::ApiError;
-use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
+use crate::agent_runs::{AgentRunCoordinator, AgentRunPermit, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::state::UpdateAgentError;
 
@@ -148,6 +148,7 @@ pub(crate) async fn handle_run_agent(
     agent_id: &str,
     body: Vec<u8>,
     coordinator: &AgentRunCoordinator,
+    permit: AgentRunPermit,
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let content = request
@@ -155,12 +156,15 @@ pub(crate) async fn handle_run_agent(
         .map_err(ApiError::bad_request_static)?;
 
     coordinator
-        .run(AgentRunRequest {
-            agent_id: agent_id.to_string(),
-            content,
-            room: RunRoom::Generated,
-            idempotency_key: None,
-        })
+        .run_admitted(
+            AgentRunRequest {
+                agent_id: agent_id.to_string(),
+                content,
+                room: RunRoom::Generated,
+                idempotency_key: None,
+            },
+            permit,
+        )
         .await
 }
 
@@ -179,12 +183,7 @@ mod tests {
         ModelGenerateResponse, ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
-    use futures::executor::block_on;
-    use futures::task::noop_waker;
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
     use tokio::sync::{RwLock, Semaphore};
 
     async fn handle_run_agent(
@@ -193,18 +192,19 @@ mod tests {
         state: &SharedDaemonState,
     ) -> Result<crate::routes::AgentRunEnvelope, crate::routes::ApiError> {
         let coordinator = AgentRunCoordinator::new(Arc::clone(state), Arc::new(Semaphore::new(8)));
-        handle_run_agent_with_coordinator(agent_id, body, &coordinator).await
+        let permit = coordinator
+            .try_admit()
+            .expect("test coordinator should admit the run");
+        handle_run_agent_with_coordinator(agent_id, body, &coordinator, permit).await
     }
 
-    struct PendingModelAdapter;
+    struct PendingModelAdapter {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
 
     struct CapturingModelAdapter {
         configs: Arc<Mutex<Vec<AgentConfig>>>,
-    }
-
-    struct PendingOnce<T> {
-        value: Option<T>,
-        pending: bool,
     }
 
     #[async_trait]
@@ -218,7 +218,13 @@ mod tests {
             config: &AgentConfig,
             _request: &ModelGenerateRequest,
         ) -> Result<ModelGenerateResponse, String> {
-            Ok(PendingOnce::new(ModelGenerateResponse {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore should remain open")
+                .forget();
+            Ok(ModelGenerateResponse {
                 content: Content {
                     text: format!("{} handled task: pending", config.name),
                     attachments: None,
@@ -232,7 +238,6 @@ mod tests {
                 },
                 stop_reason: ModelStopReason::End,
             })
-            .await)
         }
     }
 
@@ -264,84 +269,66 @@ mod tests {
         }
     }
 
-    impl<T: Unpin> Future for PendingOnce<T> {
-        type Output = T;
-
-        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-            if self.pending {
-                self.pending = false;
-                context.waker().wake_by_ref();
-                Poll::Pending
-            } else {
-                Poll::Ready(self.value.take().expect("pending-once value should exist"))
-            }
-        }
-    }
-
-    impl<T> PendingOnce<T> {
-        fn new(value: T) -> Self {
-            Self {
-                value: Some(value),
-                pending: true,
-            }
-        }
-    }
-
-    #[test]
-    fn handle_run_agent_releases_state_lock_before_runtime_future_completes() {
-        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
-            PendingModelAdapter,
-        ))));
-        let agent_id = block_on(async {
+    #[tokio::test]
+    async fn handle_run_agent_releases_state_lock_before_runtime_future_completes() {
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let agent_id = {
             let mut guard = state.write().await;
             guard
                 .create_agent(test_config("operator"))
                 .expect("agent should be created")
                 .state
                 .id
+        };
+        let run_state = Arc::clone(&state);
+        let run_agent_id = agent_id.clone();
+        let run = tokio::spawn(async move {
+            handle_run_agent(
+                &run_agent_id,
+                br#"{"text":"run pending task"}"#.to_vec(),
+                &run_state,
+            )
+            .await
         });
-        let mut future = Box::pin(handle_run_agent(
-            &agent_id,
-            br#"{"text":"run pending task"}"#.to_vec(),
-            &state,
-        ));
-        let waker = noop_waker();
-        let mut context = Context::from_waker(&waker);
-
-        assert!(
-            matches!(future.as_mut().poll(&mut context), Poll::Pending),
-            "the first poll should suspend on the pending model adapter"
-        );
+        entered
+            .acquire()
+            .await
+            .expect("run should enter model")
+            .forget();
         assert!(
             state.try_write().is_ok(),
             "daemon state lock should be released while the runtime future is pending"
         );
 
-        let response = block_on(future);
+        release.add_permits(1);
+        let response = run.await.expect("run task should join");
         assert!(response.is_ok());
     }
 
-    #[test]
-    fn create_then_run_passes_canonical_tool_schemas_to_model_adapter() {
+    #[tokio::test]
+    async fn create_then_run_passes_canonical_tool_schemas_to_model_adapter() {
         let configs = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             CapturingModelAdapter {
                 configs: Arc::clone(&configs),
             },
         ))));
-        let created = block_on(handle_create_agent(
+        let created = handle_create_agent(
             br#"{"name":"Anima","model":"deterministic","tools":["read_file","write_file","bash"]}"#
                 .to_vec(),
             &state,
-        ))
+        )
+        .await
         .expect("agent should be created through the request path");
         let agent_id = created.agent.state.id;
 
-        block_on(handle_run_agent(
+        handle_run_agent(
             &agent_id,
             br#"{"text":"exercise canonical tools"}"#.to_vec(),
             &state,
-        ))
+        )
+        .await
         .expect("agent should run through the runtime path");
 
         let configs = configs.lock().expect("capture lock should not be poisoned");
@@ -365,33 +352,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn handle_run_agent_keeps_agent_visible_while_runtime_future_is_pending() {
-        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
-            PendingModelAdapter,
-        ))));
-        let agent_id = block_on(async {
+    #[tokio::test]
+    async fn handle_run_agent_keeps_agent_visible_while_runtime_future_is_pending() {
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let agent_id = {
             let mut guard = state.write().await;
             guard
                 .create_agent(test_config("operator"))
                 .expect("agent should be created")
                 .state
                 .id
+        };
+        let run_state = Arc::clone(&state);
+        let run_agent_id = agent_id.clone();
+        let run = tokio::spawn(async move {
+            handle_run_agent(
+                &run_agent_id,
+                br#"{"text":"run pending task"}"#.to_vec(),
+                &run_state,
+            )
+            .await
         });
-        let mut future = Box::pin(handle_run_agent(
-            &agent_id,
-            br#"{"text":"run pending task"}"#.to_vec(),
-            &state,
-        ));
-        let waker = noop_waker();
-        let mut context = Context::from_waker(&waker);
+        entered
+            .acquire()
+            .await
+            .expect("run should enter model")
+            .forget();
 
-        assert!(
-            matches!(future.as_mut().poll(&mut context), Poll::Pending),
-            "the first poll should suspend on the pending model adapter"
-        );
-
-        block_on(async {
+        {
             let guard = state.read().await;
             let agents = guard.list_agents();
             assert_eq!(agents.len(), 1, "pending runs should remain listable");
@@ -403,43 +392,54 @@ mod tests {
                 guard.agent_runtime_id(&agent_id).as_deref(),
                 Some(agent_id.as_str())
             );
-        });
+        }
 
-        let response = block_on(future);
+        release.add_permits(1);
+        let response = run.await.expect("run task should join");
         assert!(response.is_ok());
     }
 
-    #[test]
-    fn update_agent_patch_survives_in_flight_runtime_restoration() {
-        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
-            PendingModelAdapter,
-        ))));
-        let agent_id = block_on(async {
+    #[tokio::test]
+    async fn update_agent_patch_survives_in_flight_runtime_restoration() {
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let agent_id = {
             let mut guard = state.write().await;
             guard
                 .create_agent(test_config("operator"))
                 .expect("agent should be created")
                 .state
                 .id
+        };
+        let run_state = Arc::clone(&state);
+        let run_agent_id = agent_id.clone();
+        let run = tokio::spawn(async move {
+            handle_run_agent(
+                &run_agent_id,
+                br#"{"text":"run pending task"}"#.to_vec(),
+                &run_state,
+            )
+            .await
         });
-        let mut future = Box::pin(handle_run_agent(
-            &agent_id,
-            br#"{"text":"run pending task"}"#.to_vec(),
-            &state,
-        ));
-        let waker = noop_waker();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        entered
+            .acquire()
+            .await
+            .expect("run should enter model")
+            .forget();
 
-        block_on(handle_update_agent(
+        handle_update_agent(
             &agent_id,
             br#"{"name":"updated-operator","tools":["read_file"]}"#.to_vec(),
             &state,
-        ))
+        )
+        .await
         .expect("patch should succeed while the run is pending");
-        block_on(future).expect("pending run should complete");
+        release.add_permits(1);
+        run.await
+            .expect("run task should join")
+            .expect("pending run should complete");
 
-        block_on(async {
+        {
             let guard = state.read().await;
             let snapshot = guard
                 .get_agent(&agent_id)
@@ -454,11 +454,11 @@ mod tests {
             assert_eq!(tools[0].name, "read_file");
             assert!(!tools[0].description.is_empty());
             assert!(tools[0].parameters_schema.contains_key("required"));
-        });
+        }
     }
 
-    #[test]
-    fn deleting_agent_during_in_flight_run_stays_deleted_and_persisted() {
+    #[tokio::test]
+    async fn deleting_agent_during_in_flight_run_stays_deleted_and_persisted() {
         let store_path = std::env::temp_dir().join(format!(
             "anima-delete-race-{}-{}.json",
             std::process::id(),
@@ -468,10 +468,9 @@ mod tests {
                 .as_nanos()
         ));
         let store_config = ControlPlaneStoreConfig::Json(store_path.clone());
-        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
-            PendingModelAdapter,
-        ))));
-        let agent_id = block_on(async {
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let agent_id = {
             let mut guard = state.write().await;
             guard.set_control_plane_store(Some(store_config.clone()));
             guard
@@ -479,31 +478,56 @@ mod tests {
                 .expect("agent should be created")
                 .state
                 .id
+        };
+        let run_state = Arc::clone(&state);
+        let run_agent_id = agent_id.clone();
+        let run = tokio::spawn(async move {
+            handle_run_agent(
+                &run_agent_id,
+                br#"{"text":"run pending task"}"#.to_vec(),
+                &run_state,
+            )
+            .await
         });
-        let mut future = Box::pin(handle_run_agent(
-            &agent_id,
-            br#"{"text":"run pending task"}"#.to_vec(),
-            &state,
-        ));
-        let waker = noop_waker();
-        let mut context = Context::from_waker(&waker);
-        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        entered
+            .acquire()
+            .await
+            .expect("run should enter model")
+            .forget();
 
-        block_on(handle_delete_agent(&agent_id, &state))
+        handle_delete_agent(&agent_id, &state)
+            .await
             .expect("deleting the checked-out agent should succeed");
-        block_on(future).expect("the already-started request may finish");
+        release.add_permits(1);
+        run.await
+            .expect("run task should join")
+            .expect("the already-started request may finish");
 
-        block_on(async {
+        {
             let guard = state.read().await;
             assert!(guard.get_agent(&agent_id).is_none());
             assert_eq!(guard.agent_count(), 0);
-        });
-        let persisted = block_on(load_control_plane_snapshot(&store_config))
+        }
+        let persisted = load_control_plane_snapshot(&store_config)
+            .await
             .expect("control-plane snapshot should load")
             .expect("control-plane snapshot should exist");
         assert!(persisted.agents.is_empty());
 
         let _ = std::fs::remove_file(store_path);
+    }
+
+    fn pending_adapter() -> (Arc<dyn ModelAdapter>, Arc<Semaphore>, Arc<Semaphore>) {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        (
+            Arc::new(PendingModelAdapter {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            entered,
+            release,
+        )
     }
 
     fn test_config(name: &str) -> AgentConfig {

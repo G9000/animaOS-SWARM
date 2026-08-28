@@ -771,11 +771,18 @@ async fn run_agent_entry(
     Path(agent_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
+    let permit = match state.agent_runs.try_admit() {
+        Ok(permit) => permit,
+        Err(error) => return error.into_response(),
+    };
+
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => match agents::handle_run_agent(&agent_id, body, &state.agent_runs).await {
-            Ok(response) => json_response(StatusCode::OK, &response),
-            Err(error) => error.into_response(),
-        },
+        Ok(body) => {
+            match agents::handle_run_agent(&agent_id, body, &state.agent_runs, permit).await {
+                Ok(response) => json_response(StatusCode::OK, &response),
+                Err(error) => error.into_response(),
+            }
+        }
         Err(response) => response,
     }
 }
@@ -968,6 +975,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::RwLock;
@@ -975,6 +983,7 @@ mod tests {
 
     struct SlowModelAdapter {
         delay: Duration,
+        calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -988,7 +997,9 @@ mod tests {
             config: &AgentConfig,
             _request: &ModelGenerateRequest,
         ) -> Result<ModelGenerateResponse, String> {
-            tokio::time::sleep(self.delay).await;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(self.delay).await;
+            }
 
             Ok(ModelGenerateResponse {
                 content: Content {
@@ -1012,6 +1023,7 @@ mod tests {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             SlowModelAdapter {
                 delay: Duration::from_millis(50),
+                calls: AtomicUsize::new(0),
             },
         ))));
         let agent_id = {
@@ -1023,7 +1035,7 @@ mod tests {
                 .id
         };
         let app = router(
-            state,
+            Arc::clone(&state),
             DaemonConfig {
                 request_timeout: Duration::from_millis(10),
                 ..DaemonConfig::default()
@@ -1031,6 +1043,7 @@ mod tests {
         );
 
         let response = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -1043,13 +1056,39 @@ mod tests {
             .expect("app responds");
 
         assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+
+        for _ in 0..100 {
+            if state
+                .read()
+                .await
+                .get_agent(&agent_id)
+                .is_some_and(|snapshot| snapshot.state.status.as_str() == "completed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let retry = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"run after timeout"}"#))
+                    .expect("retry request builds"),
+            )
+            .await
+            .expect("retry response should be returned");
+        assert_eq!(retry.status(), StatusCode::OK);
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_routes_reject_when_concurrency_limit_is_exhausted() {
+    async fn run_routes_reject_before_parsing_when_concurrency_limit_is_exhausted() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             SlowModelAdapter {
                 delay: Duration::from_millis(75),
+                calls: AtomicUsize::new(0),
             },
         ))));
         let (first_agent_id, second_agent_id) = {
@@ -1085,7 +1124,7 @@ mod tests {
             .method("POST")
             .uri(format!("/api/agents/{second_agent_id}/run"))
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"text":"second task"}"#))
+            .body(Body::from(r#"{"text":"#))
             .expect("second request builds");
 
         let first_app = app.clone();
@@ -1113,6 +1152,57 @@ mod tests {
 
         let first = first.await.expect("first join succeeds");
         assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_run_body_releases_early_admission_permit() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            SlowModelAdapter {
+                delay: Duration::ZERO,
+                calls: AtomicUsize::new(0),
+            },
+        ))));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let app = router(
+            state,
+            DaemonConfig {
+                max_concurrent_runs: 1,
+                ..DaemonConfig::default()
+            },
+        );
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"#))
+                    .expect("malformed request builds"),
+            )
+            .await
+            .expect("malformed response should be returned");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        let valid = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"permit was released"}"#))
+                    .expect("valid request builds"),
+            )
+            .await
+            .expect("valid response should be returned");
+        assert_eq!(valid.status(), StatusCode::OK);
     }
 
     fn test_config(name: &str) -> AgentConfig {
