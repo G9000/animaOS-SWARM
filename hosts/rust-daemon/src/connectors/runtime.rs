@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anima_core::{Content, DataValue, MessageRole, TaskStatus};
 use async_trait::async_trait;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
 
 use super::credentials::{ConnectorCredentialStore, CredentialStoreError, TelegramBotToken};
@@ -118,12 +118,15 @@ pub(crate) struct ConnectorManager {
     runs: AgentRunCoordinator,
     credentials: Arc<dyn ConnectorCredentialStore>,
     transport: Arc<dyn TelegramTransport>,
+    lifecycle_lock: Arc<Mutex<()>>,
     mutation_lock: Arc<Mutex<()>>,
     statuses: Arc<Mutex<HashMap<String, ConnectorRuntimeStatus>>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
+    worker_generation: Arc<AtomicU64>,
 }
 
 struct WorkerHandle {
+    generation: u64,
     cancel: watch::Sender<bool>,
     join: JoinHandle<()>,
 }
@@ -140,9 +143,11 @@ impl ConnectorManager {
             runs,
             credentials,
             transport,
+            lifecycle_lock: Arc::new(Mutex::new(())),
             mutation_lock: Arc::new(Mutex::new(())),
             statuses: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            worker_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -162,6 +167,7 @@ impl ConnectorManager {
         agent_id: String,
         token: TelegramBotToken,
     ) -> Result<TelegramConnectorRecord, ConnectorManagerError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let _mutation = self.mutation_lock.lock().await;
         {
             let state = self.state.read().await;
@@ -248,26 +254,32 @@ impl ConnectorManager {
         connector_id: String,
         token: TelegramBotToken,
     ) -> Result<TelegramConnectorRecord, ConnectorManagerError> {
-        {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let preflight_connector = {
             let state = self.state.read().await;
-            if !state
+            state
                 .connectors
                 .get(&connector_id)
-                .is_some_and(TelegramConnectorRecord::is_active)
-            {
-                return Err(ConnectorManagerError::ConnectorNotFound);
-            }
-        }
+                .filter(|connector| connector.is_active())
+                .cloned()
+                .ok_or(ConnectorManagerError::ConnectorNotFound)?
+        };
+        let previous_status = self
+            .statuses
+            .lock()
+            .await
+            .get(&connector_id)
+            .copied()
+            .unwrap_or_else(|| connector_operational_status(&preflight_connector));
         let bot = self
             .transport
             .get_me(&token)
             .await
             .map_err(|_| ConnectorManagerError::Transport)?;
-        self.stop_worker(&connector_id).await?;
-        let _mutation = self.mutation_lock.lock().await;
         let previous_token = match self.credentials.load(&connector_id).await {
             Ok(Some(token)) => token,
             Ok(None) => {
+                self.stop_worker(&connector_id).await?;
                 self.statuses
                     .lock()
                     .await
@@ -276,31 +288,34 @@ impl ConnectorManager {
             }
             Err(error) => {
                 let mapped = map_credential_error(error);
-                self.statuses.lock().await.insert(
-                    connector_id,
-                    if mapped == ConnectorManagerError::CredentialStateUncertain {
-                        ConnectorRuntimeStatus::Reconciling
-                    } else {
-                        ConnectorRuntimeStatus::Error
-                    },
-                );
+                if mapped == ConnectorManagerError::CredentialStateUncertain {
+                    self.stop_worker(&connector_id).await?;
+                    self.statuses
+                        .lock()
+                        .await
+                        .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+                }
                 return Err(mapped);
             }
         };
+        self.stop_worker(&connector_id).await?;
+        let _mutation = self.mutation_lock.lock().await;
         let worker_token = token.clone();
         if let Err(error) = self.credentials.put(&connector_id, token).await {
             let mapped = map_credential_error(error);
-            self.statuses.lock().await.insert(
-                connector_id.clone(),
-                if mapped == ConnectorManagerError::CredentialStateUncertain {
-                    ConnectorRuntimeStatus::Reconciling
-                } else {
-                    ConnectorRuntimeStatus::Error
-                },
-            );
-            if mapped != ConnectorManagerError::CredentialStateUncertain {
+            if mapped == ConnectorManagerError::CredentialStateUncertain {
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+            } else {
                 drop(_mutation);
-                let _ = self.start_worker(connector_id, previous_token).await;
+                self.start_worker(connector_id.clone(), previous_token)
+                    .await?;
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, previous_status);
             }
             return Err(mapped);
         }
@@ -334,12 +349,13 @@ impl ConnectorManager {
                 .await
             {
                 Ok(()) => {
+                    drop(_mutation);
+                    self.start_worker(connector_id.clone(), previous_token)
+                        .await?;
                     self.statuses
                         .lock()
                         .await
-                        .insert(connector_id.clone(), ConnectorRuntimeStatus::Error);
-                    drop(_mutation);
-                    let _ = self.start_worker(connector_id, previous_token).await;
+                        .insert(connector_id, previous_status);
                     return Err(ConnectorManagerError::Persistence);
                 }
                 Err(_) => {
@@ -598,6 +614,12 @@ impl ConnectorManager {
         };
 
         let key = (inbound.connector_id.clone(), inbound.update_id);
+        let previous_agent = self
+            .state
+            .read()
+            .await
+            .get_agent(&inbound.agent_id)
+            .ok_or(ConnectorManagerError::AgentNotFound)?;
         let commit_connector_id = inbound.connector_id.clone();
         let commit_agent_id = inbound.agent_id.clone();
         let commit_room_id = inbound.room_id.clone();
@@ -631,7 +653,7 @@ impl ConnectorManager {
 
         let run = self
             .runs
-            .run_with_commit(request, move |state, snapshot, result| {
+            .run_with_commit_waiting(request, move |state, snapshot, result| {
                 let current = state
                     .inbound
                     .get(&commit_key)
@@ -699,6 +721,7 @@ impl ConnectorManager {
         if run.is_err() {
             let _mutation = self.mutation_lock.lock().await;
             let mut state = self.state.write().await;
+            let _ = state.rollback_agent_runtime(previous_agent);
             if let Some(record) = state.inbound.get_mut(&key) {
                 record.processing_state = InboundProcessingState::Processing;
             }
@@ -784,34 +807,36 @@ impl ConnectorManager {
             .transport
             .send_message(&token, &chat_id, &outbound.text)
             .await;
-        let (previous, persist) = {
+        let (previous_outbound, persist) = {
             let _mutation = self.mutation_lock.lock().await;
             let mut state = self.state.write().await;
-            let record = state
-                .outbound
-                .get_mut(&outbound.id)
-                .ok_or(ConnectorManagerError::ConnectorNotFound)?;
-            let previous = record.clone();
-            record.attempts = record.attempts.saturating_add(1);
-            match delivery {
-                Ok(_) => {
-                    record.delivery_state = OutboundDeliveryState::Delivered;
-                    record.delivered_at_ms = Some(now_ms());
-                }
-                Err(_) => {
-                    record.delivery_state = OutboundDeliveryState::Failed;
-                    record.delivered_at_ms = None;
+            let previous_outbound = state.outbound.clone();
+            let delivered_at_ms = now_ms();
+            {
+                let record = state
+                    .outbound
+                    .get_mut(&outbound.id)
+                    .ok_or(ConnectorManagerError::ConnectorNotFound)?;
+                record.attempts = record.attempts.saturating_add(1);
+                match &delivery {
+                    Ok(_) => {
+                        record.delivery_state = OutboundDeliveryState::Delivered;
+                        record.delivered_at_ms = Some(delivered_at_ms);
+                    }
+                    Err(_) => {
+                        record.delivery_state = OutboundDeliveryState::Failed;
+                        record.delivered_at_ms = None;
+                    }
                 }
             }
+            if delivery.is_ok() {
+                compact_delivered_outbox(&mut state.outbound, &connector_id, delivered_at_ms);
+            }
             let persist = state.control_plane_persist_request();
-            (previous, persist)
+            (previous_outbound, persist)
         };
         if persist.save().await.is_err() {
-            self.state
-                .write()
-                .await
-                .outbound
-                .insert(outbound.id, previous);
+            self.state.write().await.outbound = previous_outbound;
             self.statuses
                 .lock()
                 .await
@@ -836,6 +861,7 @@ impl ConnectorManager {
     ) -> Result<(), ConnectorManagerError> {
         let manager = self.clone();
         tokio::spawn(async move {
+            let _lifecycle = manager.lifecycle_lock.lock().await;
             let connector_ids = manager
                 .state
                 .read()
@@ -846,7 +872,7 @@ impl ConnectorManager {
                 .map(|connector| connector.id.clone())
                 .collect::<Vec<_>>();
             for connector_id in connector_ids {
-                manager.delete_owned(connector_id).await?;
+                manager.delete_unlocked(connector_id).await?;
             }
             Ok(())
         })
@@ -855,29 +881,68 @@ impl ConnectorManager {
     }
 
     async fn delete_owned(&self, connector_id: String) -> Result<(), ConnectorManagerError> {
-        self.stop_worker(&connector_id).await?;
-        let _mutation = self.mutation_lock.lock().await;
-        {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.delete_unlocked(connector_id).await
+    }
+
+    async fn delete_unlocked(&self, connector_id: String) -> Result<(), ConnectorManagerError> {
+        let connector = {
             let state = self.state.read().await;
-            if !state
+            state
                 .connectors
                 .get(&connector_id)
-                .is_some_and(TelegramConnectorRecord::is_active)
-            {
-                return Err(ConnectorManagerError::ConnectorNotFound);
+                .filter(|connector| connector.is_active())
+                .cloned()
+                .ok_or(ConnectorManagerError::ConnectorNotFound)?
+        };
+        let previous_status = self
+            .statuses
+            .lock()
+            .await
+            .get(&connector_id)
+            .copied()
+            .unwrap_or_else(|| connector_operational_status(&connector));
+        let previous_token = match self.credentials.load(&connector_id).await {
+            Ok(Some(token)) => token,
+            Ok(None) => {
+                self.stop_worker(&connector_id).await?;
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, ConnectorRuntimeStatus::CredentialRequired);
+                return Err(ConnectorManagerError::Credential);
             }
-        }
+            Err(error) => {
+                let mapped = map_credential_error(error);
+                if mapped == ConnectorManagerError::CredentialStateUncertain {
+                    self.stop_worker(&connector_id).await?;
+                    self.statuses
+                        .lock()
+                        .await
+                        .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+                }
+                return Err(mapped);
+            }
+        };
+        self.stop_worker(&connector_id).await?;
+        let _mutation = self.mutation_lock.lock().await;
 
         if let Err(error) = self.credentials.delete(&connector_id).await {
             let mapped = map_credential_error(error);
-            self.statuses.lock().await.insert(
-                connector_id.clone(),
-                if mapped == ConnectorManagerError::CredentialStateUncertain {
-                    ConnectorRuntimeStatus::Reconciling
-                } else {
-                    ConnectorRuntimeStatus::Error
-                },
-            );
+            if mapped == ConnectorManagerError::CredentialStateUncertain {
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+            } else {
+                drop(_mutation);
+                self.start_worker(connector_id.clone(), previous_token)
+                    .await?;
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id, previous_status);
+            }
             return Err(mapped);
         }
 
@@ -907,7 +972,7 @@ impl ConnectorManager {
                 record.connector_id != connector_id
                     || record.delivery_state == OutboundDeliveryState::Delivered
             });
-            compact_delivered_outbox(&mut state.outbound, now);
+            compact_delivered_outbox(&mut state.outbound, &connector_id, now);
             for schedule in state.schedules.values_mut() {
                 if matches!(
                     &schedule.target,
@@ -936,11 +1001,29 @@ impl ConnectorManager {
             state.outbound = previous_outbound;
             state.schedules = previous_schedules;
             drop(state);
-            self.statuses
-                .lock()
+            match self
+                .credentials
+                .put(&connector_id, previous_token.clone())
                 .await
-                .insert(connector_id, ConnectorRuntimeStatus::CredentialRequired);
-            return Err(ConnectorManagerError::Persistence);
+            {
+                Ok(()) => {
+                    drop(_mutation);
+                    self.start_worker(connector_id.clone(), previous_token)
+                        .await?;
+                    self.statuses
+                        .lock()
+                        .await
+                        .insert(connector_id, previous_status);
+                    return Err(ConnectorManagerError::Persistence);
+                }
+                Err(_) => {
+                    self.statuses
+                        .lock()
+                        .await
+                        .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
+                    return Err(ConnectorManagerError::CredentialStateUncertain);
+                }
+            }
         }
         self.statuses.lock().await.remove(&connector_id);
         Ok(())
@@ -954,6 +1037,11 @@ impl ConnectorManager {
     }
 
     async fn restart_owned(&self, connector_id: String) -> Result<(), ConnectorManagerError> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        self.restart_unlocked(connector_id).await
+    }
+
+    async fn restart_unlocked(&self, connector_id: String) -> Result<(), ConnectorManagerError> {
         self.stop_worker(&connector_id).await?;
         let connector = self
             .state
@@ -1001,6 +1089,7 @@ impl ConnectorManager {
     }
 
     pub(crate) async fn start_restored(&self) {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let connector_ids = self
             .state
             .read()
@@ -1011,7 +1100,7 @@ impl ConnectorManager {
             .map(|connector| connector.id.clone())
             .collect::<Vec<_>>();
         for connector_id in connector_ids {
-            let _ = self.restart(connector_id).await;
+            let _ = self.restart_unlocked(connector_id).await;
         }
     }
 
@@ -1022,18 +1111,40 @@ impl ConnectorManager {
     ) -> Result<(), ConnectorManagerError> {
         self.stop_worker(&connector_id).await?;
         let (cancel, receiver) = watch::channel(false);
+        let (start, started) = oneshot::channel();
+        let generation = self.worker_generation.fetch_add(1, Ordering::Relaxed);
         let manager = self.clone();
         let worker_connector_id = connector_id.clone();
         let join = tokio::spawn(async move {
-            manager
-                .worker_loop(worker_connector_id, token, receiver)
-                .await;
+            if started.await.is_ok() {
+                manager
+                    .worker_loop(worker_connector_id.clone(), token, receiver)
+                    .await;
+                manager
+                    .prune_finished_worker(&worker_connector_id, generation)
+                    .await;
+            }
         });
-        self.workers
-            .lock()
-            .await
-            .insert(connector_id, WorkerHandle { cancel, join });
+        self.workers.lock().await.insert(
+            connector_id,
+            WorkerHandle {
+                generation,
+                cancel,
+                join,
+            },
+        );
+        let _ = start.send(());
         Ok(())
+    }
+
+    async fn prune_finished_worker(&self, connector_id: &str, generation: u64) {
+        let mut workers = self.workers.lock().await;
+        if workers
+            .get(connector_id)
+            .is_some_and(|handle| handle.generation == generation)
+        {
+            workers.remove(connector_id);
+        }
     }
 
     async fn stop_worker(&self, connector_id: &str) -> Result<(), ConnectorManagerError> {
@@ -1097,6 +1208,20 @@ impl ConnectorManager {
                 }
             }
 
+            if let Some(status) = self
+                .state
+                .read()
+                .await
+                .connectors
+                .get(&connector_id)
+                .map(connector_operational_status)
+            {
+                self.statuses
+                    .lock()
+                    .await
+                    .insert(connector_id.clone(), status);
+            }
+
             let pending_chat = self
                 .state
                 .read()
@@ -1156,6 +1281,7 @@ impl ConnectorManager {
     }
 
     pub(crate) async fn shutdown(&self) {
+        let _lifecycle = self.lifecycle_lock.lock().await;
         let connector_ids = self
             .workers
             .lock()
@@ -1206,17 +1332,33 @@ fn same_inbound_identity(
         && existing.run_idempotency_key == candidate.run_idempotency_key
 }
 
-fn compact_delivered_outbox(outbox: &mut HashMap<String, TelegramOutboundRecord>, now: u64) {
+fn connector_operational_status(connector: &TelegramConnectorRecord) -> ConnectorRuntimeStatus {
+    if connector.approved_chat.is_some() {
+        ConnectorRuntimeStatus::Ready
+    } else {
+        ConnectorRuntimeStatus::Pairing
+    }
+}
+
+fn compact_delivered_outbox(
+    outbox: &mut HashMap<String, TelegramOutboundRecord>,
+    connector_id: &str,
+    now: u64,
+) {
     let cutoff = now.saturating_sub(DELIVERED_RETENTION_MS);
     outbox.retain(|_, record| {
-        record.delivery_state != OutboundDeliveryState::Delivered
+        record.connector_id != connector_id
+            || record.delivery_state != OutboundDeliveryState::Delivered
             || record
                 .delivered_at_ms
                 .is_none_or(|delivered_at_ms| delivered_at_ms >= cutoff)
     });
     let mut delivered = outbox
         .values()
-        .filter(|record| record.delivery_state == OutboundDeliveryState::Delivered)
+        .filter(|record| {
+            record.connector_id == connector_id
+                && record.delivery_state == OutboundDeliveryState::Delivered
+        })
         .map(|record| {
             (
                 record.delivered_at_ms.unwrap_or(record.created_at_ms),
@@ -1246,17 +1388,18 @@ async fn wait_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use anima_core::{
-        AgentConfig, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
+        AgentConfig, AgentConfigUpdate, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
         ModelGenerateResponse, ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
     use tokio::sync::{RwLock, Semaphore};
 
-    use super::{ConnectorManager, TelegramTransport};
+    use super::{ConnectorManager, ConnectorRuntimeStatus, TelegramTransport};
     use crate::agent_runs::AgentRunCoordinator;
     use crate::app::SharedDaemonState;
     use crate::connectors::credentials::{
@@ -1275,6 +1418,7 @@ mod tests {
     struct FakeTransport {
         calls: Mutex<Vec<&'static str>>,
         sent: Mutex<Vec<(String, String)>>,
+        remaining_poll_failures: AtomicUsize,
         remaining_send_failures: AtomicUsize,
     }
 
@@ -1285,6 +1429,20 @@ mod tests {
 
     #[derive(Default)]
     struct UncertainLoadStore;
+
+    #[derive(Default)]
+    struct FailingCredentialStore {
+        inner: InMemoryCredentialStore,
+        fail_next_load: AtomicBool,
+        fail_next_put: AtomicBool,
+    }
+
+    struct GateLoadCredentialStore {
+        inner: InMemoryCredentialStore,
+        gate_load: AtomicBool,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
 
     struct GateModelAdapter {
         entered: Arc<Semaphore>,
@@ -1365,6 +1523,64 @@ mod tests {
     }
 
     #[async_trait]
+    impl ConnectorCredentialStore for FailingCredentialStore {
+        async fn load(
+            &self,
+            connector_id: &str,
+        ) -> Result<Option<TelegramBotToken>, CredentialStoreError> {
+            if self.fail_next_load.swap(false, Ordering::SeqCst) {
+                return Err(CredentialStoreError::BackendUnavailable);
+            }
+            self.inner.load(connector_id).await
+        }
+
+        async fn put(
+            &self,
+            connector_id: &str,
+            token: TelegramBotToken,
+        ) -> Result<(), CredentialStoreError> {
+            if self.fail_next_put.swap(false, Ordering::SeqCst) {
+                return Err(CredentialStoreError::BackendUnavailable);
+            }
+            self.inner.put(connector_id, token).await
+        }
+
+        async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError> {
+            self.inner.delete(connector_id).await
+        }
+    }
+
+    #[async_trait]
+    impl ConnectorCredentialStore for GateLoadCredentialStore {
+        async fn load(
+            &self,
+            connector_id: &str,
+        ) -> Result<Option<TelegramBotToken>, CredentialStoreError> {
+            if self.gate_load.load(Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| CredentialStoreError::OperationCancelled)?
+                    .forget();
+            }
+            self.inner.load(connector_id).await
+        }
+
+        async fn put(
+            &self,
+            connector_id: &str,
+            token: TelegramBotToken,
+        ) -> Result<(), CredentialStoreError> {
+            self.inner.put(connector_id, token).await
+        }
+
+        async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError> {
+            self.inner.delete(connector_id).await
+        }
+    }
+
+    #[async_trait]
     impl TelegramTransport for FakeTransport {
         async fn get_me(
             &self,
@@ -1383,6 +1599,15 @@ mod tests {
             _token: &TelegramBotToken,
             offset: i64,
         ) -> Result<TelegramUpdateBatch, TelegramTransportError> {
+            if self
+                .remaining_poll_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(TelegramTransportError::Transport);
+            }
             Ok(TelegramUpdateBatch {
                 updates: Vec::new(),
                 next_update_id: offset,
@@ -1444,6 +1669,49 @@ mod tests {
         assert_eq!(
             state.read().await.connectors.get(&connector.id),
             Some(&connector)
+        );
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn successful_poll_recovers_status_after_transient_transport_error() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let transport = Arc::new(FakeTransport::default());
+        transport.remaining_poll_failures.store(1, Ordering::SeqCst);
+        let manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            transport,
+        );
+        let connector = manager
+            .create(
+                agent_id,
+                TelegramBotToken::parse("42:transient-token").unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            wait_for_status(
+                &manager,
+                &connector.id,
+                ConnectorRuntimeStatus::Error,
+                Duration::from_millis(500),
+            )
+            .await,
+            "the failed poll should expose a safe transient error"
+        );
+        assert!(
+            wait_for_status(
+                &manager,
+                &connector.id,
+                ConnectorRuntimeStatus::Pairing,
+                Duration::from_secs(2),
+            )
+            .await,
+            "a later successful poll should restore the operational status"
         );
 
         manager.shutdown().await;
@@ -1744,7 +2012,10 @@ mod tests {
             Arc::new(FakeTransport::default()),
         );
         let connector = manager
-            .create(agent_id, TelegramBotToken::parse("42:token").unwrap())
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:token").unwrap(),
+            )
             .await
             .unwrap();
         manager.shutdown().await;
@@ -1769,6 +2040,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let baseline_agent = state.read().await.get_agent(&agent_id).unwrap();
 
         let temporary = std::env::temp_dir().join(format!(
             "anima-connector-final-persist-{}-{}",
@@ -1791,6 +2063,17 @@ mod tests {
             .await
             .expect("model should enter after the running snapshot is durable")
             .forget();
+        state
+            .write()
+            .await
+            .update_agent(
+                &agent_id,
+                AgentConfigUpdate {
+                    name: Some("updated-operator".into()),
+                    ..AgentConfigUpdate::default()
+                },
+            )
+            .unwrap();
         std::fs::remove_file(&snapshot_path).unwrap();
         std::fs::create_dir(&snapshot_path).unwrap();
         release.add_permits(1);
@@ -1799,21 +2082,117 @@ mod tests {
             processing.await.unwrap().unwrap_err(),
             super::ConnectorManagerError::Persistence
         );
-        let state = state.read().await;
+        let state_guard = state.read().await;
         assert_eq!(
-            state
+            state_guard
                 .inbound
                 .get(&(connector.id.clone(), 2))
                 .unwrap()
                 .processing_state,
             InboundProcessingState::Processing
         );
-        assert!(state
+        assert!(state_guard
             .outbound
             .values()
             .all(|record| record.connector_id != connector.id));
-        drop(state);
+        drop(state_guard);
+
+        let rolled_back = state.read().await.get_agent(&agent_id).unwrap();
+        assert_eq!(rolled_back.messages, baseline_agent.messages);
+        assert_eq!(rolled_back.state.name, "updated-operator");
+
+        std::fs::remove_dir(&snapshot_path).unwrap();
+        let retry_manager = manager.clone();
+        let retry_connector_id = connector.id.clone();
+        let retry =
+            tokio::spawn(
+                async move { retry_manager.process_pending_once(retry_connector_id).await },
+            );
+        entered
+            .acquire()
+            .await
+            .expect("retry should enter the model")
+            .forget();
+        release.add_permits(1);
+        assert!(retry.await.unwrap().unwrap());
+        let retried = state.read().await.get_agent(&agent_id).unwrap();
+        assert_eq!(retried.messages.len(), baseline_agent.messages.len() + 2);
+        assert_eq!(retried.state.name, "updated-operator");
+        assert_eq!(
+            state
+                .read()
+                .await
+                .inbound
+                .get(&(connector.id.clone(), 2))
+                .unwrap()
+                .processing_state,
+            InboundProcessingState::Processed
+        );
+        assert_eq!(
+            state
+                .read()
+                .await
+                .outbound
+                .values()
+                .filter(|record| record.connector_id == connector.id)
+                .count(),
+            1
+        );
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_processing_waits_for_global_admission_instead_of_failing() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let limiter = Arc::new(Semaphore::new(0));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs,
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:token").unwrap())
+            .await
+            .unwrap();
+        manager.shutdown().await;
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(1, "101", "pair")],
+                    next_update_id: 2,
+                },
+            )
+            .await
+            .unwrap();
+        manager.approve_pending(connector.id.clone()).await.unwrap();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(2, "101", "wait")],
+                    next_update_id: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let processing_manager = manager.clone();
+        let connector_id = connector.id.clone();
+        let processing =
+            tokio::spawn(
+                async move { processing_manager.process_pending_once(connector_id).await },
+            );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let waited = !processing.is_finished();
+        limiter.add_permits(1);
+        let result = processing.await.unwrap();
+
+        assert!(waited);
+        assert_eq!(result, Ok(true));
     }
 
     #[tokio::test]
@@ -1873,6 +2252,30 @@ mod tests {
             outbound
         };
 
+        {
+            let mut state = state.write().await;
+            for (id, connector_id) in [
+                ("old-selected", connector.id.clone()),
+                ("old-other", "other-connector".into()),
+            ] {
+                state.outbound.insert(
+                    id.into(),
+                    crate::connectors::TelegramOutboundRecord {
+                        id: id.into(),
+                        connector_id,
+                        agent_id: agent_id.clone(),
+                        room_id: connector.room_id.clone(),
+                        assistant_message_id: format!("assistant-{id}"),
+                        text: id.into(),
+                        created_at_ms: 1,
+                        delivered_at_ms: Some(1),
+                        attempts: 1,
+                        delivery_state: crate::connectors::OutboundDeliveryState::Delivered,
+                    },
+                );
+            }
+        }
+
         manager
             .deliver_pending_once(connector.id.clone())
             .await
@@ -1884,6 +2287,8 @@ mod tests {
         );
         assert_eq!(delivered.attempts, 1);
         assert!(delivered.delivered_at_ms.is_some());
+        assert!(!state.read().await.outbound.contains_key("old-selected"));
+        assert!(state.read().await.outbound.contains_key("old-other"));
         assert_eq!(
             transport.sent.lock().unwrap().as_slice(),
             [("202".into(), outbound.text)]
@@ -2052,6 +2457,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_restart_and_shutdown_cannot_resurrect_a_worker() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let credentials = Arc::new(GateLoadCredentialStore {
+            inner: InMemoryCredentialStore::default(),
+            gate_load: AtomicBool::new(false),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let manager = manager(
+            state,
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id,
+                TelegramBotToken::parse("42:worker-token").unwrap(),
+            )
+            .await
+            .unwrap();
+        credentials.gate_load.store(true, Ordering::SeqCst);
+
+        let restarting_manager = manager.clone();
+        let connector_id = connector.id.clone();
+        let restart = tokio::spawn(async move { restarting_manager.restart(connector_id).await });
+        entered
+            .acquire()
+            .await
+            .expect("restart should reach credential load")
+            .forget();
+        let shutdown_manager = manager.clone();
+        let shutdown = tokio::spawn(async move { shutdown_manager.shutdown().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let shutdown_waited_for_restart = !shutdown.is_finished();
+        release.add_permits(1);
+        restart.await.unwrap().unwrap();
+        shutdown.await.unwrap();
+        let remaining_workers = manager.worker_count().await;
+        manager.shutdown().await;
+
+        assert!(shutdown_waited_for_restart);
+        assert_eq!(remaining_workers, 0);
+    }
+
+    #[tokio::test]
+    async fn naturally_finished_worker_is_pruned_from_the_registry() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id,
+                TelegramBotToken::parse("42:worker-token").unwrap(),
+            )
+            .await
+            .unwrap();
+        state
+            .write()
+            .await
+            .connectors
+            .get_mut(&connector.id)
+            .unwrap()
+            .enabled = false;
+
+        let pruned = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if manager.worker_count().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        manager.shutdown().await;
+
+        assert!(pruned);
+    }
+
+    #[tokio::test]
     async fn restored_connector_without_a_credential_is_safe_and_does_not_block_startup() {
         let state = state_with_agent();
         let agent_id = state.read().await.list_agents()[0].state.id.clone();
@@ -2079,6 +2571,133 @@ mod tests {
             Some(super::ConnectorRuntimeStatus::CredentialRequired)
         );
         restored.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_load_failure_keeps_the_previous_worker_and_state() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(FailingCredentialStore::default());
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:old-token").unwrap())
+            .await
+            .unwrap();
+        credentials.fail_next_load.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            manager
+                .replace_token(
+                    connector.id.clone(),
+                    TelegramBotToken::parse("84:new-token").unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::ConnectorManagerError::Credential
+        );
+        assert_eq!(manager.worker_count().await, 1);
+        assert_eq!(
+            manager.status(&connector.id).await,
+            Some(super::ConnectorRuntimeStatus::Pairing)
+        );
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_put_failure_restores_the_previous_worker_token_and_status() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(FailingCredentialStore::default());
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:old-token").unwrap())
+            .await
+            .unwrap();
+        credentials.fail_next_put.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            manager
+                .replace_token(
+                    connector.id.clone(),
+                    TelegramBotToken::parse("84:new-token").unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::ConnectorManagerError::Credential
+        );
+        assert_eq!(manager.worker_count().await, 1);
+        assert_eq!(
+            manager.status(&connector.id).await,
+            Some(super::ConnectorRuntimeStatus::Pairing)
+        );
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:old-token"
+        );
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn replacement_persist_failure_restores_previous_vault_state_metadata_and_worker() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:old-token").unwrap())
+            .await
+            .unwrap();
+        let invalid_path = invalid_snapshot_directory("replace");
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(invalid_path.clone()),
+        ));
+
+        assert_eq!(
+            manager
+                .replace_token(
+                    connector.id.clone(),
+                    TelegramBotToken::parse("84:new-token").unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::ConnectorManagerError::Persistence
+        );
+        assert_eq!(manager.worker_count().await, 1);
+        assert_eq!(
+            manager.status(&connector.id).await,
+            Some(super::ConnectorRuntimeStatus::Pairing)
+        );
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:old-token"
+        );
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        manager.shutdown().await;
+        std::fs::remove_dir_all(invalid_path).unwrap();
     }
 
     #[tokio::test]
@@ -2139,6 +2758,48 @@ mod tests {
         state.write().await.remove_agent(&agent_id);
         assert!(!state.read().await.connectors[&connector.id].is_active());
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delete_persist_failure_restores_credential_metadata_status_and_worker() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(agent_id, TelegramBotToken::parse("42:old-token").unwrap())
+            .await
+            .unwrap();
+        let invalid_path = invalid_snapshot_directory("delete");
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(invalid_path.clone()),
+        ));
+
+        assert_eq!(
+            manager.delete(connector.id.clone()).await.unwrap_err(),
+            super::ConnectorManagerError::Persistence
+        );
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:old-token"
+        );
+        assert_eq!(manager.worker_count().await, 1);
+        assert_eq!(
+            manager.status(&connector.id).await,
+            Some(super::ConnectorRuntimeStatus::Pairing)
+        );
+        manager.shutdown().await;
+        std::fs::remove_dir_all(invalid_path).unwrap();
     }
 
     #[tokio::test]
@@ -2317,11 +2978,101 @@ mod tests {
             );
         }
 
-        super::compact_delivered_outbox(&mut outbox, now);
+        super::compact_delivered_outbox(&mut outbox, "connector", now);
         assert!(!outbox.contains_key("old"));
         assert!(outbox.contains_key("recent"));
         assert!(outbox.contains_key("pending"));
         assert!(outbox.contains_key("failed"));
+    }
+
+    #[test]
+    fn outbox_compaction_caps_only_the_selected_connector() {
+        use crate::connectors::{OutboundDeliveryState, TelegramOutboundRecord};
+        use std::collections::HashMap;
+
+        let now = super::DELIVERED_RETENTION_MS + 10_000;
+        let mut outbox = HashMap::new();
+        for connector_id in ["selected", "other"] {
+            for index in 0..1_002_u64 {
+                let id = format!("{connector_id}-{index}");
+                outbox.insert(
+                    id.clone(),
+                    TelegramOutboundRecord {
+                        id: id.clone(),
+                        connector_id: connector_id.into(),
+                        agent_id: format!("agent-{connector_id}"),
+                        room_id: format!("room-{connector_id}"),
+                        assistant_message_id: format!("message-{id}"),
+                        text: id,
+                        created_at_ms: now - 1_000 + index,
+                        delivered_at_ms: Some(now - 1_000 + index),
+                        attempts: 1,
+                        delivery_state: OutboundDeliveryState::Delivered,
+                    },
+                );
+            }
+        }
+        for state in [
+            OutboundDeliveryState::Pending,
+            OutboundDeliveryState::Failed,
+        ] {
+            let id = format!("selected-{state:?}");
+            outbox.insert(
+                id.clone(),
+                TelegramOutboundRecord {
+                    id: id.clone(),
+                    connector_id: "selected".into(),
+                    agent_id: "agent-selected".into(),
+                    room_id: "room-selected".into(),
+                    assistant_message_id: format!("message-{id}"),
+                    text: id,
+                    created_at_ms: now,
+                    delivered_at_ms: None,
+                    attempts: 1,
+                    delivery_state: state,
+                },
+            );
+        }
+
+        super::compact_delivered_outbox(&mut outbox, "selected", now);
+
+        assert_eq!(
+            outbox
+                .values()
+                .filter(|record| {
+                    record.connector_id == "selected"
+                        && record.delivery_state == OutboundDeliveryState::Delivered
+                })
+                .count(),
+            1_000
+        );
+        assert_eq!(
+            outbox
+                .values()
+                .filter(|record| record.connector_id == "other")
+                .count(),
+            1_002
+        );
+        assert_eq!(
+            outbox
+                .values()
+                .filter(|record| {
+                    record.connector_id == "selected"
+                        && record.delivery_state != OutboundDeliveryState::Delivered
+                })
+                .count(),
+            2
+        );
+    }
+
+    fn invalid_snapshot_directory(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "anima-connector-{label}-invalid-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
     }
 
     fn text_update(update_id: i64, chat_id: &str, text: &str) -> TelegramTextUpdate {
@@ -2355,6 +3106,24 @@ mod tests {
     ) -> ConnectorManager {
         let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
         ConnectorManager::new(state, runs, credentials, transport)
+    }
+
+    async fn wait_for_status(
+        manager: &ConnectorManager,
+        connector_id: &str,
+        expected: ConnectorRuntimeStatus,
+        timeout: Duration,
+    ) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if manager.status(connector_id).await == Some(expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
     }
 
     fn test_config() -> AgentConfig {

@@ -109,6 +109,35 @@ impl AgentRunCoordinator {
         self.run_with_commit_admitted(request, permit, commit).await
     }
 
+    /// Runs durable background work after waiting for shared daemon admission.
+    ///
+    /// Interactive callers deliberately fail fast when the daemon is saturated,
+    /// but daemon-owned workers must not turn temporary saturation into a durable
+    /// connector error.
+    pub(crate) async fn run_with_commit_waiting<F>(
+        &self,
+        request: AgentRunRequest,
+        commit: F,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(
+                &mut DaemonState,
+                &AgentRuntimeSnapshot,
+                &TaskResult<Content>,
+            ) -> Result<(), ApiError>
+            + Send
+            + 'static,
+    {
+        let permit = self
+            .run_limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map(AgentRunPermit)
+            .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?;
+        self.run_with_commit_admitted(request, permit, commit).await
+    }
+
     pub(crate) async fn run_with_commit_admitted<F>(
         &self,
         request: AgentRunRequest,

@@ -745,6 +745,7 @@ mod tests {
         snapshot.connectors[0].enabled = false;
         snapshot.connectors[0].deleted_at_ms = Some(20);
         snapshot.connectors[0].updated_at_ms = 20;
+        snapshot.connectors[0].pending_pairing = None;
         snapshot.inbound[0].processing_state = InboundProcessingState::Processed;
         snapshot.outbound[0].delivery_state = OutboundDeliveryState::Delivered;
         snapshot.outbound[0].delivered_at_ms = Some(19);
@@ -771,6 +772,42 @@ mod tests {
 
         let mut restored = DaemonState::new();
         assert!(restored.restore_control_plane_snapshot(snapshot).is_err());
+    }
+
+    #[test]
+    fn tombstoned_connector_rejects_live_pairing_inbox_and_outbox_state() {
+        let (mut snapshot, _) = valid_connector_snapshot();
+        snapshot.connectors[0].enabled = false;
+        snapshot.connectors[0].deleted_at_ms = Some(20);
+        snapshot.connectors[0].updated_at_ms = 20;
+        snapshot.connectors[0].pending_pairing = None;
+        snapshot.inbound[0].processing_state = InboundProcessingState::Processed;
+        snapshot.outbound[0].delivery_state = OutboundDeliveryState::Delivered;
+        snapshot.outbound[0].delivered_at_ms = Some(19);
+        snapshot.schedules[0].enabled = false;
+        snapshot.schedules[0].updated_at_ms = 20;
+
+        let mut pending_pairing = snapshot.clone();
+        pending_pairing.connectors[0].pending_pairing = Some(TelegramPendingPairing {
+            chat: test_chat(),
+            requested_at_ms: 19,
+        });
+        assert!(DaemonState::new()
+            .restore_control_plane_snapshot(pending_pairing)
+            .is_err());
+
+        let mut processing_inbound = snapshot.clone();
+        processing_inbound.inbound[0].processing_state = InboundProcessingState::Processing;
+        assert!(DaemonState::new()
+            .restore_control_plane_snapshot(processing_inbound)
+            .is_err());
+
+        let mut pending_outbound = snapshot;
+        pending_outbound.outbound[0].delivery_state = OutboundDeliveryState::Pending;
+        pending_outbound.outbound[0].delivered_at_ms = None;
+        assert!(DaemonState::new()
+            .restore_control_plane_snapshot(pending_outbound)
+            .is_err());
     }
 
     fn valid_connector_snapshot() -> (ControlPlaneSnapshot, String) {
@@ -1342,6 +1379,12 @@ impl DaemonState {
                     connector.id
                 ));
             }
+            if tombstoned && connector.pending_pairing.is_some() {
+                return Err(format!(
+                    "connector '{}' cannot retain pending pairing after deletion",
+                    connector.id
+                ));
+            }
             if !agent_ids.contains(&connector.agent_id) && !tombstoned {
                 return Err(format!(
                     "connector '{}' references missing agent '{}'",
@@ -1367,6 +1410,17 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
+            if connector.deleted_at_ms.is_some()
+                && !matches!(
+                    record.processing_state,
+                    InboundProcessingState::Processed | InboundProcessingState::Rejected
+                )
+            {
+                return Err(format!(
+                    "inbound update {}:{} cannot remain unprocessed after connector deletion",
+                    record.connector_id, record.update_id
+                ));
+            }
             let archived = !connector.is_active()
                 && matches!(
                     record.processing_state,
@@ -1410,6 +1464,14 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
+            if connector.deleted_at_ms.is_some()
+                && record.delivery_state != OutboundDeliveryState::Delivered
+            {
+                return Err(format!(
+                    "outbound delivery '{}' cannot remain undelivered after connector deletion",
+                    record.id
+                ));
+            }
             let archived =
                 !connector.is_active() && record.delivery_state == OutboundDeliveryState::Delivered;
             if !agent_ids.contains(&record.agent_id) && !archived {
@@ -1986,6 +2048,23 @@ impl DaemonState {
             Arc::clone(&self.memory_embeddings),
             self.memory_store.clone(),
         )
+    }
+
+    /// Restores a pre-run transcript after an undurable final snapshot while
+    /// retaining configuration changes accepted during the in-flight run.
+    /// A concurrently deleted agent is never resurrected.
+    pub(crate) fn rollback_agent_runtime(
+        &mut self,
+        mut previous: AgentRuntimeSnapshot,
+    ) -> Result<bool, String> {
+        let agent_id = previous.state.id.clone();
+        let Some(latest) = self.get_agent(&agent_id) else {
+            return Ok(false);
+        };
+        previous.state.name = latest.state.name;
+        previous.state.config = latest.state.config;
+        self.restore_agent_snapshot(previous)?;
+        Ok(true)
     }
 
     fn validate_swarm_tools(&self, config: &SwarmConfig) -> Result<(), String> {
