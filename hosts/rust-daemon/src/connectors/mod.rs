@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod credentials;
+pub(crate) mod telegram;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TelegramConnectorRecord {
