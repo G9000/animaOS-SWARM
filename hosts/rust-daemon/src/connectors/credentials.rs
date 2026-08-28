@@ -117,6 +117,11 @@ pub(crate) trait ConnectorCredentialStore: Send + Sync {
         connector_id: &str,
         token: TelegramBotToken,
     ) -> Result<(), CredentialStoreError>;
+    /// Deletes a credential from the OS vault.
+    ///
+    /// The Task 5 connector manager must own this mutation future to completion rather than
+    /// attaching it directly to an HTTP request task. Once the blocking vault operation starts,
+    /// dropping the caller future cannot cancel the OS mutation and also discards its outcome.
     async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError>;
 }
 
@@ -272,13 +277,30 @@ impl ConnectorCredentialStore for OsKeyringCredentialStore {
     async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError> {
         let account = account_for(connector_id)?;
         let backend = Arc::clone(&self.backend);
-        match tokio::task::spawn_blocking(move || backend.delete(KEYRING_SERVICE, &account))
-            .await
-            .map_err(|_| CredentialStoreError::CredentialStateUncertain)?
-        {
-            Ok(()) | Err(BackendError::NotFound) => Ok(()),
-            Err(error) => Err(map_backend_error(error)),
-        }
+        tokio::task::spawn_blocking(move || -> Result<(), CredentialStoreError> {
+            let previous = backend
+                .load(KEYRING_SERVICE, &account)
+                .map_err(map_backend_error)?;
+            let deletion = backend.delete(KEYRING_SERVICE, &account);
+            let observed = backend
+                .load(KEYRING_SERVICE, &account)
+                .map_err(|_| CredentialStoreError::CredentialStateUncertain)?;
+
+            if observed.is_none() {
+                return Ok(());
+            }
+            if deletion.is_ok() {
+                return Err(CredentialStoreError::CredentialStateUncertain);
+            }
+            if credential_payload_matches(&observed, previous.as_ref().map(|value| value.as_str()))
+            {
+                Err(CredentialStoreError::BackendUnavailable)
+            } else {
+                Err(CredentialStoreError::CredentialStateUncertain)
+            }
+        })
+        .await
+        .map_err(|_| CredentialStoreError::CredentialStateUncertain)?
     }
 }
 
@@ -478,6 +500,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_accepts_an_after_mutation_backend_error_when_absence_is_confirmed() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend
+            .delete_behaviors
+            .lock()
+            .unwrap()
+            .push_back(DeleteBehavior::FailAfterMutation);
+
+        store.delete("primary").await.unwrap();
+
+        assert_eq!(store.load("primary").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delete_reports_known_failure_when_prior_credential_is_confirmed_unchanged() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend
+            .delete_behaviors
+            .lock()
+            .unwrap()
+            .push_back(DeleteBehavior::FailBeforeMutation);
+
+        let error = store.delete("primary").await.unwrap_err();
+
+        assert_eq!(error, CredentialStoreError::BackendUnavailable);
+        assert_eq!(
+            store.load("primary").await.unwrap().unwrap().expose(),
+            "prior-token"
+        );
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn delete_success_without_mutation_reports_uncertain_state() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend
+            .delete_behaviors
+            .lock()
+            .unwrap()
+            .push_back(DeleteBehavior::SucceedWithoutMutation);
+
+        let error = store.delete("primary").await.unwrap_err();
+
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn delete_verification_read_failure_reports_uncertain_state() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend
+            .read_behaviors
+            .lock()
+            .unwrap()
+            .extend([ReadBehavior::Actual, ReadBehavior::Fail]);
+
+        let error = store.delete("primary").await.unwrap_err();
+
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
+    async fn delete_verification_mismatch_reports_uncertain_state() {
+        let backend = Arc::new(FakeBackend::default());
+        let store = OsKeyringCredentialStore::with_backend(backend.clone());
+        store.put("primary", token("prior-token")).await.unwrap();
+        backend
+            .delete_behaviors
+            .lock()
+            .unwrap()
+            .push_back(DeleteBehavior::FailBeforeMutation);
+        backend.read_behaviors.lock().unwrap().extend([
+            ReadBehavior::Actual,
+            ReadBehavior::Override(Some(format!(r#"{{"version":1,"token":"{SENTINEL}"}}"#))),
+        ]);
+
+        let error = store.delete("primary").await.unwrap_err();
+
+        assert_eq!(error, CredentialStoreError::CredentialStateUncertain);
+        assert_sanitized(&error);
+    }
+
+    #[tokio::test]
     async fn versioned_payload_rejects_unsupported_versions_safely() {
         let backend = Arc::new(FakeBackend::default());
         backend.values.lock().unwrap().insert(
@@ -639,6 +753,43 @@ mod tests {
         assert!(stored.contains(SENTINEL));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_the_caller_does_not_cancel_an_in_flight_vault_delete() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let backend = Arc::new(BlockingDeleteBackend {
+            value: Mutex::new(Some(Zeroizing::new(format!(
+                r#"{{"version":1,"token":"{SENTINEL}"}}"#
+            )))),
+            started_tx: Mutex::new(Some(started_tx)),
+            finished_tx: Mutex::new(Some(finished_tx)),
+            release: Arc::clone(&release),
+        });
+        let store = Arc::new(OsKeyringCredentialStore::with_backend(backend.clone()));
+        let mutation = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.delete("primary").await }
+        });
+
+        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        mutation.abort();
+        {
+            let (released, condition) = &*release;
+            *released.lock().unwrap() = true;
+            condition.notify_all();
+        }
+        tokio::task::spawn_blocking(move || finished_rx.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(store.load("primary").await.unwrap(), None);
+    }
+
     #[test]
     fn every_public_error_format_is_sanitized() {
         for error in CredentialStoreError::ALL {
@@ -677,7 +828,9 @@ mod tests {
 
     #[derive(Clone, Copy)]
     enum DeleteBehavior {
+        SucceedWithoutMutation,
         FailBeforeMutation,
+        FailAfterMutation,
     }
 
     impl CredentialBackend for FakeBackend {
@@ -733,13 +886,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((service.into(), account.into(), None));
-            if matches!(
-                self.delete_behaviors.lock().unwrap().pop_front(),
-                Some(DeleteBehavior::FailBeforeMutation)
-            ) {
+            let behavior = self.delete_behaviors.lock().unwrap().pop_front();
+            if matches!(behavior, Some(DeleteBehavior::FailBeforeMutation)) {
                 return Err(BackendError::Unavailable);
             }
+            if matches!(behavior, Some(DeleteBehavior::SucceedWithoutMutation)) {
+                return Ok(());
+            }
             self.values.lock().unwrap().remove(account);
+            if matches!(behavior, Some(DeleteBehavior::FailAfterMutation)) {
+                return Err(BackendError::Unavailable);
+            }
             Ok(())
         }
     }
@@ -778,6 +935,44 @@ mod tests {
 
         fn delete(&self, _service: &str, _account: &str) -> Result<(), BackendError> {
             *self.value.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    struct BlockingDeleteBackend {
+        value: Mutex<Option<Zeroizing<String>>>,
+        started_tx: Mutex<Option<mpsc::Sender<()>>>,
+        finished_tx: Mutex<Option<mpsc::Sender<()>>>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl CredentialBackend for BlockingDeleteBackend {
+        fn load(
+            &self,
+            _service: &str,
+            _account: &str,
+        ) -> Result<Option<Zeroizing<String>>, BackendError> {
+            Ok(self.value.lock().unwrap().clone())
+        }
+
+        fn put(&self, _service: &str, _account: &str, payload: &str) -> Result<(), BackendError> {
+            *self.value.lock().unwrap() = Some(Zeroizing::new(payload.to_owned()));
+            Ok(())
+        }
+
+        fn delete(&self, _service: &str, _account: &str) -> Result<(), BackendError> {
+            if let Some(started_tx) = self.started_tx.lock().unwrap().take() {
+                started_tx.send(()).unwrap();
+                let (released, condition) = &*self.release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = condition.wait(released).unwrap();
+                }
+            }
+            *self.value.lock().unwrap() = None;
+            if let Some(finished_tx) = self.finished_tx.lock().unwrap().take() {
+                finished_tx.send(()).unwrap();
+            }
             Ok(())
         }
     }
