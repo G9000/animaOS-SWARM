@@ -94,7 +94,7 @@ pub(crate) enum ConnectorManagerError {
     AgentNotFound,
     ConnectorNotFound,
     AgentAlreadyConnected,
-    PairingNotFound,
+    PendingPairingNotFound,
     InvalidToken,
     Transport,
     Credential,
@@ -111,7 +111,7 @@ impl fmt::Display for ConnectorManagerError {
             Self::AgentNotFound => "agent not found",
             Self::ConnectorNotFound => "connector not found",
             Self::AgentAlreadyConnected => "agent already has an active Telegram connector",
-            Self::PairingNotFound => "Telegram pairing candidate was not found",
+            Self::PendingPairingNotFound => "Telegram pairing candidate was not found",
             Self::InvalidToken => "Telegram bot token is invalid",
             Self::Transport => "Telegram transport failed",
             Self::Credential => "credential vault operation failed",
@@ -765,7 +765,7 @@ impl ConnectorManager {
                     .insert(connector_id, previous);
                 return Err(ConnectorManagerError::Persistence);
             }
-            return Err(ConnectorManagerError::ConnectorNotFound);
+            return Err(ConnectorManagerError::PendingPairingNotFound);
         }
         let (previous, updated, persist) = {
             let mut state = self.state.write().await;
@@ -780,12 +780,12 @@ impl ConnectorManager {
             let pending = previous
                 .pending_pairing
                 .clone()
-                .ok_or(ConnectorManagerError::PairingNotFound)?;
+                .ok_or(ConnectorManagerError::PendingPairingNotFound)?;
             if expected_chat_id
                 .as_deref()
                 .is_some_and(|expected| expected != pending.chat.id)
             {
-                return Err(ConnectorManagerError::PairingNotFound);
+                return Err(ConnectorManagerError::PendingPairingNotFound);
             }
             let connector = state
                 .connectors
@@ -3586,6 +3586,15 @@ mod tests {
     async fn stale_pairing_candidate_cannot_be_approved_and_a_new_chat_replaces_it() {
         let state = state_with_agent();
         let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let temporary = std::env::temp_dir().join(format!(
+            "anima-pairing-approval-expiry-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let snapshot_path = temporary.join("control-plane.json");
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
+        ));
         let manager = manager(
             Arc::clone(&state),
             Arc::new(InMemoryCredentialStore::default()),
@@ -3624,11 +3633,18 @@ mod tests {
                 .approve_pending(connector.id.clone())
                 .await
                 .unwrap_err(),
-            super::ConnectorManagerError::ConnectorNotFound
+            super::ConnectorManagerError::PendingPairingNotFound
         );
         assert!(state.read().await.connectors[&connector.id]
             .pending_pairing
             .is_none());
+        let persisted = crate::control_plane_store::load_control_plane_snapshot(
+            &crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(persisted.connectors[0].pending_pairing.is_none());
 
         manager
             .accept_batch(
@@ -3650,6 +3666,7 @@ mod tests {
             "202"
         );
         manager.shutdown().await;
+        std::fs::remove_dir_all(temporary).unwrap();
     }
 
     #[tokio::test]

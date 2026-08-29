@@ -1109,6 +1109,7 @@ mod tests {
     #[derive(Default)]
     struct CountingCredentialStore {
         calls: AtomicUsize,
+        fail_put: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1127,6 +1128,9 @@ mod tests {
             _token: TelegramBotToken,
         ) -> Result<(), CredentialStoreError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_put.swap(false, Ordering::SeqCst) {
+                return Err(CredentialStoreError::BackendUnavailable);
+            }
             Ok(())
         }
 
@@ -1539,7 +1543,7 @@ mod tests {
             (
                 TelegramTransportError::Transport,
                 StatusCode::SERVICE_UNAVAILABLE,
-                "telegram_unavailable",
+                "connector_upstream_unavailable",
             ),
         ] {
             let mut daemon = DaemonState::new();
@@ -1591,6 +1595,60 @@ mod tests {
             assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
             assert!(state.read().await.connectors.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn connector_create_maps_credential_store_failure_to_stable_public_error() {
+        let mut daemon = DaemonState::new();
+        let agent_id = daemon
+            .create_agent(test_config("credential-store-failure"))
+            .unwrap()
+            .state
+            .id;
+        let state = Arc::new(RwLock::new(daemon));
+        let limiter = Arc::new(Semaphore::new(4));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let credentials = Arc::new(CountingCredentialStore {
+            calls: AtomicUsize::new(0),
+            fail_put: std::sync::atomic::AtomicBool::new(true),
+        });
+        let transport = Arc::new(CountingTelegramTransport::default());
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            credentials.clone(),
+            transport.clone(),
+        );
+        let app = router_with_services(
+            Arc::clone(&state),
+            DaemonConfig::default(),
+            limiter,
+            runs,
+            manager,
+            true,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/connectors/telegram"))
+                    .header("host", "127.0.0.1:8080")
+                    .header("origin", "http://localhost:4200")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"botToken":"42:telegram-secret-sentinel"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["code"], "connector_credential_store_unavailable");
+        assert!(!text.contains("telegram-secret-sentinel"));
+        assert!(credentials.calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+        assert!(state.read().await.connectors.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

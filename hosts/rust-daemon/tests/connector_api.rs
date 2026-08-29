@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anima_daemon::app as daemon_app;
 use axum::body::{to_bytes, Body};
-use axum::http::{HeaderMap, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::Response;
 use axum::Router;
 use serde_json::{json, Value};
@@ -302,15 +302,15 @@ async fn connector_routes_enforce_agent_ownership_and_not_found_without_secret_l
 
     for (status, response, _) in responses.values() {
         assert_eq!(*status, StatusCode::NOT_FOUND);
-        assert_eq!(response["code"], "not_found");
+        assert_eq!(response["code"], "connector_not_found");
     }
     let (missing_status, _, missing, missing_text) = get_connectors(&app, "agent-missing").await;
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
-    assert_eq!(missing["code"], "not_found");
+    assert_eq!(missing["code"], "connector_not_found");
     let (missing_create_status, _, missing_create, missing_create_text) =
         create_connector(&app, "agent-missing").await;
     assert_eq!(missing_create_status, StatusCode::NOT_FOUND);
-    assert_eq!(missing_create["code"], "not_found");
+    assert_eq!(missing_create["code"], "connector_not_found");
     assert_secret_absent(
         std::iter::once(create_text)
             .chain(responses.into_values().map(|(_, _, text)| text))
@@ -511,17 +511,62 @@ async fn connector_inputs_are_bounded_before_mutation() {
 
 #[tokio::test]
 async fn local_owner_guard_fails_before_connector_side_effects() {
-    for (name, host, origins, admin, mutate) in [
-        ("remote bind", "0.0.0.0", None, None, "origin"),
-        ("unapproved origin", "127.0.0.1", None, None, "evil-origin"),
-        ("forwarded", "127.0.0.1", None, None, "forwarded"),
-        ("originless", "127.0.0.1", None, None, "originless"),
+    for (name, host, origins, admin, mutate, expected_code) in [
+        (
+            "remote bind",
+            "0.0.0.0",
+            None,
+            None,
+            "origin",
+            "connector_local_admin_required",
+        ),
+        (
+            "unapproved origin",
+            "127.0.0.1",
+            None,
+            None,
+            "evil-origin",
+            "connector_origin_rejected",
+        ),
+        (
+            "malformed origin",
+            "127.0.0.1",
+            None,
+            None,
+            "malformed-origin",
+            "connector_origin_rejected",
+        ),
+        (
+            "forwarded",
+            "127.0.0.1",
+            None,
+            None,
+            "forwarded",
+            "connector_local_admin_required",
+        ),
+        (
+            "missing host",
+            "127.0.0.1",
+            None,
+            None,
+            "missing-host",
+            "connector_local_admin_required",
+        ),
+        (
+            "originless",
+            "127.0.0.1",
+            None,
+            None,
+            "originless",
+            "connector_local_admin_required",
+        ),
         (
             "wrong bearer",
             "127.0.0.1",
             None,
             Some("right-token"),
             "wrong-token",
+            "connector_local_admin_required",
         ),
     ] {
         let app = app_with_owner_env(host, origins, admin).await;
@@ -543,6 +588,15 @@ async fn local_owner_guard_fails_before_connector_side_effects() {
                     .headers_mut()
                     .insert("forwarded", "for=127.0.0.1".parse().unwrap());
             }
+            "malformed-origin" => {
+                blocked.headers_mut().insert(
+                    "origin",
+                    HeaderValue::from_bytes(&[0xff]).expect("opaque origin header"),
+                );
+            }
+            "missing-host" => {
+                blocked.headers_mut().remove("host");
+            }
             "originless" => {
                 blocked.headers_mut().remove("origin");
             }
@@ -557,7 +611,7 @@ async fn local_owner_guard_fails_before_connector_side_effects() {
         let (status, headers, body, text) = send(&app, blocked).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {text}");
         assert_no_store(&headers);
-        assert_eq!(body["code"], "local_owner_required");
+        assert_eq!(body["code"], expected_code);
         assert_secret_absent([text]);
         let (list_status, _, listed, _) = get_connectors(&app, &agent_id).await;
         assert_eq!(list_status, StatusCode::OK);
@@ -585,7 +639,7 @@ async fn local_owner_guard_fails_before_connector_side_effects() {
             .insert(header, "malicious-forward".parse().unwrap());
         let (status, _, body, _) = send(&forwarded_app, blocked).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{header}");
-        assert_eq!(body["code"], "local_owner_required");
+        assert_eq!(body["code"], "connector_local_admin_required");
     }
     let (_, _, forwarded_list, _) = get_connectors(&forwarded_app, &forwarded_agent_id).await;
     assert_eq!(forwarded_list, json!({"connectors": []}));

@@ -33,6 +33,12 @@ pub(super) struct LocalOwnerPolicy {
     admin_token: Option<Zeroizing<String>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LocalOwnerRejection {
+    LocalAdminRequired,
+    OriginRejected,
+}
+
 impl LocalOwnerPolicy {
     pub(super) fn from_env(bind_is_loopback: bool) -> Self {
         let mut allowed_origins = DEFAULT_LOCAL_UI_ORIGINS
@@ -57,33 +63,42 @@ impl LocalOwnerPolicy {
         }
     }
 
-    pub(super) fn authorize(&self, headers: &axum::http::HeaderMap) -> bool {
+    pub(super) fn authorize(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<(), LocalOwnerRejection> {
         if !self.bind_is_loopback
             || !request_host_is_loopback(headers)
             || has_forwarding_headers(headers)
         {
-            return false;
+            return Err(LocalOwnerRejection::LocalAdminRequired);
         }
 
         if let Some(origin) = headers.get(header::ORIGIN) {
             let Ok(origin) = origin.to_str() else {
-                return false;
+                return Err(LocalOwnerRejection::OriginRejected);
             };
             return normalize_serialized_origin(origin)
-                .is_some_and(|origin| self.allowed_origins.contains(&origin));
+                .filter(|origin| self.allowed_origins.contains(origin))
+                .map(|_| ())
+                .ok_or(LocalOwnerRejection::OriginRejected);
         }
 
         let Some(expected) = self.admin_token.as_deref() else {
-            return false;
+            return Err(LocalOwnerRejection::LocalAdminRequired);
         };
         let Some(presented) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
         else {
-            return false;
+            return Err(LocalOwnerRejection::LocalAdminRequired);
         };
-        constant_time_local_admin_eq(presented.as_bytes(), expected.as_bytes())
+        if constant_time_local_admin_eq(presented.as_bytes(), expected.as_bytes()) {
+            Ok(())
+        } else {
+            Err(LocalOwnerRejection::LocalAdminRequired)
+        }
     }
 }
 

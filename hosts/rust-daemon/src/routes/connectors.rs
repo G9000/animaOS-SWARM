@@ -13,7 +13,7 @@ use super::contracts::{
     DeleteResponse, TelegramConnectorEnvelope, TelegramConnectorResponse,
     TelegramConnectorsEnvelope, TelegramCredentialRequest,
 };
-use super::http::{json_response, read_limited_body, request_query};
+use super::http::{json_response, read_limited_body, request_query, LocalOwnerRejection};
 use super::{parse_json_body, AppState};
 
 #[utoipa::path(
@@ -33,7 +33,7 @@ pub(super) async fn list_connectors(
     let records = {
         let daemon = state.daemon.read().await;
         if daemon.get_agent(&agent_id).is_none() {
-            return error_response(StatusCode::NOT_FOUND, "not_found", "not found");
+            return not_found_error();
         }
         let mut records = daemon
             .connectors
@@ -79,8 +79,8 @@ pub(super) async fn create_telegram_connector(
     Path(agent_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
-    if !state.local_owner.authorize(request.headers()) {
-        return local_owner_error();
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        return local_owner_error(rejection);
     }
     let token = match credential_from_request(request, &state).await {
         Ok(token) => token,
@@ -121,8 +121,8 @@ pub(super) async fn replace_telegram_credential(
     Path((agent_id, connector_id)): Path<(String, String)>,
     request: AxumRequest,
 ) -> AxumResponse {
-    if !state.local_owner.authorize(request.headers()) {
-        return local_owner_error();
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        return local_owner_error(rejection);
     }
     let token = match credential_from_request(request, &state).await {
         Ok(token) => token,
@@ -166,8 +166,8 @@ pub(super) async fn approve_telegram_pairing(
     Path((agent_id, connector_id, chat_id)): Path<(String, String, String)>,
     request: AxumRequest,
 ) -> AxumResponse {
-    if !state.local_owner.authorize(request.headers()) {
-        return local_owner_error();
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        return local_owner_error(rejection);
     }
     if chat_id.is_empty() || chat_id.len() > 64 {
         return invalid_request("chat identifier is invalid");
@@ -208,8 +208,8 @@ pub(super) async fn restart_telegram_connector(
     Path((agent_id, connector_id)): Path<(String, String)>,
     request: AxumRequest,
 ) -> AxumResponse {
-    if !state.local_owner.authorize(request.headers()) {
-        return local_owner_error();
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        return local_owner_error(rejection);
     }
     if owned_connector(&state, &agent_id, &connector_id)
         .await
@@ -246,8 +246,8 @@ pub(super) async fn delete_telegram_connector(
     Path((agent_id, connector_id)): Path<(String, String)>,
     request: AxumRequest,
 ) -> AxumResponse {
-    if !state.local_owner.authorize(request.headers()) {
-        return local_owner_error();
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        return local_owner_error(rejection);
     }
     if owned_connector(&state, &agent_id, &connector_id)
         .await
@@ -335,8 +335,8 @@ pub(super) async fn send_connector_message(
     Path((agent_id, connector_id)): Path<(String, String)>,
     request: AxumRequest,
 ) -> AxumResponse {
-    if !state.local_owner.authorize(request.headers()) {
-        return local_owner_error();
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        return local_owner_error(rejection);
     }
     let body = match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => body,
@@ -460,7 +460,7 @@ fn manager_error(error: ConnectorManagerError) -> AxumResponse {
             "connector_already_exists",
             "agent already has an active Telegram connector",
         ),
-        ConnectorManagerError::PairingNotFound => error_response(
+        ConnectorManagerError::PendingPairingNotFound => error_response(
             StatusCode::CONFLICT,
             "connector_pairing_not_found",
             "pairing candidate was not found",
@@ -468,27 +468,27 @@ fn manager_error(error: ConnectorManagerError) -> AxumResponse {
         ConnectorManagerError::InvalidToken => invalid_token(),
         ConnectorManagerError::Transport => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "telegram_unavailable",
+            "connector_upstream_unavailable",
             "Telegram is unavailable",
         ),
         ConnectorManagerError::Credential => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "credential_unavailable",
+            "connector_credential_store_unavailable",
             "credential vault is unavailable",
         ),
         ConnectorManagerError::CredentialStateUncertain => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "credential_reconciliation_required",
+            "connector_credential_reconciliation_required",
             "credential state requires reconciliation",
         ),
         ConnectorManagerError::Persistence => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
-            "persistence_unavailable",
+            "connector_persistence_unavailable",
             "connector state persistence is unavailable",
         ),
         ConnectorManagerError::Backpressure => error_response(
             StatusCode::TOO_MANY_REQUESTS,
-            "too_many_requests",
+            "connector_busy",
             "connector is busy",
         ),
         ConnectorManagerError::ConflictingUpdate => error_response(
@@ -516,16 +516,27 @@ fn invalid_token() -> AxumResponse {
     )
 }
 
-fn local_owner_error() -> AxumResponse {
-    error_response(
-        StatusCode::FORBIDDEN,
-        "local_owner_required",
-        "local owner authorization required",
-    )
+fn local_owner_error(rejection: LocalOwnerRejection) -> AxumResponse {
+    match rejection {
+        LocalOwnerRejection::LocalAdminRequired => error_response(
+            StatusCode::FORBIDDEN,
+            "connector_local_admin_required",
+            "local connector administration authorization is required",
+        ),
+        LocalOwnerRejection::OriginRejected => error_response(
+            StatusCode::FORBIDDEN,
+            "connector_origin_rejected",
+            "browser origin is not approved for connector administration",
+        ),
+    }
 }
 
 fn not_found_error() -> AxumResponse {
-    error_response(StatusCode::NOT_FOUND, "not_found", "not found")
+    error_response(
+        StatusCode::NOT_FOUND,
+        "connector_not_found",
+        "connector was not found",
+    )
 }
 
 fn error_response(status: StatusCode, code: &str, message: &str) -> AxumResponse {
@@ -543,4 +554,93 @@ fn no_store(mut response: AxumResponse) -> AxumResponse {
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+    use axum::http::StatusCode;
+
+    use super::{manager_error, ConnectorManagerError};
+
+    #[tokio::test]
+    async fn connector_manager_errors_have_stable_public_codes() {
+        for (error, expected_status, expected_code) in [
+            (
+                ConnectorManagerError::AgentNotFound,
+                StatusCode::NOT_FOUND,
+                "connector_not_found",
+            ),
+            (
+                ConnectorManagerError::ConnectorNotFound,
+                StatusCode::NOT_FOUND,
+                "connector_not_found",
+            ),
+            (
+                ConnectorManagerError::AgentAlreadyConnected,
+                StatusCode::CONFLICT,
+                "connector_already_exists",
+            ),
+            (
+                ConnectorManagerError::PendingPairingNotFound,
+                StatusCode::CONFLICT,
+                "connector_pairing_not_found",
+            ),
+            (
+                ConnectorManagerError::InvalidToken,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "connector_token_invalid",
+            ),
+            (
+                ConnectorManagerError::Transport,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector_upstream_unavailable",
+            ),
+            (
+                ConnectorManagerError::Credential,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector_credential_store_unavailable",
+            ),
+            (
+                ConnectorManagerError::CredentialStateUncertain,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector_credential_reconciliation_required",
+            ),
+            (
+                ConnectorManagerError::Persistence,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector_persistence_unavailable",
+            ),
+            (
+                ConnectorManagerError::Backpressure,
+                StatusCode::TOO_MANY_REQUESTS,
+                "connector_busy",
+            ),
+            (
+                ConnectorManagerError::ConflictingUpdate,
+                StatusCode::CONFLICT,
+                "connector_conflict",
+            ),
+            (
+                ConnectorManagerError::WorkerStopped,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "connector_unavailable",
+            ),
+        ] {
+            let response = manager_error(error);
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["code"], expected_code);
+            assert!(!text.contains("telegram-secret-sentinel"));
+        }
+    }
 }
