@@ -25,7 +25,7 @@ use utoipa_scalar::Scalar;
 
 use crate::agent_runs::AgentRunCoordinator;
 use crate::app::{DaemonConfig, SharedDaemonState};
-use crate::connectors::runtime::ConnectorManager;
+use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError};
 
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
@@ -743,7 +743,10 @@ async fn get_agent_entry(
     path = "/api/agents/{agent_id}",
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent identifier")),
-    responses((status = 200, description = "Agent deleted", body = DeleteResponse))
+    responses(
+        (status = 200, description = "Agent deleted", body = DeleteResponse),
+        (status = 404, description = "Not found", body = ErrorBody)
+    )
 )]
 async fn delete_agent_entry(
     State(state): State<AppState>,
@@ -751,6 +754,7 @@ async fn delete_agent_entry(
 ) -> AxumResponse {
     match state.connector_manager.delete_agent(agent_id).await {
         Ok(()) => json_response(StatusCode::OK, &DeleteResponse { deleted: true }),
+        Err(ConnectorManagerError::AgentNotFound) => ApiError::not_found().into_response(),
         Err(error) => ApiError::service_unavailable(error.to_string()).into_response(),
     }
 }

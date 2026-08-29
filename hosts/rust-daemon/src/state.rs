@@ -23,8 +23,8 @@ use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
 use crate::connectors::{
-    InboundProcessingState, OutboundDeliveryState, TelegramConnectorRecord, TelegramInboundRecord,
-    TelegramOutboundRecord,
+    InboundProcessingState, OutboundDeliveryState, TelegramConnectorRecord,
+    TelegramCredentialCleanupIntent, TelegramInboundRecord, TelegramOutboundRecord,
 };
 use crate::control_plane_store::{
     save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, StoredSwarmSnapshot,
@@ -54,8 +54,9 @@ mod tests {
     use super::DaemonState;
     use crate::connectors::{
         InboundProcessingState, OutboundDeliveryState, TelegramBotIdentity, TelegramChatKind,
-        TelegramChatMetadata, TelegramConnectorRecord, TelegramInboundRecord,
-        TelegramOutboundRecord, TelegramPendingPairing, TelegramSenderMetadata,
+        TelegramChatMetadata, TelegramConnectorRecord, TelegramCredentialCleanupIntent,
+        TelegramInboundRecord, TelegramOutboundRecord, TelegramPendingPairing,
+        TelegramSenderMetadata,
     };
     use crate::control_plane_store::{
         load_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
@@ -353,6 +354,37 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_intents_round_trip_and_sort_without_connector_metadata() {
+        let mut source = DaemonState::new();
+        for connector_id in ["telegram-z", "telegram-a"] {
+            source.credential_cleanup.insert(
+                connector_id.into(),
+                TelegramCredentialCleanupIntent {
+                    connector_id: connector_id.into(),
+                    created_at_ms: 1,
+                },
+            );
+        }
+
+        let snapshot = source.control_plane_snapshot();
+        assert_eq!(
+            snapshot
+                .credential_cleanup
+                .iter()
+                .map(|intent| intent.connector_id.as_str())
+                .collect::<Vec<_>>(),
+            ["telegram-a", "telegram-z"]
+        );
+        assert!(snapshot.connectors.is_empty());
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("non-secret credential cleanup intents should restore");
+        assert_eq!(restored.credential_cleanup.len(), 2);
+    }
+
+    #[test]
     fn snapshot_sorts_inbound_outbound_and_schedules_deterministically() {
         let mut state = DaemonState::new();
         let agent_id = state
@@ -547,10 +579,43 @@ mod tests {
         let mut outbound_wrong_owner = snapshot.clone();
         outbound_wrong_owner.outbound[0].agent_id = other_agent_id;
 
-        let mut schedule_missing_connector = snapshot;
+        let mut schedule_missing_connector = snapshot.clone();
         schedule_missing_connector.schedules[0].target = ScheduleTarget::Connector {
             connector_id: "missing-connector".into(),
         };
+
+        let mut blank_cleanup_intent = snapshot.clone();
+        blank_cleanup_intent
+            .credential_cleanup
+            .push(TelegramCredentialCleanupIntent {
+                connector_id: " ".into(),
+                created_at_ms: 1,
+            });
+
+        let mut zero_time_cleanup_intent = snapshot.clone();
+        zero_time_cleanup_intent
+            .credential_cleanup
+            .push(TelegramCredentialCleanupIntent {
+                connector_id: "orphan-zero".into(),
+                created_at_ms: 0,
+            });
+
+        let mut duplicate_cleanup_intent = snapshot.clone();
+        let duplicate = TelegramCredentialCleanupIntent {
+            connector_id: "orphan-duplicate".into(),
+            created_at_ms: 1,
+        };
+        duplicate_cleanup_intent
+            .credential_cleanup
+            .extend([duplicate.clone(), duplicate]);
+
+        let mut conflicting_cleanup_intent = snapshot;
+        conflicting_cleanup_intent
+            .credential_cleanup
+            .push(TelegramCredentialCleanupIntent {
+                connector_id: conflicting_cleanup_intent.connectors[0].id.clone(),
+                created_at_ms: 1,
+            });
 
         for invalid_snapshot in [
             duplicate_connector,
@@ -559,6 +624,10 @@ mod tests {
             outbound_missing_agent,
             outbound_wrong_owner,
             schedule_missing_connector,
+            blank_cleanup_intent,
+            zero_time_cleanup_intent,
+            duplicate_cleanup_intent,
+            conflicting_cleanup_intent,
         ] {
             let mut state = DaemonState::new();
             assert!(
@@ -569,6 +638,7 @@ mod tests {
             );
             assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
             assert!(state.connectors.is_empty());
+            assert!(state.credential_cleanup.is_empty());
             assert!(state.inbound.is_empty());
             assert!(state.outbound.is_empty());
             assert!(state.schedules.is_empty());
@@ -585,7 +655,9 @@ mod tests {
         let mut duplicate_inbound_idempotency = snapshot.clone();
         let mut duplicate_inbound = duplicate_inbound_idempotency.inbound[0].clone();
         duplicate_inbound.update_id = 43;
-        duplicate_inbound_idempotency.inbound.push(duplicate_inbound);
+        duplicate_inbound_idempotency
+            .inbound
+            .push(duplicate_inbound);
 
         let mut blank_import_idempotency = snapshot.clone();
         blank_import_idempotency.schedules[0].import_idempotency_key = Some(" ".into());
@@ -593,7 +665,9 @@ mod tests {
         let mut duplicate_import_idempotency = snapshot.clone();
         let mut duplicate_schedule = duplicate_import_idempotency.schedules[0].clone();
         duplicate_schedule.id = "schedule-2".into();
-        duplicate_import_idempotency.schedules.push(duplicate_schedule);
+        duplicate_import_idempotency
+            .schedules
+            .push(duplicate_schedule);
 
         let mut dangling_assistant = snapshot.clone();
         dangling_assistant.outbound[0].assistant_message_id = "missing-message".into();
@@ -607,7 +681,9 @@ mod tests {
         let mut duplicate_delivery_identity = snapshot.clone();
         let mut duplicate_delivery = duplicate_delivery_identity.outbound[0].clone();
         duplicate_delivery.id = "outbound-2".into();
-        duplicate_delivery_identity.outbound.push(duplicate_delivery);
+        duplicate_delivery_identity
+            .outbound
+            .push(duplicate_delivery);
 
         let mut blank_prompt = snapshot.clone();
         blank_prompt.schedules[0].prompt = " \t".into();
@@ -685,7 +761,9 @@ mod tests {
         ] {
             let mut state = DaemonState::new();
             assert!(
-                state.restore_control_plane_snapshot(invalid_snapshot).is_err(),
+                state
+                    .restore_control_plane_snapshot(invalid_snapshot)
+                    .is_err(),
                 "invalid durable identity or schedule state must reject the full restore"
             );
             assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
@@ -1083,6 +1161,7 @@ pub(crate) struct DaemonState {
     pub(crate) swarm_events: HashMap<String, EventFanout>,
     pub(crate) swarm_snapshots: HashMap<String, SwarmState>,
     pub(crate) connectors: HashMap<String, TelegramConnectorRecord>,
+    pub(crate) credential_cleanup: HashMap<String, TelegramCredentialCleanupIntent>,
     pub(crate) inbound: HashMap<(String, i64), TelegramInboundRecord>,
     pub(crate) outbound: HashMap<String, TelegramOutboundRecord>,
     pub(crate) schedules: HashMap<String, ScheduledPromptRecord>,
@@ -1219,6 +1298,7 @@ impl DaemonState {
             swarm_events: HashMap::new(),
             swarm_snapshots: HashMap::new(),
             connectors: HashMap::new(),
+            credential_cleanup: HashMap::new(),
             inbound: HashMap::new(),
             outbound: HashMap::new(),
             schedules: HashMap::new(),
@@ -1308,6 +1388,12 @@ impl DaemonState {
         swarms.sort_by(|left, right| left.state.id.cmp(&right.state.id));
         let mut connectors = self.connectors.values().cloned().collect::<Vec<_>>();
         connectors.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut credential_cleanup = self
+            .credential_cleanup
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        credential_cleanup.sort_by(|left, right| left.connector_id.cmp(&right.connector_id));
         let mut inbound = self.inbound.values().cloned().collect::<Vec<_>>();
         inbound.sort_by(|left, right| {
             left.connector_id
@@ -1319,8 +1405,14 @@ impl DaemonState {
         let mut schedules = self.schedules.values().cloned().collect::<Vec<_>>();
         schedules.sort_by(|left, right| left.id.cmp(&right.id));
 
-        ControlPlaneSnapshot::with_connector_state(
-            agents, swarms, connectors, inbound, outbound, schedules,
+        ControlPlaneSnapshot::with_connector_state_and_cleanup(
+            agents,
+            swarms,
+            connectors,
+            credential_cleanup,
+            inbound,
+            outbound,
+            schedules,
         )
     }
 
@@ -1348,6 +1440,11 @@ impl DaemonState {
             .connectors
             .into_iter()
             .map(|connector| (connector.id.clone(), connector))
+            .collect();
+        self.credential_cleanup = snapshot
+            .credential_cleanup
+            .into_iter()
+            .map(|intent| (intent.connector_id.clone(), intent))
             .collect();
         self.inbound = snapshot
             .inbound
@@ -1446,6 +1543,20 @@ impl DaemonState {
                 ));
             }
             connectors.insert(connector.id.clone(), connector.clone());
+        }
+
+        let mut cleanup_ids = HashSet::new();
+        for intent in &snapshot.credential_cleanup {
+            if intent.connector_id.trim().is_empty()
+                || intent.created_at_ms == 0
+                || !cleanup_ids.insert(intent.connector_id.clone())
+                || connector_ids.contains(&intent.connector_id)
+            {
+                return Err(format!(
+                    "invalid or conflicting credential cleanup intent: {}",
+                    intent.connector_id
+                ));
+            }
         }
 
         let mut inbound_keys = HashSet::new();
@@ -1619,7 +1730,9 @@ impl DaemonState {
                 }
             }
             match &schedule.trigger {
-                crate::schedules::ScheduleTrigger::Interval { interval_ms } if *interval_ms == 0 => {
+                crate::schedules::ScheduleTrigger::Interval { interval_ms }
+                    if *interval_ms == 0 =>
+                {
                     return Err(format!("schedule '{}' has a zero interval", schedule.id));
                 }
                 crate::schedules::ScheduleTrigger::Daily {

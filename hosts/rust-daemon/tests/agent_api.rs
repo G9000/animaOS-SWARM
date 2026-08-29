@@ -774,6 +774,16 @@ async fn delete_agent_removes_runtime_and_returns_deleted_flag() {
 }
 
 #[tokio::test]
+async fn delete_unknown_agent_retains_not_found_semantics() {
+    let app = test_app();
+
+    let (status, response) = send_empty_request(&app, "DELETE", "/api/agents/agent-missing").await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(response.contains("\"error\":\"not found\""));
+}
+
+#[tokio::test]
 async fn run_agent_executes_memory_search_tool_round_trip() {
     let app = test_app();
     let (_, create_response) = create_agent(

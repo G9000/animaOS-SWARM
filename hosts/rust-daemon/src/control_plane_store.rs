@@ -8,10 +8,13 @@ use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
-use crate::connectors::{TelegramConnectorRecord, TelegramInboundRecord, TelegramOutboundRecord};
+use crate::connectors::{
+    TelegramConnectorRecord, TelegramCredentialCleanupIntent, TelegramInboundRecord,
+    TelegramOutboundRecord,
+};
 use crate::schedules::ScheduledPromptRecord;
 
-const CONTROL_PLANE_STORE_VERSION: u32 = 2;
+const CONTROL_PLANE_STORE_VERSION: u32 = 3;
 const CONTROL_PLANE_SNAPSHOT_KEY: &str = "control_plane";
 
 #[derive(Clone, Debug)]
@@ -54,6 +57,8 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) swarms: Vec<StoredSwarmSnapshot>,
     #[serde(default)]
     pub(crate) connectors: Vec<TelegramConnectorRecord>,
+    #[serde(default)]
+    pub(crate) credential_cleanup: Vec<TelegramCredentialCleanupIntent>,
     #[serde(default)]
     pub(crate) inbound: Vec<TelegramInboundRecord>,
     #[serde(default)]
@@ -250,11 +255,32 @@ impl ControlPlaneSnapshot {
         outbound: Vec<TelegramOutboundRecord>,
         schedules: Vec<ScheduledPromptRecord>,
     ) -> Self {
+        Self::with_connector_state_and_cleanup(
+            agents,
+            swarms,
+            connectors,
+            vec![],
+            inbound,
+            outbound,
+            schedules,
+        )
+    }
+
+    pub(crate) fn with_connector_state_and_cleanup(
+        agents: Vec<AgentRuntimeSnapshot>,
+        swarms: Vec<StoredSwarmSnapshot>,
+        connectors: Vec<TelegramConnectorRecord>,
+        credential_cleanup: Vec<TelegramCredentialCleanupIntent>,
+        inbound: Vec<TelegramInboundRecord>,
+        outbound: Vec<TelegramOutboundRecord>,
+        schedules: Vec<ScheduledPromptRecord>,
+    ) -> Self {
         Self {
             version: CONTROL_PLANE_STORE_VERSION,
             agents,
             swarms,
             connectors,
+            credential_cleanup,
             inbound,
             outbound,
             schedules,
@@ -292,7 +318,7 @@ mod tests {
         let loaded = super::load_json_snapshot(&path)
             .expect("replacement should load")
             .expect("replacement should exist");
-        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.version, 3);
         assert_no_temp_residue(&path);
         let _ = std::fs::remove_dir_all(path.parent().expect("snapshot path has a parent"));
     }
@@ -346,12 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_serializes_version_two_with_empty_connector_collections() {
+    fn snapshot_serializes_current_version_with_empty_connector_collections() {
         let snapshot = ControlPlaneSnapshot::new(vec![], vec![]);
         let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
 
-        assert_eq!(payload["version"], 2);
+        assert_eq!(payload["version"], 3);
         assert_eq!(payload["connectors"], serde_json::json!([]));
+        assert_eq!(payload["credentialCleanup"], serde_json::json!([]));
         assert_eq!(payload["inbound"], serde_json::json!([]));
         assert_eq!(payload["outbound"], serde_json::json!([]));
         assert_eq!(payload["schedules"], serde_json::json!([]));
@@ -368,9 +395,26 @@ mod tests {
 
         let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
         assert_eq!(payload["connectors"], serde_json::json!([]));
+        assert_eq!(payload["credentialCleanup"], serde_json::json!([]));
         assert_eq!(payload["inbound"], serde_json::json!([]));
         assert_eq!(payload["outbound"], serde_json::json!([]));
         assert_eq!(payload["schedules"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn version_two_payload_defaults_cleanup_intents_to_empty() {
+        let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "agents": [],
+            "swarms": [],
+            "connectors": [],
+            "inbound": [],
+            "outbound": [],
+            "schedules": []
+        }))
+        .expect("version-two snapshot should deserialize");
+
+        assert!(snapshot.credential_cleanup.is_empty());
     }
 
     #[test]
@@ -390,6 +434,7 @@ mod tests {
             .expect("version-one snapshot should load")
             .expect("version-one snapshot should exist");
         assert!(snapshot.connectors.is_empty());
+        assert!(snapshot.credential_cleanup.is_empty());
         assert!(snapshot.inbound.is_empty());
         assert!(snapshot.outbound.is_empty());
         assert!(snapshot.schedules.is_empty());
@@ -410,6 +455,7 @@ mod tests {
             "the row version supplies v1 when absent"
         );
         assert!(snapshot.connectors.is_empty());
+        assert!(snapshot.credential_cleanup.is_empty());
         assert!(snapshot.inbound.is_empty());
         assert!(snapshot.outbound.is_empty());
         assert!(snapshot.schedules.is_empty());

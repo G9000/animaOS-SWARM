@@ -25,6 +25,15 @@ pub(crate) struct TelegramConnectorRecord {
     pub(crate) updated_at_ms: u64,
 }
 
+/// Durable, non-secret evidence that a generated vault account may need
+/// cleanup before the connector can be published safely.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TelegramCredentialCleanupIntent {
+    pub(crate) connector_id: String,
+    pub(crate) created_at_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TelegramBotIdentity {
