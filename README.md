@@ -29,7 +29,7 @@ The terminal UI is the primary local operator surface. The web UI is secondary a
 The reusable Rust runtime core lives under `packages/core-rust`, the current runnable Rust host lives under `hosts/rust-daemon`, and the TypeScript core port lives under `packages/core-ts`.
 
 - `packages/core-rust` contains the reusable Rust runtime crates: `anima-core`, `anima-swarm`, and `anima-memory`.
-- `hosts/rust-daemon` contains the runnable Axum host package, `anima-daemon`, which exposes the current HTTP/SSE boundary on top of the reusable Rust core.
+- `hosts/rust-daemon` contains the runnable Axum host package, `anima-daemon`, which exposes the current HTTP/SSE boundary and embeds persisted Telegram connectors on top of the reusable Rust core.
 - `packages/sdk` is the public TypeScript client for that runtime.
 - `packages/core-ts` is the shared TypeScript core port used by the SDK, CLI, TUI, and UI. It is not the source of truth for execution behavior.
 
@@ -52,7 +52,8 @@ bun run affected:test
 # Open the project graph
 bun run graph
 
-# Start the default local workspace (same as `bun dev --host rust`)
+# Start the default local workspace (same as `bun dev --host rust`).
+# The daemon automatically starts any persisted Telegram connectors.
 bun dev
 
 # Start the daemon only for local launch/chat workflows

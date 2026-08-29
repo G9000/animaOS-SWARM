@@ -20,6 +20,7 @@ Its job is to:
 5. Stream swarm events over SSE.
 6. Optionally attach a Postgres-backed `DatabaseAdapter` for step-log persistence and request-keyed retry tool-step recovery.
 7. Optionally load and autosave host-owned control-plane and memory snapshots through JSON/SQLite files or the Postgres `host_snapshots` table.
+8. Own Telegram connector polling, pairing, dedicated agent rooms, outbound delivery, and daemon-backed scheduled delivery.
 
 Without `ANIMAOS_RS_CONTROL_PLANE_FILE` or Postgres mode, the daemon is an `ephemeral` control plane. With a control-plane file or Postgres mode configured, it restores registered agents, registered swarms, latest snapshots, and swarm message history after restart. Running work is restored as failed/interrupted because the daemon does not resume a model turn from the middle. Enabling Postgres also adds durable step logs and lets retried tool steps reuse previously completed results when the caller repeats the same explicit retry key in request metadata.
 
@@ -42,6 +43,7 @@ graph TD
     ControlPlane["control_plane_store.rs\ncontrol-plane snapshot"]
     MemoryStore["memory_store.rs\nmemory snapshot"]
     Providers["External model providers"]
+    Telegram["Telegram Bot API"]
 
     Client --> Main
     Main --> App
@@ -55,6 +57,7 @@ graph TD
     Swarm --> Events
     Runtime --> Events
     Model --> Providers
+    App --> Telegram
     State -. optional .-> Postgres
     State -. optional .-> ControlPlane
     State -. optional .-> MemoryStore
@@ -71,6 +74,9 @@ graph TD
 | `hosts/rust-daemon/src/memory_store.rs` | Host-owned JSON, SQLite, or Postgres snapshot store for `anima-memory` state. |
 | `hosts/rust-daemon/src/routes/mod.rs` | Owns the router, request middleware, timeout policy, run admission semaphore, OpenAPI, and Scalar docs wiring. |
 | `hosts/rust-daemon/src/routes/agents.rs` | Create, list, fetch, delete, recent-memory, and run handlers for agents. |
+| `hosts/rust-daemon/src/routes/connectors.rs` | Local-owner API for agent-scoped Telegram connector setup, pairing, restart, messages, and removal. |
+| `hosts/rust-daemon/src/connectors/` | Persisted Telegram connector records, OS credential storage, Bot API transport, and supervised polling/delivery workers. |
+| `hosts/rust-daemon/src/schedules.rs` | Daemon-backed schedules, including optional Telegram delivery targets. |
 | `hosts/rust-daemon/src/routes/memories.rs` | HTTP surface for memory create, recent, and search operations. |
 | `hosts/rust-daemon/src/routes/swarms.rs` | Create, list, fetch, run, and SSE subscription handlers for swarms. |
 | `hosts/rust-daemon/src/routes/health.rs` | Liveness, readiness, and metrics computation. |
@@ -99,6 +105,7 @@ sequenceDiagram
     A->>S: Build DaemonState with RuntimeModelAdapter and EventFanout
     A->>P: configure_persistence(state, persistence_mode)
     P-->>A: Inject optional SqlxPostgresAdapter
+    A->>A: Start restored Telegram connectors
     A->>R: Build Axum router
     A->>A: Start server with graceful shutdown
 ```
@@ -118,8 +125,15 @@ The important steps are:
    - connects to Postgres, runs migrations from `hosts/rust-daemon/migrations`, creates `SqlxPostgresAdapter`, and injects it into shared state
 5. `configure_persistence()` loads memory snapshots from explicit JSON/SQLite env vars, or from Postgres `host_snapshots` in Postgres mode when no file store is set.
 6. `configure_persistence()` loads registered agents and swarms from explicit `ANIMAOS_RS_CONTROL_PLANE_FILE`, or from Postgres `host_snapshots` in Postgres mode when no file store is set.
-7. `routes::router()` builds the HTTP API, OpenAPI document, and Scalar UI.
-8. `serve_with_state()` runs Axum with graceful shutdown on `Ctrl+C`.
+7. The connector manager reconciles persisted credential cleanup and automatically starts enabled Telegram connectors after the control plane is restored.
+8. `routes::router()` builds the HTTP API, OpenAPI document, and Scalar UI.
+9. `serve_with_state()` runs Axum with graceful shutdown on `Ctrl+C`, then stops and joins connector workers.
+
+Telegram bot credentials are not stored in the control-plane snapshot. The
+daemon stores them in the OS credential store and keeps only non-secret,
+agent-scoped connector metadata in its snapshot. The normal `bun dev --host
+rust` workflow therefore needs neither a separate gateway process nor a shared
+Telegram token environment variable.
 
 ## Shared State Model
 

@@ -8,8 +8,7 @@ This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime pa
 - `packages/core-ts` is the TypeScript host-agnostic core package. Its npm package name is still `@animaOS-SWARM/core`.
 - `packages/*` is for reusable libraries, SDKs, runtime ports, and shared tooling.
 - `hosts/*` is for runnable backend host processes only. Hosts wrap a core implementation and expose it over a runtime boundary such as HTTP, WebSocket, SSE, jobs, or another process interface.
-- `hosts/rust-daemon` is the ready Rust host. `hosts/elixir-phoenix` and `hosts/python-service` are placeholder host projects until implemented.
-- `hosts/telegram-gateway` is a thin Rust host that bridges Telegram to the daemon HTTP API; it is a pure client of the daemon with no agent/engine logic.
+- `hosts/rust-daemon` is the ready Rust host. It embeds the Telegram connector runtime, including polling, pairing, delivery, persistence, and restart recovery. `hosts/elixir-phoenix` and `hosts/python-service` are placeholder host projects until implemented.
 - `apps/*` is for user-facing app surfaces such as the `web` runtime console, `playground`, `web-e2e`, the Astro docs apps, and the legacy local TypeScript server.
 - `tools/*` is for workspace tooling such as the `workspace-dev` launcher.
 
@@ -23,7 +22,7 @@ This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime pa
 
 # Dev Workflow
 
-- Use `bun dev --host rust` for the normal local workflow. It runs the selected host plus both browser surfaces, `@animaOS-SWARM/web` and `@animaOS-SWARM/playground`, through `workspace-dev`. The web console talks only to the daemon on `127.0.0.1:8080`.
+- Use `bun dev --host rust` for the normal local workflow. It runs the selected host plus both browser surfaces, `@animaOS-SWARM/web` and `@animaOS-SWARM/playground`, through `workspace-dev`. The web console talks only to the daemon on `127.0.0.1:8080`. The daemon automatically starts restored Telegram connectors; no separate gateway process or token environment variable is used.
 - The current supported host keys are `rust`, `elixir`, and `python`; only `rust` is production-ready today.
 - Use Nx project targets for host work: `bun x nx run rust-daemon:dev`, `bun x nx run rust-daemon:build`, `bun x nx run rust-daemon:test`, and `bun x nx run rust-daemon:lint`.
 - Use Nx project targets for docs work: `bun x nx run @animaOS-SWARM/docs:build` and `bun x nx run @animaOS-SWARM/contributor-docs:build`.

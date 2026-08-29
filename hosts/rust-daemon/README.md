@@ -3,7 +3,9 @@
 `anima-daemon` is the runnable Rust host in `hosts/rust-daemon`. It is the
 current Axum HTTP/SSE boundary for animaOS, wiring the reusable crates in
 `packages/core-rust` to real infrastructure such as model providers, optional
-Postgres persistence, and streaming clients.
+Postgres persistence, streaming clients, and Telegram. Telegram polling,
+pairing, dedicated message threads, scheduled delivery, and restart recovery
+run inside this daemon; there is no second connector process.
 
 For an implementation walkthrough, see [Rust Daemon Architecture](../../docs/rust-daemon-architecture.md).
 
@@ -127,6 +129,12 @@ For the normal workspace loop, run:
 ```bash
 bun dev --host rust
 ```
+
+This starts the daemon and browser surfaces. After control-plane persistence is
+loaded, the daemon automatically starts every enabled Telegram connector whose
+credential is available in the OS credential store. Add or replace bot tokens
+through the web connector settings or daemon API; do not set a shared Telegram
+token environment variable.
 
 To run only the host process through Nx, use:
 
