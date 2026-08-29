@@ -1,4 +1,6 @@
-use super::contracts::{WorkspaceConfigResponse, WorkspaceResponse};
+use std::path::{Path, PathBuf};
+
+use super::contracts::{WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceResponse};
 use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::control_plane_store::WorkspaceConfig;
@@ -18,6 +20,108 @@ pub(crate) async fn handle_get_workspace(
     })
 }
 
+pub(crate) async fn handle_put_workspace(
+    body: Vec<u8>,
+    state: &SharedDaemonState,
+) -> Result<WorkspaceResponse, ApiError> {
+    let request: WorkspaceConfigRequest = super::parse_json_body(body)?;
+    let root_existed = Path::new(request.root_path.trim()).exists();
+    let config = validate_workspace_request(&request)?;
+
+    if request.validate_only {
+        let currently_configured = {
+            let guard = state.read().await;
+            guard.workspace.is_some()
+        };
+        return Ok(WorkspaceResponse {
+            configured: currently_configured,
+            workspace: Some(config_response(&config)),
+            default_root: default_root_label(),
+            root_path_exists: Some(root_existed),
+        });
+    }
+
+    let persist_request = {
+        let mut guard = state.write().await;
+        guard.workspace = Some(config);
+        guard.control_plane_persist_request()
+    };
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+
+    handle_get_workspace(state).await
+}
+
+pub(super) fn validate_workspace_request(
+    request: &WorkspaceConfigRequest,
+) -> Result<WorkspaceConfig, ApiError> {
+    let company = request.company_name.trim();
+    if company.is_empty() {
+        return Err(ApiError::bad_request_static("companyName is required"));
+    }
+    let mission = request.mission.trim();
+    if mission.is_empty() {
+        return Err(ApiError::bad_request_static("mission is required"));
+    }
+    let root = validate_root_path(&request.root_path, request.validate_only)?;
+    let values = request
+        .values
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .take(5)
+        .collect();
+    Ok(WorkspaceConfig {
+        root_path: root,
+        company_name: company.to_string(),
+        mission: mission.to_string(),
+        values,
+    })
+}
+
+fn validate_root_path(raw: &str, validate_only: bool) -> Result<PathBuf, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request_static("rootPath is required"));
+    }
+    let candidate = PathBuf::from(trimmed);
+    if !candidate.is_absolute() {
+        return Err(ApiError::bad_request_static(
+            "rootPath must be an absolute path",
+        ));
+    }
+    if candidate.exists() {
+        if !candidate.is_dir() {
+            return Err(ApiError::bad_request_static("rootPath is not a directory"));
+        }
+    } else {
+        let ancestor = candidate
+            .ancestors()
+            .skip(1)
+            .find(|path| path.exists())
+            .ok_or_else(|| ApiError::bad_request_static("rootPath has no existing ancestor"))?;
+        if !ancestor.is_dir() {
+            return Err(ApiError::bad_request_static(
+                "rootPath's nearest existing ancestor is not a directory",
+            ));
+        }
+        if !validate_only {
+            std::fs::create_dir_all(&candidate).map_err(|error| {
+                ApiError::bad_request(format!("rootPath could not be created: {error}"))
+            })?;
+        }
+    }
+    if validate_only && !candidate.exists() {
+        // Nothing to canonicalize yet; return as-is.
+        return Ok(candidate);
+    }
+    candidate.canonicalize().map_err(|error| {
+        ApiError::bad_request(format!("rootPath could not be resolved: {error}"))
+    })
+}
+
 pub(super) fn config_response(config: &WorkspaceConfig) -> WorkspaceConfigResponse {
     WorkspaceConfigResponse {
         root_path: config.root_path.display().to_string(),
@@ -28,10 +132,9 @@ pub(super) fn config_response(config: &WorkspaceConfig) -> WorkspaceConfigRespon
 }
 
 pub(super) fn default_root_label() -> String {
-    match std::env::var("ANIMAOS_WORKSPACE_ROOT") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => std::env::current_dir()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-    }
+    // Delegates to the same resolution the tools use so the label never
+    // diverges (including the empty-env-var edge case).
+    crate::tools::workspace_root_path("workspace", None)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default()
 }

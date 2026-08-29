@@ -43,7 +43,7 @@ use self::contracts::{
     MemoryRetentionReportResponse, MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery,
     ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
     SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
-    WorkspaceResponse,
+    WorkspaceConfigRequest, WorkspaceResponse,
 };
 pub(crate) use self::contracts::{
     AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
@@ -88,6 +88,7 @@ use crate::runtime_model::provider_summaries;
         swarm_events_entry,
         list_providers_entry,
         get_workspace_entry,
+        put_workspace_entry,
         connectors::list_connectors,
         connectors::create_telegram_connector,
         connectors::replace_telegram_credential,
@@ -262,7 +263,10 @@ fn router_with_services_with_policies(
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/ready", get(ready_entry))
-        .route("/api/workspace", get(get_workspace_entry))
+        .route(
+            "/api/workspace",
+            get(get_workspace_entry).put(put_workspace_entry),
+        )
         .route(
             "/api/agencies/create",
             axum::routing::post(create_agency_entry),
@@ -1142,6 +1146,30 @@ async fn get_workspace_entry(State(state): State<AppState>) -> AxumResponse {
     match workspace::handle_get_workspace(&state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/workspace",
+    tag = "workspace",
+    request_body = WorkspaceConfigRequest,
+    responses(
+        (status = 200, description = "Workspace configuration validated (validate-only) or persisted", body = WorkspaceResponse),
+        (status = 400, description = "Invalid request or workspace root path", body = ErrorBody),
+        (status = 503, description = "Workspace configuration could not be persisted", body = ErrorBody)
+    )
+)]
+async fn put_workspace_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => {
+            let _transaction = state.agent_runs.control_plane_transaction().await;
+            match workspace::handle_put_workspace(body, &state.daemon).await {
+                Ok(response) => json_response(StatusCode::OK, &response),
+                Err(error) => error.into_response(),
+            }
+        }
+        Err(response) => response,
     }
 }
 

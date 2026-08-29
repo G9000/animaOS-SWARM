@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceConfigResponse {
@@ -24,10 +23,9 @@ pub(crate) struct WorkspaceResponse {
     pub(crate) root_path_exists: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 // Consumed by PUT /api/workspace and POST /api/workspace/bootstrap (Tasks 4/6).
-#[allow(dead_code)]
 pub(crate) struct WorkspaceConfigRequest {
     pub(crate) root_path: String,
     pub(crate) company_name: String,
