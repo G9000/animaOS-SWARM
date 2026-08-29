@@ -3,6 +3,7 @@ mod agents;
 mod connectors;
 mod memories;
 mod providers;
+mod schedules;
 mod shared;
 mod swarms;
 
@@ -26,6 +27,7 @@ pub(crate) use memories::{
     RecentMemoriesQuery,
 };
 pub(crate) use providers::{ProviderResponse, ProvidersEnvelope};
+pub(crate) use schedules::*;
 pub(crate) use shared::{
     DeleteResponse, ErrorBody, HealthResponse, ReadinessResponse, TaskRequest, TaskResultResponse,
 };

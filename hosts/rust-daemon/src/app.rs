@@ -26,6 +26,7 @@ use crate::connectors::{
 use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::routes;
 use crate::runtime_model::RuntimeModelAdapter;
+use crate::schedules::SchedulerService;
 use crate::state::DaemonState;
 use crate::tools::DEFAULT_MAX_BACKGROUND_PROCESSES;
 
@@ -35,6 +36,7 @@ struct DaemonRuntime {
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connectors: ConnectorManager,
+    scheduler: SchedulerService,
 }
 
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
@@ -143,6 +145,7 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     configure_persistence(&state, &config).await?;
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
     runtime.connectors.start_restored().await;
+    runtime.scheduler.start().await;
     Ok(router_with_runtime(state, config, runtime, false))
 }
 
@@ -169,11 +172,14 @@ pub(crate) async fn serve_with_state(
     let bind_is_loopback = listener.local_addr()?.ip().is_loopback();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
     runtime.connectors.start_restored().await;
+    runtime.scheduler.start().await;
     let connectors = runtime.connectors.clone();
+    let scheduler = runtime.scheduler.clone();
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            scheduler.shutdown().await;
             connectors.shutdown().await;
         })
         .await
@@ -185,15 +191,17 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
     let transport = TelegramClient::new()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     let connectors = ConnectorManager::new(
-        state,
+        Arc::clone(&state),
         agent_runs.clone(),
         Arc::new(OsKeyringCredentialStore::new()),
         Arc::new(transport),
     );
+    let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     Ok(DaemonRuntime {
         run_limiter,
         agent_runs,
         connectors,
+        scheduler,
     })
 }
 
@@ -201,15 +209,17 @@ fn deterministic_daemon_runtime(state: SharedDaemonState, config: &DaemonConfig)
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
     let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
     let connectors = ConnectorManager::new(
-        state,
+        Arc::clone(&state),
         agent_runs.clone(),
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(DeterministicTelegramTransport),
     );
+    let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     DaemonRuntime {
         run_limiter,
         agent_runs,
         connectors,
+        scheduler,
     }
 }
 
@@ -219,12 +229,13 @@ fn router_with_runtime(
     runtime: DaemonRuntime,
     bind_is_loopback: bool,
 ) -> Router {
-    routes::router_with_services(
+    routes::router_with_all_services(
         state,
         config,
         runtime.run_limiter,
         runtime.agent_runs,
         runtime.connectors,
+        runtime.scheduler,
         bind_is_loopback,
     )
 }

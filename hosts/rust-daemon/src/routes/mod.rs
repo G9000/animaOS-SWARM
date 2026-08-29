@@ -5,6 +5,7 @@ mod contracts;
 mod health;
 mod http;
 mod memories;
+mod schedules;
 mod swarms;
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use utoipa_scalar::Scalar;
 use crate::agent_runs::AgentRunCoordinator;
 use crate::app::{DaemonConfig, SharedDaemonState};
 use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError};
+use crate::schedules::SchedulerService;
 
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
@@ -91,6 +93,11 @@ use crate::runtime_model::provider_summaries;
         connectors::delete_telegram_connector,
         connectors::list_connector_messages,
         connectors::send_connector_message,
+        schedules::list_schedules,
+        schedules::create_schedule,
+        schedules::update_schedule,
+        schedules::delete_schedule,
+        schedules::import_legacy_schedules,
     ),
     tags(
         (name = "health", description = "Daemon health endpoints"),
@@ -101,6 +108,7 @@ use crate::runtime_model::provider_summaries;
         (name = "providers", description = "Model provider catalog"),
         (name = "connectors", description = "Agent-scoped connector administration"),
         (name = "connector-thread", description = "Dedicated connector-room messages"),
+        (name = "schedules", description = "Daemon-backed scheduled prompts"),
     )
 )]
 struct ApiDoc;
@@ -112,6 +120,7 @@ struct AppState {
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    scheduler: SchedulerService,
     local_owner: self::http::LocalOwnerPolicy,
 }
 
@@ -163,6 +172,7 @@ impl IntoResponse for ApiError {
     }
 }
 
+#[allow(dead_code)] // Compatibility constructor used by focused route tests.
 pub(crate) fn router_with_services(
     state: SharedDaemonState,
     config: DaemonConfig,
@@ -171,12 +181,38 @@ pub(crate) fn router_with_services(
     connector_manager: ConnectorManager,
     bind_is_loopback: bool,
 ) -> Router {
+    let scheduler = SchedulerService::new(
+        Arc::clone(&state),
+        agent_runs.clone(),
+        connector_manager.clone(),
+    );
+    router_with_all_services(
+        state,
+        config,
+        run_limiter,
+        agent_runs,
+        connector_manager,
+        scheduler,
+        bind_is_loopback,
+    )
+}
+
+pub(crate) fn router_with_all_services(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    run_limiter: Arc<Semaphore>,
+    agent_runs: AgentRunCoordinator,
+    connector_manager: ConnectorManager,
+    scheduler: SchedulerService,
+    bind_is_loopback: bool,
+) -> Router {
     router_with_services_with_policies(
         state,
         config,
         run_limiter,
         agent_runs,
         connector_manager,
+        scheduler,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
     )
@@ -188,6 +224,7 @@ fn router_with_services_with_policies(
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    scheduler: SchedulerService,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
@@ -197,6 +234,7 @@ fn router_with_services_with_policies(
         run_limiter: Arc::clone(&run_limiter),
         agent_runs,
         connector_manager,
+        scheduler,
         local_owner,
     };
     let request_middleware = ServiceBuilder::new()
@@ -275,6 +313,18 @@ fn router_with_services_with_policies(
         )
         .route("/api/swarms/{swarm_id}", get(get_swarm_entry))
         .route("/api/providers", get(list_providers_entry))
+        .route(
+            "/api/agents/{agent_id}/schedules",
+            get(schedules::list_schedules).post(schedules::create_schedule),
+        )
+        .route(
+            "/api/agents/{agent_id}/schedules/import",
+            axum::routing::post(schedules::import_legacy_schedules),
+        )
+        .route(
+            "/api/agents/{agent_id}/schedules/{schedule_id}",
+            axum::routing::patch(schedules::update_schedule).delete(schedules::delete_schedule),
+        )
         .route(
             "/api/agents/{agent_id}/connectors",
             get(connectors::list_connectors),
@@ -1618,12 +1668,18 @@ mod tests {
             Arc::new(InMemoryCredentialStore::default()),
             Arc::new(CountingTelegramTransport::default()),
         );
+        let scheduler = crate::schedules::SchedulerService::new(
+            Arc::clone(&state),
+            runs.clone(),
+            manager.clone(),
+        );
         let app = router_with_services_with_policies(
             Arc::clone(&state),
             DaemonConfig::default(),
             limiter,
             runs,
             manager,
+            scheduler,
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),
         );

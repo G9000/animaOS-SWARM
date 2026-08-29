@@ -21,7 +21,7 @@ use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
-use crate::schedules::ScheduleTarget;
+use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
 use crate::state::DaemonState;
 
 static CONNECTOR_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -1601,6 +1601,7 @@ impl ConnectorManager {
                         }
                     }
                 }
+                state.schedules.retain(|_, schedule| schedule.agent_id != agent_id);
                 state.remove_agent(&agent_id);
                 let persist = state.control_plane_persist_request();
                 (
@@ -1780,6 +1781,11 @@ impl ConnectorManager {
                 ) {
                     schedule.enabled = false;
                     schedule.updated_at_ms = now;
+                    schedule.last_safe_outcome = Some(ScheduleSafeOutcome {
+                        status: ScheduleOutcomeStatus::Failed,
+                        occurred_at_ms: now,
+                        error_code: Some("schedule_target_unavailable".into()),
+                    });
                 }
             }
             let persist = state.control_plane_persist_request();

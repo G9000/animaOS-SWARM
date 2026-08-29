@@ -1060,8 +1060,9 @@ mod tests {
                 run_idempotency_key: "schedule-1:13".into(),
             }),
             last_safe_outcome: Some(ScheduleSafeOutcome {
-                status: ScheduleOutcomeStatus::Succeeded,
+                status: ScheduleOutcomeStatus::Spoke,
                 occurred_at_ms: 13,
+                error_code: None,
             }),
             created_at_ms: 10,
             updated_at_ms: 14,
@@ -1721,7 +1722,10 @@ impl DaemonState {
             if let Some(import_idempotency_key) = &schedule.import_idempotency_key {
                 let import_idempotency_key = import_idempotency_key.trim();
                 if import_idempotency_key.is_empty()
-                    || !import_idempotency_keys.insert(import_idempotency_key.to_string())
+                    || !import_idempotency_keys.insert((
+                        schedule.agent_id.clone(),
+                        import_idempotency_key.to_string(),
+                    ))
                 {
                     return Err(format!(
                         "schedule '{}' has a duplicate or empty import idempotency key",
@@ -1731,7 +1735,7 @@ impl DaemonState {
             }
             match &schedule.trigger {
                 crate::schedules::ScheduleTrigger::Interval { interval_ms }
-                    if *interval_ms == 0 =>
+                    if *interval_ms == 0 || *interval_ms % 1_000 != 0 =>
                 {
                     return Err(format!("schedule '{}' has a zero interval", schedule.id));
                 }
@@ -1739,7 +1743,11 @@ impl DaemonState {
                     hour,
                     minute,
                     time_zone,
-                } if *hour > 23 || *minute > 59 || time_zone.trim().is_empty() => {
+                } if *hour > 23
+                    || *minute > 59
+                    || time_zone.trim().is_empty()
+                    || time_zone.parse::<chrono_tz::Tz>().is_err() =>
+                {
                     return Err(format!(
                         "schedule '{}' has an invalid daily trigger",
                         schedule.id
