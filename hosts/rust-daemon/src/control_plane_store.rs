@@ -14,7 +14,7 @@ use crate::connectors::{
 };
 use crate::schedules::ScheduledPromptRecord;
 
-const CONTROL_PLANE_STORE_VERSION: u32 = 3;
+const CONTROL_PLANE_STORE_VERSION: u32 = 4;
 const CONTROL_PLANE_SNAPSHOT_KEY: &str = "control_plane";
 
 #[derive(Clone, Debug)]
@@ -46,6 +46,16 @@ impl ControlPlaneStoreConfig {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceConfig {
+    pub(crate) root_path: PathBuf,
+    pub(crate) company_name: String,
+    pub(crate) mission: String,
+    #[serde(default)]
+    pub(crate) values: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ControlPlaneSnapshot {
@@ -65,6 +75,8 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) outbound: Vec<TelegramOutboundRecord>,
     #[serde(default)]
     pub(crate) schedules: Vec<ScheduledPromptRecord>,
+    #[serde(default)]
+    pub(crate) workspace: Option<WorkspaceConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -284,13 +296,48 @@ impl ControlPlaneSnapshot {
             inbound,
             outbound,
             schedules,
+            workspace: None,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ControlPlaneSnapshot;
+    use super::{ControlPlaneSnapshot, WorkspaceConfig};
+    use std::path::PathBuf;
+
+    #[test]
+    fn v3_snapshot_without_workspace_loads_as_unconfigured() {
+        let json = r#"{
+            "version": 3,
+            "agents": [],
+            "swarms": [],
+            "connectors": [],
+            "credentialCleanup": [],
+            "inbound": [],
+            "outbound": [],
+            "schedules": []
+        }"#;
+        let snapshot: ControlPlaneSnapshot = serde_json::from_str(json).expect("v3 snapshot parses");
+        assert!(snapshot.workspace.is_none());
+    }
+
+    #[test]
+    fn workspace_config_round_trips() {
+        let config = WorkspaceConfig {
+            root_path: PathBuf::from("C:\\workspaces\\northwind"),
+            company_name: "Northwind Research".into(),
+            mission: "Continuous equity research".into(),
+            values: vec!["cite sources".into()],
+        };
+        let snapshot = ControlPlaneSnapshot {
+            workspace: Some(config.clone()),
+            ..Default::default()
+        };
+        let payload = serde_json::to_string(&snapshot).expect("serialize");
+        let restored: ControlPlaneSnapshot = serde_json::from_str(&payload).expect("deserialize");
+        assert_eq!(restored.workspace, Some(config));
+    }
 
     #[test]
     fn json_snapshot_replaces_an_existing_snapshot_only_after_a_synced_temp_write() {
@@ -318,7 +365,7 @@ mod tests {
         let loaded = super::load_json_snapshot(&path)
             .expect("replacement should load")
             .expect("replacement should exist");
-        assert_eq!(loaded.version, 3);
+        assert_eq!(loaded.version, 4);
         assert_no_temp_residue(&path);
         let _ = std::fs::remove_dir_all(path.parent().expect("snapshot path has a parent"));
     }
@@ -376,7 +423,7 @@ mod tests {
         let snapshot = ControlPlaneSnapshot::new(vec![], vec![]);
         let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
 
-        assert_eq!(payload["version"], 3);
+        assert_eq!(payload["version"], 4);
         assert_eq!(payload["connectors"], serde_json::json!([]));
         assert_eq!(payload["credentialCleanup"], serde_json::json!([]));
         assert_eq!(payload["inbound"], serde_json::json!([]));

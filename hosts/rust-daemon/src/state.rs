@@ -28,6 +28,7 @@ use crate::connectors::{
 };
 use crate::control_plane_store::{
     save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, StoredSwarmSnapshot,
+    WorkspaceConfig,
 };
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::memory_embeddings::{MemoryEmbeddingRuntime, SharedMemoryEmbeddings};
@@ -1166,6 +1167,7 @@ pub(crate) struct DaemonState {
     pub(crate) inbound: HashMap<(String, i64), TelegramInboundRecord>,
     pub(crate) outbound: HashMap<String, TelegramOutboundRecord>,
     pub(crate) schedules: HashMap<String, ScheduledPromptRecord>,
+    pub(crate) workspace: Option<WorkspaceConfig>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) process_manager: SharedProcessManager,
@@ -1303,6 +1305,7 @@ impl DaemonState {
             inbound: HashMap::new(),
             outbound: HashMap::new(),
             schedules: HashMap::new(),
+            workspace: None,
             model_adapter,
             tool_registry: ToolRegistry::new(),
             process_manager: new_shared_process_manager_with_limit(max_background_processes),
@@ -1406,7 +1409,7 @@ impl DaemonState {
         let mut schedules = self.schedules.values().cloned().collect::<Vec<_>>();
         schedules.sort_by(|left, right| left.id.cmp(&right.id));
 
-        ControlPlaneSnapshot::with_connector_state_and_cleanup(
+        let mut snapshot = ControlPlaneSnapshot::with_connector_state_and_cleanup(
             agents,
             swarms,
             connectors,
@@ -1414,7 +1417,9 @@ impl DaemonState {
             inbound,
             outbound,
             schedules,
-        )
+        );
+        snapshot.workspace = self.workspace.clone();
+        snapshot
     }
 
     pub(crate) fn restore_control_plane_snapshot(
@@ -1422,6 +1427,7 @@ impl DaemonState {
         snapshot: ControlPlaneSnapshot,
     ) -> Result<(usize, usize), String> {
         self.validate_control_plane_snapshot(&snapshot)?;
+        self.workspace = snapshot.workspace.clone();
         let mut restored_agents = 0;
         let mut restored_swarms = 0;
 
