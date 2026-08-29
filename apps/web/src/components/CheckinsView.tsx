@@ -1,10 +1,11 @@
 import type { AgentDetail } from '../lib/types';
-import { formatInterval, formatRelative, type Checkin } from '../lib/checkins';
+import { formatInterval, formatRelative } from '../lib/checkins';
+import type { DaemonSchedule } from '../lib/daemon-api';
 import { AlertIcon, PlusIcon, PulseIcon, TrashIcon } from './icons';
 import { ErrorBanner, primaryBtnCls } from './ui-bits';
 
 const OUTCOME_STYLE: Record<
-  NonNullable<Checkin['lastOutcome']>,
+  NonNullable<DaemonSchedule['lastOutcome']>['status'],
   { dot: string; label: string }
 > = {
   silent: { dot: 'bg-zinc-500', label: 'stayed silent' },
@@ -22,9 +23,13 @@ export function CheckinsView({
   addCheckin,
   removeCheckin,
   error,
+  target,
+  setTarget,
+  telegramAvailable,
+  busy,
 }: {
   agent: AgentDetail;
-  checkins: Checkin[];
+  checkins: DaemonSchedule[];
   prompt: string;
   setPrompt: (v: string) => void;
   intervalMin: number;
@@ -32,6 +37,10 @@ export function CheckinsView({
   addCheckin: () => void;
   removeCheckin: (id: string) => void;
   error: string | null;
+  target: 'workspace' | 'telegram';
+  setTarget: (value: 'workspace' | 'telegram') => void;
+  telegramAvailable: boolean;
+  busy: boolean;
 }) {
   return (
     <section
@@ -70,7 +79,7 @@ export function CheckinsView({
             keeps the run silent.
           </p>
           <p className="mt-2 font-mono text-[11px] text-ink-3">
-            runs while this tab is open · stored locally per agent
+            runs while anima-daemon is active · persisted per agent
           </p>
 
           {/* Add form */}
@@ -89,6 +98,27 @@ export function CheckinsView({
             />
             <div className="mt-3 flex items-center justify-between gap-3">
               <label className="flex items-center gap-2 font-mono text-[11px] text-ink-3">
+                deliver to
+                <select
+                  value={target}
+                  onChange={(event) =>
+                    setTarget(event.target.value as 'workspace' | 'telegram')
+                  }
+                  className="field w-auto px-2 py-1"
+                  disabled={busy}
+                >
+                  <option value="workspace">Workspace</option>
+                  <option value="telegram" disabled={!telegramAvailable}>
+                    Telegram
+                  </option>
+                </select>
+              </label>
+              {!telegramAvailable ? (
+                <span className="font-mono text-[10px] text-ink-3">
+                  approve a Telegram chat to enable delivery
+                </span>
+              ) : null}
+              <label className="flex items-center gap-2 font-mono text-[11px] text-ink-3">
                 every
                 <input
                   type="number"
@@ -103,7 +133,11 @@ export function CheckinsView({
               </label>
               <button
                 onClick={addCheckin}
-                disabled={!prompt.trim()}
+                disabled={
+                  !prompt.trim() ||
+                  busy ||
+                  (target === 'telegram' && !telegramAvailable)
+                }
                 className={primaryBtnCls}
               >
                 <PlusIcon size={14} />
@@ -148,13 +182,16 @@ export function CheckinsView({
                         {c.prompt}
                       </div>
                       <div className="mt-0.5 flex items-center gap-2 font-mono text-[10px] text-ink-3">
-                        {c.lastRunAtMs ? (
+                        {c.lastFiredAtMs ? (
                           <>
                             <span
-                              className={`h-1.5 w-1.5 rounded-full ${OUTCOME_STYLE[c.lastOutcome ?? 'silent'].dot}`}
+                              className={`h-1.5 w-1.5 rounded-full ${OUTCOME_STYLE[c.lastOutcome?.status ?? 'silent'].dot}`}
                             />
-                            last ran {formatRelative(c.lastRunAtMs)} ·{' '}
-                            {OUTCOME_STYLE[c.lastOutcome ?? 'silent'].label}
+                            last ran {formatRelative(c.lastFiredAtMs)} ·{' '}
+                            {
+                              OUTCOME_STYLE[c.lastOutcome?.status ?? 'silent']
+                                .label
+                            }
                           </>
                         ) : (
                           'has not run yet'
@@ -162,7 +199,9 @@ export function CheckinsView({
                       </div>
                     </div>
                     <span className="shrink-0 rounded-md border border-line bg-white/[0.03] px-2 py-0.5 font-mono text-[10px] text-ink-2">
-                      every {formatInterval(c.intervalSecs)}
+                      {c.trigger.type === 'interval'
+                        ? `every ${formatInterval(c.trigger.intervalMs / 1000)}`
+                        : `daily ${String(c.trigger.hour).padStart(2, '0')}:${String(c.trigger.minute).padStart(2, '0')}`}
                     </span>
                     <button
                       onClick={() => removeCheckin(c.id)}
@@ -172,14 +211,6 @@ export function CheckinsView({
                       <TrashIcon size={14} />
                     </button>
                   </div>
-                  {c.lastOutcome === 'spoke' && c.lastReply && (
-                    <div
-                      className="mt-2.5 truncate rounded-lg border border-line bg-white/[0.02] px-3 py-2 font-mono text-[11px] text-ink-3"
-                      title={c.lastReply}
-                    >
-                      ↳ {c.lastReply}
-                    </div>
-                  )}
                 </div>
               ))
             )}

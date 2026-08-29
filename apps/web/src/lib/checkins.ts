@@ -1,8 +1,7 @@
-// Check-ins: proactive recurring prompts for the single agent.
-// The daemon has no scheduler, so check-ins are stored locally (per agent)
-// and fired from this tab through POST /api/agents/:id/run. The user message
-// is tagged via metadata { kind: 'checkin' } so chat can hide the mechanics;
-// a reply of exactly CHECKIN_OK marks a silent tick.
+import { daemon, type LegacyScheduleInput } from './daemon-api';
+
+// Browser records are legacy input only. New proactive prompts are persisted
+// and executed by anima-daemon, including while this tab is closed.
 
 export const CHECKIN_SENTINEL = 'CHECKIN_OK';
 
@@ -17,6 +16,86 @@ export interface Checkin {
 }
 
 const storageKey = (agentId: string) => `animaos.checkins.${agentId}`;
+
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+function parseLegacy(value: unknown): LegacyScheduleInput | null {
+  if (!value || typeof value !== 'object') return null;
+  const item = value as Record<string, unknown>;
+  if (
+    typeof item.id !== 'string' ||
+    !item.id ||
+    item.id.length > 256 ||
+    typeof item.prompt !== 'string' ||
+    !item.prompt.trim() ||
+    typeof item.intervalSecs !== 'number' ||
+    !Number.isFinite(item.intervalSecs) ||
+    item.intervalSecs <= 0 ||
+    !isFiniteNonNegative(item.createdAtMs) ||
+    (item.lastRunAtMs !== undefined && !isFiniteNonNegative(item.lastRunAtMs))
+  )
+    return null;
+  return {
+    id: item.id,
+    prompt: item.prompt,
+    intervalSecs: item.intervalSecs,
+    createdAtMs: item.createdAtMs,
+    ...(item.lastRunAtMs === undefined
+      ? {}
+      : { lastRunAtMs: item.lastRunAtMs as number }),
+  };
+}
+
+export function readLegacyCheckins(agentId: string): {
+  valid: LegacyScheduleInput[];
+  malformedCount: number;
+  exists: boolean;
+} {
+  const raw = localStorage.getItem(storageKey(agentId));
+  if (raw === null) return { valid: [], malformedCount: 0, exists: false };
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed))
+      return { valid: [], malformedCount: 1, exists: true };
+    const projected = parsed.map(parseLegacy);
+    return {
+      valid: projected.filter(
+        (item): item is LegacyScheduleInput => item !== null,
+      ),
+      malformedCount: projected.filter((item) => item === null).length,
+      exists: true,
+    };
+  } catch {
+    return { valid: [], malformedCount: 1, exists: true };
+  }
+}
+
+export function legacyImportKey(agentId: string, recordId: string): string {
+  return `legacy:${agentId}:${recordId}`;
+}
+
+export async function importLegacyCheckins(agentId: string): Promise<{
+  imported: number;
+  malformed: number;
+  complete: boolean;
+}> {
+  const records = readLegacyCheckins(agentId);
+  if (!records.exists) return { imported: 0, malformed: 0, complete: true };
+  if (records.valid.length > 0) {
+    await daemon.importLegacySchedules(agentId, { schedules: records.valid });
+  }
+  if (records.malformedCount > 0) {
+    return {
+      imported: records.valid.length,
+      malformed: records.malformedCount,
+      complete: false,
+    };
+  }
+  localStorage.removeItem(storageKey(agentId));
+  return { imported: records.valid.length, malformed: 0, complete: true };
+}
 
 export function loadCheckins(agentId: string): Checkin[] {
   try {

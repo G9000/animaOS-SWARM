@@ -176,3 +176,112 @@ describe('daemon agent requests', () => {
     );
   });
 });
+
+describe('daemon integration requests', () => {
+  it('uses connector routes and requires a caller supplied idempotency key for sends', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ messages: [], nextBefore: null }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.listConnectorMessages('agent 1', 'connector/1', {
+      before: 'message 1',
+      limit: 25,
+    });
+    await daemon.sendConnectorMessage(
+      'agent 1',
+      'connector/1',
+      'hello',
+      'telegram-send-1',
+    );
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/agents/agent%201/connectors/connector%2F1/messages?before=message+1&limit=25',
+      expect.any(Object),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/agents/agent%201/connectors/connector%2F1/messages',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({
+          'content-type': 'application/json',
+          'Idempotency-Key': 'telegram-send-1',
+        }),
+        body: JSON.stringify({ text: 'hello' }),
+      }),
+    );
+  });
+
+  it('uses schedule CRUD and import wire payloads unchanged', async () => {
+    const schedule = {
+      id: 'schedule-1',
+      importIdempotencyKey: null,
+      agentId: 'agent-1',
+      prompt: 'Check goals',
+      trigger: { type: 'interval' as const, intervalMs: 60_000 },
+      enabled: true,
+      target: { type: 'workspace' as const },
+      nextDueAtMs: 61_000,
+      lastFiredAtMs: null,
+      lastOutcome: null,
+      createdAtMs: 1_000,
+      updatedAtMs: 1_000,
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ schedule, schedules: [schedule] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.createSchedule('agent-1', {
+      prompt: 'Check goals',
+      trigger: { type: 'interval', intervalMs: 60_000 },
+      target: { type: 'workspace' },
+    });
+    await daemon.updateSchedule('agent-1', 'schedule-1', { enabled: false });
+    await daemon.deleteSchedule('agent-1', 'schedule-1');
+    await daemon.importLegacySchedules('agent-1', {
+      schedules: [
+        {
+          id: 'legacy-1',
+          prompt: 'Check goals',
+          intervalSecs: 60,
+          createdAtMs: 1_000,
+          lastRunAtMs: 2_000,
+        },
+      ],
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/agents/agent-1/schedules',
+      '/api/agents/agent-1/schedules/schedule-1',
+      '/api/agents/agent-1/schedules/schedule-1',
+      '/api/agents/agent-1/schedules/import',
+    ]);
+    expect(fetchMock.mock.calls[3]?.[1]).toEqual(
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          schedules: [
+            {
+              id: 'legacy-1',
+              prompt: 'Check goals',
+              intervalSecs: 60,
+              createdAtMs: 1_000,
+              lastRunAtMs: 2_000,
+            },
+          ],
+        }),
+      }),
+    );
+  });
+});

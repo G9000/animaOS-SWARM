@@ -12,18 +12,12 @@ import { Composer, MessageList } from './components/ChatScreen';
 import { AlertIcon } from './components/icons';
 import { OnboardingFlow } from './components/onboarding/OnboardingFlow';
 import { SettingsPanel } from './components/SettingsPanel';
+import { TelegramSettings } from './components/TelegramSettings';
+import { TelegramThread } from './components/TelegramThread';
 import { WorkspaceShell } from './components/WorkspaceShell';
+import { useAgentIntegrations } from './hooks/useAgentIntegrations';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
-import {
-  CHECKIN_SENTINEL,
-  clearCheckins,
-  isDue,
-  loadCheckins,
-  newCheckin,
-  saveCheckins,
-  wrapPrompt,
-  type Checkin,
-} from './lib/checkins';
+import { clearCheckins, importLegacyCheckins } from './lib/checkins';
 import {
   daemon,
   toAgentDetail,
@@ -129,9 +123,14 @@ export function ViewHarness() {
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [resetting, setResetting] = useState(false);
-  const [checkins, setCheckins] = useState<Checkin[]>([]);
   const [ciPrompt, setCiPrompt] = useState('');
   const [ciIntervalMin, setCiIntervalMin] = useState(30);
+  const [ciTarget, setCiTarget] = useState<'workspace' | 'telegram'>(
+    'workspace',
+  );
+  const [legacyMigrationError, setLegacyMigrationError] = useState<
+    string | null
+  >(null);
 
   const sendingRef = useRef(false);
   const savingSettingsRef = useRef(false);
@@ -143,13 +142,11 @@ export function ViewHarness() {
   const settingsTriggerRef = useRef<HTMLElement | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
   const previousSelectedMainIdRef = useRef<string | null>(null);
-  const checkinsRef = useRef<Checkin[]>([]);
-  const checkinRunningRef = useRef(false);
-  const checkinRunGenerationRef = useRef(0);
   sendingRef.current = sending;
-  checkinsRef.current = checkins;
 
   const agentId = agent?.id ?? null;
+  const integrations = useAgentIntegrations(agentId);
+  const telegramConnector = integrations.connectors[0] ?? null;
   useLayoutEffect(() => {
     if (previousSelectedMainIdRef.current === agentId) return;
 
@@ -161,14 +158,14 @@ export function ViewHarness() {
     settingsOperationGenerationRef.current = null;
     resetInFlightRef.current = null;
     settingsTriggerRef.current = null;
-    checkinRunGenerationRef.current += 1;
-    checkinRunningRef.current = false;
     sendingRef.current = false;
     savingSettingsRef.current = false;
 
     setDraft('');
     setCiPrompt('');
     setCiIntervalMin(30);
+    setCiTarget('workspace');
+    setLegacyMigrationError(null);
     setWorkspaceError(null);
     setSettingsSaveError(null);
     setResetError(null);
@@ -176,7 +173,6 @@ export function ViewHarness() {
     setSending(false);
     setSavingSettings(false);
     setResetting(false);
-    setCheckins(agentId ? loadCheckins(agentId) : []);
   }, [agentId]);
 
   const beginAgentOperation = useCallback(
@@ -191,13 +187,6 @@ export function ViewHarness() {
   const isCurrentAgentOperation = useCallback(
     (operation: AgentOperation) =>
       operation.generation === agentOperationGenerationRef.current &&
-      operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
-      operation.targetAgentId === currentAgentIdRef.current,
-    [],
-  );
-
-  const isCurrentAgentLifecycle = useCallback(
-    (operation: AgentOperation) =>
       operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
       operation.targetAgentId === currentAgentIdRef.current,
     [],
@@ -234,124 +223,55 @@ export function ViewHarness() {
     });
   };
 
-  const runCheckin = useCallback(
-    async (targetAgentId: string, checkin: Checkin) => {
-      const operation = beginAgentOperation(targetAgentId);
-      const stamp = (patch: Partial<Checkin>) => {
-        if (!isCurrentAgentLifecycle(operation)) return;
-        setCheckins((current) => {
-          if (!isCurrentAgentLifecycle(operation)) return current;
-          const next = current.map((item) =>
-            item.id === checkin.id ? { ...item, ...patch } : item,
-          );
-          saveCheckins(targetAgentId, next);
-          return next;
-        });
-      };
-
-      try {
-        const { agent: updatedAgent, result } = await daemon.runAgent(
-          targetAgentId,
-          wrapPrompt(checkin),
-          { kind: 'checkin', id: checkin.id },
-        );
-        adoptAgentSnapshot(operation, updatedAgent);
-        const reply = result.data?.text?.trim() ?? '';
-        if (result.status === 'error') {
-          stamp({
-            lastRunAtMs: Date.now(),
-            lastOutcome: 'error',
-            lastReply: result.error ?? 'run failed',
-          });
-        } else if (reply === CHECKIN_SENTINEL) {
-          stamp({
-            lastRunAtMs: Date.now(),
-            lastOutcome: 'silent',
-            lastReply: undefined,
-          });
-        } else {
-          stamp({
-            lastRunAtMs: Date.now(),
-            lastOutcome: 'spoke',
-            lastReply: reply,
-          });
-        }
-      } catch (caught) {
-        stamp({
-          lastRunAtMs: Date.now(),
-          lastOutcome: 'error',
-          lastReply: caught instanceof Error ? caught.message : String(caught),
-        });
-      }
-    },
-    [adoptAgentSnapshot, beginAgentOperation, isCurrentAgentLifecycle],
-  );
-
   useEffect(() => {
     if (!agentId) return;
-    const timer = window.setInterval(async () => {
-      if (
-        checkinRunningRef.current ||
-        sendingRef.current ||
-        savingSettingsRef.current ||
-        resetInFlightRef.current !== null
-      ) {
-        return;
-      }
-      const due = checkinsRef.current.filter((checkin) =>
-        isDue(checkin, Date.now()),
-      );
-      if (due.length === 0) return;
-      const runGeneration = ++checkinRunGenerationRef.current;
-      const lifecycleGeneration = agentLifecycleGenerationRef.current;
-      checkinRunningRef.current = true;
-      try {
-        for (const checkin of due) {
-          if (
-            runGeneration !== checkinRunGenerationRef.current ||
-            lifecycleGeneration !== agentLifecycleGenerationRef.current ||
-            resetInFlightRef.current !== null ||
-            sendingRef.current ||
-            savingSettingsRef.current
-          ) {
-            break;
-          }
-          await runCheckin(agentId, checkin);
+    let current = true;
+    void importLegacyCheckins(agentId)
+      .then((result) => {
+        if (!current) return;
+        if (result.malformed > 0) {
+          setLegacyMigrationError(
+            `${result.malformed} legacy check-in record could not be imported and was kept in this browser.`,
+          );
+        } else if (result.imported > 0) {
+          setLegacyMigrationError(null);
+          void integrations.refresh();
         }
-      } finally {
-        if (runGeneration === checkinRunGenerationRef.current) {
-          checkinRunningRef.current = false;
-        }
-      }
-    }, 10_000);
+      })
+      .catch(() => {
+        if (current)
+          setLegacyMigrationError(
+            'Legacy check-ins could not be imported. They remain in this browser for retry.',
+          );
+      });
     return () => {
-      window.clearInterval(timer);
-      checkinRunGenerationRef.current += 1;
-      checkinRunningRef.current = false;
+      current = false;
     };
-  }, [agentId, runCheckin]);
+  }, [agentId]);
 
-  const addCheckin = () => {
+  useEffect(() => {
+    if (telegramConnector) void integrations.loadMessages(telegramConnector.id);
+  }, [telegramConnector?.id]);
+
+  const addCheckin = async () => {
     const text = ciPrompt.trim();
     if (!text || !agentId) return;
-    setCheckins((current) => {
-      const next = [
-        ...current,
-        newCheckin(text, Math.max(1, ciIntervalMin) * 60),
-      ];
-      saveCheckins(agentId, next);
-      return next;
+    const added = await integrations.createSchedule({
+      prompt: text,
+      trigger: {
+        type: 'interval',
+        intervalMs: Math.max(1, ciIntervalMin) * 60_000,
+      },
+      target:
+        ciTarget === 'telegram' && telegramConnector
+          ? { type: 'connector', connectorId: telegramConnector.id }
+          : { type: 'workspace' },
     });
-    setCiPrompt('');
+    if (added) setCiPrompt('');
   };
 
   const removeCheckin = (id: string) => {
-    if (!agentId) return;
-    setCheckins((current) => {
-      const next = current.filter((checkin) => checkin.id !== id);
-      saveCheckins(agentId, next);
-      return next;
-    });
+    void integrations.removeSchedule(id);
   };
 
   const openSettings = () => {
@@ -541,6 +461,19 @@ export function ViewHarness() {
       saveSettings={saveSettings}
       resetAgent={resetAgent}
       close={closeSettings}
+      integrations={
+        <TelegramSettings
+          connector={telegramConnector}
+          busy={integrations.connectorBusy}
+          error={integrations.connectorError}
+          connect={integrations.connectTelegram}
+          replace={integrations.replaceTelegram}
+          approve={integrations.approvePairing}
+          restart={integrations.restartTelegram}
+          disconnect={integrations.disconnectTelegram}
+          refresh={integrations.refresh}
+        />
+      }
     />
   ) : null;
 
@@ -584,15 +517,37 @@ export function ViewHarness() {
           activity={
             <ActivityView
               agent={agent}
-              checkins={checkins}
+              checkins={integrations.schedules}
               prompt={ciPrompt}
               setPrompt={setCiPrompt}
               intervalMin={ciIntervalMin}
               setIntervalMin={setCiIntervalMin}
               addCheckin={addCheckin}
               removeCheckin={removeCheckin}
-              error={workspaceError}
+              error={integrations.scheduleError ?? legacyMigrationError}
+              target={ciTarget}
+              setTarget={setCiTarget}
+              telegramAvailable={telegramConnector?.approvedChat != null}
+              busy={integrations.scheduleBusy}
             />
+          }
+          telegram={
+            telegramConnector ? (
+              <TelegramThread
+                agentName={agent.name}
+                messages={integrations.messages}
+                hasOlder={integrations.nextBefore !== null}
+                busy={integrations.connectorBusy}
+                error={integrations.connectorError}
+                deliveryQueued={integrations.deliveryQueued}
+                loadOlder={() =>
+                  integrations.loadMessages(telegramConnector.id, true)
+                }
+                send={(text) =>
+                  integrations.sendTelegramMessage(telegramConnector.id, text)
+                }
+              />
+            ) : null
           }
         />
       </div>

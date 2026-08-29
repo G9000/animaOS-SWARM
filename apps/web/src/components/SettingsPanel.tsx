@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ACCESS_PROFILES,
   deriveAccessProfile,
@@ -73,6 +73,7 @@ export function SettingsPanel({
   saveSettings,
   resetAgent,
   close,
+  integrations,
 }: {
   agent: AgentDetail;
   providers: DaemonProvider[] | null;
@@ -83,6 +84,7 @@ export function SettingsPanel({
   saveSettings: (patch: AgentUpdateInput) => Promise<boolean>;
   resetAgent: () => void;
   close: () => void;
+  integrations?: ReactNode;
 }) {
   const seedModel = useMemo(() => {
     const options = MODEL_SUGGESTIONS[agent.provider] ?? [];
@@ -457,6 +459,8 @@ export function SettingsPanel({
               cleared = daemon builds its default prompt from the agent profile
             </p>
           </section>
+
+          {integrations}
 
           {saveError ? (
             <div

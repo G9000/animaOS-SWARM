@@ -35,6 +35,37 @@ afterEach(() => {
 });
 
 describe('WorkspaceShell', () => {
+  it('shows a dedicated Telegram destination only when a connector exists', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    const view = render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        telegram={null}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Telegram' }),
+    ).not.toBeInTheDocument();
+    view.rerender(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        telegram={<div>Telegram canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Telegram' }));
+    expect(screen.getByText('Telegram canvas')).toBeVisible();
+  });
   it('owns one responsive navigation with Workspace, Activity, and Agents destinations', async () => {
     const user = userEvent.setup();
     const nova = agent('agent-main', 'Nova', 1);

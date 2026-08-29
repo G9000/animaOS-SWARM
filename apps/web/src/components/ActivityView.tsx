@@ -1,4 +1,4 @@
-import type { Checkin } from '../lib/checkins';
+import type { DaemonSchedule } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { CheckinsView } from './CheckinsView';
 import { ChipIcon, PulseIcon, SparkIcon } from './icons';
@@ -6,7 +6,7 @@ import { formatTokens } from './ui-bits';
 
 export interface ActivityViewProps {
   agent: AgentDetail;
-  checkins: Checkin[];
+  checkins: DaemonSchedule[];
   prompt: string;
   setPrompt: (value: string) => void;
   intervalMin: number;
@@ -14,6 +14,10 @@ export interface ActivityViewProps {
   addCheckin: () => void;
   removeCheckin: (id: string) => void;
   error: string | null;
+  target: 'workspace' | 'telegram';
+  setTarget: (value: 'workspace' | 'telegram') => void;
+  telegramAvailable: boolean;
+  busy: boolean;
 }
 
 export function ActivityView(props: ActivityViewProps) {

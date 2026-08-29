@@ -4,9 +4,13 @@ import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
 import type { AgentDetail } from '../lib/types';
 import { AgentPresence } from './AgentPresence';
 import { AgentsView } from './AgentsView';
-import { AgentsIcon, PulseIcon, SparkIcon } from './icons';
+import { AgentsIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
 
-export type WorkspaceDestination = 'workspace' | 'activity' | 'agents';
+export type WorkspaceDestination =
+  | 'workspace'
+  | 'telegram'
+  | 'activity'
+  | 'agents';
 
 const DESTINATIONS: Array<{
   id: WorkspaceDestination;
@@ -43,11 +47,24 @@ function DestinationNavigation({
   destination,
   setDestination,
   placement,
+  hasTelegram,
 }: {
   destination: WorkspaceDestination;
   setDestination: (destination: WorkspaceDestination) => void;
   placement: 'top-shell' | 'bottom-dock';
+  hasTelegram: boolean;
 }) {
+  const destinations = hasTelegram
+    ? [
+        DESTINATIONS[0],
+        {
+          id: 'telegram' as const,
+          label: 'Telegram',
+          icon: <SendIcon size={15} />,
+        },
+        ...DESTINATIONS.slice(1),
+      ]
+    : DESTINATIONS;
   return (
     <nav
       aria-label="Workspace navigation"
@@ -58,7 +75,7 @@ function DestinationNavigation({
           : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
       }
     >
-      {DESTINATIONS.map((item) => {
+      {destinations.map((item) => {
         const active = destination === item.id;
         return (
           <button
@@ -87,6 +104,7 @@ export function WorkspaceShell({
   connection,
   workspace,
   activity,
+  telegram = null,
   onOpenSettings,
 }: {
   mainAgent: AgentDetail;
@@ -94,11 +112,18 @@ export function WorkspaceShell({
   connection: Exclude<DaemonConnection, 'unknown'>;
   workspace: ReactNode;
   activity: ReactNode;
+  telegram?: ReactNode | null;
   onOpenSettings: () => void;
 }) {
   const [destination, setDestination] =
     useState<WorkspaceDestination>('workspace');
   const desktopNavigation = useDesktopNavigation();
+
+  useEffect(() => {
+    if (destination === 'telegram' && telegram === null) {
+      setDestination('workspace');
+    }
+  }, [destination, telegram]);
 
   return (
     <div className="relative z-[1] flex min-h-0 flex-1 flex-col">
@@ -113,12 +138,15 @@ export function WorkspaceShell({
           destination={destination}
           setDestination={setDestination}
           placement="top-shell"
+          hasTelegram={telegram !== null}
         />
       ) : null}
 
       <main className="spatial-canvas workspace-mobile-safe relative min-h-0 flex-1">
         {destination === 'workspace' ? (
           workspace
+        ) : destination === 'telegram' && telegram !== null ? (
+          telegram
         ) : destination === 'activity' ? (
           activity
         ) : (
@@ -131,6 +159,7 @@ export function WorkspaceShell({
           destination={destination}
           setDestination={setDestination}
           placement="bottom-dock"
+          hasTelegram={telegram !== null}
         />
       ) : null}
     </div>

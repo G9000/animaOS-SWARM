@@ -78,6 +78,87 @@ export interface AgentUpdateInput {
   tools?: string[];
 }
 
+export type TelegramConnectorStatus =
+  | 'ready'
+  | 'pairing'
+  | 'credentialRequired'
+  | 'error'
+  | 'degraded'
+  | 'reconciling';
+
+export interface TelegramChat {
+  id: string;
+  kind: 'private' | 'group' | 'supergroup' | 'channel';
+  title: string | null;
+  username: string | null;
+}
+
+export interface TelegramConnector {
+  id: string;
+  agentId: string;
+  roomId: string;
+  type: 'telegram';
+  bot: { id: string; username: string | null; displayName: string | null };
+  approvedChat: TelegramChat | null;
+  pendingPairing: { chat: TelegramChat; requestedAtMs: number } | null;
+  status: TelegramConnectorStatus;
+  enabled: boolean;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface ConnectorMessage {
+  id: string;
+  agentId: string;
+  roomId: string;
+  content: { text: string; metadata?: Record<string, unknown> | null };
+  role: 'user' | 'assistant' | 'system' | 'tool';
+  createdAtMs: number;
+}
+
+export type ScheduleTrigger =
+  | { type: 'interval'; intervalMs: number }
+  | { type: 'daily'; hour: number; minute: number; timeZone: string };
+export type ScheduleTarget =
+  | { type: 'workspace' }
+  | { type: 'connector'; connectorId: string };
+export interface ScheduleOutcome {
+  status: 'silent' | 'spoke' | 'error';
+  occurredAtMs: number;
+  errorCode: string | null;
+}
+export interface DaemonSchedule {
+  id: string;
+  importIdempotencyKey: string | null;
+  agentId: string;
+  prompt: string;
+  trigger: ScheduleTrigger;
+  enabled: boolean;
+  target: ScheduleTarget;
+  nextDueAtMs: number;
+  lastFiredAtMs: number | null;
+  lastOutcome: ScheduleOutcome | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface ScheduleCreateInput {
+  prompt: string;
+  trigger: ScheduleTrigger;
+  target: ScheduleTarget;
+  enabled?: boolean;
+  importIdempotencyKey?: string;
+}
+
+export interface LegacyScheduleInput {
+  id: string;
+  prompt: string;
+  intervalSecs: number;
+  createdAtMs: number;
+  lastRunAtMs?: number;
+  target?: ScheduleTarget;
+}
+
 /** Model suggestions keyed by daemon provider id. */
 export const MODEL_SUGGESTIONS: Record<string, string[]> = {
   ...PROVIDER_MODELS,
@@ -86,13 +167,19 @@ export const MODEL_SUGGESTIONS: Record<string, string[]> = {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
-    headers: init?.body ? { 'content-type': 'application/json' } : undefined,
     ...init,
+    headers: {
+      ...(init?.body ? { 'content-type': 'application/json' } : {}),
+      ...init?.headers,
+    },
   });
   if (!response.ok) {
     let message = `daemon request failed (${response.status})`;
     try {
-      const body = (await response.json()) as { error?: string; message?: string };
+      const body = (await response.json()) as {
+        error?: string;
+        message?: string;
+      };
       message = body.error ?? body.message ?? message;
     } catch {
       /* keep default message */
@@ -144,7 +231,112 @@ export const daemon = {
   runAgent: (id: string, text: string, metadata?: Record<string, unknown>) =>
     request<{ agent: DaemonSnapshot; result: DaemonRunResult }>(
       `/agents/${id}/run`,
-      { method: 'POST', body: JSON.stringify({ text, ...(metadata ? { metadata } : {}) }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({ text, ...(metadata ? { metadata } : {}) }),
+      },
+    ),
+
+  listConnectors: (agentId: string) =>
+    request<{ connectors: TelegramConnector[] }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors`,
+    ),
+  createTelegramConnector: (agentId: string, botToken: string) =>
+    request<{ connector: TelegramConnector }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/telegram`,
+      { method: 'POST', body: JSON.stringify({ botToken }) },
+    ),
+  replaceTelegramCredential: (
+    agentId: string,
+    connectorId: string,
+    botToken: string,
+  ) =>
+    request<{ connector: TelegramConnector }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/credential`,
+      { method: 'PUT', body: JSON.stringify({ botToken }) },
+    ),
+  approveTelegramPairing: (
+    agentId: string,
+    connectorId: string,
+    chatId: string,
+  ) =>
+    request<{ connector: TelegramConnector }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/pairings/${encodeURIComponent(chatId)}/approve`,
+      { method: 'POST' },
+    ),
+  restartTelegramConnector: (agentId: string, connectorId: string) =>
+    request<{ connector: TelegramConnector }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/restart`,
+      { method: 'POST' },
+    ),
+  deleteTelegramConnector: (agentId: string, connectorId: string) =>
+    request<{ deleted: boolean }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}`,
+      { method: 'DELETE' },
+    ),
+  listConnectorMessages: (
+    agentId: string,
+    connectorId: string,
+    page: { before?: string; limit?: number } = {},
+  ) => {
+    const query = new URLSearchParams();
+    if (page.before) query.set('before', page.before);
+    if (page.limit) query.set('limit', String(page.limit));
+    const suffix = query.size ? `?${query}` : '';
+    return request<{ messages: ConnectorMessage[]; nextBefore: string | null }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/messages${suffix}`,
+    );
+  },
+  sendConnectorMessage: (
+    agentId: string,
+    connectorId: string,
+    text: string,
+    idempotencyKey: string,
+  ) =>
+    request<{
+      messages: ConnectorMessage[];
+      result: DaemonRunResult;
+      deliveryQueued: boolean;
+    }>(
+      `/agents/${encodeURIComponent(agentId)}/connectors/${encodeURIComponent(connectorId)}/messages`,
+      {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({ text }),
+      },
+    ),
+  listSchedules: (agentId: string) =>
+    request<{ schedules: DaemonSchedule[] }>(
+      `/agents/${encodeURIComponent(agentId)}/schedules`,
+    ),
+  createSchedule: (agentId: string, input: ScheduleCreateInput) =>
+    request<{ schedule: DaemonSchedule }>(
+      `/agents/${encodeURIComponent(agentId)}/schedules`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  updateSchedule: (
+    agentId: string,
+    scheduleId: string,
+    patch: Partial<
+      Pick<DaemonSchedule, 'prompt' | 'trigger' | 'target' | 'enabled'>
+    >,
+  ) =>
+    request<{ schedule: DaemonSchedule }>(
+      `/agents/${encodeURIComponent(agentId)}/schedules/${encodeURIComponent(scheduleId)}`,
+      { method: 'PATCH', body: JSON.stringify(patch) },
+    ),
+  deleteSchedule: (agentId: string, scheduleId: string) =>
+    request<{ deleted: boolean }>(
+      `/agents/${encodeURIComponent(agentId)}/schedules/${encodeURIComponent(scheduleId)}`,
+      { method: 'DELETE' },
+    ),
+  importLegacySchedules: (
+    agentId: string,
+    input: { schedules: LegacyScheduleInput[] },
+  ) =>
+    request<{ schedules: DaemonSchedule[] }>(
+      `/agents/${encodeURIComponent(agentId)}/schedules/import`,
+      { method: 'POST', body: JSON.stringify(input) },
     ),
 };
 
@@ -195,8 +387,10 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
     messages: snapshot.messages
       .filter((m) => {
         // hide check-in plumbing: tagged prompt messages + silent ticks
-        if (m.role === 'user' && m.content.metadata?.kind === 'checkin') return false;
-        if (m.role === 'assistant' && m.content.text.trim() === 'CHECKIN_OK') return false;
+        if (m.role === 'user' && m.content.metadata?.kind === 'checkin')
+          return false;
+        if (m.role === 'assistant' && m.content.text.trim() === 'CHECKIN_OK')
+          return false;
         return true;
       })
       .map((m) => ({
