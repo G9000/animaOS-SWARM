@@ -39,6 +39,7 @@ The flow replaces the application shell while no agent exists, as today. The ste
 - **Company name** (required). This becomes the agency name.
 - **Mission** (required, one sentence). Stored in workspace config and `agency.yaml`; injected into the profile-generation prompt.
 - **Office location** (required): absolute folder path on the daemon host. A Verify action (via `PUT /api/workspace` in validate-only mode) canonicalizes the path, confirms it exists or can be created, and reports which. On submit the folder is created if missing.
+- **No partial persistence:** onboarding never calls the persisting form of `PUT /api/workspace`. Workspace config is only persisted inside the bootstrap transaction, so abandoning the flow midway leaves no daemon-side state.
 - **Values** (optional, 3–5 short chips). Stored in workspace config and `agency.yaml`; injected into the profile-generation prompt.
 
 ### Step 2: Intelligence (existing `ModelStep`, moved earlier)
@@ -49,9 +50,10 @@ Unchanged in behavior: configured provider cards, model suggestions, custom mode
 
 - **Name** (required, defaults to `Anima`).
 - **Personality preset** (required selection, default `chief-of-staff`): one of four cards — Chief of Staff, Calm Assistant, Senior Engineer, Creative Partner. Each preset ships a template profile (bio, adjectives, style, system-prompt template with workspace placeholders) in `apps/web/src/lib/agent-presets.ts`.
-- **Intent** (required for generation): plain-language "what do you want this agent to do for you?" Rough wording is fine.
+- **Intent** (free text): plain-language "what do you want this agent to do for you?" Rough wording is fine. Required to enable Generate, but not required to complete the step.
 - **✨ Generate profile**: calls `POST /api/agents/generate-profile` with preset, intent, and the chosen provider/model. Returns `{ bio, adjectives, style, system }` with the workspace mission and values baked in. All returned fields render as editable inputs. Regenerate is available.
 - **Fallback:** if the selected provider cannot generate (only the deterministic provider is configured, or generation fails), the preset's template profile fills the fields with the workspace name/mission substituted, and the step remains completable without generation.
+- **Step requirement:** name, preset, and a non-empty `system` — sourced from generation, the preset template, or manual edits.
 
 ### Step 4: Access (existing `AccessStep`)
 
@@ -86,7 +88,7 @@ The draft is held in onboarding component state for the page session. Successful
   3. Write `agency.yaml` at the root: single-orchestrator agency with company name, mission, values, strategy `supervisor`, and the orchestrator definition (name, bio, adjectives, style, system, model, tools).
   4. Create the runtime agent with the full personality fields on `AgentConfig` (`bio`, `adjectives`, `style`, `system`) plus the resolved canonical tool descriptors.
   5. Persist workspace config + agent in the control-plane snapshot.
-  Any step failing rolls back: no folder creation side effects beyond an empty folder, no `agency.yaml`, no agent, no config. Returns `{ workspace, agent }` (the created snapshot) on success.
+  Any step failing rolls back all durable state: no `agency.yaml`, no agent, no workspace config. The only permitted side effect of a failed bootstrap is the empty root folder itself if validation created it. Returns `{ workspace, agent }` (the created snapshot) on success.
 - Existing `POST /api/agents` and PATCH paths are untouched; bootstrap composes their validation and tool-resolution internals.
 
 ### Personality on runtime agents
