@@ -67,6 +67,7 @@ pub(super) async fn list_connectors(
     responses(
         (status = 201, description = "Telegram connector created", body = TelegramConnectorEnvelope),
         (status = 400, description = "Invalid credential request", body = ConnectorErrorBody),
+        (status = 422, description = "Telegram rejected the bot token", body = ConnectorErrorBody),
         (status = 403, description = "Local owner authorization required", body = ConnectorErrorBody),
         (status = 404, description = "Agent not found", body = ConnectorErrorBody),
         (status = 409, description = "Agent already has a Telegram connector", body = ConnectorErrorBody),
@@ -109,6 +110,7 @@ pub(super) async fn create_telegram_connector(
     responses(
         (status = 200, description = "Telegram credential replaced", body = TelegramConnectorEnvelope),
         (status = 400, description = "Invalid credential request", body = ConnectorErrorBody),
+        (status = 422, description = "Telegram rejected the bot token", body = ConnectorErrorBody),
         (status = 403, description = "Local owner authorization required", body = ConnectorErrorBody),
         (status = 404, description = "Connector not found for agent", body = ConnectorErrorBody),
         (status = 503, description = "Telegram, vault, or persistence unavailable", body = ConnectorErrorBody)
@@ -320,11 +322,10 @@ pub(super) async fn list_connector_messages(
     ),
     request_body = ConnectorMessageRequest,
     responses(
-        (status = 200, description = "Agent turn committed and Telegram delivery queued", body = ConnectorMessageSendResponse),
+        (status = 200, description = "Agent turn committed with optional Telegram delivery", body = ConnectorMessageSendResponse),
         (status = 400, description = "Invalid text", body = ConnectorErrorBody),
         (status = 403, description = "Local owner authorization required", body = ConnectorErrorBody),
         (status = 404, description = "Connector not found for agent", body = ConnectorErrorBody),
-        (status = 409, description = "Connector has no approved chat", body = ConnectorErrorBody),
         (status = 429, description = "Agent or connector is busy", body = ConnectorErrorBody),
         (status = 503, description = "Agent run or persistence unavailable", body = ConnectorErrorBody)
     )
@@ -358,9 +359,9 @@ pub(super) async fn send_connector_message(
         .send_from_owner(agent_id, connector_id, text)
         .await
     {
-        Ok(run) => no_store(json_response(
+        Ok((run, delivery_queued)) => no_store(json_response(
             StatusCode::OK,
-            &ConnectorMessageSendResponse::from_run(run, &room_id),
+            &ConnectorMessageSendResponse::from_run(run, &room_id, delivery_queued),
         )),
         Err(error) => manager_error(error),
     }
@@ -376,8 +377,8 @@ async fn credential_from_request(
     let value = parse_json_body::<TelegramCredentialRequest>(body)
         .map_err(|_| invalid_request("request body is invalid"))?
         .into_token()
-        .map_err(invalid_request)?;
-    TelegramBotToken::parse(value).map_err(|_| invalid_request("botToken is invalid"))
+        .map_err(|_| invalid_token())?;
+    TelegramBotToken::parse(value).map_err(|_| invalid_token())
 }
 
 async fn owned_connector(
@@ -461,14 +462,10 @@ fn manager_error(error: ConnectorManagerError) -> AxumResponse {
         ),
         ConnectorManagerError::PairingNotFound => error_response(
             StatusCode::CONFLICT,
-            "pairing_not_found",
+            "connector_pairing_not_found",
             "pairing candidate was not found",
         ),
-        ConnectorManagerError::ConnectorNotPaired => error_response(
-            StatusCode::CONFLICT,
-            "connector_not_paired",
-            "Telegram connector has no approved chat",
-        ),
+        ConnectorManagerError::InvalidToken => invalid_token(),
         ConnectorManagerError::Transport => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "telegram_unavailable",
@@ -509,6 +506,14 @@ fn manager_error(error: ConnectorManagerError) -> AxumResponse {
 
 fn invalid_request(message: &str) -> AxumResponse {
     error_response(StatusCode::BAD_REQUEST, "invalid_request", message)
+}
+
+fn invalid_token() -> AxumResponse {
+    error_response(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "connector_token_invalid",
+        "Telegram bot token is invalid",
+    )
 }
 
 fn local_owner_error() -> AxumResponse {

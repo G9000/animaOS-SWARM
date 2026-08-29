@@ -95,7 +95,7 @@ pub(crate) enum ConnectorManagerError {
     ConnectorNotFound,
     AgentAlreadyConnected,
     PairingNotFound,
-    ConnectorNotPaired,
+    InvalidToken,
     Transport,
     Credential,
     CredentialStateUncertain,
@@ -112,7 +112,7 @@ impl fmt::Display for ConnectorManagerError {
             Self::ConnectorNotFound => "connector not found",
             Self::AgentAlreadyConnected => "agent already has an active Telegram connector",
             Self::PairingNotFound => "Telegram pairing candidate was not found",
-            Self::ConnectorNotPaired => "Telegram connector is not paired",
+            Self::InvalidToken => "Telegram bot token is invalid",
             Self::Transport => "Telegram transport failed",
             Self::Credential => "credential vault operation failed",
             Self::CredentialStateUncertain => "credential vault state requires reconciliation",
@@ -220,7 +220,7 @@ impl ConnectorManager {
             .transport
             .get_me(&token)
             .await
-            .map_err(|_| ConnectorManagerError::Transport)?;
+            .map_err(map_token_validation_error)?;
         let now = now_ms();
         let id = next_connector_id(now);
         let connector = TelegramConnectorRecord {
@@ -383,7 +383,7 @@ impl ConnectorManager {
             .transport
             .get_me(&token)
             .await
-            .map_err(|_| ConnectorManagerError::Transport)?;
+            .map_err(map_token_validation_error)?;
         let previous_token = match self.credentials.load(&connector_id).await {
             Ok(token) => token,
             Err(error) => {
@@ -822,7 +822,7 @@ impl ConnectorManager {
         agent_id: String,
         connector_id: String,
         text: String,
-    ) -> Result<crate::routes::AgentRunEnvelope, ConnectorManagerError> {
+    ) -> Result<(crate::routes::AgentRunEnvelope, bool), ConnectorManagerError> {
         let manager = self.clone();
         tokio::spawn(async move {
             manager
@@ -838,7 +838,7 @@ impl ConnectorManager {
         agent_id: String,
         connector_id: String,
         text: String,
-    ) -> Result<crate::routes::AgentRunEnvelope, ConnectorManagerError> {
+    ) -> Result<(crate::routes::AgentRunEnvelope, bool), ConnectorManagerError> {
         let (connector, connector_worker_generation) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             self.ensure_open()?;
@@ -849,18 +849,16 @@ impl ConnectorManager {
                 .filter(|connector| connector.is_active() && connector.agent_id == agent_id)
                 .cloned()
                 .ok_or(ConnectorManagerError::ConnectorNotFound)?;
-            if connector.approved_chat.is_none() {
-                return Err(ConnectorManagerError::ConnectorNotPaired);
-            }
-            if state
-                .outbound
-                .values()
-                .filter(|record| {
-                    record.connector_id == connector_id
-                        && record.delivery_state != OutboundDeliveryState::Delivered
-                })
-                .count()
-                >= MAX_UNDELIVERED_OUTBOUND
+            if connector.approved_chat.is_some()
+                && state
+                    .outbound
+                    .values()
+                    .filter(|record| {
+                        record.connector_id == connector_id
+                            && record.delivery_state != OutboundDeliveryState::Delivered
+                    })
+                    .count()
+                    >= MAX_UNDELIVERED_OUTBOUND
             {
                 return Err(ConnectorManagerError::Backpressure);
             }
@@ -879,12 +877,8 @@ impl ConnectorManager {
         let commit_connector_id = connector.id.clone();
         let commit_agent_id = connector.agent_id.clone();
         let commit_room_id = connector.room_id.clone();
-        let commit_chat_id = connector
-            .approved_chat
-            .as_ref()
-            .expect("paired connector was prevalidated")
-            .id
-            .clone();
+        let commit_chat_id = connector.approved_chat.as_ref().map(|chat| chat.id.clone());
+        let delivery_queued = commit_chat_id.is_some();
         let rollback_outbound = Arc::new(std::sync::Mutex::new(None::<TelegramOutboundRecord>));
         let commit_rollback_outbound = Arc::clone(&rollback_outbound);
         let commit_lifecycle_lock = Arc::clone(&self.lifecycle_lock);
@@ -905,7 +899,8 @@ impl ConnectorManager {
             room: RunRoom::Stable(connector.room_id.clone()),
             idempotency_key: None,
         };
-        self.runs
+        let run = self
+            .runs
             .run_with_commit_admitted_and_rollback(
                 request,
                 permit,
@@ -932,13 +927,11 @@ impl ConnectorManager {
                             current.is_active()
                                 && current.agent_id == commit_agent_id
                                 && current.room_id == commit_room_id
-                                && current
-                                    .approved_chat
-                                    .as_ref()
-                                    .is_some_and(|chat| chat.id == commit_chat_id)
+                                && current.approved_chat.as_ref().map(|chat| &chat.id)
+                                    == commit_chat_id.as_ref()
                         })
                         .ok_or_else(|| ApiError::not_found())?;
-                    if result.status == TaskStatus::Error {
+                    if result.status == TaskStatus::Error || commit_chat_id.is_none() {
                         return Ok(());
                     }
                     if state
@@ -1014,7 +1007,9 @@ impl ConnectorManager {
                 },
             )
             .await
-            .map_err(|_| ConnectorManagerError::Persistence)
+            .map_err(|_| ConnectorManagerError::Persistence)?;
+        let delivery_queued = delivery_queued && run.result.status == "success";
+        Ok((run, delivery_queued))
     }
 
     async fn expire_pending_pairing_at(
@@ -1382,6 +1377,7 @@ impl ConnectorManager {
         connector_id: String,
         token: &TelegramBotToken,
     ) -> Result<bool, ConnectorManagerError> {
+        let _mutation = self.mutation_lock.lock().await;
         let (chat_id, outbound) = {
             let state = self.state.read().await;
             let connector = state
@@ -1413,7 +1409,6 @@ impl ConnectorManager {
             .transport
             .send_message(token, &chat_id, &outbound.text)
             .await;
-        let _mutation = self.mutation_lock.lock().await;
         let (previous_connector_outbound, persist) = {
             let mut state = self.state.write().await;
             let previous_connector_outbound = state
@@ -2262,6 +2257,25 @@ fn map_credential_error(error: CredentialStoreError) -> ConnectorManagerError {
         }
         _ => ConnectorManagerError::Credential,
     }
+}
+
+fn map_token_validation_error(error: TelegramTransportError) -> ConnectorManagerError {
+    if is_invalid_token(error) {
+        ConnectorManagerError::InvalidToken
+    } else {
+        ConnectorManagerError::Transport
+    }
+}
+
+fn is_invalid_token(error: TelegramTransportError) -> bool {
+    matches!(
+        error,
+        TelegramTransportError::HttpStatus {
+            status: 400 | 401 | 404
+        } | TelegramTransportError::UpstreamApi {
+            code: Some(400 | 401 | 404)
+        }
+    )
 }
 
 fn is_revoked_credential(error: TelegramTransportError) -> bool {
@@ -4018,10 +4032,11 @@ mod tests {
         state.write().await.set_control_plane_store(Some(
             crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
         ));
+        let transport = Arc::new(FakeTransport::default());
         let manager = manager(
             Arc::clone(&state),
             Arc::new(InMemoryCredentialStore::default()),
-            Arc::new(FakeTransport::default()),
+            transport.clone(),
         );
         let connector = manager
             .create(
@@ -4102,6 +4117,7 @@ mod tests {
             delivering.await.unwrap().unwrap_err(),
             super::ConnectorManagerError::Persistence
         );
+        assert_eq!(transport.sent.lock().unwrap().len(), 1);
         updating.await.unwrap();
 
         let state_guard = state.read().await;
@@ -4131,6 +4147,17 @@ mod tests {
             persisted.agents[0].state.config.name,
             "after delivery rollback"
         );
+        assert!(manager
+            .deliver_pending_once(connector.id.clone())
+            .await
+            .unwrap());
+        assert_eq!(transport.sent.lock().unwrap().len(), 2);
+        let retried = state.read().await.outbound[&outbound_id].clone();
+        assert_eq!(
+            retried.delivery_state,
+            crate::connectors::OutboundDeliveryState::Delivered
+        );
+        assert_eq!(retried.attempts, 1);
         manager.shutdown().await;
         std::fs::remove_dir_all(temporary).unwrap();
     }
@@ -4279,6 +4306,91 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delivery_cannot_send_outbound_from_a_failing_final_owner_thread_snapshot() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let transport = Arc::new(FakeTransport::default());
+        let manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            transport.clone(),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:owner-final-save-gate").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.stop_worker(&connector.id).await.unwrap();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(1, "101", "pair")],
+                    next_update_id: 2,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .approve_pending_chat(connector.id.clone(), Some("101".into()))
+            .await
+            .unwrap();
+
+        let sending = {
+            let manager = manager.clone();
+            let agent_id = agent_id.clone();
+            let connector_id = connector.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .send_from_owner(agent_id, connector_id, "owner web turn".into())
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        let save_gate = state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        release.add_permits(1);
+        save_gate.entered.acquire().await.unwrap().forget();
+
+        let delivering = {
+            let manager = manager.clone();
+            let connector_id = connector.id.clone();
+            tokio::spawn(async move { manager.deliver_pending_once(connector_id).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            transport.sent.lock().unwrap().is_empty(),
+            "delivery must not observe outbound before the final snapshot commits"
+        );
+
+        save_gate.release.add_permits(1);
+        assert_eq!(
+            sending.await.unwrap().unwrap_err(),
+            super::ConnectorManagerError::Persistence
+        );
+        assert!(!delivering.await.unwrap().unwrap());
+        assert!(transport.sent.lock().unwrap().is_empty());
+        assert!(state
+            .read()
+            .await
+            .outbound
+            .values()
+            .all(|outbound| outbound.connector_id != connector.id));
+        manager.shutdown().await;
     }
 
     #[tokio::test]

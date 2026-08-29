@@ -210,7 +210,7 @@ async fn connector_routes_cover_create_list_replace_pair_restart_and_delete() {
     )
     .await;
     assert_eq!(wrong_status, StatusCode::CONFLICT);
-    assert_eq!(wrong["code"], "pairing_not_found");
+    assert_eq!(wrong["code"], "connector_pairing_not_found");
 
     let (approve_status, approve_headers, approved, approve_text) = send(
         &app,
@@ -284,6 +284,7 @@ async fn connector_routes_enforce_agent_ownership_and_not_found_without_secret_l
             "/credential",
             Some(json!({"botToken": SECRET_SENTINEL})),
         ),
+        ("pairing", "POST", "/pairings/foreign-chat/approve", None),
         ("restart", "POST", "/restart", None),
         ("delete", "DELETE", "", None),
         ("messages", "GET", "/messages", None),
@@ -333,8 +334,14 @@ async fn connector_thread_is_dedicated_bounded_and_stably_paginated() {
         ),
     )
     .await;
-    assert_eq!(unpaired_status, StatusCode::CONFLICT);
-    assert_eq!(unpaired["code"], "connector_not_paired");
+    assert_eq!(unpaired_status, StatusCode::OK);
+    assert_eq!(unpaired["deliveryQueued"], false);
+    assert_eq!(unpaired["result"]["status"], "success");
+    assert!(unpaired["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| { message["roomId"] == created["connector"]["roomId"] }));
 
     let chat_id = wait_for_pending_chat(&app, &agent_id).await;
     let _ = send(
@@ -356,7 +363,11 @@ async fn connector_thread_is_dedicated_bounded_and_stably_paginated() {
         ),
     )
     .await;
-    let ordinary_room = ordinary_run["agent"]["messages"][0]["roomId"]
+    let ordinary_room = ordinary_run["agent"]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["roomId"]
         .as_str()
         .unwrap()
         .to_string();
@@ -433,6 +444,18 @@ async fn connector_thread_is_dedicated_bounded_and_stably_paginated() {
 async fn connector_inputs_are_bounded_before_mutation() {
     let app = app_with_owner_env("127.0.0.1", None, None).await;
     let agent_id = create_agent(&app, "bounded").await;
+    let (missing_status, _, missing_body, _) = send(
+        &app,
+        owner_request(
+            "POST",
+            &format!("/api/agents/{agent_id}/connectors/telegram"),
+            Some(json!({})),
+        ),
+    )
+    .await;
+    assert_eq!(missing_status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing_body["code"], "invalid_request");
+
     for token in ["".to_string(), "x".repeat(257), "x".repeat(4097)] {
         let (status, _, body, _) = send(
             &app,
@@ -443,8 +466,8 @@ async fn connector_inputs_are_bounded_before_mutation() {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(body["code"], "invalid_request");
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body["code"], "connector_token_invalid");
     }
     let (_, _, listed, _) = get_connectors(&app, &agent_id).await;
     assert_eq!(listed, json!({"connectors": []}));
@@ -637,4 +660,12 @@ async fn openapi_registers_connector_paths_tags_and_camel_case_schemas() {
     ] {
         assert!(!text.contains(forbidden), "snake_case leaked: {forbidden}");
     }
+    assert_eq!(
+        document["components"]["schemas"]["TelegramCredentialRequest"]["required"],
+        json!(["botToken"])
+    );
+    assert_eq!(
+        document["components"]["schemas"]["ConnectorMessageRequest"]["required"],
+        json!(["text"])
+    );
 }

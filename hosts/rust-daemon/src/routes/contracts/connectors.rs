@@ -19,12 +19,12 @@ pub(crate) const MAX_CONNECTOR_CURSOR_LENGTH: usize = 256;
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TelegramCredentialRequest {
-    pub(crate) bot_token: Option<String>,
+    pub(crate) bot_token: String,
 }
 
 impl TelegramCredentialRequest {
     pub(crate) fn into_token(self) -> Result<String, &'static str> {
-        let token = self.bot_token.ok_or("botToken is required")?;
+        let token = self.bot_token;
         if token.is_empty() {
             return Err("botToken must not be empty");
         }
@@ -35,12 +35,12 @@ impl TelegramCredentialRequest {
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ConnectorMessageRequest {
-    pub(crate) text: Option<String>,
+    pub(crate) text: String,
 }
 
 impl ConnectorMessageRequest {
     pub(crate) fn into_text(self) -> Result<String, &'static str> {
-        let text = self.text.ok_or("text is required")?;
+        let text = self.text;
         let scalar_count = text.chars().count();
         if scalar_count == 0 {
             return Err("text must not be empty");
@@ -285,8 +285,7 @@ pub(crate) struct ConnectorMessageSendResponse {
 }
 
 impl ConnectorMessageSendResponse {
-    pub(crate) fn from_run(run: AgentRunEnvelope, room_id: &str) -> Self {
-        let delivery_queued = run.result.status == "success";
+    pub(crate) fn from_run(run: AgentRunEnvelope, room_id: &str, delivery_queued: bool) -> Self {
         Self {
             messages: run
                 .agent
