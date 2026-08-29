@@ -391,6 +391,7 @@ mod tests {
             None,
             ToolRegistry::new(),
             new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
+            None,
         )
     }
 

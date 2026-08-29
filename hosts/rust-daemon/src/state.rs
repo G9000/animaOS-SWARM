@@ -2216,6 +2216,7 @@ impl DaemonState {
             self.memory_store.clone(),
             self.tool_registry.clone(),
             Arc::clone(&self.process_manager),
+            self.workspace.as_ref().map(|w| w.root_path.clone()),
         );
         Some((runtime, tool_context))
     }

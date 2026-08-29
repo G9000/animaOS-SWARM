@@ -93,10 +93,11 @@ impl Drop for ProcessManager {
 
 pub(super) fn start_background_process(
     process_manager: &SharedProcessManager,
+    configured_root: Option<&Path>,
     command: &str,
     cwd: &str,
 ) -> Result<String, String> {
-    let workspace_root = workspace_root_path("bg_start")?;
+    let workspace_root = workspace_root_path("bg_start", configured_root)?;
     start_background_process_from_root(process_manager, &workspace_root, command, cwd)
 }
 

@@ -9,6 +9,7 @@ mod web;
 mod workspace;
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use anima_core::{
     tool_not_configured_error, AgentState, Content, DataValue, Message, TaskResult, ToolCall,
@@ -54,6 +55,7 @@ pub(crate) struct ToolExecutionContext {
     pub(super) memory_store: Option<MemoryStoreConfig>,
     tool_registry: ToolRegistry,
     pub(super) process_manager: SharedProcessManager,
+    pub(super) workspace_root: Option<PathBuf>,
 }
 
 impl ToolExecutionContext {
@@ -63,6 +65,7 @@ impl ToolExecutionContext {
         memory_store: Option<MemoryStoreConfig>,
         tool_registry: ToolRegistry,
         process_manager: SharedProcessManager,
+        workspace_root: Option<PathBuf>,
     ) -> Self {
         Self {
             memory,
@@ -70,6 +73,7 @@ impl ToolExecutionContext {
             memory_store,
             tool_registry,
             process_manager,
+            workspace_root,
         }
     }
 
@@ -88,6 +92,10 @@ impl ToolExecutionContext {
             None => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
         }
     }
+}
+
+pub(crate) fn ctx_workspace_root(context: &ToolExecutionContext) -> Option<&Path> {
+    context.workspace_root.as_deref()
 }
 
 impl ToolRegistry {

@@ -3,6 +3,7 @@ pub(super) mod shell;
 
 use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall};
 use futures::future::BoxFuture;
+use std::path::Path;
 
 use self::{
     background::{
@@ -11,7 +12,7 @@ use self::{
     },
     shell::execute_bash_command,
 };
-use super::ToolExecutionContext;
+use super::{ctx_workspace_root, ToolExecutionContext};
 
 pub(crate) use self::background::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
@@ -19,7 +20,7 @@ pub(crate) use self::background::{
 };
 
 pub(super) fn execute_bash(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -52,8 +53,9 @@ pub(super) fn execute_bash(
         // execute_bash_command spawns a child + polls in a busy-loop on a
         // worker thread; running it directly on a tokio worker would block the
         // entire runtime. spawn_blocking moves it onto the blocking pool.
+        let configured_root = ctx_workspace_root(&context).map(Path::to_path_buf);
         let result = tokio::task::spawn_blocking(move || {
-            execute_bash_command(&command, timeout_ms, &cwd)
+            execute_bash_command(configured_root.as_deref(), &command, timeout_ms, &cwd)
         })
         .await;
         match result {
@@ -91,7 +93,12 @@ pub(super) fn execute_bg_start(
             None => ".".to_string(),
         };
 
-        match start_background_process(&context.process_manager, &command, &cwd) {
+        match start_background_process(
+            &context.process_manager,
+            ctx_workspace_root(&context),
+            &command,
+            &cwd,
+        ) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,

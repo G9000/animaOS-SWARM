@@ -7,10 +7,11 @@ use super::super::workspace::{
 use super::FileEditOperation;
 
 pub(in super::super) fn write_workspace_file(
+    configured_root: Option<&Path>,
     file_path: &str,
     content: &str,
 ) -> Result<String, String> {
-    let workspace_root = workspace_root_path("write_file")?;
+    let workspace_root = workspace_root_path("write_file", configured_root)?;
     write_workspace_file_from_root(&workspace_root, file_path, content)
 }
 
@@ -37,11 +38,12 @@ pub(in super::super) fn write_workspace_file_from_root(
 }
 
 pub(in super::super) fn edit_workspace_file(
+    configured_root: Option<&Path>,
     file_path: &str,
     old_string: &str,
     new_string: &str,
 ) -> Result<String, String> {
-    let workspace_root = workspace_root_path("edit_file")?;
+    let workspace_root = workspace_root_path("edit_file", configured_root)?;
     edit_workspace_file_from_root(&workspace_root, file_path, old_string, new_string)
 }
 
@@ -71,10 +73,11 @@ pub(in super::super) fn edit_workspace_file_from_root(
 }
 
 pub(in super::super) fn multi_edit_workspace_file(
+    configured_root: Option<&Path>,
     file_path: &str,
     edits: &[FileEditOperation],
 ) -> Result<String, String> {
-    let workspace_root = workspace_root_path("multi_edit")?;
+    let workspace_root = workspace_root_path("multi_edit", configured_root)?;
     multi_edit_workspace_file_from_root(&workspace_root, file_path, edits)
 }
 

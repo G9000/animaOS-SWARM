@@ -8,7 +8,7 @@ use self::{
     edit::{edit_workspace_file, multi_edit_workspace_file, write_workspace_file},
     search::{glob_workspace_paths, grep_workspace_files, list_workspace_dir, read_workspace_file},
 };
-use super::ToolExecutionContext;
+use super::{ctx_workspace_root, ToolExecutionContext};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct FileEditOperation {
@@ -17,7 +17,7 @@ pub(super) struct FileEditOperation {
 }
 
 pub(super) fn execute_read_file(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -52,7 +52,7 @@ pub(super) fn execute_read_file(
             None => 2_000,
         };
 
-        match read_workspace_file(&file_path, offset, limit) {
+        match read_workspace_file(ctx_workspace_root(&context), &file_path, offset, limit) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -67,7 +67,7 @@ pub(super) fn execute_read_file(
 }
 
 pub(super) fn execute_list_dir(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -78,7 +78,7 @@ pub(super) fn execute_list_dir(
             _ => return TaskResult::error("list_dir path must be a non-empty string", 0),
         };
 
-        match list_workspace_dir(&path) {
+        match list_workspace_dir(ctx_workspace_root(&context), &path) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -93,7 +93,7 @@ pub(super) fn execute_list_dir(
 }
 
 pub(super) fn execute_glob(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -111,7 +111,7 @@ pub(super) fn execute_glob(
             None => ".".to_string(),
         };
 
-        match glob_workspace_paths(&pattern, &path) {
+        match glob_workspace_paths(ctx_workspace_root(&context), &pattern, &path) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -126,7 +126,7 @@ pub(super) fn execute_glob(
 }
 
 pub(super) fn execute_grep(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -153,7 +153,7 @@ pub(super) fn execute_grep(
             None => None,
         };
 
-        match grep_workspace_files(&pattern, &path, include.as_deref()) {
+        match grep_workspace_files(ctx_workspace_root(&context), &pattern, &path, include.as_deref()) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -168,7 +168,7 @@ pub(super) fn execute_grep(
 }
 
 pub(super) fn execute_write_file(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -184,7 +184,7 @@ pub(super) fn execute_write_file(
             _ => return TaskResult::error("write_file content must be a string", 0),
         };
 
-        match write_workspace_file(&file_path, &content) {
+        match write_workspace_file(ctx_workspace_root(&context), &file_path, &content) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -199,7 +199,7 @@ pub(super) fn execute_write_file(
 }
 
 pub(super) fn execute_edit_file(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -220,7 +220,7 @@ pub(super) fn execute_edit_file(
             _ => return TaskResult::error("edit_file new_string must be a string", 0),
         };
 
-        match edit_workspace_file(&file_path, &old_string, &new_string) {
+        match edit_workspace_file(ctx_workspace_root(&context), &file_path, &old_string, &new_string) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -235,7 +235,7 @@ pub(super) fn execute_edit_file(
 }
 
 pub(super) fn execute_multi_edit(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -289,7 +289,7 @@ pub(super) fn execute_multi_edit(
             _ => return TaskResult::error("multi_edit edits must be a non-empty array", 0),
         };
 
-        match multi_edit_workspace_file(&file_path, &edits) {
+        match multi_edit_workspace_file(ctx_workspace_root(&context), &file_path, &edits) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,

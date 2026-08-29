@@ -6,7 +6,7 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::{canonical_workspace_root, workspace_root_path};
-use super::ToolExecutionContext;
+use super::{ctx_workspace_root, ToolExecutionContext};
 
 const TODO_DIRECTORY_NAME: &str = ".animaos-swarm";
 const TODO_FILE_NAME: &str = "todos.json";
@@ -20,7 +20,7 @@ pub(super) struct TodoItem {
 }
 
 pub(super) fn execute_todo_write(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     tool_call: ToolCall,
@@ -41,7 +41,7 @@ pub(super) fn execute_todo_write(
             None => return TaskResult::error("todo_write todos is required", 0),
         };
 
-        match write_todo_list(&todos) {
+        match write_todo_list(ctx_workspace_root(&context), &todos) {
             Ok(message) => TaskResult::success(
                 Content {
                     text: message,
@@ -56,13 +56,13 @@ pub(super) fn execute_todo_write(
 }
 
 pub(super) fn execute_todo_read(
-    _context: ToolExecutionContext,
+    context: ToolExecutionContext,
     _agent: AgentState,
     _user_message: Message,
     _tool_call: ToolCall,
 ) -> BoxFuture<'static, TaskResult<Content>> {
     Box::pin(async move {
-        match read_todo_list() {
+        match read_todo_list(ctx_workspace_root(&context)) {
             Ok(message) => TaskResult::success(
                 Content {
                     text: message,
@@ -76,8 +76,8 @@ pub(super) fn execute_todo_read(
     })
 }
 
-fn write_todo_list(todos: &[TodoItem]) -> Result<String, String> {
-    let workspace_root = workspace_root_path("todo_write")?;
+fn write_todo_list(configured_root: Option<&Path>, todos: &[TodoItem]) -> Result<String, String> {
+    let workspace_root = workspace_root_path("todo_write", configured_root)?;
     write_todo_list_from_root(&workspace_root, todos)
 }
 
@@ -123,8 +123,8 @@ pub(super) fn write_todo_list_from_root(
     Ok(message)
 }
 
-fn read_todo_list() -> Result<String, String> {
-    let workspace_root = workspace_root_path("todo_read")?;
+fn read_todo_list(configured_root: Option<&Path>) -> Result<String, String> {
+    let workspace_root = workspace_root_path("todo_read", configured_root)?;
     read_todo_list_from_root(&workspace_root)
 }
 

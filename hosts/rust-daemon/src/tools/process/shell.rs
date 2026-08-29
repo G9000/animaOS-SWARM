@@ -61,11 +61,12 @@ pub(in super::super) struct BashCommandResult {
 }
 
 pub(super) fn execute_bash_command(
+    configured_root: Option<&Path>,
     command: &str,
     timeout_ms: u64,
     cwd: &str,
 ) -> Result<BashCommandResult, String> {
-    let workspace_root = workspace_root_path("bash")?;
+    let workspace_root = workspace_root_path("bash", configured_root)?;
     execute_bash_command_from_root(&workspace_root, command, timeout_ms, cwd)
 }
 

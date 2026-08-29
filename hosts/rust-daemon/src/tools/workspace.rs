@@ -1,7 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn workspace_root_path(tool_name: &str) -> Result<PathBuf, String> {
+pub(crate) fn workspace_root_path(
+    tool_name: &str,
+    configured: Option<&Path>,
+) -> Result<PathBuf, String> {
+    if let Some(root) = configured {
+        return Ok(root.to_path_buf());
+    }
     match std::env::var("ANIMAOS_WORKSPACE_ROOT") {
         Ok(value) if !value.trim().is_empty() => Ok(PathBuf::from(value)),
         Ok(_) => Err(format!("{tool_name} workspace root is empty")),

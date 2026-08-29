@@ -25,7 +25,7 @@ use super::{
     },
     utility::{current_time_iso_utc, evaluate_expression},
     web::{parse_exa_results, strip_html_text},
-    ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    workspace_root_path, ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
 use crate::memory_embeddings::MemoryEmbeddingRuntime;
 use anima_core::{
@@ -65,6 +65,7 @@ async fn tool_execution_context_rejects_registered_but_unconfigured_write_tool()
         None,
         ToolRegistry::new(),
         new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
+        None,
     );
     let agent = AgentState {
         id: "agent-denied".into(),
@@ -1180,6 +1181,21 @@ fn todo_write_warns_when_multiple_items_are_in_progress() {
     );
 
     fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
+fn configured_workspace_root_overrides_env_var() {
+    let configured = PathBuf::from("C:\\configured\\root");
+    let resolved = workspace_root_path("read_file", Some(configured.as_path()))
+        .expect("configured root resolves");
+    assert_eq!(resolved, configured);
+}
+
+#[test]
+fn missing_config_falls_back_to_env_or_cwd() {
+    // With no override, behavior is unchanged from today.
+    let resolved = workspace_root_path("read_file", None);
+    assert!(resolved.is_ok());
 }
 
 fn create_temp_workspace(prefix: &str) -> PathBuf {

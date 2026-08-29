@@ -131,7 +131,7 @@ pub(crate) async fn handle_create_agency(
         Vec::new()
     };
 
-    let workspace_root = workspace_root_path("agency_create").map_err(ApiError::bad_request)?;
+    let workspace_root = workspace_root_path("agency_create", None).map_err(ApiError::bad_request)?;
     let canonical_root = canonical_workspace_root(&workspace_root, "agency_create")
         .map_err(ApiError::bad_request)?;
     let output_dir = output_dir.unwrap_or_else(|| agency_dir_slug(&agency.name));

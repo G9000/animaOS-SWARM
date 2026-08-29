@@ -10,11 +10,12 @@ use super::super::workspace::{
 };
 
 pub(in super::super) fn read_workspace_file(
+    configured_root: Option<&Path>,
     file_path: &str,
     offset: usize,
     limit: usize,
 ) -> Result<String, String> {
-    let workspace_root = workspace_root_path("read_file")?;
+    let workspace_root = workspace_root_path("read_file", configured_root)?;
     read_workspace_file_from_root(&workspace_root, file_path, offset, limit)
 }
 
@@ -56,8 +57,11 @@ pub(in super::super) fn read_workspace_file_from_root(
     Ok(numbered.join("\n"))
 }
 
-pub(in super::super) fn list_workspace_dir(path: &str) -> Result<String, String> {
-    let workspace_root = workspace_root_path("list_dir")?;
+pub(in super::super) fn list_workspace_dir(
+    configured_root: Option<&Path>,
+    path: &str,
+) -> Result<String, String> {
+    let workspace_root = workspace_root_path("list_dir", configured_root)?;
     list_workspace_dir_from_root(&workspace_root, path)
 }
 
@@ -106,8 +110,12 @@ pub(in super::super) fn list_workspace_dir_from_root(
     Ok(lines.join("\n"))
 }
 
-pub(in super::super) fn glob_workspace_paths(pattern: &str, path: &str) -> Result<String, String> {
-    let workspace_root = workspace_root_path("glob")?;
+pub(in super::super) fn glob_workspace_paths(
+    configured_root: Option<&Path>,
+    pattern: &str,
+    path: &str,
+) -> Result<String, String> {
+    let workspace_root = workspace_root_path("glob", configured_root)?;
     glob_workspace_paths_from_root(&workspace_root, pattern, path)
 }
 
@@ -140,11 +148,12 @@ pub(in super::super) fn glob_workspace_paths_from_root(
 }
 
 pub(in super::super) fn grep_workspace_files(
+    configured_root: Option<&Path>,
     pattern: &str,
     path: &str,
     include: Option<&str>,
 ) -> Result<String, String> {
-    let workspace_root = workspace_root_path("grep")?;
+    let workspace_root = workspace_root_path("grep", configured_root)?;
     grep_workspace_files_from_root(&workspace_root, pattern, path, include)
 }
 
