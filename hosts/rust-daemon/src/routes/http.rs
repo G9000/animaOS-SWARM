@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Write};
+use std::net::IpAddr;
 
 use axum::body::to_bytes;
 use axum::extract::Request as AxumRequest;
@@ -11,8 +12,160 @@ use serde::Serialize;
 use serde_json::ser::{CharEscape, CompactFormatter, Formatter};
 use tracing::error;
 use tracing::info_span;
+use zeroize::Zeroizing;
 
 use super::ApiError;
+
+const DEFAULT_LOCAL_UI_ORIGINS: [&str; 4] = [
+    "http://localhost:4200",
+    "http://127.0.0.1:4200",
+    "http://localhost:4201",
+    "http://127.0.0.1:4201",
+];
+const MAX_LOCAL_ADMIN_TOKEN_BYTES: usize = 4096;
+
+/// Immutable, startup-computed policy for operations that can mutate local
+/// credentials or trigger agent/external side effects.
+#[derive(Clone)]
+pub(super) struct LocalOwnerPolicy {
+    bind_is_loopback: bool,
+    allowed_origins: BTreeSet<String>,
+    admin_token: Option<Zeroizing<String>>,
+}
+
+impl LocalOwnerPolicy {
+    pub(super) fn from_env(bind_is_loopback: bool) -> Self {
+        let mut allowed_origins = DEFAULT_LOCAL_UI_ORIGINS
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        if let Ok(configured) = std::env::var("ANIMA_ALLOWED_UI_ORIGINS") {
+            allowed_origins.extend(
+                configured
+                    .split(',')
+                    .filter_map(normalize_serialized_origin),
+            );
+        }
+        let admin_token = std::env::var("ANIMA_LOCAL_ADMIN_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= MAX_LOCAL_ADMIN_TOKEN_BYTES)
+            .map(Zeroizing::new);
+        Self {
+            bind_is_loopback,
+            allowed_origins,
+            admin_token,
+        }
+    }
+
+    pub(super) fn authorize(&self, headers: &axum::http::HeaderMap) -> bool {
+        if !self.bind_is_loopback
+            || !request_host_is_loopback(headers)
+            || has_forwarding_headers(headers)
+        {
+            return false;
+        }
+
+        if let Some(origin) = headers.get(header::ORIGIN) {
+            let Ok(origin) = origin.to_str() else {
+                return false;
+            };
+            return normalize_serialized_origin(origin)
+                .is_some_and(|origin| self.allowed_origins.contains(&origin));
+        }
+
+        let Some(expected) = self.admin_token.as_deref() else {
+            return false;
+        };
+        let Some(presented) = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return false;
+        };
+        constant_time_local_admin_eq(presented.as_bytes(), expected.as_bytes())
+    }
+}
+
+pub(crate) fn configured_bind_is_loopback() -> bool {
+    let host = std::env::var("ANIMAOS_RS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    host_is_loopback(host.trim())
+}
+
+fn normalize_serialized_origin(origin: &str) -> Option<String> {
+    let origin = origin.trim();
+    if origin.is_empty() || origin == "null" || origin.contains('*') {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(origin).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || parsed.path() != "/"
+    {
+        return None;
+    }
+    Some(parsed.origin().ascii_serialization())
+}
+
+fn request_host_is_loopback(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let Ok(authority) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    host_is_loopback(authority.host())
+}
+
+fn host_is_loopback(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>().is_ok_and(|address| match address {
+        IpAddr::V4(address) => address.is_loopback(),
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or_else(|| address.is_loopback(), |address| address.is_loopback()),
+    })
+}
+
+fn has_forwarding_headers(headers: &axum::http::HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name == "forwarded"
+            || name == "via"
+            || name.starts_with("x-forwarded-")
+            || matches!(
+                name,
+                "x-real-ip" | "client-ip" | "true-client-ip" | "cf-connecting-ip"
+            )
+    })
+}
+
+fn constant_time_local_admin_eq(presented: &[u8], expected: &[u8]) -> bool {
+    if presented.len() > MAX_LOCAL_ADMIN_TOKEN_BYTES || expected.len() > MAX_LOCAL_ADMIN_TOKEN_BYTES
+    {
+        return false;
+    }
+    let mut diff = presented.len() ^ expected.len();
+    for index in 0..MAX_LOCAL_ADMIN_TOKEN_BYTES {
+        diff |= usize::from(
+            presented.get(index).copied().unwrap_or_default()
+                ^ expected.get(index).copied().unwrap_or_default(),
+        );
+    }
+    diff == 0
+}
 
 /// Optional API-key gate. Reads `ANIMAOS_RS_API_KEY` once on first call and
 /// caches the result for the process lifetime.
@@ -81,12 +234,12 @@ pub(super) async fn enforce_api_key(
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
+    let max_len = a.len().max(b.len());
+    let mut diff = a.len() ^ b.len();
+    for index in 0..max_len {
+        diff |= usize::from(
+            a.get(index).copied().unwrap_or_default() ^ b.get(index).copied().unwrap_or_default(),
+        );
     }
     diff == 0
 }

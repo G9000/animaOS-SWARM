@@ -94,6 +94,8 @@ pub(crate) enum ConnectorManagerError {
     AgentNotFound,
     ConnectorNotFound,
     AgentAlreadyConnected,
+    PairingNotFound,
+    ConnectorNotPaired,
     Transport,
     Credential,
     CredentialStateUncertain,
@@ -109,6 +111,8 @@ impl fmt::Display for ConnectorManagerError {
             Self::AgentNotFound => "agent not found",
             Self::ConnectorNotFound => "connector not found",
             Self::AgentAlreadyConnected => "agent already has an active Telegram connector",
+            Self::PairingNotFound => "Telegram pairing candidate was not found",
+            Self::ConnectorNotPaired => "Telegram connector is not paired",
             Self::Transport => "Telegram transport failed",
             Self::Credential => "credential vault operation failed",
             Self::CredentialStateUncertain => "credential vault state requires reconciliation",
@@ -706,15 +710,28 @@ impl ConnectorManager {
         &self,
         connector_id: String,
     ) -> Result<TelegramConnectorRecord, ConnectorManagerError> {
+        self.approve_pending_chat(connector_id, None).await
+    }
+
+    pub(crate) async fn approve_pending_chat(
+        &self,
+        connector_id: String,
+        expected_chat_id: Option<String>,
+    ) -> Result<TelegramConnectorRecord, ConnectorManagerError> {
         let manager = self.clone();
-        tokio::spawn(async move { manager.approve_pending_owned(connector_id).await })
-            .await
-            .map_err(|_| ConnectorManagerError::WorkerStopped)?
+        tokio::spawn(async move {
+            manager
+                .approve_pending_owned(connector_id, expected_chat_id)
+                .await
+        })
+        .await
+        .map_err(|_| ConnectorManagerError::WorkerStopped)?
     }
 
     async fn approve_pending_owned(
         &self,
         connector_id: String,
+        expected_chat_id: Option<String>,
     ) -> Result<TelegramConnectorRecord, ConnectorManagerError> {
         let _mutation = self.mutation_lock.lock().await;
         let stale = {
@@ -763,7 +780,13 @@ impl ConnectorManager {
             let pending = previous
                 .pending_pairing
                 .clone()
-                .ok_or(ConnectorManagerError::ConnectorNotFound)?;
+                .ok_or(ConnectorManagerError::PairingNotFound)?;
+            if expected_chat_id
+                .as_deref()
+                .is_some_and(|expected| expected != pending.chat.id)
+            {
+                return Err(ConnectorManagerError::PairingNotFound);
+            }
             let connector = state
                 .connectors
                 .get_mut(&connector_id)
@@ -792,6 +815,206 @@ impl ConnectorManager {
             .await
             .insert(connector_id, ConnectorRuntimeStatus::Ready);
         Ok(updated)
+    }
+
+    pub(crate) async fn send_from_owner(
+        &self,
+        agent_id: String,
+        connector_id: String,
+        text: String,
+    ) -> Result<crate::routes::AgentRunEnvelope, ConnectorManagerError> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager
+                .send_from_owner_owned(agent_id, connector_id, text)
+                .await
+        })
+        .await
+        .map_err(|_| ConnectorManagerError::WorkerStopped)?
+    }
+
+    async fn send_from_owner_owned(
+        &self,
+        agent_id: String,
+        connector_id: String,
+        text: String,
+    ) -> Result<crate::routes::AgentRunEnvelope, ConnectorManagerError> {
+        let (connector, connector_worker_generation) = {
+            let _lifecycle = self.lifecycle_lock.lock().await;
+            self.ensure_open()?;
+            let state = self.state.read().await;
+            let connector = state
+                .connectors
+                .get(&connector_id)
+                .filter(|connector| connector.is_active() && connector.agent_id == agent_id)
+                .cloned()
+                .ok_or(ConnectorManagerError::ConnectorNotFound)?;
+            if connector.approved_chat.is_none() {
+                return Err(ConnectorManagerError::ConnectorNotPaired);
+            }
+            if state
+                .outbound
+                .values()
+                .filter(|record| {
+                    record.connector_id == connector_id
+                        && record.delivery_state != OutboundDeliveryState::Delivered
+                })
+                .count()
+                >= MAX_UNDELIVERED_OUTBOUND
+            {
+                return Err(ConnectorManagerError::Backpressure);
+            }
+            let worker_generation = self
+                .workers
+                .lock()
+                .await
+                .get(&connector_id)
+                .map(|worker| worker.generation);
+            (connector, worker_generation)
+        };
+        let permit = self
+            .runs
+            .try_admit()
+            .map_err(|_| ConnectorManagerError::Backpressure)?;
+        let commit_connector_id = connector.id.clone();
+        let commit_agent_id = connector.agent_id.clone();
+        let commit_room_id = connector.room_id.clone();
+        let commit_chat_id = connector
+            .approved_chat
+            .as_ref()
+            .expect("paired connector was prevalidated")
+            .id
+            .clone();
+        let rollback_outbound = Arc::new(std::sync::Mutex::new(None::<TelegramOutboundRecord>));
+        let commit_rollback_outbound = Arc::clone(&rollback_outbound);
+        let commit_lifecycle_lock = Arc::clone(&self.lifecycle_lock);
+        let commit_workers = Arc::clone(&self.workers);
+        let request = AgentRunRequest {
+            agent_id: connector.agent_id.clone(),
+            content: Content {
+                text,
+                metadata: Some(BTreeMap::from([
+                    ("source".into(), DataValue::String("telegramThread".into())),
+                    (
+                        "connectorId".into(),
+                        DataValue::String(connector.id.clone()),
+                    ),
+                ])),
+                attachments: None,
+            },
+            room: RunRoom::Stable(connector.room_id.clone()),
+            idempotency_key: None,
+        };
+        self.runs
+            .run_with_commit_admitted_and_rollback(
+                request,
+                permit,
+                move |state, snapshot, result| {
+                    let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
+                        ApiError::service_unavailable("connector lifecycle changed during run")
+                    })?;
+                    let workers = commit_workers.try_lock().map_err(|_| {
+                        ApiError::service_unavailable("connector worker changed during run")
+                    })?;
+                    if workers
+                        .get(&commit_connector_id)
+                        .map(|worker| worker.generation)
+                        != connector_worker_generation
+                    {
+                        return Err(ApiError::service_unavailable(
+                            "connector worker changed during run",
+                        ));
+                    }
+                    let current = state
+                        .connectors
+                        .get(&commit_connector_id)
+                        .filter(|current| {
+                            current.is_active()
+                                && current.agent_id == commit_agent_id
+                                && current.room_id == commit_room_id
+                                && current
+                                    .approved_chat
+                                    .as_ref()
+                                    .is_some_and(|chat| chat.id == commit_chat_id)
+                        })
+                        .ok_or_else(|| ApiError::not_found())?;
+                    if result.status == TaskStatus::Error {
+                        return Ok(());
+                    }
+                    if state
+                        .outbound
+                        .values()
+                        .filter(|record| {
+                            record.connector_id == commit_connector_id
+                                && record.delivery_state != OutboundDeliveryState::Delivered
+                        })
+                        .count()
+                        >= MAX_UNDELIVERED_OUTBOUND
+                    {
+                        return Err(ApiError::service_unavailable(
+                            "connector outbound capacity is exhausted",
+                        ));
+                    }
+                    let assistant = snapshot
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| {
+                            message.room_id == current.room_id
+                                && message.role == MessageRole::Assistant
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            ApiError::bad_request("agent produced no assistant message")
+                        })?;
+                    let outbound_id = format!(
+                        "telegram:{}:web:{}:outbound",
+                        commit_connector_id, assistant.id
+                    );
+                    let outbound = TelegramOutboundRecord {
+                        id: outbound_id.clone(),
+                        connector_id: commit_connector_id.clone(),
+                        agent_id: commit_agent_id.clone(),
+                        room_id: commit_room_id.clone(),
+                        assistant_message_id: assistant.id,
+                        text: assistant.content.text,
+                        created_at_ms: now_ms(),
+                        delivered_at_ms: None,
+                        attempts: 0,
+                        delivery_state: OutboundDeliveryState::Pending,
+                    };
+                    if let Some(existing) = state.outbound.get(&outbound_id) {
+                        if existing != &outbound {
+                            return Err(ApiError::bad_request(
+                                "connector outbound conflicts with run",
+                            ));
+                        }
+                    } else {
+                        state.outbound.insert(outbound_id, outbound.clone());
+                        *commit_rollback_outbound
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outbound);
+                    }
+                    Ok(())
+                },
+                move |state, baseline| {
+                    if let Some(inserted) = rollback_outbound
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_ref()
+                    {
+                        if state.outbound.get(&inserted.id) == Some(inserted) {
+                            state.outbound.remove(&inserted.id);
+                        }
+                    }
+                    state
+                        .rollback_agent_runtime(baseline)
+                        .map(|_| ())
+                        .map_err(ApiError::service_unavailable)
+                },
+            )
+            .await
+            .map_err(|_| ConnectorManagerError::Persistence)
     }
 
     async fn expire_pending_pairing_at(
@@ -4056,6 +4279,92 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_thread_run_releases_lifecycle_lock_and_rolls_back_if_deleted() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:owner-thread").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(1, "101", "pair")],
+                    next_update_id: 2,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .approve_pending_chat(connector.id.clone(), Some("101".into()))
+            .await
+            .unwrap();
+        let baseline = state.read().await.get_agent(&agent_id).unwrap();
+
+        let sending_manager = manager.clone();
+        let sending_agent_id = agent_id.clone();
+        let sending_connector_id = connector.id.clone();
+        let sending = tokio::spawn(async move {
+            sending_manager
+                .send_from_owner(
+                    sending_agent_id,
+                    sending_connector_id,
+                    "owner web turn".into(),
+                )
+                .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("owner thread run should enter model")
+            .forget();
+
+        let deleting_manager = manager.clone();
+        let deleting_connector_id = connector.id.clone();
+        let deleting =
+            tokio::spawn(async move { deleting_manager.delete(deleting_connector_id).await });
+        let deleted_while_model_was_running =
+            tokio::time::timeout(Duration::from_millis(200), deleting).await;
+        release.add_permits(1);
+
+        assert!(
+            deleted_while_model_was_running.is_ok(),
+            "connector lifecycle mutations must not wait for model/tool execution"
+        );
+        assert!(deleted_while_model_was_running.unwrap().unwrap().is_ok());
+        assert_eq!(
+            sending.await.unwrap().unwrap_err(),
+            super::ConnectorManagerError::Persistence
+        );
+        let state = state.read().await;
+        assert_eq!(
+            state.get_agent(&agent_id).unwrap().messages,
+            baseline.messages
+        );
+        assert!(state
+            .outbound
+            .values()
+            .all(|outbound| outbound.connector_id != connector.id));
+        assert!(state.connectors[&connector.id].deleted_at_ms.is_some());
     }
 
     #[tokio::test]

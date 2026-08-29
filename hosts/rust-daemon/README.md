@@ -18,6 +18,8 @@ For an implementation walkthrough, see [Rust Daemon Architecture](../../docs/rus
 | `DATABASE_URL` | No | Postgres connection string. Required when `ANIMAOS_RS_PERSISTENCE_MODE=postgres`. Postgres mode runs migrations, stores host snapshots in `host_snapshots`, and injects `SqlxPostgresAdapter` for step-log persistence plus completed-tool reuse for retried requests that repeat the same metadata retry key. |
 | `ANIMAOS_RS_HOST` | No | Bind host (default `127.0.0.1`). |
 | `ANIMAOS_RS_PORT` | No | Bind port (default `8080`). |
+| `ANIMA_ALLOWED_UI_ORIGINS` | No | Comma-separated additional exact browser origins allowed to perform local-owner connector and schedule mutations. The built-in local development origins are `http://localhost:4200`, `http://127.0.0.1:4200`, `http://localhost:4201`, and `http://127.0.0.1:4201`; wildcards and suffix matching are not supported. |
+| `ANIMA_LOCAL_ADMIN_TOKEN` | No | Bearer token for originless local-owner clients. When unset, originless connector and schedule mutations are disabled. The daemon snapshots this value at startup, compares it in constant time, and never returns or logs it. |
 | `ANIMAOS_RS_MAX_REQUEST_BYTES` | No | Request body size limit in bytes (default `65536` / 64 KB). |
 | `ANIMAOS_RS_REQUEST_TIMEOUT_SECS` | No | Per-request timeout in seconds for standard routes and blocking `/run` endpoints (default `30`). |
 | `ANIMAOS_RS_PERSISTENCE_MODE` | No | Persistence mode: `memory` (default) or `postgres`. `postgres` requires `DATABASE_URL` and fails startup if Postgres is unavailable or migrations fail. |

@@ -178,6 +178,27 @@ impl AgentRunCoordinator {
             .await
     }
 
+    pub(crate) async fn run_with_commit_admitted_and_rollback<F, R>(
+        &self,
+        request: AgentRunRequest,
+        permit: AgentRunPermit,
+        commit: F,
+        rollback: R,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(
+                &mut DaemonState,
+                &AgentRuntimeSnapshot,
+                &TaskResult<Content>,
+            ) -> Result<(), ApiError>
+            + Send
+            + 'static,
+        R: FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
+    {
+        self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
+            .await
+    }
+
     async fn run_transaction_admitted<F>(
         &self,
         request: AgentRunRequest,

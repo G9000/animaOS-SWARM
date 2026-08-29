@@ -6,15 +6,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anima_core::DatabaseAdapter;
+use async_trait::async_trait;
 use axum::Router;
 use tokio::net::TcpListener;
 use tokio::sync::{RwLock, Semaphore};
 
 use self::{lifecycle::shutdown_signal, persistence::configure_persistence};
 use crate::agent_runs::AgentRunCoordinator;
-use crate::connectors::credentials::OsKeyringCredentialStore;
-use crate::connectors::runtime::ConnectorManager;
-use crate::connectors::telegram::TelegramClient;
+use crate::connectors::credentials::{
+    InMemoryCredentialStore, OsKeyringCredentialStore, TelegramBotToken,
+};
+use crate::connectors::runtime::{ConnectorManager, TelegramTransport};
+use crate::connectors::telegram::{
+    TelegramClient, TelegramSentMessage, TelegramTransportError, TelegramUpdateBatch,
+};
+use crate::connectors::{
+    TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata, TelegramSenderMetadata,
+};
 use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::routes;
 use crate::runtime_model::RuntimeModelAdapter;
@@ -117,9 +125,13 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 }
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
-    let runtime = daemon_runtime(Arc::clone(&state), &config)
-        .expect("default Telegram transport configuration should be valid");
-    router_with_runtime(state, config, runtime)
+    let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+    router_with_runtime(
+        state,
+        config,
+        runtime,
+        routes::configured_bind_is_loopback(),
+    )
 }
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
@@ -131,7 +143,12 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     configure_persistence(&state, &config).await?;
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
     runtime.connectors.start_restored().await;
-    Ok(router_with_runtime(state, config, runtime))
+    Ok(router_with_runtime(
+        state,
+        config,
+        runtime,
+        routes::configured_bind_is_loopback(),
+    ))
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
@@ -154,10 +171,11 @@ pub(crate) async fn serve_with_state(
     state: SharedDaemonState,
     config: DaemonConfig,
 ) -> io::Result<()> {
+    let bind_is_loopback = listener.local_addr()?.ip().is_loopback();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
     runtime.connectors.start_restored().await;
     let connectors = runtime.connectors.clone();
-    let router = router_with_runtime(state, config, runtime);
+    let router = router_with_runtime(state, config, runtime, bind_is_loopback);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -184,10 +202,27 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
     })
 }
 
+fn deterministic_daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> DaemonRuntime {
+    let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let connectors = ConnectorManager::new(
+        state,
+        agent_runs.clone(),
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(DeterministicTelegramTransport),
+    );
+    DaemonRuntime {
+        run_limiter,
+        agent_runs,
+        connectors,
+    }
+}
+
 fn router_with_runtime(
     state: SharedDaemonState,
     config: DaemonConfig,
     runtime: DaemonRuntime,
+    bind_is_loopback: bool,
 ) -> Router {
     routes::router_with_services(
         state,
@@ -195,5 +230,72 @@ fn router_with_runtime(
         runtime.run_limiter,
         runtime.agent_runs,
         runtime.connectors,
+        bind_is_loopback,
     )
+}
+
+/// Deterministic Telegram boundary paired with the deterministic model in the
+/// public test/embedding router helpers. Production `serve` always uses the
+/// fixed-origin `TelegramClient` and OS credential vault.
+struct DeterministicTelegramTransport;
+
+#[async_trait]
+impl TelegramTransport for DeterministicTelegramTransport {
+    async fn get_me(
+        &self,
+        _token: &TelegramBotToken,
+    ) -> Result<TelegramBotIdentity, TelegramTransportError> {
+        Ok(TelegramBotIdentity {
+            id: "900001".to_string(),
+            username: Some("anima_test_bot".to_string()),
+            display_name: Some("Anima Test Bot".to_string()),
+        })
+    }
+
+    async fn get_updates(
+        &self,
+        _token: &TelegramBotToken,
+        offset: i64,
+    ) -> Result<TelegramUpdateBatch, TelegramTransportError> {
+        if offset <= 1 {
+            return Ok(TelegramUpdateBatch {
+                updates: vec![crate::connectors::telegram::TelegramTextUpdate {
+                    update_id: 1,
+                    text: "pair deterministic Telegram chat".to_string(),
+                    sender: TelegramSenderMetadata {
+                        id: "700001".to_string(),
+                        username: Some("local_owner".to_string()),
+                        display_name: Some("Local Owner".to_string()),
+                    },
+                    chat: deterministic_chat(),
+                }],
+                next_update_id: 2,
+            });
+        }
+        Ok(TelegramUpdateBatch {
+            updates: Vec::new(),
+            next_update_id: offset,
+        })
+    }
+
+    async fn send_message(
+        &self,
+        _token: &TelegramBotToken,
+        _chat_id: &str,
+        _text: &str,
+    ) -> Result<Vec<TelegramSentMessage>, TelegramTransportError> {
+        Ok(vec![TelegramSentMessage {
+            message_id: "800001".to_string(),
+            chat: deterministic_chat(),
+        }])
+    }
+}
+
+fn deterministic_chat() -> TelegramChatMetadata {
+    TelegramChatMetadata {
+        id: "424242".to_string(),
+        kind: TelegramChatKind::Private,
+        title: None,
+        username: Some("local_owner".to_string()),
+    }
 }

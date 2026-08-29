@@ -1,5 +1,6 @@
 mod agencies;
 mod agents;
+mod connectors;
 mod memories;
 mod providers;
 mod shared;
@@ -13,6 +14,7 @@ pub(crate) use agents::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
     AgentRuntimeSnapshotResponse, AgentUpdateRequest, AgentsEnvelope,
 };
+pub(crate) use connectors::*;
 pub(crate) use memories::{
     AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
     AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,

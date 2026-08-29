@@ -1,5 +1,6 @@
 mod agencies;
 mod agents;
+mod connectors;
 mod contracts;
 mod health;
 mod http;
@@ -43,6 +44,7 @@ use self::contracts::{
 pub(crate) use self::contracts::{
     AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
 };
+pub(crate) use self::http::configured_bind_is_loopback;
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
 pub(super) use self::http::{parse_json_body, serialize_json};
 use crate::runtime_model::provider_summaries;
@@ -80,7 +82,15 @@ use crate::runtime_model::provider_summaries;
         get_swarm_entry,
         run_swarm_entry,
         swarm_events_entry,
-        list_providers_entry
+        list_providers_entry,
+        connectors::list_connectors,
+        connectors::create_telegram_connector,
+        connectors::replace_telegram_credential,
+        connectors::approve_telegram_pairing,
+        connectors::restart_telegram_connector,
+        connectors::delete_telegram_connector,
+        connectors::list_connector_messages,
+        connectors::send_connector_message,
     ),
     tags(
         (name = "health", description = "Daemon health endpoints"),
@@ -88,7 +98,9 @@ use crate::runtime_model::provider_summaries;
         (name = "agents", description = "Agent management and execution"),
         (name = "memories", description = "Memory storage and search"),
         (name = "swarms", description = "Swarm creation, execution, and streaming"),
-        (name = "providers", description = "Model provider catalog")
+        (name = "providers", description = "Model provider catalog"),
+        (name = "connectors", description = "Agent-scoped connector administration"),
+        (name = "connector-thread", description = "Dedicated connector-room messages"),
     )
 )]
 struct ApiDoc;
@@ -100,6 +112,7 @@ struct AppState {
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    local_owner: self::http::LocalOwnerPolicy,
 }
 
 #[derive(Debug)]
@@ -156,6 +169,7 @@ pub(crate) fn router_with_services(
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    bind_is_loopback: bool,
 ) -> Router {
     let app_state = AppState {
         daemon: Arc::clone(&state),
@@ -163,6 +177,7 @@ pub(crate) fn router_with_services(
         run_limiter: Arc::clone(&run_limiter),
         agent_runs,
         connector_manager,
+        local_owner: self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -240,6 +255,34 @@ pub(crate) fn router_with_services(
         )
         .route("/api/swarms/{swarm_id}", get(get_swarm_entry))
         .route("/api/providers", get(list_providers_entry))
+        .route(
+            "/api/agents/{agent_id}/connectors",
+            get(connectors::list_connectors),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/telegram",
+            axum::routing::post(connectors::create_telegram_connector),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/{connector_id}/credential",
+            axum::routing::put(connectors::replace_telegram_credential),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/{connector_id}/pairings/{chat_id}/approve",
+            axum::routing::post(connectors::approve_telegram_pairing),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/{connector_id}/restart",
+            axum::routing::post(connectors::restart_telegram_connector),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/{connector_id}",
+            axum::routing::delete(connectors::delete_telegram_connector),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/{connector_id}/messages",
+            get(connectors::list_connector_messages),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             config.request_timeout,
@@ -252,6 +295,10 @@ pub(crate) fn router_with_services(
         .route(
             "/api/swarms/{swarm_id}/run",
             axum::routing::post(run_swarm_entry),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/{connector_id}/messages",
+            axum::routing::post(connectors::send_connector_message),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -285,7 +332,14 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(TelegramClient::new().expect("test Telegram client should configure")),
     );
-    router_with_services(state, config, run_limiter, agent_runs, connector_manager)
+    router_with_services(
+        state,
+        config,
+        run_limiter,
+        agent_runs,
+        connector_manager,
+        configured_bind_is_loopback(),
+    )
 }
 
 async fn health_entry() -> AxumResponse {
@@ -1008,9 +1062,14 @@ mod tests {
     use super::{router, router_with_services};
     use crate::agent_runs::AgentRunCoordinator;
     use crate::app::DaemonConfig;
-    use crate::connectors::credentials::InMemoryCredentialStore;
-    use crate::connectors::runtime::ConnectorManager;
-    use crate::connectors::telegram::TelegramClient;
+    use crate::connectors::credentials::{
+        ConnectorCredentialStore, CredentialStoreError, InMemoryCredentialStore, TelegramBotToken,
+    };
+    use crate::connectors::runtime::{ConnectorManager, TelegramTransport};
+    use crate::connectors::telegram::{
+        TelegramClient, TelegramSentMessage, TelegramTransportError, TelegramUpdateBatch,
+    };
+    use crate::connectors::{TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata};
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
@@ -1038,6 +1097,86 @@ mod tests {
 
     struct TransactionalSwarmModelAdapter {
         context: StdMutex<Option<(AgentRunCoordinator, Arc<RwLock<DaemonState>>)>>,
+    }
+
+    #[derive(Default)]
+    struct CountingCredentialStore {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ConnectorCredentialStore for CountingCredentialStore {
+        async fn load(
+            &self,
+            _connector_id: &str,
+        ) -> Result<Option<TelegramBotToken>, CredentialStoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+
+        async fn put(
+            &self,
+            _connector_id: &str,
+            _token: TelegramBotToken,
+        ) -> Result<(), CredentialStoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn delete(&self, _connector_id: &str) -> Result<(), CredentialStoreError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingTelegramTransport {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl TelegramTransport for CountingTelegramTransport {
+        async fn get_me(
+            &self,
+            _token: &TelegramBotToken,
+        ) -> Result<TelegramBotIdentity, TelegramTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TelegramBotIdentity {
+                id: "counting-bot".into(),
+                username: None,
+                display_name: None,
+            })
+        }
+
+        async fn get_updates(
+            &self,
+            _token: &TelegramBotToken,
+            offset: i64,
+        ) -> Result<TelegramUpdateBatch, TelegramTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(TelegramUpdateBatch {
+                updates: Vec::new(),
+                next_update_id: offset,
+            })
+        }
+
+        async fn send_message(
+            &self,
+            _token: &TelegramBotToken,
+            _chat_id: &str,
+            _text: &str,
+        ) -> Result<Vec<TelegramSentMessage>, TelegramTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![TelegramSentMessage {
+                message_id: "counting-message".into(),
+                chat: TelegramChatMetadata {
+                    id: "1".into(),
+                    kind: TelegramChatKind::Private,
+                    title: None,
+                    username: None,
+                },
+            }])
+        }
     }
 
     #[async_trait]
@@ -1179,7 +1318,106 @@ mod tests {
             Arc::new(InMemoryCredentialStore::default()),
             Arc::new(TelegramClient::new().unwrap()),
         );
-        router_with_services(state, config, limiter, runs, connectors)
+        router_with_services(state, config, limiter, runs, connectors, true)
+    }
+
+    #[tokio::test]
+    async fn connector_owner_guard_precedes_vault_and_telegram_side_effects() {
+        let mut daemon = DaemonState::new();
+        let agent_id = daemon
+            .create_agent(test_config("guarded"))
+            .unwrap()
+            .state
+            .id;
+        let state = Arc::new(RwLock::new(daemon));
+        let limiter = Arc::new(Semaphore::new(4));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let credentials = Arc::new(CountingCredentialStore::default());
+        let transport = Arc::new(CountingTelegramTransport::default());
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            credentials.clone(),
+            transport.clone(),
+        );
+        let app = router_with_services(
+            Arc::clone(&state),
+            DaemonConfig::default(),
+            limiter,
+            runs,
+            manager,
+            true,
+        );
+        let path = format!("/api/agents/{agent_id}/connectors/telegram");
+        let body = r#"{"botToken":"42:must-not-reach-side-effects"}"#;
+
+        let requests = [
+            Request::builder()
+                .method("POST")
+                .uri(&path)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "https://attacker.example")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+            Request::builder()
+                .method("POST")
+                .uri(&path)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://localhost:4200")
+                .header("forwarded", "for=127.0.0.1")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+            Request::builder()
+                .method("POST")
+                .uri(&path)
+                .header("host", "127.0.0.1:8080")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        ];
+
+        for request in requests {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        assert!(state.read().await.connectors.is_empty());
+
+        let remote_limiter = Arc::new(Semaphore::new(4));
+        let remote_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&remote_limiter));
+        let remote_manager = ConnectorManager::new(
+            Arc::clone(&state),
+            remote_runs.clone(),
+            credentials.clone(),
+            transport.clone(),
+        );
+        let remote = router_with_services(
+            state,
+            DaemonConfig::default(),
+            remote_limiter,
+            remote_runs,
+            remote_manager,
+            false,
+        );
+        let response = remote
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header("host", "127.0.0.1:8080")
+                    .header("origin", "http://localhost:4200")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
