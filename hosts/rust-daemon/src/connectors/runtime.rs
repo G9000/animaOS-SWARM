@@ -137,6 +137,13 @@ struct WorkerHandle {
     join: JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct ConnectorRunRollbackDelta {
+    committed_target: Option<TelegramInboundRecord>,
+    inserted_outbound: Option<TelegramOutboundRecord>,
+    removed_terminal: Vec<((String, i64), TelegramInboundRecord)>,
+}
+
 impl ConnectorManager {
     pub(crate) fn new(
         state: SharedDaemonState,
@@ -204,7 +211,7 @@ impl ConnectorManager {
             .map_err(|_| ConnectorManagerError::Transport)?;
         let now = now_ms();
         let id = next_connector_id(now);
-        let mut connector = TelegramConnectorRecord {
+        let connector = TelegramConnectorRecord {
             id: id.clone(),
             agent_id,
             room_id: format!("telegram:{id}"),
@@ -212,98 +219,50 @@ impl ConnectorManager {
             approved_chat: None,
             pending_pairing: None,
             next_update_id: 0,
-            enabled: false,
+            enabled: true,
             deleted_at_ms: None,
             created_at_ms: now,
             updated_at_ms: now,
         };
 
-        let _mutation = self.mutation_lock.lock().await;
-        let precommit = {
-            let mut state = self.state.write().await;
-            if state.get_agent(&connector.agent_id).is_none() {
-                return Err(ConnectorManagerError::AgentNotFound);
-            }
-            if state.connectors.values().any(|candidate| {
-                candidate.agent_id == connector.agent_id && candidate.deleted_at_ms.is_none()
-            }) {
-                return Err(ConnectorManagerError::AgentAlreadyConnected);
-            }
-            state.connectors.insert(id.clone(), connector.clone());
-            state.control_plane_persist_request()
-        };
-        if precommit.save().await.is_err() {
-            self.state.write().await.connectors.remove(&id);
-            return Err(ConnectorManagerError::Persistence);
-        }
-        drop(_mutation);
-        self.statuses
-            .lock()
-            .await
-            .insert(id.clone(), ConnectorRuntimeStatus::CredentialRequired);
-
         let worker_token = token.clone();
         if let Err(error) = self.credentials.put(&id, token).await {
             let mapped = map_credential_error(error);
             if mapped == ConnectorManagerError::CredentialStateUncertain {
-                self.statuses
-                    .lock()
-                    .await
-                    .insert(id, ConnectorRuntimeStatus::Reconciling);
+                self.retain_create_reconciliation_marker(connector).await;
                 return Err(mapped);
             }
-            let _mutation = self.mutation_lock.lock().await;
-            self.state.write().await.connectors.remove(&id);
-            let rollback = self.state.write().await.control_plane_persist_request();
-            if rollback.save().await.is_err() {
-                self.state
-                    .write()
-                    .await
-                    .connectors
-                    .insert(id.clone(), connector);
-                self.statuses
-                    .lock()
-                    .await
-                    .insert(id, ConnectorRuntimeStatus::CredentialRequired);
-                return Err(ConnectorManagerError::Persistence);
-            }
-            self.statuses.lock().await.remove(&id);
             return Err(mapped);
         }
 
         let _mutation = self.mutation_lock.lock().await;
-        connector.enabled = true;
-        connector.updated_at_ms = now_ms();
-        self.state
-            .write()
-            .await
-            .connectors
-            .insert(id.clone(), connector.clone());
-        let persist = self.state.write().await.control_plane_persist_request();
+        let persist = {
+            let mut state = self.state.write().await;
+            if state.get_agent(&connector.agent_id).is_none() {
+                drop(state);
+                drop(_mutation);
+                return self
+                    .cleanup_failed_create(connector, ConnectorManagerError::AgentNotFound)
+                    .await;
+            }
+            if state.connectors.values().any(|candidate| {
+                candidate.agent_id == connector.agent_id && candidate.deleted_at_ms.is_none()
+            }) {
+                drop(state);
+                drop(_mutation);
+                return self
+                    .cleanup_failed_create(connector, ConnectorManagerError::AgentAlreadyConnected)
+                    .await;
+            }
+            state.connectors.insert(id.clone(), connector.clone());
+            state.control_plane_persist_request()
+        };
         if persist.save().await.is_err() {
-            connector.enabled = false;
-            self.state
-                .write()
-                .await
-                .connectors
-                .insert(id.clone(), connector);
+            self.state.write().await.connectors.remove(&id);
             drop(_mutation);
-            return match self.credentials.delete(&id).await {
-                Ok(()) => {
-                    self.statuses
-                        .lock()
-                        .await
-                        .insert(id, ConnectorRuntimeStatus::CredentialRequired);
-                    Err(ConnectorManagerError::Persistence)
-                }
-                Err(_) => {
-                    self.statuses
-                        .lock()
-                        .await
-                        .insert(id, ConnectorRuntimeStatus::Reconciling);
-                    Err(ConnectorManagerError::CredentialStateUncertain)
-                }
-            };
+            return self
+                .cleanup_failed_create(connector, ConnectorManagerError::Persistence)
+                .await;
         }
         self.statuses
             .lock()
@@ -312,6 +271,38 @@ impl ConnectorManager {
         drop(_mutation);
         self.start_worker(id, worker_token).await?;
         Ok(connector)
+    }
+
+    async fn cleanup_failed_create(
+        &self,
+        connector: TelegramConnectorRecord,
+        original_error: ConnectorManagerError,
+    ) -> Result<TelegramConnectorRecord, ConnectorManagerError> {
+        if self.credentials.delete(&connector.id).await.is_ok() {
+            return Err(original_error);
+        }
+        self.retain_create_reconciliation_marker(connector).await;
+        Err(ConnectorManagerError::CredentialStateUncertain)
+    }
+
+    async fn retain_create_reconciliation_marker(&self, mut connector: TelegramConnectorRecord) {
+        let now = now_ms();
+        connector.enabled = false;
+        connector.deleted_at_ms = Some(now);
+        connector.pending_pairing = None;
+        connector.updated_at_ms = now;
+        let connector_id = connector.id.clone();
+        let _mutation = self.mutation_lock.lock().await;
+        let persist = {
+            let mut state = self.state.write().await;
+            state.connectors.insert(connector_id.clone(), connector);
+            state.control_plane_persist_request()
+        };
+        let _ = persist.save().await;
+        self.statuses
+            .lock()
+            .await
+            .insert(connector_id, ConnectorRuntimeStatus::Reconciling);
     }
 
     pub(crate) async fn replace_token(
@@ -631,7 +622,7 @@ impl ConnectorManager {
                 .expect("connector was prevalidated");
             connector.next_update_id = connector.next_update_id.max(batch.next_update_id);
             connector.updated_at_ms = now;
-            compact_terminal_inbound(&mut state.inbound, &connector_id);
+            let _ = compact_terminal_inbound(&mut state.inbound, &connector_id);
             let persist = state.control_plane_persist_request();
             (previous_connector, previous_inbound, persist)
         };
@@ -841,20 +832,15 @@ impl ConnectorManager {
             "telegram:{}:update:{}:outbound",
             inbound.connector_id, inbound.update_id
         );
-        let (previous_outbound, previous_connector_inbound) = {
+        let previous_outbound = {
             let state = self.state.read().await;
-            (
-                state.outbound.get(&outbound_id).cloned(),
-                state
-                    .inbound
-                    .iter()
-                    .filter(|((record_connector_id, _), _)| record_connector_id == &connector_id)
-                    .map(|(key, record)| (key.clone(), record.clone()))
-                    .collect::<Vec<_>>(),
-            )
+            state.outbound.get(&outbound_id).cloned()
         };
+        let rollback_delta = Arc::new(std::sync::Mutex::new(ConnectorRunRollbackDelta::default()));
+        let commit_rollback_delta = Arc::clone(&rollback_delta);
         let commit_outbound_id = outbound_id.clone();
-        let rollback_connector_id = connector_id.clone();
+        let rollback_target = inbound.clone();
+        let rollback_key = key.clone();
         let rollback_outbound_id = outbound_id.clone();
         let request = AgentRunRequest {
             agent_id: inbound.agent_id.clone(),
@@ -894,11 +880,15 @@ impl ConnectorManager {
                     }
 
                     if result.status == TaskStatus::Error {
-                        state
+                        let target = state
                             .inbound
                             .get_mut(&commit_key)
-                            .expect("inbound was prevalidated")
-                            .processing_state = InboundProcessingState::Rejected;
+                            .expect("inbound was prevalidated");
+                        target.processing_state = InboundProcessingState::Rejected;
+                        commit_rollback_delta
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .committed_target = Some(target.clone());
                         return Ok(());
                     }
 
@@ -939,27 +929,54 @@ impl ConnectorManager {
                         }
                     }
 
-                    state
+                    let target = state
                         .inbound
                         .get_mut(&commit_key)
-                        .expect("inbound was prevalidated")
-                        .processing_state = InboundProcessingState::Processed;
-                    state
-                        .outbound
-                        .entry(commit_outbound_id.clone())
-                        .or_insert(candidate);
-                    compact_terminal_inbound(&mut state.inbound, &commit_connector_id);
+                        .expect("inbound was prevalidated");
+                    target.processing_state = InboundProcessingState::Processed;
+                    let committed_target = target.clone();
+                    let inserted_outbound = if state.outbound.contains_key(&commit_outbound_id) {
+                        None
+                    } else {
+                        state
+                            .outbound
+                            .insert(commit_outbound_id.clone(), candidate.clone());
+                        Some(candidate)
+                    };
+                    let removed_terminal =
+                        compact_terminal_inbound(&mut state.inbound, &commit_connector_id);
+                    let mut delta = commit_rollback_delta
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    delta.committed_target = Some(committed_target);
+                    delta.inserted_outbound = inserted_outbound;
+                    delta.removed_terminal = removed_terminal;
                     Ok(())
                 },
                 move |state, baseline| {
-                    state.inbound.retain(|(record_connector_id, _), _| {
-                        record_connector_id != &rollback_connector_id
-                    });
-                    state.inbound.extend(previous_connector_inbound);
-                    if let Some(previous) = previous_outbound {
-                        state.outbound.insert(rollback_outbound_id, previous);
-                    } else {
+                    let delta = rollback_delta
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for (removed_key, removed_record) in &delta.removed_terminal {
+                        state
+                            .inbound
+                            .entry(removed_key.clone())
+                            .or_insert_with(|| removed_record.clone());
+                    }
+                    if delta.committed_target.as_ref().is_some_and(|committed| {
+                        state.inbound.get(&rollback_key) == Some(committed)
+                    }) {
+                        state.inbound.insert(rollback_key.clone(), rollback_target);
+                    }
+                    if delta.inserted_outbound.as_ref().is_some_and(|inserted| {
+                        state.outbound.get(&rollback_outbound_id) == Some(inserted)
+                    }) {
                         state.outbound.remove(&rollback_outbound_id);
+                    } else if let Some(previous) = previous_outbound {
+                        state
+                            .outbound
+                            .entry(rollback_outbound_id)
+                            .or_insert(previous);
                     }
                     state
                         .rollback_agent_runtime(baseline)
@@ -1513,10 +1530,23 @@ impl ConnectorManager {
             .await
             .connectors
             .values()
-            .filter(|connector| connector.deleted_at_ms.is_none())
             .cloned()
             .collect::<Vec<_>>();
         for connector in connectors {
+            if connector.deleted_at_ms.is_some() {
+                match self.credentials.delete(&connector.id).await {
+                    Ok(()) => {
+                        self.statuses.lock().await.remove(&connector.id);
+                    }
+                    Err(_) => {
+                        self.statuses
+                            .lock()
+                            .await
+                            .insert(connector.id, ConnectorRuntimeStatus::Reconciling);
+                    }
+                }
+                continue;
+            }
             if connector.is_active() {
                 let _ = self.restart_unlocked(connector.id).await;
             } else {
@@ -1850,7 +1880,7 @@ fn compact_delivered_outbox(
 fn compact_terminal_inbound(
     inbound: &mut HashMap<(String, i64), TelegramInboundRecord>,
     connector_id: &str,
-) {
+) -> Vec<((String, i64), TelegramInboundRecord)> {
     let mut terminal = inbound
         .iter()
         .filter(|((record_connector_id, _), record)| {
@@ -1864,12 +1894,16 @@ fn compact_terminal_inbound(
         .collect::<Vec<_>>();
     let excess = terminal.len().saturating_sub(MAX_RETAINED_TERMINAL_INBOUND);
     if excess == 0 {
-        return;
+        return Vec::new();
     }
     terminal.sort();
+    let mut removed = Vec::with_capacity(excess);
     for (_, _, key) in terminal.into_iter().take(excess) {
-        inbound.remove(&key);
+        if let Some(record) = inbound.remove(&key) {
+            removed.push((key, record));
+        }
     }
+    removed
 }
 
 async fn wait_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
@@ -1955,6 +1989,11 @@ mod tests {
         inner: InMemoryCredentialStore,
         entered: Arc<Semaphore>,
         release: Arc<Semaphore>,
+    }
+
+    struct OneShotUncertainDeleteStore {
+        inner: InMemoryCredentialStore,
+        fail_next_delete: AtomicBool,
     }
 
     struct GateModelAdapter {
@@ -2155,6 +2194,31 @@ mod tests {
     }
 
     #[async_trait]
+    impl ConnectorCredentialStore for OneShotUncertainDeleteStore {
+        async fn load(
+            &self,
+            connector_id: &str,
+        ) -> Result<Option<TelegramBotToken>, CredentialStoreError> {
+            self.inner.load(connector_id).await
+        }
+
+        async fn put(
+            &self,
+            connector_id: &str,
+            token: TelegramBotToken,
+        ) -> Result<(), CredentialStoreError> {
+            self.inner.put(connector_id, token).await
+        }
+
+        async fn delete(&self, connector_id: &str) -> Result<(), CredentialStoreError> {
+            if self.fail_next_delete.swap(false, Ordering::SeqCst) {
+                return Err(CredentialStoreError::CredentialStateUncertain);
+            }
+            self.inner.delete(connector_id).await
+        }
+    }
+
+    #[async_trait]
     impl TelegramTransport for FakeTransport {
         async fn get_me(
             &self,
@@ -2256,18 +2320,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_precommits_discoverable_metadata_before_vault_mutation() {
+    async fn create_does_not_publish_metadata_before_verified_vault_write() {
         let state = state_with_agent();
         let agent_id = state.read().await.list_agents()[0].state.id.clone();
-        let temporary = std::env::temp_dir().join(format!(
-            "anima-create-precommit-{}-{}",
-            std::process::id(),
-            super::now_ms()
-        ));
-        let snapshot_path = temporary.join("control-plane.json");
-        state.write().await.set_control_plane_store(Some(
-            crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
-        ));
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let credentials = Arc::new(GatePutUncertainDeleteStore {
@@ -2295,48 +2350,143 @@ mod tests {
             .expect("credential put should be reached")
             .forget();
 
-        let persisted = crate::control_plane_store::load_control_plane_snapshot(
-            &crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
-        )
-        .await
-        .unwrap()
-        .expect("metadata must be durable before the vault is touched");
-        assert_eq!(persisted.connectors.len(), 1);
-        assert!(!persisted.connectors[0].enabled);
-        assert!(persisted.connectors[0].deleted_at_ms.is_none());
-
-        let invalid_path = temporary.join("invalid-final-save");
-        std::fs::create_dir(&invalid_path).unwrap();
-        state.write().await.set_control_plane_store(Some(
-            crate::control_plane_store::ControlPlaneStoreConfig::Json(invalid_path),
-        ));
+        assert!(state.read().await.connectors.is_empty());
         release.add_permits(1);
+        let connector = creating.await.unwrap().unwrap();
+        assert!(state.read().await.connectors[&connector.id].is_active());
+
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_active_create_publish_leaves_tombstone_then_restart_cleans_credential() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(OneShotUncertainDeleteStore {
+            inner: InMemoryCredentialStore::default(),
+            fail_next_delete: AtomicBool::new(true),
+        });
+        let first_manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let gate = state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+
+        assert_eq!(
+            first_manager
+                .create(
+                    agent_id.clone(),
+                    TelegramBotToken::parse("42:cleanup-on-restart").unwrap(),
+                )
+                .await
+                .unwrap_err(),
+            super::ConnectorManagerError::CredentialStateUncertain
+        );
+        let marker = state
+            .read()
+            .await
+            .connectors
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(!marker.enabled);
+        assert!(marker.deleted_at_ms.is_some());
+        assert_eq!(
+            first_manager.status(&marker.id).await,
+            Some(ConnectorRuntimeStatus::Reconciling)
+        );
+        assert!(credentials.load(&marker.id).await.unwrap().is_some());
+
+        first_manager.shutdown().await;
+        let restored = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        restored.start_restored().await;
+        assert!(credentials.load(&marker.id).await.unwrap().is_none());
+        assert_eq!(restored.status(&marker.id).await, None);
+        let replacement = restored
+            .create(
+                agent_id,
+                TelegramBotToken::parse("84:retry-after-cleanup").unwrap(),
+            )
+            .await
+            .expect("a tombstoned reconciliation marker must not block retry");
+        assert!(replacement.is_active());
+        restored.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_reconciliation_marker_save_remains_visible_in_memory() {
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let invalid_path = std::env::temp_dir().join(format!(
+            "anima-create-reconciliation-unavailable-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        std::fs::create_dir_all(&invalid_path).unwrap();
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(invalid_path.clone()),
+        ));
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let credentials = Arc::new(GatePutUncertainDeleteStore {
+            inner: InMemoryCredentialStore::default(),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let manager = manager(
+            Arc::clone(&state),
+            credentials,
+            Arc::new(FakeTransport::default()),
+        );
+        let creating = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .create(
+                        agent_id,
+                        TelegramBotToken::parse("42:uncertain-create").unwrap(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), entered.acquire())
+            .await
+            .expect("vault write must precede the failing metadata publish")
+            .unwrap()
+            .forget();
+        assert!(state.read().await.connectors.is_empty());
+        release.add_permits(1);
+
         assert_eq!(
             creating.await.unwrap().unwrap_err(),
             super::ConnectorManagerError::CredentialStateUncertain
         );
-        let connector_id = persisted.connectors[0].id.clone();
-        assert!(state.read().await.connectors.contains_key(&connector_id));
+        let marker = state
+            .read()
+            .await
+            .connectors
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        assert!(!marker.enabled);
+        assert!(marker.deleted_at_ms.is_some());
         assert_eq!(
-            manager.status(&connector_id).await,
+            manager.status(&marker.id).await,
             Some(ConnectorRuntimeStatus::Reconciling)
         );
-        let durable_precommit = crate::control_plane_store::load_control_plane_snapshot(
-            &crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        let mut restored = DaemonState::new();
-        restored
-            .restore_control_plane_snapshot(durable_precommit)
-            .expect("recoverable connector metadata must survive daemon restore");
-        let restored_connector = restored.connectors.get(&connector_id).unwrap();
-        assert!(!restored_connector.enabled);
-        assert!(restored_connector.deleted_at_ms.is_none());
-
         manager.shutdown().await;
-        std::fs::remove_dir_all(temporary).unwrap();
+        std::fs::remove_dir_all(invalid_path).unwrap();
     }
 
     #[tokio::test]
@@ -3204,6 +3354,130 @@ mod tests {
                 .count(),
             1
         );
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_run_publish_preserves_inbound_accepted_while_model_was_running() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let temporary = std::env::temp_dir().join(format!(
+            "anima-run-delta-rollback-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let snapshot_path = temporary.join("control-plane.json");
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
+        ));
+        let manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:delta-rollback").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.stop_worker(&connector.id).await.unwrap();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(1, "101", "pair")],
+                    next_update_id: 2,
+                },
+            )
+            .await
+            .unwrap();
+        manager.approve_pending(connector.id.clone()).await.unwrap();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(2, "101", "run A")],
+                    next_update_id: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let processing = {
+            let manager = manager.clone();
+            let connector_id = connector.id.clone();
+            tokio::spawn(async move { manager.process_pending_once(connector_id).await })
+        };
+        entered.acquire().await.unwrap().forget();
+        manager
+            .accept_batch(
+                connector.id.clone(),
+                TelegramUpdateBatch {
+                    updates: vec![text_update(3, "101", "run B")],
+                    next_update_id: 4,
+                },
+            )
+            .await
+            .unwrap();
+        let gate = state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        release.add_permits(1);
+        gate.entered.acquire().await.unwrap().forget();
+        gate.release.add_permits(1);
+
+        assert_eq!(
+            processing.await.unwrap().unwrap_err(),
+            super::ConnectorManagerError::Persistence
+        );
+        let state_guard = state.read().await;
+        assert!(state_guard.inbound.contains_key(&(connector.id.clone(), 2)));
+        assert_eq!(
+            state_guard.inbound[&(connector.id.clone(), 3)].normalized_text,
+            "run B"
+        );
+        drop(state_guard);
+
+        let _transaction = manager.runs.control_plane_transaction().await;
+        let later_publish = {
+            let mut state = state.write().await;
+            state
+                .update_agent(
+                    &agent_id,
+                    AgentConfigUpdate {
+                        name: Some("published after rollback".into()),
+                        ..AgentConfigUpdate::default()
+                    },
+                )
+                .unwrap();
+            state.control_plane_persist_request()
+        };
+        later_publish.save().await.unwrap();
+        drop(_transaction);
+        let persisted = crate::control_plane_store::load_control_plane_snapshot(
+            &crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(persisted
+            .inbound
+            .iter()
+            .any(|record| record.connector_id == connector.id && record.update_id == 3));
+        let mut restored = DaemonState::new();
+        restored.restore_control_plane_snapshot(persisted).unwrap();
+        assert!(restored.inbound.contains_key(&(connector.id.clone(), 3)));
+        manager.shutdown().await;
         std::fs::remove_dir_all(temporary).unwrap();
     }
 

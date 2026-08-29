@@ -10,6 +10,7 @@ use super::contracts::{
     TaskRequest, TaskResultResponse,
 };
 use super::ApiError;
+use crate::agent_runs::AgentRunCoordinator;
 use crate::app::SharedDaemonState;
 
 pub(crate) async fn handle_create_swarm(
@@ -90,6 +91,7 @@ pub(crate) async fn handle_run_swarm(
     swarm_id: &str,
     body: Vec<u8>,
     state: &SharedDaemonState,
+    agent_runs: &AgentRunCoordinator,
 ) -> Result<SwarmRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let content = request
@@ -109,7 +111,8 @@ pub(crate) async fn handle_run_swarm(
         return Err(ApiError::not_found());
     };
 
-    let persist_request = {
+    let running_transaction = agent_runs.control_plane_transaction().await;
+    let (previous_snapshot, persist_request) = {
         let mut running_snapshot = coordinator.get_state();
         running_snapshot.status = SwarmStatus::Running;
         running_snapshot
@@ -117,13 +120,17 @@ pub(crate) async fn handle_run_swarm(
             .get_or_insert_with(anima_core::primitives::now_millis);
         running_snapshot.completed_at = None;
         let mut guard = state.write().await;
+        let previous_snapshot = guard.get_swarm(swarm_id);
         guard.store_swarm_snapshot(running_snapshot);
-        guard.control_plane_persist_request()
+        (previous_snapshot, guard.control_plane_persist_request())
     };
-    persist_request
-        .save()
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    if let Err(error) = persist_request.save().await {
+        if let Some(previous_snapshot) = previous_snapshot {
+            state.write().await.store_swarm_snapshot(previous_snapshot);
+        }
+        return Err(ApiError::service_unavailable(error.to_string()));
+    }
+    drop(running_transaction);
 
     let running_swarm_id = swarm_id.to_string();
     let running_global_event_fanout = global_event_fanout.clone();
@@ -141,15 +148,20 @@ pub(crate) async fn handle_run_swarm(
         })
         .await;
     let snapshot = coordinator.get_state();
-    let persist_request = {
+    let final_transaction = agent_runs.control_plane_transaction().await;
+    let (previous_snapshot, persist_request) = {
         let mut guard = state.write().await;
+        let previous_snapshot = guard.get_swarm(swarm_id);
         guard.store_swarm_snapshot(snapshot.clone());
-        guard.control_plane_persist_request()
+        (previous_snapshot, guard.control_plane_persist_request())
     };
-    persist_request
-        .save()
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    if let Err(error) = persist_request.save().await {
+        if let Some(previous_snapshot) = previous_snapshot {
+            state.write().await.store_swarm_snapshot(previous_snapshot);
+        }
+        return Err(ApiError::service_unavailable(error.to_string()));
+    }
+    drop(final_transaction);
 
     publish_swarm_event(
         &global_event_fanout,
@@ -191,4 +203,3 @@ pub(crate) async fn handle_subscribe_swarm_events(
 
     subscribe_swarm_events_response(subscriber)
 }
-

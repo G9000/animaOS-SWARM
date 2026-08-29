@@ -933,8 +933,8 @@ async fn run_swarm_entry(
 
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => {
-            let _transaction = state.agent_runs.control_plane_transaction().await;
-            match swarms::handle_run_swarm(&swarm_id, body, &state.daemon).await {
+            match swarms::handle_run_swarm(&swarm_id, body, &state.daemon, &state.agent_runs).await
+            {
                 Ok(response) => json_response(StatusCode::OK, &response),
                 Err(error) => error.into_response(),
             }
@@ -1001,8 +1001,12 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
-    use super::router;
+    use super::{router, router_with_services};
+    use crate::agent_runs::AgentRunCoordinator;
     use crate::app::DaemonConfig;
+    use crate::connectors::credentials::InMemoryCredentialStore;
+    use crate::connectors::runtime::ConnectorManager;
+    use crate::connectors::telegram::TelegramClient;
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
@@ -1012,14 +1016,24 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
     use tower::util::ServiceExt;
 
     struct SlowModelAdapter {
         delay: Duration,
         calls: AtomicUsize,
+    }
+
+    struct GateFirstModelAdapter {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+        calls: AtomicUsize,
+    }
+
+    struct TransactionalSwarmModelAdapter {
+        context: StdMutex<Option<(AgentRunCoordinator, Arc<RwLock<DaemonState>>)>>,
     }
 
     #[async_trait]
@@ -1052,6 +1066,225 @@ mod tests {
                 stop_reason: ModelStopReason::End,
             })
         }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for GateFirstModelAdapter {
+        fn provider(&self) -> &str {
+            "gate-first"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.entered.add_permits(1);
+                self.release
+                    .acquire()
+                    .await
+                    .map_err(|_| "release gate closed".to_string())?
+                    .forget();
+            }
+            Ok(model_response(config))
+        }
+    }
+
+    #[async_trait]
+    impl ModelAdapter for TransactionalSwarmModelAdapter {
+        fn provider(&self) -> &str {
+            "transactional-swarm"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let context = self
+                .context
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some((runs, state)) = context {
+                let _transaction = runs.control_plane_transaction().await;
+                let persist = {
+                    let mut state = state.write().await;
+                    state
+                        .create_agent(test_config("created-from-swarm-model"))
+                        .map_err(|error| error.to_string())?;
+                    state.control_plane_persist_request()
+                };
+                persist.save().await.map_err(|error| error.to_string())?;
+            }
+            Ok(model_response(config))
+        }
+    }
+
+    fn model_response(config: &AgentConfig) -> ModelGenerateResponse {
+        ModelGenerateResponse {
+            content: Content {
+                text: format!("{} completed", config.name),
+                attachments: None,
+                metadata: None,
+            },
+            tool_calls: None,
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+            stop_reason: ModelStopReason::End,
+        }
+    }
+
+    async fn create_test_swarm(app: &axum::Router, state: &Arc<RwLock<DaemonState>>) -> String {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/swarms")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "strategy":"round-robin",
+                            "manager":{"name":"manager","model":"gpt-5.4"},
+                            "workers":[{"name":"worker-a","model":"gpt-5.4"}],
+                            "maxTurns":1
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        state.read().await.list_swarms()[0].id.clone()
+    }
+
+    fn custom_router(
+        state: Arc<RwLock<DaemonState>>,
+        runs: AgentRunCoordinator,
+        config: DaemonConfig,
+    ) -> axum::Router {
+        let limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
+        let connectors = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(TelegramClient::new().unwrap()),
+        );
+        router_with_services(state, config, limiter, runs, connectors)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swarm_model_callback_can_publish_through_the_shared_transaction_gate() {
+        let adapter = Arc::new(TransactionalSwarmModelAdapter {
+            context: StdMutex::new(None),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        *adapter
+            .context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((runs.clone(), Arc::clone(&state)));
+        let app = custom_router(
+            Arc::clone(&state),
+            runs,
+            DaemonConfig {
+                request_timeout: Duration::from_millis(500),
+                ..DaemonConfig::default()
+            },
+        );
+        let swarm_id = create_test_swarm(&app, &state).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/swarms/{swarm_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"mutate during dispatch"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state
+            .read()
+            .await
+            .list_agents()
+            .iter()
+            .any(|agent| agent.state.config.name == "created-from-swarm-model"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn another_control_plane_publisher_progresses_during_swarm_dispatch() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            GateFirstModelAdapter {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                calls: AtomicUsize::new(0),
+            },
+        ))));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        let app = custom_router(
+            Arc::clone(&state),
+            runs,
+            DaemonConfig {
+                request_timeout: Duration::from_secs(2),
+                ..DaemonConfig::default()
+            },
+        );
+        let swarm_id = create_test_swarm(&app, &state).await;
+        let running_app = app.clone();
+        let running = tokio::spawn(async move {
+            running_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/swarms/{swarm_id}/run"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"text":"hold dispatch"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        });
+        entered.acquire().await.unwrap().forget();
+
+        let publisher = tokio::time::timeout(
+            Duration::from_millis(100),
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/agents")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"parallel-publisher","model":"gpt-5.4"}"#,
+                    ))
+                    .unwrap(),
+            ),
+        )
+        .await;
+        release.add_permits(1);
+        let running_response = running.await.unwrap();
+
+        assert_eq!(
+            publisher
+                .expect("publisher must not wait for swarm dispatch")
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(running_response.status(), StatusCode::OK);
     }
 
     #[tokio::test(flavor = "multi_thread")]
