@@ -60,7 +60,7 @@ mod tests {
         TelegramSenderMetadata,
     };
     use crate::control_plane_store::{
-        load_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
+        load_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, WorkspaceConfig,
     };
     use crate::schedules::{
         ScheduleLastFired, ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget,
@@ -383,6 +383,31 @@ mod tests {
             .restore_control_plane_snapshot(snapshot)
             .expect("non-secret credential cleanup intents should restore");
         assert_eq!(restored.credential_cleanup.len(), 2);
+    }
+
+    #[test]
+    fn workspace_config_round_trips_through_persist_and_restore() {
+        let workspace = WorkspaceConfig {
+            root_path: std::path::PathBuf::from("C:\\workspaces\\northwind"),
+            company_name: "Northwind Research".into(),
+            mission: "Continuous equity research".into(),
+            values: vec!["cite sources".into(), "show your work".into()],
+        };
+        let mut source = DaemonState::new();
+        source.workspace = Some(workspace.clone());
+
+        // Same snapshot assembly that control_plane_persist_request persists,
+        // round-tripped through serde exactly like the durable store does.
+        let snapshot = source.control_plane_snapshot();
+        let serialized = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(&serialized).expect("snapshot should deserialize");
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("workspace config should restore");
+        assert_eq!(restored.workspace, Some(workspace));
     }
 
     #[test]
