@@ -6,6 +6,7 @@ mod providers;
 mod schedules;
 mod shared;
 mod swarms;
+mod workspace;
 
 pub(crate) use agencies::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
@@ -35,3 +36,6 @@ pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
     SwarmsEnvelope,
 };
+// WorkspaceConfigRequest is consumed by PUT /api/workspace (Task 4).
+#[allow(unused_imports)]
+pub(crate) use workspace::{WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceResponse};

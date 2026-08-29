@@ -7,6 +7,7 @@ mod http;
 mod memories;
 mod schedules;
 mod swarms;
+mod workspace;
 
 use std::sync::Arc;
 
@@ -42,6 +43,7 @@ use self::contracts::{
     MemoryRetentionReportResponse, MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery,
     ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
     SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
+    WorkspaceResponse,
 };
 pub(crate) use self::contracts::{
     AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
@@ -85,6 +87,7 @@ use crate::runtime_model::provider_summaries;
         run_swarm_entry,
         swarm_events_entry,
         list_providers_entry,
+        get_workspace_entry,
         connectors::list_connectors,
         connectors::create_telegram_connector,
         connectors::replace_telegram_credential,
@@ -109,6 +112,7 @@ use crate::runtime_model::provider_summaries;
         (name = "connectors", description = "Agent-scoped connector administration"),
         (name = "connector-thread", description = "Dedicated connector-room messages"),
         (name = "schedules", description = "Daemon-backed scheduled prompts"),
+        (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
 struct ApiDoc;
@@ -258,6 +262,7 @@ fn router_with_services_with_policies(
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/ready", get(ready_entry))
+        .route("/api/workspace", get(get_workspace_entry))
         .route(
             "/api/agencies/create",
             axum::routing::post(create_agency_entry),
@@ -1125,6 +1130,19 @@ async fn list_providers_entry() -> AxumResponse {
         })
         .collect::<Vec<_>>();
     json_response(StatusCode::OK, &ProvidersEnvelope { providers })
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/workspace",
+    tag = "workspace",
+    responses((status = 200, description = "Workspace configuration state", body = WorkspaceResponse))
+)]
+async fn get_workspace_entry(State(state): State<AppState>) -> AxumResponse {
+    match workspace::handle_get_workspace(&state.daemon).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
+    }
 }
 
 async fn not_found_entry() -> AxumResponse {
