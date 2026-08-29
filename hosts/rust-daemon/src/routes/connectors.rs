@@ -318,7 +318,8 @@ pub(super) async fn list_connector_messages(
     tag = "connector-thread",
     params(
         ("agent_id" = String, Path, description = "Agent identifier"),
-        ("connector_id" = String, Path, description = "Connector identifier")
+        ("connector_id" = String, Path, description = "Connector identifier"),
+        ("Idempotency-Key" = String, Header, description = "Required 1-128 byte visible ASCII retry key", min_length = 1, max_length = 128)
     ),
     request_body = ConnectorMessageRequest,
     responses(
@@ -326,6 +327,7 @@ pub(super) async fn list_connector_messages(
         (status = 400, description = "Invalid text", body = ConnectorErrorBody),
         (status = 403, description = "Local owner authorization required", body = ConnectorErrorBody),
         (status = 404, description = "Connector not found for agent", body = ConnectorErrorBody),
+        (status = 409, description = "Idempotency key conflicts with committed text", body = ConnectorErrorBody),
         (status = 429, description = "Agent or connector is busy", body = ConnectorErrorBody),
         (status = 503, description = "Agent run or persistence unavailable", body = ConnectorErrorBody)
     )
@@ -338,6 +340,10 @@ pub(super) async fn send_connector_message(
     if let Err(rejection) = state.local_owner.authorize(request.headers()) {
         return local_owner_error(rejection);
     }
+    let idempotency_key = match connector_idempotency_key(request.headers()) {
+        Ok(key) => key,
+        Err(response) => return response,
+    };
     let body = match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => body,
         Err(_) => return invalid_request("malformed request"),
@@ -356,7 +362,7 @@ pub(super) async fn send_connector_message(
     };
     match state
         .connector_manager
-        .send_from_owner(agent_id, connector_id, text)
+        .send_from_owner(agent_id, connector_id, text, idempotency_key)
         .await
     {
         Ok((run, delivery_queued)) => no_store(json_response(
@@ -365,6 +371,40 @@ pub(super) async fn send_connector_message(
         )),
         Err(error) => manager_error(error),
     }
+}
+
+fn connector_idempotency_key(headers: &axum::http::HeaderMap) -> Result<String, AxumResponse> {
+    let values = headers.get_all("idempotency-key");
+    let mut values = values.iter();
+    let Some(value) = values.next() else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "connector_idempotency_key_required",
+            "Idempotency-Key header is required",
+        ));
+    };
+    if values.next().is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "connector_idempotency_key_invalid",
+            "Idempotency-Key header is invalid",
+        ));
+    }
+    let key = value.to_str().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "connector_idempotency_key_invalid",
+            "Idempotency-Key header is invalid",
+        )
+    })?;
+    if key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "connector_idempotency_key_invalid",
+            "Idempotency-Key header is invalid",
+        ));
+    }
+    Ok(key.to_string())
 }
 
 async fn credential_from_request(
@@ -496,6 +536,11 @@ fn manager_error(error: ConnectorManagerError) -> AxumResponse {
             "connector_conflict",
             "connector state changed",
         ),
+        ConnectorManagerError::IdempotencyConflict => error_response(
+            StatusCode::CONFLICT,
+            "connector_idempotency_conflict",
+            "idempotency key conflicts with committed request text",
+        ),
         ConnectorManagerError::WorkerStopped => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "connector_unavailable",
@@ -620,6 +665,11 @@ mod tests {
                 ConnectorManagerError::ConflictingUpdate,
                 StatusCode::CONFLICT,
                 "connector_conflict",
+            ),
+            (
+                ConnectorManagerError::IdempotencyConflict,
+                StatusCode::CONFLICT,
+                "connector_idempotency_conflict",
             ),
             (
                 ConnectorManagerError::WorkerStopped,

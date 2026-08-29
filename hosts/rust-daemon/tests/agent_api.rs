@@ -1,11 +1,13 @@
 mod support;
 
 use anima_daemon::{app_with_configured_persistence, DaemonConfig};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde_json::Value;
+use std::sync::OnceLock;
 use support::{
-    extract_json_string_field, send_empty_request, send_json_request, test_app,
+    extract_json_string_field, send_empty_request, send_json_request, send_request, test_app,
     use_temp_workspace_root,
 };
 
@@ -19,6 +21,20 @@ async fn run_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, Str
 
 async fn update_agent(app: &Router, agent_id: &str, body: &str) -> (StatusCode, String) {
     send_json_request(app, "PATCH", &format!("/api/agents/{agent_id}"), body).await
+}
+
+async fn delete_agent(app: &Router, agent_id: &str) -> (StatusCode, String) {
+    send_request(
+        app,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/agents/{agent_id}"))
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://localhost:4200")
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await
 }
 
 fn response_json(body: &str) -> Value {
@@ -81,6 +97,11 @@ impl Drop for EnvVarGuard {
     }
 }
 
+fn env_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn extract_result_text(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()?
@@ -140,6 +161,7 @@ async fn get_agent_returns_runtime_snapshot() {
 
 #[tokio::test]
 async fn control_plane_store_recovers_agents_and_swarms_after_restart() {
+    let _env_lock = env_lock().lock().await;
     let workspace = use_temp_workspace_root("control-plane-restart");
     let control_plane_path = workspace.path().join("control-plane.json");
     let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
@@ -762,8 +784,7 @@ async fn delete_agent_removes_runtime_and_returns_deleted_flag() {
     let (_, create_response) = create_agent(&app, r#"{"name":"operator","model":"gpt-5.4"}"#).await;
     let agent_id = extract_json_string_field(&create_response, "id");
 
-    let (delete_status, delete_response) =
-        send_empty_request(&app, "DELETE", &format!("/api/agents/{agent_id}")).await;
+    let (delete_status, delete_response) = delete_agent(&app, &agent_id).await;
     let (get_status, get_response) =
         send_empty_request(&app, "GET", &format!("/api/agents/{agent_id}")).await;
 
@@ -777,10 +798,38 @@ async fn delete_agent_removes_runtime_and_returns_deleted_flag() {
 async fn delete_unknown_agent_retains_not_found_semantics() {
     let app = test_app();
 
-    let (status, response) = send_empty_request(&app, "DELETE", "/api/agents/agent-missing").await;
+    let (status, response) = delete_agent(&app, "agent-missing").await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(response.contains("\"error\":\"not found\""));
+}
+
+#[tokio::test]
+async fn configured_persistence_helper_is_untrusted_for_local_owner_mutations() {
+    let _env_lock = env_lock().lock().await;
+    let _host = EnvVarGuard::set("ANIMAOS_RS_HOST", "127.0.0.1");
+    let app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("configured persistence app builds");
+    let (_, create_response) =
+        create_agent(&app, r#"{"name":"helper-owner","model":"gpt-5.4"}"#).await;
+    let agent_id = extract_json_string_field(&create_response, "id");
+
+    let (delete_status, _) = send_request(
+        &app,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/agents/{agent_id}"))
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://localhost:4200")
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await;
+    let (get_status, _) = send_empty_request(&app, "GET", &format!("/api/agents/{agent_id}")).await;
+
+    assert_eq!(delete_status, StatusCode::FORBIDDEN);
+    assert_eq!(get_status, StatusCode::OK);
 }
 
 #[tokio::test]

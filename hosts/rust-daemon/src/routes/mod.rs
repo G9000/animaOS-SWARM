@@ -171,13 +171,33 @@ pub(crate) fn router_with_services(
     connector_manager: ConnectorManager,
     bind_is_loopback: bool,
 ) -> Router {
+    router_with_services_with_policies(
+        state,
+        config,
+        run_limiter,
+        agent_runs,
+        connector_manager,
+        self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
+        self::http::ApiKeyPolicy::from_env(),
+    )
+}
+
+fn router_with_services_with_policies(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    run_limiter: Arc<Semaphore>,
+    agent_runs: AgentRunCoordinator,
+    connector_manager: ConnectorManager,
+    local_owner: self::http::LocalOwnerPolicy,
+    api_key: self::http::ApiKeyPolicy,
+) -> Router {
     let app_state = AppState {
         daemon: Arc::clone(&state),
         config,
         run_limiter: Arc::clone(&run_limiter),
         agent_runs,
         connector_manager,
-        local_owner: self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
+        local_owner,
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -313,7 +333,10 @@ pub(crate) fn router_with_services(
         // exempts health/readiness/metrics/docs by path. When
         // ANIMAOS_RS_API_KEY is unset the daemon runs in trust-the-network
         // mode (fine for 127.0.0.1 dev only).
-        .layer(axum::middleware::from_fn(self::http::enforce_api_key))
+        .layer(axum::middleware::from_fn_with_state(
+            api_key,
+            self::http::enforce_api_key,
+        ))
         .fallback(not_found_entry)
         .layer(request_middleware)
         .with_state(app_state)
@@ -799,13 +822,29 @@ async fn get_agent_entry(
     params(("agent_id" = String, Path, description = "Agent identifier")),
     responses(
         (status = 200, description = "Agent deleted", body = DeleteResponse),
+        (status = 403, description = "Local owner authorization required", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody)
     )
 )]
 async fn delete_agent_entry(
     State(state): State<AppState>,
     Path(agent_id): Path<String>,
+    request: AxumRequest,
 ) -> AxumResponse {
+    if let Err(rejection) = state.local_owner.authorize(request.headers()) {
+        let message = match rejection {
+            self::http::LocalOwnerRejection::LocalAdminRequired => {
+                "local owner authorization required"
+            }
+            self::http::LocalOwnerRejection::OriginRejected => "browser origin is not approved",
+        };
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &ErrorBody {
+                error: message.to_string(),
+            },
+        );
+    }
     match state.connector_manager.delete_agent(agent_id).await {
         Ok(()) => json_response(StatusCode::OK, &DeleteResponse { deleted: true }),
         Err(ConnectorManagerError::AgentNotFound) => ApiError::not_found().into_response(),
@@ -1059,7 +1098,7 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
-    use super::{router, router_with_services};
+    use super::{router, router_with_services, router_with_services_with_policies};
     use crate::agent_runs::AgentRunCoordinator;
     use crate::app::DaemonConfig;
     use crate::connectors::credentials::{
@@ -1070,9 +1109,10 @@ mod tests {
         TelegramClient, TelegramSentMessage, TelegramTransportError, TelegramUpdateBatch,
     };
     use crate::connectors::{
-        TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata, TelegramConnectorRecord,
-        TelegramPendingPairing,
+        OutboundDeliveryState, TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata,
+        TelegramConnectorRecord, TelegramPendingPairing,
     };
+    use crate::routes::http::{ApiKeyPolicy, LocalOwnerPolicy};
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
@@ -1143,6 +1183,7 @@ mod tests {
     #[derive(Default)]
     struct CountingTelegramTransport {
         calls: AtomicUsize,
+        send_calls: AtomicUsize,
         get_me_error: StdMutex<Option<TelegramTransportError>>,
     }
 
@@ -1187,6 +1228,7 @@ mod tests {
             _text: &str,
         ) -> Result<Vec<TelegramSentMessage>, TelegramTransportError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.send_calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![TelegramSentMessage {
                 message_id: "counting-message".into(),
                 chat: TelegramChatMetadata {
@@ -1468,6 +1510,27 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"text":"must not run"}"#))
                 .unwrap(),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/agents/{agent_id}"))
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "https://attacker.example")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/agents/{agent_id}"))
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://localhost:4200")
+                .header("x-forwarded-host", "attacker.example")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/agents/{agent_id}"))
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
         ];
 
         let baseline_connector = state.read().await.connectors[&connector_id].clone();
@@ -1509,8 +1572,8 @@ mod tests {
         let response = remote
             .oneshot(
                 Request::builder()
-                    .method("POST")
-                    .uri(format!("{connector_path}/restart"))
+                    .method("DELETE")
+                    .uri(format!("/api/agents/{agent_id}"))
                     .header("host", "127.0.0.1:8080")
                     .header("origin", "http://localhost:4200")
                     .body(Body::empty())
@@ -1530,6 +1593,248 @@ mod tests {
             state.read().await.get_agent(&agent_id).unwrap(),
             baseline_agent
         );
+    }
+
+    #[tokio::test]
+    async fn api_key_and_local_owner_credentials_are_independent() {
+        let mut daemon = DaemonState::new();
+        let mut agent_ids = Vec::new();
+        for name in [
+            "combined-credentials",
+            "wrong-local-owner",
+            "wrong-global-key",
+            "authorization-api-key",
+            "x-api-key",
+            "wrong-authorization-valid-x-api-key",
+        ] {
+            agent_ids.push(daemon.create_agent(test_config(name)).unwrap().state.id);
+        }
+        let state = Arc::new(RwLock::new(daemon));
+        let limiter = Arc::new(Semaphore::new(4));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(CountingTelegramTransport::default()),
+        );
+        let app = router_with_services_with_policies(
+            Arc::clone(&state),
+            DaemonConfig::default(),
+            limiter,
+            runs,
+            manager,
+            LocalOwnerPolicy::for_test(true, Some("local-admin")),
+            ApiKeyPolicy::for_test(Some("global-api")),
+        );
+
+        let cases = [
+            (
+                &agent_ids[0],
+                Some("Bearer local-admin"),
+                Some("global-api"),
+                None,
+                StatusCode::OK,
+            ),
+            (
+                &agent_ids[1],
+                Some("Bearer wrong-local"),
+                Some("global-api"),
+                None,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &agent_ids[2],
+                Some("Bearer local-admin"),
+                Some("wrong-global"),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                &agent_ids[3],
+                Some("Bearer global-api"),
+                None,
+                Some("http://localhost:4200"),
+                StatusCode::OK,
+            ),
+            (
+                &agent_ids[4],
+                None,
+                Some("global-api"),
+                Some("http://localhost:4200"),
+                StatusCode::OK,
+            ),
+            (
+                &agent_ids[5],
+                Some("Bearer wrong-global"),
+                Some("global-api"),
+                Some("http://localhost:4200"),
+                StatusCode::OK,
+            ),
+        ];
+
+        for (agent_id, authorization, x_api_key, origin, expected) in cases {
+            let mut request = Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/agents/{agent_id}"))
+                .header("host", "127.0.0.1:8080");
+            if let Some(authorization) = authorization {
+                request = request.header("authorization", authorization);
+            }
+            if let Some(x_api_key) = x_api_key {
+                request = request.header("x-api-key", x_api_key);
+            }
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "agent {agent_id}");
+        }
+
+        let guard = state.read().await;
+        assert!(guard.get_agent(&agent_ids[0]).is_none());
+        assert!(guard.get_agent(&agent_ids[1]).is_some());
+        assert!(guard.get_agent(&agent_ids[2]).is_some());
+        assert!(guard.get_agent(&agent_ids[3]).is_none());
+        assert!(guard.get_agent(&agent_ids[4]).is_none());
+        assert!(guard.get_agent(&agent_ids[5]).is_none());
+    }
+
+    #[tokio::test]
+    async fn timed_out_owner_send_retry_singleflights_and_delivers_once() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateFirstModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            calls: AtomicUsize::new(0),
+        });
+        let mut daemon = DaemonState::with_model_adapter(adapter.clone());
+        let agent_id = daemon
+            .create_agent(test_config("timeout-idempotency"))
+            .unwrap()
+            .state
+            .id;
+        let connector_id = "telegram-timeout-idempotency".to_string();
+        let room_id = "telegram-room-timeout-idempotency".to_string();
+        daemon.connectors.insert(
+            connector_id.clone(),
+            TelegramConnectorRecord {
+                id: connector_id.clone(),
+                agent_id: agent_id.clone(),
+                room_id: room_id.clone(),
+                bot: TelegramBotIdentity {
+                    id: "timeout-bot".into(),
+                    username: Some("timeout_bot".into()),
+                    display_name: None,
+                },
+                approved_chat: Some(TelegramChatMetadata {
+                    id: "timeout-chat".into(),
+                    kind: TelegramChatKind::Private,
+                    title: None,
+                    username: None,
+                }),
+                pending_pairing: None,
+                next_update_id: 0,
+                enabled: true,
+                deleted_at_ms: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        );
+        let state = Arc::new(RwLock::new(daemon));
+        let limiter = Arc::new(Semaphore::new(4));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        credentials
+            .put(
+                &connector_id,
+                TelegramBotToken::parse("42:timeout-owner-send").unwrap(),
+            )
+            .await
+            .unwrap();
+        let transport = Arc::new(CountingTelegramTransport::default());
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            credentials,
+            transport.clone(),
+        );
+        let mut config = DaemonConfig::default();
+        config.request_timeout = Duration::from_millis(30);
+        let app = router_with_services(
+            Arc::clone(&state),
+            config,
+            limiter,
+            runs,
+            manager.clone(),
+            true,
+        );
+        let uri = format!("/api/agents/{agent_id}/connectors/{connector_id}/messages");
+        let request = || {
+            Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://localhost:4200")
+                .header("idempotency-key", "timeout-owner-key")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"text":"timeout owner turn"}"#))
+                .unwrap()
+        };
+
+        let first = {
+            let app = app.clone();
+            let request = request();
+            tokio::spawn(async move { app.oneshot(request).await.unwrap() })
+        };
+        entered.acquire().await.unwrap().forget();
+        assert_eq!(first.await.unwrap().status(), StatusCode::REQUEST_TIMEOUT);
+
+        let retry = {
+            let app = app.clone();
+            let request = request();
+            tokio::spawn(async move { app.oneshot(request).await.unwrap() })
+        };
+        tokio::task::yield_now().await;
+        release.add_permits(1);
+        assert_eq!(retry.await.unwrap().status(), StatusCode::OK);
+
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        let guard = state.read().await;
+        let snapshot = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.room_id == room_id)
+                .count(),
+            2
+        );
+        assert_eq!(
+            guard
+                .outbound
+                .values()
+                .filter(|outbound| outbound.connector_id == connector_id)
+                .count(),
+            1
+        );
+        drop(guard);
+
+        assert!(manager
+            .deliver_pending_once(connector_id.clone())
+            .await
+            .unwrap());
+        assert_eq!(transport.send_calls.load(Ordering::SeqCst), 1);
+        assert!(state.read().await.outbound.values().any(|outbound| {
+            outbound.connector_id == connector_id
+                && outbound.delivery_state == OutboundDeliveryState::Delivered
+        }));
+        manager.shutdown().await;
     }
 
     #[tokio::test]
@@ -1558,6 +1863,7 @@ mod tests {
             let credentials = Arc::new(CountingCredentialStore::default());
             let transport = Arc::new(CountingTelegramTransport {
                 calls: AtomicUsize::new(0),
+                send_calls: AtomicUsize::new(0),
                 get_me_error: StdMutex::new(Some(error)),
             });
             let manager = ConnectorManager::new(

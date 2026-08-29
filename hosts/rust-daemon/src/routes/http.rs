@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 
 use axum::body::to_bytes;
-use axum::extract::Request as AxumRequest;
+use axum::extract::{Request as AxumRequest, State};
 use axum::http::{header, HeaderValue, Request as HttpRequest, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response as AxumResponse};
@@ -33,6 +33,11 @@ pub(super) struct LocalOwnerPolicy {
     admin_token: Option<Zeroizing<String>>,
 }
 
+#[derive(Clone)]
+pub(super) struct ApiKeyPolicy {
+    expected: Option<Zeroizing<String>>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LocalOwnerRejection {
     LocalAdminRequired,
@@ -60,6 +65,18 @@ impl LocalOwnerPolicy {
             bind_is_loopback,
             allowed_origins,
             admin_token,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(bind_is_loopback: bool, admin_token: Option<&str>) -> Self {
+        Self {
+            bind_is_loopback,
+            allowed_origins: DEFAULT_LOCAL_UI_ORIGINS
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            admin_token: admin_token.map(|value| Zeroizing::new(value.to_string())),
         }
     }
 
@@ -99,6 +116,41 @@ impl LocalOwnerPolicy {
         } else {
             Err(LocalOwnerRejection::LocalAdminRequired)
         }
+    }
+}
+
+impl ApiKeyPolicy {
+    pub(super) fn from_env() -> Self {
+        let expected = std::env::var("ANIMAOS_RS_API_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(Zeroizing::new);
+        Self { expected }
+    }
+
+    #[cfg(test)]
+    pub(super) fn for_test(expected: Option<&str>) -> Self {
+        Self {
+            expected: expected.map(|value| Zeroizing::new(value.to_string())),
+        }
+    }
+
+    fn authorize(&self, headers: &axum::http::HeaderMap) -> bool {
+        let Some(expected) = self.expected.as_deref() else {
+            return true;
+        };
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default();
+        let x_api_key = headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        constant_time_eq(authorization.as_bytes(), expected.as_bytes())
+            | constant_time_eq(x_api_key.as_bytes(), expected.as_bytes())
     }
 }
 
@@ -182,8 +234,8 @@ fn constant_time_local_admin_eq(presented: &[u8], expected: &[u8]) -> bool {
     diff == 0
 }
 
-/// Optional API-key gate. Reads `ANIMAOS_RS_API_KEY` once on first call and
-/// caches the result for the process lifetime.
+/// Optional API-key gate. The immutable policy is computed once while the
+/// router is built.
 ///
 /// - If the env var is **unset or empty**, all requests pass through (default,
 ///   matches prior behavior).
@@ -193,21 +245,10 @@ fn constant_time_local_admin_eq(presented: &[u8], expected: &[u8]) -> bool {
 ///   `/openapi.json`, `/docs`, `/docs/`) are exempt so external monitoring
 ///   keeps working.
 pub(super) async fn enforce_api_key(
+    State(policy): State<ApiKeyPolicy>,
     request: AxumRequest,
     next: Next,
 ) -> Result<AxumResponse, AxumResponse> {
-    use std::sync::OnceLock;
-    static EXPECTED_KEY: OnceLock<Option<String>> = OnceLock::new();
-    let expected = EXPECTED_KEY.get_or_init(|| {
-        std::env::var("ANIMAOS_RS_API_KEY")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-    });
-    let Some(expected) = expected.as_deref() else {
-        return Ok(next.run(request).await);
-    };
-
     let path = request.uri().path();
     if matches!(
         path,
@@ -223,20 +264,7 @@ pub(super) async fn enforce_api_key(
         return Ok(next.run(request).await);
     }
 
-    let presented = request
-        .headers()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .or_else(|| {
-            request
-                .headers()
-                .get("x-api-key")
-                .and_then(|value| value.to_str().ok())
-        })
-        .unwrap_or_default();
-
-    if constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+    if policy.authorize(request.headers()) {
         Ok(next.run(request).await)
     } else {
         Err(json_response(

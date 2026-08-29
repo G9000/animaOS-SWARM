@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anima_core::{Content, DataValue, MessageRole, TaskStatus};
+use anima_core::{Content, DataValue, MessageRole, TaskResult, TaskStatus};
 use async_trait::async_trait;
 use tokio::sync::{oneshot, watch, Mutex};
 use tokio::task::JoinHandle;
@@ -20,8 +20,9 @@ use super::{
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
-use crate::routes::ApiError;
+use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::schedules::ScheduleTarget;
+use crate::state::DaemonState;
 
 static CONNECTOR_ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 const DELIVERED_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -102,6 +103,7 @@ pub(crate) enum ConnectorManagerError {
     Persistence,
     Backpressure,
     ConflictingUpdate,
+    IdempotencyConflict,
     WorkerStopped,
 }
 
@@ -119,6 +121,7 @@ impl fmt::Display for ConnectorManagerError {
             Self::Persistence => "connector state persistence failed",
             Self::Backpressure => "connector inbound capacity is exhausted",
             Self::ConflictingUpdate => "Telegram update conflicts with durable history",
+            Self::IdempotencyConflict => "connector idempotency key conflicts with committed text",
             Self::WorkerStopped => "connector worker stopped unexpectedly",
         })
     }
@@ -136,6 +139,7 @@ pub(crate) struct ConnectorManager {
     mutation_lock: Arc<Mutex<()>>,
     statuses: Arc<Mutex<HashMap<String, ConnectorRuntimeStatus>>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
+    owner_send_locks: Arc<StdMutex<HashMap<(String, String), Weak<Mutex<()>>>>>,
     worker_generation: Arc<AtomicU64>,
     closing: Arc<AtomicBool>,
     owner_close: Option<watch::Sender<bool>>,
@@ -172,6 +176,7 @@ impl ConnectorManager {
             mutation_lock,
             statuses: Arc::new(Mutex::new(HashMap::new())),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            owner_send_locks: Arc::new(StdMutex::new(HashMap::new())),
             worker_generation: Arc::new(AtomicU64::new(1)),
             closing: Arc::new(AtomicBool::new(false)),
             owner_close: Some(owner_close),
@@ -184,6 +189,21 @@ impl ConnectorManager {
         } else {
             Ok(())
         }
+    }
+
+    fn owner_send_lock(&self, connector_id: &str, idempotency_key: &str) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .owner_send_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (connector_id.to_string(), idempotency_key.to_string());
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
     }
 
     pub(crate) async fn create(
@@ -822,11 +842,12 @@ impl ConnectorManager {
         agent_id: String,
         connector_id: String,
         text: String,
+        idempotency_key: String,
     ) -> Result<(crate::routes::AgentRunEnvelope, bool), ConnectorManagerError> {
         let manager = self.clone();
         tokio::spawn(async move {
             manager
-                .send_from_owner_owned(agent_id, connector_id, text)
+                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key)
                 .await
         })
         .await
@@ -838,8 +859,11 @@ impl ConnectorManager {
         agent_id: String,
         connector_id: String,
         text: String,
+        idempotency_key: String,
     ) -> Result<(crate::routes::AgentRunEnvelope, bool), ConnectorManagerError> {
-        let (connector, connector_worker_generation) = {
+        let owner_send_lock = self.owner_send_lock(&connector_id, &idempotency_key);
+        let _owner_send_guard = owner_send_lock.lock().await;
+        let (connector, connector_worker_generation, replay) = {
             let _lifecycle = self.lifecycle_lock.lock().await;
             self.ensure_open()?;
             let state = self.state.read().await;
@@ -868,8 +892,12 @@ impl ConnectorManager {
                 .await
                 .get(&connector_id)
                 .map(|worker| worker.generation);
-            (connector, worker_generation)
+            let replay = owner_send_replay(&state, &connector, &text, &idempotency_key)?;
+            (connector, worker_generation, replay)
         };
+        if let Some(replay) = replay {
+            return Ok(replay);
+        }
         let permit = self
             .runs
             .try_admit()
@@ -897,7 +925,7 @@ impl ConnectorManager {
                 attachments: None,
             },
             room: RunRoom::Stable(connector.room_id.clone()),
-            idempotency_key: None,
+            idempotency_key: Some(idempotency_key),
         };
         let run = self
             .runs
@@ -2005,6 +2033,7 @@ impl ConnectorManager {
             mutation_lock: Arc::clone(&self.mutation_lock),
             statuses: Arc::clone(&self.statuses),
             workers: Arc::new(Mutex::new(HashMap::new())),
+            owner_send_locks: Arc::clone(&self.owner_send_locks),
             worker_generation: Arc::clone(&self.worker_generation),
             closing: Arc::clone(&self.closing),
             owner_close: None,
@@ -2250,6 +2279,56 @@ impl ConnectorManager {
     }
 }
 
+fn owner_send_replay(
+    state: &DaemonState,
+    connector: &TelegramConnectorRecord,
+    text: &str,
+    idempotency_key: &str,
+) -> Result<Option<(AgentRunEnvelope, bool)>, ConnectorManagerError> {
+    let snapshot = state
+        .get_agent(&connector.agent_id)
+        .ok_or(ConnectorManagerError::AgentNotFound)?;
+    let Some((user_index, user)) = snapshot.messages.iter().enumerate().find(|(_, message)| {
+        message.room_id == connector.room_id
+            && message.role == MessageRole::User
+            && message.content.metadata.as_ref().is_some_and(|metadata| {
+                matches!(
+                    metadata.get("idempotencyKey"),
+                    Some(DataValue::String(value)) if value == idempotency_key
+                ) && matches!(
+                    metadata.get("connectorId"),
+                    Some(DataValue::String(value)) if value == &connector.id
+                )
+            })
+    }) else {
+        return Ok(None);
+    };
+    if user.content.text != text {
+        return Err(ConnectorManagerError::IdempotencyConflict);
+    }
+    let Some(assistant) = snapshot
+        .messages
+        .iter()
+        .skip(user_index + 1)
+        .find(|message| {
+            message.room_id == connector.room_id && message.role == MessageRole::Assistant
+        })
+    else {
+        return Ok(None);
+    };
+    let delivery_queued = state.outbound.values().any(|outbound| {
+        outbound.connector_id == connector.id && outbound.assistant_message_id == assistant.id
+    });
+    let result = TaskResult::success(assistant.content.clone(), 0);
+    Ok(Some((
+        AgentRunEnvelope {
+            agent: AgentRuntimeSnapshotResponse::from(&snapshot),
+            result: TaskResultResponse::from(&result),
+        },
+        delivery_queued,
+    )))
+}
+
 fn map_credential_error(error: CredentialStoreError) -> ConnectorManagerError {
     match error {
         CredentialStoreError::CredentialStateUncertain => {
@@ -2420,8 +2499,8 @@ mod tests {
     use std::time::Duration;
 
     use anima_core::{
-        AgentConfig, AgentConfigUpdate, AgentSettings, Content, ModelAdapter, ModelGenerateRequest,
-        ModelGenerateResponse, ModelStopReason, TokenUsage,
+        AgentConfig, AgentConfigUpdate, AgentSettings, Content, DataValue, ModelAdapter,
+        ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
     use tokio::sync::{RwLock, Semaphore};
@@ -4326,6 +4405,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_thread_idempotency_singleflights_replays_and_rejects_conflicts() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:owner-idempotency").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.stop_worker(&connector.id).await.unwrap();
+
+        let first = {
+            let manager = manager.clone();
+            let agent_id = agent_id.clone();
+            let connector_id = connector.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .send_from_owner(
+                        agent_id,
+                        connector_id,
+                        "same owner turn".into(),
+                        "owner-key".into(),
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        let retry = {
+            let manager = manager.clone();
+            let agent_id = agent_id.clone();
+            let connector_id = connector.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .send_from_owner(
+                        agent_id,
+                        connector_id,
+                        "same owner turn".into(),
+                        "owner-key".into(),
+                    )
+                    .await
+            })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), entered.acquire())
+                .await
+                .is_err(),
+            "retry must wait on the same manager-owned singleflight"
+        );
+        release.add_permits(1);
+        assert!(!first.await.unwrap().unwrap().1);
+        assert!(!retry.await.unwrap().unwrap().1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), entered.acquire())
+                .await
+                .is_err(),
+            "committed retry must replay without another model call"
+        );
+
+        let snapshot = state.read().await.get_agent(&agent_id).unwrap();
+        let room_messages = snapshot
+            .messages
+            .iter()
+            .filter(|message| message.room_id == connector.room_id)
+            .collect::<Vec<_>>();
+        assert_eq!(room_messages.len(), 2);
+        assert_eq!(
+            room_messages[0]
+                .content
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("idempotencyKey")),
+            Some(&DataValue::String("owner-key".into()))
+        );
+
+        assert_eq!(
+            manager
+                .send_from_owner(
+                    agent_id,
+                    connector.id,
+                    "different owner turn".into(),
+                    "owner-key".into(),
+                )
+                .await
+                .unwrap_err(),
+            super::ConnectorManagerError::IdempotencyConflict
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owner_thread_idempotency_replays_after_control_plane_restart() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let temporary = std::env::temp_dir().join(format!(
+            "anima-owner-idempotency-restart-{}-{}",
+            std::process::id(),
+            super::now_ms()
+        ));
+        let snapshot_path = temporary.join("control-plane.json");
+        daemon.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path.clone()),
+        ));
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let first_manager = manager(
+            Arc::clone(&state),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = first_manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:owner-restart").unwrap(),
+            )
+            .await
+            .unwrap();
+        first_manager.stop_worker(&connector.id).await.unwrap();
+        let first = {
+            let manager = first_manager.clone();
+            let agent_id = agent_id.clone();
+            let connector_id = connector.id.clone();
+            tokio::spawn(async move {
+                manager
+                    .send_from_owner(
+                        agent_id,
+                        connector_id,
+                        "restart-safe turn".into(),
+                        "restart-key".into(),
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        release.add_permits(1);
+        assert!(!first.await.unwrap().unwrap().1);
+        first_manager.shutdown().await;
+
+        let snapshot = crate::control_plane_store::load_control_plane_snapshot(
+            &crate::control_plane_store::ControlPlaneStoreConfig::Json(snapshot_path),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let retry_entered = Arc::new(Semaphore::new(0));
+        let mut restored = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&retry_entered),
+            release: Arc::new(Semaphore::new(0)),
+        }));
+        restored.restore_control_plane_snapshot(snapshot).unwrap();
+        let restored = Arc::new(RwLock::new(restored));
+        let retry_manager = manager(
+            Arc::clone(&restored),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let replay = retry_manager
+            .send_from_owner(
+                agent_id.clone(),
+                connector.id.clone(),
+                "restart-safe turn".into(),
+                "restart-key".into(),
+            )
+            .await
+            .unwrap();
+        assert!(!replay.1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), retry_entered.acquire())
+                .await
+                .is_err(),
+            "durable replay must not call the model after restart"
+        );
+        assert_eq!(
+            restored
+                .read()
+                .await
+                .get_agent(&agent_id)
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|message| message.room_id == connector.room_id)
+                .count(),
+            2
+        );
+        retry_manager.shutdown().await;
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+
+    #[tokio::test]
     async fn delivery_cannot_send_outbound_from_a_failing_final_owner_thread_snapshot() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -4371,7 +4656,12 @@ mod tests {
             let connector_id = connector.id.clone();
             tokio::spawn(async move {
                 manager
-                    .send_from_owner(agent_id, connector_id, "owner web turn".into())
+                    .send_from_owner(
+                        agent_id,
+                        connector_id,
+                        "owner web turn".into(),
+                        "owner-final-save".into(),
+                    )
                     .await
             })
         };
@@ -4458,6 +4748,7 @@ mod tests {
                     sending_agent_id,
                     sending_connector_id,
                     "owner web turn".into(),
+                    "owner-delete-race".into(),
                 )
                 .await
         });

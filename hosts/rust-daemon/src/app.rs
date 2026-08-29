@@ -143,12 +143,7 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     configure_persistence(&state, &config).await?;
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
     runtime.connectors.start_restored().await;
-    Ok(router_with_runtime(
-        state,
-        config,
-        runtime,
-        routes::configured_bind_is_loopback(),
-    ))
+    Ok(router_with_runtime(state, config, runtime, false))
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {

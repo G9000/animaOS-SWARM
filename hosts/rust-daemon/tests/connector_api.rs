@@ -88,6 +88,50 @@ fn owner_request(method: &str, uri: &str, body: Option<Value>) -> Request<Body> 
     request
 }
 
+fn owner_message_request(uri: &str, body: Value, idempotency_key: &str) -> Request<Body> {
+    let mut request = owner_request("POST", uri, Some(body));
+    request.headers_mut().insert(
+        "idempotency-key",
+        HeaderValue::from_str(idempotency_key).expect("valid test idempotency key"),
+    );
+    request
+}
+
+fn apply_owner_guard_attack(request: &mut Request<Body>, attack: &str) {
+    match attack {
+        "evil-origin" => {
+            request.headers_mut().insert(
+                "origin",
+                "http://localhost:4200.evil.example".parse().unwrap(),
+            );
+        }
+        "forwarded" => {
+            request
+                .headers_mut()
+                .insert("forwarded", "for=127.0.0.1".parse().unwrap());
+        }
+        "malformed-origin" => {
+            request.headers_mut().insert(
+                "origin",
+                HeaderValue::from_bytes(&[0xff]).expect("opaque origin header"),
+            );
+        }
+        "missing-host" => {
+            request.headers_mut().remove("host");
+        }
+        "originless" => {
+            request.headers_mut().remove("origin");
+        }
+        "wrong-token" => {
+            request.headers_mut().remove("origin");
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer wrong-token".parse().unwrap());
+        }
+        _ => {}
+    }
+}
+
 async fn create_agent(app: &Router, name: &str) -> String {
     let (status, _, body, _) = send(
         app,
@@ -291,11 +335,16 @@ async fn connector_routes_enforce_agent_ownership_and_not_found_without_secret_l
         ("send", "POST", "/messages", Some(json!({"text": "hello"}))),
     ] {
         let uri = format!("/api/agents/{other_id}/connectors/{connector_id}{suffix}");
-        let request = if method == "GET" {
+        let mut request = if method == "GET" {
             request(method, &uri, body)
         } else {
             owner_request(method, &uri, body)
         };
+        if name == "send" {
+            request
+                .headers_mut()
+                .insert("idempotency-key", "ownership-mismatch".parse().unwrap());
+        }
         let (status, _, response, text) = send(&app, request).await;
         responses.insert(name, (status, response, text));
     }
@@ -327,10 +376,10 @@ async fn connector_thread_is_dedicated_bounded_and_stably_paginated() {
 
     let (unpaired_status, _, unpaired, _) = send(
         &app,
-        owner_request(
-            "POST",
+        owner_message_request(
             &format!("/api/agents/{agent_id}/connectors/{connector_id}/messages"),
-            Some(json!({"text": "not paired"})),
+            json!({"text": "not paired"}),
+            "unpaired-owner-send",
         ),
     )
     .await;
@@ -342,6 +391,33 @@ async fn connector_thread_is_dedicated_bounded_and_stably_paginated() {
         .unwrap()
         .iter()
         .all(|message| { message["roomId"] == created["connector"]["roomId"] }));
+    let unpaired_message_count = unpaired["messages"].as_array().unwrap().len();
+    let (replay_status, _, replay, _) = send(
+        &app,
+        owner_message_request(
+            &format!("/api/agents/{agent_id}/connectors/{connector_id}/messages"),
+            json!({"text": "not paired"}),
+            "unpaired-owner-send",
+        ),
+    )
+    .await;
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay["deliveryQueued"], false);
+    assert_eq!(
+        replay["messages"].as_array().unwrap().len(),
+        unpaired_message_count
+    );
+    let (conflict_status, _, conflict, _) = send(
+        &app,
+        owner_message_request(
+            &format!("/api/agents/{agent_id}/connectors/{connector_id}/messages"),
+            json!({"text": "different text"}),
+            "unpaired-owner-send",
+        ),
+    )
+    .await;
+    assert_eq!(conflict_status, StatusCode::CONFLICT);
+    assert_eq!(conflict["code"], "connector_idempotency_conflict");
 
     let chat_id = wait_for_pending_chat(&app, &agent_id).await;
     let _ = send(
@@ -372,13 +448,16 @@ async fn connector_thread_is_dedicated_bounded_and_stably_paginated() {
         .unwrap()
         .to_string();
 
-    for text in ["first telegram", "second telegram", "third telegram"] {
+    for (index, text) in ["first telegram", "second telegram", "third telegram"]
+        .into_iter()
+        .enumerate()
+    {
         let (status, headers, sent, raw) = send(
             &app,
-            owner_request(
-                "POST",
+            owner_message_request(
                 &format!("/api/agents/{agent_id}/connectors/{connector_id}/messages"),
-                Some(json!({"text": text})),
+                json!({"text": text}),
+                &format!("paired-owner-send-{index}"),
             ),
         )
         .await;
@@ -484,13 +563,16 @@ async fn connector_inputs_are_bounded_before_mutation() {
         ),
     )
     .await;
-    for text in ["".to_string(), "x".repeat(4097), "x".repeat(16_385)] {
+    for (index, text) in ["".to_string(), "x".repeat(4097), "x".repeat(16_385)]
+        .into_iter()
+        .enumerate()
+    {
         let (status, _, body, _) = send(
             &app,
-            owner_request(
-                "POST",
+            owner_message_request(
                 &format!("/api/agents/{agent_id}/connectors/{connector_id}/messages"),
-                Some(json!({"text": text})),
+                json!({"text": text}),
+                &format!("bounded-text-{index}"),
             ),
         )
         .await;
@@ -506,6 +588,43 @@ async fn connector_inputs_are_bounded_before_mutation() {
         ),
     )
     .await;
+    assert_eq!(messages["messages"], json!([]));
+}
+
+#[tokio::test]
+async fn connector_thread_requires_a_bounded_idempotency_key() {
+    let app = app_with_owner_env("127.0.0.1", None, None).await;
+    let agent_id = create_agent(&app, "idempotency-key-validation").await;
+    let (_, _, created, _) = create_connector(&app, &agent_id).await;
+    let connector_id = created["connector"]["id"].as_str().unwrap();
+    let uri = format!("/api/agents/{agent_id}/connectors/{connector_id}/messages");
+
+    let missing = owner_request("POST", &uri, Some(json!({"text": "missing"})));
+    let (status, _, body, _) = send(&app, missing).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "connector_idempotency_key_required");
+
+    for value in ["".to_string(), "contains space".into(), "x".repeat(129)] {
+        let mut invalid = owner_request("POST", &uri, Some(json!({"text": "invalid"})));
+        invalid.headers_mut().insert(
+            "idempotency-key",
+            HeaderValue::from_str(&value).expect("header value"),
+        );
+        let (status, _, body, _) = send(&app, invalid).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value:?}");
+        assert_eq!(body["code"], "connector_idempotency_key_invalid");
+    }
+
+    let mut invalid = owner_request("POST", &uri, Some(json!({"text": "invalid"})));
+    invalid.headers_mut().insert(
+        "idempotency-key",
+        HeaderValue::from_bytes(&[0xff]).expect("opaque idempotency header"),
+    );
+    let (status, _, body, _) = send(&app, invalid).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "connector_idempotency_key_invalid");
+
+    let (_, _, messages, _) = send(&app, request("GET", &uri, None)).await;
     assert_eq!(messages["messages"], json!([]));
 }
 
@@ -576,38 +695,7 @@ async fn local_owner_guard_fails_before_connector_side_effects() {
             &format!("/api/agents/{agent_id}/connectors/telegram"),
             Some(json!({"botToken": SECRET_SENTINEL})),
         );
-        match mutate {
-            "evil-origin" => {
-                blocked.headers_mut().insert(
-                    "origin",
-                    "http://localhost:4200.evil.example".parse().unwrap(),
-                );
-            }
-            "forwarded" => {
-                blocked
-                    .headers_mut()
-                    .insert("forwarded", "for=127.0.0.1".parse().unwrap());
-            }
-            "malformed-origin" => {
-                blocked.headers_mut().insert(
-                    "origin",
-                    HeaderValue::from_bytes(&[0xff]).expect("opaque origin header"),
-                );
-            }
-            "missing-host" => {
-                blocked.headers_mut().remove("host");
-            }
-            "originless" => {
-                blocked.headers_mut().remove("origin");
-            }
-            "wrong-token" => {
-                blocked.headers_mut().remove("origin");
-                blocked
-                    .headers_mut()
-                    .insert("authorization", "Bearer wrong-token".parse().unwrap());
-            }
-            _ => {}
-        }
+        apply_owner_guard_attack(&mut blocked, mutate);
         let (status, headers, body, text) = send(&app, blocked).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{name}: {text}");
         assert_no_store(&headers);
@@ -615,6 +703,18 @@ async fn local_owner_guard_fails_before_connector_side_effects() {
         assert_secret_absent([text]);
         let (list_status, _, listed, _) = get_connectors(&app, &agent_id).await;
         assert_eq!(list_status, StatusCode::OK);
+        assert_eq!(listed, json!({"connectors": []}), "{name}");
+
+        let mut blocked_delete = owner_request("DELETE", &format!("/api/agents/{agent_id}"), None);
+        apply_owner_guard_attack(&mut blocked_delete, mutate);
+        let (delete_status, _, _, delete_text) = send(&app, blocked_delete).await;
+        assert_eq!(
+            delete_status,
+            StatusCode::FORBIDDEN,
+            "agent deletion guard {name}: {delete_text}"
+        );
+        let (list_status, _, listed, _) = get_connectors(&app, &agent_id).await;
+        assert_eq!(list_status, StatusCode::OK, "agent must remain: {name}");
         assert_eq!(listed, json!({"connectors": []}), "{name}");
     }
 
@@ -680,6 +780,31 @@ async fn local_owner_guard_fails_before_connector_side_effects() {
     let default_agent_id = create_agent(&app, "default-origin-remains").await;
     let (default_status, _, _, _) = create_connector(&app, &default_agent_id).await;
     assert_eq!(default_status, StatusCode::CREATED);
+
+    let origin_delete_agent = create_agent(&app, "origin-delete").await;
+    let (origin_delete_status, _, origin_delete, _) = send(
+        &app,
+        owner_request(
+            "DELETE",
+            &format!("/api/agents/{origin_delete_agent}"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(origin_delete_status, StatusCode::OK);
+    assert_eq!(origin_delete["deleted"], true);
+
+    let token_delete_agent = create_agent(&app, "token-delete").await;
+    let mut token_delete = request("DELETE", &format!("/api/agents/{token_delete_agent}"), None);
+    token_delete
+        .headers_mut()
+        .insert("host", "localhost:8080".parse().unwrap());
+    token_delete
+        .headers_mut()
+        .insert("authorization", "Bearer right-token".parse().unwrap());
+    let (token_delete_status, _, token_delete, _) = send(&app, token_delete).await;
+    assert_eq!(token_delete_status, StatusCode::OK);
+    assert_eq!(token_delete["deleted"], true);
 }
 
 #[tokio::test]
@@ -722,4 +847,23 @@ async fn openapi_registers_connector_paths_tags_and_camel_case_schemas() {
         document["components"]["schemas"]["ConnectorMessageRequest"]["required"],
         json!(["text"])
     );
+    let idempotency_parameter = document["paths"]
+        ["/api/agents/{agent_id}/connectors/{connector_id}/messages"]["post"]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == "Idempotency-Key")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "thread send documents Idempotency-Key: {}",
+                document["paths"]["/api/agents/{agent_id}/connectors/{connector_id}/messages"]
+                    ["post"]
+            )
+        });
+    assert_eq!(idempotency_parameter["in"], "header");
+    assert_eq!(idempotency_parameter["required"], true);
+    assert_eq!(idempotency_parameter["schema"]["minLength"], 1);
+    assert_eq!(idempotency_parameter["schema"]["maxLength"], 128);
 }
