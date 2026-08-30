@@ -20,7 +20,7 @@ Markdown applies to both `User` and `Assistant` bubbles. System and tool event p
 
 Add a focused Markdown presentation component under `apps/web/src/components/`. `ChatScreen` will delegate message body rendering to that component while retaining ownership of bubble alignment, color, timestamps, and non-chat event pills.
 
-Use `react-markdown` for React-native rendering, `remark-gfm` for GitHub-flavored syntax, and `prism-react-renderer` for fenced-code highlighting. These libraries avoid a custom parser and do not require injecting generated HTML into the DOM.
+Use `react-markdown` for native React element rendering, `remark-gfm` for GitHub-flavored syntax, and `prism-react-renderer` for fenced-code highlighting. These libraries avoid a custom parser and do not require injecting generated HTML into the DOM.
 
 The Markdown component will provide element mappings for links, tables, inline code, fenced code blocks, and other prose elements so rendered content follows the existing dark visual system. A dedicated code-block unit will own syntax highlighting, horizontal overflow, the language label, clipboard interaction, and copied-state feedback.
 
@@ -38,7 +38,7 @@ Tables will sit inside a horizontal overflow wrapper. Fenced code blocks will sc
 
 ## Error Handling
 
-Valid plain text remains valid Markdown and renders as text. Unknown fenced-code languages fall back to unhighlighted code without failing the message. If the Clipboard API rejects a copy request, the button remains available and does not show a successful state; rendering and chat interaction continue normally.
+Valid plain text remains valid Markdown and renders as text. Unknown fenced-code languages fall back to unhighlighted code without failing the message. A successful copy displays a two-second copied state. If the Clipboard API is unavailable or rejects a copy request, the button remains available, does not show a successful state, and exposes a non-disruptive failure label; rendering and chat interaction continue normally.
 
 ## Testing
 
