@@ -4,6 +4,7 @@ import {
   daemon,
   type DaemonProvider,
   type DaemonSnapshot,
+  type DaemonWorkspaceState,
 } from '../lib/daemon-api';
 
 export type DaemonConnection = 'unknown' | 'online' | 'offline';
@@ -14,8 +15,10 @@ export interface DaemonBootstrap {
   agents: DaemonSnapshot[];
   providers: DaemonProvider[] | null;
   providersError: string | null;
+  workspace: DaemonWorkspaceState | null;
   refreshAgents(): Promise<void>;
   retryProviders(): Promise<void>;
+  refreshWorkspace(): Promise<void>;
   acceptAgentSnapshot(snapshot: DaemonSnapshot): void;
   removeAgentSnapshot(id: string): void;
 }
@@ -49,10 +52,12 @@ export function useDaemonBootstrap(): DaemonBootstrap {
   const [agents, setAgents] = useState<DaemonSnapshot[]>([]);
   const [providers, setProviders] = useState<DaemonProvider[] | null>(null);
   const [providersError, setProvidersError] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<DaemonWorkspaceState | null>(null);
   const mountedRef = useRef(false);
   const agentRequestGenerationRef = useRef(0);
   const collectionMutationEpochRef = useRef(0);
   const providerRequestGenerationRef = useRef(0);
+  const workspaceRequestGenerationRef = useRef(0);
 
   const refreshAgents = useCallback(async () => {
     const requestGeneration = ++agentRequestGenerationRef.current;
@@ -113,6 +118,30 @@ export function useDaemonBootstrap(): DaemonBootstrap {
     }
   }, []);
 
+  const refreshWorkspace = useCallback(async () => {
+    const requestGeneration = ++workspaceRequestGenerationRef.current;
+
+    try {
+      const state = await daemon.getWorkspace();
+      if (
+        !mountedRef.current ||
+        requestGeneration !== workspaceRequestGenerationRef.current
+      ) {
+        return;
+      }
+      setWorkspace(state);
+    } catch {
+      if (
+        !mountedRef.current ||
+        requestGeneration !== workspaceRequestGenerationRef.current
+      ) {
+        return;
+      }
+      // The workspace is optional context: never fail the bootstrap over it.
+      setWorkspace(null);
+    }
+  }, []);
+
   const acceptAgentSnapshot = useCallback((snapshot: DaemonSnapshot) => {
     collectionMutationEpochRef.current += 1;
     setAgents((current) => {
@@ -150,7 +179,9 @@ export function useDaemonBootstrap(): DaemonBootstrap {
 
       pollTimer = window.setTimeout(() => {
         pollTimer = undefined;
-        void refreshAgents().finally(schedulePoll);
+        void Promise.allSettled([refreshAgents(), refreshWorkspace()]).then(
+          schedulePoll,
+        );
       }, 5_000);
     };
 
@@ -184,17 +215,19 @@ export function useDaemonBootstrap(): DaemonBootstrap {
 
     void availability.finally(schedulePoll);
     void retryProviders();
+    void refreshWorkspace();
 
     return () => {
       active = false;
       mountedRef.current = false;
       agentRequestGenerationRef.current += 1;
       providerRequestGenerationRef.current += 1;
+      workspaceRequestGenerationRef.current += 1;
       if (pollTimer !== undefined) {
         window.clearTimeout(pollTimer);
       }
     };
-  }, [refreshAgents, retryProviders]);
+  }, [refreshAgents, retryProviders, refreshWorkspace]);
 
   return {
     connection,
@@ -202,8 +235,10 @@ export function useDaemonBootstrap(): DaemonBootstrap {
     agents,
     providers,
     providersError,
+    workspace,
     refreshAgents,
     retryProviders,
+    refreshWorkspace,
     acceptAgentSnapshot,
     removeAgentSnapshot,
   };

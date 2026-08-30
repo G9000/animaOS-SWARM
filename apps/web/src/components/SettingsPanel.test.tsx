@@ -7,7 +7,11 @@ import {
   toolNamesForProfile,
   type AccessProfile,
 } from '../lib/agent-access';
-import type { AgentUpdateInput, DaemonProvider } from '../lib/daemon-api';
+import type {
+  AgentUpdateInput,
+  DaemonProvider,
+  DaemonWorkspaceState,
+} from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { SettingsPanel } from './SettingsPanel';
 
@@ -55,6 +59,7 @@ function renderPanel(
     resetting: boolean;
     saveError: string | null;
     resetError: string | null;
+    workspace: DaemonWorkspaceState | null;
     saveSettings: (patch: AgentUpdateInput) => Promise<boolean>;
     resetAgent: () => void;
     close: () => void;
@@ -67,6 +72,7 @@ function renderPanel(
     resetting: false,
     saveError: null,
     resetError: null,
+    workspace: null,
     saveSettings: vi.fn(async () => true),
     resetAgent: vi.fn(),
     close: vi.fn(),
@@ -75,6 +81,70 @@ function renderPanel(
 
   return { ...render(<SettingsPanel {...props} />), props };
 }
+
+const configuredWorkspace: DaemonWorkspaceState = {
+  configured: true,
+  workspace: {
+    rootPath: '/workspaces/northwind',
+    companyName: 'Northwind Research',
+    mission: 'Map supply chains',
+    values: ['rigor'],
+  },
+  defaultRoot: '/workspaces',
+};
+
+describe('SettingsPanel workspace section', () => {
+  it('shows the configured workspace as read-only company, mission, and folder rows', () => {
+    renderPanel(agent(), { workspace: configuredWorkspace });
+
+    const heading = screen.getByRole('heading', {
+      level: 4,
+      name: 'Workspace',
+    });
+    expect(heading).toBeVisible();
+    expect(screen.getByText('Company')).toBeVisible();
+    expect(screen.getByText('Northwind Research')).toBeVisible();
+    expect(screen.getByText('Mission')).toBeVisible();
+    expect(screen.getByText('Map supply chains')).toBeVisible();
+    expect(screen.getByText('Folder')).toBeVisible();
+    expect(screen.getByText('/workspaces/northwind')).toBeVisible();
+    // Read-only: the workspace values are not editable controls.
+    expect(screen.queryByDisplayValue('Northwind Research')).toBeNull();
+    expect(screen.queryByDisplayValue('Map supply chains')).toBeNull();
+  });
+
+  it('places the workspace section above the identity settings', () => {
+    renderPanel(agent(), { workspace: configuredWorkspace });
+
+    const workspaceHeading = screen.getByRole('heading', {
+      level: 4,
+      name: 'Workspace',
+    });
+    const identityHeading = screen.getByRole('heading', {
+      level: 4,
+      name: 'Identity',
+    });
+    expect(
+      workspaceHeading.compareDocumentPosition(identityHeading) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  });
+
+  it.each([null, { configured: false, workspace: null, defaultRoot: '/w' }])(
+    'hides the workspace section when workspace state is %o',
+    (workspace) => {
+      renderPanel(agent(), { workspace });
+
+      expect(
+        screen.queryByRole('heading', { level: 4, name: 'Workspace' }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText('Company')).not.toBeInTheDocument();
+      expect(
+        screen.getByRole('heading', { level: 4, name: 'Identity' }),
+      ).toBeVisible();
+    },
+  );
+});
 
 describe('SettingsPanel access', () => {
   it('opens as a labelled modal and keeps keyboard focus inside it', async () => {

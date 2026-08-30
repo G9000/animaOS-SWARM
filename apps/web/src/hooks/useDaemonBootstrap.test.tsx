@@ -5,6 +5,7 @@ import {
   daemon,
   type DaemonProvider,
   type DaemonSnapshot,
+  type DaemonWorkspaceState,
 } from '../lib/daemon-api';
 import { useDaemonBootstrap } from './useDaemonBootstrap';
 
@@ -21,6 +22,7 @@ vi.mock('../lib/daemon-api', async () => {
       health: vi.fn(),
       listAgents: vi.fn(),
       listProviders: vi.fn(),
+      getWorkspace: vi.fn(),
     },
   };
 });
@@ -73,6 +75,24 @@ function snapshot(id: string, createdAtMs: number, name = id): DaemonSnapshot {
 const healthMock = vi.mocked(daemon.health);
 const listAgentsMock = vi.mocked(daemon.listAgents);
 const listProvidersMock = vi.mocked(daemon.listProviders);
+const getWorkspaceMock = vi.mocked(daemon.getWorkspace);
+
+const unconfiguredWorkspace: DaemonWorkspaceState = {
+  configured: false,
+  workspace: null,
+  defaultRoot: '/default-root',
+};
+
+const configuredWorkspace: DaemonWorkspaceState = {
+  configured: true,
+  workspace: {
+    rootPath: '/workspaces/northwind',
+    companyName: 'Northwind Research',
+    mission: 'Map supply chains',
+    values: ['rigor'],
+  },
+  defaultRoot: '/default-root',
+};
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -103,6 +123,8 @@ beforeEach(() => {
   healthMock.mockReset();
   listAgentsMock.mockReset();
   listProvidersMock.mockReset();
+  getWorkspaceMock.mockReset();
+  getWorkspaceMock.mockResolvedValue(unconfiguredWorkspace);
 });
 
 afterEach(() => {
@@ -570,5 +592,69 @@ describe('useDaemonBootstrap', () => {
     });
 
     expect(result.current.agents).toEqual([first, last]);
+  });
+
+  it('exposes the daemon workspace state alongside agents and providers', async () => {
+    const known = snapshot('known', 10);
+    resolveBootstrap([known]);
+    getWorkspaceMock.mockResolvedValue(configuredWorkspace);
+
+    const { result } = renderHook(() => useDaemonBootstrap());
+
+    await waitFor(() => {
+      expect(result.current.loaded).toBe(true);
+      expect(result.current.workspace).toEqual(configuredWorkspace);
+    });
+    expect(result.current.connection).toBe('online');
+    expect(result.current.agents).toEqual([known]);
+  });
+
+  it('tolerates a workspace request rejection without failing the bootstrap', async () => {
+    const known = snapshot('known', 10);
+    resolveBootstrap([known]);
+    getWorkspaceMock.mockRejectedValue(new Error('workspace unavailable'));
+
+    const { result } = renderHook(() => useDaemonBootstrap());
+
+    await waitFor(() => {
+      expect(result.current.loaded).toBe(true);
+      expect(result.current.connection).toBe('online');
+    });
+    expect(result.current.workspace).toBeNull();
+    expect(result.current.agents).toEqual([known]);
+    expect(result.current.providers).toEqual([provider]);
+  });
+
+  it('refreshWorkspace re-reads the workspace state after onboarding', async () => {
+    resolveBootstrap([]);
+
+    const { result } = renderHook(() => useDaemonBootstrap());
+    await waitFor(() => expect(result.current.loaded).toBe(true));
+    expect(result.current.workspace).toEqual(unconfiguredWorkspace);
+
+    getWorkspaceMock.mockResolvedValue(configuredWorkspace);
+    await act(async () => {
+      await result.current.refreshWorkspace();
+    });
+
+    expect(result.current.workspace).toEqual(configuredWorkspace);
+  });
+
+  it('keeps the workspace state null when a refreshWorkspace call fails', async () => {
+    resolveBootstrap([]);
+    getWorkspaceMock.mockResolvedValue(configuredWorkspace);
+
+    const { result } = renderHook(() => useDaemonBootstrap());
+    await waitFor(() =>
+      expect(result.current.workspace).toEqual(configuredWorkspace),
+    );
+
+    getWorkspaceMock.mockRejectedValue(new Error('workspace gone'));
+    await act(async () => {
+      await result.current.refreshWorkspace();
+    });
+
+    expect(result.current.workspace).toBeNull();
+    expect(result.current.connection).toBe('online');
   });
 });

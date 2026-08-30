@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 
 import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
+import type { DaemonWorkspaceState } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { AgentPresence } from './AgentPresence';
 import { AgentsView } from './AgentsView';
@@ -105,6 +106,7 @@ export function WorkspaceShell({
   workspace,
   activity,
   telegram = null,
+  workspaceState = null,
   onOpenSettings,
 }: {
   mainAgent: AgentDetail;
@@ -113,11 +115,16 @@ export function WorkspaceShell({
   workspace: ReactNode;
   activity: ReactNode;
   telegram?: ReactNode | null;
+  workspaceState?: DaemonWorkspaceState | null;
   onOpenSettings: () => void;
 }) {
   const [destination, setDestination] =
     useState<WorkspaceDestination>('workspace');
   const desktopNavigation = useDesktopNavigation();
+  const companyName =
+    workspaceState?.configured && workspaceState.workspace !== null
+      ? workspaceState.workspace.companyName
+      : null;
 
   useEffect(() => {
     if (destination === 'telegram' && telegram === null) {
@@ -130,6 +137,7 @@ export function WorkspaceShell({
       <AgentPresence
         agent={mainAgent}
         connection={connection}
+        companyName={companyName}
         onOpenSettings={onOpenSettings}
       />
 

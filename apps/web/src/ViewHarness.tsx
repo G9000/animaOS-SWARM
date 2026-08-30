@@ -102,8 +102,10 @@ export function ViewHarness() {
     agents: agentSnapshots,
     providers,
     providersError,
+    workspace,
     refreshAgents,
     retryProviders,
+    refreshWorkspace,
     acceptAgentSnapshot,
     removeAgentSnapshot,
   } = useDaemonBootstrap();
@@ -444,6 +446,7 @@ export function ViewHarness() {
           agentOperationGenerationRef.current += 1;
           agentLifecycleGenerationRef.current += 1;
           acceptAgentSnapshot(snapshot);
+          void refreshWorkspace();
           scrollDown();
         }}
       />
@@ -454,6 +457,7 @@ export function ViewHarness() {
     <SettingsPanel
       agent={agent}
       providers={providers}
+      workspace={workspace}
       saving={savingSettings}
       resetting={resetting}
       saveError={settingsSaveError}
@@ -491,6 +495,7 @@ export function ViewHarness() {
           agents={agents}
           connection={connection}
           onOpenSettings={openSettings}
+          workspaceState={workspace}
           workspace={
             <section
               className="flex h-full min-h-0 flex-col"

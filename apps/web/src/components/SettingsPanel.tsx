@@ -10,6 +10,7 @@ import {
   MODEL_SUGGESTIONS,
   type AgentUpdateInput,
   type DaemonProvider,
+  type DaemonWorkspaceState,
 } from '../lib/daemon-api';
 import { AlertIcon, TrashIcon, XIcon } from './icons';
 import {
@@ -66,6 +67,7 @@ const ACCESS_ORDER: readonly AccessProfile[] = [
 export function SettingsPanel({
   agent,
   providers,
+  workspace = null,
   saving,
   resetting,
   saveError,
@@ -77,6 +79,7 @@ export function SettingsPanel({
 }: {
   agent: AgentDetail;
   providers: DaemonProvider[] | null;
+  workspace?: DaemonWorkspaceState | null;
   saving: boolean;
   resetting: boolean;
   saveError: string | null;
@@ -304,6 +307,24 @@ export function SettingsPanel({
               value={formatTokens(agent.token_usage.total_tokens)}
             />
           </section>
+
+          {/* Workspace identity (read-only — editing is a follow-up) */}
+          {workspace?.configured && workspace.workspace !== null ? (
+            <section className="space-y-2.5">
+              <SectionTitle>Workspace</SectionTitle>
+              <InfoRow
+                label="Company"
+                value={workspace.workspace.companyName}
+                mono={false}
+              />
+              <InfoRow
+                label="Mission"
+                value={workspace.workspace.mission}
+                mono={false}
+              />
+              <InfoRow label="Folder" value={workspace.workspace.rootPath} />
+            </section>
+          ) : null}
 
           {/* Editable identity */}
           <section className="space-y-2.5">

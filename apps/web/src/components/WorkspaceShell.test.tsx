@@ -239,4 +239,84 @@ describe('WorkspaceShell', () => {
         ) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
   });
+
+  it('shows the configured workspace company name next to the shell brand', () => {
+    const nova = agent('agent-main', 'Nova', 1);
+
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspaceState={{
+          configured: true,
+          workspace: {
+            rootPath: '/workspaces/northwind',
+            companyName: 'Northwind Research',
+            mission: 'Map supply chains',
+            values: ['rigor'],
+          },
+          defaultRoot: '/workspaces',
+        }}
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    const header = screen.getByRole('banner');
+    expect(within(header).getByText('Welcome back')).toBeVisible();
+    expect(within(header).getByText('Northwind Research')).toBeVisible();
+  });
+
+  it('renders the header exactly as today when no workspace is configured', () => {
+    const nova = agent('agent-main', 'Nova', 1);
+
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspaceState={null}
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    const header = screen.getByRole('banner');
+    expect(within(header).getByText('Welcome back')).toBeVisible();
+    expect(
+      within(header).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
+    expect(
+      within(header).queryByText('Northwind Research'),
+    ).not.toBeInTheDocument();
+  });
+
+  it('hides the company name when the workspace state is not configured', () => {
+    const nova = agent('agent-main', 'Nova', 1);
+
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspaceState={{
+          configured: false,
+          workspace: null,
+          defaultRoot: '/workspaces',
+        }}
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    const header = screen.getByRole('banner');
+    expect(within(header).getByText('Welcome back')).toBeVisible();
+    expect(
+      within(header).queryByText('Northwind Research'),
+    ).not.toBeInTheDocument();
+  });
 });

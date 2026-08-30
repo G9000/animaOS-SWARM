@@ -40,10 +40,12 @@ function StatusLabel({
 export function AgentPresence({
   agent,
   connection,
+  companyName = null,
   onOpenSettings,
 }: {
   agent: AgentDetail;
   connection: Exclude<DaemonConnection, 'unknown'>;
+  companyName?: string | null;
   onOpenSettings: () => void;
 }) {
   const accessProfile = deriveAccessProfile(agent.toolNames);
@@ -63,9 +65,19 @@ export function AgentPresence({
           <span className="agent-orb-core relative h-3 w-3 rounded-full" />
         </div>
         <div className="min-w-0">
-          <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
-            Welcome back
-          </p>
+          <div className="flex min-w-0 items-baseline gap-2">
+            <p className="shrink-0 font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
+              Welcome back
+            </p>
+            {companyName ? (
+              <p
+                className="truncate font-mono text-[10px] uppercase tracking-[0.16em] text-ink-2"
+                title={companyName}
+              >
+                {companyName}
+              </p>
+            ) : null}
+          </div>
           <div className="mt-0.5 flex min-w-0 items-baseline gap-2">
             <h1
               className="truncate font-display text-base font-semibold tracking-tight text-ink"
