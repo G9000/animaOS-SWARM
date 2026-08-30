@@ -37,4 +37,7 @@ pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,
     SwarmsEnvelope,
 };
-pub(crate) use workspace::{WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceResponse};
+pub(crate) use workspace::{
+    WorkspaceBootstrapRequest, WorkspaceBootstrapResponse, WorkspaceConfigRequest,
+    WorkspaceConfigResponse, WorkspaceResponse,
+};

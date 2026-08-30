@@ -34,7 +34,7 @@ struct PreparedAgencyRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgencyYamlConfig {
+pub(crate) struct AgencyYamlConfig {
     name: String,
     description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,9 +50,37 @@ struct AgencyYamlConfig {
     agents: Vec<AgencyYamlAgent>,
 }
 
+impl AgencyYamlConfig {
+    pub(crate) fn single_orchestrator(
+        name: String,
+        mission: String,
+        values: Vec<String>,
+        provider: String,
+        model: String,
+        orchestrator: AgencyYamlAgent,
+    ) -> Self {
+        Self {
+            name,
+            description: mission.clone(),
+            mission: Some(mission),
+            values: if values.is_empty() {
+                None
+            } else {
+                Some(values)
+            },
+            model,
+            provider,
+            strategy: "supervisor".to_string(),
+            max_parallel_delegations: None,
+            orchestrator,
+            agents: Vec::new(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AgencyYamlAgent {
+pub(crate) struct AgencyYamlAgent {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     position: Option<String>,
@@ -74,6 +102,34 @@ struct AgencyYamlAgent {
     tools: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     collaborates_with: Option<Vec<String>>,
+}
+
+impl AgencyYamlAgent {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn orchestrator(
+        name: String,
+        bio: String,
+        style: Option<String>,
+        system: String,
+        model: Option<String>,
+        tools: Option<Vec<String>>,
+        adjectives: Option<Vec<String>>,
+    ) -> Self {
+        Self {
+            name,
+            position: Some("orchestrator".to_string()),
+            bio,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives,
+            style,
+            system,
+            model,
+            tools,
+            collaborates_with: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]

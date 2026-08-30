@@ -36,3 +36,36 @@ pub(crate) struct WorkspaceConfigRequest {
     #[serde(default)]
     pub(crate) validate_only: bool,
 }
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BootstrapAgentRequest {
+    pub(crate) name: String,
+    pub(crate) preset_id: String,
+    #[serde(default)]
+    pub(crate) bio: Option<String>,
+    #[serde(default)]
+    pub(crate) adjectives: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) style: Option<String>,
+    pub(crate) system: String,
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+    pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceBootstrapRequest {
+    pub(crate) workspace: WorkspaceConfigRequest,
+    pub(crate) agent: BootstrapAgentRequest,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceBootstrapResponse {
+    pub(crate) workspace: WorkspaceConfigResponse,
+    pub(crate) agent: super::AgentRuntimeSnapshotResponse,
+}

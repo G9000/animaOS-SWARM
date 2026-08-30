@@ -1,6 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::contracts::{WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceResponse};
+use anima_core::{AgentConfig, ToolDescriptor};
+
+use super::agencies::{AgencyYamlAgent, AgencyYamlConfig};
+use super::contracts::{
+    AgentRuntimeSnapshotResponse, WorkspaceBootstrapRequest, WorkspaceBootstrapResponse,
+    WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceResponse,
+};
+use super::profile::profile_preset;
 use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::control_plane_store::WorkspaceConfig;
@@ -52,6 +60,153 @@ pub(crate) async fn handle_put_workspace(
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
 
     handle_get_workspace(state).await
+}
+
+pub(crate) async fn handle_bootstrap_workspace(
+    body: Vec<u8>,
+    state: &SharedDaemonState,
+) -> Result<WorkspaceBootstrapResponse, ApiError> {
+    let request: WorkspaceBootstrapRequest = super::parse_json_body(body)?;
+
+    // 1. Validate EVERYTHING before any side effect. Workspace validation runs
+    //    with validate_only forced off so the root directory is created and
+    //    canonicalized up front.
+    let mut workspace_request = request.workspace;
+    workspace_request.validate_only = false;
+    let workspace_config = validate_workspace_request(&workspace_request)?;
+
+    let agent = request.agent;
+    let name = agent.name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::bad_request_static("agent.name is required"));
+    }
+    if profile_preset(agent.preset_id.trim()).is_none() {
+        return Err(ApiError::bad_request(format!(
+            "unknown presetId: {}",
+            agent.preset_id.trim()
+        )));
+    }
+    let system = agent.system.trim().to_string();
+    if system.is_empty() {
+        return Err(ApiError::bad_request_static("agent.system is required"));
+    }
+    let model = agent.model.trim().to_string();
+    if model.is_empty() {
+        return Err(ApiError::bad_request_static("agent.model is required"));
+    }
+    let tool_names = agent
+        .tools
+        .iter()
+        .map(|tool| tool.trim().to_string())
+        .collect::<Vec<_>>();
+    if tool_names.is_empty() {
+        return Err(ApiError::bad_request_static(
+            "agent.tools must not be empty",
+        ));
+    }
+
+    // 2. Build the AgentConfig with name-only tool descriptors; create_agent
+    //    canonicalizes them against the registry before mutating state.
+    let non_blank = |value: Option<String>| {
+        value
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    let bio = non_blank(agent.bio);
+    let style = non_blank(agent.style);
+    let provider = non_blank(agent.provider);
+    let adjectives = agent
+        .adjectives
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty());
+
+    let tools = tool_names
+        .iter()
+        .map(|tool| ToolDescriptor {
+            name: tool.clone(),
+            description: String::new(),
+            parameters_schema: BTreeMap::new(),
+            examples: None,
+        })
+        .collect::<Vec<_>>();
+
+    let config = AgentConfig {
+        name: name.clone(),
+        model: model.clone(),
+        bio: bio.clone(),
+        lore: None,
+        knowledge: None,
+        topics: None,
+        adjectives: adjectives.clone(),
+        style: style.clone(),
+        provider: provider.clone(),
+        system: Some(system.clone()),
+        tools: Some(tools),
+        plugins: None,
+        settings: None,
+    };
+
+    // 3. One state write: create the agent (tool slugs are validated before
+    //    any mutation inside create_agent) and set the workspace config.
+    let (snapshot, persist_request) = {
+        let mut guard = state.write().await;
+        let snapshot = guard.create_agent(config).map_err(ApiError::bad_request)?;
+        guard.workspace = Some(workspace_config.clone());
+        (snapshot, guard.control_plane_persist_request())
+    };
+
+    // 4. Write agency.yaml at the workspace root AFTER the agent exists. On
+    //    IO failure roll back the state write so bootstrap stays atomic.
+    let agency_yaml = AgencyYamlConfig::single_orchestrator(
+        workspace_config.company_name.clone(),
+        workspace_config.mission.clone(),
+        workspace_config.values.clone(),
+        provider.unwrap_or_default(),
+        model.clone(),
+        AgencyYamlAgent::orchestrator(
+            name,
+            bio.unwrap_or_default(),
+            style,
+            system,
+            Some(model),
+            Some(tool_names),
+            adjectives,
+        ),
+    );
+    let yaml_path = workspace_config.root_path.join("agency.yaml");
+    let write_result = serde_yaml::to_string(&agency_yaml)
+        .map_err(|error| format!("failed to serialize agency yaml: {error}"))
+        .and_then(|yaml| {
+            std::fs::write(&yaml_path, yaml)
+                .map_err(|error| format!("failed to write agency.yaml: {error}"))
+        });
+    if let Err(message) = write_result {
+        let rollback_request = {
+            let mut guard = state.write().await;
+            guard.remove_agent(&snapshot.state.id);
+            guard.workspace = None;
+            guard.control_plane_persist_request()
+        };
+        rollback_request.save().await.ok();
+        return Err(ApiError::service_unavailable(message));
+    }
+
+    // 5. Persist the control-plane snapshot last.
+    persist_request
+        .save()
+        .await
+        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+
+    Ok(WorkspaceBootstrapResponse {
+        workspace: config_response(&workspace_config),
+        agent: AgentRuntimeSnapshotResponse::from(&snapshot),
+    })
 }
 
 pub(super) fn validate_workspace_request(
