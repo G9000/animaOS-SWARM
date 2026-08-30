@@ -91,6 +91,7 @@ describe('MessageList', () => {
     );
 
     for (const message of screen.getAllByTestId('markdown-message')) {
+      expect(message.parentElement).toHaveClass('min-w-0', 'max-w-full');
       expect(message.parentElement?.parentElement).toHaveClass(
         'max-w-[85%]',
         'min-w-0',

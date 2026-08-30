@@ -32,7 +32,7 @@ function Bubble({ message }: { message: ChatMessage }) {
         className={`flex min-w-0 max-w-[85%] flex-col ${isUser ? 'items-end' : 'items-start'}`}
       >
         <div
-          className={`break-words px-4 py-2.5 text-sm leading-relaxed ${
+          className={`min-w-0 max-w-full break-words px-4 py-2.5 text-sm leading-relaxed ${
             isUser
               ? 'rounded-2xl rounded-br-md border border-line-strong bg-panel-2/90 text-ink shadow-lg shadow-black/25'
               : 'glass rounded-2xl rounded-bl-md text-ink'
