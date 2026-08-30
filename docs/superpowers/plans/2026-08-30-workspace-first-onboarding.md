@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rebuild Guided Focus onboarding as a 5-step workspace-first flow (Workspace → Intelligence → Agent → Access → Review) backed by new daemon workspace endpoints and an atomic bootstrap that creates workspace config + `agency.yaml` + orchestrator runtime agent.
+**Goal:** Rebuild Guided Focus onboarding as a 5-step workspace-first flow (Workspace → Intelligence → Agent → Access → Review) backed by new daemon workspace endpoints and an atomic bootstrap that creates workspace config + `anima.yaml` + orchestrator runtime agent.
 
 **Architecture:** The daemon gains a persisted `WorkspaceConfig` in the control-plane snapshot (store v3 → v4) and owns workspace-root truth; `ANIMAOS_WORKSPACE_ROOT` becomes the initial default. New endpoints: `GET/PUT /api/workspace`, `POST /api/agents/generate-profile`, `POST /api/workspace/bootstrap`. The web app drives them from new `WorkspaceStep` / `AgentStep` components; profile generation drafts `bio`/`adjectives`/`style`/`system` from a preset + plain-language intent, with preset templates as the offline fallback.
 
@@ -957,8 +957,8 @@ async fn bootstrap_creates_workspace_agency_file_and_agent() {
     assert_eq!(body["agent"]["state"]["config"]["bio"], "A vigilant chief of staff.");
     assert_eq!(body["agent"]["state"]["config"]["adjectives"], serde_json::json!(["vigilant", "concise", "proactive"]));
 
-    // agency.yaml exists at the root and describes a single orchestrator.
-    let yaml_path = root.join("agency.yaml");
+    // anima.yaml exists at the root and describes a single orchestrator.
+    let yaml_path = root.join("anima.yaml");
     assert!(yaml_path.is_file());
     let yaml: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&yaml_path).unwrap()).unwrap();
     assert_eq!(yaml["name"], "Northwind Research");
@@ -985,7 +985,7 @@ async fn bootstrap_rejects_unknown_tools_without_side_effects() {
     body["agent"]["tools"] = serde_json::json!(["definitely_not_a_tool"]);
     let (status, _) = send_json_request(&app, "POST", "/api/workspace/bootstrap", Some(body)).await;
     assert_eq!(status, 400);
-    assert!(!root.join("agency.yaml").exists(), "failed bootstrap must not write agency.yaml");
+    assert!(!root.join("anima.yaml").exists(), "failed bootstrap must not write anima.yaml");
     let (_, workspace) = send_json_request(&app, "GET", "/api/workspace", None).await;
     assert_eq!(workspace["configured"], false);
     let (_, agents) = send_json_request(&app, "GET", "/api/agents", None).await;
@@ -1186,7 +1186,7 @@ pub(crate) async fn handle_bootstrap_workspace(
         (snapshot, guard.control_plane_persist_request())
     };
 
-    // 4. Write agency.yaml only after the agent exists; on IO failure, roll
+    // 4. Write anima.yaml only after the agent exists; on IO failure, roll
     //    back the in-memory agent + workspace before returning the error.
     let agency = AgencyYamlConfig::single_orchestrator(
         workspace_config.company_name.clone(),
@@ -1204,9 +1204,9 @@ pub(crate) async fn handle_bootstrap_workspace(
             request.agent.adjectives.clone(),
         ),
     );
-    let yaml_path = workspace_config.root_path.join("agency.yaml");
+    let yaml_path = workspace_config.root_path.join("anima.yaml");
     let yaml_body = serde_yaml::to_string(&agency)
-        .map_err(|error| ApiError::bad_request(format!("agency.yaml could not be serialized: {error}")))?;
+        .map_err(|error| ApiError::bad_request(format!("anima.yaml could not be serialized: {error}")))?;
     if let Err(error) = std::fs::write(&yaml_path, yaml_body) {
         let rollback_persist = {
             let mut guard = state.write().await;
@@ -1216,7 +1216,7 @@ pub(crate) async fn handle_bootstrap_workspace(
         };
         rollback_persist.save().await.ok();
         return Err(ApiError::service_unavailable(format!(
-            "agency.yaml could not be written: {error}"
+            "anima.yaml could not be written: {error}"
         )));
     }
 
@@ -2311,7 +2311,7 @@ Add a bio preview line under the agent name, and an atomicity note:
 
 ```tsx
 <p className="text-xs leading-relaxed text-ink-3">
-  Creates the workspace, the company file (agency.yaml), and your agent in one step — if anything fails, nothing is half-created.
+  Creates the workspace, the company file (anima.yaml), and your agent in one step — if anything fails, nothing is half-created.
 </p>
 ```
 
@@ -2391,7 +2391,7 @@ Expected: PASS (build performs the Vite production build and type checking).
 - [ ] **Step 3: Manual browser pass**
 
 Run `bun dev --host rust`, then with a fresh daemon data directory:
-1. Onboarding opens on the Workspace step; complete all five steps against the deterministic provider (template fallback path) → agent created, `agency.yaml` exists at the chosen root, shell header shows the company name.
+1. Onboarding opens on the Workspace step; complete all five steps against the deterministic provider (template fallback path) → agent created, `anima.yaml` exists at the chosen root, shell header shows the company name.
 2. Repeat against a configured provider and use ✨ Generate (generation path); edit the generated instructions before creating.
 3. Kill the daemon mid-flow; confirm the offline state never shows onboarding losing the draft; restart and confirm the created agent + workspace survive.
 4. Small-screen width: stepper labels truncate, Verify/Generate buttons stay reachable.
@@ -2408,7 +2408,7 @@ git commit -m "chore: final verification for workspace-first onboarding" --allow
 
 ## Out of Scope (documented follow-ups)
 
-- Hire-a-worker flow that appends to `agency.yaml` and creates additional runtime agents.
+- Hire-a-worker flow that appends to `anima.yaml` and creates additional runtime agents.
 - Editing workspace config after onboarding (Settings section is read-only for now).
 - `generate-profile` model selection independent of the agent's model.
 - Migrating pre-existing daemon agents into agencies.

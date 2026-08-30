@@ -8,17 +8,17 @@
 
 ## Summary
 
-Rework the Guided Focus onboarding from "create your main agent" into "set up your workspace": the user founds a company (name, mission, values, folder on disk), picks a model, then designs their main agent by choosing a personality preset and describing what they want in plain words — the daemon's model drafts the proper bio, traits, and instructions, which stay fully editable. Submission creates the workspace config, an `agency.yaml` (single-orchestrator agency), and the orchestrator as a runtime agent in one atomic daemon transaction.
+Rework the Guided Focus onboarding from "create your main agent" into "set up your workspace": the user founds a company (name, mission, values, folder on disk), picks a model, then designs their main agent by choosing a personality preset and describing what they want in plain words — the daemon's model drafts the proper bio, traits, and instructions, which stay fully editable. Submission creates the workspace config, an `anima.yaml` (single-orchestrator agency), and the orchestrator as a runtime agent in one atomic daemon transaction.
 
 The workspace becomes a first-class daemon concept: a persisted `WorkspaceConfig` owns the root path and company identity, and `ANIMAOS_WORKSPACE_ROOT` becomes only the initial default. The agency file format becomes the durable home for team identity so that hiring worker agents later is a natural extension of the same structure.
 
 ## Goals
 
 - Onboarding defines the workspace before the agent: company name, mission, values, and the folder the daemon uses as workspace root.
-- The main agent is the orchestrator of a real single-member agency, persisted as `agency.yaml` in the workspace root.
+- The main agent is the orchestrator of a real single-member agency, persisted as `anima.yaml` in the workspace root.
 - Users never have to write a system prompt from scratch: personality presets plus a plain-language intent field feed a daemon-side profile generator; output is editable.
 - Personality fields (`bio`, `adjectives`, `style`) flow end to end into `anima-core`'s existing `AgentConfig` — no core schema changes.
-- One atomic bootstrap: any failure leaves no partial workspace config, no `agency.yaml`, and no agent.
+- One atomic bootstrap: any failure leaves no partial workspace config, no `anima.yaml`, and no agent.
 - Existing chat, settings, check-ins, provider configuration, and the oldest-agent main rule keep working.
 
 ## Non-goals
@@ -37,10 +37,10 @@ The flow replaces the application shell while no agent exists, as today. The ste
 ### Step 1: Workspace (new)
 
 - **Company name** (required). This becomes the agency name.
-- **Mission** (required, one sentence). Stored in workspace config and `agency.yaml`; injected into the profile-generation prompt.
+- **Mission** (required, one sentence). Stored in workspace config and `anima.yaml`; injected into the profile-generation prompt.
 - **Office location** (required): absolute folder path on the daemon host. A Verify action (via `PUT /api/workspace` in validate-only mode) canonicalizes the path, confirms it exists or can be created, and reports which. On submit the folder is created if missing.
 - **No partial persistence:** onboarding never calls the persisting form of `PUT /api/workspace`. Workspace config is only persisted inside the bootstrap transaction, so abandoning the flow midway leaves no daemon-side state.
-- **Values** (optional, 3–5 short chips). Stored in workspace config and `agency.yaml`; injected into the profile-generation prompt.
+- **Values** (optional, 3–5 short chips). Stored in workspace config and `anima.yaml`; injected into the profile-generation prompt.
 
 ### Step 2: Intelligence (existing `ModelStep`, moved earlier)
 
@@ -85,10 +85,10 @@ The draft is held in onboarding component state for the page session. Successful
 - `POST /api/workspace/bootstrap` — body `{ workspace: {...}, agent: { name, presetId, bio, adjectives, style, system, provider, model, tools } }`. One control-plane transaction:
   1. Validate workspace fields and agent fields (name non-empty, model non-empty, known tool slugs resolved to canonical registry descriptors as in the existing create path).
   2. Validate/canonicalize/create the root folder.
-  3. Write `agency.yaml` at the root: single-orchestrator agency with company name, mission, values, strategy `supervisor`, and the orchestrator definition (name, bio, adjectives, style, system, model, tools).
+  3. Write `anima.yaml` at the root: single-orchestrator agency with company name, mission, values, strategy `supervisor`, and the orchestrator definition (name, bio, adjectives, style, system, model, tools).
   4. Create the runtime agent with the full personality fields on `AgentConfig` (`bio`, `adjectives`, `style`, `system`) plus the resolved canonical tool descriptors.
   5. Persist workspace config + agent in the control-plane snapshot.
-  Any step failing rolls back all durable state: no `agency.yaml`, no agent, no workspace config. The only permitted side effect of a failed bootstrap is the empty root folder itself if validation created it. Returns `{ workspace, agent }` (the created snapshot) on success.
+  Any step failing rolls back all durable state: no `anima.yaml`, no agent, no workspace config. The only permitted side effect of a failed bootstrap is the empty root folder itself if validation created it. Returns `{ workspace, agent }` (the created snapshot) on success.
 - Existing `POST /api/agents` and PATCH paths are untouched; bootstrap composes their validation and tool-resolution internals.
 
 ### Personality on runtime agents
@@ -121,7 +121,7 @@ The draft is held in onboarding component state for the page session. Successful
 - Root resolution precedence: configured root > env var > current directory; tool escape checks still bind to the configured root.
 - `PUT /api/workspace`: validates relative paths (reject), uncreatable paths (reject), creates missing folders, `validateOnly` does not persist.
 - `generate-profile`: unknown preset rejected; deterministic provider returns the stable fallback error; a scripted adapter returns structured fields.
-- `bootstrap`: success writes `agency.yaml` (parse and assert orchestrator fields), creates the agent with canonical tool descriptors, and persists workspace config; forced failure at agent creation leaves no `agency.yaml`, no config, and no agent; unknown tool slugs rejected before any side effect.
+- `bootstrap`: success writes `anima.yaml` (parse and assert orchestrator fields), creates the agent with canonical tool descriptors, and persists workspace config; forced failure at agent creation leaves no `anima.yaml`, no config, and no agent; unknown tool slugs rejected before any side effect.
 - Existing agency, agent, and tool tests remain green.
 
 ### Web tests
@@ -142,10 +142,19 @@ The draft is held in onboarding component state for the page session. Successful
 ## Acceptance Criteria
 
 - With a fresh daemon and zero agents, onboarding opens with the Workspace step first.
-- The user can complete Workspace → Intelligence → Agent → Access → Review and create exactly one orchestrator agent plus a workspace config and `agency.yaml` in one atomic request.
-- A failed bootstrap leaves no workspace config, no `agency.yaml`, and no agent.
+- The user can complete Workspace → Intelligence → Agent → Access → Review and create exactly one orchestrator agent plus a workspace config and `anima.yaml` in one atomic request.
+- A failed bootstrap leaves no workspace config, no `anima.yaml`, and no agent.
 - The generated profile reflects the workspace mission and values; all generated fields are editable before creation.
 - With only the deterministic provider, onboarding completes via preset templates without generation.
 - The created agent's `AgentConfig` carries `bio`, `adjectives`, `style`, and `system`; its tools are the exact profile list with canonical descriptors.
 - Workspace tools operate under the configured root after bootstrap; `ANIMAOS_WORKSPACE_ROOT` still works as the pre-config default.
 - Existing agents, chat, check-ins, and settings continue to work; the oldest agent remains main.
+
+## Implementation Amendments (2026-08-31, code review outcomes)
+
+Applied during Task 6 implementation review; the doc body above was updated to match:
+
+- **File name:** bootstrap writes `anima.yaml` (not `agency.yaml`) — the CLI loader (`packages/cli/src/agency/loader.ts`), the daemon's own `/api/agencies/create`, the TUI, and docs all standardize on `anima.yaml`.
+- **Bio required:** bootstrap rejects a blank/omitted agent `bio` with 400 because the CLI loader requires a truthy `orchestrator.bio`; empty `provider` is omitted from the yaml rather than serialized as `""`.
+- **Double-bootstrap guard:** bootstrap returns 409 when the daemon already has workspace config or an `anima.yaml` file exists at the target root.
+- **Atomic file write:** `anima.yaml` is written via tmp file + rename, and the persist-save failure path performs the same full rollback as the yaml-write failure path (agent removed, workspace config cleared, file removed, best-effort rollback persist).
