@@ -75,12 +75,34 @@ describe('MarkdownMessage', () => {
       </MarkdownMessage>,
     );
 
-    expect(screen.getByRole('table').parentElement).toHaveAttribute(
-      'data-markdown-overflow',
-      'table',
-    );
+    const tableWrapper = screen.getByRole('table').parentElement;
+    expect(tableWrapper).toHaveAttribute('data-markdown-overflow', 'table');
+    expect(tableWrapper).toHaveClass('max-w-full', 'overflow-x-auto');
     expect(screen.getByText('a-very-long-inline-code-value')).toHaveClass(
       'break-all',
+    );
+  });
+
+  it('preserves ordered-list starts, link titles, and table alignment', () => {
+    render(
+      <MarkdownMessage>
+        {
+          '3. third\n4. fourth\n\n[reference](https://example.com "Reference title")\n\n| Left | Center | Right |\n| :--- | :----: | ----: |\n| a | b | c |'
+        }
+      </MarkdownMessage>,
+    );
+
+    expect(screen.getByRole('list')).toHaveAttribute('start', '3');
+    expect(screen.getByRole('link', { name: 'reference' })).toHaveAttribute(
+      'title',
+      'Reference title',
+    );
+    expect(
+      screen.getByRole('columnheader', { name: 'Center' }),
+    ).toHaveAttribute('align', 'center');
+    expect(screen.getByRole('cell', { name: 'c' })).toHaveAttribute(
+      'align',
+      'right',
     );
   });
 
@@ -121,14 +143,15 @@ describe('MarkdownMessage', () => {
 
     expect(writeText).toHaveBeenCalledWith('const answer = 42;\n');
     expect(await screen.findByRole('button', { name: 'Copied' })).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent('Copied');
     expect(
       screen.getByTestId('markdown-message').querySelectorAll('pre'),
     ).toHaveLength(1);
-    expect(
-      screen
-        .getByTestId('markdown-message')
-        .querySelector('[data-markdown-overflow="code"]'),
-    ).toBeVisible();
+    const codeWrapper = screen
+      .getByTestId('markdown-message')
+      .querySelector('[data-markdown-overflow="code"]');
+    expect(codeWrapper).toBeVisible();
+    expect(codeWrapper).toHaveClass('max-w-full', 'overflow-x-auto');
   });
 
   it('applies Prism token classes for supported fenced TypeScript', () => {
@@ -212,6 +235,38 @@ describe('MarkdownMessage', () => {
       await Promise.resolve();
     });
 
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('invalidates a pending copy when fenced source changes', async () => {
+    vi.useFakeTimers();
+    let resolveWrite: (() => void) | undefined;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: vi.fn(
+          () =>
+            new Promise<void>((resolve) => {
+              resolveWrite = resolve;
+            }),
+        ),
+      },
+    });
+    const { rerender } = render(
+      <MarkdownMessage>{'```text\nold source\n```'}</MarkdownMessage>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    rerender(
+      <MarkdownMessage>{'```typescript\nnew source\n```'}</MarkdownMessage>,
+    );
+    resolveWrite?.();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('typescript')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeVisible();
     expect(vi.getTimerCount()).toBe(0);
   });
 

@@ -1,4 +1,11 @@
-import { Component, type ReactNode, useEffect, useRef, useState } from 'react';
+import {
+  Component,
+  type ReactNode,
+  type TdHTMLAttributes,
+  useEffect,
+  useRef,
+  useState,
+} from 'react';
 import { Highlight, Prism, themes } from 'prism-react-renderer';
 import ReactMarkdown, {
   defaultUrlTransform,
@@ -16,8 +23,22 @@ function sourceText(children: ReactNode): string {
     : String(children);
 }
 
+function tableAlignment(
+  value: unknown,
+): TdHTMLAttributes<HTMLTableCellElement>['align'] {
+  return value === 'left' ||
+    value === 'center' ||
+    value === 'right' ||
+    value === 'justify' ||
+    value === 'char'
+    ? value
+    : undefined;
+}
+
 function PlainCode({ source }: { source: string }) {
-  return <code className="block font-mono text-xs leading-5">{source}</code>;
+  return (
+    <code className="block font-mono text-xs leading-5 text-ink">{source}</code>
+  );
 }
 
 class HighlightFallback extends Component<
@@ -66,6 +87,12 @@ function CodeBlock({
     };
   }, []);
 
+  useEffect(() => {
+    copyOperation.current += 1;
+    clearTimeout(resetTimer.current);
+    setCopyState('idle');
+  }, [language, source]);
+
   const copy = async () => {
     const operation = ++copyOperation.current;
     let nextState: 'copied' | 'failed';
@@ -102,11 +129,11 @@ function CodeBlock({
   );
 
   return (
-    <section className="mt-2 overflow-hidden rounded-md border border-slate-700 bg-slate-950 text-slate-100">
-      <header className="flex items-center justify-between gap-3 border-b border-slate-800 px-3 py-2">
-        <span className="font-mono text-[11px] text-slate-400">{language}</span>
+    <div className="mt-2 overflow-hidden rounded-md border border-line bg-panel-2 text-ink">
+      <div className="flex items-center justify-between gap-3 border-b border-line px-3 py-2">
+        <span className="font-mono text-[11px] text-ink-3">{language}</span>
         <button
-          className="rounded px-2 py-1 text-xs text-slate-300 hover:bg-slate-800 hover:text-white"
+          className="rounded px-2 py-1 text-xs text-ink-2 hover:bg-panel hover:text-ink"
           onClick={copy}
           type="button"
         >
@@ -116,10 +143,22 @@ function CodeBlock({
               ? 'Copy failed'
               : 'Copy'}
         </button>
-      </header>
+        <span
+          aria-atomic="true"
+          aria-live="polite"
+          className="sr-only"
+          role="status"
+        >
+          {copyState === 'idle'
+            ? ''
+            : copyState === 'copied'
+              ? 'Copied'
+              : 'Copy failed'}
+        </span>
+      </div>
       <pre>
         <span
-          className="block overflow-x-auto p-3"
+          className="block max-w-full overflow-x-auto p-3"
           data-markdown-overflow="code"
         >
           <HighlightFallback key={`${language}:${source}`} source={source}>
@@ -127,21 +166,21 @@ function CodeBlock({
           </HighlightFallback>
         </span>
       </pre>
-    </section>
+    </div>
   );
 }
 
 const components: Components = {
   h1: ({ children }) => (
-    <h1 className="mt-3 text-base font-semibold text-slate-100 first:mt-0">
+    <h1 className="mt-3 text-base font-semibold text-ink first:mt-0">
       {children}
     </h1>
   ),
   h2: ({ children }) => (
-    <h2 className="mt-3 text-sm font-semibold text-slate-100">{children}</h2>
+    <h2 className="mt-3 text-sm font-semibold text-ink">{children}</h2>
   ),
   h3: ({ children }) => (
-    <h3 className="mt-3 text-sm font-medium text-slate-100">{children}</h3>
+    <h3 className="mt-3 text-sm font-medium text-ink">{children}</h3>
   ),
   p: ({ children }) => <p className="mt-2 first:mt-0">{children}</p>,
   ul: ({ children, className, node: _node, ...props }) => {
@@ -155,8 +194,13 @@ const components: Components = {
       </ul>
     );
   },
-  ol: ({ children }) => (
-    <ol className="mt-2 list-decimal space-y-1 pl-5">{children}</ol>
+  ol: ({ children, className, node: _node, ...props }) => (
+    <ol
+      {...props}
+      className={`mt-2 list-decimal space-y-1 pl-5 ${className ?? ''}`}
+    >
+      {children}
+    </ol>
   ),
   li: ({ children, className, node: _node, ...props }) => (
     <li {...props} className={`pl-1 ${className ?? ''}`}>
@@ -164,13 +208,14 @@ const components: Components = {
     </li>
   ),
   blockquote: ({ children }) => (
-    <blockquote className="mt-2 border-l-2 border-slate-500 pl-3 text-slate-300">
+    <blockquote className="mt-2 border-l-2 border-line-strong pl-3 text-ink-2">
       {children}
     </blockquote>
   ),
-  a: ({ children, href }) => (
+  a: ({ children, href, className, node: _node, ...props }) => (
     <a
-      className="break-words text-sky-300 underline underline-offset-2"
+      {...props}
+      className={`break-words text-accent underline underline-offset-2 ${className ?? ''}`}
       href={href}
       {...(isAbsoluteWebUrl(href)
         ? { target: '_blank', rel: 'noopener noreferrer' }
@@ -181,7 +226,7 @@ const components: Components = {
   ),
   table: ({ children }) => (
     <div
-      className="mt-2 max-w-full overflow-x-auto rounded-md border border-slate-700"
+      className="mt-2 max-w-full overflow-x-auto rounded-md border border-line"
       data-markdown-overflow="table"
     >
       <table className="w-full min-w-max border-collapse text-left text-xs">
@@ -189,24 +234,40 @@ const components: Components = {
       </table>
     </div>
   ),
-  thead: ({ children }) => (
-    <thead className="bg-slate-800/70">{children}</thead>
-  ),
-  th: ({ children }) => (
-    <th className="border-b border-slate-700 px-3 py-2 font-semibold">
+  thead: ({ children, className, node: _node, ...props }) => (
+    <thead {...props} className={`bg-panel-2 ${className ?? ''}`}>
       {children}
-    </th>
+    </thead>
   ),
-  td: ({ children }) => (
-    <td className="border-b border-slate-800 px-3 py-2 align-top">
-      {children}
-    </td>
-  ),
-  hr: () => <hr className="my-3 border-slate-700" />,
+  th: ({ children, className, node, ...props }) => {
+    const align = tableAlignment(node?.properties.align);
+    return (
+      <th
+        {...props}
+        align={align}
+        className={`border-b border-line px-3 py-2 font-semibold ${className ?? ''}`}
+      >
+        {children}
+      </th>
+    );
+  },
+  td: ({ children, className, node, ...props }) => {
+    const align = tableAlignment(node?.properties.align);
+    return (
+      <td
+        {...props}
+        align={align}
+        className={`border-b border-line px-3 py-2 align-top ${className ?? ''}`}
+      >
+        {children}
+      </td>
+    );
+  },
+  hr: () => <hr className="my-3 border-line" />,
   strong: ({ children }) => (
-    <strong className="font-semibold text-slate-100">{children}</strong>
+    <strong className="font-semibold text-ink">{children}</strong>
   ),
-  del: ({ children }) => <del className="text-slate-400">{children}</del>,
+  del: ({ children }) => <del className="text-ink-3">{children}</del>,
   pre: ({ children }) => <>{children}</>,
   code: ({ children, className }) => {
     const source = sourceText(children);
@@ -214,7 +275,7 @@ const components: Components = {
     return fenced ? (
       <CodeBlock className={className} children={children} />
     ) : (
-      <code className="break-all rounded bg-slate-800 px-1 py-0.5 font-mono text-[0.9em]">
+      <code className="break-all rounded bg-panel-2 px-1 py-0.5 font-mono text-[0.9em]">
         {children}
       </code>
     );
@@ -224,7 +285,7 @@ const components: Components = {
 export function MarkdownMessage({ children }: { children: string }) {
   return (
     <div
-      className="min-w-0 break-words text-sm leading-6 text-slate-200"
+      className="min-w-0 break-words text-sm leading-6 text-ink"
       data-testid="markdown-message"
     >
       <ReactMarkdown
