@@ -68,6 +68,15 @@ pub(crate) async fn handle_bootstrap_workspace(
 ) -> Result<WorkspaceBootstrapResponse, ApiError> {
     let request: WorkspaceBootstrapRequest = super::parse_json_body(body)?;
 
+    // Refuse to bootstrap twice: a configured workspace means this daemon was
+    // already bootstrapped.
+    {
+        let guard = state.read().await;
+        if guard.workspace.is_some() {
+            return Err(ApiError::conflict("workspace is already bootstrapped"));
+        }
+    }
+
     // 1. Validate EVERYTHING before any side effect. Workspace validation runs
     //    with validate_only forced off so the root directory is created and
     //    canonicalized up front.
@@ -75,11 +84,24 @@ pub(crate) async fn handle_bootstrap_workspace(
     workspace_request.validate_only = false;
     let workspace_config = validate_workspace_request(&workspace_request)?;
 
+    // A leftover agency file at the target root also means the workspace was
+    // bootstrapped before (possibly by an earlier daemon run).
+    let yaml_path = workspace_config.root_path.join("anima.yaml");
+    if yaml_path.is_file() {
+        return Err(ApiError::conflict(format!(
+            "anima.yaml already exists at {}",
+            yaml_path.display()
+        )));
+    }
+
     let agent = request.agent;
     let name = agent.name.trim().to_string();
     if name.is_empty() {
         return Err(ApiError::bad_request_static("agent.name is required"));
     }
+    // The preset shaped the already-generated profile fields (bio, system,
+    // style, adjectives) submitted with this request, so only its validity
+    // is checked here.
     if profile_preset(agent.preset_id.trim()).is_none() {
         return Err(ApiError::bad_request(format!(
             "unknown presetId: {}",
@@ -112,7 +134,10 @@ pub(crate) async fn handle_bootstrap_workspace(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     };
-    let bio = non_blank(agent.bio);
+    // The CLI agency loader requires a truthy orchestrator bio, so a blank or
+    // omitted bio is rejected rather than serialized as an empty field.
+    let bio = non_blank(agent.bio)
+        .ok_or_else(|| ApiError::bad_request_static("agent.bio is required"))?;
     let style = non_blank(agent.style);
     let provider = non_blank(agent.provider);
     let adjectives = agent
@@ -139,7 +164,7 @@ pub(crate) async fn handle_bootstrap_workspace(
     let config = AgentConfig {
         name: name.clone(),
         model: model.clone(),
-        bio: bio.clone(),
+        bio: Some(bio.clone()),
         lore: None,
         knowledge: None,
         topics: None,
@@ -161,8 +186,10 @@ pub(crate) async fn handle_bootstrap_workspace(
         (snapshot, guard.control_plane_persist_request())
     };
 
-    // 4. Write agency.yaml at the workspace root AFTER the agent exists. On
-    //    IO failure roll back the state write so bootstrap stays atomic.
+    // 4. Write anima.yaml at the workspace root AFTER the agent exists,
+    //    atomically (tmp file + rename within the same directory, i.e. the
+    //    same filesystem). On IO failure roll back the state write so
+    //    bootstrap stays atomic.
     let agency_yaml = AgencyYamlConfig::single_orchestrator(
         workspace_config.company_name.clone(),
         workspace_config.mission.clone(),
@@ -171,7 +198,7 @@ pub(crate) async fn handle_bootstrap_workspace(
         model.clone(),
         AgencyYamlAgent::orchestrator(
             name,
-            bio.unwrap_or_default(),
+            bio,
             style,
             system,
             Some(model),
@@ -179,34 +206,50 @@ pub(crate) async fn handle_bootstrap_workspace(
             adjectives,
         ),
     );
-    let yaml_path = workspace_config.root_path.join("agency.yaml");
+    let tmp_path = workspace_config.root_path.join("anima.yaml.tmp");
     let write_result = serde_yaml::to_string(&agency_yaml)
         .map_err(|error| format!("failed to serialize agency yaml: {error}"))
         .and_then(|yaml| {
-            std::fs::write(&yaml_path, yaml)
-                .map_err(|error| format!("failed to write agency.yaml: {error}"))
+            std::fs::write(&tmp_path, yaml)
+                .and_then(|()| std::fs::rename(&tmp_path, &yaml_path))
+                .map_err(|error| format!("failed to write anima.yaml: {error}"))
         });
     if let Err(message) = write_result {
-        let rollback_request = {
-            let mut guard = state.write().await;
-            guard.remove_agent(&snapshot.state.id);
-            guard.workspace = None;
-            guard.control_plane_persist_request()
-        };
-        rollback_request.save().await.ok();
+        rollback_bootstrap(state, &snapshot.state.id, &yaml_path, &tmp_path).await;
         return Err(ApiError::service_unavailable(message));
     }
 
-    // 5. Persist the control-plane snapshot last.
-    persist_request
-        .save()
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    // 5. Persist the control-plane snapshot last; a failure here rolls back
+    //    exactly like a yaml-write failure.
+    if let Err(error) = persist_request.save().await {
+        rollback_bootstrap(state, &snapshot.state.id, &yaml_path, &tmp_path).await;
+        return Err(ApiError::service_unavailable(error.to_string()));
+    }
 
     Ok(WorkspaceBootstrapResponse {
         workspace: config_response(&workspace_config),
         agent: AgentRuntimeSnapshotResponse::from(&snapshot),
     })
+}
+
+/// Undo a partially applied bootstrap: drop the agent and workspace state,
+/// remove any written agency yaml files, and persist the rolled-back state on
+/// a best-effort basis.
+async fn rollback_bootstrap(
+    state: &SharedDaemonState,
+    agent_id: &str,
+    yaml_path: &Path,
+    tmp_path: &Path,
+) {
+    std::fs::remove_file(tmp_path).ok();
+    std::fs::remove_file(yaml_path).ok();
+    let rollback_request = {
+        let mut guard = state.write().await;
+        guard.remove_agent(agent_id);
+        guard.workspace = None;
+        guard.control_plane_persist_request()
+    };
+    rollback_request.save().await.ok();
 }
 
 pub(super) fn validate_workspace_request(

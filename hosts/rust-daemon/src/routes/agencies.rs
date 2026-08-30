@@ -42,6 +42,9 @@ pub(crate) struct AgencyYamlConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     values: Option<Vec<String>>,
     model: String,
+    // Omitted when empty so bootstrap never writes `provider: ""`; the CLI
+    // loader defaults a missing provider to "openai".
+    #[serde(skip_serializing_if = "String::is_empty")]
     provider: String,
     strategy: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +87,9 @@ pub(crate) struct AgencyYamlAgent {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     position: Option<String>,
+    // Omitted when empty; the CLI loader requires a truthy orchestrator bio,
+    // so bootstrap rejects blank bios before this point.
+    #[serde(skip_serializing_if = "String::is_empty")]
     bio: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     lore: Option<String>,

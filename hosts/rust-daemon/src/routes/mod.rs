@@ -162,6 +162,13 @@ impl ApiError {
         }
     }
 
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1217,7 +1224,8 @@ async fn put_workspace_entry(State(state): State<AppState>, request: AxumRequest
     responses(
         (status = 201, description = "Workspace, agency file, and orchestrator agent created atomically", body = WorkspaceBootstrapResponse),
         (status = 400, description = "Invalid workspace, agent, or tool request", body = ErrorBody),
-        (status = 503, description = "Bootstrap could not be persisted; state was rolled back", body = ErrorBody)
+        (status = 409, description = "Workspace already bootstrapped", body = ErrorBody),
+        (status = 503, description = "Bootstrap could not be completed; all state was rolled back", body = ErrorBody)
     )
 )]
 async fn bootstrap_workspace_entry(

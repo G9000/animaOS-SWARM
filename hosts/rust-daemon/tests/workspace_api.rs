@@ -233,13 +233,19 @@ async fn bootstrap_creates_workspace_agency_file_and_agent() {
         serde_json::json!(["vigilant", "concise", "proactive"])
     );
 
-    // agency.yaml exists at the root and describes a single orchestrator.
-    let yaml_path = root.join("agency.yaml");
+    // anima.yaml exists at the root and describes a single orchestrator.
+    let yaml_path = root.join("anima.yaml");
     assert!(yaml_path.is_file());
+    assert!(
+        !root.join("anima.yaml.tmp").exists(),
+        "tmp file must be renamed away"
+    );
     let yaml: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&yaml_path).unwrap()).unwrap();
     assert_eq!(yaml["name"], "Northwind Research");
     assert_eq!(yaml["orchestrator"]["name"], "Anima");
+    assert_eq!(yaml["orchestrator"]["bio"], "A vigilant chief of staff.");
+    assert_eq!(yaml["provider"], "deterministic");
     assert_eq!(yaml["strategy"], "supervisor");
 
     // Workspace config is live.
@@ -267,8 +273,12 @@ async fn bootstrap_rejects_unknown_tools_without_side_effects() {
         send_json_request(&app, "POST", "/api/workspace/bootstrap", &body.to_string()).await;
     assert_eq!(status, 400);
     assert!(
-        !root.join("agency.yaml").exists(),
-        "failed bootstrap must not write agency.yaml"
+        !root.join("anima.yaml").exists(),
+        "failed bootstrap must not write anima.yaml"
+    );
+    assert!(
+        !root.join("anima.yaml.tmp").exists(),
+        "failed bootstrap must not leave a tmp file"
     );
     let (_, workspace) = send_json_request(&app, "GET", "/api/workspace", "").await;
     let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
@@ -293,12 +303,61 @@ async fn bootstrap_rejects_empty_system() {
 }
 
 #[tokio::test]
+async fn bootstrap_rejects_blank_bio() {
+    let app = test_app();
+    let root = std::env::temp_dir().join(format!("anima-boot-bio-{}", std::process::id()));
+    let mut body = bootstrap_body(&root);
+    body["agent"]["bio"] = serde_json::json!("  ");
+    let (status, _) =
+        send_json_request(&app, "POST", "/api/workspace/bootstrap", &body.to_string()).await;
+    assert_eq!(status, 400);
+    assert!(
+        !root.join("anima.yaml").exists(),
+        "blank bio must not produce anima.yaml"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn bootstrap_conflicts_when_already_bootstrapped() {
+    let app = test_app();
+    let root = std::env::temp_dir().join(format!("anima-boot-twice-{}", std::process::id()));
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &bootstrap_body(&root).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "body: {body}");
+
+    // Second bootstrap (even against a different root) is rejected.
+    let other_root =
+        std::env::temp_dir().join(format!("anima-boot-twice-other-{}", std::process::id()));
+    let (status, _) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &bootstrap_body(&other_root).to_string(),
+    )
+    .await;
+    assert_eq!(status, 409);
+
+    let (_, agents) = send_json_request(&app, "GET", "/api/agents", "").await;
+    let agents: serde_json::Value = serde_json::from_str(&agents).unwrap();
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 1);
+
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&other_root).ok();
+}
+
+#[tokio::test]
 async fn bootstrap_rolls_back_when_agency_yaml_write_fails() {
     let app = test_app();
     let root = std::env::temp_dir().join(format!("anima-boot-iofail-{}", std::process::id()));
-    // Force the agency.yaml write to fail: pre-create the target path as a
-    // directory so std::fs::write cannot open it as a file.
-    std::fs::create_dir_all(root.join("agency.yaml")).expect("agency.yaml dir placeholder");
+    // Force the anima.yaml write to fail: pre-create the target path as a
+    // directory so the atomic rename cannot replace it with a file.
+    std::fs::create_dir_all(root.join("anima.yaml")).expect("anima.yaml dir placeholder");
 
     let (status, body) = send_json_request(
         &app,
@@ -308,6 +367,12 @@ async fn bootstrap_rolls_back_when_agency_yaml_write_fails() {
     )
     .await;
     assert_eq!(status, 503, "body: {body}");
+
+    // Rollback also cleans up the tmp file from the atomic write.
+    assert!(
+        !root.join("anima.yaml.tmp").exists(),
+        "tmp file must be removed on rollback"
+    );
 
     // Full rollback: no agent, no live workspace configuration.
     let (_, agents) = send_json_request(&app, "GET", "/api/agents", "").await;
