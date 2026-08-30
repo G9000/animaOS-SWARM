@@ -8,7 +8,10 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@animaOS-SWARM/ui": "workspace:*"
+    "@animaOS-SWARM/ui": "workspace:*",
+    "prism-react-renderer": "^2.4.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",
