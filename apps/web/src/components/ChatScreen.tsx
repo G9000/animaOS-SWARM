@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { AgentDetail, ChatMessage } from '../lib/types';
 import { AlertIcon, BoltIcon, PulseIcon, SendIcon } from './icons';
+import { MarkdownMessage } from './MarkdownMessage';
 import { ErrorBanner, formatTime } from './ui-bits';
 
 /* ── Messages ── */
@@ -31,13 +32,13 @@ function Bubble({ message }: { message: ChatMessage }) {
         className={`flex max-w-[85%] flex-col ${isUser ? 'items-end' : 'items-start'}`}
       >
         <div
-          className={`whitespace-pre-wrap break-words px-4 py-2.5 text-sm leading-relaxed ${
+          className={`break-words px-4 py-2.5 text-sm leading-relaxed ${
             isUser
               ? 'rounded-2xl rounded-br-md border border-line-strong bg-panel-2/90 text-ink shadow-lg shadow-black/25'
               : 'glass rounded-2xl rounded-bl-md text-ink'
           }`}
         >
-          {message.content.text}
+          <MarkdownMessage>{message.content.text}</MarkdownMessage>
         </div>
         <span className="mt-1 px-1 font-mono text-[10px] text-ink-3">
           {formatTime(message.created_at_ms)}
