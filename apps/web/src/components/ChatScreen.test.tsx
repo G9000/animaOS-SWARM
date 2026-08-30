@@ -78,4 +78,23 @@ describe('MessageList', () => {
     expect(screen.getByText(formatTime(messages[0].created_at_ms))).toBeVisible();
     expect(screen.getByText(formatTime(messages[1].created_at_ms))).toBeVisible();
   });
+
+  it('allows rich-content bubbles to shrink within their width cap', () => {
+    const scrollerRef = { current: null };
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={scrollerRef}
+        onSuggestion={vi.fn()}
+      />,
+    );
+
+    for (const message of screen.getAllByTestId('markdown-message')) {
+      expect(message.parentElement?.parentElement).toHaveClass(
+        'max-w-[85%]',
+        'min-w-0',
+      );
+    }
+  });
 });

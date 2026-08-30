@@ -29,7 +29,7 @@ function Bubble({ message }: { message: ChatMessage }) {
       className={`animate-msg-in flex ${isUser ? 'justify-end' : 'justify-start'}`}
     >
       <div
-        className={`flex max-w-[85%] flex-col ${isUser ? 'items-end' : 'items-start'}`}
+        className={`flex min-w-0 max-w-[85%] flex-col ${isUser ? 'items-end' : 'items-start'}`}
       >
         <div
           className={`break-words px-4 py-2.5 text-sm leading-relaxed ${
