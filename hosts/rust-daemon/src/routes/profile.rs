@@ -6,6 +6,10 @@ use super::contracts::{AgentProfileEnvelope, AgentProfileResponse, GenerateProfi
 use super::ApiError;
 use crate::app::SharedDaemonState;
 
+/// Stable error prefix the web client matches on to trigger the preset-template
+/// fallback. Keep this exact string stable.
+pub(crate) const PROFILE_GENERATION_UNAVAILABLE: &str = "PROFILE_GENERATION_UNAVAILABLE";
+
 pub(crate) struct ProfilePreset {
     pub(crate) id: &'static str,
     pub(crate) style_guidance: &'static str,
@@ -154,9 +158,9 @@ pub(crate) async fn handle_generate_profile(
         // (and an explicitly unconfigured provider) as unavailable so the web
         // app falls back to preset templates.
         if provider.is_empty() || provider == "deterministic" {
-            return Err(ApiError::bad_request_static(
-                "PROFILE_GENERATION_UNAVAILABLE: no generative provider configured",
-            ));
+            return Err(ApiError::bad_request(format!(
+                "{PROFILE_GENERATION_UNAVAILABLE}: no generative provider configured"
+            )));
         }
         std::sync::Arc::clone(&guard.model_adapter)
     };
@@ -343,7 +347,7 @@ mod tests {
         .expect_err("deterministic provider should be rejected");
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(
-            error.message.starts_with("PROFILE_GENERATION_UNAVAILABLE"),
+            error.message.starts_with(PROFILE_GENERATION_UNAVAILABLE),
             "unexpected message: {}",
             error.message
         );
@@ -357,7 +361,7 @@ mod tests {
             .expect_err("missing provider should be rejected");
         assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
         assert!(
-            error.message.starts_with("PROFILE_GENERATION_UNAVAILABLE"),
+            error.message.starts_with(PROFILE_GENERATION_UNAVAILABLE),
             "unexpected message: {}",
             error.message
         );
