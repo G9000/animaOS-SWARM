@@ -4,17 +4,23 @@ import {
   toolNamesForProfile,
   type AccessProfile,
 } from '../../lib/agent-access';
+import { presetTemplate, type PresetId } from '../../lib/agent-presets';
 import {
   daemon,
   MODEL_SUGGESTIONS,
+  PROFILE_GENERATION_UNAVAILABLE,
   type DaemonProvider,
   type DaemonSnapshot,
 } from '../../lib/daemon-api';
 import { AccessStep } from './AccessStep';
-import { IdentityStep } from './IdentityStep';
+import { AgentStep } from './AgentStep';
 import { ModelStep, type ProviderCatalogState } from './ModelStep';
 import { ONBOARDING_STEPS, OnboardingProgress } from './OnboardingProgress';
 import { ReviewStep } from './ReviewStep';
+import {
+  WorkspaceStep,
+  type WorkspaceVerifyStatus,
+} from './WorkspaceStep';
 
 export interface OnboardingFlowProps {
   providers: DaemonProvider[] | null;
@@ -23,8 +29,21 @@ export interface OnboardingFlowProps {
   onCreated(snapshot: DaemonSnapshot): void;
 }
 
+interface WorkspaceDraft {
+  companyName: string;
+  mission: string;
+  rootPath: string;
+  values: string[];
+}
+
 interface OnboardingDraft {
+  workspace: WorkspaceDraft;
   name: string;
+  presetId: PresetId;
+  intent: string;
+  bio: string;
+  adjectives: string[];
+  style: string;
   system: string;
   provider: string;
   model: string;
@@ -33,7 +52,13 @@ interface OnboardingDraft {
 }
 
 const INITIAL_DRAFT: OnboardingDraft = {
+  workspace: { companyName: '', mission: '', rootPath: '', values: [] },
   name: 'Anima',
+  presetId: 'chief-of-staff',
+  intent: '',
+  bio: '',
+  adjectives: [],
+  style: '',
   system: '',
   provider: '',
   model: '',
@@ -43,8 +68,11 @@ const INITIAL_DRAFT: OnboardingDraft = {
 
 const PROVIDER_CATALOG_CHANGED_ERROR =
   'Provider catalog changed. Review your provider and model before creating the agent.';
+const WORKSPACE_REQUIRED_ERROR =
+  'Enter a company name, mission, and workspace folder.';
 const NAME_REQUIRED_ERROR = 'Enter an agent name.';
 const MODEL_REQUIRED_ERROR = 'Enter a model.';
+const WORKSPACE_ERROR_ID = 'onboarding-workspace-error';
 const NAME_ERROR_ID = 'onboarding-agent-name-error';
 const CUSTOM_MODEL_ERROR_ID = 'onboarding-custom-model-error';
 
@@ -54,6 +82,38 @@ function defaultModel(provider: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function templateContext(draft: OnboardingDraft) {
+  return {
+    companyName: draft.workspace.companyName.trim(),
+    mission: draft.workspace.mission.trim(),
+    agentName: draft.name.trim(),
+  };
+}
+
+/** Fill only the profile fields that are still empty from the preset template. */
+function fillEmptyFromTemplate(
+  draft: OnboardingDraft,
+  presetId: PresetId = draft.presetId,
+): OnboardingDraft {
+  const template = presetTemplate(presetId, templateContext(draft));
+  return {
+    ...draft,
+    presetId,
+    bio: draft.bio || template.bio,
+    adjectives: draft.adjectives.length ? draft.adjectives : template.adjectives,
+    style: draft.style || template.style,
+    system: draft.system || template.system,
+  };
+}
+
+function workspaceComplete(workspace: WorkspaceDraft): boolean {
+  return Boolean(
+    workspace.companyName.trim() &&
+      workspace.mission.trim() &&
+      workspace.rootPath.trim(),
+  );
 }
 
 export function OnboardingFlow({
@@ -67,14 +127,26 @@ export function OnboardingFlow({
   const [blockingError, setBlockingError] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyStatus, setVerifyStatus] =
+    useState<WorkspaceVerifyStatus | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [generateAvailable, setGenerateAvailable] = useState(true);
+  const [generateError, setGenerateError] = useState<string | null>(null);
   const [providersRetrying, setProvidersRetrying] = useState(false);
   const [providerRetryError, setProviderRetryError] = useState<string | null>(
     null,
   );
+  const companyInputRef = useRef<HTMLInputElement>(null);
+  const missionInputRef = useRef<HTMLInputElement>(null);
+  const rootPathInputRef = useRef<HTMLInputElement>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const modelSelectRef = useRef<HTMLSelectElement>(null);
   const customModelInputRef = useRef<HTMLInputElement>(null);
   const providerRetryInFlightRef = useRef(false);
+  const verifyInFlightRef = useRef(false);
+  const verifyRequestIdRef = useRef(0);
+  const generateInFlightRef = useRef(false);
   const submitInFlightRef = useRef(false);
   const mountedRef = useRef(false);
 
@@ -82,6 +154,34 @@ export function OnboardingFlow({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+    };
+  }, []);
+
+  // Pre-fill the workspace folder from the daemon's default root. Failure is
+  // non-blocking: the field simply stays empty for manual entry.
+  useEffect(() => {
+    let active = true;
+    daemon
+      .getWorkspace()
+      .then((state) => {
+        if (!active) {
+          return;
+        }
+        setDraft((current) =>
+          current.workspace.rootPath
+            ? current
+            : {
+                ...current,
+                workspace: {
+                  ...current.workspace,
+                  rootPath: state.defaultRoot,
+                },
+              },
+        );
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
     };
   }, []);
 
@@ -144,9 +244,9 @@ export function OnboardingFlow({
   }
   const intelligenceReady =
     providerCatalogState === 'ready' && selectedProviderConfigured;
-  const nameValidationErrorId =
-    currentStep === 0 && blockingError === NAME_REQUIRED_ERROR
-      ? NAME_ERROR_ID
+  const workspaceValidationErrorId =
+    currentStep === 0 && blockingError === WORKSPACE_REQUIRED_ERROR
+      ? WORKSPACE_ERROR_ID
       : undefined;
   const customModelValidationErrorId =
     currentStep === 1 &&
@@ -154,7 +254,14 @@ export function OnboardingFlow({
     blockingError === MODEL_REQUIRED_ERROR
       ? CUSTOM_MODEL_ERROR_ID
       : undefined;
-  const blockingErrorId = nameValidationErrorId ?? customModelValidationErrorId;
+  const nameValidationErrorId =
+    currentStep === 2 && blockingError === NAME_REQUIRED_ERROR
+      ? NAME_ERROR_ID
+      : undefined;
+  const blockingErrorId =
+    workspaceValidationErrorId ??
+    customModelValidationErrorId ??
+    nameValidationErrorId;
 
   useEffect(() => {
     if (currentStep < 2 || intelligenceReady) {
@@ -166,13 +273,27 @@ export function OnboardingFlow({
     setCurrentStep(1);
   }, [currentStep, intelligenceReady]);
 
+  const focusFirstEmptyWorkspaceField = () => {
+    if (!draft.workspace.companyName.trim()) {
+      companyInputRef.current?.focus();
+      return;
+    }
+    if (!draft.workspace.mission.trim()) {
+      missionInputRef.current?.focus();
+      return;
+    }
+    if (!draft.workspace.rootPath.trim()) {
+      rootPathInputRef.current?.focus();
+    }
+  };
+
   useEffect(() => {
     if (!blockingError) {
       return;
     }
 
-    if (currentStep === 0 && !draft.name.trim()) {
-      nameInputRef.current?.focus();
+    if (currentStep === 0 && !workspaceComplete(draft.workspace)) {
+      focusFirstEmptyWorkspaceField();
       return;
     }
 
@@ -182,12 +303,18 @@ export function OnboardingFlow({
       } else {
         modelSelectRef.current?.focus();
       }
+      return;
+    }
+
+    if (currentStep === 2 && !draft.name.trim()) {
+      nameInputRef.current?.focus();
     }
   }, [
     blockingError,
     currentStep,
     draft.model,
     draft.name,
+    draft.workspace,
     intelligenceReady,
     resolvedModel,
   ]);
@@ -200,12 +327,45 @@ export function OnboardingFlow({
     setBlockingError(null);
   };
 
+  const updateWorkspace = <Key extends keyof WorkspaceDraft>(
+    key: Key,
+    value: WorkspaceDraft[Key],
+  ) => {
+    setDraft((current) => ({
+      ...current,
+      workspace: { ...current.workspace, [key]: value },
+    }));
+    setBlockingError(null);
+  };
+
+  const changeRootPath = (rootPath: string) => {
+    // Invalidate any in-flight verify: its result was computed for the old
+    // path and must not surface as status for the new one.
+    verifyRequestIdRef.current += 1;
+    updateWorkspace('rootPath', rootPath);
+    setVerifyStatus(null);
+  };
+
   const changeProvider = (provider: string) => {
     setDraft((current) => ({
       ...current,
       provider,
       model: defaultModel(provider),
     }));
+    setBlockingError(null);
+  };
+
+  const changePreset = (presetId: PresetId) => {
+    setDraft((current) => {
+      const untouched =
+        !current.bio &&
+        current.adjectives.length === 0 &&
+        !current.style &&
+        !current.system;
+      return untouched
+        ? fillEmptyFromTemplate(current, presetId)
+        : { ...current, presetId };
+    });
     setBlockingError(null);
   };
 
@@ -218,9 +378,9 @@ export function OnboardingFlow({
   const goNext = () => {
     setBlockingError(null);
 
-    if (currentStep === 0 && !draft.name.trim()) {
-      setBlockingError(NAME_REQUIRED_ERROR);
-      nameInputRef.current?.focus();
+    if (currentStep === 0 && !workspaceComplete(draft.workspace)) {
+      setBlockingError(WORKSPACE_REQUIRED_ERROR);
+      focusFirstEmptyWorkspaceField();
       return;
     }
 
@@ -240,6 +400,20 @@ export function OnboardingFlow({
       }
     }
 
+    if (currentStep === 2) {
+      if (!draft.name.trim()) {
+        setBlockingError(NAME_REQUIRED_ERROR);
+        nameInputRef.current?.focus();
+        return;
+      }
+
+      if (!draft.system.trim()) {
+        // Guarantee a valid profile before Review: fill any still-empty
+        // profile fields (system, bio, adjectives, style) from the template.
+        setDraft((current) => fillEmptyFromTemplate(current));
+      }
+    }
+
     setCurrentStep((step) => Math.min(ONBOARDING_STEPS.length - 1, step + 1));
   };
 
@@ -254,10 +428,112 @@ export function OnboardingFlow({
     try {
       await retryProviders();
     } catch (error) {
-      setProviderRetryError(errorMessage(error));
+      if (mountedRef.current) {
+        setProviderRetryError(errorMessage(error));
+      }
     } finally {
       providerRetryInFlightRef.current = false;
-      setProvidersRetrying(false);
+      if (mountedRef.current) {
+        setProvidersRetrying(false);
+      }
+    }
+  };
+
+  const verifyWorkspace = async () => {
+    if (verifyInFlightRef.current) {
+      return;
+    }
+
+    const requestId = ++verifyRequestIdRef.current;
+    verifyInFlightRef.current = true;
+    setVerifying(true);
+    setVerifyStatus(null);
+    try {
+      const response = await daemon.validateWorkspace({
+        rootPath: draft.workspace.rootPath.trim(),
+        companyName: draft.workspace.companyName.trim(),
+        mission: draft.workspace.mission.trim(),
+        values: draft.workspace.values,
+      });
+      // Bail when the root path changed while the request was in flight —
+      // this result describes a folder the draft no longer points at.
+      if (!mountedRef.current || requestId !== verifyRequestIdRef.current) {
+        return;
+      }
+      setVerifyStatus({
+        ok: true,
+        willCreate: response.rootPathExists === false,
+      });
+    } catch (error) {
+      if (mountedRef.current && requestId === verifyRequestIdRef.current) {
+        setVerifyStatus({ ok: false, message: errorMessage(error) });
+      }
+    } finally {
+      verifyInFlightRef.current = false;
+      if (mountedRef.current) {
+        setVerifying(false);
+      }
+    }
+  };
+
+  const generateProfile = async () => {
+    if (generateInFlightRef.current) {
+      return;
+    }
+
+    generateInFlightRef.current = true;
+    setGenerating(true);
+    setGenerateError(null);
+    // Snapshot the profile fields so a successful generation only overwrites
+    // fields the user has not touched while the request was in flight.
+    const before = {
+      bio: draft.bio,
+      adjectives: draft.adjectives,
+      style: draft.style,
+      system: draft.system,
+    };
+    try {
+      const { profile } = await daemon.generateProfile({
+        presetId: draft.presetId,
+        intent: draft.intent.trim(),
+        provider: draft.provider,
+        model: resolvedModel,
+        workspace: {
+          companyName: draft.workspace.companyName.trim(),
+          mission: draft.workspace.mission.trim(),
+          values: draft.workspace.values,
+        },
+      });
+      if (!mountedRef.current) {
+        return;
+      }
+      setDraft((current) => ({
+        ...current,
+        bio: current.bio === before.bio ? profile.bio : current.bio,
+        adjectives:
+          current.adjectives === before.adjectives
+            ? profile.adjectives
+            : current.adjectives,
+        style: current.style === before.style ? profile.style : current.style,
+        system:
+          current.system === before.system ? profile.system : current.system,
+      }));
+    } catch (error) {
+      if (!mountedRef.current) {
+        return;
+      }
+      const message = errorMessage(error);
+      if (message.startsWith(PROFILE_GENERATION_UNAVAILABLE)) {
+        setGenerateAvailable(false);
+        setDraft((current) => fillEmptyFromTemplate(current));
+      } else {
+        setGenerateError(message);
+      }
+    } finally {
+      generateInFlightRef.current = false;
+      if (mountedRef.current) {
+        setGenerating(false);
+      }
     }
   };
 
@@ -266,11 +542,22 @@ export function OnboardingFlow({
       return;
     }
 
+    // The guards below are defense-in-depth: goNext already revalidates each
+    // step before advancing, so submit can only be reached with a valid
+    // draft. They protect against state changing while on Review (e.g. the
+    // provider catalog refreshing underneath the user).
+    if (!workspaceComplete(draft.workspace)) {
+      setCreateError(null);
+      setBlockingError(WORKSPACE_REQUIRED_ERROR);
+      setCurrentStep(0);
+      return;
+    }
+
     const name = draft.name.trim();
     if (!name) {
       setCreateError(null);
       setBlockingError(NAME_REQUIRED_ERROR);
-      setCurrentStep(0);
+      setCurrentStep(2);
       return;
     }
 
@@ -292,22 +579,39 @@ export function OnboardingFlow({
     setCreating(true);
     setCreateError(null);
     try {
-      const system = draft.system.trim();
-      const response = await daemon.createAgent({
-        name,
-        provider: draft.provider,
-        model: resolvedModel,
-        tools: toolNamesForProfile(draft.access),
-        ...(system ? { system } : {}),
+      const response = await daemon.bootstrapWorkspace({
+        workspace: {
+          rootPath: draft.workspace.rootPath.trim(),
+          companyName: draft.workspace.companyName.trim(),
+          mission: draft.workspace.mission.trim(),
+          values: draft.workspace.values,
+        },
+        agent: {
+          name,
+          presetId: draft.presetId,
+          bio: draft.bio.trim(),
+          ...(draft.adjectives.length
+            ? { adjectives: draft.adjectives }
+            : {}),
+          ...(draft.style.trim() ? { style: draft.style.trim() } : {}),
+          system: draft.system.trim(),
+          ...(draft.provider ? { provider: draft.provider } : {}),
+          model: resolvedModel,
+          tools: toolNamesForProfile(draft.access),
+        },
       });
       if (mountedRef.current) {
         onCreated(response.agent);
       }
     } catch (error) {
-      setCreateError(errorMessage(error));
+      if (mountedRef.current) {
+        setCreateError(errorMessage(error));
+      }
     } finally {
       submitInFlightRef.current = false;
-      setCreating(false);
+      if (mountedRef.current) {
+        setCreating(false);
+      }
     }
   };
 
@@ -315,13 +619,22 @@ export function OnboardingFlow({
   switch (currentStep) {
     case 0:
       stepContent = (
-        <IdentityStep
-          name={draft.name}
-          system={draft.system}
-          onNameChange={(name) => updateDraft('name', name)}
-          onSystemChange={(system) => updateDraft('system', system)}
-          nameInputRef={nameInputRef}
-          validationErrorId={nameValidationErrorId}
+        <WorkspaceStep
+          companyName={draft.workspace.companyName}
+          mission={draft.workspace.mission}
+          rootPath={draft.workspace.rootPath}
+          values={draft.workspace.values}
+          verifying={verifying}
+          verifyStatus={verifyStatus}
+          onCompanyNameChange={(value) => updateWorkspace('companyName', value)}
+          onMissionChange={(value) => updateWorkspace('mission', value)}
+          onRootPathChange={changeRootPath}
+          onValuesChange={(values) => updateWorkspace('values', values)}
+          onVerify={() => void verifyWorkspace()}
+          companyInputRef={companyInputRef}
+          missionInputRef={missionInputRef}
+          rootPathInputRef={rootPathInputRef}
+          validationErrorId={workspaceValidationErrorId}
         />
       );
       break;
@@ -345,6 +658,31 @@ export function OnboardingFlow({
       );
       break;
     case 2:
+      stepContent = (
+        <AgentStep
+          name={draft.name}
+          presetId={draft.presetId}
+          intent={draft.intent}
+          bio={draft.bio}
+          adjectives={draft.adjectives}
+          style={draft.style}
+          system={draft.system}
+          generating={generating}
+          generateAvailable={generateAvailable}
+          generateError={generateError}
+          onNameChange={(name) => updateDraft('name', name)}
+          onPresetChange={changePreset}
+          onIntentChange={(intent) => updateDraft('intent', intent)}
+          onBioChange={(bio) => updateDraft('bio', bio)}
+          onStyleChange={(style) => updateDraft('style', style)}
+          onSystemChange={(system) => updateDraft('system', system)}
+          onGenerate={() => void generateProfile()}
+          nameInputRef={nameInputRef}
+          validationErrorId={nameValidationErrorId}
+        />
+      );
+      break;
+    case 3:
       stepContent = (
         <AccessStep
           access={draft.access}
@@ -374,13 +712,13 @@ export function OnboardingFlow({
       <div className="w-full max-w-2xl space-y-6">
         <header className="space-y-2 text-center">
           <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-ink-3">
-            Guided Focus · Main agent
+            Guided Focus · Workspace
           </p>
           <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
-            Create your main agent
+            Set up your workspace
           </h1>
           <p className="mx-auto max-w-lg text-sm leading-relaxed text-ink-2">
-            Set the identity, intelligence, and workspace access for your agent.
+            Name your company, pick its folder, and hire your first agent.
           </p>
         </header>
 

@@ -44,6 +44,14 @@ describe('WorkspaceStep', () => {
     expect(screen.getByRole('button', { name: /verifying/i })).toBeDisabled();
   });
 
+  it('disables Verify until a folder is entered', () => {
+    setup({ rootPath: 'C:\\anima' });
+    expect(screen.getByRole('button', { name: 'Verify' })).toBeEnabled();
+
+    setup({ rootPath: '   ' });
+    expect(screen.getAllByRole('button', { name: 'Verify' })[1]).toBeDisabled();
+  });
+
   it('shows create-vs-existing result copy', () => {
     setup({ verifyStatus: { ok: true, willCreate: true } });
     expect(screen.getByText(/will be created/i)).toBeInTheDocument();

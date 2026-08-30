@@ -1,6 +1,7 @@
 export const ONBOARDING_STEPS = [
-  'Identity',
+  'Workspace',
   'Intelligence',
+  'Agent',
   'Access',
   'Review',
 ] as const;
@@ -13,7 +14,7 @@ export function OnboardingProgress({ currentStep }: OnboardingProgressProps) {
   return (
     <ol
       aria-label="Onboarding progress"
-      className="grid grid-cols-4 gap-1.5 sm:gap-2"
+      className="grid grid-cols-5 gap-1.5 sm:gap-2"
     >
       {ONBOARDING_STEPS.map((label, index) => {
         const active = index === currentStep;

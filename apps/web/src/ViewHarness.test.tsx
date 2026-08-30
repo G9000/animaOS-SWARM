@@ -242,7 +242,7 @@ describe('ViewHarness workspace controller', () => {
     render(<ViewHarness />);
 
     expect(
-      await screen.findByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
     expect(screen.queryByText('Daemon Online')).not.toBeInTheDocument();
@@ -502,7 +502,7 @@ describe('ViewHarness workspace controller', () => {
       await deletion.promise;
     });
     expect(
-      await screen.findByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
   });
 
@@ -712,7 +712,7 @@ describe('ViewHarness workspace controller', () => {
     await user.click(screen.getByRole('button', { name: 'Reset' }));
 
     expect(
-      await screen.findByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });
@@ -737,7 +737,7 @@ describe('ViewHarness workspace controller', () => {
     await user.click(screen.getByRole('button', { name: 'Reset' }));
 
     expect(
-      await screen.findByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
     expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-only');
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
@@ -780,7 +780,7 @@ describe('ViewHarness workspace controller', () => {
       await deletion.promise;
     });
     expect(
-      await screen.findByRole('heading', { name: 'Create your main agent' }),
+      await screen.findByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
 
     await act(async () => {
@@ -788,7 +788,7 @@ describe('ViewHarness workspace controller', () => {
       await stalePoll.promise;
     });
     expect(
-      screen.getByRole('heading', { name: 'Create your main agent' }),
+      screen.getByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
     expect(
       screen.queryByRole('heading', { name: 'Say something to Nova' }),

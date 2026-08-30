@@ -31,6 +31,8 @@ export interface WorkspaceStepProps {
   onValuesChange(values: string[]): void;
   onVerify(): void;
   companyInputRef: RefObject<HTMLInputElement | null>;
+  missionInputRef?: RefObject<HTMLInputElement | null>;
+  rootPathInputRef?: RefObject<HTMLInputElement | null>;
   validationErrorId?: string;
 }
 
@@ -47,6 +49,8 @@ export function WorkspaceStep({
   onValuesChange,
   onVerify,
   companyInputRef,
+  missionInputRef,
+  rootPathInputRef,
   validationErrorId,
 }: WorkspaceStepProps) {
   const [valuesDraft, setValuesDraft] = useState(() => values.join(', '));
@@ -102,6 +106,7 @@ export function WorkspaceStep({
           Mission (one sentence)
         </label>
         <input
+          ref={missionInputRef}
           id="onboarding-mission"
           className="field"
           value={mission}
@@ -117,6 +122,7 @@ export function WorkspaceStep({
         </label>
         <div className="flex gap-2">
           <input
+            ref={rootPathInputRef}
             id="onboarding-root-path"
             className="field flex-1"
             value={rootPath}
@@ -127,7 +133,7 @@ export function WorkspaceStep({
           <button
             type="button"
             onClick={onVerify}
-            disabled={verifying}
+            disabled={verifying || !rootPath.trim()}
             className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
           >
             {verifying ? 'Verifying…' : 'Verify'}
