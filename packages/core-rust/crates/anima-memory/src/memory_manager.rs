@@ -1725,11 +1725,7 @@ fn temporal_status_matches(
     }
 }
 
-fn temporal_record_valid_at(
-    valid_from: Option<u64>,
-    valid_to: Option<u64>,
-    instant: u64,
-) -> bool {
+fn temporal_record_valid_at(valid_from: Option<u64>, valid_to: Option<u64>, instant: u64) -> bool {
     valid_from.is_none_or(|valid_from| valid_from <= instant)
         && valid_to.is_none_or(|valid_to| valid_to >= instant)
 }

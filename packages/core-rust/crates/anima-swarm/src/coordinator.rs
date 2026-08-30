@@ -430,10 +430,7 @@ impl SwarmCoordinator {
         }
 
         {
-            let mut pool = self
-                .inner
-                .pool
-                .lock_recover();
+            let mut pool = self.inner.pool.lock_recover();
             for (worker_name, agent_id) in &created_workers {
                 pool.insert(worker_name.clone(), agent_id.clone());
             }
@@ -485,10 +482,7 @@ impl SwarmCoordinator {
         let _dispatch_guard = self.inner.dispatch_lock.lock().await;
 
         let agents = {
-            let mut agents = self
-                .inner
-                .agents
-                .lock_recover();
+            let mut agents = self.inner.agents.lock_recover();
             let drained = agents
                 .drain()
                 .map(|(agent_id, agent)| {
@@ -496,18 +490,12 @@ impl SwarmCoordinator {
                     (agent_id, agent.shell)
                 })
                 .collect::<Vec<_>>();
-            self.inner
-                .pool
-                .lock_recover()
-                .clear();
+            self.inner.pool.lock_recover().clear();
             drained
         };
 
         {
-            let mut bus = self
-                .inner
-                .message_bus
-                .lock_recover();
+            let mut bus = self.inner.message_bus.lock_recover();
             bus.clear();
         }
 
@@ -533,10 +521,7 @@ impl SwarmCoordinator {
             self.capture_message_history();
         }
 
-        self.inner
-            .state
-            .lock_recover()
-            .clone()
+        self.inner.state.lock_recover().clone()
     }
 
     pub fn get_message_bus(&self) -> Arc<Mutex<MessageBus>> {
@@ -614,10 +599,7 @@ impl SwarmCoordinator {
 
     fn state_snapshot(&self) -> SwarmState {
         self.capture_message_history();
-        self.inner
-            .state
-            .lock_recover()
-            .clone()
+        self.inner.state.lock_recover().clone()
     }
 
     async fn spawn_for_dispatch(
@@ -670,23 +652,17 @@ impl SwarmCoordinator {
         );
 
         {
-            let mut bus = self
-                .inner
-                .message_bus
-                .lock_recover();
+            let mut bus = self.inner.message_bus.lock_recover();
             bus.register_agent(&agent_id);
         }
-        self.inner
-            .agents
-            .lock_recover()
-            .insert(
-                agent_id.clone(),
-                CoordinatorManagedAgent {
-                    name: agent_name,
-                    shell,
-                    liveness,
-                },
-            );
+        self.inner.agents.lock_recover().insert(
+            agent_id.clone(),
+            CoordinatorManagedAgent {
+                name: agent_name,
+                shell,
+                liveness,
+            },
+        );
         self.with_state(|state| {
             state.agent_ids.push(agent_id.clone());
         });
@@ -695,12 +671,7 @@ impl SwarmCoordinator {
     }
 
     fn get_pool_agent(&self, name: &str) -> Option<CoordinatorAgentRef> {
-        let pool_agent_id = self
-            .inner
-            .pool
-            .lock_recover()
-            .get(name)
-            .cloned()?;
+        let pool_agent_id = self.inner.pool.lock_recover().get(name).cloned()?;
         self.inner
             .agents
             .lock_recover()
@@ -715,10 +686,7 @@ impl SwarmCoordinator {
     }
 
     fn reset_task_state(&self) {
-        self.inner
-            .message_bus
-            .lock_recover()
-            .clear_inboxes();
+        self.inner.message_bus.lock_recover().clear_inboxes();
 
         let messages = self.message_history();
         self.with_state(|state| {
@@ -749,10 +717,7 @@ impl SwarmCoordinator {
             .collect::<HashSet<_>>();
 
         let ephemeral = {
-            let mut agents = self
-                .inner
-                .agents
-                .lock_recover();
+            let mut agents = self.inner.agents.lock_recover();
             let ephemeral_ids = agents
                 .keys()
                 .filter(|agent_id| !pooled_agent_ids.contains(*agent_id))
@@ -815,18 +780,11 @@ impl SwarmCoordinator {
     }
 
     fn message_history(&self) -> Vec<AgentMessage> {
-        self.inner
-            .message_bus
-            .lock_recover()
-            .get_all_messages()
+        self.inner.message_bus.lock_recover().get_all_messages()
     }
 
     fn has_live_agents(&self) -> bool {
-        !self
-            .inner
-            .agents
-            .lock_recover()
-            .is_empty()
+        !self.inner.agents.lock_recover().is_empty()
     }
 
     fn reserve_agent_slot(&self, agent_id: &str) -> Result<(), String> {
@@ -835,10 +793,7 @@ impl SwarmCoordinator {
             .config
             .max_concurrent_agents
             .unwrap_or(usize::MAX);
-        let mut admitted = self
-            .inner
-            .admitted_agent_ids
-            .lock_recover();
+        let mut admitted = self.inner.admitted_agent_ids.lock_recover();
         if admitted.len() >= max_agents {
             return Err(format!("Max concurrent agents ({max_agents}) reached"));
         }
@@ -873,8 +828,7 @@ impl SwarmCoordinator {
                     return Err(inactive_agent_error(&from_agent_id));
                 }
                 let message = {
-                    let mut message_bus = message_bus
-                        .lock_recover();
+                    let mut message_bus = message_bus.lock_recover();
                     message_bus.send_message(&from_agent_id, &to_agent_id, content)
                 };
                 if let Some(message_events) = message_events {
@@ -905,8 +859,7 @@ impl SwarmCoordinator {
                     return Err(inactive_agent_error(&from_agent_id));
                 }
                 let message = {
-                    let mut message_bus = message_bus
-                        .lock_recover();
+                    let mut message_bus = message_bus.lock_recover();
                     message_bus.broadcast_message(&from_agent_id, content)
                 };
                 if let Some(message_events) = message_events {
@@ -932,9 +885,7 @@ impl SwarmCoordinator {
                 if !liveness.is_active() {
                     return Err(inactive_agent_error(&agent_id));
                 }
-                Ok(message_bus
-                    .lock_recover()
-                    .get_messages(&agent_id))
+                Ok(message_bus.lock_recover().get_messages(&agent_id))
             })
         })
     }
@@ -971,10 +922,7 @@ impl SwarmCoordinator {
     }
 
     fn with_state(&self, update: impl FnOnce(&mut SwarmState)) {
-        let mut state = self
-            .inner
-            .state
-            .lock_recover();
+        let mut state = self.inner.state.lock_recover();
         update(&mut state);
     }
 
@@ -998,10 +946,7 @@ impl SwarmCoordinator {
             .retain(|name, _| !created_names.contains(name));
 
         let removed_agents = {
-            let mut agents = self
-                .inner
-                .agents
-                .lock_recover();
+            let mut agents = self.inner.agents.lock_recover();
             created_ids
                 .iter()
                 .filter_map(|agent_id| {
@@ -1014,20 +959,14 @@ impl SwarmCoordinator {
         };
 
         {
-            let mut bus = self
-                .inner
-                .message_bus
-                .lock_recover();
+            let mut bus = self.inner.message_bus.lock_recover();
             for agent_id in &created_ids {
                 bus.unregister_agent(agent_id);
             }
         }
 
         let should_reset_tokens = {
-            let agents = self
-                .inner
-                .agents
-                .lock_recover();
+            let agents = self.inner.agents.lock_recover();
             agents.is_empty()
         };
 

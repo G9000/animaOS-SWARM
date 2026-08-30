@@ -166,10 +166,7 @@ fn build_result_content(history: &[HistoryEntry], errors: &[TurnError]) -> Conte
                     .map(|entry| {
                         let mut record = BTreeMap::new();
                         record.insert("turn".into(), DataValue::Number(entry.turn as f64));
-                        record.insert(
-                            "speaker".into(),
-                            DataValue::String(entry.speaker.clone()),
-                        );
+                        record.insert("speaker".into(), DataValue::String(entry.speaker.clone()));
                         record.insert("error".into(), DataValue::String(entry.error.clone()));
                         DataValue::Object(record)
                     })

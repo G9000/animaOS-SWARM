@@ -11,11 +11,13 @@ async fn get_workspace_reports_unconfigured_with_default_root() {
 
     let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
     assert_eq!(body["configured"], false);
-    assert!(body["defaultRoot"]
-        .as_str()
-        .expect("defaultRoot is a string")
-        .len()
-        > 0);
+    assert!(
+        body["defaultRoot"]
+            .as_str()
+            .expect("defaultRoot is a string")
+            .len()
+            > 0
+    );
     assert!(body["workspace"].is_null());
     assert!(body.get("rootPathExists").is_none());
 }
@@ -119,7 +121,10 @@ async fn put_workspace_validate_only_reports_root_path_exists() {
     assert_eq!(status, 200, "{body}");
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["rootPathExists"], false, "{body}");
-    assert!(!missing.exists(), "validate-only must not create the folder");
+    assert!(
+        !missing.exists(),
+        "validate-only must not create the folder"
+    );
 
     let existing = std::env::temp_dir();
     let (status, body) = send_json_request(

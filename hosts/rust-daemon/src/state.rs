@@ -27,8 +27,8 @@ use crate::connectors::{
     TelegramCredentialCleanupIntent, TelegramInboundRecord, TelegramOutboundRecord,
 };
 use crate::control_plane_store::{
-    save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig, StoredSwarmSnapshot,
-    WorkspaceConfig,
+    save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
+    StoredSwarmSnapshot, WorkspaceConfig,
 };
 use crate::events::{EventFanout, EventSubscriber, DEFAULT_EVENT_BUFFER};
 use crate::memory_embeddings::{MemoryEmbeddingRuntime, SharedMemoryEmbeddings};

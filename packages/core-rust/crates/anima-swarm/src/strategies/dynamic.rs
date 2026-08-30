@@ -81,8 +81,7 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
                     };
 
                     let history_text = {
-                        let history = chat_history
-                            .lock_recover();
+                        let history = chat_history.lock_recover();
                         if history.is_empty() {
                             String::new()
                         } else {
@@ -117,12 +116,10 @@ pub fn dynamic_strategy(ctx: CoordinatorDispatchContext) -> CoordinatorFuture<Ta
                         )
                     };
 
-                    chat_history
-                        .lock_recover()
-                        .push(HistoryEntry {
-                            speaker: agent_name,
-                            content: response_text,
-                        });
+                    chat_history.lock_recover().push(HistoryEntry {
+                        speaker: agent_name,
+                        content: response_text,
+                    });
 
                     result
                 })

@@ -41,7 +41,9 @@ fn web_fetch_client() -> Result<&'static reqwest::Client, String> {
         .build()
         .map_err(|error| format!("web_fetch client init failed: {error}"))?;
     let _ = WEB_FETCH_CLIENT.set(client);
-    Ok(WEB_FETCH_CLIENT.get().expect("web_fetch client just installed"))
+    Ok(WEB_FETCH_CLIENT
+        .get()
+        .expect("web_fetch client just installed"))
 }
 
 fn exa_client() -> Result<&'static reqwest::Client, String> {
@@ -331,7 +333,8 @@ async fn read_capped_bytes(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<(Vec<u8>, bool), String> {
-    let mut buffer = Vec::with_capacity(response.content_length().unwrap_or(0).min(max_bytes as u64) as usize);
+    let mut buffer =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(max_bytes as u64) as usize);
     let mut truncated = false;
     while let Some(chunk) = response
         .chunk()

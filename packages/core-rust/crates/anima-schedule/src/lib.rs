@@ -155,7 +155,8 @@ impl Scheduler {
                 } => {
                     let local_ms = local_ms(now_ms, *tz_offset_minutes);
                     let day = local_ms.div_euclid(DAY_MS);
-                    let reached = local_minutes_of_day(local_ms) >= u32::from(*hour) * 60 + u32::from(*minute);
+                    let reached = local_minutes_of_day(local_ms)
+                        >= u32::from(*hour) * 60 + u32::from(*minute);
                     reached && self.state[idx].last_fired_day != Some(day)
                 }
             };
@@ -246,13 +247,15 @@ fn local_minutes_of_day(local_ms: i64) -> u32 {
 /// the file path and parse context attached.
 pub fn load_jobs_file(path: &Path) -> std::io::Result<Vec<ScheduledJob>> {
     let text = std::fs::read_to_string(path)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| invalid_data(path, format!("malformed JSON: {e}")))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| invalid_data(path, format!("malformed JSON: {e}")))?;
     let jobs_value = if value.is_object() {
-        value
-            .get("jobs")
-            .cloned()
-            .ok_or_else(|| invalid_data(path, "object form must contain a \"jobs\" array".to_string()))?
+        value.get("jobs").cloned().ok_or_else(|| {
+            invalid_data(
+                path,
+                "object form must contain a \"jobs\" array".to_string(),
+            )
+        })?
     } else {
         value
     };
@@ -461,14 +464,17 @@ mod tests {
         assert_eq!(s.next_due_in_ms(10 * HOUR_MS), Some(0));
         s.due_jobs(10 * HOUR_MS);
         // Fired today -> next is tomorrow 09:30 (23.5 h away).
-        assert_eq!(s.next_due_in_ms(10 * HOUR_MS), Some(86_400_000 - 30 * 60_000));
+        assert_eq!(
+            s.next_due_in_ms(10 * HOUR_MS),
+            Some(86_400_000 - 30 * 60_000)
+        );
     }
 
     #[test]
     fn next_due_is_min_across_jobs() {
         let mut s = Scheduler::new(vec![every_job("a", 60), daily_job("b", 9, 30, 0)]).unwrap();
         s.due_jobs(8 * HOUR_MS); // fires "a" (every), not "b"
-        // "a" next at +60s; "b" next in 90 min.
+                                 // "a" next at +60s; "b" next in 90 min.
         assert_eq!(s.next_due_in_ms(8 * HOUR_MS), Some(60_000));
     }
 

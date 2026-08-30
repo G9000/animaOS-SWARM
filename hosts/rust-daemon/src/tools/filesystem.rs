@@ -153,7 +153,12 @@ pub(super) fn execute_grep(
             None => None,
         };
 
-        match grep_workspace_files(ctx_workspace_root(&context), &pattern, &path, include.as_deref()) {
+        match grep_workspace_files(
+            ctx_workspace_root(&context),
+            &pattern,
+            &path,
+            include.as_deref(),
+        ) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -220,7 +225,12 @@ pub(super) fn execute_edit_file(
             _ => return TaskResult::error("edit_file new_string must be a string", 0),
         };
 
-        match edit_workspace_file(ctx_workspace_root(&context), &file_path, &old_string, &new_string) {
+        match edit_workspace_file(
+            ctx_workspace_root(&context),
+            &file_path,
+            &old_string,
+            &new_string,
+        ) {
             Ok(text) => TaskResult::success(
                 Content {
                     text,

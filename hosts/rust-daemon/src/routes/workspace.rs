@@ -117,9 +117,9 @@ fn validate_root_path(raw: &str, validate_only: bool) -> Result<PathBuf, ApiErro
         // Nothing to canonicalize yet; return as-is.
         return Ok(candidate);
     }
-    candidate.canonicalize().map_err(|error| {
-        ApiError::bad_request(format!("rootPath could not be resolved: {error}"))
-    })
+    candidate
+        .canonicalize()
+        .map_err(|error| ApiError::bad_request(format!("rootPath could not be resolved: {error}")))
 }
 
 pub(super) fn config_response(config: &WorkspaceConfig) -> WorkspaceConfigResponse {
@@ -133,8 +133,60 @@ pub(super) fn config_response(config: &WorkspaceConfig) -> WorkspaceConfigRespon
 
 pub(super) fn default_root_label() -> String {
     // Delegates to the same resolution the tools use so the label never
-    // diverges (including the empty-env-var edge case).
+    // diverges. Tools reject a set-but-empty ANIMAOS_WORKSPACE_ROOT; the
+    // pre-fill label falls back to the launch directory in that case.
     crate::tools::workspace_root_path("workspace", None)
+        .ok()
+        .or_else(|| std::env::current_dir().ok())
         .map(|path| path.display().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_root_label;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
+    #[test]
+    fn default_root_label_falls_back_to_launch_dir_when_env_empty() {
+        let _lock = ENV_LOCK.lock().expect("env lock should not poison");
+        let _guard = EnvGuard::set("ANIMAOS_WORKSPACE_ROOT", "");
+        let expected = std::env::current_dir()
+            .expect("current dir resolves")
+            .display()
+            .to_string();
+        assert_eq!(default_root_label(), expected);
+    }
+
+    #[test]
+    fn default_root_label_uses_env_path_when_set() {
+        let _lock = ENV_LOCK.lock().expect("env lock should not poison");
+        let _guard = EnvGuard::set("ANIMAOS_WORKSPACE_ROOT", "C:\\anima\\workspace");
+        assert_eq!(default_root_label(), "C:\\anima\\workspace");
+    }
 }

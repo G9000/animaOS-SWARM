@@ -318,7 +318,8 @@ mod tests {
             "outbound": [],
             "schedules": []
         }"#;
-        let snapshot: ControlPlaneSnapshot = serde_json::from_str(json).expect("v3 snapshot parses");
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(json).expect("v3 snapshot parses");
         assert!(snapshot.workspace.is_none());
     }
 
