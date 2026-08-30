@@ -53,6 +53,9 @@ export interface DaemonSnapshot {
       model: string;
       provider?: string | null;
       system?: string | null;
+      bio?: string | null;
+      adjectives?: string[] | null;
+      style?: string | null;
       tools?: DaemonToolDescriptor[] | null;
     };
     createdAtMs: number;
@@ -190,6 +193,61 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
+}
+
+/** Error.message prefix returned by the daemon when no generative provider is available. */
+export const PROFILE_GENERATION_UNAVAILABLE = 'PROFILE_GENERATION_UNAVAILABLE';
+
+export interface DaemonWorkspaceConfig {
+  rootPath: string;
+  companyName: string;
+  mission: string;
+  values: string[];
+}
+
+export interface DaemonWorkspaceState {
+  configured: boolean;
+  workspace: DaemonWorkspaceConfig | null;
+  defaultRoot: string;
+  /** Present only on validate-only responses: does the folder already exist? */
+  rootPathExists?: boolean;
+}
+
+export interface WorkspaceConfigInput {
+  rootPath: string;
+  companyName: string;
+  mission: string;
+  values: string[];
+}
+
+export interface GenerateProfileInput {
+  presetId: string;
+  intent: string;
+  provider: string;
+  model: string;
+  workspace: { companyName: string; mission: string; values: string[] };
+}
+
+export interface AgentProfile {
+  bio: string;
+  adjectives: string[];
+  style: string;
+  system: string;
+}
+
+export interface BootstrapWorkspaceInput {
+  workspace: WorkspaceConfigInput;
+  agent: {
+    name: string;
+    presetId: string;
+    bio?: string;
+    adjectives?: string[];
+    style?: string;
+    system: string;
+    provider?: string;
+    model: string;
+    tools: string[];
+  };
 }
 
 export const daemon = {
@@ -336,6 +394,32 @@ export const daemon = {
   ) =>
     request<{ schedules: DaemonSchedule[] }>(
       `/agents/${encodeURIComponent(agentId)}/schedules/import`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+
+  getWorkspace: () => request<DaemonWorkspaceState>('/workspace'),
+
+  putWorkspace: (input: WorkspaceConfigInput) =>
+    request<DaemonWorkspaceState>('/workspace', {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    }),
+
+  validateWorkspace: (input: WorkspaceConfigInput) =>
+    request<DaemonWorkspaceState>('/workspace', {
+      method: 'PUT',
+      body: JSON.stringify({ ...input, validateOnly: true }),
+    }),
+
+  generateProfile: (input: GenerateProfileInput) =>
+    request<{ profile: AgentProfile }>('/agents/generate-profile', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  bootstrapWorkspace: (input: BootstrapWorkspaceInput) =>
+    request<{ workspace: DaemonWorkspaceConfig; agent: DaemonSnapshot }>(
+      '/workspace/bootstrap',
       { method: 'POST', body: JSON.stringify(input) },
     ),
 };

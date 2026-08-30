@@ -177,6 +177,143 @@ describe('daemon agent requests', () => {
   });
 });
 
+describe('daemon workspace requests', () => {
+  const workspaceState = {
+    configured: true,
+    workspace: {
+      rootPath: '/srv/company',
+      companyName: 'Acme',
+      mission: 'Ship it',
+      values: ['rigor', 'care'],
+    },
+    defaultRoot: '/srv',
+  };
+
+  it('getWorkspace fetches /workspace and parses configured/defaultRoot', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(workspaceState), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const state = await daemon.getWorkspace();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace',
+      expect.any(Object),
+    );
+    expect(state.configured).toBe(true);
+    expect(state.defaultRoot).toBe('/srv');
+    expect(state.workspace?.companyName).toBe('Acme');
+  });
+
+  it('validateWorkspace PUTs with validateOnly', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ ...workspaceState, rootPathExists: false }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const input = {
+      rootPath: '/srv/company',
+      companyName: 'Acme',
+      mission: 'Ship it',
+      values: ['rigor', 'care'],
+    };
+    const state = await daemon.validateWorkspace(input);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ ...input, validateOnly: true }),
+      }),
+    );
+    expect(state.rootPathExists).toBe(false);
+  });
+
+  it('generateProfile POSTs preset, intent, model, and workspace identity', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          profile: {
+            bio: 'A precise operator.',
+            adjectives: ['precise', 'calm'],
+            style: 'Concise',
+            system: 'You are precise.',
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const input = {
+      presetId: 'operator',
+      intent: 'Runs the back office',
+      provider: 'anthropic',
+      model: 'claude-sonnet-4',
+      workspace: {
+        companyName: 'Acme',
+        mission: 'Ship it',
+        values: ['rigor', 'care'],
+      },
+    };
+    const result = await daemon.generateProfile(input);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/agents/generate-profile',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+    );
+    expect(result.profile.adjectives).toEqual(['precise', 'calm']);
+  });
+
+  it('bootstrapWorkspace POSTs workspace and agent payloads', async () => {
+    const created = snapshot();
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({ workspace: workspaceState.workspace, agent: created }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const input = {
+      workspace: {
+        rootPath: '/srv/company',
+        companyName: 'Acme',
+        mission: 'Ship it',
+        values: ['rigor', 'care'],
+      },
+      agent: {
+        name: 'Anima',
+        presetId: 'operator',
+        bio: 'A precise operator.',
+        system: 'You are precise.',
+        model: 'claude-sonnet-4',
+        tools: ['read_file'],
+      },
+    };
+    const result = await daemon.bootstrapWorkspace(input);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace/bootstrap',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify(input),
+      }),
+    );
+    expect(result.agent.state.id).toBe('agent-1');
+  });
+});
+
 describe('daemon integration requests', () => {
   it('uses connector routes and requires a caller supplied idempotency key for sends', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockImplementation(
