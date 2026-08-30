@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { daemon, toAgentDetail, type DaemonSnapshot } from './daemon-api';
+import {
+  daemon,
+  toAgentDetail,
+  PROFILE_GENERATION_UNAVAILABLE,
+  type DaemonSnapshot,
+} from './daemon-api';
 
 function snapshot(): DaemonSnapshot {
   return {
@@ -209,6 +214,32 @@ describe('daemon workspace requests', () => {
     expect(state.workspace?.companyName).toBe('Acme');
   });
 
+  it('putWorkspace PUTs to /workspace with the exact body', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(workspaceState), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const input = {
+      rootPath: '/srv/company',
+      companyName: 'Acme',
+      mission: 'Ship it',
+      values: ['rigor', 'care'],
+    };
+    await daemon.putWorkspace(input);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify(input),
+      }),
+    );
+  });
+
   it('validateWorkspace PUTs with validateOnly', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(JSON.stringify({ ...workspaceState, rootPathExists: false }), {
@@ -273,6 +304,37 @@ describe('daemon workspace requests', () => {
       }),
     );
     expect(result.profile.adjectives).toEqual(['precise', 'calm']);
+  });
+
+  it('generateProfile surfaces the PROFILE_GENERATION_UNAVAILABLE error prefix', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          error: 'PROFILE_GENERATION_UNAVAILABLE: no generative provider configured',
+        }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const error = await daemon
+      .generateProfile({
+        presetId: 'operator',
+        intent: 'Runs the back office',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4',
+        workspace: {
+          companyName: 'Acme',
+          mission: 'Ship it',
+          values: ['rigor', 'care'],
+        },
+      })
+      .catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message.startsWith(PROFILE_GENERATION_UNAVAILABLE)).toBe(
+      true,
+    );
   });
 
   it('bootstrapWorkspace POSTs workspace and agent payloads', async () => {

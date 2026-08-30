@@ -213,12 +213,12 @@ export interface DaemonWorkspaceState {
   rootPathExists?: boolean;
 }
 
-export interface WorkspaceConfigInput {
-  rootPath: string;
-  companyName: string;
-  mission: string;
-  values: string[];
-}
+/** Validate-only response: the daemon always sets rootPathExists here, never elsewhere. */
+export type DaemonWorkspaceValidation = DaemonWorkspaceState & {
+  rootPathExists: boolean;
+};
+
+export type WorkspaceConfigInput = DaemonWorkspaceConfig;
 
 export interface GenerateProfileInput {
   presetId: string;
@@ -240,7 +240,7 @@ export interface BootstrapWorkspaceInput {
   agent: {
     name: string;
     presetId: string;
-    bio?: string;
+    bio: string;
     adjectives?: string[];
     style?: string;
     system: string;
@@ -406,7 +406,7 @@ export const daemon = {
     }),
 
   validateWorkspace: (input: WorkspaceConfigInput) =>
-    request<DaemonWorkspaceState>('/workspace', {
+    request<DaemonWorkspaceValidation>('/workspace', {
       method: 'PUT',
       body: JSON.stringify({ ...input, validateOnly: true }),
     }),
