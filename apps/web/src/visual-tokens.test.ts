@@ -175,7 +175,7 @@ describe('Neon Rose spatial visual contract', () => {
     expect(read('components/WorkspaceShell.tsx')).toContain(
       'data-placement={placement}',
     );
-    expect(read('components/WorkspaceShell.tsx')).toContain("'top-shell'");
+    expect(read('components/WorkspaceShell.tsx')).toContain("'sidebar'");
     expect(read('components/WorkspaceShell.tsx')).toContain("'bottom-dock'");
     expect(read('components/SettingsPanel.tsx')).toContain(
       'data-surface="settings-sheet-drawer"',

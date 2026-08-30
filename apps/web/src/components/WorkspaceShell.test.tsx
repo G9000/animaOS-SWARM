@@ -66,7 +66,8 @@ describe('WorkspaceShell', () => {
     await user.click(screen.getByRole('button', { name: 'Telegram' }));
     expect(screen.getByText('Telegram canvas')).toBeVisible();
   });
-  it('owns one responsive navigation with Workspace, Activity, and Agents destinations', async () => {
+
+  it('uses a left sidebar for desktop workspace navigation', async () => {
     const user = userEvent.setup();
     const nova = agent('agent-main', 'Nova', 1);
 
@@ -84,8 +85,8 @@ describe('WorkspaceShell', () => {
     const navigation = screen.getByRole('navigation', {
       name: 'Workspace navigation',
     });
-    expect(navigation).toHaveAttribute('data-placement', 'top-shell');
-    expect(navigation.previousElementSibling?.tagName).toBe('HEADER');
+    expect(navigation).toHaveAttribute('data-placement', 'sidebar');
+    expect(navigation).toHaveAttribute('aria-orientation', 'vertical');
     expect(navigation.nextElementSibling?.tagName).toBe('MAIN');
     expect(
       within(navigation).getByRole('button', { name: 'Workspace' }),
@@ -230,7 +231,7 @@ describe('WorkspaceShell', () => {
       name: 'Workspace navigation',
     });
     expect(navigation).toHaveAttribute('data-placement', 'bottom-dock');
-    expect(content.nextElementSibling).toBe(navigation);
+    expect(content.parentElement?.nextElementSibling).toBe(navigation);
     expect(
       screen
         .getByRole('button', { name: 'Workspace action' })

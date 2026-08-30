@@ -52,9 +52,10 @@ function DestinationNavigation({
 }: {
   destination: WorkspaceDestination;
   setDestination: (destination: WorkspaceDestination) => void;
-  placement: 'top-shell' | 'bottom-dock';
+  placement: 'sidebar' | 'bottom-dock';
   hasTelegram: boolean;
 }) {
+  const sidebar = placement === 'sidebar';
   const destinations = hasTelegram
     ? [
         DESTINATIONS[0],
@@ -69,13 +70,19 @@ function DestinationNavigation({
   return (
     <nav
       aria-label="Workspace navigation"
+      aria-orientation={sidebar ? 'vertical' : 'horizontal'}
       data-placement={placement}
       className={
-        placement === 'top-shell'
-          ? 'glass relative z-20 mx-auto mt-2 flex w-[min(calc(100%-2rem),40rem)] items-center justify-center gap-1 rounded-2xl p-1.5'
+        sidebar
+          ? 'relative z-20 flex w-48 shrink-0 flex-col gap-1 border-r border-line bg-panel/55 p-3 backdrop-blur-2xl xl:w-56'
           : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
       }
     >
+      {sidebar ? (
+        <p className="mb-2 px-3 font-mono text-[9px] uppercase tracking-[0.18em] text-ink-3">
+          Navigate
+        </p>
+      ) : null}
       {destinations.map((item) => {
         const active = destination === item.id;
         return (
@@ -84,7 +91,11 @@ function DestinationNavigation({
             type="button"
             onClick={() => setDestination(item.id)}
             aria-current={active ? 'page' : undefined}
-            className={`inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition md:max-w-40 ${
+            className={`inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition ${
+              sidebar
+                ? 'w-full justify-start py-2.5 text-left'
+                : 'flex-1 justify-center'
+            } ${
               active
                 ? 'bg-accent/12 text-accent shadow-[inset_0_0_0_1px_rgb(var(--color-accent-rgb)/0.18)]'
                 : 'text-ink-3 hover:bg-white/[0.04] hover:text-ink'
@@ -141,26 +152,28 @@ export function WorkspaceShell({
         onOpenSettings={onOpenSettings}
       />
 
-      {desktopNavigation ? (
-        <DestinationNavigation
-          destination={destination}
-          setDestination={setDestination}
-          placement="top-shell"
-          hasTelegram={telegram !== null}
-        />
-      ) : null}
+      <div className="relative flex min-h-0 flex-1">
+        {desktopNavigation ? (
+          <DestinationNavigation
+            destination={destination}
+            setDestination={setDestination}
+            placement="sidebar"
+            hasTelegram={telegram !== null}
+          />
+        ) : null}
 
-      <main className="spatial-canvas workspace-mobile-safe relative min-h-0 flex-1">
-        {destination === 'workspace' ? (
-          workspace
-        ) : destination === 'telegram' && telegram !== null ? (
-          telegram
-        ) : destination === 'activity' ? (
-          activity
-        ) : (
-          <AgentsView agents={agents} mainAgent={mainAgent} />
-        )}
-      </main>
+        <main className="spatial-canvas workspace-mobile-safe relative min-h-0 min-w-0 flex-1">
+          {destination === 'workspace' ? (
+            workspace
+          ) : destination === 'telegram' && telegram !== null ? (
+            telegram
+          ) : destination === 'activity' ? (
+            activity
+          ) : (
+            <AgentsView agents={agents} mainAgent={mainAgent} />
+          )}
+        </main>
+      </div>
 
       {!desktopNavigation ? (
         <DestinationNavigation
