@@ -93,6 +93,16 @@ describe('MarkdownMessage', () => {
     ).not.toBeInTheDocument();
   });
 
+  it('preserves GFM task-list classes without generic list bullets', () => {
+    render(
+      <MarkdownMessage>{'- [ ] pending\n- [x] complete'}</MarkdownMessage>,
+    );
+
+    expect(screen.getByRole('list')).toHaveClass('contains-task-list');
+    expect(screen.getByRole('list')).not.toHaveClass('list-disc');
+    expect(screen.getAllByRole('listitem')[0]).toHaveClass('task-list-item');
+  });
+
   it('labels fenced TypeScript and copies its exact source', async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, 'clipboard', {
@@ -119,6 +129,16 @@ describe('MarkdownMessage', () => {
         .getByTestId('markdown-message')
         .querySelector('[data-markdown-overflow="code"]'),
     ).toBeVisible();
+  });
+
+  it('applies Prism token classes for supported fenced TypeScript', () => {
+    render(
+      <MarkdownMessage>
+        {'```typescript\nconst answer = 42;\n```'}
+      </MarkdownMessage>,
+    );
+
+    expect(screen.getByText('const')).toHaveClass('token', 'keyword');
   });
 
   it('restores Copy after two seconds', async () => {
@@ -165,6 +185,34 @@ describe('MarkdownMessage', () => {
     expect(
       await screen.findByRole('button', { name: 'Copy failed' }),
     ).toBeVisible();
+  });
+
+  it('does not schedule clipboard feedback after unmounting during a pending copy', async () => {
+    vi.useFakeTimers();
+    let resolveWrite: (() => void) | undefined;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: vi.fn(
+          () =>
+            new Promise<void>((resolve) => {
+              resolveWrite = resolve;
+            }),
+        ),
+      },
+    });
+    const { unmount } = render(
+      <MarkdownMessage>{'```text\nhello\n```'}</MarkdownMessage>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Copy' }));
+    unmount();
+    resolveWrite?.();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('falls back to original source for an unknown fenced language', () => {

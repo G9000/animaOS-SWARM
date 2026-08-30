@@ -54,18 +54,31 @@ function CodeBlock({
   const resetTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
+  const mounted = useRef(true);
+  const copyOperation = useRef(0);
 
-  useEffect(() => () => clearTimeout(resetTimer.current), []);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      copyOperation.current += 1;
+      clearTimeout(resetTimer.current);
+    };
+  }, []);
 
   const copy = async () => {
+    const operation = ++copyOperation.current;
+    let nextState: 'copied' | 'failed';
     try {
       if (!navigator.clipboard?.writeText)
         throw new Error('Clipboard unavailable');
       await navigator.clipboard.writeText(source);
-      setCopyState('copied');
+      nextState = 'copied';
     } catch {
-      setCopyState('failed');
+      nextState = 'failed';
     }
+    if (!mounted.current || operation !== copyOperation.current) return;
+    setCopyState(nextState);
     clearTimeout(resetTimer.current);
     resetTimer.current = setTimeout(() => setCopyState('idle'), 2_000);
   };
@@ -131,13 +144,25 @@ const components: Components = {
     <h3 className="mt-3 text-sm font-medium text-slate-100">{children}</h3>
   ),
   p: ({ children }) => <p className="mt-2 first:mt-0">{children}</p>,
-  ul: ({ children }) => (
-    <ul className="mt-2 list-disc space-y-1 pl-5">{children}</ul>
-  ),
+  ul: ({ children, className, node: _node, ...props }) => {
+    const taskList = className?.includes('contains-task-list');
+    return (
+      <ul
+        {...props}
+        className={`mt-2 space-y-1 ${taskList ? 'list-none pl-0' : 'list-disc pl-5'} ${className ?? ''}`}
+      >
+        {children}
+      </ul>
+    );
+  },
   ol: ({ children }) => (
     <ol className="mt-2 list-decimal space-y-1 pl-5">{children}</ol>
   ),
-  li: ({ children }) => <li className="pl-1">{children}</li>,
+  li: ({ children, className, node: _node, ...props }) => (
+    <li {...props} className={`pl-1 ${className ?? ''}`}>
+      {children}
+    </li>
+  ),
   blockquote: ({ children }) => (
     <blockquote className="mt-2 border-l-2 border-slate-500 pl-3 text-slate-300">
       {children}
