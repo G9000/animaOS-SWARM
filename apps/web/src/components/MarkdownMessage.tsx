@@ -1,11 +1,4 @@
-import {
-  Component,
-  type ReactNode,
-  type TdHTMLAttributes,
-  useEffect,
-  useRef,
-  useState,
-} from 'react';
+import { Component, type ReactNode, useEffect, useRef, useState } from 'react';
 import { Highlight, Prism, themes } from 'prism-react-renderer';
 import ReactMarkdown, {
   defaultUrlTransform,
@@ -21,18 +14,6 @@ function sourceText(children: ReactNode): string {
   return Array.isArray(children)
     ? children.map(sourceText).join('')
     : String(children);
-}
-
-function tableAlignment(
-  value: unknown,
-): TdHTMLAttributes<HTMLTableCellElement>['align'] {
-  return value === 'left' ||
-    value === 'center' ||
-    value === 'right' ||
-    value === 'justify' ||
-    value === 'char'
-    ? value
-    : undefined;
 }
 
 function PlainCode({ source }: { source: string }) {
@@ -239,24 +220,38 @@ const components: Components = {
       {children}
     </thead>
   ),
-  th: ({ children, className, node, ...props }) => {
-    const align = tableAlignment(node?.properties.align);
+  th: ({ children, className, node, style, ...props }) => {
+    const textAlign =
+      node?.properties.align === 'left'
+        ? 'left'
+        : node?.properties.align === 'center'
+          ? 'center'
+          : node?.properties.align === 'right'
+            ? 'right'
+            : undefined;
     return (
       <th
         {...props}
-        align={align}
+        style={{ ...style, ...(textAlign ? { textAlign } : {}) }}
         className={`border-b border-line px-3 py-2 font-semibold ${className ?? ''}`}
       >
         {children}
       </th>
     );
   },
-  td: ({ children, className, node, ...props }) => {
-    const align = tableAlignment(node?.properties.align);
+  td: ({ children, className, node, style, ...props }) => {
+    const textAlign =
+      node?.properties.align === 'left'
+        ? 'left'
+        : node?.properties.align === 'center'
+          ? 'center'
+          : node?.properties.align === 'right'
+            ? 'right'
+            : undefined;
     return (
       <td
         {...props}
-        align={align}
+        style={{ ...style, ...(textAlign ? { textAlign } : {}) }}
         className={`border-b border-line px-3 py-2 align-top ${className ?? ''}`}
       >
         {children}

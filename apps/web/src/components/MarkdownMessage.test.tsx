@@ -97,13 +97,14 @@ describe('MarkdownMessage', () => {
       'title',
       'Reference title',
     );
-    expect(
-      screen.getByRole('columnheader', { name: 'Center' }),
-    ).toHaveAttribute('align', 'center');
-    expect(screen.getByRole('cell', { name: 'c' })).toHaveAttribute(
-      'align',
-      'right',
-    );
+    const centerHeader = screen.getByRole('columnheader', { name: 'Center' });
+    const rightCell = screen.getByRole('cell', { name: 'c' });
+    expect(centerHeader).toHaveStyle({ textAlign: 'center' });
+    expect(rightCell).toHaveStyle({
+      textAlign: 'right',
+    });
+    expect(centerHeader).not.toHaveAttribute('align');
+    expect(rightCell).not.toHaveAttribute('align');
   });
 
   it('keeps inline code free of a copy control', () => {
