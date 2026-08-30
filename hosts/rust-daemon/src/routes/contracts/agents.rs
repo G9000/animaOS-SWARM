@@ -242,6 +242,40 @@ pub(crate) struct AgentRecentMemoriesQuery {
     pub(crate) limit: Option<usize>,
 }
 
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceIdentityRequest {
+    pub(crate) company_name: String,
+    pub(crate) mission: String,
+    #[serde(default)]
+    pub(crate) values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GenerateProfileRequest {
+    pub(crate) preset_id: String,
+    pub(crate) intent: String,
+    pub(crate) provider: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) workspace: WorkspaceIdentityRequest,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentProfileResponse {
+    pub(crate) bio: String,
+    pub(crate) adjectives: Vec<String>,
+    pub(crate) style: String,
+    pub(crate) system: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentProfileEnvelope {
+    pub(crate) profile: AgentProfileResponse,
+}
+
 impl AgentConfigRequest {
     pub(crate) fn into_domain(self) -> Result<AgentConfig, &'static str> {
         Ok(AgentConfig {

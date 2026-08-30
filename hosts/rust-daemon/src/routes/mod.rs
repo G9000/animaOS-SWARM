@@ -5,6 +5,7 @@ mod contracts;
 mod health;
 mod http;
 mod memories;
+mod profile;
 mod schedules;
 mod swarms;
 mod workspace;
@@ -33,15 +34,15 @@ use crate::schedules::SchedulerService;
 
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
-    AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRelationshipCreateRequest,
-    AgentRelationshipQuery, AgentRelationshipResponse, AgentRelationshipsEnvelope,
-    AgentUpdateRequest, AgentsEnvelope, DeleteResponse, ErrorBody, HealthResponse,
-    MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope, MemoryEntityCreateRequest,
-    MemoryEntityQuery, MemoryEntityResponse, MemoryEvaluationOutcomeResponse,
-    MemoryEvaluationRequest, MemoryEvaluationResponse, MemoryEvidenceTraceResponse,
-    MemoryReadinessResponse, MemoryRecallEnvelope, MemoryRecallQuery, MemoryResponse,
-    MemoryRetentionReportResponse, MemoryRetentionRequest, MemorySearchEnvelope, MemorySearchQuery,
-    ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
+    AgentConfigRequest, AgentEnvelope, AgentProfileEnvelope, AgentRecentMemoriesQuery,
+    AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
+    AgentRelationshipsEnvelope, AgentUpdateRequest, AgentsEnvelope, DeleteResponse, ErrorBody,
+    GenerateProfileRequest, HealthResponse, MemoriesEnvelope, MemoryCreateRequest,
+    MemoryEntitiesEnvelope, MemoryEntityCreateRequest, MemoryEntityQuery, MemoryEntityResponse,
+    MemoryEvaluationOutcomeResponse, MemoryEvaluationRequest, MemoryEvaluationResponse,
+    MemoryEvidenceTraceResponse, MemoryReadinessResponse, MemoryRecallEnvelope, MemoryRecallQuery,
+    MemoryResponse, MemoryRetentionReportResponse, MemoryRetentionRequest, MemorySearchEnvelope,
+    MemorySearchQuery, ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
     SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
     WorkspaceConfigRequest, WorkspaceResponse,
 };
@@ -76,6 +77,7 @@ use crate::runtime_model::provider_summaries;
         list_agent_relationships_entry,
         list_agents_entry,
         create_agent_entry,
+        generate_profile_entry,
         get_agent_entry,
         update_agent_entry,
         delete_agent_entry,
@@ -305,6 +307,10 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents",
             get(list_agents_entry).post(create_agent_entry),
+        )
+        .route(
+            "/api/agents/generate-profile",
+            axum::routing::post(generate_profile_entry),
         )
         .route(
             "/api/agents/{agent_id}",
@@ -815,6 +821,30 @@ async fn list_agent_relationships_entry(State(state): State<AppState>, uri: Uri)
     match memories::handle_list_agent_relationships(query, &state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/agents/generate-profile",
+    tag = "agents",
+    request_body = GenerateProfileRequest,
+    responses(
+        (status = 200, description = "Generated agent personality profile", body = AgentProfileEnvelope),
+        (status = 400, description = "Invalid request, unknown preset, or no generative provider configured", body = ErrorBody),
+        (status = 503, description = "Model output could not be parsed into a profile", body = ErrorBody)
+    )
+)]
+async fn generate_profile_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => match profile::handle_generate_profile(body, &state.daemon).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
+        Err(response) => response,
     }
 }
 

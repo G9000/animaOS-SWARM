@@ -1357,7 +1357,7 @@ fn map_agent_definition(raw: Value) -> AgentDefinitionResponse {
     }
 }
 
-fn strip_code_fences(value: &str) -> String {
+pub(super) fn strip_code_fences(value: &str) -> String {
     let mut text = value.trim().to_string();
     if text.starts_with("```") {
         if let Some(rest) = text.strip_prefix("```") {
