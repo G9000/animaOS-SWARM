@@ -4,6 +4,13 @@ import { ACCESS_PROFILES, type AccessProfile } from '../../lib/agent-access';
 import type { DaemonProvider } from '../../lib/daemon-api';
 
 export interface ReviewStepProps {
+  workspace: {
+    companyName: string;
+    mission: string;
+    rootPath: string;
+  };
+  presetLabel: string;
+  bio: string;
   name: string;
   system: string;
   provider: string;
@@ -17,6 +24,9 @@ export interface ReviewStepProps {
 }
 
 export function ReviewStep({
+  workspace,
+  presetLabel,
+  bio,
   name,
   system,
   provider,
@@ -54,9 +64,33 @@ export function ReviewStep({
         </p>
       </div>
 
+      <div className="rounded-2xl border border-line bg-white/[0.02] p-4">
+        <p className="text-sm font-semibold text-ink">
+          <span aria-hidden="true">🏢 </span>
+          {workspace.companyName.trim()}
+        </p>
+        <p className="mt-1 text-sm text-ink-2">{workspace.mission.trim()}</p>
+        <p
+          className="mt-1 truncate font-mono text-xs text-ink-3"
+          title={workspace.rootPath}
+        >
+          {workspace.rootPath}
+        </p>
+      </div>
+
       <dl className="grid gap-3 rounded-2xl border border-line bg-abyss/35 p-4 sm:grid-cols-[10rem_1fr] sm:p-5">
         <dt className="text-xs uppercase tracking-wide text-ink-3">Name</dt>
-        <dd className="text-sm text-ink">{name.trim()}</dd>
+        <dd className="text-sm text-ink">
+          {name.trim()}
+          {bio.trim() ? (
+            <span className="mt-1 block text-xs leading-relaxed text-ink-3">
+              {bio.trim()}
+            </span>
+          ) : null}
+        </dd>
+
+        <dt className="text-xs uppercase tracking-wide text-ink-3">Preset</dt>
+        <dd className="text-sm text-ink">{presetLabel}</dd>
 
         <dt className="text-xs uppercase tracking-wide text-ink-3">
           Provider / model
@@ -93,6 +127,11 @@ export function ReviewStep({
           {createError}
         </p>
       ) : null}
+
+      <p className="text-xs leading-relaxed text-ink-3">
+        Creates the workspace, the company file (anima.yaml), and your agent in
+        one step — if anything fails, nothing is half-created.
+      </p>
 
       <div className="flex items-center justify-between gap-3">
         <button

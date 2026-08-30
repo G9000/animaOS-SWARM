@@ -600,7 +600,7 @@ describe('OnboardingFlow', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('summarizes the agent name, provider/model, and access on Review', async () => {
+  it('summarizes the workspace, preset, agent name, provider/model, and access on Review', async () => {
     const user = userEvent.setup();
     renderFlow();
     await goToAgent(user);
@@ -612,6 +612,19 @@ describe('OnboardingFlow', () => {
     await user.click(screen.getByRole('radio', { name: /Operate/ }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
 
+    expect(screen.getByText(WORKSPACE.companyName)).toBeVisible();
+    expect(screen.getByText(WORKSPACE.mission)).toBeVisible();
+    const rootPath = screen.getByTitle(WORKSPACE.rootPath);
+    expect(rootPath).toHaveTextContent(WORKSPACE.rootPath);
+    expect(screen.getByText('Chief of Staff')).toBeVisible();
+
+    const template = presetTemplate('chief-of-staff', {
+      companyName: WORKSPACE.companyName,
+      mission: WORKSPACE.mission,
+      agentName: 'Nova',
+    });
+    expect(screen.getByText(template.bio)).toBeVisible();
+
     expect(screen.getByText('Nova')).toBeVisible();
     expect(screen.getByText('OpenAI / gpt-4o')).toBeVisible();
     expect(screen.getByText('Operate')).toBeVisible();
@@ -619,6 +632,9 @@ describe('OnboardingFlow', () => {
       screen.getByText(
         'Can execute shell commands and manage background processes.',
       ),
+    ).toBeVisible();
+    expect(
+      screen.getByText(/if anything fails, nothing is half-created/),
     ).toBeVisible();
   });
 

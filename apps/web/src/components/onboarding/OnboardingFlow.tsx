@@ -4,7 +4,11 @@ import {
   toolNamesForProfile,
   type AccessProfile,
 } from '../../lib/agent-access';
-import { presetTemplate, type PresetId } from '../../lib/agent-presets';
+import {
+  presetById,
+  presetTemplate,
+  type PresetId,
+} from '../../lib/agent-presets';
 import {
   daemon,
   MODEL_SUGGESTIONS,
@@ -693,6 +697,9 @@ export function OnboardingFlow({
     default:
       stepContent = (
         <ReviewStep
+          workspace={draft.workspace}
+          presetLabel={presetById(draft.presetId)?.label ?? draft.presetId}
+          bio={draft.bio}
           name={draft.name}
           system={draft.system}
           provider={draft.provider}
