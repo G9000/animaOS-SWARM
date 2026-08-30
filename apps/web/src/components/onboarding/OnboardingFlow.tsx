@@ -127,6 +127,7 @@ export function OnboardingFlow({
   onCreated,
 }: OnboardingFlowProps) {
   const [draft, setDraft] = useState<OnboardingDraft>(INITIAL_DRAFT);
+  const [workspaceConfigured, setWorkspaceConfigured] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
   const [blockingError, setBlockingError] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -162,13 +163,30 @@ export function OnboardingFlow({
   }, []);
 
   // Pre-fill the workspace folder from the daemon's default root. Failure is
-  // non-blocking: the field simply stays empty for manual entry.
+  // non-blocking: the field simply stays empty for manual entry. When the
+  // daemon reports an already-configured workspace (e.g. the user reset the
+  // only agent), prefill the persisted workspace instead — submit will then
+  // re-use createAgent rather than re-bootstrapping.
   useEffect(() => {
     let active = true;
     daemon
       .getWorkspace()
       .then((state) => {
         if (!active) {
+          return;
+        }
+        if (state.configured && state.workspace) {
+          const existing = state.workspace;
+          setWorkspaceConfigured(true);
+          setDraft((current) => ({
+            ...current,
+            workspace: {
+              companyName: existing.companyName,
+              mission: existing.mission,
+              rootPath: existing.rootPath,
+              values: existing.values,
+            },
+          }));
           return;
         }
         setDraft((current) =>
@@ -583,6 +601,24 @@ export function OnboardingFlow({
     setCreating(true);
     setCreateError(null);
     try {
+      if (workspaceConfigured) {
+        // The workspace is already bootstrapped (bootstrapWorkspace would 409):
+        // hire the agent into the existing workspace via the classic route.
+        // Note: createAgent's wire type carries no bio/adjectives/style, so
+        // those profile fields are folded into `system` only.
+        const response = await daemon.createAgent({
+          name,
+          ...(draft.provider ? { provider: draft.provider } : {}),
+          model: resolvedModel,
+          ...(draft.system.trim() ? { system: draft.system.trim() } : {}),
+          tools: toolNamesForProfile(draft.access),
+        });
+        if (mountedRef.current) {
+          onCreated(response.agent);
+        }
+        return;
+      }
+
       const response = await daemon.bootstrapWorkspace({
         workspace: {
           rootPath: draft.workspace.rootPath.trim(),
@@ -708,6 +744,7 @@ export function OnboardingFlow({
           providers={providers}
           creating={creating}
           createError={createError}
+          bootstrapsWorkspace={!workspaceConfigured}
           onBack={goBack}
           onSubmit={() => void submit()}
         />
@@ -725,7 +762,9 @@ export function OnboardingFlow({
             Set up your workspace
           </h1>
           <p className="mx-auto max-w-lg text-sm leading-relaxed text-ink-2">
-            Name your company, pick its folder, and hire your first agent.
+            {workspaceConfigured
+              ? 'Your workspace is ready — hire another agent.'
+              : 'Name your company, pick its folder, and hire your first agent.'}
           </p>
         </header>
 

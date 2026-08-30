@@ -19,6 +19,8 @@ export interface ReviewStepProps {
   providers: DaemonProvider[] | null;
   creating: boolean;
   createError: string | null;
+  /** true when submit bootstraps the workspace; false when it only creates an agent. */
+  bootstrapsWorkspace?: boolean;
   onBack(): void;
   onSubmit(): void;
 }
@@ -35,6 +37,7 @@ export function ReviewStep({
   providers,
   creating,
   createError,
+  bootstrapsWorkspace = true,
   onBack,
   onSubmit,
 }: ReviewStepProps) {
@@ -129,8 +132,9 @@ export function ReviewStep({
       ) : null}
 
       <p className="text-xs leading-relaxed text-ink-3">
-        Creates the workspace, the company file (anima.yaml), and your agent in
-        one step — if anything fails, nothing is half-created.
+        {bootstrapsWorkspace
+          ? 'Creates the workspace, the company file (anima.yaml), and your agent in one step — if anything fails, nothing is half-created.'
+          : 'Your workspace already exists — this step only creates the agent.'}
       </p>
 
       <div className="flex items-center justify-between gap-3">

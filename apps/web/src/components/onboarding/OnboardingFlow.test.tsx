@@ -706,6 +706,74 @@ describe('OnboardingFlow', () => {
     expect(bootstrapWorkspace).toHaveBeenCalledTimes(1);
   });
 
+  it('re-uses createAgent and prefills the draft when the workspace is already configured', async () => {
+    const user = userEvent.setup();
+    const existingWorkspace = {
+      rootPath: '/srv/acme',
+      companyName: 'Acme Corp',
+      mission: 'Ship calmly',
+      values: ['cite sources'],
+    };
+    vi.spyOn(daemon, 'getWorkspace').mockResolvedValue({
+      configured: true,
+      workspace: existingWorkspace,
+      defaultRoot: '/Users/dev/anima',
+    });
+    const created = snapshot();
+    const createAgent = vi
+      .spyOn(daemon, 'createAgent')
+      .mockResolvedValue({ agent: created });
+    const bootstrapWorkspace = vi.spyOn(daemon, 'bootstrapWorkspace');
+    const onCreated = vi.fn();
+    renderFlow({ onCreated });
+
+    expect(
+      await screen.findByDisplayValue('Acme Corp'),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
+    ).toHaveValue('Ship calmly');
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue('/srv/acme');
+    expect(screen.getByRole('textbox', { name: /Values/ })).toHaveValue(
+      'cite sources',
+    );
+    expect(
+      screen.getByText('Your workspace is ready — hire another agent.'),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByRole('heading', { name: 'Intelligence' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    const name = screen.getByRole('textbox', { name: 'Name' });
+    await user.clear(name);
+    await user.type(name, 'Nova');
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(screen.getByRole('radio', { name: /Operate/ }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+
+    expect(screen.getByRole('heading', { name: 'Review' })).toBeVisible();
+    expect(screen.queryByText(/anima\.yaml/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith(created));
+    const template = presetTemplate('chief-of-staff', {
+      companyName: 'Acme Corp',
+      mission: 'Ship calmly',
+      agentName: 'Nova',
+    });
+    expect(createAgent).toHaveBeenCalledTimes(1);
+    expect(createAgent).toHaveBeenCalledWith({
+      name: 'Nova',
+      provider: 'openai',
+      model: 'gpt-4o',
+      system: template.system,
+      tools: toolNamesForProfile('operate'),
+    });
+    expect(bootstrapWorkspace).not.toHaveBeenCalled();
+  });
+
   it('stays on Review with the full draft intact when bootstrap fails', async () => {
     const user = userEvent.setup();
     const bootstrapWorkspace = vi
