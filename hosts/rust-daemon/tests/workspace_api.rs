@@ -498,6 +498,22 @@ async fn inspect_rejects_blank_orchestrator_bio() {
 }
 
 #[tokio::test]
+async fn inspect_rejects_yaml_without_mission_or_description() {
+    let root = support::use_temp_workspace_root("inspect-no-mission");
+    let yaml = VALID_AGENCY_YAML
+        .replace("description: Continuous equity research\n", "")
+        .replace("mission: Continuous equity research\n", "");
+    std::fs::write(root.path().join("anima.yaml"), yaml).expect("yaml writes");
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("mission or description is required"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
 async fn inspect_rejects_missing_root_path_param_with_json_error() {
     let app = test_app();
     let (status, body) = send_empty_request(&app, "GET", "/api/workspace/inspect").await;

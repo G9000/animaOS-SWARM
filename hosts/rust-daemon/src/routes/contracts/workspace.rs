@@ -64,7 +64,7 @@ pub(crate) struct WorkspaceResponse {
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-// Consumed by PUT /api/workspace and POST /api/workspace/bootstrap (Tasks 4/6).
+// Consumed by PUT /api/workspace and POST /api/workspace/bootstrap.
 pub(crate) struct WorkspaceConfigRequest {
     pub(crate) root_path: String,
     pub(crate) company_name: String,

@@ -45,6 +45,18 @@ pub(crate) async fn handle_inspect_workspace(
         return Ok(not_found());
     }
     let config = load_agency_yaml(&yaml_path)?;
+    // Mirror the resume contract up front: a workspace without a mission or
+    // description cannot be adopted, so report it as malformed here instead
+    // of showing a resume card that would always fail at resume time.
+    let mission = config
+        .mission
+        .clone()
+        .unwrap_or_else(|| config.description.clone());
+    if mission.trim().is_empty() {
+        return Err(ApiError::bad_request_static(
+            "anima.yaml: mission or description is required",
+        ));
+    }
     let provider = {
         let provider = config.provider.trim();
         if provider.is_empty() {
