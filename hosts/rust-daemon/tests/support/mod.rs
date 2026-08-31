@@ -110,6 +110,19 @@ pub(crate) async fn send_empty_request(
     .await
 }
 
+/// Build a GET URI with one query parameter, percent-encoding the value
+/// (Windows paths contain `:` and `\`, which must be encoded).
+pub(crate) fn query_uri(path: &str, param: &str, value: &str) -> String {
+    let encoded: String = value
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            other => format!("%{:02X}", other as u32),
+        })
+        .collect();
+    format!("{path}?{param}={encoded}")
+}
+
 pub(crate) fn extract_json_string_field(response: &str, field: &str) -> String {
     let needle = format!("\"{field}\":\"");
     let start = response

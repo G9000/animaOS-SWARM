@@ -12,7 +12,7 @@ mod workspace;
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request as AxumRequest, State};
+use axum::extract::{Path, Query, Request as AxumRequest, State};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response as AxumResponse};
 use axum::routing::get;
@@ -45,7 +45,7 @@ use self::contracts::{
     MemorySearchQuery, ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
     SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
     WorkspaceBootstrapRequest, WorkspaceBootstrapResponse, WorkspaceConfigRequest,
-    WorkspaceResponse,
+    WorkspaceInspectQuery, WorkspaceInspectResponse, WorkspaceResponse,
 };
 pub(crate) use self::contracts::{
     AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
@@ -93,6 +93,7 @@ use crate::runtime_model::provider_summaries;
         get_workspace_entry,
         put_workspace_entry,
         bootstrap_workspace_entry,
+        inspect_workspace_entry,
         connectors::list_connectors,
         connectors::create_telegram_connector,
         connectors::replace_telegram_credential,
@@ -282,6 +283,7 @@ fn router_with_services_with_policies(
             "/api/workspace/bootstrap",
             axum::routing::post(bootstrap_workspace_entry),
         )
+        .route("/api/workspace/inspect", get(inspect_workspace_entry))
         .route(
             "/api/agencies/create",
             axum::routing::post(create_agency_entry),
@@ -1241,6 +1243,23 @@ async fn bootstrap_workspace_entry(
             }
         }
         Err(response) => response,
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/workspace/inspect",
+    tag = "workspace",
+    params(("rootPath" = String, Query, description = "Workspace root path to inspect")),
+    responses(
+        (status = 200, description = "Workspace inspection result", body = WorkspaceInspectResponse),
+        (status = 400, description = "Invalid path or anima.yaml", body = ErrorBody)
+    )
+)]
+async fn inspect_workspace_entry(Query(query): Query<WorkspaceInspectQuery>) -> AxumResponse {
+    match workspace::handle_inspect_workspace(&query.root_path).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
     }
 }
 

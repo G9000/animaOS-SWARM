@@ -3,15 +3,93 @@ use std::path::{Path, PathBuf};
 
 use anima_core::{AgentConfig, ToolDescriptor};
 
-use super::agencies::{AgencyYamlAgent, AgencyYamlConfig};
+use super::agencies::{load_agency_yaml, AgencyYamlAgent, AgencyYamlConfig};
 use super::contracts::{
     AgentRuntimeSnapshotResponse, WorkspaceBootstrapRequest, WorkspaceBootstrapResponse,
-    WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceResponse,
+    WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceInspectAgentPreview,
+    WorkspaceInspectResponse, WorkspaceResponse,
 };
 use super::profile::profile_preset;
 use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::control_plane_store::WorkspaceConfig;
+use crate::runtime_model::provider_summaries;
+
+/// Read-only inspection of a candidate workspace root: reports whether an
+/// anima.yaml exists there and, when it does, a preview of the agency it
+/// describes. Used by onboarding to offer resuming an existing workspace.
+/// A relative rootPath resolves against the daemon's current working
+/// directory; the web console always sends absolute paths.
+pub(crate) async fn handle_inspect_workspace(
+    root_path: &str,
+) -> Result<WorkspaceInspectResponse, ApiError> {
+    let not_found = || WorkspaceInspectResponse {
+        found: false,
+        company_name: None,
+        mission: None,
+        values: None,
+        orchestrator: None,
+        workers: None,
+        provider_available: None,
+    };
+    let trimmed = root_path.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request_static("rootPath is required"));
+    }
+    let candidate = PathBuf::from(trimmed);
+    if !candidate.is_dir() {
+        return Ok(not_found());
+    }
+    let yaml_path = candidate.join("anima.yaml");
+    if !yaml_path.is_file() {
+        return Ok(not_found());
+    }
+    let config = load_agency_yaml(&yaml_path)?;
+    let provider = {
+        let provider = config.provider.trim();
+        if provider.is_empty() {
+            "openai".to_string()
+        } else {
+            provider.to_string()
+        }
+    };
+    // providerAvailable mirrors the providers catalog: unknown or
+    // unconfigured providers (and the deterministic adapter) report false.
+    let provider_available = provider_summaries()
+        .into_iter()
+        .find(|summary| summary.id == provider)
+        .map(|summary| summary.configured && summary.id != "deterministic")
+        .unwrap_or(false);
+    let preview = |agent: &AgencyYamlAgent, include_bio: bool| WorkspaceInspectAgentPreview {
+        name: agent.name.clone(),
+        bio: if include_bio {
+            Some(agent.bio.clone())
+        } else {
+            None
+        },
+        provider: provider.clone(),
+        model: agent.model.clone().unwrap_or_else(|| config.model.clone()),
+    };
+    Ok(WorkspaceInspectResponse {
+        found: true,
+        company_name: Some(config.name.clone()),
+        mission: config
+            .mission
+            .clone()
+            .or_else(|| Some(config.description.clone()))
+            .filter(|mission| !mission.trim().is_empty()),
+        values: config.values.clone(),
+        orchestrator: Some(preview(&config.orchestrator, true)),
+        workers: Some(
+            config
+                .agents
+                .iter()
+                .map(|agent| preview(agent, false))
+                .collect(),
+        ),
+        provider_available: Some(provider_available),
+    })
+}
 
 pub(crate) async fn handle_get_workspace(
     state: &SharedDaemonState,

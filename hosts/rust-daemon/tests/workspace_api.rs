@@ -1,7 +1,7 @@
 #[allow(dead_code)]
 mod support;
 
-use support::{send_json_request, test_app};
+use support::{send_empty_request, send_json_request, test_app};
 
 #[tokio::test]
 async fn get_workspace_reports_unconfigured_with_default_root() {
@@ -390,4 +390,179 @@ async fn bootstrap_rolls_back_when_agency_yaml_write_fails() {
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+fn inspect_uri(root: &std::path::Path) -> String {
+    support::query_uri(
+        "/api/workspace/inspect",
+        "rootPath",
+        root.to_str().expect("temp root is utf-8"),
+    )
+}
+
+const VALID_AGENCY_YAML: &str = r#"name: Northwind Research
+description: Continuous equity research
+mission: Continuous equity research
+values: [cite sources]
+model: kimi-k2
+provider: moonshot
+strategy: supervisor
+orchestrator:
+  name: Anima
+  bio: A vigilant chief of staff.
+  system: You are Anima.
+  model: kimi-k2
+  tools: [read_file]
+agents:
+  - name: Scout
+    bio: A scout.
+    system: You are Scout.
+"#;
+
+#[tokio::test]
+async fn inspect_returns_found_false_without_yaml() {
+    let root = support::use_temp_workspace_root("inspect-empty");
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("\"found\":false"), "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+    assert!(body.get("companyName").is_none(), "{body}");
+    assert!(body.get("orchestrator").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn inspect_returns_preview_for_valid_yaml() {
+    let root = support::use_temp_workspace_root("inspect-valid");
+    std::fs::write(root.path().join("anima.yaml"), VALID_AGENCY_YAML).expect("yaml writes");
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 200, "{body}");
+
+    let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+    assert_eq!(body["found"], true, "{body}");
+    assert_eq!(body["companyName"], "Northwind Research", "{body}");
+    assert_eq!(body["mission"], "Continuous equity research", "{body}");
+    assert_eq!(
+        body["values"],
+        serde_json::json!(["cite sources"]),
+        "{body}"
+    );
+
+    let orchestrator = &body["orchestrator"];
+    assert_eq!(orchestrator["name"], "Anima", "{body}");
+    assert_eq!(orchestrator["bio"], "A vigilant chief of staff.", "{body}");
+    assert_eq!(orchestrator["provider"], "moonshot", "{body}");
+    assert_eq!(orchestrator["model"], "kimi-k2", "{body}");
+
+    let workers = body["workers"].as_array().expect("workers is an array");
+    assert_eq!(workers.len(), 1, "{body}");
+    assert_eq!(workers[0]["name"], "Scout", "{body}");
+    assert_eq!(workers[0]["model"], "kimi-k2", "{body}");
+    assert!(
+        workers[0].get("bio").is_none(),
+        "worker previews omit bio: {body}"
+    );
+    assert!(
+        workers[0].get("system").is_none(),
+        "worker previews omit system: {body}"
+    );
+
+    assert!(
+        body["providerAvailable"].is_boolean(),
+        "providerAvailable present: {body}"
+    );
+}
+
+#[tokio::test]
+async fn inspect_rejects_malformed_yaml() {
+    let root = support::use_temp_workspace_root("inspect-malformed");
+    std::fs::write(root.path().join("anima.yaml"), "{{ not yaml").expect("yaml writes");
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 400, "{body}");
+}
+
+#[tokio::test]
+async fn inspect_rejects_blank_orchestrator_bio() {
+    let root = support::use_temp_workspace_root("inspect-badfields");
+    let yaml = VALID_AGENCY_YAML.replace("  bio: A vigilant chief of staff.\n", "  bio: \"\"\n");
+    std::fs::write(root.path().join("anima.yaml"), yaml).expect("yaml writes");
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("orchestrator.bio"), "{body}");
+}
+
+#[tokio::test]
+async fn inspect_rejects_missing_root_path_param_with_json_error() {
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", "/api/workspace/inspect").await;
+    assert_eq!(status, 400, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("error body is json");
+    assert_eq!(body["error"], "rootPath is required", "{body}");
+}
+
+#[tokio::test]
+async fn inspect_rejects_empty_root_path_param() {
+    let app = test_app();
+    let uri = support::query_uri("/api/workspace/inspect", "rootPath", "");
+    let (status, body) = send_empty_request(&app, "GET", &uri).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("rootPath is required"), "{body}");
+}
+
+#[tokio::test]
+async fn inspect_defaults_provider_to_openai_when_yaml_omits_provider() {
+    let root = support::use_temp_workspace_root("inspect-default-provider");
+    let yaml = VALID_AGENCY_YAML.replace("provider: moonshot\n", "");
+    std::fs::write(root.path().join("anima.yaml"), yaml).expect("yaml writes");
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 200, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+    assert_eq!(body["found"], true, "{body}");
+    assert_eq!(body["orchestrator"]["provider"], "openai", "{body}");
+    assert_eq!(body["workers"][0]["provider"], "openai", "{body}");
+    assert!(
+        body["providerAvailable"].is_boolean(),
+        "providerAvailable present: {body}"
+    );
+}
+
+#[tokio::test]
+async fn inspect_reports_provider_unavailable_without_moonshot_keys() {
+    let root = support::use_temp_workspace_root("inspect-provider-keys");
+    std::fs::write(root.path().join("anima.yaml"), VALID_AGENCY_YAML).expect("yaml writes");
+    // Pin the environment: moonshot reports configured only when one of its
+    // API-key env vars is set, so clear them all for a deterministic result.
+    // Serialized with the other inspect tests via the workspace-root lock
+    // held by `root`.
+    let saved: Vec<(&'static str, Option<std::ffi::OsString>)> = [
+        "MOONSHOT_API_KEY",
+        "MOONSHOT_KEY",
+        "MOONSHOT_TOKEN",
+        "KIMI_API_KEY",
+    ]
+    .into_iter()
+    .map(|name| {
+        let previous = std::env::var_os(name);
+        std::env::remove_var(name);
+        (name, previous)
+    })
+    .collect();
+
+    let app = test_app();
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+
+    for (name, previous) in saved {
+        if let Some(previous) = previous {
+            std::env::set_var(name, previous);
+        }
+    }
+
+    assert_eq!(status, 200, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+    assert_eq!(body["found"], true, "{body}");
+    assert_eq!(body["providerAvailable"], false, "{body}");
 }

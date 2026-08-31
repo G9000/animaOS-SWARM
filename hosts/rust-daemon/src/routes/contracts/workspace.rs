@@ -1,5 +1,44 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceInspectAgentPreview {
+    pub(crate) name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bio: Option<String>, // orchestrator only; workers omit bio/system
+    pub(crate) provider: String,
+    pub(crate) model: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceInspectResponse {
+    pub(crate) found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) company_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) mission: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) values: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) orchestrator: Option<WorkspaceInspectAgentPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) workers: Option<Vec<WorkspaceInspectAgentPreview>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider_available: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub(crate) struct WorkspaceInspectQuery {
+    // Defaulted so a fully-absent rootPath deserializes to "" and reaches the
+    // handler's "rootPath is required" 400, instead of axum rejecting the
+    // query with a plain-text QueryRejection that bypasses the ErrorBody
+    // envelope.
+    #[serde(rename = "rootPath", default)]
+    pub(crate) root_path: String,
+}
+
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceConfigResponse {
