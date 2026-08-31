@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { memo, useEffect, useRef } from 'react';
 import type { AgentDetail, ChatMessage } from '../lib/types';
 import { AlertIcon, BoltIcon, PulseIcon, SendIcon } from './icons';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -123,7 +123,7 @@ function ThinkingIndicator({ name }: { name: string }) {
   );
 }
 
-export function MessageList({
+export const MessageList = memo(function MessageList({
   agent,
   sending,
   scrollerRef,
@@ -152,7 +152,7 @@ export function MessageList({
       )}
     </div>
   );
-}
+});
 
 /* ── Composer ── */
 export function Composer({
