@@ -83,6 +83,26 @@ describe('MarkdownMessage', () => {
     );
   });
 
+  it('renders Markdown images as inert accessible placeholders', () => {
+    render(
+      <MarkdownMessage>
+        {'![tracking pixel](https://example.com/pixel.gif)'}
+      </MarkdownMessage>,
+    );
+
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.getByText('[Image: tracking pixel]')).toBeVisible();
+  });
+
+  it('uses a neutral placeholder when a Markdown image has no alt text', () => {
+    render(
+      <MarkdownMessage>{'![](https://example.com/pixel.gif)'}</MarkdownMessage>,
+    );
+
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.getByText('[Image]')).toBeVisible();
+  });
+
   it('preserves ordered-list starts, link titles, and table alignment', () => {
     render(
       <MarkdownMessage>

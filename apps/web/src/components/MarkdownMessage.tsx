@@ -205,6 +205,11 @@ const components: Components = {
       {children}
     </a>
   ),
+  img: ({ alt }) => (
+    <span className="text-ink-3">
+      {alt?.trim() ? `[Image: ${alt}]` : '[Image]'}
+    </span>
+  ),
   table: ({ children }) => (
     <div
       className="mt-2 max-w-full overflow-x-auto rounded-md border border-line"
