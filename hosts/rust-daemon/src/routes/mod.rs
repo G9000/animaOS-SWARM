@@ -1275,9 +1275,9 @@ async fn inspect_workspace_entry(Query(query): Query<WorkspaceInspectQuery>) -> 
     tag = "workspace",
     request_body = WorkspaceResumeRequest,
     responses(
-        (status = 201, description = "Workspace adopted from anima.yaml; orchestrator and workers created atomically", body = WorkspaceResumeResponse),
+        (status = 201, description = "Workspace adopted; existing agents kept, missing agents created atomically", body = WorkspaceResumeResponse),
         (status = 400, description = "Missing folder/anima.yaml or invalid agency file", body = ErrorBody),
-        (status = 409, description = "Workspace already configured for a different root, or an agent name already exists", body = ErrorBody),
+        (status = 409, description = "Workspace already configured for a different root, or every agent from anima.yaml already exists", body = ErrorBody),
         (status = 503, description = "Resume could not be persisted; all state was rolled back", body = ErrorBody)
     )
 )]

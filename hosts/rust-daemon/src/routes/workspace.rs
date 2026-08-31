@@ -337,10 +337,12 @@ async fn rollback_bootstrap(
 /// failure restores the previous state. The anima.yaml file is never
 /// modified — resume does not own it.
 ///
-/// Collision policy for this fresh-adopt implementation: any yaml agent name
-/// that already exists (orchestrator or worker) is a 409 before any mutation,
-/// as is a workspace already configured for a different root. Same-root
-/// re-resume with name-skip/restore semantics is a deliberate follow-up.
+/// Conflict + idempotency policy: a workspace already configured for a
+/// DIFFERENT root is a 409. Otherwise (same root, or unconfigured) agents
+/// whose names already exist are skipped — the persisted agent is kept — and
+/// only the missing agents are created, so re-resuming a root restores what
+/// is gone without duplicating what survives. When nothing needed creating at
+/// all, resume returns 409 as a "nothing to do" signal.
 pub(crate) async fn handle_resume_workspace(
     body: Vec<u8>,
     state: &SharedDaemonState,
@@ -405,6 +407,15 @@ pub(crate) async fn handle_resume_workspace(
                     "anima.yaml: orchestrator bio is required",
                 ));
             }
+            // Trim-consistent with the loader's orchestrator.system check:
+            // a whitespace-only worker system would resume an agent with no
+            // instructions, so reject it naming the agent.
+            let system = agent.system.trim().to_string();
+            if system.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "anima.yaml: agent {name} system is required"
+                )));
+            }
             Ok(AgentConfig {
                 name,
                 model,
@@ -422,7 +433,7 @@ pub(crate) async fn handle_resume_workspace(
                         Some(provider)
                     }
                 },
-                system: Some(agent.system.clone()),
+                system: Some(system),
                 tools: agent.tools.as_ref().map(|tools| {
                     tools
                         .iter()
@@ -438,15 +449,32 @@ pub(crate) async fn handle_resume_workspace(
                 settings: None,
             })
         };
+    // Reject yaml-internal duplicate names before any mutation; create_agent
+    // does not enforce name uniqueness, so without this a duplicated name
+    // would silently create two agents.
+    let mut seen_names = std::collections::BTreeSet::new();
     let agent_configs = std::iter::once((&agency.orchestrator, true))
         .chain(agency.agents.iter().map(|agent| (agent, false)))
-        .map(|(agent, is_orchestrator)| to_agent_config(agent, is_orchestrator))
+        .map(|(agent, is_orchestrator)| {
+            to_agent_config(agent, is_orchestrator).and_then(|config| {
+                if seen_names.insert(config.name.clone()) {
+                    Ok(config)
+                } else {
+                    Err(ApiError::bad_request(format!(
+                        "anima.yaml: duplicate agent name '{}'",
+                        config.name
+                    )))
+                }
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // 4. Conflict + collision rules, resolved inside one read: a workspace
-    //    configured for a different root is a 409, and so is any yaml agent
-    //    name that already exists — fresh adopt stays simple and loud.
-    {
+    // 4. Conflict + skip rules, resolved inside one read: a workspace
+    //    configured for a different root is a 409. Otherwise agents whose
+    //    names already exist are skipped (the persisted agent is kept) and
+    //    only the missing ones are created.
+    let orchestrator_name = agent_configs[0].name.clone();
+    let (configs_to_create, skipped, orchestrator_existed) = {
         let guard = state.read().await;
         if let Some(current) = &guard.workspace {
             if current.root_path != workspace_config.root_path {
@@ -461,26 +489,40 @@ pub(crate) async fn handle_resume_workspace(
             .iter()
             .map(|snapshot| snapshot.state.name.clone())
             .collect();
-        for config in &agent_configs {
-            if existing_names.contains(&config.name) {
-                return Err(ApiError::conflict(format!(
-                    "anima.yaml: agent '{}' conflicts with an existing agent; \
-                     rename it in anima.yaml or delete the existing agent first",
-                    config.name
-                )));
-            }
-        }
+        let orchestrator_existed = existing_names.contains(&orchestrator_name);
+        let mut skipped = Vec::new();
+        let configs_to_create = agent_configs
+            .into_iter()
+            .filter(|config| {
+                if existing_names.contains(&config.name) {
+                    skipped.push(config.name.clone());
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+        (configs_to_create, skipped, orchestrator_existed)
+    };
+
+    // Idempotency signal: a re-resume with the full roster already live has
+    // nothing to do.
+    if configs_to_create.is_empty() {
+        return Err(ApiError::conflict(
+            "all agents from anima.yaml already exist",
+        ));
     }
 
-    // 5. One write guard: create the agents in order (orchestrator first),
-    //    tracking created ids so a failure mid-batch rolls back the whole
-    //    batch (create_agent validates tool slugs before inserting, but an
-    //    earlier agent in the batch would already exist).
+    // 5. One write guard: create the missing agents in order (orchestrator
+    //    first when it was not skipped), tracking created ids so a failure
+    //    mid-batch rolls back the whole batch (create_agent validates tool
+    //    slugs before inserting, but an earlier agent in the batch would
+    //    already exist).
     let mut created: Vec<(String, AgentRuntimeSnapshot)> = Vec::new();
     let (previous_workspace, persist_request) = {
         let mut guard = state.write().await;
         let mut failure: Option<ApiError> = None;
-        for config in agent_configs {
+        for config in configs_to_create {
             let agent_name = config.name.clone();
             match guard.create_agent(config) {
                 Ok(snapshot) => created.push((snapshot.state.id.clone(), snapshot)),
@@ -515,15 +557,33 @@ pub(crate) async fn handle_resume_workspace(
     }
 
     let mut snapshots = created.into_iter().map(|(_, snapshot)| snapshot);
-    let orchestrator = snapshots
-        .next()
-        .expect("the orchestrator is always the first agent created on fresh adopt");
+    let orchestrator = if orchestrator_existed {
+        // The orchestrator was skipped by the name-skip rule: report the
+        // existing agent, not the first created worker.
+        let guard = state.read().await;
+        guard
+            .list_agents()
+            .into_iter()
+            .find(|snapshot| snapshot.state.name == orchestrator_name)
+            // Safe today: the route wrapper holds control_plane_transaction() for the
+            // whole handler, and every live remove_agent path takes the same mutex.
+            .ok_or_else(|| {
+                ApiError::conflict(format!(
+                    "orchestrator '{orchestrator_name}' was deleted concurrently; retry resume"
+                ))
+            })?
+    } else {
+        snapshots
+            .next()
+            .expect("fresh adopt always creates the orchestrator first")
+    };
     Ok(WorkspaceResumeResponse {
         workspace: config_response(&workspace_config),
         orchestrator: AgentRuntimeSnapshotResponse::from(&orchestrator),
         workers: snapshots
             .map(|snapshot| AgentRuntimeSnapshotResponse::from(&snapshot))
             .collect(),
+        skipped,
     })
 }
 

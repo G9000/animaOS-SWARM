@@ -1,7 +1,10 @@
 #[allow(dead_code)]
 mod support;
 
-use support::{send_empty_request, send_json_request, test_app};
+use anima_daemon::{app_with_configured_persistence, DaemonConfig};
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use support::{send_empty_request, send_json_request, send_request, test_app};
 
 #[tokio::test]
 async fn get_workspace_reports_unconfigured_with_default_root() {
@@ -574,6 +577,11 @@ async fn resume_adopts_workspace_with_orchestrator_and_workers() {
         "{body}"
     );
     assert_eq!(body["orchestrator"]["state"]["name"], "Anima", "{body}");
+    assert_eq!(
+        body["skipped"],
+        serde_json::json!([]),
+        "fresh adopt without collisions skips nothing: {body}"
+    );
     let workers = body["workers"].as_array().expect("workers is an array");
     assert_eq!(workers.len(), 2, "{body}");
     assert_eq!(workers[0]["state"]["name"], "Scout", "{body}");
@@ -682,4 +690,404 @@ async fn inspect_reports_provider_unavailable_without_moonshot_keys() {
     let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
     assert_eq!(body["found"], true, "{body}");
     assert_eq!(body["providerAvailable"], false, "{body}");
+}
+
+// --- Task 4: resume conflict, idempotency, and rollback semantics ----------
+
+/// Two-agent fixture (orchestrator "Anima" + worker "Scout") for the
+/// idempotency tests.
+const RESUME_RESTORE_YAML: &str = r#"name: Northwind Research
+description: Continuous equity research
+mission: Continuous equity research
+values: [cite sources]
+model: kimi-k2
+provider: moonshot
+strategy: supervisor
+orchestrator:
+  name: Anima
+  bio: A vigilant chief of staff.
+  system: You are Anima.
+  model: kimi-k2
+  tools: [read_file]
+agents:
+  - name: Scout
+    bio: A scout.
+    system: You are Scout.
+"#;
+
+/// A roster whose names deliberately differ from the bootstrap agent, so a
+/// different-root 409 cannot be confused with a name collision.
+const OTHER_ROOT_YAML: &str = r#"name: Contoso
+description: Sales
+mission: Sales
+model: kimi-k2
+strategy: supervisor
+orchestrator:
+  name: Atlas
+  bio: A tireless lead.
+  system: You are Atlas.
+agents:
+  - name: Scout
+    system: You are Scout.
+"#;
+
+async fn resume_workspace(app: &axum::Router, root: &std::path::Path) -> (StatusCode, String) {
+    send_json_request(
+        app,
+        "POST",
+        "/api/workspace/resume",
+        &serde_json::json!({ "rootPath": root }).to_string(),
+    )
+    .await
+}
+
+async fn delete_agent(app: &axum::Router, agent_id: &str) -> (StatusCode, String) {
+    send_request(
+        app,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/agents/{agent_id}"))
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://localhost:4200")
+            .body(Body::empty())
+            .expect("request builds"),
+    )
+    .await
+}
+
+/// The live roster as (id, name) pairs, sorted by name for stable assertions.
+fn roster(body: &str) -> Vec<(String, String)> {
+    let body: serde_json::Value = serde_json::from_str(body).expect("body is json");
+    let mut agents = body["agents"]
+        .as_array()
+        .expect("agents is an array")
+        .iter()
+        .map(|agent| {
+            (
+                agent["state"]["id"].as_str().expect("id").to_string(),
+                agent["state"]["name"].as_str().expect("name").to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    agents.sort_by(|left, right| left.1.cmp(&right.1));
+    agents
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.previous {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
+
+#[tokio::test]
+async fn resume_conflicts_when_configured_for_different_root() {
+    let guard = support::use_temp_workspace_root("resume-diff-root");
+    let root_a = guard.path().join("a");
+    let root_b = guard.path().join("b");
+    std::fs::create_dir_all(&root_b).expect("root b created");
+    std::fs::write(root_b.join("anima.yaml"), OTHER_ROOT_YAML).expect("yaml writes");
+    let app = test_app();
+
+    // Bootstrap configures the daemon for root A.
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &bootstrap_body(&root_a).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "body: {body}");
+
+    // Resuming root B is a conflict that names root A.
+    let (status, body) = resume_workspace(&app, &root_b).await;
+    assert_eq!(status, 409, "{body}");
+    let canonical_a = root_a.canonicalize().expect("root a canonicalizes");
+    let error: serde_json::Value = serde_json::from_str(&body).expect("error body is json");
+    let message = error["error"].as_str().expect("error message");
+    assert!(
+        message.contains(&canonical_a.display().to_string()),
+        "conflict names the configured root: {body}"
+    );
+
+    // Nothing from root B's yaml was created: only the bootstrap agent exists.
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(
+        roster(&agents)
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Anima"],
+        "{agents}"
+    );
+}
+
+#[tokio::test]
+async fn resume_same_root_restores_missing_agents_only() {
+    let root = support::use_temp_workspace_root("resume-restore");
+    std::fs::write(root.path().join("anima.yaml"), RESUME_RESTORE_YAML).expect("yaml writes");
+    let app = test_app();
+
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let first: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+    let orchestrator_id = first["orchestrator"]["state"]["id"]
+        .as_str()
+        .expect("orchestrator id")
+        .to_string();
+    let scout_id = first["workers"][0]["state"]["id"]
+        .as_str()
+        .expect("worker id")
+        .to_string();
+
+    // The worker disappears (crash, owner cleanup, ...); a re-resume of the
+    // same root must restore exactly it.
+    let (status, body) = delete_agent(&app, &scout_id).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let second: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+
+    // The response reports the PRE-EXISTING orchestrator, not a new one.
+    assert_eq!(
+        second["orchestrator"]["state"]["id"].as_str(),
+        Some(orchestrator_id.as_str()),
+        "{second}"
+    );
+    assert_eq!(
+        second["skipped"],
+        serde_json::json!(["Anima"]),
+        "the kept orchestrator is reported as skipped: {second}"
+    );
+    let workers = second["workers"].as_array().expect("workers is an array");
+    assert_eq!(workers.len(), 1, "{second}");
+    assert_eq!(workers[0]["state"]["name"], "Scout", "{second}");
+    assert_ne!(
+        workers[0]["state"]["id"].as_str(),
+        Some(scout_id.as_str()),
+        "the restored worker is a fresh agent: {second}"
+    );
+
+    // The orchestrator was not duplicated and the roster is whole again.
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    let roster = roster(&agents);
+    assert_eq!(roster.len(), 2, "{agents}");
+    assert_eq!(
+        roster.iter().filter(|(_, name)| name == "Anima").count(),
+        1,
+        "orchestrator must not be duplicated: {agents}"
+    );
+
+    let (_, workspace) = send_empty_request(&app, "GET", "/api/workspace").await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    assert_eq!(workspace["configured"], true, "{workspace}");
+}
+
+#[tokio::test]
+async fn resume_fresh_adopt_skips_persisted_agent_name_collisions() {
+    let root = support::use_temp_workspace_root("resume-adopt-collision");
+    std::fs::write(root.path().join("anima.yaml"), RESUME_RESTORE_YAML).expect("yaml writes");
+    let app = test_app();
+
+    // A standalone agent that happens to share the orchestrator's name.
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/agents",
+        r#"{"name":"Anima","model":"gpt-5.4"}"#,
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let existing_id = support::extract_json_string_field(&body, "id");
+
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+
+    // The persisted agent is kept and reported as the orchestrator; only the
+    // missing worker is created.
+    assert_eq!(
+        body["orchestrator"]["state"]["id"].as_str(),
+        Some(existing_id.as_str()),
+        "{body}"
+    );
+    assert_eq!(
+        body["skipped"],
+        serde_json::json!(["Anima"]),
+        "the name collision is reported as skipped: {body}"
+    );
+    let workers = body["workers"].as_array().expect("workers is an array");
+    assert_eq!(workers.len(), 1, "{body}");
+    assert_eq!(workers[0]["state"]["name"], "Scout", "{body}");
+
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    let roster = roster(&agents);
+    assert_eq!(roster.len(), 2, "{agents}");
+    assert!(
+        roster
+            .iter()
+            .any(|(id, name)| id == &existing_id && name == "Anima"),
+        "pre-existing agent kept with its id: {agents}"
+    );
+
+    let (_, workspace) = send_empty_request(&app, "GET", "/api/workspace").await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    assert_eq!(workspace["configured"], true, "{workspace}");
+}
+
+#[tokio::test]
+async fn resume_all_agents_exist_returns_409() {
+    let root = support::use_temp_workspace_root("resume-nothing-to-do");
+    std::fs::write(root.path().join("anima.yaml"), RESUME_RESTORE_YAML).expect("yaml writes");
+    let app = test_app();
+
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+
+    // A second resume with the full roster already live is a meaningful
+    // "nothing to do" conflict rather than a silent 200.
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body.contains("all agents from anima.yaml already exist"),
+        "{body}"
+    );
+
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 2, "{agents}");
+}
+
+#[tokio::test]
+async fn resume_rolls_back_when_persist_fails() {
+    let workspace = support::use_temp_workspace_root("resume-rollback");
+    let control_plane_path = workspace.path().join("control-plane.json");
+    // Serialized against the other workspace tests by the root lock held in
+    // `workspace`.
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    let adopt_root = workspace.path().join("adopt");
+    std::fs::create_dir_all(&adopt_root).expect("adopt root created");
+    std::fs::write(adopt_root.join("anima.yaml"), RESUME_RESTORE_YAML).expect("yaml writes");
+    let app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("app configures persistence");
+
+    // Force the next control-plane save to fail: replace the snapshot file
+    // with a directory so the atomic rename cannot replace it (mirrors the
+    // bootstrap rollback test's anima.yaml technique).
+    std::fs::remove_file(&control_plane_path).expect("startup snapshot exists");
+    std::fs::create_dir(&control_plane_path).expect("sabotage directory created");
+
+    let (status, body) = resume_workspace(&app, &adopt_root).await;
+    assert_eq!(status, 503, "{body}");
+
+    // Full rollback: no agents, no live workspace configuration.
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(
+        roster(&agents).len(),
+        0,
+        "agents must be rolled back: {agents}"
+    );
+    let (_, workspace_body) = send_empty_request(&app, "GET", "/api/workspace").await;
+    let workspace_body: serde_json::Value = serde_json::from_str(&workspace_body).unwrap();
+    assert_eq!(
+        workspace_body["configured"], false,
+        "workspace must be rolled back: {workspace_body}"
+    );
+}
+
+#[tokio::test]
+async fn resume_rejects_yaml_internal_duplicate_names() {
+    let root = support::use_temp_workspace_root("resume-dup-names");
+    let yaml = RESUME_RESTORE_YAML.replace("  - name: Scout\n", "  - name: Anima\n");
+    assert!(yaml.contains("  - name: Anima\n"), "fixture edit applied");
+    std::fs::write(root.path().join("anima.yaml"), yaml).expect("yaml writes");
+    let app = test_app();
+
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("duplicate agent name 'Anima'"),
+        "error names the duplicate: {body}"
+    );
+
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 0, "{agents}");
+    let (_, workspace) = send_empty_request(&app, "GET", "/api/workspace").await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    assert_eq!(workspace["configured"], false, "{workspace}");
+}
+
+#[tokio::test]
+async fn resume_rejects_whitespace_worker_system() {
+    let root = support::use_temp_workspace_root("resume-blank-system");
+    let yaml = RESUME_RESTORE_YAML.replace("    system: You are Scout.\n", "    system: \" \"\n");
+    assert!(yaml.contains("system: \" \""), "fixture edit applied");
+    std::fs::write(root.path().join("anima.yaml"), yaml).expect("yaml writes");
+    let app = test_app();
+
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("Scout"), "error names the agent: {body}");
+
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 0, "{agents}");
+    let (_, workspace) = send_empty_request(&app, "GET", "/api/workspace").await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    assert_eq!(workspace["configured"], false, "{workspace}");
+}
+
+#[tokio::test]
+async fn resumed_agents_survive_restart() {
+    let workspace = support::use_temp_workspace_root("resume-restart");
+    let control_plane_path = workspace.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    std::fs::write(workspace.path().join("anima.yaml"), RESUME_RESTORE_YAML).expect("yaml writes");
+
+    let first_app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("first app should configure persistence");
+    let (status, body) = resume_workspace(&first_app, workspace.path()).await;
+    assert_eq!(status, 201, "{body}");
+    drop(first_app);
+
+    // Respawn against the same control-plane file (mirrors
+    // control_plane_store_recovers_agents_and_swarms_after_restart).
+    let second_app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .expect("second app should configure persistence");
+    let (_, agents) = send_empty_request(&second_app, "GET", "/api/agents").await;
+    assert_eq!(
+        roster(&agents)
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Anima", "Scout"],
+        "resumed roster restored after restart: {agents}"
+    );
+    let (_, workspace_body) = send_empty_request(&second_app, "GET", "/api/workspace").await;
+    let workspace_body: serde_json::Value = serde_json::from_str(&workspace_body).unwrap();
+    assert_eq!(workspace_body["configured"], true, "{workspace_body}");
+    let canonical_root = workspace.path().canonicalize().expect("root canonicalizes");
+    assert_eq!(
+        workspace_body["workspace"]["rootPath"].as_str(),
+        Some(canonical_root.display().to_string().as_str()),
+        "{workspace_body}"
+    );
 }

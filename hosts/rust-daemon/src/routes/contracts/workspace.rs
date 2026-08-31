@@ -121,4 +121,6 @@ pub(crate) struct WorkspaceResumeResponse {
     pub(crate) workspace: WorkspaceConfigResponse,
     pub(crate) orchestrator: super::AgentRuntimeSnapshotResponse,
     pub(crate) workers: Vec<super::AgentRuntimeSnapshotResponse>,
+    /// Names kept because agents with those names already existed (skip rule).
+    pub(crate) skipped: Vec<String>,
 }
