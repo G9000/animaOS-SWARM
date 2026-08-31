@@ -40,5 +40,5 @@ pub(crate) use swarms::{
 pub(crate) use workspace::{
     WorkspaceBootstrapRequest, WorkspaceBootstrapResponse, WorkspaceConfigRequest,
     WorkspaceConfigResponse, WorkspaceInspectAgentPreview, WorkspaceInspectQuery,
-    WorkspaceInspectResponse, WorkspaceResponse,
+    WorkspaceInspectResponse, WorkspaceResponse, WorkspaceResumeRequest, WorkspaceResumeResponse,
 };

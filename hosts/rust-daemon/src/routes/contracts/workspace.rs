@@ -108,3 +108,17 @@ pub(crate) struct WorkspaceBootstrapResponse {
     pub(crate) workspace: WorkspaceConfigResponse,
     pub(crate) agent: super::AgentRuntimeSnapshotResponse,
 }
+
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceResumeRequest {
+    pub(crate) root_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceResumeResponse {
+    pub(crate) workspace: WorkspaceConfigResponse,
+    pub(crate) orchestrator: super::AgentRuntimeSnapshotResponse,
+    pub(crate) workers: Vec<super::AgentRuntimeSnapshotResponse>,
+}

@@ -45,7 +45,8 @@ use self::contracts::{
     MemorySearchQuery, ProviderResponse, ProvidersEnvelope, ReadinessResponse, RecentMemoriesQuery,
     SwarmCreateRequest, SwarmEnvelope, SwarmRunEnvelope, SwarmsEnvelope, TaskRequest,
     WorkspaceBootstrapRequest, WorkspaceBootstrapResponse, WorkspaceConfigRequest,
-    WorkspaceInspectQuery, WorkspaceInspectResponse, WorkspaceResponse,
+    WorkspaceInspectQuery, WorkspaceInspectResponse, WorkspaceResponse, WorkspaceResumeRequest,
+    WorkspaceResumeResponse,
 };
 pub(crate) use self::contracts::{
     AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
@@ -94,6 +95,7 @@ use crate::runtime_model::provider_summaries;
         put_workspace_entry,
         bootstrap_workspace_entry,
         inspect_workspace_entry,
+        resume_workspace_entry,
         connectors::list_connectors,
         connectors::create_telegram_connector,
         connectors::replace_telegram_credential,
@@ -284,6 +286,10 @@ fn router_with_services_with_policies(
             axum::routing::post(bootstrap_workspace_entry),
         )
         .route("/api/workspace/inspect", get(inspect_workspace_entry))
+        .route(
+            "/api/workspace/resume",
+            axum::routing::post(resume_workspace_entry),
+        )
         .route(
             "/api/agencies/create",
             axum::routing::post(create_agency_entry),
@@ -1260,6 +1266,34 @@ async fn inspect_workspace_entry(Query(query): Query<WorkspaceInspectQuery>) -> 
     match workspace::handle_inspect_workspace(&query.root_path).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/api/workspace/resume",
+    tag = "workspace",
+    request_body = WorkspaceResumeRequest,
+    responses(
+        (status = 201, description = "Workspace adopted from anima.yaml; orchestrator and workers created atomically", body = WorkspaceResumeResponse),
+        (status = 400, description = "Missing folder/anima.yaml or invalid agency file", body = ErrorBody),
+        (status = 409, description = "Workspace already configured for a different root, or an agent name already exists", body = ErrorBody),
+        (status = 503, description = "Resume could not be persisted; all state was rolled back", body = ErrorBody)
+    )
+)]
+async fn resume_workspace_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => {
+            let _transaction = state.agent_runs.control_plane_transaction().await;
+            match workspace::handle_resume_workspace(body, &state.daemon).await {
+                Ok(response) => json_response(StatusCode::CREATED, &response),
+                Err(error) => error.into_response(),
+            }
+        }
+        Err(response) => response,
     }
 }
 

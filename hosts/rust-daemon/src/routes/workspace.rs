@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anima_core::{AgentConfig, ToolDescriptor};
+use anima_core::{AgentConfig, AgentRuntimeSnapshot, ToolDescriptor};
 
 use super::agencies::{load_agency_yaml, AgencyYamlAgent, AgencyYamlConfig};
 use super::contracts::{
     AgentRuntimeSnapshotResponse, WorkspaceBootstrapRequest, WorkspaceBootstrapResponse,
     WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceInspectAgentPreview,
-    WorkspaceInspectResponse, WorkspaceResponse,
+    WorkspaceInspectResponse, WorkspaceResponse, WorkspaceResumeRequest, WorkspaceResumeResponse,
 };
 use super::profile::profile_preset;
 use super::ApiError;
@@ -325,6 +325,223 @@ async fn rollback_bootstrap(
         let mut guard = state.write().await;
         guard.remove_agent(agent_id);
         guard.workspace = None;
+        guard.control_plane_persist_request()
+    };
+    rollback_request.save().await.ok();
+}
+
+/// Adopt an existing workspace folder: parse its anima.yaml, create the
+/// orchestrator and workers it describes, and mark the workspace configured.
+/// Atomic, like bootstrap: all validation happens before any mutation, a
+/// mid-batch creation failure rolls back the whole batch, and a persist
+/// failure restores the previous state. The anima.yaml file is never
+/// modified — resume does not own it.
+///
+/// Collision policy for this fresh-adopt implementation: any yaml agent name
+/// that already exists (orchestrator or worker) is a 409 before any mutation,
+/// as is a workspace already configured for a different root. Same-root
+/// re-resume with name-skip/restore semantics is a deliberate follow-up.
+pub(crate) async fn handle_resume_workspace(
+    body: Vec<u8>,
+    state: &SharedDaemonState,
+) -> Result<WorkspaceResumeResponse, ApiError> {
+    let request: WorkspaceResumeRequest = super::parse_json_body(body)?;
+
+    // 1. Validate the folder WITHOUT creating it (validate_only=true): resume
+    //    never creates directories; a missing folder or yaml is a 400.
+    let root = validate_root_path(&request.root_path, true)?;
+    let yaml_path = root.join("anima.yaml");
+    if !yaml_path.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "no anima.yaml found at {}",
+            root.display()
+        )));
+    }
+    let agency = load_agency_yaml(&yaml_path)?;
+
+    // 2. Build the workspace config; the yaml owns these fields.
+    let workspace_config = WorkspaceConfig {
+        root_path: root,
+        company_name: agency.name.trim().to_string(),
+        mission: agency
+            .mission
+            .clone()
+            .unwrap_or_else(|| agency.description.clone())
+            .trim()
+            .to_string(),
+        values: agency.values.clone().unwrap_or_default(),
+    };
+    if workspace_config.mission.is_empty() {
+        return Err(ApiError::bad_request_static(
+            "anima.yaml: mission or description is required",
+        ));
+    }
+
+    // 3. Build every agent's config up front (orchestrator first) so
+    //    validation errors surface before any state mutation. Tool slugs are
+    //    validated by create_agent against the registry before it inserts.
+    let to_agent_config =
+        |agent: &AgencyYamlAgent, is_orchestrator: bool| -> Result<AgentConfig, ApiError> {
+            let name = agent.name.trim().to_string();
+            if name.is_empty() {
+                return Err(ApiError::bad_request_static(
+                    "anima.yaml: agent name is required",
+                ));
+            }
+            let model = agent
+                .model
+                .clone()
+                .unwrap_or_else(|| agency.model.clone())
+                .trim()
+                .to_string();
+            if model.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "anima.yaml: agent {name} has no model and the file sets no default"
+                )));
+            }
+            let bio = agent.bio.trim().to_string();
+            if is_orchestrator && bio.is_empty() {
+                return Err(ApiError::bad_request_static(
+                    "anima.yaml: orchestrator bio is required",
+                ));
+            }
+            Ok(AgentConfig {
+                name,
+                model,
+                bio: if bio.is_empty() { None } else { Some(bio) },
+                lore: agent.lore.clone(),
+                knowledge: agent.knowledge.clone(),
+                topics: agent.topics.clone(),
+                adjectives: agent.adjectives.clone(),
+                style: agent.style.clone(),
+                provider: {
+                    let provider = agency.provider.trim().to_string();
+                    if provider.is_empty() {
+                        None
+                    } else {
+                        Some(provider)
+                    }
+                },
+                system: Some(agent.system.clone()),
+                tools: agent.tools.as_ref().map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| ToolDescriptor {
+                            name: tool.clone(),
+                            description: String::new(),
+                            parameters_schema: BTreeMap::new(),
+                            examples: None,
+                        })
+                        .collect::<Vec<_>>()
+                }),
+                plugins: None,
+                settings: None,
+            })
+        };
+    let agent_configs = std::iter::once((&agency.orchestrator, true))
+        .chain(agency.agents.iter().map(|agent| (agent, false)))
+        .map(|(agent, is_orchestrator)| to_agent_config(agent, is_orchestrator))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 4. Conflict + collision rules, resolved inside one read: a workspace
+    //    configured for a different root is a 409, and so is any yaml agent
+    //    name that already exists — fresh adopt stays simple and loud.
+    {
+        let guard = state.read().await;
+        if let Some(current) = &guard.workspace {
+            if current.root_path != workspace_config.root_path {
+                return Err(ApiError::conflict(format!(
+                    "workspace is already configured for {}",
+                    current.root_path.display()
+                )));
+            }
+        }
+        let existing_names: std::collections::BTreeSet<String> = guard
+            .list_agents()
+            .iter()
+            .map(|snapshot| snapshot.state.name.clone())
+            .collect();
+        for config in &agent_configs {
+            if existing_names.contains(&config.name) {
+                return Err(ApiError::conflict(format!(
+                    "anima.yaml: agent '{}' conflicts with an existing agent; \
+                     rename it in anima.yaml or delete the existing agent first",
+                    config.name
+                )));
+            }
+        }
+    }
+
+    // 5. One write guard: create the agents in order (orchestrator first),
+    //    tracking created ids so a failure mid-batch rolls back the whole
+    //    batch (create_agent validates tool slugs before inserting, but an
+    //    earlier agent in the batch would already exist).
+    let mut created: Vec<(String, AgentRuntimeSnapshot)> = Vec::new();
+    let (previous_workspace, persist_request) = {
+        let mut guard = state.write().await;
+        let mut failure: Option<ApiError> = None;
+        for config in agent_configs {
+            let agent_name = config.name.clone();
+            match guard.create_agent(config) {
+                Ok(snapshot) => created.push((snapshot.state.id.clone(), snapshot)),
+                Err(message) => {
+                    failure = Some(ApiError::bad_request(format!(
+                        "anima.yaml: agent {agent_name}: {message}"
+                    )));
+                    break;
+                }
+            }
+        }
+        match failure {
+            Some(error) => {
+                for (id, _) in &created {
+                    guard.remove_agent(id);
+                }
+                return Err(error);
+            }
+            None => {
+                let previous_workspace = guard.workspace.clone();
+                guard.workspace = Some(workspace_config.clone());
+                (previous_workspace, guard.control_plane_persist_request())
+            }
+        }
+    };
+
+    // 6. Persist; on failure roll back to the previous state (None for a
+    //    fresh adopt). The yaml file is never touched.
+    if let Err(error) = persist_request.save().await {
+        rollback_resume(state, &created, previous_workspace).await;
+        return Err(ApiError::service_unavailable(error.to_string()));
+    }
+
+    let mut snapshots = created.into_iter().map(|(_, snapshot)| snapshot);
+    let orchestrator = snapshots
+        .next()
+        .expect("the orchestrator is always the first agent created on fresh adopt");
+    Ok(WorkspaceResumeResponse {
+        workspace: config_response(&workspace_config),
+        orchestrator: AgentRuntimeSnapshotResponse::from(&orchestrator),
+        workers: snapshots
+            .map(|snapshot| AgentRuntimeSnapshotResponse::from(&snapshot))
+            .collect(),
+    })
+}
+
+/// Undo a partially applied resume: remove only the agents this resume
+/// created and restore the previous workspace config (Some when re-resuming
+/// an already-configured root, None for a fresh adopt). Never touches the
+/// yaml file — resume does not own it.
+async fn rollback_resume(
+    state: &SharedDaemonState,
+    created: &[(String, AgentRuntimeSnapshot)],
+    previous_workspace: Option<WorkspaceConfig>,
+) {
+    let rollback_request = {
+        let mut guard = state.write().await;
+        for (id, _) in created {
+            guard.remove_agent(id);
+        }
+        guard.workspace = previous_workspace;
         guard.control_plane_persist_request()
     };
     rollback_request.save().await.ok();

@@ -530,6 +530,123 @@ async fn inspect_defaults_provider_to_openai_when_yaml_omits_provider() {
     );
 }
 
+const RESUME_AGENCY_YAML: &str = r#"name: Northwind Research
+description: Continuous equity research
+mission: Continuous equity research
+values: [cite sources]
+model: kimi-k2
+provider: moonshot
+strategy: supervisor
+orchestrator:
+  name: Anima
+  bio: A vigilant chief of staff.
+  system: You are Anima.
+  model: kimi-k2
+  tools: [read_file]
+agents:
+  - name: Scout
+    bio: A scout.
+    system: You are Scout.
+  - name: Scribe
+    bio: A scribe.
+    system: You are Scribe.
+"#;
+
+#[tokio::test]
+async fn resume_adopts_workspace_with_orchestrator_and_workers() {
+    let root = support::use_temp_workspace_root("resume-adopt");
+    let yaml_path = root.path().join("anima.yaml");
+    std::fs::write(&yaml_path, RESUME_AGENCY_YAML).expect("yaml writes");
+    let yaml_before = std::fs::read(&yaml_path).expect("yaml reads");
+    let app = test_app();
+
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/resume",
+        &serde_json::json!({ "rootPath": root.path() }).to_string(),
+    )
+    .await;
+    let body: serde_json::Value = serde_json::from_str(&body).expect("body is json");
+    assert_eq!(status, 201, "body: {body}");
+    assert_eq!(
+        body["workspace"]["companyName"], "Northwind Research",
+        "{body}"
+    );
+    assert_eq!(body["orchestrator"]["state"]["name"], "Anima", "{body}");
+    let workers = body["workers"].as_array().expect("workers is an array");
+    assert_eq!(workers.len(), 2, "{body}");
+    assert_eq!(workers[0]["state"]["name"], "Scout", "{body}");
+    assert_eq!(workers[1]["state"]["name"], "Scribe", "{body}");
+
+    // Workspace config is live and the whole roster exists.
+    let (_, workspace) = send_json_request(&app, "GET", "/api/workspace", "").await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    assert_eq!(workspace["configured"], true, "{workspace}");
+    let (_, agents) = send_json_request(&app, "GET", "/api/agents", "").await;
+    let agents: serde_json::Value = serde_json::from_str(&agents).unwrap();
+    assert_eq!(agents["agents"].as_array().unwrap().len(), 3, "{agents}");
+
+    // Resume never owns the yaml: it must be byte-identical afterwards.
+    let yaml_after = std::fs::read(&yaml_path).expect("yaml reads");
+    assert_eq!(yaml_before, yaml_after, "resume must not modify anima.yaml");
+}
+
+#[tokio::test]
+async fn resume_rejects_unknown_tool_without_side_effects() {
+    let root = support::use_temp_workspace_root("resume-badtool");
+    // The WORKER carries the unknown tool, so the orchestrator is created
+    // first and the mid-batch failure must roll it back.
+    let yaml = RESUME_AGENCY_YAML.replace(
+        "  - name: Scout\n    bio: A scout.\n    system: You are Scout.\n",
+        "  - name: Scout\n    bio: A scout.\n    system: You are Scout.\n    tools: [not_a_real_tool]\n",
+    );
+    assert!(yaml.contains("not_a_real_tool"), "fixture edit applied");
+    std::fs::write(root.path().join("anima.yaml"), yaml).expect("yaml writes");
+    let app = test_app();
+
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/resume",
+        &serde_json::json!({ "rootPath": root.path() }).to_string(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body.contains("Scout"),
+        "error names the failing agent: {body}"
+    );
+
+    // The orchestrator was created before the worker failed, so an empty
+    // roster proves the in-guard batch rollback ran.
+    let (_, agents) = send_json_request(&app, "GET", "/api/agents", "").await;
+    let agents: serde_json::Value = serde_json::from_str(&agents).unwrap();
+    assert_eq!(
+        agents["agents"].as_array().unwrap().len(),
+        0,
+        "no agents may be created on failure: {agents}"
+    );
+    let (_, workspace) = send_json_request(&app, "GET", "/api/workspace", "").await;
+    let workspace: serde_json::Value = serde_json::from_str(&workspace).unwrap();
+    assert_eq!(workspace["configured"], false, "{workspace}");
+}
+
+#[tokio::test]
+async fn resume_without_yaml_returns_400() {
+    let root = support::use_temp_workspace_root("resume-noyaml");
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/resume",
+        &serde_json::json!({ "rootPath": root.path() }).to_string(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("anima.yaml"), "{body}");
+}
+
 #[tokio::test]
 async fn inspect_reports_provider_unavailable_without_moonshot_keys() {
     let root = support::use_temp_workspace_root("inspect-provider-keys");
