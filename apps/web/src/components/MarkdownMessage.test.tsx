@@ -175,6 +175,18 @@ describe('MarkdownMessage', () => {
     expect(codeWrapper).toHaveClass('max-w-full', 'overflow-x-auto');
   });
 
+  it('contains a long fence-language label without shrinking Copy', () => {
+    const language = 'very-long-custom-language-token-for-narrow-chat-bubbles';
+    render(
+      <MarkdownMessage>{`\`\`\`${language}\nconst value = 1;\n\`\`\``}</MarkdownMessage>,
+    );
+
+    expect(screen.getByText(language)).toHaveClass('min-w-0', 'truncate');
+    expect(screen.getByRole('button', { name: 'Copy' })).toHaveClass(
+      'shrink-0',
+    );
+  });
+
   it('applies Prism token classes for supported fenced TypeScript', () => {
     render(
       <MarkdownMessage>

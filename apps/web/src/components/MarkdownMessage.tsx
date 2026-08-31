@@ -112,9 +112,11 @@ function CodeBlock({
   return (
     <div className="mt-2 overflow-hidden rounded-md border border-line bg-panel-2 text-ink">
       <div className="flex items-center justify-between gap-3 border-b border-line px-3 py-2">
-        <span className="font-mono text-[11px] text-ink-3">{language}</span>
+        <span className="min-w-0 truncate font-mono text-[11px] text-ink-3">
+          {language}
+        </span>
         <button
-          className="rounded px-2 py-1 text-xs text-ink-2 hover:bg-panel hover:text-ink"
+          className="shrink-0 rounded px-2 py-1 text-xs text-ink-2 hover:bg-panel hover:text-ink"
           onClick={copy}
           type="button"
         >
