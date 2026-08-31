@@ -250,6 +250,34 @@ export interface BootstrapWorkspaceInput {
   };
 }
 
+export interface WorkspaceInspectAgentPreview {
+  name: string;
+  bio?: string;
+  provider: string;
+  model: string;
+}
+
+export interface WorkspaceInspectFound {
+  found: true;
+  companyName: string;
+  /** Omitted when the yaml lacks a mission (description fallback may be blank). */
+  mission?: string;
+  /** Omitted when the yaml lacks values. */
+  values?: string[];
+  orchestrator: WorkspaceInspectAgentPreview;
+  workers: WorkspaceInspectAgentPreview[];
+  providerAvailable: boolean;
+}
+
+export type WorkspaceInspectResponse = { found: false } | WorkspaceInspectFound;
+
+export interface WorkspaceResumeResponse {
+  workspace: DaemonWorkspaceConfig;
+  orchestrator: DaemonSnapshot;
+  workers: DaemonSnapshot[];
+  skipped: string[];
+}
+
 export const daemon = {
   health: () => request<{ status: string }>('/health'),
 
@@ -422,6 +450,17 @@ export const daemon = {
       '/workspace/bootstrap',
       { method: 'POST', body: JSON.stringify(input) },
     ),
+
+  inspectWorkspace: (rootPath: string) =>
+    request<WorkspaceInspectResponse>(
+      `/workspace/inspect?rootPath=${encodeURIComponent(rootPath)}`,
+    ),
+
+  resumeWorkspace: (rootPath: string) =>
+    request<WorkspaceResumeResponse>('/workspace/resume', {
+      method: 'POST',
+      body: JSON.stringify({ rootPath }),
+    }),
 };
 
 /* ── adapters: daemon wire format → UI view model ── */

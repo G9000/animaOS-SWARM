@@ -374,6 +374,119 @@ describe('daemon workspace requests', () => {
     );
     expect(result.agent.state.id).toBe('agent-1');
   });
+
+  it('inspectWorkspace issues GET with encoded rootPath', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ found: false }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await daemon.inspectWorkspace('C:\\anima');
+
+    expect(result).toEqual({ found: false });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/workspace/inspect?rootPath=${encodeURIComponent('C:\\anima')}`,
+      expect.any(Object),
+    );
+  });
+
+  it('inspectWorkspace parses the found preview envelope', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          found: true,
+          companyName: 'Acme',
+          mission: 'Ship it',
+          values: ['rigor', 'care'],
+          orchestrator: {
+            name: 'Anima',
+            bio: 'A precise operator.',
+            provider: 'anthropic',
+            model: 'claude-sonnet-4',
+          },
+          workers: [
+            { name: 'Scout', provider: 'anthropic', model: 'claude-sonnet-4' },
+          ],
+          providerAvailable: true,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await daemon.inspectWorkspace('/srv/company');
+
+    expect(result.found).toBe(true);
+    if (result.found) {
+      expect(result.companyName).toBe('Acme');
+      expect(result.orchestrator.name).toBe('Anima');
+      expect(result.workers).toHaveLength(1);
+      expect(result.providerAvailable).toBe(true);
+    }
+  });
+
+  it('inspectWorkspace parses a found preview without mission/values', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          found: true,
+          companyName: 'Acme',
+          orchestrator: {
+            name: 'Anima',
+            provider: 'anthropic',
+            model: 'claude-sonnet-4',
+          },
+          workers: [],
+          providerAvailable: false,
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await daemon.inspectWorkspace('/srv/company');
+
+    expect(result.found).toBe(true);
+    if (result.found) {
+      expect(result.companyName).toBe('Acme');
+      expect(result.mission).toBeUndefined();
+      expect(result.values).toBeUndefined();
+      expect(result.workers).toEqual([]);
+    }
+  });
+
+  it('resumeWorkspace posts rootPath and returns the envelope', async () => {
+    const orchestrator = snapshot();
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          workspace: workspaceState.workspace,
+          orchestrator,
+          workers: [],
+          skipped: ['Scout'],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await daemon.resumeWorkspace('C:\\anima');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace/resume',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ rootPath: 'C:\\anima' }),
+      }),
+    );
+    expect(result.workspace.companyName).toBe('Acme');
+    expect(result.orchestrator.state.id).toBe('agent-1');
+    expect(result.workers).toEqual([]);
+    expect(result.skipped).toEqual(['Scout']);
+  });
 });
 
 describe('daemon integration requests', () => {
