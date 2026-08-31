@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anima_core::{AgentConfig, Content, Message, MessageRole, ModelAdapter, ModelGenerateRequest};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::contracts::{
@@ -32,25 +32,29 @@ struct PreparedAgencyRequest {
     model_pool: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgencyYamlConfig {
-    name: String,
-    description: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    mission: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    values: Option<Vec<String>>,
-    model: String,
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) values: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) model: String,
     // Omitted when empty so bootstrap never writes `provider: ""`; the CLI
     // loader defaults a missing provider to "openai".
-    #[serde(skip_serializing_if = "String::is_empty")]
-    provider: String,
-    strategy: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_parallel_delegations: Option<u64>,
-    orchestrator: AgencyYamlAgent,
-    agents: Vec<AgencyYamlAgent>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) provider: String,
+    #[serde(default)]
+    pub(crate) strategy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_parallel_delegations: Option<u64>,
+    pub(crate) orchestrator: AgencyYamlAgent,
+    #[serde(default)]
+    pub(crate) agents: Vec<AgencyYamlAgent>,
 }
 
 impl AgencyYamlConfig {
@@ -81,33 +85,33 @@ impl AgencyYamlConfig {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgencyYamlAgent {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    position: Option<String>,
+    pub(crate) name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) position: Option<String>,
     // Omitted when empty; the CLI loader requires a truthy orchestrator bio,
     // so bootstrap rejects blank bios before this point.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    bio: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lore: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    knowledge: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    topics: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    adjectives: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    style: Option<String>,
-    system: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    collaborates_with: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) bio: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lore: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) knowledge: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) topics: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) adjectives: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) style: Option<String>,
+    pub(crate) system: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) collaborates_with: Option<Vec<String>>,
 }
 
 impl AgencyYamlAgent {
@@ -136,6 +140,40 @@ impl AgencyYamlAgent {
             collaborates_with: None,
         }
     }
+}
+
+/// Parse and validate an anima.yaml agency file. Enforces the same invariants
+/// as the CLI loader (packages/cli/src/agency/loader.ts): truthy `name`, and
+/// an orchestrator with truthy name/bio/system. `agents` defaults to empty.
+/// Note: worker agents' `system` stays serde-required here, which is
+/// deliberately stricter than the CLI loader (it defaults a missing worker
+/// system to ''): a system-less worker fails loudly with a clear 400 rather
+/// than resuming with empty instructions.
+pub(crate) fn load_agency_yaml(path: &Path) -> Result<AgencyYamlConfig, ApiError> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        ApiError::bad_request(format!("could not read {}: {error}", path.display()))
+    })?;
+    let config: AgencyYamlConfig = serde_yaml::from_str(&raw)
+        .map_err(|error| ApiError::bad_request(format!("anima.yaml is not valid: {error}")))?;
+    if config.name.trim().is_empty() {
+        return Err(ApiError::bad_request_static("anima.yaml: name is required"));
+    }
+    if config.orchestrator.name.trim().is_empty() {
+        return Err(ApiError::bad_request_static(
+            "anima.yaml: orchestrator.name is required",
+        ));
+    }
+    if config.orchestrator.bio.trim().is_empty() {
+        return Err(ApiError::bad_request_static(
+            "anima.yaml: orchestrator.bio is required",
+        ));
+    }
+    if config.orchestrator.system.trim().is_empty() {
+        return Err(ApiError::bad_request_static(
+            "anima.yaml: orchestrator.system is required",
+        ));
+    }
+    Ok(config)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1440,9 +1478,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        map_seed_memory_entry, materialize_agency_workspace, normalize_agent_definitions,
-        parse_agents_payload, parse_seed_payload, strip_code_fences, AgencyGenerateResponse,
-        AgentDefinitionResponse, AgentSeedMemories, SeedMemoryEntry,
+        load_agency_yaml, map_seed_memory_entry, materialize_agency_workspace,
+        normalize_agent_definitions, parse_agents_payload, parse_seed_payload, strip_code_fences,
+        AgencyGenerateResponse, AgentDefinitionResponse, AgentSeedMemories, SeedMemoryEntry,
     };
     use crate::tools::ToolRegistry;
     use serde_json::json;
@@ -1749,5 +1787,150 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("{prefix}-{stamp}"));
         fs::create_dir_all(&dir).expect("create temp workspace");
         dir
+    }
+
+    fn write_yaml(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("anima.yaml");
+        fs::write(&path, body).expect("write anima.yaml");
+        path
+    }
+
+    #[test]
+    fn parses_full_config_with_workers() {
+        let dir = temp_workspace("agency-yaml-full");
+        let path = write_yaml(
+            &dir,
+            r#"
+name: Northwind Research
+description: Continuous equity research
+mission: Continuous equity research
+values: [cite sources]
+model: kimi-k2
+provider: moonshot
+strategy: supervisor
+orchestrator:
+  name: Anima
+  bio: A vigilant chief of staff.
+  system: You are Anima.
+  model: kimi-k2
+  tools: [read_file]
+agents:
+  - name: Scout
+    bio: A scout.
+    system: You are Scout.
+"#,
+        );
+        let config = load_agency_yaml(&path).expect("should parse");
+        assert_eq!(config.name, "Northwind Research");
+        assert_eq!(config.orchestrator.name, "Anima");
+        assert_eq!(config.agents.len(), 1);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn defaults_agents_to_empty_when_missing() {
+        let dir = temp_workspace("agency-yaml-defaults");
+        let path = write_yaml(
+            &dir,
+            r#"
+name: Solo Ops
+orchestrator:
+  name: Anima
+  bio: Chief of staff.
+  system: You are Anima.
+"#,
+        );
+        let config = load_agency_yaml(&path).expect("should parse");
+        assert!(config.agents.is_empty());
+        assert!(config.mission.is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_missing_orchestrator_bio() {
+        let dir = temp_workspace("agency-yaml-no-bio");
+        let path = write_yaml(
+            &dir,
+            r#"
+name: No Bio Co
+orchestrator:
+  name: Anima
+  system: You are Anima.
+"#,
+        );
+        let error =
+            load_agency_yaml(&path).expect_err("missing orchestrator bio should be rejected");
+        assert_eq!(error.message, "anima.yaml: orchestrator.bio is required");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_blank_agency_name() {
+        let dir = temp_workspace("agency-yaml-blank-name");
+        let path = write_yaml(
+            &dir,
+            r#"
+name: ""
+orchestrator:
+  name: Anima
+  bio: Chief of staff.
+  system: You are Anima.
+"#,
+        );
+        let error = load_agency_yaml(&path).expect_err("blank name should be rejected");
+        assert_eq!(error.message, "anima.yaml: name is required");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_whitespace_orchestrator_bio() {
+        let dir = temp_workspace("agency-yaml-ws-bio");
+        let path = write_yaml(
+            &dir,
+            r#"
+name: Whitespace Bio Co
+orchestrator:
+  name: Anima
+  bio: "  "
+  system: You are Anima.
+"#,
+        );
+        let error = load_agency_yaml(&path).expect_err("whitespace bio should be rejected");
+        assert_eq!(error.message, "anima.yaml: orchestrator.bio is required");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_worker_without_system() {
+        let dir = temp_workspace("agency-yaml-worker-no-system");
+        let path = write_yaml(
+            &dir,
+            r#"
+name: Northwind Research
+orchestrator:
+  name: Anima
+  bio: A vigilant chief of staff.
+  system: You are Anima.
+agents:
+  - name: Scout
+    bio: A scout.
+"#,
+        );
+        let error = load_agency_yaml(&path).expect_err("system-less worker should fail to parse");
+        assert!(
+            error.message.contains("system"),
+            "error should name the missing field: {}",
+            error.message
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rejects_invalid_yaml() {
+        let dir = temp_workspace("agency-yaml-invalid");
+        let path = write_yaml(&dir, "{{{{ not yaml");
+        let result = load_agency_yaml(&path);
+        assert!(result.is_err());
+        fs::remove_dir_all(&dir).ok();
     }
 }
