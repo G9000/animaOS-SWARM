@@ -15,11 +15,13 @@ import {
   PROFILE_GENERATION_UNAVAILABLE,
   type DaemonProvider,
   type DaemonSnapshot,
+  type WorkspaceInspectFound,
 } from '../../lib/daemon-api';
 import { AccessStep } from './AccessStep';
 import { AgentStep } from './AgentStep';
 import { ModelStep, type ProviderCatalogState } from './ModelStep';
 import { ONBOARDING_STEPS, OnboardingProgress } from './OnboardingProgress';
+import { ResumeCard } from './ResumeCard';
 import { ReviewStep } from './ReviewStep';
 import {
   WorkspaceStep,
@@ -135,6 +137,12 @@ export function OnboardingFlow({
   const [verifying, setVerifying] = useState(false);
   const [verifyStatus, setVerifyStatus] =
     useState<WorkspaceVerifyStatus | null>(null);
+  const [resumeMode, setResumeMode] = useState(false);
+  const [inspectPreview, setInspectPreview] =
+    useState<WorkspaceInspectFound | null>(null);
+  const [inspectNote, setInspectNote] = useState<string | null>(null);
+  const [resuming, setResuming] = useState(false);
+  const [resumeError, setResumeError] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generateAvailable, setGenerateAvailable] = useState(true);
   const [generateError, setGenerateError] = useState<string | null>(null);
@@ -151,6 +159,8 @@ export function OnboardingFlow({
   const providerRetryInFlightRef = useRef(false);
   const verifyInFlightRef = useRef(false);
   const verifyRequestIdRef = useRef(0);
+  const inspectRequestIdRef = useRef(0);
+  const resumeInFlightRef = useRef(false);
   const generateInFlightRef = useRef(false);
   const submitInFlightRef = useRef(false);
   const mountedRef = useRef(false);
@@ -284,6 +294,9 @@ export function OnboardingFlow({
     workspaceValidationErrorId ??
     customModelValidationErrorId ??
     nameValidationErrorId;
+  // Belt-and-braces gate: even if a stale inspect ever slipped a preview into
+  // state after the user left resume mode, the card only renders in mode.
+  const showingResumeCard = resumeMode && inspectPreview !== null;
 
   useEffect(() => {
     if (currentStep < 2 || intelligenceReady) {
@@ -296,6 +309,12 @@ export function OnboardingFlow({
   }, [currentStep, intelligenceReady]);
 
   const focusFirstEmptyWorkspaceField = () => {
+    // In resume mode only the folder field is rendered; the company/mission
+    // inputs are hidden, so focusing them would be a no-op dead end.
+    if (resumeMode) {
+      rootPathInputRef.current?.focus();
+      return;
+    }
     if (!draft.workspace.companyName.trim()) {
       companyInputRef.current?.focus();
       return;
@@ -339,6 +358,7 @@ export function OnboardingFlow({
     draft.workspace,
     intelligenceReady,
     resolvedModel,
+    resumeMode,
   ]);
 
   const updateDraft = <Key extends keyof OnboardingDraft>(
@@ -361,11 +381,28 @@ export function OnboardingFlow({
   };
 
   const changeRootPath = (rootPath: string) => {
-    // Invalidate any in-flight verify: its result was computed for the old
-    // path and must not surface as status for the new one.
+    // Invalidate any in-flight verify/inspect: their results were computed for
+    // the old path and must not surface as state for the new one.
     verifyRequestIdRef.current += 1;
+    inspectRequestIdRef.current += 1;
     updateWorkspace('rootPath', rootPath);
     setVerifyStatus(null);
+    setInspectPreview(null);
+    setInspectNote(null);
+    setResumeError(null);
+  };
+
+  const changeResumeMode = (mode: boolean) => {
+    // Invalidate any in-flight verify/inspect: their results describe the
+    // mode being left and must not surface after the switch.
+    verifyRequestIdRef.current += 1;
+    inspectRequestIdRef.current += 1;
+    setResumeMode(mode);
+    setBlockingError(null);
+    setVerifyStatus(null);
+    setInspectPreview(null);
+    setInspectNote(null);
+    setResumeError(null);
   };
 
   const changeProvider = (provider: string) => {
@@ -400,7 +437,13 @@ export function OnboardingFlow({
   const goNext = () => {
     setBlockingError(null);
 
-    if (currentStep === 0 && !workspaceComplete(draft.workspace)) {
+    // Resume mode hides the nav, so this guard is defense-in-depth: the
+    // completeness check references fields that are hidden in resume mode.
+    if (
+      currentStep === 0 &&
+      !resumeMode &&
+      !workspaceComplete(draft.workspace)
+    ) {
       setBlockingError(WORKSPACE_REQUIRED_ERROR);
       focusFirstEmptyWorkspaceField();
       return;
@@ -496,6 +539,83 @@ export function OnboardingFlow({
         setVerifying(false);
       }
     }
+  };
+
+  const inspectWorkspace = async () => {
+    const rootPath = draft.workspace.rootPath.trim();
+    // Reuse the verify in-flight guard + spinner: verify and inspect are
+    // mutually exclusive modes, so one busy state covers both.
+    if (!rootPath || verifyInFlightRef.current) {
+      return;
+    }
+
+    const requestId = ++inspectRequestIdRef.current;
+    verifyInFlightRef.current = true;
+    setVerifying(true);
+    setBlockingError(null);
+    setInspectNote(null);
+    setResumeError(null);
+    try {
+      const result = await daemon.inspectWorkspace(rootPath);
+      // Bail when the root path changed while the request was in flight —
+      // this preview describes a folder the draft no longer points at.
+      if (!mountedRef.current || requestId !== inspectRequestIdRef.current) {
+        return;
+      }
+      if (result.found) {
+        setInspectPreview(result);
+        setInspectNote(null);
+      } else {
+        setInspectNote('No workspace file found here — set up fresh below.');
+      }
+    } catch (error) {
+      if (mountedRef.current && requestId === inspectRequestIdRef.current) {
+        setInspectNote(errorMessage(error));
+      }
+    } finally {
+      verifyInFlightRef.current = false;
+      if (mountedRef.current) {
+        setVerifying(false);
+      }
+    }
+  };
+
+  const resumeWorkspace = async () => {
+    if (resumeInFlightRef.current) {
+      return;
+    }
+
+    const rootPath = draft.workspace.rootPath.trim();
+    if (!rootPath) {
+      return;
+    }
+
+    resumeInFlightRef.current = true;
+    setResuming(true);
+    setResumeError(null);
+    try {
+      const response = await daemon.resumeWorkspace(rootPath);
+      if (mountedRef.current) {
+        onCreated(response.orchestrator);
+      }
+    } catch (error) {
+      if (mountedRef.current) {
+        setResumeError(errorMessage(error));
+      }
+    } finally {
+      resumeInFlightRef.current = false;
+      if (mountedRef.current) {
+        setResuming(false);
+      }
+    }
+  };
+
+  const setupFresh = () => {
+    setInspectPreview(null);
+    setResumeMode(false);
+    setInspectNote(null);
+    setResumeError(null);
+    setBlockingError(null);
   };
 
   const generateProfile = async () => {
@@ -671,6 +791,9 @@ export function OnboardingFlow({
           onRootPathChange={changeRootPath}
           onValuesChange={(values) => updateWorkspace('values', values)}
           onVerify={() => void verifyWorkspace()}
+          resumeMode={resumeMode}
+          onResumeModeChange={changeResumeMode}
+          onInspect={() => void inspectWorkspace()}
           companyInputRef={companyInputRef}
           missionInputRef={missionInputRef}
           rootPathInputRef={rootPathInputRef}
@@ -759,7 +882,9 @@ export function OnboardingFlow({
             Guided Focus · Workspace
           </p>
           <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
-            Set up your workspace
+            {showingResumeCard
+              ? 'Resume your workspace'
+              : 'Set up your workspace'}
           </h1>
           <p className="mx-auto max-w-lg text-sm leading-relaxed text-ink-2">
             {workspaceConfigured
@@ -780,9 +905,26 @@ export function OnboardingFlow({
         </p>
 
         <div className="glass-strong rounded-3xl p-5 shadow-2xl shadow-black/60 sm:p-8">
-          {stepContent}
+          {showingResumeCard && inspectPreview ? (
+            <ResumeCard
+              preview={inspectPreview}
+              rootPath={draft.workspace.rootPath.trim()}
+              resuming={resuming}
+              resumeError={resumeError}
+              onResume={() => void resumeWorkspace()}
+              onSetupFresh={setupFresh}
+            />
+          ) : (
+            stepContent
+          )}
 
-          {blockingError ? (
+          {!showingResumeCard && inspectNote ? (
+            <p className="mt-5 rounded-xl border border-line bg-white/[0.02] p-3 text-sm text-ink-2">
+              {inspectNote}
+            </p>
+          ) : null}
+
+          {blockingError && !showingResumeCard ? (
             <p
               id={blockingErrorId}
               role="alert"
@@ -792,7 +934,7 @@ export function OnboardingFlow({
             </p>
           ) : null}
 
-          {currentStep < ONBOARDING_STEPS.length - 1 ? (
+          {currentStep < ONBOARDING_STEPS.length - 1 && !resumeMode ? (
             <div className="mt-6 flex items-center justify-between gap-3">
               {currentStep > 0 ? (
                 <button

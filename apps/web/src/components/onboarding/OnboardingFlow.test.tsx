@@ -14,6 +14,7 @@ import {
   PROFILE_GENERATION_UNAVAILABLE,
   type DaemonProvider,
   type DaemonSnapshot,
+  type WorkspaceInspectFound,
 } from '../../lib/daemon-api';
 import { OnboardingFlow } from './OnboardingFlow';
 
@@ -887,5 +888,300 @@ describe('OnboardingFlow', () => {
       screen.queryByRole('button', { name: 'Create agent' }),
     ).not.toBeInTheDocument();
     expect(bootstrapWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe('OnboardingFlow workspace resume', () => {
+  const RESUME_ROOT = '/tmp/northwind';
+
+  function inspectPreview(): WorkspaceInspectFound {
+    return {
+      found: true,
+      companyName: 'Northwind Research',
+      mission: 'Continuous equity research',
+      values: ['cite sources'],
+      orchestrator: {
+        name: 'Anima',
+        bio: 'A vigilant chief of staff.',
+        provider: 'moonshot',
+        model: 'kimi-k2',
+      },
+      workers: [
+        { name: 'Scout', provider: 'moonshot', model: 'kimi-k2' },
+        { name: 'Scribe', provider: 'moonshot', model: 'kimi-k2' },
+      ],
+      providerAvailable: true,
+    };
+  }
+
+  async function enterResumeMode(
+    user: ReturnType<typeof userEvent.setup>,
+    rootPath: string = RESUME_ROOT,
+  ) {
+    await user.click(
+      screen.getByRole('button', { name: /already have a workspace/i }),
+    );
+    await user.type(
+      screen.getByRole('textbox', { name: 'Office location' }),
+      rootPath,
+    );
+  }
+
+  async function showResumeCard(user: ReturnType<typeof userEvent.setup>) {
+    await enterResumeMode(user);
+    await user.click(screen.getByRole('button', { name: 'Inspect' }));
+    expect(
+      await screen.findByRole('heading', {
+        level: 2,
+        name: 'Resume your workspace',
+      }),
+    ).toBeVisible();
+  }
+
+  it('resume mode keeps only the folder field and an Inspect button', async () => {
+    const user = userEvent.setup();
+    renderFlow();
+
+    await user.click(
+      screen.getByRole('button', { name: /already have a workspace/i }),
+    );
+
+    expect(
+      screen.queryByRole('textbox', { name: 'Company name' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('textbox', { name: 'Mission (one sentence)' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('textbox', { name: /Values/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Inspect' })).toBeVisible();
+  });
+
+  it('shows an inline note and keeps the wizard unchanged when inspect finds no workspace', async () => {
+    const user = userEvent.setup();
+    const inspectWorkspace = vi
+      .spyOn(daemon, 'inspectWorkspace')
+      .mockResolvedValue({ found: false });
+    renderFlow();
+    await enterResumeMode(user);
+
+    await user.click(screen.getByRole('button', { name: 'Inspect' }));
+
+    expect(await screen.findByText(/no workspace file/i)).toBeVisible();
+    expect(inspectWorkspace).toHaveBeenCalledWith(RESUME_ROOT);
+    expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(RESUME_ROOT);
+    expect(
+      screen.queryByRole('heading', { name: 'Resume your workspace' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('renders the resume card with the preview and hides the step body and nav', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'inspectWorkspace').mockResolvedValue(inspectPreview());
+    renderFlow();
+
+    await showResumeCard(user);
+
+    expect(screen.getByText('Northwind Research')).toBeVisible();
+    expect(screen.getByText('Continuous equity research')).toBeVisible();
+    expect(screen.getByText('Anima')).toBeVisible();
+    expect(screen.getByText('Scout')).toBeVisible();
+    expect(screen.getByText('Scribe')).toBeVisible();
+    expect(screen.getByTitle(RESUME_ROOT)).toHaveTextContent(RESUME_ROOT);
+    expect(
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Next' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole('button', { name: 'Back' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('resumes the workspace once and hands the orchestrator snapshot to onCreated', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'inspectWorkspace').mockResolvedValue(inspectPreview());
+    const created = snapshot();
+    const resumeWorkspace = vi
+      .spyOn(daemon, 'resumeWorkspace')
+      .mockResolvedValue({
+        workspace: {
+          rootPath: RESUME_ROOT,
+          companyName: 'Northwind Research',
+          mission: 'Continuous equity research',
+          values: ['cite sources'],
+        },
+        orchestrator: created,
+        workers: [],
+        skipped: [],
+      });
+    const onCreated = vi.fn();
+    renderFlow({ onCreated });
+    await showResumeCard(user);
+
+    await user.click(screen.getByRole('button', { name: 'Resume workspace' }));
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalledWith(created));
+    expect(resumeWorkspace).toHaveBeenCalledTimes(1);
+    expect(resumeWorkspace).toHaveBeenCalledWith(RESUME_ROOT);
+  });
+
+  it('shows a resume error on the card and keeps the preview intact', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'inspectWorkspace').mockResolvedValue(inspectPreview());
+    const resumeWorkspace = vi
+      .spyOn(daemon, 'resumeWorkspace')
+      .mockRejectedValue(new Error('resume refused'));
+    const onCreated = vi.fn();
+    renderFlow({ onCreated });
+    await showResumeCard(user);
+
+    await user.click(screen.getByRole('button', { name: 'Resume workspace' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'resume refused',
+    );
+    expect(onCreated).not.toHaveBeenCalled();
+    expect(screen.getByText('Northwind Research')).toBeVisible();
+    expect(screen.getByText('Scout')).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Resume workspace' }),
+    ).toBeEnabled();
+    expect(resumeWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns to the normal workspace step with the draft intact from the card', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'inspectWorkspace').mockResolvedValue(inspectPreview());
+    renderFlow();
+    await showResumeCard(user);
+
+    await user.click(
+      screen.getByRole('button', { name: 'Set up fresh instead' }),
+    );
+
+    expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
+    expect(
+      screen.getByRole('textbox', { name: 'Company name' }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(RESUME_ROOT);
+    expect(screen.getByRole('button', { name: 'Verify' })).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Next' })).toBeVisible();
+    expect(
+      screen.queryByRole('heading', { name: 'Resume your workspace' }),
+    ).not.toBeInTheDocument();
+  });
+
+  it('ignores a stale inspect response after the folder path changes', async () => {
+    const user = userEvent.setup();
+    const pending =
+      deferred<Awaited<ReturnType<typeof daemon.inspectWorkspace>>>();
+    vi.spyOn(daemon, 'inspectWorkspace').mockReturnValue(pending.promise);
+    renderFlow();
+    await enterResumeMode(user);
+
+    await user.click(screen.getByRole('button', { name: 'Inspect' }));
+    await user.type(
+      screen.getByRole('textbox', { name: 'Office location' }),
+      'x',
+    );
+
+    await act(async () => {
+      pending.resolve(inspectPreview());
+      await pending.promise;
+    });
+
+    expect(
+      screen.queryByRole('heading', { name: 'Resume your workspace' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Inspect' })).toBeEnabled();
+  });
+
+  it('ignores an inspect response that resolves after leaving resume mode', async () => {
+    const user = userEvent.setup();
+    const pending =
+      deferred<Awaited<ReturnType<typeof daemon.inspectWorkspace>>>();
+    vi.spyOn(daemon, 'inspectWorkspace').mockReturnValue(pending.promise);
+    renderFlow();
+    await enterResumeMode(user);
+
+    await user.click(screen.getByRole('button', { name: 'Inspect' }));
+    await user.click(
+      screen.getByRole('button', { name: /set up a new workspace instead/i }),
+    );
+
+    await act(async () => {
+      pending.resolve(inspectPreview());
+      await pending.promise;
+    });
+
+    expect(
+      screen.queryByRole('heading', { name: 'Resume your workspace' }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('textbox', { name: 'Company name' }),
+    ).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Verify' })).toBeEnabled();
+  });
+
+  it('ignores a verify response that resolves after entering resume mode', async () => {
+    const user = userEvent.setup();
+    const pending =
+      deferred<Awaited<ReturnType<typeof daemon.validateWorkspace>>>();
+    vi.spyOn(daemon, 'validateWorkspace').mockReturnValue(pending.promise);
+    renderFlow();
+    await fillWorkspace(user);
+
+    await user.click(screen.getByRole('button', { name: 'Verify' }));
+    await user.click(
+      screen.getByRole('button', { name: /already have a workspace/i }),
+    );
+
+    await act(async () => {
+      pending.resolve({
+        configured: false,
+        workspace: null,
+        defaultRoot: '',
+        rootPathExists: false,
+      });
+      await pending.promise;
+    });
+
+    expect(
+      screen.queryByText(/Folder will be created/),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/Folder exists/)).not.toBeInTheDocument();
+  });
+
+  it('hides Next in resume mode instead of dead-ending on hidden fields', async () => {
+    const user = userEvent.setup();
+    renderFlow();
+
+    await user.click(
+      screen.getByRole('button', { name: /already have a workspace/i }),
+    );
+
+    expect(
+      screen.queryByRole('button', { name: 'Next' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    await user.click(
+      screen.getByRole('button', { name: /set up a new workspace instead/i }),
+    );
+    expect(screen.getByRole('button', { name: 'Next' })).toBeVisible();
   });
 });
