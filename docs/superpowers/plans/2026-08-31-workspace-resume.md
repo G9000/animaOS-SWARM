@@ -154,7 +154,7 @@ pub(crate) struct AgencyYamlConfig {
 }
 ```
 
-`AgencyYamlAgent`: add `Deserialize`; all `Option` fields + `bio` get `#[serde(default)]` (keep existing `skip_serializing_if`); `name`/`system` stay required at the serde layer (blank values are rejected by validation below). Make all fields `pub(crate)`.
+`AgencyYamlAgent`: add `Deserialize`; all `Option` fields + `bio` get `#[serde(default)]` (keep existing `skip_serializing_if`); `name`/`system` stay required at the serde layer (blank values are rejected by validation below). Make all fields `pub(crate)`. Note: keeping worker `system` serde-required is deliberately stricter than the CLI loader (which defaults a missing worker system to `''`) — a system-less worker fails loudly with a clear 400 rather than resuming with empty instructions. Record that choice in a comment on the loader.
 
 2. Add the shared loader at the end of the struct section:
 
@@ -239,7 +239,24 @@ async fn inspect_rejects_yaml_missing_orchestrator_fields() {
 }
 ```
 
-(Check `tests/support/mod.rs` for how existing GET requests with query strings are built — if `send_empty_request` doesn't take a path with query, extend it or build the `Request` inline like other tests do. URL-encode the Windows path: backslashes and drive colon must be percent-encoded — simplest is to build the query with `urlencoding`-style manual replacement; check whether the dev-dependencies already include a url encoding crate, otherwise percent-encode `:` `\` and spaces manually in the test helper.)
+Before writing these tests, add a small helper to `tests/support/mod.rs` so query strings stay correct:
+
+```rust
+/// Build a GET URI with one query parameter, percent-encoding the value
+/// (Windows paths contain `:` and `\`, which must be encoded).
+pub(crate) fn query_uri(path: &str, param: &str, value: &str) -> String {
+    let encoded: String = value
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
+            other => format!("%{:02X}", other as u32),
+        })
+        .collect();
+    format!("{path}?{param}={encoded}")
+}
+```
+
+Use `query_uri("/api/workspace/inspect", "rootPath", root.path().to_str().unwrap())` in every inspect/resume test instead of the `url_encoded_root` placeholder above. (Multi-byte chars: percent-encoding per `char` is fine for these tests since paths are ASCII temp dirs.)
 
 - [ ] **Step 2: Run to verify fail** — route 404.
 
@@ -631,7 +648,7 @@ async fn rollback_resume(
 
 NOTE for the implementer: the reference above assumes `remove_agent(&str)` and `control_plane_persist_request()` signatures from `rollback_bootstrap` — mirror them exactly. The `unreachable!` for the skipped-orchestrator case is acceptable for fresh adopt; Task 4 refines same-root re-resume semantics including response shape when the orchestrator already exists — if simpler, have Task 3 return 409 when the orchestrator name already exists and let Task 4 implement the skip/restore behavior. Pick ONE, keep it consistent, and note the choice in your report.
 
-Route entry (`mod.rs`): mirror `bootstrap_workspace_entry` — `post`, path `/api/workspace/resume`, 201 response with `WorkspaceResumeResponse`, 400/409/503 documented, register route + OpenAPI path.
+Route entry (`mod.rs`): mirror `bootstrap_workspace_entry` — `post`, path `/api/workspace/resume`, 201 response with `WorkspaceResumeResponse`, 400/409/503 documented, register route + OpenAPI path. IMPORTANT: like every existing mutating entry, the wrapper must take the `control_plane_transaction()` guard before delegating to `handle_resume_workspace` (see how `bootstrap_workspace_entry` does it) — the spec's "one control-plane transaction" requirement depends on it; do not drop it when copying the snippet.
 
 - [ ] **Step 4: Run tests to verify pass.**
 
@@ -696,7 +713,9 @@ async fn resumed_agents_survive_restart() {
 }
 ```
 
-- [ ] **Step 2–4:** Run red → implement any missing pieces (skip/restore semantics if Task 3 simplified) → run green.
+- [ ] **Step 2–4:** Run red → implement any missing pieces → run green. Specifically:
+  - If Task 3 chose the 409-on-existing-orchestrator simplification, this task implements the name-skip/restore behavior.
+  - If Task 3 kept the `unreachable!` orchestrator extraction, fix the response shape now: on same-root re-resume where the orchestrator was skipped, return the EXISTING orchestrator snapshot (look it up from `list_agents()` by name) rather than the first created worker — `resume_same_root_restores_missing_agents_only` exposes this bug.
 
 - [ ] **Step 5: Commit**
 
