@@ -30,6 +30,9 @@ export interface WorkspaceStepProps {
   onRootPathChange(value: string): void;
   onValuesChange(values: string[]): void;
   onVerify(): void;
+  resumeMode?: boolean;
+  onResumeModeChange?(mode: boolean): void;
+  onInspect?(): void;
   companyInputRef: RefObject<HTMLInputElement | null>;
   missionInputRef?: RefObject<HTMLInputElement | null>;
   rootPathInputRef?: RefObject<HTMLInputElement | null>;
@@ -48,6 +51,9 @@ export function WorkspaceStep({
   onRootPathChange,
   onValuesChange,
   onVerify,
+  resumeMode = false,
+  onResumeModeChange,
+  onInspect,
   companyInputRef,
   missionInputRef,
   rootPathInputRef,
@@ -84,37 +90,41 @@ export function WorkspaceStep({
         </p>
       </div>
 
-      <div>
-        <label htmlFor="onboarding-company-name" className={labelCls}>
-          Company name
-        </label>
-        <input
-          ref={companyInputRef}
-          id="onboarding-company-name"
-          className="field"
-          value={companyName}
-          onChange={(event) => onCompanyNameChange(event.target.value)}
-          autoComplete="off"
-          required
-          aria-invalid={Boolean(validationErrorId)}
-          aria-describedby={validationErrorId}
-        />
-      </div>
+      {!resumeMode ? (
+        <div>
+          <label htmlFor="onboarding-company-name" className={labelCls}>
+            Company name
+          </label>
+          <input
+            ref={companyInputRef}
+            id="onboarding-company-name"
+            className="field"
+            value={companyName}
+            onChange={(event) => onCompanyNameChange(event.target.value)}
+            autoComplete="off"
+            required
+            aria-invalid={Boolean(validationErrorId)}
+            aria-describedby={validationErrorId}
+          />
+        </div>
+      ) : null}
 
-      <div>
-        <label htmlFor="onboarding-mission" className={labelCls}>
-          Mission (one sentence)
-        </label>
-        <input
-          ref={missionInputRef}
-          id="onboarding-mission"
-          className="field"
-          value={mission}
-          onChange={(event) => onMissionChange(event.target.value)}
-          autoComplete="off"
-          placeholder="What is this company for?"
-        />
-      </div>
+      {!resumeMode ? (
+        <div>
+          <label htmlFor="onboarding-mission" className={labelCls}>
+            Mission (one sentence)
+          </label>
+          <input
+            ref={missionInputRef}
+            id="onboarding-mission"
+            className="field"
+            value={mission}
+            onChange={(event) => onMissionChange(event.target.value)}
+            autoComplete="off"
+            placeholder="What is this company for?"
+          />
+        </div>
+      ) : null}
 
       <div>
         <label htmlFor="onboarding-root-path" className={labelCls}>
@@ -132,11 +142,17 @@ export function WorkspaceStep({
           />
           <button
             type="button"
-            onClick={onVerify}
+            onClick={resumeMode ? onInspect : onVerify}
             disabled={verifying || !rootPath.trim()}
             className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
           >
-            {verifying ? 'Verifying…' : 'Verify'}
+            {resumeMode
+              ? verifying
+                ? 'Inspecting…'
+                : 'Inspect'
+              : verifying
+                ? 'Verifying…'
+                : 'Verify'}
           </button>
         </div>
         {verifyStatus?.ok ? (
@@ -153,29 +169,48 @@ export function WorkspaceStep({
             {verifyStatus.message ?? 'Could not verify that folder.'}
           </p>
         ) : null}
+        {resumeMode ? (
+          <button
+            type="button"
+            onClick={() => onResumeModeChange?.(false)}
+            className="mt-2 text-sm text-ink-3 underline underline-offset-2 transition hover:text-ink-2"
+          >
+            or set up a new workspace instead
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => onResumeModeChange?.(true)}
+            className="mt-2 text-sm text-ink-3 underline underline-offset-2 transition hover:text-ink-2"
+          >
+            Already have a workspace? Point to it
+          </button>
+        )}
       </div>
 
-      <div>
-        <label htmlFor="onboarding-values" className={labelCls}>
-          Values (optional, up to 5, comma-separated)
-        </label>
-        <input
-          id="onboarding-values"
-          className="field"
-          value={valuesDraft}
-          onChange={(event) => {
-            setValuesDraft(event.target.value);
-            onValuesChange(parseValues(event.target.value));
-          }}
-          onBlur={() => {
-            // Normalize the draft once editing is done: trim, drop empties,
-            // cap at MAX_VALUES. onValuesChange already emitted the same parse.
-            setValuesDraft(parseValues(valuesDraft).join(', '));
-          }}
-          autoComplete="off"
-          placeholder="cite sources, never invent numbers"
-        />
-      </div>
+      {!resumeMode ? (
+        <div>
+          <label htmlFor="onboarding-values" className={labelCls}>
+            Values (optional, up to 5, comma-separated)
+          </label>
+          <input
+            id="onboarding-values"
+            className="field"
+            value={valuesDraft}
+            onChange={(event) => {
+              setValuesDraft(event.target.value);
+              onValuesChange(parseValues(event.target.value));
+            }}
+            onBlur={() => {
+              // Normalize the draft once editing is done: trim, drop empties,
+              // cap at MAX_VALUES. onValuesChange already emitted the same parse.
+              setValuesDraft(parseValues(valuesDraft).join(', '));
+            }}
+            autoComplete="off"
+            placeholder="cite sources, never invent numbers"
+          />
+        </div>
+      ) : null}
     </section>
   );
 }

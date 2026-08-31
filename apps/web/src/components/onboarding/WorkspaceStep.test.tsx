@@ -81,4 +81,27 @@ describe('WorkspaceStep', () => {
     setup({ verifyStatus: { ok: false, message: 'Nope' } });
     expect(screen.getByRole('alert')).toHaveTextContent('Nope');
   });
+
+  it('offers resume-with-existing mode', async () => {
+    const props = setup({ onResumeModeChange: vi.fn() });
+    await userEvent.click(
+      screen.getByRole('button', { name: /already have a workspace/i }),
+    );
+    expect(props.onResumeModeChange).toHaveBeenCalledWith(true);
+  });
+
+  it('inspects instead of verifying in resume mode', async () => {
+    const props = setup({ resumeMode: true, onInspect: vi.fn() });
+    await userEvent.click(screen.getByRole('button', { name: /inspect/i }));
+    expect(props.onInspect).toHaveBeenCalled();
+    expect(props.onVerify).not.toHaveBeenCalled();
+  });
+
+  it('resume mode offers a path back to fresh setup', async () => {
+    const props = setup({ resumeMode: true, onResumeModeChange: vi.fn() });
+    await userEvent.click(
+      screen.getByRole('button', { name: /set up|new workspace/i }),
+    );
+    expect(props.onResumeModeChange).toHaveBeenCalledWith(false);
+  });
 });
