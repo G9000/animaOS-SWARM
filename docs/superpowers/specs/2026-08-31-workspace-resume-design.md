@@ -59,17 +59,17 @@ Response:
 
 `providerAvailable` reflects whether the orchestrator's provider is configured on this machine (same source as the providers catalog). It is advisory: it powers the UI warning only and never blocks resume. (If providers differ per worker, per-agent availability may be added later; v1 reports the orchestrator's.)
 
-Contracts live in `hosts/rust-daemon/src/contracts/workspace.rs`, camelCase serde, matching the existing workspace contracts.
+Contracts live in `hosts/rust-daemon/src/routes/contracts/workspace.rs`, camelCase serde, matching the existing workspace contracts. The worker preview intentionally omits `bio`/`system` (roster display only) — do not "fix" that asymmetry; the full fields are only needed at resume time.
 
 ### 3. Daemon: `POST /api/workspace/resume {rootPath}`
 
 Adoption, modeled on bootstrap's discipline:
 
-1. **Validate everything before side effects.** Parse + validate the yaml (shared helper). Resolve and validate all agents' tools — unknown tools rejected pre-mutation, same as bootstrap's `create_agent` → `resolve_agent_tools` path.
+1. **Validate everything before side effects.** Re-validate the folder itself through bootstrap's shared `validate_workspace_request` path (covers canonicalization and the folder-having-vanished between inspect and resume). Parse + validate the yaml (shared helper). Resolve and validate all agents' tools — unknown tools rejected pre-mutation, same as bootstrap's `create_agent` → `resolve_agent_tools` path.
 2. **Conflict rules:**
    - Workspace configured for a *different* root → `409` naming the configured root.
    - Workspace configured for the *same* root → idempotent re-resume: skip agents whose names already exist, restore missing ones. This doubles as the recovery path after deleting the last agent (closing the seam the onboarding fix `11a0bd2` left: the createAgent re-hire path restores only the orchestrator, without its bio/adjectives/style — resume restores the full profile from the yaml).
-   - Not configured → fresh adopt.
+   - Not configured → fresh adopt. If any persisted agent name collides with a yaml agent name (possible on pre-onboarding installs), apply the same name-skip rule: keep the persisted agent, restore the rest.
 3. **Commit inside one control-plane transaction:** set workspace config from the yaml (company name, mission, values, root path), create the orchestrator, create each worker, persist.
 4. **Rollback:** any failure after the first mutation (agent creation failure, persist failure) → full rollback: created agents removed, workspace config cleared, best-effort rollback persist — same shared rollback helper pattern as bootstrap. Nothing is half-adopted.
 5. Success → `201 { workspace, orchestrator, workers }` (web client types mirror bootstrap's response shape plus `workers`).
