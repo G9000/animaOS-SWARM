@@ -198,11 +198,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 /** Error.message prefix returned by the daemon when no generative provider is available. */
 export const PROFILE_GENERATION_UNAVAILABLE = 'PROFILE_GENERATION_UNAVAILABLE';
 
-export interface DaemonWorkspaceConfig {
+export interface WorkspaceConfigInput {
   rootPath: string;
   companyName: string;
   mission: string;
   values: string[];
+}
+
+export interface DaemonWorkspaceConfig extends WorkspaceConfigInput {
+  hasAvatar: boolean;
 }
 
 export interface DaemonWorkspaceState {
@@ -218,7 +222,8 @@ export type DaemonWorkspaceValidation = DaemonWorkspaceState & {
   rootPathExists: boolean;
 };
 
-export type WorkspaceConfigInput = DaemonWorkspaceConfig;
+export const workspaceAvatarUrl = (revision: number) =>
+  `/api/workspace/avatar?v=${revision}`;
 
 export interface GenerateProfileInput {
   presetId: string;
@@ -426,6 +431,13 @@ export const daemon = {
     ),
 
   getWorkspace: () => request<DaemonWorkspaceState>('/workspace'),
+
+  uploadWorkspaceAvatar: (file: File) =>
+    request<void>('/workspace/avatar', {
+      method: 'PUT',
+      headers: { 'content-type': file.type },
+      body: file,
+    }),
 
   putWorkspace: (input: WorkspaceConfigInput) =>
     request<DaemonWorkspaceState>('/workspace', {

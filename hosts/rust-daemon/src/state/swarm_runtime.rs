@@ -34,6 +34,7 @@ impl DaemonState {
         let tool_registry = self.tool_registry.clone();
         let process_manager = Arc::clone(&self.process_manager);
         let workspace_root = self.workspace.as_ref().map(|w| w.root_path.clone());
+        let calendar = self.calendar_manager.clone();
         let db = self.db.clone();
 
         Arc::new(move |context: CoordinatorAgentFactoryContext| {
@@ -44,6 +45,7 @@ impl DaemonState {
             let tool_registry = tool_registry.clone();
             let process_manager = Arc::clone(&process_manager);
             let workspace_root = workspace_root.clone();
+            let calendar = calendar.clone();
             let event_stream = event_stream.clone();
             let db = db.clone();
 
@@ -56,6 +58,7 @@ impl DaemonState {
                     tool_registry,
                     process_manager,
                     workspace_root,
+                    calendar,
                 );
                 let runtime_events: Arc<dyn Fn(EngineEvent) + Send + Sync> = Arc::new({
                     let event_stream = event_stream.clone();

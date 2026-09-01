@@ -360,7 +360,7 @@ impl CredentialBackend for OsKeyringBackend {
     }
 }
 
-fn account_for(connector_id: &str) -> Result<String, CredentialStoreError> {
+pub(crate) fn account_for(connector_id: &str) -> Result<String, CredentialStoreError> {
     let valid = !connector_id.is_empty()
         && connector_id.len() <= MAX_CONNECTOR_ID_LENGTH
         && connector_id.is_ascii()

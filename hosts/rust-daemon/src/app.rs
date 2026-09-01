@@ -36,6 +36,7 @@ struct DaemonRuntime {
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connectors: ConnectorManager,
+    calendar: crate::connectors::gcalendar::CalendarManager,
     scheduler: SchedulerService,
 }
 
@@ -128,6 +129,11 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
     let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+    // Construction-time state is uncontended, so this always succeeds in
+    // practice; calendar tools simply report "unconfigured" otherwise.
+    if let Ok(mut guard) = state.try_write() {
+        guard.set_calendar_manager(Some(runtime.calendar.clone()));
+    }
     router_with_runtime(
         state,
         config,
@@ -144,6 +150,10 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     )));
     configure_persistence(&state, &config).await?;
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
+    state
+        .write()
+        .await
+        .set_calendar_manager(Some(runtime.calendar.clone()));
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
     Ok(router_with_runtime(state, config, runtime, false))
@@ -171,6 +181,10 @@ pub(crate) async fn serve_with_state(
 ) -> io::Result<()> {
     let bind_is_loopback = listener.local_addr()?.ip().is_loopback();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
+    state
+        .write()
+        .await
+        .set_calendar_manager(Some(runtime.calendar.clone()));
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
     let connectors = runtime.connectors.clone();
@@ -196,11 +210,22 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         Arc::new(OsKeyringCredentialStore::new()),
         Arc::new(transport),
     );
+    let google_transport =
+        crate::connectors::gcalendar::client::GoogleCalendarClient::new()
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let calendar = crate::connectors::gcalendar::CalendarManager::new(
+        &state,
+        agent_runs.clone(),
+        Arc::new(crate::connectors::gcalendar::store::OsKeyringGoogleCredentialStore::new()),
+        Arc::new(google_transport),
+        crate::connectors::gcalendar::GoogleOAuthConfig::from_env(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     Ok(DaemonRuntime {
         run_limiter,
         agent_runs,
         connectors,
+        calendar,
         scheduler,
     })
 }
@@ -214,11 +239,19 @@ fn deterministic_daemon_runtime(state: SharedDaemonState, config: &DaemonConfig)
         Arc::new(InMemoryCredentialStore::default()),
         Arc::new(DeterministicTelegramTransport),
     );
+    let calendar = crate::connectors::gcalendar::CalendarManager::new(
+        &state,
+        agent_runs.clone(),
+        Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
+        Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
+        None,
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     DaemonRuntime {
         run_limiter,
         agent_runs,
         connectors,
+        calendar,
         scheduler,
     }
 }
@@ -235,6 +268,7 @@ fn router_with_runtime(
         runtime.run_limiter,
         runtime.agent_runs,
         runtime.connectors,
+        runtime.calendar,
         runtime.scheduler,
         bind_is_loopback,
     )

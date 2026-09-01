@@ -22,6 +22,9 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 use tracing::warn;
 
 use crate::components::{default_evaluators, default_providers};
+use crate::connectors::gcalendar::{
+    CalendarManager, CalendarPendingWriteRecord, GoogleCalendarConnectorRecord,
+};
 use crate::connectors::{
     InboundProcessingState, OutboundDeliveryState, TelegramConnectorRecord,
     TelegramCredentialCleanupIntent, TelegramInboundRecord, TelegramOutboundRecord,
@@ -1192,6 +1195,9 @@ pub(crate) struct DaemonState {
     pub(crate) inbound: HashMap<(String, i64), TelegramInboundRecord>,
     pub(crate) outbound: HashMap<String, TelegramOutboundRecord>,
     pub(crate) schedules: HashMap<String, ScheduledPromptRecord>,
+    pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
+    pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
+    calendar_manager: Option<CalendarManager>,
     pub(crate) workspace: Option<WorkspaceConfig>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
@@ -1330,6 +1336,9 @@ impl DaemonState {
             inbound: HashMap::new(),
             outbound: HashMap::new(),
             schedules: HashMap::new(),
+            calendar_connectors: HashMap::new(),
+            calendar_writes: HashMap::new(),
+            calendar_manager: None,
             workspace: None,
             model_adapter,
             tool_registry: ToolRegistry::new(),
@@ -1369,6 +1378,10 @@ impl DaemonState {
         control_plane_store: Option<ControlPlaneStoreConfig>,
     ) {
         self.control_plane_store = control_plane_store;
+    }
+
+    pub(crate) fn set_calendar_manager(&mut self, calendar_manager: Option<CalendarManager>) {
+        self.calendar_manager = calendar_manager;
     }
 
     pub(crate) fn control_plane_persist_request(&mut self) -> ControlPlanePersistRequest {
@@ -1433,6 +1446,14 @@ impl DaemonState {
         outbound.sort_by(|left, right| left.id.cmp(&right.id));
         let mut schedules = self.schedules.values().cloned().collect::<Vec<_>>();
         schedules.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut calendar_connectors = self
+            .calendar_connectors
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        calendar_connectors.sort_by(|left, right| left.id.cmp(&right.id));
+        let mut calendar_writes = self.calendar_writes.values().cloned().collect::<Vec<_>>();
+        calendar_writes.sort_by(|left, right| left.id.cmp(&right.id));
 
         let mut snapshot = ControlPlaneSnapshot::with_connector_state_and_cleanup(
             agents,
@@ -1443,6 +1464,8 @@ impl DaemonState {
             outbound,
             schedules,
         );
+        snapshot.calendar_connectors = calendar_connectors;
+        snapshot.calendar_writes = calendar_writes;
         snapshot.workspace = self.workspace.clone();
         snapshot
     }
@@ -1492,6 +1515,16 @@ impl DaemonState {
             .schedules
             .into_iter()
             .map(|schedule| (schedule.id.clone(), schedule))
+            .collect();
+        self.calendar_connectors = snapshot
+            .calendar_connectors
+            .into_iter()
+            .map(|connector| (connector.id.clone(), connector))
+            .collect();
+        self.calendar_writes = snapshot
+            .calendar_writes
+            .into_iter()
+            .map(|write| (write.id.clone(), write))
             .collect();
 
         Ok((restored_agents, restored_swarms))
@@ -1826,6 +1859,80 @@ impl DaemonState {
                         schedule.id
                     ));
                 }
+            }
+        }
+
+        let mut calendar_connector_ids = HashSet::new();
+        for connector in &snapshot.calendar_connectors {
+            if connector.id.is_empty() || !calendar_connector_ids.insert(connector.id.clone()) {
+                return Err(format!(
+                    "duplicate or empty calendar connector id in snapshot: {}",
+                    connector.id
+                ));
+            }
+            if connector.deleted_at_ms.is_some_and(|deleted_at_ms| {
+                deleted_at_ms < connector.created_at_ms || deleted_at_ms < connector.updated_at_ms
+            }) {
+                return Err(format!(
+                    "calendar connector '{}' has invalid deletion timing",
+                    connector.id
+                ));
+            }
+            if connector.deleted_at_ms.is_some() && connector.enabled {
+                return Err(format!(
+                    "calendar connector '{}' cannot be enabled after deletion",
+                    connector.id
+                ));
+            }
+            if connector.deleted_at_ms.is_some() && connector.pending_auth.is_some() {
+                return Err(format!(
+                    "calendar connector '{}' cannot retain pending auth after deletion",
+                    connector.id
+                ));
+            }
+            if connector.calendar_ids.is_empty() {
+                return Err(format!(
+                    "calendar connector '{}' must watch at least one calendar",
+                    connector.id
+                ));
+            }
+            if !agent_ids.contains(&connector.agent_id) && connector.deleted_at_ms.is_none() {
+                return Err(format!(
+                    "calendar connector '{}' references missing agent '{}'",
+                    connector.id, connector.agent_id
+                ));
+            }
+        }
+
+        let mut calendar_write_ids = HashSet::new();
+        for write in &snapshot.calendar_writes {
+            if write.id.is_empty() || !calendar_write_ids.insert(write.id.clone()) {
+                return Err(format!(
+                    "duplicate or empty calendar write id in snapshot: {}",
+                    write.id
+                ));
+            }
+            let connector = snapshot
+                .calendar_connectors
+                .iter()
+                .find(|connector| connector.id == write.connector_id)
+                .ok_or_else(|| {
+                    format!(
+                        "calendar write '{}' references missing connector '{}'",
+                        write.id, write.connector_id
+                    )
+                })?;
+            if connector.deleted_at_ms.is_some() && !write.state.is_terminal() {
+                return Err(format!(
+                    "calendar write '{}' cannot remain pending after connector deletion",
+                    write.id
+                ));
+            }
+            if write.state.is_terminal() && write.resolved_at_ms.is_none() {
+                return Err(format!(
+                    "calendar write '{}' is terminal without a resolution time",
+                    write.id
+                ));
             }
         }
 
@@ -2217,6 +2324,7 @@ impl DaemonState {
             self.tool_registry.clone(),
             Arc::clone(&self.process_manager),
             self.workspace.as_ref().map(|w| w.root_path.clone()),
+            self.calendar_manager.clone(),
         );
         Some((runtime, tool_context))
     }

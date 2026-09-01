@@ -5,13 +5,22 @@ import type { DaemonWorkspaceState } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { AgentPresence } from './AgentPresence';
 import { AgentsView } from './AgentsView';
-import { AgentsIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
+import {
+  AgentsIcon,
+  GearIcon,
+  PulseIcon,
+  SendIcon,
+  SparkIcon,
+} from './icons';
+import { ghostBtnCls } from './ui-bits';
 
 export type WorkspaceDestination =
   | 'workspace'
   | 'telegram'
   | 'activity'
   | 'agents';
+
+const ignoreWorkspaceAvatarChange = async () => undefined;
 
 const DESTINATIONS: Array<{
   id: WorkspaceDestination;
@@ -74,7 +83,7 @@ function DestinationNavigation({
       data-placement={placement}
       className={
         sidebar
-          ? 'relative z-20 flex w-48 shrink-0 flex-col gap-1 border-r border-line bg-panel/55 p-3 backdrop-blur-2xl xl:w-56'
+          ? 'flex min-h-0 flex-1 flex-col gap-1 p-3'
           : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
       }
     >
@@ -119,6 +128,7 @@ export function WorkspaceShell({
   telegram = null,
   workspaceState = null,
   onOpenSettings,
+  onChangeWorkspaceAvatar = ignoreWorkspaceAvatarChange,
 }: {
   mainAgent: AgentDetail;
   agents: readonly AgentDetail[];
@@ -128,6 +138,7 @@ export function WorkspaceShell({
   telegram?: ReactNode | null;
   workspaceState?: DaemonWorkspaceState | null;
   onOpenSettings: () => void;
+  onChangeWorkspaceAvatar?: (file: File) => Promise<void>;
 }) {
   const [destination, setDestination] =
     useState<WorkspaceDestination>('workspace');
@@ -136,6 +147,9 @@ export function WorkspaceShell({
     workspaceState?.configured && workspaceState.workspace !== null
       ? workspaceState.workspace.companyName
       : null;
+  const hasAvatar =
+    workspaceState?.configured === true &&
+    workspaceState.workspace?.hasAvatar === true;
 
   useEffect(() => {
     if (destination === 'telegram' && telegram === null) {
@@ -145,21 +159,48 @@ export function WorkspaceShell({
 
   return (
     <div className="relative z-[1] flex min-h-0 flex-1 flex-col">
-      <AgentPresence
-        agent={mainAgent}
-        connection={connection}
-        companyName={companyName}
-        onOpenSettings={onOpenSettings}
-      />
+      {!desktopNavigation ? (
+        <AgentPresence
+          agent={mainAgent}
+          connection={connection}
+          companyName={companyName}
+          placement="mobile-bar"
+          hasAvatar={hasAvatar}
+          onChangeWorkspaceAvatar={onChangeWorkspaceAvatar}
+          onOpenSettings={onOpenSettings}
+        />
+      ) : null}
 
       <div className="relative flex min-h-0 flex-1">
         {desktopNavigation ? (
-          <DestinationNavigation
-            destination={destination}
-            setDestination={setDestination}
-            placement="sidebar"
-            hasTelegram={telegram !== null}
-          />
+          <aside className="relative z-20 flex w-56 shrink-0 flex-col border-r border-line bg-panel/55 backdrop-blur-2xl xl:w-64">
+            <AgentPresence
+              agent={mainAgent}
+              connection={connection}
+              companyName={companyName}
+              placement="sidebar"
+              hasAvatar={hasAvatar}
+              onChangeWorkspaceAvatar={onChangeWorkspaceAvatar}
+            />
+            <DestinationNavigation
+              destination={destination}
+              setDestination={setDestination}
+              placement="sidebar"
+              hasTelegram={telegram !== null}
+            />
+            <div className="border-t border-line/60 p-3">
+              <button
+                type="button"
+                onClick={onOpenSettings}
+                className={`${ghostBtnCls} w-full justify-start`}
+                aria-label="Settings"
+                title={`Settings for ${mainAgent.name}`}
+              >
+                <GearIcon size={13} />
+                <span>Settings</span>
+              </button>
+            </div>
+          </aside>
         ) : null}
 
         <main className="spatial-canvas workspace-mobile-safe relative min-h-0 min-w-0 flex-1">

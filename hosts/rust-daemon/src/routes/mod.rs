@@ -2,6 +2,7 @@ mod agencies;
 mod agents;
 mod connectors;
 mod contracts;
+mod gcalendar;
 mod health;
 mod http;
 mod memories;
@@ -93,6 +94,8 @@ use crate::runtime_model::provider_summaries;
         list_providers_entry,
         get_workspace_entry,
         put_workspace_entry,
+        get_workspace_avatar_entry,
+        put_workspace_avatar_entry,
         bootstrap_workspace_entry,
         inspect_workspace_entry,
         resume_workspace_entry,
@@ -104,6 +107,13 @@ use crate::runtime_model::provider_summaries;
         connectors::delete_telegram_connector,
         connectors::list_connector_messages,
         connectors::send_connector_message,
+        gcalendar::get_gcalendar_connector,
+        gcalendar::connect_gcalendar,
+        gcalendar::gcalendar_oauth_callback,
+        gcalendar::delete_gcalendar_connector,
+        gcalendar::list_calendar_writes,
+        gcalendar::approve_calendar_write,
+        gcalendar::reject_calendar_write,
         schedules::list_schedules,
         schedules::create_schedule,
         schedules::update_schedule,
@@ -132,6 +142,7 @@ struct AppState {
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    calendar: crate::connectors::gcalendar::CalendarManager,
     scheduler: SchedulerService,
     local_owner: self::http::LocalOwnerPolicy,
 }
@@ -205,12 +216,20 @@ pub(crate) fn router_with_services(
         agent_runs.clone(),
         connector_manager.clone(),
     );
+    let calendar = crate::connectors::gcalendar::CalendarManager::new(
+        &state,
+        agent_runs.clone(),
+        Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
+        Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
+        None,
+    );
     router_with_all_services(
         state,
         config,
         run_limiter,
         agent_runs,
         connector_manager,
+        calendar,
         scheduler,
         bind_is_loopback,
     )
@@ -222,6 +241,7 @@ pub(crate) fn router_with_all_services(
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    calendar: crate::connectors::gcalendar::CalendarManager,
     scheduler: SchedulerService,
     bind_is_loopback: bool,
 ) -> Router {
@@ -231,6 +251,7 @@ pub(crate) fn router_with_all_services(
         run_limiter,
         agent_runs,
         connector_manager,
+        calendar,
         scheduler,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
@@ -243,6 +264,7 @@ fn router_with_services_with_policies(
     run_limiter: Arc<Semaphore>,
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
+    calendar: crate::connectors::gcalendar::CalendarManager,
     scheduler: SchedulerService,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
@@ -253,6 +275,7 @@ fn router_with_services_with_policies(
         run_limiter: Arc::clone(&run_limiter),
         agent_runs,
         connector_manager,
+        calendar,
         scheduler,
         local_owner,
     };
@@ -280,6 +303,10 @@ fn router_with_services_with_policies(
         .route(
             "/api/workspace",
             get(get_workspace_entry).put(put_workspace_entry),
+        )
+        .route(
+            "/api/workspace/avatar",
+            get(get_workspace_avatar_entry).put(put_workspace_avatar_entry),
         )
         .route(
             "/api/workspace/bootstrap",
@@ -388,6 +415,30 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/connectors/{connector_id}/messages",
             get(connectors::list_connector_messages),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/gcalendar",
+            get(gcalendar::get_gcalendar_connector).post(gcalendar::connect_gcalendar),
+        )
+        .route(
+            "/api/connectors/gcalendar/callback",
+            get(gcalendar::gcalendar_oauth_callback),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/gcalendar/{connector_id}",
+            axum::routing::delete(gcalendar::delete_gcalendar_connector),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/gcalendar/{connector_id}/writes",
+            get(gcalendar::list_calendar_writes),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/gcalendar/{connector_id}/writes/{write_id}/approve",
+            axum::routing::post(gcalendar::approve_calendar_write),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/gcalendar/{connector_id}/writes/{write_id}/reject",
+            axum::routing::post(gcalendar::reject_calendar_write),
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -1225,6 +1276,69 @@ async fn put_workspace_entry(State(state): State<AppState>, request: AxumRequest
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/workspace/avatar",
+    tag = "workspace",
+    responses(
+        (status = 200, description = "Workspace avatar image bytes"),
+        (status = 404, description = "No valid workspace avatar", body = ErrorBody),
+        (status = 409, description = "Workspace is not configured", body = ErrorBody)
+    )
+)]
+async fn get_workspace_avatar_entry(State(state): State<AppState>) -> AxumResponse {
+    match workspace::handle_get_workspace_avatar(&state.daemon).await {
+        Ok(avatar) => {
+            let mut response = avatar.bytes.into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(avatar.content_type),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/workspace/avatar",
+    tag = "workspace",
+    responses(
+        (status = 204, description = "Workspace avatar replaced"),
+        (status = 400, description = "Invalid avatar body or content type", body = ErrorBody),
+        (status = 409, description = "Workspace is not configured", body = ErrorBody),
+        (status = 503, description = "Workspace avatar could not be stored", body = ErrorBody)
+    )
+)]
+async fn put_workspace_avatar_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = match read_limited_body(request, workspace::MAX_WORKSPACE_AVATAR_BYTES + 1).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if body.len() > workspace::MAX_WORKSPACE_AVATAR_BYTES {
+        return ApiError::bad_request_static("workspace avatar exceeds 5 MiB").into_response();
+    }
+
+    let _transaction = state.agent_runs.control_plane_transaction().await;
+    match workspace::handle_put_workspace_avatar(body, content_type.as_deref(), &state.daemon).await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(
     post,
     path = "/api/workspace/bootstrap",
     tag = "workspace",
@@ -1332,6 +1446,7 @@ mod tests {
         OutboundDeliveryState, TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata,
         TelegramConnectorRecord, TelegramPendingPairing,
     };
+    use crate::control_plane_store::WorkspaceConfig;
     use crate::routes::http::{ApiKeyPolicy, LocalOwnerPolicy};
     use crate::state::DaemonState;
     use anima_core::{
@@ -1341,11 +1456,62 @@ mod tests {
     use async_trait::async_trait;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::{RwLock, Semaphore};
     use tower::util::ServiceExt;
+
+    static WORKSPACE_AVATAR_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct WorkspaceAvatarTemp {
+        root: PathBuf,
+    }
+
+    impl WorkspaceAvatarTemp {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "anima-workspace-avatar-route-{label}-{}-{}",
+                std::process::id(),
+                WORKSPACE_AVATAR_TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&root).expect("temp workspace should be created");
+            Self { root }
+        }
+
+        fn state(&self) -> Arc<RwLock<DaemonState>> {
+            let mut daemon = DaemonState::new();
+            daemon.workspace = Some(WorkspaceConfig {
+                root_path: self.root.clone(),
+                company_name: "Acme".into(),
+                mission: "Ship carefully".into(),
+                values: vec!["care".into()],
+            });
+            Arc::new(RwLock::new(daemon))
+        }
+
+        fn write_avatar(&self, bytes: &[u8]) {
+            let assets = self.root.join("assets");
+            std::fs::create_dir_all(&assets).expect("assets should be created");
+            std::fs::write(assets.join("workspace-avatar"), bytes)
+                .expect("avatar should be written");
+        }
+    }
+
+    impl Drop for WorkspaceAvatarTemp {
+        fn drop(&mut self) {
+            if self.root.starts_with(std::env::temp_dir())
+                && self
+                    .root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("anima-workspace-avatar-route-"))
+            {
+                std::fs::remove_dir_all(&self.root).ok();
+            }
+        }
+    }
 
     struct SlowModelAdapter {
         delay: Duration,
@@ -1617,6 +1783,156 @@ mod tests {
             Arc::new(TelegramClient::new().unwrap()),
         );
         router_with_services(state, config, limiter, runs, connectors, true)
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_routes_store_serve_and_report_route_specific_upload() {
+        let workspace = WorkspaceAvatarTemp::new("round-trip");
+        let state = workspace.state();
+        let app = router(Arc::clone(&state), DaemonConfig::default());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workspace"]["hasAvatar"], false);
+
+        let mut png = vec![0_u8; 65 * 1024];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/workspace/avatar")
+                    .header("content-type", "image/png")
+                    .body(Body::from(png.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/avatar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get("content-type").unwrap(), "image/png");
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), png);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["workspace"]["hasAvatar"], true);
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_routes_reject_invalid_and_oversized_assets() {
+        let workspace = WorkspaceAvatarTemp::new("invalid");
+        let state = workspace.state();
+        let app = router(Arc::clone(&state), DaemonConfig::default());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/workspace/avatar")
+                    .header("content-type", "image/png")
+                    .body(Body::from("not-an-image"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/workspace/avatar")
+                    .header("content-type", "image/png")
+                    .body(Body::from(vec![
+                        0_u8;
+                        super::workspace::MAX_WORKSPACE_AVATAR_BYTES
+                            + 1
+                    ]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        workspace.write_avatar(b"invalid");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/avatar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut oversized = vec![0_u8; super::workspace::MAX_WORKSPACE_AVATAR_BYTES + 1];
+        oversized[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        workspace.write_avatar(&oversized);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/workspace/avatar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_put_requires_configured_workspace() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let app = router(state, DaemonConfig::default());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/workspace/avatar")
+                    .header("content-type", "image/png")
+                    .body(Body::from(b"\x89PNG\r\n\x1a\n".as_slice()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

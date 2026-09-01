@@ -106,6 +106,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "utoipa-scalar",
+ "uuid",
  "zeroize",
 ]
 

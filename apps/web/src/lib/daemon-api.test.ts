@@ -4,6 +4,7 @@ import {
   daemon,
   toAgentDetail,
   PROFILE_GENERATION_UNAVAILABLE,
+  workspaceAvatarUrl,
   type DaemonSnapshot,
 } from './daemon-api';
 
@@ -190,6 +191,7 @@ describe('daemon workspace requests', () => {
       companyName: 'Acme',
       mission: 'Ship it',
       values: ['rigor', 'care'],
+      hasAvatar: false,
     },
     defaultRoot: '/srv',
   };
@@ -238,6 +240,31 @@ describe('daemon workspace requests', () => {
         body: JSON.stringify(input),
       }),
     );
+  });
+
+  it('uploads the workspace avatar as raw bytes and accepts 204', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const file = new File(['avatar-bytes'], 'avatar.png', {
+      type: 'image/png',
+    });
+
+    await daemon.uploadWorkspaceAvatar(file);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/workspace/avatar',
+      expect.objectContaining({
+        method: 'PUT',
+        body: file,
+        headers: expect.objectContaining({ 'content-type': 'image/png' }),
+      }),
+    );
+  });
+
+  it('builds a cache-busted workspace avatar URL', () => {
+    expect(workspaceAvatarUrl(3)).toBe('/api/workspace/avatar?v=3');
   });
 
   it('validateWorkspace PUTs with validateOnly', async () => {

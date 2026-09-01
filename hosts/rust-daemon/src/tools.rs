@@ -1,5 +1,6 @@
 mod filesystem;
 mod memory;
+pub(crate) mod calendar;
 mod process;
 #[cfg(test)]
 mod tests;
@@ -17,6 +18,7 @@ use anima_core::{
 };
 use futures::future::BoxFuture;
 
+use crate::connectors::gcalendar::CalendarManager;
 use crate::memory_embeddings::SharedMemoryEmbeddings;
 use crate::memory_store::MemoryStoreConfig;
 use crate::state::SharedMemoryStore;
@@ -56,9 +58,11 @@ pub(crate) struct ToolExecutionContext {
     tool_registry: ToolRegistry,
     pub(super) process_manager: SharedProcessManager,
     pub(super) workspace_root: Option<PathBuf>,
+    pub(super) calendar: Option<CalendarManager>,
 }
 
 impl ToolExecutionContext {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         memory: SharedMemoryStore,
         memory_embeddings: SharedMemoryEmbeddings,
@@ -66,6 +70,7 @@ impl ToolExecutionContext {
         tool_registry: ToolRegistry,
         process_manager: SharedProcessManager,
         workspace_root: Option<PathBuf>,
+        calendar: Option<CalendarManager>,
     ) -> Self {
         Self {
             memory,
@@ -74,6 +79,7 @@ impl ToolExecutionContext {
             tool_registry,
             process_manager,
             workspace_root,
+            calendar,
         }
     }
 
@@ -489,6 +495,102 @@ impl ToolRegistry {
                 )]),
             ),
             execute_swarm_only_tool,
+        );
+        registry.register(
+            tool_descriptor(
+                "calendar_list_events",
+                "List Google Calendar events in a time window. Requires a connected Google Calendar; returns connection guidance when not connected.",
+                object_parameters(vec![
+                    required_parameter(
+                        "time_min",
+                        non_empty_string_parameter(
+                            "Start of the window as RFC 3339, e.g. 2026-09-01T00:00:00Z",
+                        ),
+                    ),
+                    required_parameter(
+                        "time_max",
+                        non_empty_string_parameter("End of the window as RFC 3339"),
+                    ),
+                    optional_parameter(
+                        "calendar_id",
+                        string_parameter("Calendar id; defaults to the primary calendar"),
+                    ),
+                ]),
+            ),
+            calendar::execute_calendar_list_events,
+        );
+        registry.register(
+            tool_descriptor(
+                "calendar_create_event",
+                "Draft a new Google Calendar event. The event is NOT created until the owner approves it in Settings → Google Calendar.",
+                object_parameters(vec![
+                    required_parameter("title", non_blank_string_parameter("Event title")),
+                    required_parameter(
+                        "start",
+                        non_empty_string_parameter("Start time as RFC 3339 with offset"),
+                    ),
+                    required_parameter(
+                        "end",
+                        non_empty_string_parameter("End time as RFC 3339 with offset"),
+                    ),
+                    optional_parameter("location", string_parameter("Event location")),
+                    optional_parameter("description", string_parameter("Event description")),
+                    optional_parameter(
+                        "calendar_id",
+                        string_parameter("Calendar id; defaults to the primary calendar"),
+                    ),
+                ]),
+            ),
+            calendar::execute_calendar_create_event,
+        );
+        registry.register(
+            tool_descriptor(
+                "calendar_update_event",
+                "Draft changes to an existing Google Calendar event. Applied only after owner approval in Settings → Google Calendar.",
+                object_parameters(vec![
+                    required_parameter(
+                        "event_id",
+                        non_empty_string_parameter(
+                            "Event id from calendar_list_events to update",
+                        ),
+                    ),
+                    optional_parameter("title", string_parameter("New event title")),
+                    optional_parameter(
+                        "start",
+                        string_parameter("New start time as RFC 3339 with offset"),
+                    ),
+                    optional_parameter(
+                        "end",
+                        string_parameter("New end time as RFC 3339 with offset"),
+                    ),
+                    optional_parameter("location", string_parameter("New location")),
+                    optional_parameter("description", string_parameter("New description")),
+                    optional_parameter(
+                        "calendar_id",
+                        string_parameter("Calendar id; defaults to the primary calendar"),
+                    ),
+                ]),
+            ),
+            calendar::execute_calendar_update_event,
+        );
+        registry.register(
+            tool_descriptor(
+                "calendar_delete_event",
+                "Draft deletion of a Google Calendar event. Applied only after owner approval in Settings → Google Calendar.",
+                object_parameters(vec![
+                    required_parameter(
+                        "event_id",
+                        non_empty_string_parameter(
+                            "Event id from calendar_list_events to delete",
+                        ),
+                    ),
+                    optional_parameter(
+                        "calendar_id",
+                        string_parameter("Calendar id; defaults to the primary calendar"),
+                    ),
+                ]),
+            ),
+            calendar::execute_calendar_delete_event,
         );
         registry
     }

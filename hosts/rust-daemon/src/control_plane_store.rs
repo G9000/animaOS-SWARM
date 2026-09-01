@@ -8,6 +8,7 @@ use atomicwrites::{AllowOverwrite, AtomicFile};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 
+use crate::connectors::gcalendar::{CalendarPendingWriteRecord, GoogleCalendarConnectorRecord};
 use crate::connectors::{
     TelegramConnectorRecord, TelegramCredentialCleanupIntent, TelegramInboundRecord,
     TelegramOutboundRecord,
@@ -75,6 +76,10 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) outbound: Vec<TelegramOutboundRecord>,
     #[serde(default)]
     pub(crate) schedules: Vec<ScheduledPromptRecord>,
+    #[serde(default)]
+    pub(crate) calendar_connectors: Vec<GoogleCalendarConnectorRecord>,
+    #[serde(default)]
+    pub(crate) calendar_writes: Vec<CalendarPendingWriteRecord>,
     #[serde(default)]
     pub(crate) workspace: Option<WorkspaceConfig>,
 }
@@ -296,6 +301,8 @@ impl ControlPlaneSnapshot {
             inbound,
             outbound,
             schedules,
+            calendar_connectors: vec![],
+            calendar_writes: vec![],
             workspace: None,
         }
     }

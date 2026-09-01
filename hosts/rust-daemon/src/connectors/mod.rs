@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod credentials;
+pub(crate) mod gcalendar;
 pub(crate) mod runtime;
 pub(crate) mod telegram;
 

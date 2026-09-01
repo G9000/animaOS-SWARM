@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anima_core::{AgentConfig, AgentRuntimeSnapshot, ToolDescriptor};
+use atomicwrites::{AllowOverwrite, AtomicFile};
 
 use super::agencies::{load_agency_yaml, AgencyYamlAgent, AgencyYamlConfig};
 use super::contracts::{
@@ -14,6 +17,128 @@ use super::ApiError;
 use crate::app::SharedDaemonState;
 use crate::control_plane_store::WorkspaceConfig;
 use crate::runtime_model::provider_summaries;
+
+pub(super) const MAX_WORKSPACE_AVATAR_BYTES: usize = 5 * 1024 * 1024;
+const WORKSPACE_AVATAR_DIRECTORY: &str = "assets";
+const WORKSPACE_AVATAR_FILE: &str = "workspace-avatar";
+
+fn workspace_avatar_path(root: &Path) -> PathBuf {
+    root.join(WORKSPACE_AVATAR_DIRECTORY)
+        .join(WORKSPACE_AVATAR_FILE)
+}
+
+fn detect_avatar_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+fn inspect_workspace_avatar(root: &Path) -> Option<&'static str> {
+    let path = workspace_avatar_path(root);
+    let metadata = path.metadata().ok()?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_WORKSPACE_AVATAR_BYTES as u64
+    {
+        return None;
+    }
+
+    let mut file = File::open(path).ok()?;
+    let mut header = [0_u8; 12];
+    let read = file.read(&mut header).ok()?;
+    detect_avatar_media_type(&header[..read])
+}
+
+pub(crate) struct WorkspaceAvatar {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) content_type: &'static str,
+}
+
+async fn configured_workspace_root(state: &SharedDaemonState) -> Result<PathBuf, ApiError> {
+    state
+        .read()
+        .await
+        .workspace
+        .as_ref()
+        .map(|workspace| workspace.root_path.clone())
+        .ok_or_else(|| ApiError::conflict("workspace is not configured"))
+}
+
+pub(crate) async fn handle_put_workspace_avatar(
+    body: Vec<u8>,
+    declared_content_type: Option<&str>,
+    state: &SharedDaemonState,
+) -> Result<(), ApiError> {
+    if body.is_empty() {
+        return Err(ApiError::bad_request_static(
+            "workspace avatar must not be empty",
+        ));
+    }
+    if body.len() > MAX_WORKSPACE_AVATAR_BYTES {
+        return Err(ApiError::bad_request_static(
+            "workspace avatar exceeds 5 MiB",
+        ));
+    }
+
+    let detected_content_type = detect_avatar_media_type(&body).ok_or_else(|| {
+        ApiError::bad_request_static("workspace avatar must be PNG, JPEG, or WebP")
+    })?;
+    if declared_content_type != Some(detected_content_type) {
+        return Err(ApiError::bad_request_static(
+            "workspace avatar content type does not match its bytes",
+        ));
+    }
+
+    let root = configured_workspace_root(state).await?;
+    let path = workspace_avatar_path(&root);
+    let parent = path
+        .parent()
+        .expect("workspace avatar path always has an assets parent");
+    std::fs::create_dir_all(parent).map_err(|error| {
+        ApiError::service_unavailable(format!("workspace avatar could not be stored: {error}"))
+    })?;
+    AtomicFile::new(&path, AllowOverwrite)
+        .write(|file| file.write_all(&body))
+        .map_err(|error| {
+            ApiError::service_unavailable(format!("workspace avatar could not be stored: {error}"))
+        })?;
+    Ok(())
+}
+
+pub(crate) async fn handle_get_workspace_avatar(
+    state: &SharedDaemonState,
+) -> Result<WorkspaceAvatar, ApiError> {
+    let root = configured_workspace_root(state).await?;
+    let path = workspace_avatar_path(&root);
+    let metadata = path.metadata().map_err(|_| ApiError::not_found())?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_WORKSPACE_AVATAR_BYTES as u64
+    {
+        return Err(ApiError::not_found());
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .map_err(|_| ApiError::not_found())?
+        .take((MAX_WORKSPACE_AVATAR_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ApiError::not_found())?;
+    if bytes.len() > MAX_WORKSPACE_AVATAR_BYTES {
+        return Err(ApiError::not_found());
+    }
+    let content_type = detect_avatar_media_type(&bytes).ok_or_else(ApiError::not_found)?;
+    Ok(WorkspaceAvatar {
+        bytes,
+        content_type,
+    })
+}
 
 /// Read-only inspection of a candidate workspace root: reports whether an
 /// anima.yaml exists there and, when it does, a preview of the agency it
@@ -693,6 +818,7 @@ pub(super) fn config_response(config: &WorkspaceConfig) -> WorkspaceConfigRespon
         company_name: config.company_name.clone(),
         mission: config.mission.clone(),
         values: config.values.clone(),
+        has_avatar: inspect_workspace_avatar(&config.root_path).is_some(),
     }
 }
 
@@ -709,10 +835,79 @@ pub(super) fn default_root_label() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::default_root_label;
-    use std::sync::Mutex;
+    use super::{
+        config_response, default_root_label, detect_avatar_media_type, handle_get_workspace_avatar,
+        handle_put_workspace_avatar, MAX_WORKSPACE_AVATAR_BYTES,
+    };
+    use crate::control_plane_store::WorkspaceConfig;
+    use crate::state::DaemonState;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::RwLock;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\nworkspace-avatar";
+    const JPEG_BYTES: &[u8] = &[0xff, 0xd8, 0xff, 0xe0, b'a', b'v', b'a', b't', b'a', b'r'];
+    const WEBP_BYTES: &[u8] = b"RIFF\x04\x00\x00\x00WEBPavatar";
+
+    struct TempWorkspace {
+        root: PathBuf,
+    }
+
+    impl TempWorkspace {
+        fn new(label: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "anima-workspace-avatar-{label}-{}-{}",
+                std::process::id(),
+                TEMP_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&root).expect("temp workspace should be created");
+            Self { root }
+        }
+
+        fn config(&self) -> WorkspaceConfig {
+            WorkspaceConfig {
+                root_path: self.root.clone(),
+                company_name: "Acme".into(),
+                mission: "Ship carefully".into(),
+                values: vec!["care".into()],
+            }
+        }
+
+        fn write_avatar(&self, bytes: &[u8]) {
+            let assets = self.root.join("assets");
+            std::fs::create_dir_all(&assets).expect("assets should be created");
+            std::fs::write(assets.join("workspace-avatar"), bytes)
+                .expect("avatar should be written");
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            if self.root.starts_with(std::env::temp_dir())
+                && self
+                    .root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("anima-workspace-avatar-"))
+            {
+                std::fs::remove_dir_all(&self.root).ok();
+            }
+        }
+    }
+
+    fn avatar_path(root: &Path) -> PathBuf {
+        root.join("assets").join("workspace-avatar")
+    }
+
+    fn configured_state(workspace: &TempWorkspace) -> Arc<RwLock<DaemonState>> {
+        let mut daemon = DaemonState::new();
+        daemon.workspace = Some(workspace.config());
+        Arc::new(RwLock::new(daemon))
+    }
 
     struct EnvGuard {
         name: &'static str,
@@ -753,5 +948,117 @@ mod tests {
         let _lock = ENV_LOCK.lock().expect("env lock should not poison");
         let _guard = EnvGuard::set("ANIMAOS_WORKSPACE_ROOT", "C:\\anima\\workspace");
         assert_eq!(default_root_label(), "C:\\anima\\workspace");
+    }
+
+    #[test]
+    fn workspace_avatar_detects_supported_formats() {
+        assert_eq!(detect_avatar_media_type(PNG_BYTES), Some("image/png"));
+        assert_eq!(detect_avatar_media_type(JPEG_BYTES), Some("image/jpeg"));
+        assert_eq!(detect_avatar_media_type(WEBP_BYTES), Some("image/webp"));
+        assert_eq!(detect_avatar_media_type(b"not-an-image"), None);
+    }
+
+    #[test]
+    fn workspace_avatar_config_response_reports_only_valid_asset() {
+        let workspace = TempWorkspace::new("discovery");
+        let config = workspace.config();
+        assert!(!config_response(&config).has_avatar);
+
+        workspace.write_avatar(PNG_BYTES);
+        assert!(config_response(&config).has_avatar);
+
+        let restored_config = workspace.config();
+        assert!(config_response(&restored_config).has_avatar);
+
+        workspace.write_avatar(b"invalid");
+        assert!(!config_response(&config).has_avatar);
+
+        let mut oversized = vec![0_u8; MAX_WORKSPACE_AVATAR_BYTES + 1];
+        oversized[..PNG_BYTES.len()].copy_from_slice(PNG_BYTES);
+        workspace.write_avatar(&oversized);
+        assert!(!config_response(&config).has_avatar);
+        assert!(avatar_path(&workspace.root).is_file());
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_put_get_round_trips_supported_formats_and_replaces() {
+        let workspace = TempWorkspace::new("round-trip");
+        let state = configured_state(&workspace);
+
+        for (bytes, content_type) in [
+            (PNG_BYTES, "image/png"),
+            (JPEG_BYTES, "image/jpeg"),
+            (WEBP_BYTES, "image/webp"),
+        ] {
+            handle_put_workspace_avatar(bytes.to_vec(), Some(content_type), &state)
+                .await
+                .expect("valid avatar should be stored");
+            let avatar = handle_get_workspace_avatar(&state)
+                .await
+                .expect("stored avatar should be returned");
+            assert_eq!(avatar.content_type, content_type);
+            assert_eq!(avatar.bytes, bytes);
+        }
+
+        assert_eq!(
+            std::fs::read(avatar_path(&workspace.root)).expect("avatar should be readable"),
+            WEBP_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_rejects_invalid_upload_without_replacing_previous_asset() {
+        let workspace = TempWorkspace::new("invalid-upload");
+        let state = configured_state(&workspace);
+        handle_put_workspace_avatar(PNG_BYTES.to_vec(), Some("image/png"), &state)
+            .await
+            .expect("initial avatar should be stored");
+
+        for (bytes, content_type) in [
+            (Vec::new(), Some("image/png")),
+            (b"invalid".to_vec(), Some("image/png")),
+            (JPEG_BYTES.to_vec(), Some("image/png")),
+            (PNG_BYTES.to_vec(), Some("text/plain")),
+        ] {
+            assert!(handle_put_workspace_avatar(bytes, content_type, &state)
+                .await
+                .is_err());
+        }
+
+        let oversized = vec![0_u8; MAX_WORKSPACE_AVATAR_BYTES + 1];
+        assert!(
+            handle_put_workspace_avatar(oversized, Some("image/png"), &state)
+                .await
+                .is_err()
+        );
+        let avatar = handle_get_workspace_avatar(&state)
+            .await
+            .expect("previous avatar should survive rejected uploads");
+        assert_eq!(avatar.bytes, PNG_BYTES);
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_get_rejects_missing_invalid_and_oversized_assets() {
+        let workspace = TempWorkspace::new("invalid-read");
+        let state = configured_state(&workspace);
+        assert!(handle_get_workspace_avatar(&state).await.is_err());
+
+        workspace.write_avatar(b"invalid");
+        assert!(handle_get_workspace_avatar(&state).await.is_err());
+
+        let mut oversized = vec![0_u8; MAX_WORKSPACE_AVATAR_BYTES + 1];
+        oversized[..PNG_BYTES.len()].copy_from_slice(PNG_BYTES);
+        workspace.write_avatar(&oversized);
+        assert!(handle_get_workspace_avatar(&state).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn workspace_avatar_put_rejects_unconfigured_workspace() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        assert!(
+            handle_put_workspace_avatar(PNG_BYTES.to_vec(), Some("image/png"), &state)
+                .await
+                .is_err()
+        );
     }
 }

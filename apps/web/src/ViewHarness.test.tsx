@@ -134,6 +134,62 @@ afterEach(() => {
 });
 
 describe('ViewHarness workspace controller', () => {
+  it('uploads a workspace avatar and refreshes daemon-owned workspace state', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    const getWorkspace = vi
+      .spyOn(daemon, 'getWorkspace')
+      .mockResolvedValueOnce({
+        configured: true,
+        workspace: {
+          rootPath: '/workspaces/northwind',
+          companyName: 'Northwind Research',
+          mission: 'Map supply chains',
+          values: ['rigor'],
+          hasAvatar: false,
+        },
+        defaultRoot: '/workspaces',
+      })
+      .mockResolvedValue({
+        configured: true,
+        workspace: {
+          rootPath: '/workspaces/northwind',
+          companyName: 'Northwind Research',
+          mission: 'Map supply chains',
+          values: ['rigor'],
+          hasAvatar: true,
+        },
+        defaultRoot: '/workspaces',
+      });
+    const uploadWorkspaceAvatar = vi
+      .spyOn(daemon, 'uploadWorkspaceAvatar')
+      .mockResolvedValue(undefined);
+    Object.defineProperties(URL, {
+      createObjectURL: {
+        configurable: true,
+        value: vi.fn(() => 'blob:workspace-avatar-preview'),
+      },
+      revokeObjectURL: {
+        configurable: true,
+        value: vi.fn(),
+      },
+    });
+
+    render(<ViewHarness />);
+
+    const input = await screen.findByLabelText('Workspace avatar image file');
+    const file = new File(['avatar'], 'avatar.png', { type: 'image/png' });
+    await user.upload(input, file);
+
+    await waitFor(() =>
+      expect(uploadWorkspaceAvatar).toHaveBeenCalledWith(file),
+    );
+    await waitFor(() => expect(getWorkspace).toHaveBeenCalledTimes(2));
+  });
+
   it('imports legacy prompts into the daemon without starting a browser execution timer', async () => {
     const nova = snapshot('agent-main', 'Nova', 1);
     localStorage.setItem(
@@ -245,7 +301,7 @@ describe('ViewHarness workspace controller', () => {
       await screen.findByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
-    expect(screen.queryByText('Daemon Online')).not.toBeInTheDocument();
+    expect(screen.queryByText('Welcome back')).not.toBeInTheDocument();
   });
 
   it('selects the oldest agent by creation time then id for chat, settings, and Main', async () => {
@@ -406,7 +462,7 @@ describe('ViewHarness workspace controller', () => {
     });
     expect(await screen.findByDisplayValue('Nova Prime')).toBeVisible();
     expect(screen.getByText('Existing conversation')).toBeVisible();
-    expect(screen.getByText('Access Operate')).toBeVisible();
+    expect(screen.getByText('Nova Prime')).toBeVisible();
     expect(
       screen.getByRole('heading', { name: 'Agent settings' }),
     ).toBeVisible();
@@ -634,7 +690,7 @@ describe('ViewHarness workspace controller', () => {
     render(<ViewHarness />);
 
     await screen.findByText('Existing conversation');
-    expect(screen.getByText('Access Collaborate')).toBeVisible();
+    expect(screen.getByText('Welcome back')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Settings' }));
     const name = screen.getByDisplayValue('Nova');
     await user.clear(name);
@@ -685,7 +741,7 @@ describe('ViewHarness workspace controller', () => {
     expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
     expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
     expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
-    expect(screen.getByText('Access Collaborate')).toBeVisible();
+    expect(screen.getByText('Welcome back')).toBeVisible();
     expect(screen.getByText('Existing conversation')).toBeVisible();
     expect(
       screen.getByRole('heading', { name: 'Agent settings' }),
@@ -795,7 +851,7 @@ describe('ViewHarness workspace controller', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('keeps the last-known shell and explicitly labels Offline after a late poll failure', async () => {
+  it('keeps the last-known shell after a late poll failure', async () => {
     vi.useFakeTimers();
     const nova = snapshot('agent-main', 'Nova', 1);
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
@@ -809,14 +865,12 @@ describe('ViewHarness workspace controller', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(screen.getByText('Daemon Online')).toBeVisible();
+    expect(screen.getByText('Welcome back')).toBeVisible();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(5_000);
     });
 
-    expect(screen.getByText('Daemon Offline')).toBeVisible();
-    expect(screen.getByLabelText('Daemon offline')).toBeVisible();
     expect(
       screen.getByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();

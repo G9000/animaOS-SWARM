@@ -276,6 +276,14 @@ export function ViewHarness() {
     void integrations.removeSchedule(id);
   };
 
+  const changeWorkspaceAvatar = useCallback(
+    async (file: File) => {
+      await daemon.uploadWorkspaceAvatar(file);
+      await refreshWorkspace();
+    },
+    [refreshWorkspace],
+  );
+
   const openSettings = () => {
     settingsTriggerRef.current =
       document.activeElement instanceof HTMLElement
@@ -495,6 +503,7 @@ export function ViewHarness() {
           agents={agents}
           connection={connection}
           onOpenSettings={openSettings}
+          onChangeWorkspaceAvatar={changeWorkspaceAvatar}
           workspaceState={workspace}
           workspace={
             <section

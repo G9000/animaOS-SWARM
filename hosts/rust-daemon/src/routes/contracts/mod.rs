@@ -1,6 +1,7 @@
 mod agencies;
 mod agents;
 mod connectors;
+mod gcalendar;
 mod memories;
 mod providers;
 mod schedules;
@@ -18,6 +19,7 @@ pub(crate) use agents::{
     AgentsEnvelope, GenerateProfileRequest,
 };
 pub(crate) use connectors::*;
+pub(crate) use gcalendar::*;
 pub(crate) use memories::{
     AgentRelationshipCreateRequest, AgentRelationshipQuery, AgentRelationshipResponse,
     AgentRelationshipsEnvelope, MemoriesEnvelope, MemoryCreateRequest, MemoryEntitiesEnvelope,

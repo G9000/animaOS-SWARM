@@ -46,6 +46,7 @@ pub(crate) struct WorkspaceConfigResponse {
     pub(crate) company_name: String,
     pub(crate) mission: String,
     pub(crate) values: Vec<String>,
+    pub(crate) has_avatar: bool,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]

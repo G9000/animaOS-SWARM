@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -87,7 +87,9 @@ describe('WorkspaceShell', () => {
     });
     expect(navigation).toHaveAttribute('data-placement', 'sidebar');
     expect(navigation).toHaveAttribute('aria-orientation', 'vertical');
-    expect(navigation.nextElementSibling?.tagName).toBe('MAIN');
+    const sidebar = navigation.closest('aside');
+    expect(sidebar).not.toBeNull();
+    expect(sidebar?.nextElementSibling?.tagName).toBe('MAIN');
     expect(
       within(navigation).getByRole('button', { name: 'Workspace' }),
     ).toHaveAttribute('aria-current', 'page');
@@ -116,11 +118,8 @@ describe('WorkspaceShell', () => {
     ).toBeVisible();
   });
 
-  it('labels daemon, agent, and access status with text and icons', () => {
-    const nova = agent('agent-main', 'Nova', 1, {
-      status: 'Running',
-      toolNames: ['read_file', 'bespoke_tool'],
-    });
+  it('shows the main agent identity in the sidebar presence block', () => {
+    const nova = agent('agent-main', 'Nova', 1);
 
     render(
       <WorkspaceShell
@@ -133,18 +132,103 @@ describe('WorkspaceShell', () => {
       />,
     );
 
-    expect(screen.getByText('Daemon Offline')).toBeVisible();
-    expect(screen.getByLabelText('Daemon offline')).toBeVisible();
-    expect(screen.getByText('Agent Running')).toBeVisible();
-    expect(screen.getByLabelText('Agent running')).toBeVisible();
-    expect(screen.getByText('Access Custom')).toBeVisible();
-    expect(screen.getByLabelText('Custom access profile')).toBeVisible();
-    expect(screen.getByTestId('compact-daemon-status')).toHaveTextContent(
-      'Daemon Offline',
+    const sidebar = screen.getByRole('complementary');
+    expect(
+      within(sidebar).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
+    expect(within(sidebar).getByText('Welcome back')).toBeVisible();
+    expect(within(sidebar).getByText('Main')).toBeVisible();
+  });
+
+  it('shows the persisted workspace avatar and uploads a replacement', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    const onChangeWorkspaceAvatar = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperties(URL, {
+      createObjectURL: {
+        configurable: true,
+        value: vi.fn(() => 'blob:workspace-avatar-preview'),
+      },
+      revokeObjectURL: {
+        configurable: true,
+        value: vi.fn(),
+      },
+    });
+
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspaceState={{
+          configured: true,
+          workspace: {
+            rootPath: '/workspaces/northwind',
+            companyName: 'Northwind Research',
+            mission: 'Map supply chains',
+            values: ['rigor'],
+            hasAvatar: true,
+          },
+          defaultRoot: '/workspaces',
+        }}
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+        onChangeWorkspaceAvatar={onChangeWorkspaceAvatar}
+      />,
     );
-    expect(screen.getByTestId('compact-daemon-status')).toHaveClass(
-      'sm:hidden',
+
+    expect(
+      screen
+        .getByRole('button', { name: 'Change workspace avatar' })
+        .querySelector('img'),
+    ).toHaveAttribute('src', '/api/workspace/avatar?v=0');
+
+    const file = new File(['avatar'], 'avatar.png', { type: 'image/png' });
+    await user.upload(
+      screen.getByLabelText('Workspace avatar image file'),
+      file,
     );
+
+    await waitFor(() =>
+      expect(onChangeWorkspaceAvatar).toHaveBeenCalledWith(file),
+    );
+  });
+
+  it('shows a compact presence bar on mobile', () => {
+    vi.stubGlobal(
+      'matchMedia',
+      vi.fn(() => ({
+        matches: false,
+        media: '(min-width: 768px)',
+        onchange: null,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      })),
+    );
+    const nova = agent('agent-main', 'Nova', 1, { status: 'Running' });
+
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="offline"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    const bar = screen.getByRole('banner');
+    expect(
+      within(bar).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
+    expect(
+      within(bar).getByRole('button', { name: 'Settings' }),
+    ).toBeVisible();
   });
 
   it('marks the selected agent as Main and keeps additional agents read-only', async () => {
@@ -256,6 +340,7 @@ describe('WorkspaceShell', () => {
             companyName: 'Northwind Research',
             mission: 'Map supply chains',
             values: ['rigor'],
+            hasAvatar: false,
           },
           defaultRoot: '/workspaces',
         }}
@@ -265,12 +350,12 @@ describe('WorkspaceShell', () => {
       />,
     );
 
-    const header = screen.getByRole('banner');
-    expect(within(header).getByText('Welcome back')).toBeVisible();
-    expect(within(header).getByText('Northwind Research')).toBeVisible();
+    const sidebar = screen.getByRole('complementary');
+    expect(within(sidebar).getByText('Welcome back')).toBeVisible();
+    expect(within(sidebar).getByText('Northwind Research')).toBeVisible();
   });
 
-  it('renders the header exactly as today when no workspace is configured', () => {
+  it('renders the presence block exactly as today when no workspace is configured', () => {
     const nova = agent('agent-main', 'Nova', 1);
 
     render(
@@ -285,13 +370,13 @@ describe('WorkspaceShell', () => {
       />,
     );
 
-    const header = screen.getByRole('banner');
-    expect(within(header).getByText('Welcome back')).toBeVisible();
+    const sidebar = screen.getByRole('complementary');
+    expect(within(sidebar).getByText('Welcome back')).toBeVisible();
     expect(
-      within(header).getByRole('heading', { name: 'Nova' }),
+      within(sidebar).getByRole('heading', { name: 'Nova' }),
     ).toBeVisible();
     expect(
-      within(header).queryByText('Northwind Research'),
+      within(sidebar).queryByText('Northwind Research'),
     ).not.toBeInTheDocument();
   });
 
@@ -314,10 +399,10 @@ describe('WorkspaceShell', () => {
       />,
     );
 
-    const header = screen.getByRole('banner');
-    expect(within(header).getByText('Welcome back')).toBeVisible();
+    const sidebar = screen.getByRole('complementary');
+    expect(within(sidebar).getByText('Welcome back')).toBeVisible();
     expect(
-      within(header).queryByText('Northwind Research'),
+      within(sidebar).queryByText('Northwind Research'),
     ).not.toBeInTheDocument();
   });
 });
