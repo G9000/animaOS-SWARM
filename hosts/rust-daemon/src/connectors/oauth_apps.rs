@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 const SERVICE: &str = "animaos.oauth.apps";
 const VERSION: u64 = 1;
@@ -65,12 +65,25 @@ impl OAuthAppCredentials {
         secret: impl Into<String>,
         tenant: Option<String>,
     ) -> Result<Self, OAuthAppError> {
-        let client_id = valid_text(client_id.into(), 2048).ok_or(OAuthAppError::InvalidClientId)?;
-        let secret = valid_text(secret.into(), 4096).ok_or(OAuthAppError::InvalidClientSecret)?;
+        Self::from_zeroizing(
+            provider,
+            client_id.into(),
+            Zeroizing::new(secret.into()),
+            tenant,
+        )
+    }
+    fn from_zeroizing(
+        provider: OAuthProvider,
+        client_id: String,
+        secret: Zeroizing<String>,
+        tenant: Option<String>,
+    ) -> Result<Self, OAuthAppError> {
+        let client_id = valid_text(client_id, 2048).ok_or(OAuthAppError::InvalidClientId)?;
+        let secret = valid_secret(secret, 4096).ok_or(OAuthAppError::InvalidClientSecret)?;
         let tenant = tenant_for(provider, tenant)?;
         Ok(Self {
             client_id,
-            secret: Zeroizing::new(secret),
+            secret,
             tenant,
         })
     }
@@ -88,7 +101,7 @@ impl Clone for OAuthAppCredentials {
     fn clone(&self) -> Self {
         Self {
             client_id: self.client_id.clone(),
-            secret: Zeroizing::new(self.secret.to_string()),
+            secret: self.secret.clone(),
             tenant: self.tenant.clone(),
         }
     }
@@ -390,12 +403,13 @@ impl OAuthAppService {
         let mut guard = self.lock(provider).lock_owned().await;
         let vault = self.inner.vault.clone();
         let known = guard.revision;
-        let revision =
+        let outcome =
             tokio::task::spawn_blocking(move || delete_verified(vault.as_ref(), provider, known))
                 .await
                 .map_err(|_| OAuthAppError::OperationCancelled)??;
-        guard.revision = revision;
-        Ok(revision)
+        guard.revision = outcome.revision;
+        outcome.response?;
+        Ok(outcome.revision)
     }
 }
 impl Default for OAuthAppService {
@@ -420,15 +434,32 @@ impl OAuthAppLease {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Stored {
+struct StoredOwned {
     version: u64,
     revision: u64,
     client_id: String,
-    client_secret: String,
+    #[serde(deserialize_with = "deserialize_secret")]
+    client_secret: Zeroizing<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tenant: Option<String>,
+}
+fn deserialize_secret<'de, D>(deserializer: D) -> Result<Zeroizing<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Zeroizing::new)
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredBorrowed<'a> {
+    version: u64,
+    revision: u64,
+    client_id: &'a str,
+    client_secret: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tenant: Option<&'a str>,
 }
 async fn resolve(
     inner: &Inner,
@@ -471,29 +502,26 @@ fn from_env(
     OAuthAppCredentials::new(p, i, s, t.and_then(|n| e.get(n))).map(Some)
 }
 fn decode(p: OAuthProvider, raw: &str) -> Result<(OAuthAppCredentials, u64), OAuthAppError> {
-    let mut v: Stored =
+    let v: StoredOwned =
         serde_json::from_str(raw).map_err(|_| OAuthAppError::InvalidVaultPayload)?;
     if v.version != VERSION {
-        v.client_secret.zeroize();
         return Err(OAuthAppError::UnsupportedVaultPayloadVersion);
     }
     if v.revision == 0 {
-        v.client_secret.zeroize();
         return Err(OAuthAppError::InvalidVaultPayload);
     }
     let r = v.revision;
-    let s = std::mem::take(&mut v.client_secret);
-    OAuthAppCredentials::new(p, v.client_id, s, v.tenant)
+    OAuthAppCredentials::from_zeroizing(p, v.client_id, v.client_secret, v.tenant)
         .map(|c| (c, r))
         .map_err(|_| OAuthAppError::InvalidVaultPayload)
 }
 fn encode(c: &OAuthAppCredentials, r: u64) -> Result<Zeroizing<String>, OAuthAppError> {
-    serde_json::to_string(&Stored {
+    serde_json::to_string(&StoredBorrowed {
         version: VERSION,
         revision: r,
-        client_id: c.client_id.clone(),
-        client_secret: c.secret.to_string(),
-        tenant: c.tenant.clone(),
+        client_id: c.client_id.as_str(),
+        client_secret: c.secret.as_str(),
+        tenant: c.tenant.as_deref(),
     })
     .map(Zeroizing::new)
     .map_err(|_| OAuthAppError::InvalidVaultPayload)
@@ -556,11 +584,16 @@ fn restore(
         Err(OAuthAppError::VaultStateUncertain)
     }
 }
+struct DeleteOutcome {
+    revision: u64,
+    response: Result<(), OAuthAppError>,
+}
+
 fn delete_verified(
     v: &dyn OAuthVaultBackend,
     p: OAuthProvider,
     known: u64,
-) -> Result<u64, OAuthAppError> {
+) -> Result<DeleteOutcome, OAuthAppError> {
     let old = v
         .load(SERVICE, p.account())
         .map_err(|_| OAuthAppError::VaultUnavailable)?;
@@ -578,10 +611,20 @@ fn delete_verified(
         .load(SERVICE, p.account())
         .map_err(|_| OAuthAppError::VaultStateUncertain)?;
     if deletion.is_err() {
-        return Err(OAuthAppError::VaultUnavailable);
+        return if seen.is_none() {
+            Ok(DeleteOutcome {
+                revision: rev,
+                response: Err(OAuthAppError::VaultUnavailable),
+            })
+        } else {
+            Err(OAuthAppError::VaultUnavailable)
+        };
     }
     if seen.is_none() {
-        Ok(rev)
+        Ok(DeleteOutcome {
+            revision: rev,
+            response: Ok(()),
+        })
     } else {
         Err(OAuthAppError::VaultStateUncertain)
     }
@@ -613,6 +656,22 @@ fn valid_text(v: String, max: usize) -> Option<String> {
     }
     let s = v.trim();
     (!s.is_empty()).then(|| s.to_string())
+}
+fn valid_secret(mut value: Zeroizing<String>, max: usize) -> Option<Zeroizing<String>> {
+    if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+        return None;
+    }
+    let (start, end) = {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let start = value.len() - value.trim_start().len();
+        (start, start + trimmed.len())
+    };
+    value.truncate(end);
+    value.drain(..start);
+    Some(value)
 }
 fn tenant_for(p: OAuthProvider, t: Option<String>) -> Result<Option<String>, OAuthAppError> {
     if p == OAuthProvider::Google {
@@ -782,6 +841,20 @@ mod tests {
             )
             .unwrap_err(),
             OAuthAppError::InvalidClientId
+        );
+        assert_eq!(
+            OAuthAppCredentials::new(
+                OAuthProvider::Google,
+                "id",
+                format!(" {} ", "x".repeat(4096)),
+                None
+            )
+            .unwrap_err(),
+            OAuthAppError::InvalidClientSecret
+        );
+        assert_eq!(
+            OAuthAppCredentials::new(OAuthProvider::Google, "id", " secret\t", None).unwrap_err(),
+            OAuthAppError::InvalidClientSecret
         )
     }
     #[tokio::test]
@@ -875,7 +948,7 @@ mod tests {
             .get(OAuthProvider::Google.account())
             .unwrap()
             .clone();
-        let stored: Stored = serde_json::from_str(raw.as_str()).unwrap();
+        let stored: StoredOwned = serde_json::from_str(raw.as_str()).unwrap();
         assert_eq!((stored.version, stored.revision), (VERSION, 2));
         v.puts.lock().unwrap().extend([PB::FailAfter, PB::Normal]);
         assert_eq!(
@@ -925,7 +998,7 @@ mod tests {
                 .await
                 .unwrap()
                 .revision(),
-            2
+            3
         );
         s.put(
             OAuthProvider::Google,
@@ -933,12 +1006,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.delete(OAuthProvider::Google).await.unwrap(), 4);
+        assert_eq!(s.delete(OAuthProvider::Google).await.unwrap(), 5);
         assert_eq!(
             s.put(OAuthProvider::Google, creds(OAuthProvider::Google, "last"))
                 .await
                 .unwrap(),
-            5
+            6
         )
     }
     #[test]
