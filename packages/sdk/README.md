@@ -2,7 +2,7 @@
 
 Public TypeScript client for the animaOS Rust daemon.
 
-This package exports `createDaemonClient`, `AgentsClient`, `MemoriesClient`, `SwarmsClient`, and the `agent()`, `action()`, `plugin()`, and `swarm()` helpers. It talks to the daemon over HTTP and SSE and does not embed the execution runtime.
+This package exports `createDaemonClient`, `AgentsClient`, `ConnectorsClient`, `MemoriesClient`, `SwarmsClient`, and the `agent()`, `action()`, `plugin()`, and `swarm()` helpers. It talks to the daemon over HTTP and SSE and does not embed the execution runtime.
 
 Current SDK coverage includes:
 
@@ -10,6 +10,7 @@ Current SDK coverage includes:
 - agent create, list, get, run, and recent-memory reads
 - memory create, search, recent-memory reads, entities, evaluated writes, hybrid recall, evidence trace, retention, readiness/eval reporting, and relationships
 - swarm create, get, run, and live SSE event subscriptions
+- Google Calendar connection management and write approvals; Gmail and Outlook connection management, inbox reads, local drafts, and owner-approved sending
 - daemon-specific error surfaces for HTTP failures and connection failures
 
 ## Quick Example
@@ -41,6 +42,41 @@ console.log({
   memoryReady: memoryReadiness.passed,
 });
 ```
+
+## Connectors
+
+In a browser with same-origin daemon routing, use `createDaemonClient({ baseUrl: '' })`. A relative prefix such as `/daemon` is also supported. Node's default fetch requires an absolute base URL. Authentication can be supplied through the existing custom `fetch` option.
+
+Configure Google and Microsoft OAuth apps through the daemon's owner-facing UI when possible. The SDK also exposes the same settings for trusted local administration code. Keep client secrets out of logs, errors, analytics, and agent-visible messages.
+
+```ts
+const status = await client.connectors.oauthAppStatus('google');
+
+if (!status.configured) {
+  await client.connectors.configureOauthApp('google', {
+    clientId: process.env.GOOGLE_CLIENT_ID!,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+  });
+}
+
+// Remove credentials from the daemon vault when the OAuth app is retired.
+await client.connectors.removeOauthApp('google');
+```
+
+Microsoft configuration also accepts an optional `tenant`. OAuth app status returns only configuration metadata and a masked client ID hint; it never returns the stored secret.
+
+```ts
+const client = createDaemonClient({ baseUrl: '' });
+const status = await client.connectors.mailStatus(agentId, 'gmail');
+if (status.connector?.status === 'active') {
+  const messages = await client.connectors.mailMessages(agentId, 'gmail', status.connector.id);
+  const drafts = await client.connectors.mailDrafts(agentId, 'gmail', status.connector.id);
+}
+```
+
+`connectMail` and `connectCalendar` return `{ connector, consentUrl }` for the owner to authorize. Status methods return `{ configured, connector }`; list methods return arrays; draft/write actions return the updated record. Disconnect methods resolve without a value. Mail arguments are ordered `agentId, provider, connectorId, draftId` as applicable; Calendar omits `provider`.
+
+`createMailDraft` stores `{ to, subject, body }` locally without sending. Call `approveMailDraft` only after explicit owner review; an ambiguous send must not be retried automatically. Calendar writes similarly require `approveCalendarWrite` or `rejectCalendarWrite` after review. These owner-facing approval methods must not be exposed as agent-callable tools.
 
 ## Build
 

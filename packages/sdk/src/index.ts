@@ -1,4 +1,23 @@
 export { AgentsClient, action, agent, plugin } from './agents.js';
+export { ConnectorsClient } from './connectors.js';
+export type {
+  CalendarConnector,
+  CalendarConnectResult,
+  CalendarEventDraft,
+  CalendarStatus,
+  CalendarWrite,
+  ConfigureOAuthAppInput,
+  ConnectorStatus,
+  CreateMailDraftInput,
+  MailConnector,
+  MailConnectResult,
+  MailDraft,
+  MailMessage,
+  MailProvider,
+  MailStatus,
+  OAuthAppProvider,
+  OAuthAppStatus,
+} from './connectors.js';
 export type { AgentMemory, AgentRunResponse, AgentSnapshot } from './agents.js';
 export type {
   DaemonAgentConfig,
