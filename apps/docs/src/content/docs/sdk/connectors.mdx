@@ -1,0 +1,61 @@
+---
+title: Connectors
+description: Connect the personal daemon to Telegram, Google Calendar, Gmail and Outlook
+---
+
+The web console's **Connectors** tab manages connections for the main agent. The Rust daemon owns OAuth tokens, polling and approvals; the SDK exposes the HTTP contracts. Telegram conversation history remains in its own tab.
+
+## Connect an account
+
+For normal setup, use the web console. You do not need to edit code, set environment variables or restart the daemon.
+
+1. Open **Connectors** and find **OAuth app setup**.
+2. Register the provider application and its redirect URIs:
+   - **Google:** In Google Cloud Console, enable the Gmail API and Google Calendar API. Open **Google Auth Platform > Clients**, create a **Web application** OAuth client, and add both values below under **Authorized redirect URIs**. They must match exactly, including `http`, host, port, path and the absence of a trailing slash.
+     - `http://127.0.0.1:8080/api/connectors/mail/gmail/callback`
+     - `http://127.0.0.1:8080/api/connectors/gcalendar/callback`
+   - **Microsoft:** In the Microsoft Entra admin center, open **Entra ID > App registrations > New registration**, choose the supported account type for the accounts you intend to connect, and register the app. Open **Authentication > Add a platform > Web** and add this exact redirect URI: `http://127.0.0.1:8080/api/connectors/mail/outlook/callback`. Then open **Certificates & secrets > Client secrets > New client secret** and copy the secret's **Value** when it is created.
+3. Paste the provider's client ID and client secret into its setup card. The Google configuration is shared by Gmail and Google Calendar. The Microsoft configuration enables Outlook; its tenant defaults to `common` so personal and organizational Microsoft accounts can use the shared authorization endpoint.
+4. Select **Save Google OAuth app** or **Save Microsoft OAuth app**. After the provider reports **Configured**, select **Connect** on Gmail, Google Calendar or Outlook and complete the provider consent flow.
+
+OAuth application credentials and account tokens are stored in the operating system credential vault. Secrets and tokens are never returned by the daemon; the UI receives only redacted configuration status. To replace or remove a Google configuration, first disconnect every dependent Gmail and Google Calendar account. To replace or remove a Microsoft configuration, first disconnect every dependent Outlook account.
+
+Gmail and Outlook expose recent inbox messages and local plain-text drafts. Drafts remain in animaOS until the owner reviews the saved recipients, subject and body and selects **Send**. Agents can read and create drafts; they cannot call the approval operation. An uncertain send is marked **unknown** and is not automatically retried. Check Sent mail before composing a replacement.
+
+## Operator fallback
+
+Environment variables remain available for backward-compatible daemon deployments. A configuration loaded from the environment is managed outside the web console: its fields are disabled there, and it cannot be replaced or removed through the UI. Restart the daemon after changing environment variables.
+
+| Provider | Environment variables |
+| --- | --- |
+| Google (shared by Gmail and Google Calendar) | `ANIMA_GOOGLE_CLIENT_ID`, `ANIMA_GOOGLE_CLIENT_SECRET` |
+| Microsoft (Outlook) | `ANIMA_MICROSOFT_CLIENT_ID`, `ANIMA_MICROSOFT_CLIENT_SECRET`; optional `ANIMA_MICROSOFT_TENANT` (defaults to `common`) |
+
+For restart recovery, configure `ANIMAOS_RS_CONTROL_PLANE_FILE` to a durable local JSON path (or use the daemon's Postgres persistence). This stores connector metadata and drafts alongside agent state. Without a persistent control plane, the default development session is ephemeral even though OAuth tokens remain in the operating system vault.
+
+Mail requests delegated inbox-reading and sending permissions. The daemon enforces approval before any send. Gmail uses `gmail.readonly` and `gmail.send`; Microsoft uses `offline_access`, `User.Read`, `Mail.Read` and `Mail.Send`. No provider draft write permission is needed because drafts are local. See [Google Gmail scopes](https://developers.google.com/workspace/gmail/api/auth/scopes) and [Microsoft delegated permissions](https://learn.microsoft.com/en-us/graph/permissions-reference).
+
+## SDK
+
+```typescript
+import { createDaemonClient } from '@animaOS-SWARM/sdk';
+
+// Browser: use the current origin and the app's configured API proxy.
+const client = createDaemonClient({ baseUrl: '' });
+const status = await client.connectors.mailStatus(agentId, 'gmail');
+
+if (status.connector?.status === 'active') {
+  const messages = await client.connectors.mailMessages(
+    agentId, 'gmail', status.connector.id,
+  );
+  const draft = await client.connectors.createMailDraft(
+    agentId, 'gmail', status.connector.id,
+    { to: ['recipient@example.com'], subject: 'Meeting notes', body: 'Draft for review.' },
+  );
+  // Present the saved draft for owner review. Do not automatically approve it.
+}
+```
+
+Use `connectCalendar`, `calendarStatus`, `calendarWrites`, `approveCalendarWrite` and `rejectCalendarWrite` for calendar management. Mail provides equivalent connection methods plus `mailMessages`, `mailDrafts`, `createMailDraft`, `approveMailDraft` and `rejectMailDraft`. Approval methods belong in an owner-facing UI, never the agent tool allowlist.
+
+For non-browser clients, supply the daemon's configured API and local-owner authentication through the SDK fetch option. Reads from the local web console use same-origin browser metadata; OAuth callbacks use single-use state rather than an API-key header.
