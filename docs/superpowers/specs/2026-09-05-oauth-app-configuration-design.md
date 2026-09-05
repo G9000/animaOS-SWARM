@@ -18,6 +18,8 @@ The service exposes owner-only HTTP JSON endpoints under `/api/connectors/oauth-
 
 Each provider has one shared lifecycle lock and a monotonically increasing configuration revision. Configuration reads, writes, OAuth start/callback, token refresh, disconnect and removal use that provider lock. An OAuth flow records the revision at start, and its callback is rejected if the revision changed. This prevents a callback or refresh from crossing a credential replacement boundary.
 
+PUT and DELETE dispatch a daemon-owned mutation task; the HTTP route only awaits its result. The task retains the provider lifecycle lock through the blocking keyring operation, read-back verification or compensation, and revision publication even if the caller disconnects. The revision is stored in the same versioned keyring payload as the application credentials so a restart cannot separate the persisted credential from its revision. Deletion verifies absence before publishing the next in-memory revision.
+
 Google and Microsoft are daemon-level application settings, while connected accounts remain agent-scoped. Replacing or removing application settings is rejected while the provider has any non-deleted connector or pending authorization, including reauthorization/error/disabled states that may retain tokens. The owner disconnects every dependent account first. The dependency check and configuration mutation happen while holding the same provider lifecycle lock used by OAuth and token operations.
 
 Environment configuration is used only when the vault reports that no entry exists. A vault read or decode failure returns `503`; it never silently falls back to environment values.
@@ -44,7 +46,7 @@ Environment configuration is used only when the vault reports that no entry exis
 
 `DELETE /api/connectors/oauth-apps/{provider}` removes only a vault-managed configuration, increments its revision, and returns `204`. It returns `409` if any non-deleted connector or pending authorization exists, or if the effective configuration comes only from environment variables.
 
-All three operations use the existing local-owner authorization boundary. They are included in OpenAPI. Errors have `{ "error": "<stable-code>" }`: `oauth_app_invalid_provider` or `oauth_app_invalid_configuration` use `400`; the existing local-owner error uses `403`; `oauth_app_configuration_in_use` or `oauth_app_environment_managed` use `409`; and `oauth_app_credential_vault_unavailable` uses `503`. Secrets are zeroized in memory, excluded from debug output, omitted from logs and never included in response/error text.
+All three operations use the existing local-owner authorization boundary and the daemon's bounded-body reader. Owner authorization is checked before reading, parsing, or allocating the secret-bearing body. They are included in OpenAPI. Errors have `{ "error": "<stable-code>" }`: `oauth_app_invalid_provider` or `oauth_app_invalid_configuration` use `400`; the existing local-owner error uses `403`; `oauth_app_configuration_in_use` or `oauth_app_environment_managed` use `409`; and `oauth_app_credential_vault_unavailable` uses `503`. Secrets are zeroized in memory, excluded from debug output, omitted from logs and never included in response/error text.
 
 ## UI and SDK
 
