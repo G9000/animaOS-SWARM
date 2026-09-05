@@ -514,16 +514,20 @@ function OAuthAppCard({
 
   const submit = () => {
     setValidationError(null);
-    if (!clientId.trim() || !clientSecret.trim()) {
+    const submittedClientId = clientId.trim();
+    const submittedClientSecret = clientSecret.trim();
+    const submittedTenant = tenant.trim();
+    if (!submittedClientId || !submittedClientSecret) {
       setValidationError('Client ID and client secret are required.');
       return;
     }
+    setClientSecret('');
     void resource
       .run(() =>
         client.configureOauthApp(provider, {
-          clientId,
-          clientSecret,
-          ...(provider === 'microsoft' ? { tenant } : {}),
+          clientId: submittedClientId,
+          clientSecret: submittedClientSecret,
+          ...(provider === 'microsoft' ? { tenant: submittedTenant } : {}),
         }),
       )
       .then((ok) => {
@@ -637,6 +641,7 @@ function OAuthAppCard({
               disabled={resource.busy}
               onClick={() => {
                 setValidationError(null);
+                setClientSecret('');
                 void resource
                   .run(() => client.removeOauthApp(provider))
                   .then((ok) => {

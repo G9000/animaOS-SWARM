@@ -481,6 +481,38 @@ it('saves Microsoft credentials with tenant and enables Outlook independently', 
   expect(screen.getByRole('button', { name: 'Connect Gmail' })).toBeDisabled();
 });
 
+it('clears a submitted secret before a failed configuration request settles', async () => {
+  api.configureOauthApp.mockRejectedValue(
+    new Error('rejected response containing never-render-this-secret'),
+  );
+  const user = userEvent.setup();
+  render(<ConnectorsView agentId="main" telegram={null} />);
+
+  await user.type(await screen.findByLabelText('Google client ID'), '  id  ');
+  await user.type(
+    screen.getByLabelText('Google client secret'),
+    '  never-render-this-secret  ',
+  );
+  await user.click(
+    screen.getByRole('button', { name: 'Save Google OAuth app' }),
+  );
+
+  expect(api.configureOauthApp).toHaveBeenCalledWith('google', {
+    clientId: 'id',
+    clientSecret: 'never-render-this-secret',
+  });
+  expect(screen.getByLabelText('Google client secret')).toHaveValue('');
+  expect(
+    await screen.findByText(
+      'This action could not be completed. Refresh the connection before trying again.',
+    ),
+  ).toBeVisible();
+  expect(screen.getByLabelText('Google client secret')).toHaveValue('');
+  expect(
+    screen.queryByText(/never-render-this-secret/),
+  ).not.toBeInTheDocument();
+});
+
 it('keeps provider failures independent and validates credentials locally', async () => {
   api.oauthAppStatus.mockImplementation((provider) =>
     provider === 'google'
