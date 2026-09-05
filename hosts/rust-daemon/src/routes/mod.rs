@@ -6,6 +6,7 @@ mod gcalendar;
 mod health;
 mod http;
 mod memories;
+mod oauth_apps;
 mod profile;
 mod schedules;
 mod swarms;
@@ -107,6 +108,9 @@ use crate::runtime_model::provider_summaries;
         connectors::delete_telegram_connector,
         connectors::list_connector_messages,
         connectors::send_connector_message,
+        oauth_apps::get_oauth_app,
+        oauth_apps::put_oauth_app,
+        oauth_apps::delete_oauth_app,
         mail::status,
         mail::connect,
         mail::disconnect,
@@ -469,6 +473,12 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/connectors",
             get(connectors::list_connectors),
+        )
+        .route(
+            "/api/connectors/oauth-apps/{provider}",
+            get(oauth_apps::get_oauth_app)
+                .put(oauth_apps::put_oauth_app)
+                .delete(oauth_apps::delete_oauth_app),
         )
         .route(
             "/api/agents/{agent_id}/connectors/telegram",
