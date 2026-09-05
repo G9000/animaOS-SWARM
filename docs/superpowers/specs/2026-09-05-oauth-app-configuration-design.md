@@ -24,7 +24,7 @@ Environment configuration is used only when the vault reports that no entry exis
 
 ## API contract
 
-`GET /api/connectors/oauth-apps/{provider}` where provider is `google` or `microsoft` returns:
+`GET /api/connectors/oauth-apps/{provider}` where provider is `google` or `microsoft` returns the following shape. `source` and `clientIdHint` are `null` when unconfigured. A configured Microsoft response always returns its effective tenant, including `common` when the owner omitted it.
 
 ```json
 {
@@ -40,11 +40,11 @@ Environment configuration is used only when the vault reports that no entry exis
 }
 ```
 
-`PUT /api/connectors/oauth-apps/{provider}` accepts `clientId`, `clientSecret`, and optional `tenant` for Microsoft. Both credential fields are required and trimmed. Values have conservative size limits, reject control characters, and Microsoft tenant accepts `common`, `organizations`, `consumers`, or a tenant ID/domain using the daemon's current safe character set. The operation replaces the provider's vault configuration atomically, increments its revision, and returns the redacted status envelope. It returns `409` if any dependent connector or pending authorization exists.
+`PUT /api/connectors/oauth-apps/{provider}` accepts `clientId`, `clientSecret`, and optional `tenant` for Microsoft. Both credential fields are required and trimmed. Client ID is limited to 2,048 UTF-8 bytes, secret to 4,096 bytes, and tenant to 255 bytes; all reject control characters. Microsoft tenant omission defaults to `common`, and a supplied value accepts `common`, `organizations`, `consumers`, or a tenant ID/domain using the daemon's current safe character set. The operation replaces the provider's vault configuration atomically, increments its revision, and returns the redacted status envelope. It returns `409` if any dependent connector or pending authorization exists.
 
 `DELETE /api/connectors/oauth-apps/{provider}` removes only a vault-managed configuration, increments its revision, and returns `204`. It returns `409` if any non-deleted connector or pending authorization exists, or if the effective configuration comes only from environment variables.
 
-All three operations use the existing local-owner authorization boundary. They are included in OpenAPI. Responses use `400` for invalid input/provider, `403` for owner failure, `409` for a lifecycle conflict, and `503` for credential-vault failure. Secrets are zeroized in memory, excluded from debug output, omitted from logs and never included in response/error text.
+All three operations use the existing local-owner authorization boundary. They are included in OpenAPI. Errors have `{ "error": "<stable-code>" }`: `oauth_app_invalid_provider` or `oauth_app_invalid_configuration` use `400`; the existing local-owner error uses `403`; `oauth_app_configuration_in_use` or `oauth_app_environment_managed` use `409`; and `oauth_app_credential_vault_unavailable` uses `503`. Secrets are zeroized in memory, excluded from debug output, omitted from logs and never included in response/error text.
 
 ## UI and SDK
 
