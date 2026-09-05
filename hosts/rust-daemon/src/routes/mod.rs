@@ -280,6 +280,13 @@ pub(crate) fn router_with_services(
         Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
         oauth_apps.clone(),
     );
+    let mail = crate::connectors::mail::MailManager::new(
+        &state,
+        agent_runs.clone(),
+        Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
+        Arc::new(crate::app::DeterministicMailTransport),
+        oauth_apps.clone(),
+    );
     router_with_all_services(
         state,
         config,
@@ -287,6 +294,7 @@ pub(crate) fn router_with_services(
         agent_runs,
         connector_manager,
         calendar,
+        mail,
         oauth_apps,
         scheduler,
         bind_is_loopback,
@@ -300,6 +308,7 @@ pub(crate) fn router_with_all_services(
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
     calendar: crate::connectors::gcalendar::CalendarManager,
+    mail: crate::connectors::mail::MailManager,
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     bind_is_loopback: bool,
@@ -311,6 +320,7 @@ pub(crate) fn router_with_all_services(
         agent_runs,
         connector_manager,
         calendar,
+        mail,
         oauth_apps,
         scheduler,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
@@ -325,16 +335,12 @@ fn router_with_services_with_policies(
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
     calendar: crate::connectors::gcalendar::CalendarManager,
+    mail: crate::connectors::mail::MailManager,
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
-    let mail = crate::connectors::mail::MailManager::production(
-        &state,
-        agent_runs.clone(),
-        oauth_apps.clone(),
-    );
     if let Ok(mut guard) = state.try_write() {
         guard.mail_manager = Some(mail.clone());
     }
@@ -2276,6 +2282,13 @@ mod tests {
             Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
             oauth_apps.clone(),
         );
+        let mail = crate::connectors::mail::MailManager::new(
+            &state,
+            runs.clone(),
+            Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
+            Arc::new(crate::app::DeterministicMailTransport),
+            oauth_apps.clone(),
+        );
         let app = router_with_services_with_policies(
             Arc::clone(&state),
             DaemonConfig::default(),
@@ -2283,6 +2296,7 @@ mod tests {
             runs,
             manager,
             calendar,
+            mail,
             oauth_apps,
             scheduler,
             LocalOwnerPolicy::for_test(true, Some("local-admin")),

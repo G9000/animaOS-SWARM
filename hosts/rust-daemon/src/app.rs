@@ -37,6 +37,7 @@ struct DaemonRuntime {
     agent_runs: AgentRunCoordinator,
     connectors: ConnectorManager,
     calendar: crate::connectors::gcalendar::CalendarManager,
+    mail: crate::connectors::mail::MailManager,
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
 }
@@ -221,18 +222,38 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         Arc::new(google_transport),
         oauth_apps.clone(),
     );
+    let mail = crate::connectors::mail::MailManager::new(
+        &state,
+        agent_runs.clone(),
+        Arc::new(crate::connectors::gcalendar::store::OsKeyringGoogleCredentialStore::new()),
+        Arc::new(crate::connectors::mail::client::MailClient::new()),
+        oauth_apps.clone(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     Ok(DaemonRuntime {
         run_limiter,
         agent_runs,
         connectors,
         calendar,
+        mail,
         oauth_apps,
         scheduler,
     })
 }
 
 fn deterministic_daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> DaemonRuntime {
+    deterministic_daemon_runtime_with_mail_transport(
+        state,
+        config,
+        Arc::new(DeterministicMailTransport),
+    )
+}
+
+fn deterministic_daemon_runtime_with_mail_transport(
+    state: SharedDaemonState,
+    config: &DaemonConfig,
+    mail_transport: Arc<dyn crate::connectors::mail::client::MailTransport>,
+) -> DaemonRuntime {
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
     let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
     let connectors = ConnectorManager::new(
@@ -249,12 +270,20 @@ fn deterministic_daemon_runtime(state: SharedDaemonState, config: &DaemonConfig)
         Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
         oauth_apps.clone(),
     );
+    let mail = crate::connectors::mail::MailManager::new(
+        &state,
+        agent_runs.clone(),
+        Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
+        mail_transport,
+        oauth_apps.clone(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     DaemonRuntime {
         run_limiter,
         agent_runs,
         connectors,
         calendar,
+        mail,
         oauth_apps,
         scheduler,
     }
@@ -273,6 +302,7 @@ fn router_with_runtime(
         runtime.agent_runs,
         runtime.connectors,
         runtime.calendar,
+        runtime.mail,
         runtime.oauth_apps,
         runtime.scheduler,
         bind_is_loopback,
@@ -283,6 +313,59 @@ fn router_with_runtime(
 /// public test/embedding router helpers. Production `serve` always uses the
 /// fixed-origin `TelegramClient` and OS credential vault.
 struct DeterministicTelegramTransport;
+
+pub(crate) struct DeterministicMailTransport;
+
+#[async_trait]
+impl crate::connectors::mail::client::MailTransport for DeterministicMailTransport {
+    async fn exchange(
+        &self,
+        _config: &crate::connectors::mail::OAuthConfig,
+        _code: &str,
+        _verifier: &str,
+    ) -> Result<
+        crate::connectors::gcalendar::store::GoogleOAuthTokens,
+        crate::connectors::mail::MailError,
+    > {
+        Err(crate::connectors::mail::MailError::Unconfigured)
+    }
+
+    async fn refresh(
+        &self,
+        _config: &crate::connectors::mail::OAuthConfig,
+        _refresh: &str,
+    ) -> Result<
+        crate::connectors::gcalendar::store::GoogleOAuthTokens,
+        crate::connectors::mail::MailError,
+    > {
+        Err(crate::connectors::mail::MailError::Unconfigured)
+    }
+
+    async fn account(
+        &self,
+        _provider: crate::connectors::mail::Provider,
+        _access: &str,
+    ) -> Result<String, crate::connectors::mail::MailError> {
+        Err(crate::connectors::mail::MailError::Unconfigured)
+    }
+
+    async fn inbox(
+        &self,
+        _provider: crate::connectors::mail::Provider,
+        _access: &str,
+    ) -> Result<Vec<crate::connectors::mail::MailMessage>, crate::connectors::mail::MailError> {
+        Err(crate::connectors::mail::MailError::Unconfigured)
+    }
+
+    async fn send(
+        &self,
+        _provider: crate::connectors::mail::Provider,
+        _access: &str,
+        _draft: &crate::connectors::mail::MailDraft,
+    ) -> Result<(), crate::connectors::mail::MailError> {
+        Err(crate::connectors::mail::MailError::Unconfigured)
+    }
+}
 
 #[async_trait]
 impl TelegramTransport for DeterministicTelegramTransport {
@@ -342,5 +425,128 @@ fn deterministic_chat() -> TelegramChatMetadata {
         kind: TelegramChatKind::Private,
         title: None,
         username: Some("local_owner".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::gcalendar::store::GoogleOAuthTokens;
+    use crate::connectors::mail::client::MailTransport;
+    use crate::connectors::mail::{MailDraft, MailError, MailMessage, OAuthConfig, Provider};
+    use crate::connectors::oauth_apps::{OAuthAppCredentials, OAuthProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroize::Zeroizing;
+
+    struct CountingMailTransport(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl MailTransport for CountingMailTransport {
+        async fn exchange(
+            &self,
+            _config: &OAuthConfig,
+            _code: &str,
+            _verifier: &str,
+        ) -> Result<GoogleOAuthTokens, MailError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(GoogleOAuthTokens::new(
+                Zeroizing::new("access".to_string()),
+                Zeroizing::new("refresh".to_string()),
+                crate::connectors::gcalendar::now_ms() + 3_600_000,
+            ))
+        }
+
+        async fn refresh(
+            &self,
+            _config: &OAuthConfig,
+            _refresh: &str,
+        ) -> Result<GoogleOAuthTokens, MailError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(MailError::Unconfigured)
+        }
+
+        async fn account(&self, _provider: Provider, _access: &str) -> Result<String, MailError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("owner@example.com".to_string())
+        }
+
+        async fn inbox(
+            &self,
+            _provider: Provider,
+            _access: &str,
+        ) -> Result<Vec<MailMessage>, MailError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(MailError::Unconfigured)
+        }
+
+        async fn send(
+            &self,
+            _provider: Provider,
+            _access: &str,
+            _draft: &MailDraft,
+        ) -> Result<(), MailError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(MailError::Unconfigured)
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_runtime_routes_mail_through_its_injected_boundary() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(anima_core::AgentConfig {
+                name: "mail-runtime".to_string(),
+                model: "deterministic".to_string(),
+                provider: None,
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            })
+            .unwrap()
+            .state
+            .id;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = deterministic_daemon_runtime_with_mail_transport(
+            Arc::clone(&state),
+            &DaemonConfig::default(),
+            Arc::new(CountingMailTransport(Arc::clone(&calls))),
+        );
+        runtime
+            .oauth_apps
+            .put(
+                OAuthProvider::Google,
+                OAuthAppCredentials::new(OAuthProvider::Google, "client", "secret", None).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let (_, consent_url) = runtime
+            .mail
+            .begin_connect(&agent_id, Provider::Gmail)
+            .await
+            .unwrap();
+        let nonce = reqwest::Url::parse(&consent_url)
+            .unwrap()
+            .query_pairs()
+            .find(|(key, _)| key == "state")
+            .unwrap()
+            .1
+            .into_owned();
+        runtime
+            .mail
+            .complete_connect(Provider::Gmail, &nonce, "code")
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
