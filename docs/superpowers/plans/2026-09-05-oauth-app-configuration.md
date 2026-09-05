@@ -17,7 +17,7 @@
 - Modify: `hosts/rust-daemon/src/connectors/mod.rs`
 - Test: `hosts/rust-daemon/src/connectors/oauth_apps.rs`
 
-- [ ] Write failing tests for redacted status, Google/Microsoft validation, `common` tenant default, versioned keyring payloads, vault-over-environment precedence, fail-closed vault errors, replacement/removal, and cancellation-safe owned mutation completion.
+- [ ] Write failing tests for redacted status, Google/Microsoft validation, `common` tenant default, versioned keyring payloads, vault-over-environment precedence, fail-closed vault errors, and cancellation-safe owned mutation completion. Prove a replacement read-back failure restores and verifies the previous payload without publishing a revision, and deletion verifies absence before publishing its next revision.
 - [ ] Run `bun x nx run rust-daemon:test --excludeTaskDependencies --args='connectors::oauth_apps::tests' --skipNxCache` and confirm failures are caused by the missing service.
 - [ ] Implement `OAuthAppProvider`, zeroizing config values, status envelopes, environment fallback, in-memory/keyring stores, provider lifecycle locks and revisioned daemon-owned mutations.
 - [ ] Rerun the focused tests and confirm they pass.
@@ -32,9 +32,9 @@
 - Test: `hosts/rust-daemon/src/connectors/gcalendar/tests.rs`
 - Test: `hosts/rust-daemon/src/connectors/mail/tests.rs`
 
-- [ ] Write failing tests proving a saved Google configuration enables Gmail and Calendar without restart, a saved Microsoft configuration enables Outlook, stale OAuth revisions are rejected, and PUT/DELETE conflict with every non-deleted dependent connector or pending flow.
-- [ ] Run the focused Calendar and mail tests and verify the expected failures.
-- [ ] Inject the shared OAuth app configuration service into both managers; resolve the current config inside the provider lifecycle boundary for begin, callback, refresh and disconnect.
+- [ ] Write failing tests proving a saved Google configuration enables Gmail and Calendar without restart, a saved Microsoft configuration enables Outlook, stale OAuth revisions are rejected, and PUT/DELETE conflict with every non-deleted dependent connector or pending flow. Include a cross-service concurrency test that races a Google configuration mutation with Gmail and Calendar OAuth operations.
+- [ ] Run `bun x nx run rust-daemon:test --excludeTaskDependencies --args='connectors::gcalendar::tests' --skipNxCache` and the equivalent `--args='connectors::mail::tests'`; verify expected failures.
+- [ ] Inject the shared OAuth app configuration service into both managers. Replace manager-local lifecycle paths so Google configuration, Gmail and Calendar share one provider lock, Microsoft configuration and Outlook share one provider lock, and begin, callback, refresh, disconnect and dependency checks all run under the matching shared lock.
 - [ ] Rerun the focused tests and confirm they pass.
 
 ### Task 3: Owner-only HTTP API and OpenAPI
@@ -55,12 +55,13 @@
 **Files:**
 - Modify: `packages/sdk/src/connectors.ts`
 - Modify: `packages/sdk/src/connectors.spec.ts`
+- Modify: `packages/sdk/src/index.ts`
 - Modify: `packages/sdk/README.md`
 
 - [ ] Write failing SDK tests for encoded provider paths, PUT body, redacted status response and DELETE behavior.
 - [ ] Run `bun x nx run @animaOS-SWARM/sdk:test --skipNxCache` and confirm expected failures.
-- [ ] Add `OAuthAppStatus`, `ConfigureOAuthAppInput`, `oauthAppStatus`, `configureOAuthApp` and `removeOAuthApp`.
-- [ ] Rerun SDK tests, typecheck and build.
+- [ ] Add and publicly export `OAuthAppStatus`, `ConfigureOAuthAppInput`, `oauthAppStatus`, `configureOauthApp` and `removeOauthApp`.
+- [ ] Rerun `bun x nx run @animaOS-SWARM/sdk:test --skipNxCache`, `bun x nx run @animaOS-SWARM/sdk:typecheck --skipNxCache`, and `bun x nx run @animaOS-SWARM/sdk:build --skipNxCache`.
 
 ### Task 5: Connectors setup UI
 
@@ -70,7 +71,7 @@
 - Modify: `apps/web/src/studio.css` only if existing utilities cannot express the layout
 
 - [ ] Write failing UI tests for visible redirect URIs, masked secret inputs, Google shared-service copy, Microsoft tenant default, successful save clearing secrets and enabling Connect, independent provider errors, replacement/removal conflicts, and no secret rendering.
-- [ ] Run the focused web test and confirm expected failures.
+- [ ] Run `bun x nx run @animaOS-SWARM/web:test --skipNxCache --args='apps/web/src/components/ConnectorsView.test.tsx'` and confirm expected failures.
 - [ ] Build accessible Google and Microsoft setup cards above the connector grid. Keep provider status isolated, use generic errors, and refresh affected service cards after Save/Remove.
 - [ ] Rerun focused and full web tests, typecheck and build.
 
@@ -81,8 +82,8 @@
 - Modify: `docs/superpowers/plans/2026-09-05-oauth-app-configuration.md`
 
 - [ ] Replace terminal-first setup guidance with the UI flow while retaining environment-variable fallback documentation.
-- [ ] Run Rust formatting and the full serial Rust daemon suite via Nx.
-- [ ] Run SDK/web tests, typechecks and builds plus the docs build through Nx.
+- [ ] Run `bun x nx run rust-daemon:lint --skipNxCache` and `$env:RUST_TEST_THREADS='1'; bun x nx run rust-daemon:test --skipNxCache` (using `CI=1` and a separate `CARGO_TARGET_DIR` if the live Windows daemon locks the default target).
+- [ ] Run `bun x nx run-many -t test typecheck build --projects=@animaOS-SWARM/web,@animaOS-SWARM/sdk --skipNxCache` and `bun x nx run @animaOS-SWARM/docs:build --skipNxCache`.
 - [ ] Run an isolated daemon smoke test with fake app credentials, confirm only redacted status is returned and Gmail/Calendar readiness changes without restart, then remove the fake credentials without starting provider OAuth.
 - [ ] Restart the existing workspace launcher with its environment preserved, reload the saved workspace if the control plane is ephemeral, and verify the Connectors UI/API is live without writing real provider credentials.
 - [ ] Mark this plan complete with current verification evidence.
