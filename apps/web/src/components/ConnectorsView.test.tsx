@@ -481,6 +481,36 @@ it('saves Microsoft credentials with tenant and enables Outlook independently', 
   expect(screen.getByRole('button', { name: 'Connect Gmail' })).toBeDisabled();
 });
 
+it('omits a blank Microsoft tenant so the daemon can use its default', async () => {
+  api.configureOauthApp.mockResolvedValue({
+    provider: 'microsoft',
+    configured: true,
+    source: 'vault',
+    clientIdHint: 'mic…-id',
+    redirectUris: ['https://daemon.test/microsoft/callback'],
+    tenant: 'common',
+  });
+  const user = userEvent.setup();
+  render(<ConnectorsView agentId="main" telegram={null} />);
+
+  await user.type(
+    await screen.findByLabelText('Microsoft client ID'),
+    'microsoft-id',
+  );
+  await user.type(screen.getByLabelText('Microsoft client secret'), 'secret');
+  const tenant = screen.getByLabelText('Microsoft tenant');
+  await user.clear(tenant);
+  await user.type(tenant, '   ');
+  await user.click(
+    screen.getByRole('button', { name: 'Save Microsoft OAuth app' }),
+  );
+
+  expect(api.configureOauthApp).toHaveBeenCalledWith('microsoft', {
+    clientId: 'microsoft-id',
+    clientSecret: 'secret',
+  });
+});
+
 it('clears a submitted secret before a failed configuration request settles', async () => {
   api.configureOauthApp.mockRejectedValue(
     new Error('rejected response containing never-render-this-secret'),

@@ -527,7 +527,9 @@ function OAuthAppCard({
         client.configureOauthApp(provider, {
           clientId: submittedClientId,
           clientSecret: submittedClientSecret,
-          ...(provider === 'microsoft' ? { tenant: submittedTenant } : {}),
+          ...(provider === 'microsoft' && submittedTenant
+            ? { tenant: submittedTenant }
+            : {}),
         }),
       )
       .then((ok) => {
