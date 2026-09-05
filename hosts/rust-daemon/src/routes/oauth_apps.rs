@@ -3,6 +3,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use zeroize::Zeroizing;
 
 use crate::connectors::oauth_apps::{
     OAuthAppCredentials, OAuthAppError, OAuthAppSource, OAuthAppStatus, OAuthProvider,
@@ -10,7 +11,7 @@ use crate::connectors::oauth_apps::{
 
 use super::contracts::ConnectorErrorBody;
 use super::http::{json_response, read_limited_body, LocalOwnerRejection};
-use super::{parse_json_body, AppState};
+use super::AppState;
 
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -104,10 +105,10 @@ pub(super) async fn put_oauth_app(
         Err(response) => return response,
     };
     let body = match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => body,
+        Ok(body) => Zeroizing::new(body),
         Err(_) => return invalid_configuration(),
     };
-    let request = match parse_json_body::<OAuthAppCredentialsRequest>(body) {
+    let request = match parse_oauth_app_request(body) {
         Ok(request) => request,
         Err(_) => return invalid_configuration(),
     };
@@ -134,6 +135,10 @@ pub(super) async fn put_oauth_app(
         Ok(status) => status_response(status),
         Err(error) => oauth_app_error(error),
     }
+}
+
+fn parse_oauth_app_request(body: Zeroizing<Vec<u8>>) -> Result<OAuthAppCredentialsRequest, ()> {
+    serde_json::from_slice(body.as_slice()).map_err(|_| ())
 }
 
 #[utoipa::path(
@@ -305,7 +310,7 @@ mod tests {
         state::DaemonState,
     };
 
-    use super::oauth_app_error;
+    use super::{oauth_app_error, parse_oauth_app_request};
 
     struct TestEnvironment(HashMap<String, String>);
 
@@ -387,6 +392,22 @@ mod tests {
 
     async fn json(response: axum::response::Response) -> serde_json::Value {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn secret_request_parser_accepts_valid_json_and_rejects_trailing_malformed_data() {
+        let parsed = parse_oauth_app_request(Zeroizing::new(
+            br#"{"clientId":"client","clientSecret":"secret","tenant":"common"}"#.to_vec(),
+        ))
+        .unwrap();
+        assert_eq!(parsed.client_id, "client");
+        assert_eq!(parsed.client_secret, "secret");
+        assert_eq!(parsed.tenant.as_deref(), Some("common"));
+
+        assert!(parse_oauth_app_request(Zeroizing::new(
+            br#"{"clientId":"client","clientSecret":"secret"} trailing"#.to_vec(),
+        ))
+        .is_err());
     }
 
     #[tokio::test]
