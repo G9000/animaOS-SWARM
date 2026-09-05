@@ -18,7 +18,25 @@ use crate::connectors::gcalendar::{
     now_ms, CalendarError, CalendarEventDraft, CalendarManager, CalendarWriteOperation,
     CalendarWriteState, GoogleOAuthConfig, CALENDAR_TOOL_NAMES,
 };
+use crate::connectors::oauth_apps::{
+    InMemoryOAuthAppVault, OAuthAppCredentials, OAuthAppService, OAuthEnvironment, OAuthProvider,
+};
 use crate::state::DaemonState;
+
+struct EmptyEnvironment;
+
+impl OAuthEnvironment for EmptyEnvironment {
+    fn get(&self, _name: &str) -> Option<String> {
+        None
+    }
+}
+
+fn oauth_apps() -> OAuthAppService {
+    OAuthAppService::with_backends(
+        Arc::new(InMemoryOAuthAppVault::default()),
+        Arc::new(EmptyEnvironment),
+    )
+}
 
 fn tool_message() -> Message {
     Message {
@@ -32,6 +50,8 @@ fn tool_message() -> Message {
 }
 
 struct FakeGoogleTransport {
+    account: Mutex<String>,
+    exchanges: std::sync::atomic::AtomicUsize,
     tokens: Mutex<Option<Result<GoogleOAuthTokens, GoogleTransportError>>>,
     refreshed: Mutex<Option<Result<GoogleOAuthTokens, GoogleTransportError>>>,
     events: Mutex<Vec<GoogleCalendarEvent>>,
@@ -39,11 +59,15 @@ struct FakeGoogleTransport {
     updated: Mutex<Vec<CalendarEventDraft>>,
     deleted: Mutex<Vec<CalendarEventDraft>>,
     apply_error: Mutex<Option<GoogleTransportError>>,
+    exchange_entered: Mutex<Option<Arc<Semaphore>>>,
+    exchange_gate: Mutex<Option<Arc<Semaphore>>>,
 }
 
 impl FakeGoogleTransport {
     fn new() -> Self {
         Self {
+            account: Mutex::new("owner@example.com".to_string()),
+            exchanges: std::sync::atomic::AtomicUsize::new(0),
             tokens: Mutex::new(Some(Ok(GoogleOAuthTokens::new(
                 Zeroizing::new("access-initial".to_string()),
                 Zeroizing::new("refresh-initial".to_string()),
@@ -55,6 +79,8 @@ impl FakeGoogleTransport {
             updated: Mutex::new(Vec::new()),
             deleted: Mutex::new(Vec::new()),
             apply_error: Mutex::new(None),
+            exchange_entered: Mutex::new(None),
+            exchange_gate: Mutex::new(None),
         }
     }
 }
@@ -66,6 +92,15 @@ impl GoogleCalendarTransport for FakeGoogleTransport {
         _config: &GoogleOAuthConfig,
         _code: &str,
     ) -> Result<GoogleOAuthTokens, GoogleTransportError> {
+        self.exchanges
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = self.exchange_entered.lock().unwrap().clone() {
+            entered.add_permits(1);
+        }
+        let gate = self.exchange_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.unwrap().forget();
+        }
         self.tokens
             .lock()
             .unwrap()
@@ -86,7 +121,7 @@ impl GoogleCalendarTransport for FakeGoogleTransport {
     }
 
     async fn primary_calendar(&self, _access_token: &str) -> Result<String, GoogleTransportError> {
-        Ok("owner@example.com".to_string())
+        Ok(self.account.lock().unwrap().clone())
     }
 
     async fn list_events(
@@ -162,12 +197,29 @@ async fn fixture_with_transport(
         .id;
     let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
     let credentials = Arc::new(InMemoryGoogleCredentialStore::default());
+    let oauth_apps = oauth_apps();
+    if let Some(config) = oauth {
+        let client_secret = config.client_secret().to_string();
+        oauth_apps
+            .put(
+                OAuthProvider::Google,
+                OAuthAppCredentials::new(
+                    OAuthProvider::Google,
+                    config.client_id,
+                    client_secret,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
     let manager = CalendarManager::new(
         &state,
         agent_runs,
         credentials.clone(),
         transport.clone(),
-        oauth,
+        oauth_apps,
     );
     state
         .write()
@@ -180,6 +232,169 @@ async fn fixture_with_transport(
         credentials,
         agent_id,
     }
+}
+
+#[tokio::test]
+async fn saving_google_oauth_config_enables_calendar_without_restart() {
+    let fixture = fixture(None).await;
+    assert!(!fixture.manager.oauth_configured().await.unwrap());
+
+    fixture
+        .manager
+        .oauth_apps
+        .put(
+            OAuthProvider::Google,
+            OAuthAppCredentials::new(OAuthProvider::Google, "live-client", "live-secret", None)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert!(fixture.manager.oauth_configured().await.unwrap());
+    assert!(fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap()
+        .1
+        .contains("live-client"));
+}
+
+#[tokio::test]
+async fn callback_rejects_oauth_config_revision_changed_after_begin() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let (pairing, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    fixture
+        .manager
+        .oauth_apps
+        .put(
+            OAuthProvider::Google,
+            OAuthAppCredentials::new(OAuthProvider::Google, "new-client", "new-secret", None)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fixture
+            .manager
+            .complete_connect(&pairing.pending_auth.unwrap().nonce, "code")
+            .await
+            .unwrap_err(),
+        CalendarError::PairingNotFound
+    );
+    assert_eq!(
+        fixture
+            .transport
+            .exchanges
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn google_config_mutation_waits_for_calendar_oauth_callback() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let (pairing, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    *fixture.transport.exchange_entered.lock().unwrap() = Some(entered.clone());
+    *fixture.transport.exchange_gate.lock().unwrap() = Some(release.clone());
+
+    let callback = {
+        let manager = fixture.manager.clone();
+        let nonce = pairing.pending_auth.unwrap().nonce;
+        tokio::spawn(async move { manager.complete_connect(&nonce, "code").await })
+    };
+    entered.acquire().await.unwrap().forget();
+    let mutation = {
+        let service = fixture.manager.oauth_apps.clone();
+        tokio::spawn(async move {
+            service
+                .put(
+                    OAuthProvider::Google,
+                    OAuthAppCredentials::new(
+                        OAuthProvider::Google,
+                        "replacement-client",
+                        "replacement-secret",
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .await
+        })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            while !mutation.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err()
+    );
+    release.add_permits(1);
+    callback.await.unwrap().unwrap();
+    mutation.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn every_non_deleted_calendar_connector_blocks_google_config_changes() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let (pairing, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .manager
+            .has_provider_dependency(OAuthProvider::Google)
+            .await
+    );
+
+    {
+        let mut state = fixture.state.write().await;
+        let record = state.calendar_connectors.get_mut(&pairing.id).unwrap();
+        record.pending_auth = None;
+        record.reauth_required = true;
+        record.enabled = false;
+    }
+    assert!(
+        fixture
+            .manager
+            .has_provider_dependency(OAuthProvider::Google)
+            .await
+    );
+    assert!(
+        !fixture
+            .manager
+            .has_provider_dependency(OAuthProvider::Microsoft)
+            .await
+    );
+
+    fixture
+        .state
+        .write()
+        .await
+        .calendar_connectors
+        .get_mut(&pairing.id)
+        .unwrap()
+        .deleted_at_ms = Some(now_ms());
+    assert!(
+        !fixture
+            .manager
+            .has_provider_dependency(OAuthProvider::Google)
+            .await
+    );
 }
 
 fn test_config(name: &str) -> AgentConfig {
@@ -246,7 +461,9 @@ async fn begin_connect_creates_pairing_record_and_consent_url() {
     assert!(consent_url.contains("state="));
 
     let duplicate = fixture.manager.begin_connect(&fixture.agent_id).await;
-    assert_eq!(duplicate.unwrap_err(), CalendarError::AlreadyConnected);
+    let duplicate = duplicate.expect("pairing can restart").0;
+    assert_eq!(duplicate.id, record.id);
+    assert_ne!(duplicate.pending_auth, record.pending_auth);
 
     let missing = fixture.manager.begin_connect("agent-missing").await;
     assert_eq!(missing.unwrap_err(), CalendarError::AgentNotFound);
@@ -257,6 +474,258 @@ async fn begin_connect_requires_oauth_configuration() {
     let fixture = fixture(None).await;
     let result = fixture.manager.begin_connect(&fixture.agent_id).await;
     assert_eq!(result.unwrap_err(), CalendarError::Unconfigured);
+}
+
+#[tokio::test]
+async fn reconnect_preserves_identity_and_pending_writes_and_invalidates_old_nonce() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let original = connect(&fixture).await;
+    let write = fixture
+        .manager
+        .submit_write(&fixture.agent_id, CalendarWriteOperation::Create, draft())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .write()
+        .await
+        .calendar_connectors
+        .get_mut(&original.id)
+        .unwrap()
+        .reauth_required = true;
+    let (first, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    let (second, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    assert_eq!(second.id, original.id);
+    assert_eq!(second.created_at_ms, original.created_at_ms);
+    assert_eq!(
+        fixture
+            .manager
+            .complete_connect(&first.pending_auth.unwrap().nonce, "old")
+            .await
+            .unwrap_err(),
+        CalendarError::PairingNotFound
+    );
+    *fixture.transport.tokens.lock().unwrap() = Some(Ok(GoogleOAuthTokens::new(
+        Zeroizing::new("new-access".into()),
+        Zeroizing::new("new-refresh".into()),
+        now_ms() + 3_600_000,
+    )));
+    let nonce = second.pending_auth.unwrap().nonce;
+    let active = fixture
+        .manager
+        .complete_connect(&nonce, "new")
+        .await
+        .unwrap();
+    assert!(!active.reauth_required);
+    assert!(active.is_active());
+    assert_eq!(
+        fixture
+            .manager
+            .list_writes(&fixture.agent_id, &active.id)
+            .await
+            .unwrap(),
+        vec![write]
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .complete_connect(&nonce, "replay")
+            .await
+            .unwrap_err(),
+        CalendarError::PairingNotFound
+    );
+    assert_eq!(
+        fixture
+            .transport
+            .exchanges
+            .load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
+#[tokio::test]
+async fn reconnect_cannot_transfer_pending_writes_to_another_account() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let original = connect(&fixture).await;
+    let write = fixture
+        .manager
+        .submit_write(&fixture.agent_id, CalendarWriteOperation::Create, draft())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .write()
+        .await
+        .calendar_connectors
+        .get_mut(&original.id)
+        .unwrap()
+        .reauth_required = true;
+    let (pairing, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    *fixture.transport.account.lock().unwrap() = "other@example.com".into();
+    *fixture.transport.tokens.lock().unwrap() = Some(Ok(GoogleOAuthTokens::new(
+        Zeroizing::new("other-access".into()),
+        Zeroizing::new("other-refresh".into()),
+        now_ms() + 3_600_000,
+    )));
+    assert_eq!(
+        fixture
+            .manager
+            .complete_connect(&pairing.pending_auth.unwrap().nonce, "other")
+            .await
+            .unwrap_err(),
+        CalendarError::ReauthRequired
+    );
+    assert_eq!(
+        fixture
+            .credentials
+            .load(&original.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .access_token(),
+        "access-initial"
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .list_writes(&fixture.agent_id, &original.id)
+            .await
+            .unwrap(),
+        vec![write.clone()]
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .approve_write(&fixture.agent_id, &original.id, &write.id)
+            .await
+            .unwrap_err(),
+        CalendarError::ReauthRequired
+    );
+}
+
+#[tokio::test]
+async fn failed_exchange_consumes_nonce_and_restart_can_issue_a_new_one() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let (pairing, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    *fixture.transport.tokens.lock().unwrap() = Some(Err(GoogleTransportError::Unavailable));
+    let nonce = pairing.pending_auth.unwrap().nonce;
+    assert_eq!(
+        fixture
+            .manager
+            .complete_connect(&nonce, "failed")
+            .await
+            .unwrap_err(),
+        CalendarError::Transport
+    );
+    assert_eq!(
+        fixture
+            .manager
+            .complete_connect(&nonce, "replay")
+            .await
+            .unwrap_err(),
+        CalendarError::PairingNotFound
+    );
+    assert_eq!(
+        fixture
+            .transport
+            .exchanges
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert!(fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn concurrent_pairing_starts_share_one_connector_and_only_latest_nonce_completes() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let (first, second) = tokio::join!(
+        fixture.manager.begin_connect(&fixture.agent_id),
+        fixture.manager.begin_connect(&fixture.agent_id)
+    );
+    let first = first.unwrap().0;
+    let second = second.unwrap().0;
+    assert_eq!(first.id, second.id);
+    assert_eq!(fixture.state.read().await.calendar_connectors.len(), 1);
+    let current = fixture
+        .manager
+        .connector_for_agent(&fixture.agent_id)
+        .await
+        .unwrap();
+    let nonce = current.pending_auth.unwrap().nonce;
+    let (first, second) = tokio::join!(
+        fixture.manager.complete_connect(&nonce, "same"),
+        fixture.manager.complete_connect(&nonce, "same")
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    assert_eq!(
+        fixture
+            .transport
+            .exchanges
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reconnect_with_unknown_original_account_rejects_unverifiable_pending_writes() {
+    let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
+    let original = connect(&fixture).await;
+    let write = fixture
+        .manager
+        .submit_write(&fixture.agent_id, CalendarWriteOperation::Create, draft())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .write()
+        .await
+        .calendar_connectors
+        .get_mut(&original.id)
+        .unwrap()
+        .account_label = None;
+    let (pairing, _) = fixture
+        .manager
+        .begin_connect(&fixture.agent_id)
+        .await
+        .unwrap();
+    *fixture.transport.tokens.lock().unwrap() = Some(Ok(GoogleOAuthTokens::new(
+        Zeroizing::new("new-access".into()),
+        Zeroizing::new("new-refresh".into()),
+        now_ms() + 3_600_000,
+    )));
+    fixture
+        .manager
+        .complete_connect(&pairing.pending_auth.unwrap().nonce, "new")
+        .await
+        .unwrap();
+    let writes = fixture
+        .manager
+        .list_writes(&fixture.agent_id, &original.id)
+        .await
+        .unwrap();
+    assert_eq!(writes[0].id, write.id);
+    assert_eq!(writes[0].state, CalendarWriteState::Rejected);
+    assert!(writes[0].error.as_ref().unwrap().contains("account"));
 }
 
 #[tokio::test]

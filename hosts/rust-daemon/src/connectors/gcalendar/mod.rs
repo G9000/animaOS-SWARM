@@ -19,6 +19,7 @@ use zeroize::Zeroizing;
 
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
+use crate::connectors::oauth_apps::{OAuthAppService, OAuthProvider, ResolvedOAuthApp};
 use crate::state::DaemonState;
 
 use self::client::{GoogleCalendarEvent, GoogleCalendarTransport, GoogleTransportError};
@@ -59,7 +60,7 @@ pub(crate) struct GoogleCalendarConnectorRecord {
     pub(crate) id: String,
     pub(crate) agent_id: String,
     /// Non-secret account label (usually the Google account email) shown in
-    /// the console. Populated best-effort after OAuth completes.
+    /// the console. Verified after OAuth completes; older records may lack it.
     #[serde(default)]
     pub(crate) account_label: Option<String>,
     #[serde(default = "default_calendar_ids")]
@@ -87,6 +88,8 @@ impl GoogleCalendarConnectorRecord {
 pub(crate) struct GooglePendingAuth {
     pub(crate) nonce: String,
     pub(crate) expires_at_ms: u64,
+    #[serde(default)]
+    pub(crate) config_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,9 +158,6 @@ fn default_enabled() -> bool {
 // OAuth configuration (daemon-level, from environment)
 // ---------------------------------------------------------------------------
 
-pub(crate) const GOOGLE_CLIENT_ID_ENV: &str = "ANIMA_GOOGLE_CLIENT_ID";
-pub(crate) const GOOGLE_CLIENT_SECRET_ENV: &str = "ANIMA_GOOGLE_CLIENT_SECRET";
-pub(crate) const GOOGLE_REDIRECT_URI_ENV: &str = "ANIMA_GOOGLE_REDIRECT_URI";
 const DEFAULT_REDIRECT_URI: &str = "http://127.0.0.1:8080/api/connectors/gcalendar/callback";
 
 #[derive(Clone)]
@@ -168,27 +168,13 @@ pub(crate) struct GoogleOAuthConfig {
 }
 
 impl GoogleOAuthConfig {
-    pub(crate) fn from_env() -> Option<Self> {
-        let client_id = std::env::var(GOOGLE_CLIENT_ID_ENV).ok()?.trim().to_string();
-        let client_secret = std::env::var(GOOGLE_CLIENT_SECRET_ENV)
-            .ok()?
-            .trim()
-            .to_string();
-        if client_id.is_empty() || client_secret.is_empty() {
-            return None;
+    fn from_resolved(resolved: &ResolvedOAuthApp) -> Self {
+        Self {
+            client_id: resolved.credentials().client_id().to_string(),
+            client_secret: Zeroizing::new(resolved.credentials().client_secret().to_string()),
+            redirect_uri: DEFAULT_REDIRECT_URI.to_string(),
         }
-        let redirect_uri = std::env::var(GOOGLE_REDIRECT_URI_ENV)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| DEFAULT_REDIRECT_URI.to_string());
-        Some(Self {
-            client_id,
-            client_secret: Zeroizing::new(client_secret),
-            redirect_uri,
-        })
     }
-
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Self {
@@ -270,7 +256,7 @@ pub(crate) struct CalendarManager {
     agent_runs: AgentRunCoordinator,
     credentials: Arc<dyn GoogleCredentialStore>,
     transport: Arc<dyn GoogleCalendarTransport>,
-    oauth: Option<GoogleOAuthConfig>,
+    pub(crate) oauth_apps: OAuthAppService,
 }
 
 impl CalendarManager {
@@ -279,19 +265,39 @@ impl CalendarManager {
         agent_runs: AgentRunCoordinator,
         credentials: Arc<dyn GoogleCredentialStore>,
         transport: Arc<dyn GoogleCalendarTransport>,
-        oauth: Option<GoogleOAuthConfig>,
+        oauth_apps: OAuthAppService,
     ) -> Self {
         Self {
             state: Arc::downgrade(state),
             agent_runs,
             credentials,
             transport,
-            oauth,
+            oauth_apps,
         }
     }
 
-    pub(crate) fn oauth_configured(&self) -> bool {
-        self.oauth.is_some()
+    pub(crate) async fn oauth_configured(&self) -> Result<bool, CalendarError> {
+        self.oauth_apps
+            .status(OAuthProvider::Google)
+            .await
+            .map(|status| status.configured)
+            .map_err(|_| CalendarError::Credential)
+    }
+
+    pub(crate) async fn has_provider_dependency(&self, provider: OAuthProvider) -> bool {
+        if provider != OAuthProvider::Google {
+            return false;
+        }
+        let Some(state) = self.state.upgrade() else {
+            return false;
+        };
+        let in_use = state
+            .read()
+            .await
+            .calendar_connectors
+            .values()
+            .any(|record| record.deleted_at_ms.is_none());
+        in_use
     }
 
     fn shared_state(&self) -> Result<SharedDaemonState, CalendarError> {
@@ -311,42 +317,60 @@ impl CalendarManager {
             .cloned()
     }
 
-    /// Starts OAuth: creates a connector record in pairing state and returns
-    /// it together with the Google consent URL the owner must visit.
+    /// Starts or restarts OAuth, preserving connector identity and pending writes.
+    /// A new nonce invalidates all previously issued consent links.
     pub(crate) async fn begin_connect(
         &self,
         agent_id: &str,
     ) -> Result<(GoogleCalendarConnectorRecord, String), CalendarError> {
-        let oauth = self.oauth.clone().ok_or(CalendarError::Unconfigured)?;
+        let oauth_lease = self
+            .oauth_apps
+            .locked_config(OAuthProvider::Google)
+            .await
+            .map_err(|_| CalendarError::Credential)?;
+        let oauth = oauth_lease
+            .config()
+            .map(GoogleOAuthConfig::from_resolved)
+            .ok_or(CalendarError::Unconfigured)?;
+        let config_revision = oauth_lease.revision();
         let state = self.shared_state()?;
         let now = now_ms();
-        let record = {
+        let _transaction = self.agent_runs.control_plane_transaction().await;
+        let mut record = {
             let guard = state.read().await;
             if guard.get_agent(agent_id).is_none() {
                 return Err(CalendarError::AgentNotFound);
             }
-            if guard.calendar_connectors.values().any(|connector| {
+            if let Some(existing) = guard.calendar_connectors.values().find(|connector| {
                 connector.agent_id == agent_id && connector.deleted_at_ms.is_none()
             }) {
-                return Err(CalendarError::AlreadyConnected);
-            }
-            let sequence = CONNECTOR_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            GoogleCalendarConnectorRecord {
-                id: format!("gcalendar-{now}-{sequence}"),
-                agent_id: agent_id.to_string(),
-                account_label: None,
-                calendar_ids: default_calendar_ids(),
-                pending_auth: Some(GooglePendingAuth {
-                    nonce: uuid::Uuid::new_v4().to_string(),
-                    expires_at_ms: now + PENDING_AUTH_TTL_MS,
-                }),
-                reauth_required: false,
-                enabled: true,
-                deleted_at_ms: None,
-                created_at_ms: now,
-                updated_at_ms: now,
+                existing.clone()
+            } else {
+                let sequence = CONNECTOR_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                GoogleCalendarConnectorRecord {
+                    id: format!("gcalendar-{now}-{sequence}"),
+                    agent_id: agent_id.to_string(),
+                    account_label: None,
+                    calendar_ids: default_calendar_ids(),
+                    pending_auth: Some(GooglePendingAuth {
+                        nonce: uuid::Uuid::new_v4().to_string(),
+                        expires_at_ms: now + PENDING_AUTH_TTL_MS,
+                        config_revision,
+                    }),
+                    reauth_required: false,
+                    enabled: true,
+                    deleted_at_ms: None,
+                    created_at_ms: now,
+                    updated_at_ms: now,
+                }
             }
         };
+        record.pending_auth = Some(GooglePendingAuth {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            expires_at_ms: now + PENDING_AUTH_TTL_MS,
+            config_revision,
+        });
+        record.updated_at_ms = now;
         let consent_url = oauth.consent_url(
             &record
                 .pending_auth
@@ -355,7 +379,6 @@ impl CalendarManager {
                 .nonce,
         );
 
-        let _transaction = self.agent_runs.control_plane_transaction().await;
         let persist = {
             let mut guard = state.write().await;
             guard
@@ -377,23 +400,51 @@ impl CalendarManager {
         nonce: &str,
         code: &str,
     ) -> Result<GoogleCalendarConnectorRecord, CalendarError> {
-        let oauth = self.oauth.clone().ok_or(CalendarError::Unconfigured)?;
+        let oauth_lease = self
+            .oauth_apps
+            .locked_config(OAuthProvider::Google)
+            .await
+            .map_err(|_| CalendarError::Credential)?;
+        let oauth = oauth_lease
+            .config()
+            .map(GoogleOAuthConfig::from_resolved)
+            .ok_or(CalendarError::Unconfigured)?;
         let state = self.shared_state()?;
         let now = now_ms();
-        let connector_id = {
-            let guard = state.read().await;
-            guard
+        // Consume the nonce durably before contacting Google. Keep an expired
+        // pending record so a failed exchange cannot accidentally activate old tokens.
+        let (connector_id, original_account) = {
+            let _transaction = self.agent_runs.control_plane_transaction().await;
+            let mut guard = state.write().await;
+            let record = guard
                 .calendar_connectors
-                .values()
+                .values_mut()
                 .find(|connector| {
-                    connector.deleted_at_ms.is_none()
+                    connector.enabled
+                        && connector.deleted_at_ms.is_none()
                         && connector.pending_auth.as_ref().is_some_and(|pending| {
-                            pending.nonce == nonce && pending.expires_at_ms >= now
+                            pending.nonce == nonce
+                                && pending.expires_at_ms >= now
+                                && oauth_lease.revision_is_current(pending.config_revision)
                         })
                 })
-                .map(|connector| connector.id.clone())
-        }
-        .ok_or(CalendarError::PairingNotFound)?;
+                .ok_or(CalendarError::PairingNotFound)?;
+            let identity = (record.id.clone(), record.account_label.clone());
+            record
+                .pending_auth
+                .as_mut()
+                .expect("validated nonce")
+                .expires_at_ms = 0;
+            record.reauth_required = true;
+            record.updated_at_ms = now;
+            let persist = guard.control_plane_persist_request();
+            drop(guard);
+            persist
+                .save()
+                .await
+                .map_err(|_| CalendarError::Persistence)?;
+            identity
+        };
 
         let tokens = self
             .transport
@@ -404,22 +455,60 @@ impl CalendarManager {
             .transport
             .primary_calendar(tokens.access_token())
             .await
-            .ok();
+            .map_err(|_| CalendarError::Transport)?;
+        if original_account
+            .as_ref()
+            .is_some_and(|original| original != &account_label)
+        {
+            return Err(CalendarError::ReauthRequired);
+        }
+
+        let _transaction = self.agent_runs.control_plane_transaction().await;
+        // Revalidate after network awaits, including deletion outside this manager.
+        {
+            let guard = state.read().await;
+            let valid = guard
+                .calendar_connectors
+                .get(&connector_id)
+                .is_some_and(|record| {
+                    record.enabled
+                        && record.deleted_at_ms.is_none()
+                        && guard.get_agent(&record.agent_id).is_some()
+                        && record.pending_auth.as_ref().is_some_and(|pending| {
+                            pending.nonce == nonce && pending.expires_at_ms == 0
+                        })
+                });
+            if !valid {
+                return Err(CalendarError::PairingNotFound);
+            }
+        }
         self.credentials
             .put(&connector_id, tokens)
             .await
             .map_err(|_| CalendarError::Credential)?;
-
-        let _transaction = self.agent_runs.control_plane_transaction().await;
         let persist = {
             let mut guard = state.write().await;
             let Some(record) = guard.calendar_connectors.get_mut(&connector_id) else {
                 return Err(CalendarError::ConnectorNotFound);
             };
             record.pending_auth = None;
-            record.account_label = account_label;
-            record.updated_at_ms = now;
+            record.account_label = Some(account_label);
+            record.reauth_required = false;
+            record.updated_at_ms = now_ms();
             let agent_id = record.agent_id.clone();
+            if original_account.is_none() {
+                // Legacy connections could lack an account label. No old write
+                // can be safely bound to the newly verified Google identity.
+                for write in guard.calendar_writes.values_mut() {
+                    if write.connector_id == connector_id
+                        && write.state == CalendarWriteState::Pending
+                    {
+                        write.state = CalendarWriteState::Rejected;
+                        write.error = Some("original calendar account could not be verified; review and create a new change".into());
+                        write.resolved_at_ms = Some(now_ms());
+                    }
+                }
+            }
             add_calendar_tools(&mut guard, &agent_id)?;
             guard.control_plane_persist_request()
         };
@@ -441,6 +530,11 @@ impl CalendarManager {
         agent_id: &str,
         connector_id: &str,
     ) -> Result<(), CalendarError> {
+        let _oauth_lease = self
+            .oauth_apps
+            .locked_config(OAuthProvider::Google)
+            .await
+            .map_err(|_| CalendarError::Credential)?;
         let state = self.shared_state()?;
         {
             let guard = state.read().await;
@@ -790,7 +884,15 @@ impl CalendarManager {
         if tokens.expires_at_ms() > now + TOKEN_REFRESH_SKEW_MS {
             return Ok(tokens.access_token().to_string());
         }
-        let oauth = self.oauth.clone().ok_or(CalendarError::ReauthRequired)?;
+        let oauth_lease = self
+            .oauth_apps
+            .locked_config(OAuthProvider::Google)
+            .await
+            .map_err(|_| CalendarError::Credential)?;
+        let oauth = oauth_lease
+            .config()
+            .map(GoogleOAuthConfig::from_resolved)
+            .ok_or(CalendarError::ReauthRequired)?;
         let refreshed = match self
             .transport
             .refresh_tokens(&oauth, tokens.refresh_token())

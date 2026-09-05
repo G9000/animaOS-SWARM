@@ -37,7 +37,7 @@ pub(super) async fn get_gcalendar_connector(
         StatusCode::OK,
         &CalendarStatusEnvelope {
             connector: record.as_ref().map(CalendarConnectorResponse::from_record),
-            configured: state.calendar.oauth_configured(),
+            configured: state.calendar.oauth_configured().await.unwrap_or(false),
         },
     ))
 }
@@ -101,7 +101,7 @@ pub(super) async fn gcalendar_oauth_callback(
     if code.is_empty() || nonce.is_empty() {
         return callback_page(
             StatusCode::BAD_REQUEST,
-            "Google authorization was not completed. Try connecting again from Settings.",
+            "Google authorization was not completed. Try connecting again from Connectors.",
         );
     }
     match state.calendar.complete_connect(&nonce, &code).await {
@@ -111,11 +111,11 @@ pub(super) async fn gcalendar_oauth_callback(
         ),
         Err(CalendarError::PairingNotFound) => callback_page(
             StatusCode::BAD_REQUEST,
-            "This connection attempt expired. Start a new one from Settings.",
+            "This connection attempt expired. Start a new one from Connectors.",
         ),
         Err(_) => callback_page(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Google Calendar could not be connected right now. Try again from Settings.",
+            "Google Calendar could not be connected right now. Try again from Connectors.",
         ),
     }
 }

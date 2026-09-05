@@ -107,6 +107,15 @@ use crate::runtime_model::provider_summaries;
         connectors::delete_telegram_connector,
         connectors::list_connector_messages,
         connectors::send_connector_message,
+        mail::status,
+        mail::connect,
+        mail::disconnect,
+        mail::messages,
+        mail::drafts,
+        mail::create_draft,
+        mail::approve,
+        mail::reject,
+        mail::callback,
         gcalendar::get_gcalendar_connector,
         gcalendar::connect_gcalendar,
         gcalendar::gcalendar_oauth_callback,
@@ -137,6 +146,8 @@ struct ApiDoc;
 
 #[derive(Clone)]
 struct AppState {
+    mail: crate::connectors::mail::MailManager,
+    pub(super) oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     daemon: SharedDaemonState,
     config: DaemonConfig,
     run_limiter: Arc<Semaphore>,
@@ -216,12 +227,13 @@ pub(crate) fn router_with_services(
         agent_runs.clone(),
         connector_manager.clone(),
     );
+    let oauth_apps = crate::connectors::oauth_apps::OAuthAppService::in_memory();
     let calendar = crate::connectors::gcalendar::CalendarManager::new(
         &state,
         agent_runs.clone(),
         Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
         Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
-        None,
+        oauth_apps.clone(),
     );
     router_with_all_services(
         state,
@@ -230,6 +242,7 @@ pub(crate) fn router_with_services(
         agent_runs,
         connector_manager,
         calendar,
+        oauth_apps,
         scheduler,
         bind_is_loopback,
     )
@@ -242,6 +255,7 @@ pub(crate) fn router_with_all_services(
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
     calendar: crate::connectors::gcalendar::CalendarManager,
+    oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     bind_is_loopback: bool,
 ) -> Router {
@@ -252,6 +266,7 @@ pub(crate) fn router_with_all_services(
         agent_runs,
         connector_manager,
         calendar,
+        oauth_apps,
         scheduler,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
@@ -265,11 +280,23 @@ fn router_with_services_with_policies(
     agent_runs: AgentRunCoordinator,
     connector_manager: ConnectorManager,
     calendar: crate::connectors::gcalendar::CalendarManager,
+    oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
+    let mail = crate::connectors::mail::MailManager::production(
+        &state,
+        agent_runs.clone(),
+        oauth_apps.clone(),
+    );
+    if let Ok(mut guard) = state.try_write() {
+        guard.mail_manager = Some(mail.clone());
+    }
+    mail.start();
     let app_state = AppState {
+        mail,
+        oauth_apps,
         daemon: Arc::clone(&state),
         config,
         run_limiter: Arc::clone(&run_limiter),
@@ -415,6 +442,34 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/connectors/{connector_id}/messages",
             get(connectors::list_connector_messages),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/mail/{provider}",
+            get(mail::status).post(mail::connect),
+        )
+        .route(
+            "/api/connectors/mail/{provider}/callback",
+            get(mail::callback),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/mail/{provider}/{id}",
+            axum::routing::delete(mail::disconnect),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/mail/{provider}/{id}/messages",
+            get(mail::messages),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/mail/{provider}/{id}/drafts",
+            get(mail::drafts).post(mail::create_draft),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/mail/{provider}/{id}/drafts/{draft}/approve",
+            axum::routing::post(mail::approve),
+        )
+        .route(
+            "/api/agents/{agent_id}/connectors/mail/{provider}/{id}/drafts/{draft}/reject",
+            axum::routing::post(mail::reject),
         )
         .route(
             "/api/agents/{agent_id}/connectors/gcalendar",
@@ -2168,12 +2223,13 @@ mod tests {
             runs.clone(),
             manager.clone(),
         );
+        let oauth_apps = crate::connectors::oauth_apps::OAuthAppService::in_memory();
         let calendar = crate::connectors::gcalendar::CalendarManager::new(
             &state,
             runs.clone(),
             Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
             Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
-            None,
+            oauth_apps.clone(),
         );
         let app = router_with_services_with_policies(
             Arc::clone(&state),
@@ -2182,6 +2238,7 @@ mod tests {
             runs,
             manager,
             calendar,
+            oauth_apps,
             scheduler,
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),

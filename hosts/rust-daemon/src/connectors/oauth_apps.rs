@@ -177,6 +177,7 @@ pub(crate) enum OAuthAppError {
     UnsupportedVaultPayloadVersion,
     VaultStateUncertain,
     OperationCancelled,
+    DependenciesExist,
 }
 impl fmt::Display for OAuthAppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -191,6 +192,7 @@ impl fmt::Display for OAuthAppError {
             }
             Self::VaultStateUncertain => "OAuth application vault state could not be confirmed",
             Self::OperationCancelled => "OAuth application vault operation did not complete",
+            Self::DependenciesExist => "OAuth application credentials are in use",
         })
     }
 }
@@ -217,6 +219,12 @@ struct ProcessEnvironment;
 impl OAuthEnvironment for ProcessEnvironment {
     fn get(&self, name: &str) -> Option<String> {
         std::env::var(name).ok()
+    }
+}
+struct EmptyEnvironment;
+impl OAuthEnvironment for EmptyEnvironment {
+    fn get(&self, _name: &str) -> Option<String> {
+        None
     }
 }
 pub(crate) struct OsOAuthVault;
@@ -305,6 +313,12 @@ impl OAuthAppService {
     pub(crate) fn new() -> Self {
         Self::with_backends(Arc::new(OsOAuthVault), Arc::new(ProcessEnvironment))
     }
+    pub(crate) fn in_memory() -> Self {
+        Self::with_backends(
+            Arc::new(InMemoryOAuthAppVault::default()),
+            Arc::new(EmptyEnvironment),
+        )
+    }
     pub(crate) fn with_backends(
         vault: Arc<dyn OAuthVaultBackend>,
         environment: Arc<dyn OAuthEnvironment>,
@@ -375,12 +389,43 @@ impl OAuthAppService {
         });
         rx.await.map_err(|_| OAuthAppError::OperationCancelled)?
     }
+    pub(crate) async fn put_if_unused<F, Fut>(
+        &self,
+        provider: OAuthProvider,
+        credentials: OAuthAppCredentials,
+        in_use: F,
+    ) -> Result<u64, OAuthAppError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut guard = this.lock(provider).lock_owned().await;
+            let result = if in_use().await {
+                Err(OAuthAppError::DependenciesExist)
+            } else {
+                this.put_with_guard(provider, credentials, &mut guard).await
+            };
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| OAuthAppError::OperationCancelled)?
+    }
     async fn put_owned(
         &self,
         provider: OAuthProvider,
         credentials: OAuthAppCredentials,
     ) -> Result<u64, OAuthAppError> {
         let mut guard = self.lock(provider).lock_owned().await;
+        self.put_with_guard(provider, credentials, &mut guard).await
+    }
+    async fn put_with_guard(
+        &self,
+        provider: OAuthProvider,
+        credentials: OAuthAppCredentials,
+        guard: &mut Lifecycle,
+    ) -> Result<u64, OAuthAppError> {
         let vault = self.inner.vault.clone();
         let known = guard.revision;
         let revision = tokio::task::spawn_blocking(move || {
@@ -399,8 +444,37 @@ impl OAuthAppService {
         });
         rx.await.map_err(|_| OAuthAppError::OperationCancelled)?
     }
+    pub(crate) async fn delete_if_unused<F, Fut>(
+        &self,
+        provider: OAuthProvider,
+        in_use: F,
+    ) -> Result<u64, OAuthAppError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = bool> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut guard = this.lock(provider).lock_owned().await;
+            let result = if in_use().await {
+                Err(OAuthAppError::DependenciesExist)
+            } else {
+                this.delete_with_guard(provider, &mut guard).await
+            };
+            let _ = tx.send(result);
+        });
+        rx.await.map_err(|_| OAuthAppError::OperationCancelled)?
+    }
     async fn delete_owned(&self, provider: OAuthProvider) -> Result<u64, OAuthAppError> {
         let mut guard = self.lock(provider).lock_owned().await;
+        self.delete_with_guard(provider, &mut guard).await
+    }
+    async fn delete_with_guard(
+        &self,
+        provider: OAuthProvider,
+        guard: &mut Lifecycle,
+    ) -> Result<u64, OAuthAppError> {
         let vault = self.inner.vault.clone();
         let known = guard.revision;
         let outcome =
