@@ -1,6 +1,6 @@
+pub(crate) mod calendar;
 mod filesystem;
 mod memory;
-pub(crate) mod calendar;
 mod process;
 #[cfg(test)]
 mod tests;

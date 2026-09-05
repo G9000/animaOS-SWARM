@@ -1,5 +1,24 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { resolveDaemonModelSettings } from './utils.js';
+import { resolveDaemonModelSettings, toRuntimeTaskResult } from './utils.js';
+
+it('converts nullable daemon result fields at the runtime display boundary', () => {
+  expect(
+    toRuntimeTaskResult({
+      status: 'success',
+      data: { text: 'done' },
+      error: null,
+      durationMs: 7,
+    })
+  ).toEqual({ status: 'success', data: { text: 'done' }, durationMs: 7 });
+  expect(
+    toRuntimeTaskResult({
+      status: 'error',
+      data: null,
+      error: 'failed',
+      durationMs: 8,
+    })
+  ).toEqual({ status: 'error', error: 'failed', durationMs: 8 });
+});
 
 const ENV_KEYS = [
   'GEMINI_API_KEY',

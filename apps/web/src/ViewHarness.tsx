@@ -116,6 +116,8 @@ export function ViewHarness() {
   const agent = selectMainAgent(agents);
 
   const [draft, setDraft] = useState('');
+  const [failedDrafts, setFailedDrafts] = useState<string[]>([]);
+  const failedDraft = failedDrafts[0] ?? null;
   const [sending, setSending] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
@@ -164,6 +166,7 @@ export function ViewHarness() {
     savingSettingsRef.current = false;
 
     setDraft('');
+    setFailedDrafts([]);
     setCiPrompt('');
     setCiIntervalMin(30);
     setCiTarget('workspace');
@@ -391,6 +394,7 @@ export function ViewHarness() {
     if (
       !text ||
       !agent ||
+      connection !== 'online' ||
       sendingRef.current ||
       resetInFlightRef.current !== null
     ) {
@@ -411,10 +415,14 @@ export function ViewHarness() {
         if (result.status === 'error') {
           setWorkspaceError(result.error ?? 'run failed');
         }
-        scrollDown();
       }
     } catch (caught) {
-      if (isCurrentAgentOperation(operation)) {
+      if (
+        sendingOperationGenerationRef.current === operation.generation &&
+        operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
+        operation.targetAgentId === currentAgentIdRef.current
+      ) {
+        setFailedDrafts((current) => [...current, text]);
         setWorkspaceError(
           caught instanceof Error ? caught.message : String(caught),
         );
@@ -504,6 +512,11 @@ export function ViewHarness() {
           connection={connection}
           onOpenSettings={openSettings}
           onChangeWorkspaceAvatar={changeWorkspaceAvatar}
+          onPickPrompt={(prompt) =>
+            setDraft((current) =>
+              current.trim() ? `${current}\n\n${prompt}` : prompt,
+            )
+          }
           workspaceState={workspace}
           workspace={
             <section
@@ -522,9 +535,28 @@ export function ViewHarness() {
                 setDraft={setDraft}
                 sending={sending}
                 disabled={resetting}
+                offline={connection === 'offline'}
                 onSend={send}
                 error={workspaceError}
                 onDismissError={() => setWorkspaceError(null)}
+                recovery={
+                  failedDraft
+                    ? {
+                        count: failedDrafts.length,
+                        text: failedDraft,
+                        restore: () => {
+                          setDraft((current) =>
+                            current.trim()
+                              ? `${current}\n\n${failedDraft}`
+                              : failedDraft,
+                          );
+                          setFailedDrafts((current) => current.slice(1));
+                        },
+                        dismiss: () =>
+                          setFailedDrafts((current) => current.slice(1)),
+                      }
+                    : undefined
+                }
               />
             </section>
           }

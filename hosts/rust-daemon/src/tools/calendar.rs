@@ -51,7 +51,10 @@ fn calendar_error(error: CalendarError) -> String {
     }
 }
 
-fn draft_from_args(tool_call: &ToolCall, require_event_id: bool) -> Result<CalendarEventDraft, String> {
+fn draft_from_args(
+    tool_call: &ToolCall,
+    require_event_id: bool,
+) -> Result<CalendarEventDraft, String> {
     let event_id = optional_string(tool_call, "event_id");
     if require_event_id && event_id.is_none() {
         return Err("event_id must be a non-empty string".to_string());

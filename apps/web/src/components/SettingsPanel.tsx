@@ -257,7 +257,7 @@ export function SettingsPanel({
         aria-labelledby="settings-heading"
         aria-busy={controlsDisabled}
         tabIndex={-1}
-        className="safe-settings-sheet animate-slide-in-right fixed inset-0 z-20 flex w-full flex-col bg-panel/95 shadow-2xl shadow-black/70 backdrop-blur-2xl sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-md sm:border-l sm:border-line"
+        className="studio-settings safe-settings-sheet animate-slide-in-right fixed inset-0 z-20 flex w-full flex-col shadow-2xl shadow-black/20 sm:inset-y-0 sm:left-auto sm:right-0 sm:max-w-lg sm:border-l sm:border-line"
       >
         {/* Panel header */}
         <div className="flex items-center justify-between border-b border-line px-5 py-4 sm:px-6">
@@ -332,6 +332,7 @@ export function SettingsPanel({
             <div>
               <label className={labelCls}>Name</label>
               <input
+                aria-label="Name"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 disabled={controlsDisabled}
@@ -341,6 +342,7 @@ export function SettingsPanel({
             <div>
               <label className={labelCls}>Provider</label>
               <select
+                aria-label="Provider"
                 value={provider}
                 disabled={controlsDisabled}
                 onChange={(e) => {
@@ -379,6 +381,7 @@ export function SettingsPanel({
             <div>
               <label className={labelCls}>Model</label>
               <select
+                aria-label="Model"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 disabled={controlsDisabled}
@@ -394,6 +397,7 @@ export function SettingsPanel({
             </div>
             {model === '__custom__' && (
               <input
+                aria-label="Custom model"
                 value={customModel}
                 onChange={(e) => setCustomModel(e.target.value)}
                 disabled={controlsDisabled}
@@ -469,6 +473,7 @@ export function SettingsPanel({
           <section className="space-y-2.5">
             <SectionTitle>System prompt</SectionTitle>
             <textarea
+              aria-label="System prompt"
               value={system}
               onChange={(e) => setSystem(e.target.value)}
               disabled={controlsDisabled}

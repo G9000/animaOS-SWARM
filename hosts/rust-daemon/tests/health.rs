@@ -293,11 +293,24 @@ async fn docs_endpoint_returns_html() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn serve_exposes_health_and_error_paths_over_real_http() {
+    // serve reads process-wide persistence settings. Share the fixture lock
+    // with the configured-persistence test so it cannot delete our store mid-startup.
+    let workspace = use_temp_workspace_root("real-http-health");
+    let _store = EnvVarGuard::set(
+        "ANIMAOS_RS_CONTROL_PLANE_FILE",
+        workspace.path().join("control-plane.json"),
+    );
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener binds");
     let addr = listener.local_addr().expect("listener has local addr");
-    let server = tokio::spawn(async move { serve(listener, DaemonConfig::default()).await });
+    let server = tokio::spawn(async move {
+        let result = serve(listener, DaemonConfig::default()).await;
+        if let Err(error) = &result {
+            eprintln!("test server failed: {error}");
+        }
+        result
+    });
 
     let health_response = send_raw_http(
         addr,

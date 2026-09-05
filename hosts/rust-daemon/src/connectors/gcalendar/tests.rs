@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use anima_core::{AgentConfig, AgentState, DataValue, Message, MessageRole, ToolCall};
+use anima_core::{AgentConfig, DataValue, Message, MessageRole, ToolCall};
 use async_trait::async_trait;
 use tokio::sync::{RwLock, Semaphore};
 use zeroize::Zeroizing;
@@ -85,10 +85,7 @@ impl GoogleCalendarTransport for FakeGoogleTransport {
             .unwrap_or(Err(GoogleTransportError::Unavailable))
     }
 
-    async fn primary_calendar(
-        &self,
-        _access_token: &str,
-    ) -> Result<String, GoogleTransportError> {
+    async fn primary_calendar(&self, _access_token: &str) -> Result<String, GoogleTransportError> {
         Ok("owner@example.com".to_string())
     }
 
@@ -188,7 +185,18 @@ async fn fixture_with_transport(
 fn test_config(name: &str) -> AgentConfig {
     AgentConfig {
         name: name.to_string(),
-        ..AgentConfig::default()
+        model: "deterministic".into(),
+        provider: None,
+        bio: None,
+        lore: None,
+        knowledge: None,
+        topics: None,
+        adjectives: None,
+        style: None,
+        system: None,
+        tools: None,
+        plugins: None,
+        settings: None,
     }
 }
 
@@ -304,22 +312,37 @@ async fn list_events_requires_an_active_connector() {
     let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
     let result = fixture
         .manager
-        .list_events_for_agent(&fixture.agent_id, None, "2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z")
+        .list_events_for_agent(
+            &fixture.agent_id,
+            None,
+            "2026-09-01T00:00:00Z",
+            "2026-09-02T00:00:00Z",
+        )
         .await;
     assert_eq!(result.unwrap_err(), CalendarError::NotConnected);
 
     connect(&fixture).await;
-    fixture.transport.events.lock().unwrap().push(GoogleCalendarEvent {
-        id: "event-1".to_string(),
-        title: "Standup".to_string(),
-        start: "2026-09-01T09:00:00Z".to_string(),
-        end: "2026-09-01T09:15:00Z".to_string(),
-        location: None,
-        description: None,
-    });
+    fixture
+        .transport
+        .events
+        .lock()
+        .unwrap()
+        .push(GoogleCalendarEvent {
+            id: "event-1".to_string(),
+            title: "Standup".to_string(),
+            start: "2026-09-01T09:00:00Z".to_string(),
+            end: "2026-09-01T09:15:00Z".to_string(),
+            location: None,
+            description: None,
+        });
     let events = fixture
         .manager
-        .list_events_for_agent(&fixture.agent_id, None, "2026-09-01T00:00:00Z", "2026-09-02T00:00:00Z")
+        .list_events_for_agent(
+            &fixture.agent_id,
+            None,
+            "2026-09-01T00:00:00Z",
+            "2026-09-02T00:00:00Z",
+        )
         .await
         .expect("events should list");
     assert_eq!(events.len(), 1);
@@ -493,7 +516,10 @@ async fn failed_apply_marks_write_failed_with_sanitized_error() {
         .expect("failed apply still resolves the write");
     assert_eq!(applied.state, CalendarWriteState::Failed);
     let error = applied.error.expect("error recorded");
-    assert!(!error.contains("access-initial"), "error must not leak tokens");
+    assert!(
+        !error.contains("access-initial"),
+        "error must not leak tokens"
+    );
 }
 
 #[tokio::test]
@@ -530,7 +556,12 @@ async fn disconnect_tombstones_connector_rejects_pending_and_strips_tools() {
         .state
         .config
         .tools
-        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>())
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     for name in CALENDAR_TOOL_NAMES {
         assert!(!tool_names.iter().any(|tool| tool == name));
@@ -594,7 +625,10 @@ async fn list_events_tool_reports_connection_guidance_when_unconnected() {
             .expect("runtime available");
         (context, runtime.state().clone())
     };
-    let result = crate::tools::calendar::execute_calendar_list_events(
+    let handler = crate::tools::ToolRegistry::new()
+        .lookup("calendar_list_events")
+        .unwrap();
+    let result = handler(
         context,
         agent,
         tool_message(),
@@ -615,7 +649,10 @@ async fn list_events_tool_reports_connection_guidance_when_unconnected() {
     )
     .await;
     let message = result.error.expect("tool should report an error");
-    assert!(message.contains("not connected"), "unexpected message: {message}");
+    assert!(
+        message.contains("not connected"),
+        "unexpected message: {message}"
+    );
 }
 
 #[tokio::test]
@@ -629,7 +666,10 @@ async fn create_tool_records_pending_write_without_calling_google() {
             .expect("runtime available");
         (context, runtime.state().clone())
     };
-    let result = crate::tools::calendar::execute_calendar_create_event(
+    let handler = crate::tools::ToolRegistry::new()
+        .lookup("calendar_create_event")
+        .unwrap();
+    let result = handler(
         context,
         agent,
         tool_message(),

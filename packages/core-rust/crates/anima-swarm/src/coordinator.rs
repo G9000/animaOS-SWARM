@@ -42,6 +42,9 @@ pub type CoordinatorMessageEventFn =
 pub type CoordinatorAgentRunFn =
     dyn Fn(Content) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
 
+/// Checks the dispatch's observed token usage. Hosts call this before model requests.
+pub type CoordinatorBudgetCheckFn = dyn Fn() -> Result<(), String> + Send + Sync;
+
 pub type CoordinatorDelegateFn =
     dyn Fn(String, String) -> CoordinatorFuture<TaskResult<Content>> + Send + Sync;
 
@@ -63,6 +66,7 @@ pub struct CoordinatorAgentFactoryContext {
     pub participants: Arc<CoordinatorParticipantsFn>,
     pub delegate_task: Option<Arc<CoordinatorDelegateFn>>,
     pub delegate_tasks: Option<Arc<CoordinatorBatchDelegateFn>>,
+    pub check_budget: Arc<CoordinatorBudgetCheckFn>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -274,6 +278,8 @@ struct CoordinatorInner {
     admitted_agent_ids: Mutex<HashSet<String>>,
     pool: Mutex<HashMap<String, String>>,
     dispatch_lock: AsyncMutex<()>,
+    usage_sealed: AtomicBool,
+    usage_generation: AtomicU64,
 }
 
 struct CoordinatorAgentLiveness {
@@ -356,6 +362,8 @@ impl SwarmCoordinator {
                 admitted_agent_ids: Mutex::new(HashSet::new()),
                 pool: Mutex::new(HashMap::new()),
                 dispatch_lock: AsyncMutex::new(()),
+                usage_sealed: AtomicBool::new(false),
+                usage_generation: AtomicU64::new(0),
             }),
         }
     }
@@ -382,6 +390,8 @@ impl SwarmCoordinator {
                 admitted_agent_ids: Mutex::new(HashSet::new()),
                 pool: Mutex::new(HashMap::new()),
                 dispatch_lock: AsyncMutex::new(()),
+                usage_sealed: AtomicBool::new(true),
+                usage_generation: AtomicU64::new(0),
             }),
         }
     }
@@ -578,6 +588,7 @@ impl SwarmCoordinator {
 
         let result = (self.inner.strategy)(context).await;
         self.capture_live_token_usage();
+        self.inner.usage_sealed.store(true, Ordering::Release);
         self.stop_ephemeral_agents().await;
 
         let completed_at = now_millis();
@@ -642,12 +653,13 @@ impl SwarmCoordinator {
             participants: self.build_participants_hook(&agent_id, liveness.clone()),
             delegate_task,
             delegate_tasks,
+            check_budget: self.build_budget_check(),
         })
         .await
         .inspect_err(|_| self.release_agent_slot(&agent_id))?;
         let agent = CoordinatorAgentRef::with_liveness(
             agent_id.clone(),
-            shell.run.clone(),
+            self.budgeted_run(shell.run.clone()),
             liveness.clone(),
         );
 
@@ -679,13 +691,15 @@ impl SwarmCoordinator {
             .map(|agent| {
                 CoordinatorAgentRef::with_liveness(
                     pool_agent_id,
-                    agent.shell.run.clone(),
+                    self.budgeted_run(agent.shell.run.clone()),
                     agent.liveness.clone(),
                 )
             })
     }
 
     fn reset_task_state(&self) {
+        self.inner.usage_sealed.store(true, Ordering::Release);
+        self.inner.usage_generation.fetch_add(1, Ordering::AcqRel);
         self.inner.message_bus.lock_recover().clear_inboxes();
 
         let messages = self.message_history();
@@ -705,6 +719,49 @@ impl SwarmCoordinator {
         for clear_task_state in clear_hooks {
             clear_task_state();
         }
+        self.inner.usage_sealed.store(false, Ordering::Release);
+    }
+
+    fn build_budget_check(&self) -> Arc<CoordinatorBudgetCheckFn> {
+        // Shells live in the coordinator registry: a strong reference here would leak the swarm.
+        let inner = Arc::downgrade(&self.inner);
+        Arc::new(move || {
+            let inner = inner
+                .upgrade()
+                .ok_or_else(|| "swarm is no longer active".to_string())?;
+            let Some(limit) = inner.config.token_budget else {
+                return Ok(());
+            };
+            let coordinator = SwarmCoordinator { inner };
+            coordinator.capture_live_token_usage();
+            let used = coordinator
+                .inner
+                .state
+                .lock_recover()
+                .token_usage
+                .total_tokens;
+            if used >= limit {
+                Err(format!(
+                    "swarm token budget exhausted ({used}/{limit} tokens)"
+                ))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn budgeted_run(&self, run: Arc<CoordinatorAgentRunFn>) -> Arc<CoordinatorAgentRunFn> {
+        let check = self.build_budget_check();
+        Arc::new(move |input| {
+            let check = check.clone();
+            let run = run.clone();
+            Box::pin(async move {
+                if let Err(error) = check() {
+                    return TaskResult::error(error, 0);
+                }
+                run(input).await
+            })
+        })
     }
 
     async fn stop_ephemeral_agents(&self) {
@@ -747,6 +804,12 @@ impl SwarmCoordinator {
     }
 
     fn capture_live_token_usage(&self) {
+        let generation = self.inner.usage_generation.load(Ordering::Acquire);
+        if self.inner.usage_sealed.load(Ordering::Acquire)
+            || self.inner.state.lock_recover().completed_at.is_some()
+        {
+            return;
+        }
         let token_hooks = self
             .inner
             .agents
@@ -762,13 +825,34 @@ impl SwarmCoordinator {
         let mut token_usage = TokenUsage::default();
         for token_hook in token_hooks {
             let snapshot = token_hook();
-            token_usage.prompt_tokens += snapshot.prompt_tokens;
-            token_usage.completion_tokens += snapshot.completion_tokens;
-            token_usage.total_tokens += snapshot.total_tokens;
+            token_usage.prompt_tokens = token_usage
+                .prompt_tokens
+                .saturating_add(snapshot.prompt_tokens);
+            token_usage.completion_tokens = token_usage
+                .completion_tokens
+                .saturating_add(snapshot.completion_tokens);
+            token_usage.total_tokens = token_usage
+                .total_tokens
+                .saturating_add(snapshot.total_tokens);
         }
 
         self.with_state(|state| {
-            state.token_usage = token_usage;
+            if !self.inner.usage_sealed.load(Ordering::Acquire)
+                && self.inner.usage_generation.load(Ordering::Acquire) == generation
+                && state.completed_at.is_none()
+            {
+                // A slower poll may finish after a newer model response was observed.
+                state.token_usage.prompt_tokens = state
+                    .token_usage
+                    .prompt_tokens
+                    .max(token_usage.prompt_tokens);
+                state.token_usage.completion_tokens = state
+                    .token_usage
+                    .completion_tokens
+                    .max(token_usage.completion_tokens);
+                state.token_usage.total_tokens =
+                    state.token_usage.total_tokens.max(token_usage.total_tokens);
+            }
         });
     }
 

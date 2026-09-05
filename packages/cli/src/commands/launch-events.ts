@@ -11,7 +11,7 @@ import type {
 } from '@animaOS-SWARM/sdk';
 
 import type { AgencyConfig } from '../agency/types.js';
-import { extractResultText } from './utils.js';
+import { extractResultText, toRuntimeTaskResult } from './utils.js';
 
 export interface LaunchDisplayAgent {
   id: string;
@@ -326,7 +326,7 @@ function resolveDisplayAgent(
 
 function normalizeResult(result: SwarmEventPayload['result']): TaskResult {
   if (result) {
-    return result;
+    return toRuntimeTaskResult(result);
   }
 
   return {

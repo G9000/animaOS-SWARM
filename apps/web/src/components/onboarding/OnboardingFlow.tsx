@@ -23,10 +23,7 @@ import { ModelStep, type ProviderCatalogState } from './ModelStep';
 import { ONBOARDING_STEPS, OnboardingProgress } from './OnboardingProgress';
 import { ResumeCard } from './ResumeCard';
 import { ReviewStep } from './ReviewStep';
-import {
-  WorkspaceStep,
-  type WorkspaceVerifyStatus,
-} from './WorkspaceStep';
+import { WorkspaceStep, type WorkspaceVerifyStatus } from './WorkspaceStep';
 
 export interface OnboardingFlowProps {
   providers: DaemonProvider[] | null;
@@ -108,7 +105,9 @@ function fillEmptyFromTemplate(
     ...draft,
     presetId,
     bio: draft.bio || template.bio,
-    adjectives: draft.adjectives.length ? draft.adjectives : template.adjectives,
+    adjectives: draft.adjectives.length
+      ? draft.adjectives
+      : template.adjectives,
     style: draft.style || template.style,
     system: draft.system || template.system,
   };
@@ -117,8 +116,8 @@ function fillEmptyFromTemplate(
 function workspaceComplete(workspace: WorkspaceDraft): boolean {
   return Boolean(
     workspace.companyName.trim() &&
-      workspace.mission.trim() &&
-      workspace.rootPath.trim(),
+    workspace.mission.trim() &&
+    workspace.rootPath.trim(),
   );
 }
 
@@ -750,9 +749,7 @@ export function OnboardingFlow({
           name,
           presetId: draft.presetId,
           bio: draft.bio.trim(),
-          ...(draft.adjectives.length
-            ? { adjectives: draft.adjectives }
-            : {}),
+          ...(draft.adjectives.length ? { adjectives: draft.adjectives } : {}),
           ...(draft.style.trim() ? { style: draft.style.trim() } : {}),
           system: draft.system.trim(),
           ...(draft.provider ? { provider: draft.provider } : {}),
@@ -875,11 +872,14 @@ export function OnboardingFlow({
   }
 
   return (
-    <div className="relative z-[1] flex flex-1 items-center justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10">
+    <div className="studio-onboarding relative z-[1] flex flex-1 items-start justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10">
       <div className="w-full max-w-2xl space-y-6">
         <header className="space-y-2 text-center">
+          <div className="studio-onboarding-brand">
+            <span aria-hidden>✳</span> animaOS
+          </div>
           <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-ink-3">
-            Guided Focus · Workspace
+            MAKE YOURSELF AT HOME
           </p>
           <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
             {showingResumeCard
@@ -891,6 +891,34 @@ export function OnboardingFlow({
               ? 'Your workspace is ready — hire another agent.'
               : 'Name your company, pick its folder, and hire your first agent.'}
           </p>
+          <div className="studio-onboarding-promise">
+            <div className="studio-onboarding-art" aria-hidden>
+              <span>✳</span>
+              <i />
+              <b>YOUR NEXT CHAPTER</b>
+            </div>
+            <div>
+              <span>01</span>
+              <p>
+                <strong>Your space, your rules.</strong>Choose a folder and
+                decide how your agent can help.
+              </p>
+            </div>
+            <div>
+              <span>02</span>
+              <p>
+                <strong>Intelligence with intention.</strong>Pick a model, shape
+                a personality, and start a conversation.
+              </p>
+            </div>
+            <div>
+              <span>03</span>
+              <p>
+                <strong>Start small. Go somewhere.</strong>You can refine your
+                agent’s settings as you work.
+              </p>
+            </div>
+          </div>
         </header>
 
         <OnboardingProgress currentStep={currentStep} />

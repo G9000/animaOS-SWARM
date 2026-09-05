@@ -513,7 +513,7 @@ fn start_populates_workers_and_dispatch_reuses_the_pool() {
 
     let state = coordinator.get_state();
     assert_eq!(state.results.len(), 2);
-    assert_eq!(state.token_usage.total_tokens, 12);
+    assert_eq!(state.token_usage.total_tokens, 21);
 }
 
 #[test]
@@ -1354,10 +1354,187 @@ fn get_state_preserves_results_and_get_message_bus_is_stable() {
     assert_eq!(state.results.len(), 2);
     assert_eq!(state.results[0].status, TaskStatus::Success);
     assert_eq!(state.results[1].status, TaskStatus::Success);
-    assert_eq!(state.token_usage.total_tokens, 6);
+    assert_eq!(state.token_usage.total_tokens, 14);
 
     block_on(coordinator.stop()).expect("stop should succeed");
-    assert_eq!(coordinator.get_state().token_usage.total_tokens, 6);
+    assert_eq!(coordinator.get_state().token_usage.total_tokens, 14);
+}
+
+fn metered_factory(runs: Arc<Mutex<Vec<String>>>) -> Arc<CoordinatorAgentFactoryFn> {
+    Arc::new(move |context| {
+        let runs = runs.clone();
+        Box::pin(async move {
+            let tokens = Arc::new(Mutex::new(TokenUsage::default()));
+            Ok(CoordinatorAgentShell {
+                run: Arc::new({
+                    let tokens = tokens.clone();
+                    move |_| {
+                        runs.lock().unwrap().push(context.config.name.clone());
+                        let mut usage = tokens.lock().unwrap();
+                        usage.prompt_tokens += 3;
+                        usage.completion_tokens += 2;
+                        usage.total_tokens += 5;
+                        Box::pin(async { TaskResult::success(text_content("done"), 0) })
+                    }
+                }),
+                token_usage: Arc::new({
+                    let tokens = tokens.clone();
+                    move || tokens.lock().unwrap().clone()
+                }),
+                clear_task_state: Arc::new(move || *tokens.lock().unwrap() = TokenUsage::default()),
+                stop: Arc::new(|| Box::pin(async {})),
+            })
+        })
+    })
+}
+
+#[test]
+fn zero_token_budget_prevents_all_agent_execution() {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let config = SwarmConfig {
+        token_budget: Some(0),
+        ..round_robin_config_with_turns(&["worker-a"], 3)
+    };
+    let coordinator = SwarmCoordinator::with_hooks(
+        config,
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        metered_factory(runs.clone()),
+    );
+    let result = block_on(coordinator.dispatch("work"));
+    assert!(runs.lock().unwrap().is_empty());
+    assert_eq!(result.status, TaskStatus::Error);
+    assert!(result.error.unwrap().contains("token budget exhausted"));
+}
+
+#[test]
+fn shared_token_budget_stops_later_turns_and_resets_for_next_dispatch() {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let config = SwarmConfig {
+        token_budget: Some(5),
+        ..round_robin_config_with_turns(&["worker-a"], 3)
+    };
+    let coordinator = SwarmCoordinator::with_hooks(
+        config,
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        metered_factory(runs.clone()),
+    );
+    block_on(coordinator.start()).unwrap();
+    for _ in 0..2 {
+        let result = block_on(coordinator.dispatch("work"));
+        assert_eq!(result.status, TaskStatus::Error);
+        assert!(result.error.unwrap().contains("token budget exhausted"));
+        assert_eq!(coordinator.get_state().token_usage.total_tokens, 5);
+    }
+    assert_eq!(*runs.lock().unwrap(), vec!["manager", "manager"]);
+}
+
+#[test]
+fn unlimited_token_budget_keeps_all_turns_and_completed_usage() {
+    let runs = Arc::new(Mutex::new(Vec::new()));
+    let coordinator = SwarmCoordinator::with_hooks(
+        round_robin_config_with_turns(&["worker-a"], 3),
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        metered_factory(runs.clone()),
+    );
+    block_on(coordinator.start()).unwrap();
+    assert_eq!(
+        block_on(coordinator.dispatch("work")).status,
+        TaskStatus::Success
+    );
+    assert_eq!(runs.lock().unwrap().len(), 3);
+    assert_eq!(coordinator.get_state().token_usage.total_tokens, 15);
+}
+
+#[test]
+fn polling_during_manager_cleanup_cannot_erase_final_usage() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+    let release = Arc::new(Mutex::new(Some(release_rx)));
+    let base = metered_factory(Arc::new(Mutex::new(Vec::new())));
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new(move |context| {
+        let manager = context.config.name == "manager";
+        let base = base.clone();
+        let release = release.clone();
+        let entered = entered_tx.clone();
+        Box::pin(async move {
+            let mut shell = base(context).await?;
+            if manager {
+                shell.stop = Arc::new(move || {
+                    let release = release.lock().unwrap().take().unwrap();
+                    let entered = entered.clone();
+                    Box::pin(async move {
+                        entered.send(()).unwrap();
+                        release.await.unwrap();
+                    })
+                });
+            }
+            Ok(shell)
+        })
+    });
+    let coordinator = SwarmCoordinator::with_hooks(
+        round_robin_config_with_turns(&["worker-a"], 3),
+        resolve_strategy(SwarmStrategy::RoundRobin),
+        factory,
+    );
+    block_on(coordinator.start()).unwrap();
+    let running = coordinator.clone();
+    let dispatch = thread::spawn(move || block_on(running.dispatch("work")));
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let during_cleanup = coordinator.get_state().token_usage.total_tokens;
+    release_tx.send(()).unwrap();
+    dispatch.join().unwrap();
+    assert_eq!(during_cleanup, 15);
+    assert_eq!(coordinator.get_state().token_usage.total_tokens, 15);
+}
+
+#[test]
+fn delayed_usage_poll_cannot_reopen_an_already_exhausted_budget() {
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release = Arc::new(Mutex::new(release_rx));
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory: Arc<CoordinatorAgentFactoryFn> = Arc::new(move |_| {
+        let release = release.clone();
+        let entered = entered_tx.clone();
+        let calls = calls.clone();
+        Box::pin(async move {
+            Ok(CoordinatorAgentShell {
+                run: Arc::new(|_| {
+                    Box::pin(async { TaskResult::success(text_content("unused"), 0) })
+                }),
+                token_usage: Arc::new(move || {
+                    let total = if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        entered.send(()).unwrap();
+                        release.lock().unwrap().recv().unwrap();
+                        5
+                    } else {
+                        10
+                    };
+                    TokenUsage {
+                        prompt_tokens: total,
+                        completion_tokens: 0,
+                        total_tokens: total,
+                    }
+                }),
+                clear_task_state: Arc::new(|| {}),
+                stop: Arc::new(|| Box::pin(async {})),
+            })
+        })
+    });
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a"]),
+        resolve_strategy(SwarmStrategy::Supervisor),
+        factory,
+    );
+    block_on(coordinator.start()).unwrap();
+    let delayed = coordinator.clone();
+    let poll = thread::spawn(move || delayed.get_state());
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let latest = coordinator.get_state();
+    release_tx.send(()).unwrap();
+    let delayed = poll.join().unwrap();
+    assert_eq!(latest.token_usage.total_tokens, 10);
+    assert_eq!(delayed.token_usage.total_tokens, 10);
 }
 
 #[test]

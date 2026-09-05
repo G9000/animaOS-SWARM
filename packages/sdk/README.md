@@ -49,3 +49,11 @@ Run `bun run build:cli-sdk` to build the SDK and CLI together, or `bun x nx buil
 ## Test
 
 Run `bun x nx test @animaOS-SWARM/sdk`.
+
+Integration tests build the Rust daemon with a separate compilation deadline, then run its binary on a temporary local port and workspace. They use an isolated environment and a local model stub; no developer credentials or persisted workspace data are inherited. `CARGO_TARGET_DIR` can select a build directory (otherwise `target/sdk-daemon-integration`).
+
+## Wire contracts
+
+Agent snapshots use the exported `DaemonAgentState` / `DaemonAgentConfig` types, not executable TypeScript runtime objects. Returned tools have JSON `parameters` and no callable `handler`; returned custom settings are under `settings.additional`. Optional response values are explicitly nullable. Create requests still use `AgentConfig` with flat custom settings: do not pass a returned snapshot config back as a create request unchanged.
+
+Provider credentials and base URLs are configured on the daemon host, not in agent settings. For authenticated deployments, supply a custom `fetch` wrapper that adds `X-Api-Key` while forwarding the request options (including the SSE abort signal).

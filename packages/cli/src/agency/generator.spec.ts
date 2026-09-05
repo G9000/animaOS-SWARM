@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createAdapter, generateAgentSeeds, generateAgentTeam } from './generator.js';
+import {
+  createAdapter,
+  generateAgentSeeds,
+  generateAgentTeam,
+} from './generator.js';
 
 const originalFetch = globalThis.fetch;
 
@@ -139,7 +143,7 @@ describe('createAdapter', () => {
             roomId: '00000000-0000-0000-0000-000000000000',
             role: 'user',
             content: { text: 'make a team' },
-            createdAt: Date.now(),
+            createdAtMs: Date.now(),
           },
         ],
       }

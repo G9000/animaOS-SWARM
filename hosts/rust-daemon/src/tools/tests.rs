@@ -66,6 +66,7 @@ async fn tool_execution_context_rejects_registered_but_unconfigured_write_tool()
         ToolRegistry::new(),
         new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
         None,
+        None,
     );
     let agent = AgentState {
         id: "agent-denied".into(),
@@ -232,6 +233,33 @@ fn registry_defines_every_registered_tool_schema() {
             &["to_agent_id", "to_agent_name"][..],
         ),
         ("broadcast_message", &["message"][..], &[][..]),
+        (
+            "calendar_list_events",
+            &["time_min", "time_max"][..],
+            &["calendar_id"][..],
+        ),
+        (
+            "calendar_create_event",
+            &["title", "start", "end"][..],
+            &["location", "description", "calendar_id"][..],
+        ),
+        (
+            "calendar_update_event",
+            &["event_id"][..],
+            &[
+                "title",
+                "start",
+                "end",
+                "location",
+                "description",
+                "calendar_id",
+            ][..],
+        ),
+        (
+            "calendar_delete_event",
+            &["event_id"][..],
+            &["calendar_id"][..],
+        ),
     ];
 
     assert_eq!(registry.tool_names().len(), expectations.len());

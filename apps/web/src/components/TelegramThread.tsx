@@ -30,7 +30,7 @@ export function TelegramThread({
   };
   return (
     <section
-      className="flex h-full min-h-0 flex-col"
+      className="studio-telegram flex h-full min-h-0 flex-col"
       aria-label="Telegram thread"
     >
       <header className="border-b border-line bg-panel/60 px-6 py-3">
@@ -94,6 +94,7 @@ export function TelegramThread({
         ) : null}
         <div className="glass-strong mx-auto flex max-w-3xl items-end gap-2 rounded-2xl p-2">
           <textarea
+            aria-label={`Message ${agentName} on Telegram`}
             value={draft}
             disabled={busy !== null}
             onChange={(event) => setDraft(event.target.value)}

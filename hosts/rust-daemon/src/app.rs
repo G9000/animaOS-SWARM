@@ -210,9 +210,8 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         Arc::new(OsKeyringCredentialStore::new()),
         Arc::new(transport),
     );
-    let google_transport =
-        crate::connectors::gcalendar::client::GoogleCalendarClient::new()
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
+    let google_transport = crate::connectors::gcalendar::client::GoogleCalendarClient::new()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     let calendar = crate::connectors::gcalendar::CalendarManager::new(
         &state,
         agent_runs.clone(),

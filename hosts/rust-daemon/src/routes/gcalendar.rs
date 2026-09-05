@@ -36,9 +36,7 @@ pub(super) async fn get_gcalendar_connector(
     no_store(json_response(
         StatusCode::OK,
         &CalendarStatusEnvelope {
-            connector: record
-                .as_ref()
-                .map(CalendarConnectorResponse::from_record),
+            connector: record.as_ref().map(CalendarConnectorResponse::from_record),
             configured: state.calendar.oauth_configured(),
         },
     ))
@@ -96,9 +94,7 @@ pub(super) async fn gcalendar_oauth_callback(
 ) -> AxumResponse {
     let query = match request_query(&uri) {
         Ok(query) => query,
-        Err(_) => {
-            return callback_page(StatusCode::BAD_REQUEST, "Malformed OAuth callback.")
-        }
+        Err(_) => return callback_page(StatusCode::BAD_REQUEST, "Malformed OAuth callback."),
     };
     let code = query.get("code").cloned().unwrap_or_default();
     let nonce = query.get("state").cloned().unwrap_or_default();
@@ -276,10 +272,9 @@ fn callback_page(status: StatusCode, message: &str) -> AxumResponse {
     ))
     .into_response();
     *response.status_mut() = status;
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

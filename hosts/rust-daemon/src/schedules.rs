@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,7 @@ const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
 const WORKER_TICK: Duration = Duration::from_millis(250);
+const MAX_ACTIVE_SCHEDULES: usize = 8;
 static NEXT_SCHEDULE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +112,8 @@ struct SchedulerInner {
     state: SharedDaemonState,
     runs: AgentRunCoordinator,
     connectors: ConnectorManager,
+    // A job owns its slot until the detached agent run and durable commit finish.
+    jobs: Mutex<BTreeMap<String, JoinHandle<()>>>,
 }
 
 struct SchedulerWorker {
@@ -129,6 +132,7 @@ impl SchedulerService {
                 state,
                 runs,
                 connectors,
+                jobs: Mutex::new(BTreeMap::new()),
             }),
             worker: Arc::new(Mutex::new(None)),
         }
@@ -148,16 +152,20 @@ impl SchedulerService {
                         if *cancelled.borrow() { break; }
                     }
                     _ = tokio::time::sleep(WORKER_TICK) => {
-                        let _ = SchedulerService::tick_inner(&inner, now_ms()).await;
+                        if let Err(error) = SchedulerService::tick_inner(&inner, now_ms()).await {
+                            tracing::warn!(?error, "schedule recovery or admission failed; retrying next tick");
+                        }
                     }
                 }
             }
+            drain_jobs(&inner).await;
         });
         *worker = Some(SchedulerWorker { cancel, join });
     }
 
     pub(crate) async fn shutdown(&self) {
-        if let Some(worker) = self.worker.lock().await.take() {
+        let mut slot = self.worker.lock().await;
+        if let Some(worker) = slot.take() {
             let _ = worker.cancel.send(true);
             let _ = worker.join.await;
         }
@@ -366,30 +374,119 @@ impl SchedulerService {
 
     #[cfg(test)]
     pub(crate) async fn tick_at(&self, now: u64) -> Result<usize, ScheduleError> {
-        Self::tick_inner(&self.inner, now).await
+        let result = Self::tick_inner(&self.inner, now).await;
+        drain_jobs(&self.inner).await;
+        result
     }
 
     async fn tick_inner(inner: &Arc<SchedulerInner>, now: u64) -> Result<usize, ScheduleError> {
+        let mut jobs = inner.jobs.lock().await;
+        let finished = jobs
+            .iter()
+            .filter(|(_, job)| job.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in finished {
+            if let Some(job) = jobs.remove(&id) {
+                if let Err(error) = job.await {
+                    tracing::warn!(?error, "scheduled worker stopped unexpectedly");
+                }
+            }
+        }
+        // Reconcile only jobs with no live owner, including failures after startup.
+        // Persistence failure closes admission for this tick; the next tick retries.
+        let active_agents = jobs.keys().cloned().collect();
+        reconcile_interrupted(inner, now, &active_agents).await?;
         let due_ids = {
             let state = inner.state.read().await;
             let mut ids = state
                 .schedules
                 .values()
-                .filter(|item| item.enabled && item.next_due_at_ms <= now)
-                .map(|item| item.id.clone())
+                .filter(|item| {
+                    item.enabled && item.next_due_at_ms <= now && !unresolved_occurrence(item)
+                })
+                .map(|item| (item.next_due_at_ms, item.id.clone(), item.agent_id.clone()))
                 .collect::<Vec<_>>();
             ids.sort();
             ids
         };
         let mut claimed = 0;
-        for id in due_ids {
+        for (_, id, agent_id) in due_ids {
+            if jobs.len() >= MAX_ACTIVE_SCHEDULES {
+                break;
+            }
+            if jobs.contains_key(&agent_id) {
+                continue;
+            }
             if let Some(record) = claim_due(inner, &id, now).await? {
                 claimed += 1;
-                execute_claimed(inner, record, now).await;
+                let inner = inner.clone();
+                jobs.insert(
+                    agent_id,
+                    tokio::spawn(async move {
+                        execute_claimed(&inner, record, now).await;
+                    }),
+                );
             }
         }
         Ok(claimed)
     }
+}
+
+async fn drain_jobs(inner: &Arc<SchedulerInner>) {
+    let mut jobs = inner.jobs.lock().await;
+    for (_, job) in std::mem::take(&mut *jobs) {
+        if let Err(error) = job.await {
+            tracing::warn!(?error, "scheduled worker stopped during shutdown");
+        }
+    }
+}
+
+fn unresolved_occurrence(record: &ScheduledPromptRecord) -> bool {
+    record.last_fired.as_ref().is_some_and(|fired| {
+        record
+            .last_safe_outcome
+            .as_ref()
+            .is_none_or(|outcome| outcome.occurred_at_ms < fired.fired_at_ms)
+    })
+}
+
+async fn reconcile_interrupted(
+    inner: &Arc<SchedulerInner>,
+    now: u64,
+    active_agents: &BTreeSet<String>,
+) -> Result<(), ScheduleError> {
+    let _transaction = inner.runs.control_plane_transaction().await;
+    let (previous, persist) = {
+        let mut state = inner.state.write().await;
+        let mut previous = Vec::new();
+        for schedule in state
+            .schedules
+            .values_mut()
+            .filter(|s| !active_agents.contains(&s.agent_id) && unresolved_occurrence(s))
+        {
+            previous.push(schedule.clone());
+            schedule.enabled = false;
+            schedule.last_safe_outcome = Some(ScheduleSafeOutcome {
+                status: ScheduleOutcomeStatus::Failed,
+                occurred_at_ms: now.max(schedule.last_fired.as_ref().unwrap().fired_at_ms),
+                error_code: Some("schedule_run_interrupted".into()),
+            });
+            schedule.updated_at_ms = now.max(schedule.updated_at_ms);
+        }
+        if previous.is_empty() {
+            return Ok(());
+        }
+        (previous, state.control_plane_persist_request())
+    };
+    if persist.save().await.is_err() {
+        let mut state = inner.state.write().await;
+        for record in previous {
+            state.schedules.insert(record.id.clone(), record);
+        }
+        return Err(ScheduleError::Persistence);
+    }
+    Ok(())
 }
 
 async fn claim_due(
@@ -415,6 +512,7 @@ async fn claim_due(
             fired_at_ms: now,
             run_idempotency_key: format!("schedule:{}:{}", claimed.id, now),
         });
+        claimed.last_safe_outcome = None;
         claimed.updated_at_ms = now.max(claimed.created_at_ms);
         state.schedules.insert(id.to_string(), claimed.clone());
         (claimed, previous, state.control_plane_persist_request())
@@ -866,7 +964,17 @@ mod tests {
         String,
         ConnectorManager,
     ) {
-        let mut daemon = DaemonState::new();
+        service_with_daemon(DaemonState::new())
+    }
+
+    fn service_with_daemon(
+        mut daemon: DaemonState,
+    ) -> (
+        SchedulerService,
+        SharedDaemonState,
+        String,
+        ConnectorManager,
+    ) {
         let agent_id = daemon
             .create_agent(AgentConfig {
                 name: "scheduler".into(),
@@ -900,6 +1008,335 @@ mod tests {
             agent_id,
             connectors,
         )
+    }
+
+    struct GatedModel {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl anima_core::ModelAdapter for GatedModel {
+        fn provider(&self) -> &str {
+            "test"
+        }
+        async fn generate(
+            &self,
+            _: &AgentConfig,
+            _: &anima_core::ModelGenerateRequest,
+        ) -> Result<anima_core::ModelGenerateResponse, String> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(anima_core::ModelGenerateResponse {
+                content: Content {
+                    text: CHECKIN_SENTINEL.into(),
+                    ..Default::default()
+                },
+                tool_calls: None,
+                usage: Default::default(),
+                stop_reason: anima_core::ModelStopReason::End,
+            })
+        }
+    }
+
+    async fn due_schedule(service: &SchedulerService, agent_id: &str) -> ScheduledPromptRecord {
+        service
+            .create(
+                agent_id.into(),
+                "Check status".into(),
+                ScheduleTrigger::Interval {
+                    interval_ms: 60_000,
+                },
+                ScheduleTarget::Workspace,
+                true,
+                None,
+                Some(now_ms()),
+                None,
+            )
+            .await
+            .unwrap()
+            .0
+    }
+
+    #[tokio::test]
+    async fn scheduler_starts_new_due_agent_while_another_is_running() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let daemon = DaemonState::with_model_adapter(Arc::new(GatedModel {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let (service, state, first, _) = service_with_daemon(daemon);
+        let second = {
+            let mut state = state.write().await;
+            let mut config = state.get_agent(&first).unwrap().state.config;
+            config.name = "second".into();
+            state.create_agent(config).unwrap().state.id
+        };
+        due_schedule(&service, &first).await;
+        service.start().await;
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        // A second due occurrence for the busy agent must not monopolize admission.
+        due_schedule(&service, &first).await;
+        let second_record = due_schedule(&service, &second).await;
+        let independent_started =
+            tokio::time::timeout(Duration::from_secs(2), entered.acquire()).await;
+        release.add_permits(10);
+        service.shutdown().await;
+        assert!(
+            independent_started.is_ok(),
+            "an unrelated newly due agent must start before the first finishes"
+        );
+        assert!(state.read().await.schedules[&second_record.id]
+            .last_safe_outcome
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_disables_unfinished_claim_without_replaying_it() {
+        let (service, state, agent_id, _) = service();
+        let record = due_schedule(&service, &agent_id).await;
+        claim_due(&service.inner, &record.id, now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        service.start().await;
+        let reconciled = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !state.read().await.schedules[&record.id].enabled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        service.shutdown().await;
+        assert!(
+            reconciled.is_ok(),
+            "interrupted occurrence must require review before another run"
+        );
+        let state = state.read().await;
+        assert_eq!(
+            state.schedules[&record.id]
+                .last_safe_outcome
+                .as_ref()
+                .unwrap()
+                .error_code
+                .as_deref(),
+            Some("schedule_run_interrupted")
+        );
+        assert!(state.get_agent(&agent_id).unwrap().messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claiming_new_occurrence_clears_previous_outcome() {
+        let (service, state, agent_id, _) = service();
+        let record = due_schedule(&service, &agent_id).await;
+        state
+            .write()
+            .await
+            .schedules
+            .get_mut(&record.id)
+            .unwrap()
+            .last_safe_outcome = Some(ScheduleSafeOutcome {
+            status: ScheduleOutcomeStatus::Spoke,
+            occurred_at_ms: 1,
+            error_code: None,
+        });
+        let claimed = claim_due(&service.inner, &record.id, now_ms())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(claimed.last_safe_outcome.is_none());
+        assert!(state.read().await.schedules[&record.id]
+            .last_safe_outcome
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn reconciliation_preserves_completed_and_never_claimed_schedules() {
+        let (service, state, agent_id, _) = service();
+        let completed = due_schedule(&service, &agent_id).await;
+        let now = now_ms();
+        claim_due(&service.inner, &completed.id, now).await.unwrap();
+        record_outcome(
+            &service.inner,
+            &completed.id,
+            ScheduleOutcomeStatus::Spoke,
+            None,
+            now,
+        )
+        .await
+        .unwrap();
+        let fresh = due_schedule(&service, &agent_id).await;
+        let before = state.read().await.schedules.clone();
+        reconcile_interrupted(&service.inner, now, &BTreeSet::new())
+            .await
+            .unwrap();
+        assert_eq!(state.read().await.schedules, before);
+        assert!(state.read().await.schedules[&fresh.id].enabled);
+        // Legacy snapshots kept an outcome from an earlier occurrence.
+        state
+            .write()
+            .await
+            .schedules
+            .get_mut(&completed.id)
+            .unwrap()
+            .last_safe_outcome
+            .as_mut()
+            .unwrap()
+            .occurred_at_ms = now - 1;
+        reconcile_interrupted(&service.inner, now, &BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(!state.read().await.schedules[&completed.id].enabled);
+        assert!(state.read().await.schedules[&fresh.id].enabled);
+    }
+
+    #[tokio::test]
+    async fn scheduler_bounds_admission_and_leaves_excess_work_unclaimed() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let daemon = DaemonState::with_model_adapter(Arc::new(GatedModel {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let (mut service, state, first, _) = service_with_daemon(daemon);
+        Arc::get_mut(&mut service.inner).unwrap().runs =
+            AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(64)));
+        due_schedule(&service, &first).await;
+        due_schedule(&service, &first).await;
+        for n in 0..10 {
+            let agent_id = {
+                let mut state = state.write().await;
+                let mut config = state.get_agent(&first).unwrap().state.config;
+                config.name = format!("worker-{n}");
+                state.create_agent(config).unwrap().state.id
+            };
+            due_schedule(&service, &agent_id).await;
+        }
+        let tick = tokio::spawn(async move { service.tick_at(now_ms()).await });
+        let concurrent =
+            tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(8)).await;
+        let claimed = state
+            .read()
+            .await
+            .schedules
+            .values()
+            .filter(|r| r.last_fired.is_some())
+            .count();
+        release.add_permits(30);
+        let result = tick.await.unwrap().unwrap();
+        assert!(
+            concurrent.is_ok(),
+            "eight independent schedules should be admitted concurrently"
+        );
+        assert_eq!(claimed, 8);
+        assert_eq!(result, 8);
+    }
+
+    #[tokio::test]
+    async fn failed_restart_reconciliation_keeps_all_admission_closed() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let daemon = DaemonState::with_model_adapter(Arc::new(GatedModel {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let (service, state, agent_id, _) = service_with_daemon(daemon);
+        let record = due_schedule(&service, &agent_id).await;
+        claim_due(&service.inner, &record.id, now_ms())
+            .await
+            .unwrap();
+        due_schedule(&service, &agent_id).await;
+        let path = std::env::temp_dir().join(format!("anima-reconcile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(path.clone()),
+        ));
+        service.start().await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let no_execution = entered.available_permits() == 0;
+        release.add_permits(10);
+        service.shutdown().await;
+        std::fs::remove_dir(&path).unwrap();
+        assert!(
+            no_execution,
+            "no work may execute until reconciliation is durably saved"
+        );
+        let state = state.read().await;
+        assert!(
+            state.schedules[&record.id].enabled,
+            "failed persistence must roll back in-memory reconciliation"
+        );
+        assert!(state.schedules[&record.id].last_safe_outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn orphaned_claim_is_reconciled_after_storage_recovers_without_reexecution() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let daemon = DaemonState::with_model_adapter(Arc::new(GatedModel {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
+        let (service, state, agent_id, _) = service_with_daemon(daemon);
+        let record = due_schedule(&service, &agent_id).await;
+        let run_service = service.clone();
+        let running = tokio::spawn(async move { run_service.tick_at(now_ms()).await });
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let directory = std::env::temp_dir().join(format!("anima-orphan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        state.write().await.set_control_plane_store(Some(
+            crate::control_plane_store::ControlPlaneStoreConfig::Json(directory.clone()),
+        ));
+        release.add_permits(1);
+        assert_eq!(running.await.unwrap().unwrap(), 1);
+        assert!(state.read().await.schedules[&record.id]
+            .last_safe_outcome
+            .is_none());
+        let path = directory.join("snapshot.json");
+        let config = crate::control_plane_store::ControlPlaneStoreConfig::Json(path.clone());
+        state
+            .write()
+            .await
+            .set_control_plane_store(Some(config.clone()));
+        assert_eq!(service.tick_at(now_ms()).await.unwrap(), 0);
+        let repaired = state.read().await.schedules[&record.id].clone();
+        let persisted = crate::control_plane_store::load_control_plane_snapshot(&config)
+            .await
+            .unwrap();
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::fs::remove_dir(&directory).unwrap();
+        assert!(
+            !repaired.enabled,
+            "storage recovery must surface the orphan as requiring review"
+        );
+        assert_eq!(
+            repaired
+                .last_safe_outcome
+                .as_ref()
+                .unwrap()
+                .error_code
+                .as_deref(),
+            Some("schedule_run_interrupted")
+        );
+        assert_eq!(persisted.unwrap().schedules[0], repaired);
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "reconciliation must not run the provider again"
+        );
     }
 
     #[test]

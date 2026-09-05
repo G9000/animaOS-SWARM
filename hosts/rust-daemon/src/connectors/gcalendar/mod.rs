@@ -170,7 +170,10 @@ pub(crate) struct GoogleOAuthConfig {
 impl GoogleOAuthConfig {
     pub(crate) fn from_env() -> Option<Self> {
         let client_id = std::env::var(GOOGLE_CLIENT_ID_ENV).ok()?.trim().to_string();
-        let client_secret = std::env::var(GOOGLE_CLIENT_SECRET_ENV).ok()?.trim().to_string();
+        let client_secret = std::env::var(GOOGLE_CLIENT_SECRET_ENV)
+            .ok()?
+            .trim()
+            .to_string();
         if client_id.is_empty() || client_secret.is_empty() {
             return None;
         }
@@ -322,13 +325,9 @@ impl CalendarManager {
             if guard.get_agent(agent_id).is_none() {
                 return Err(CalendarError::AgentNotFound);
             }
-            if guard
-                .calendar_connectors
-                .values()
-                .any(|connector| {
-                    connector.agent_id == agent_id && connector.deleted_at_ms.is_none()
-                })
-            {
+            if guard.calendar_connectors.values().any(|connector| {
+                connector.agent_id == agent_id && connector.deleted_at_ms.is_none()
+            }) {
                 return Err(CalendarError::AlreadyConnected);
             }
             let sequence = CONNECTOR_ID_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -364,7 +363,10 @@ impl CalendarManager {
                 .insert(record.id.clone(), record.clone());
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
         Ok((record, consent_url))
     }
 
@@ -421,7 +423,10 @@ impl CalendarManager {
             add_calendar_tools(&mut guard, &agent_id)?;
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
 
         let guard = state.read().await;
         guard
@@ -478,7 +483,10 @@ impl CalendarManager {
             }
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
         Ok(())
     }
 
@@ -561,7 +569,10 @@ impl CalendarManager {
                 .insert(record.id.clone(), record.clone());
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
         Ok(record)
     }
 
@@ -609,9 +620,7 @@ impl CalendarManager {
             let write = guard
                 .calendar_writes
                 .get(write_id)
-                .filter(|write| {
-                    write.agent_id == agent_id && write.connector_id == connector_id
-                })
+                .filter(|write| write.agent_id == agent_id && write.connector_id == connector_id)
                 .cloned()
                 .ok_or(CalendarError::ConnectorNotFound)?;
             (connector, write)
@@ -669,7 +678,10 @@ impl CalendarManager {
             record.resolved_at_ms = Some(now);
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
 
         let updated = {
             let guard = state.read().await;
@@ -710,7 +722,10 @@ impl CalendarManager {
             record.resolved_at_ms = Some(now);
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
         let guard = state.read().await;
         guard
             .calendar_writes
@@ -752,7 +767,10 @@ impl CalendarManager {
             }
             guard.control_plane_persist_request()
         };
-        persist.save().await.map_err(|_| CalendarError::Persistence)?;
+        persist
+            .save()
+            .await
+            .map_err(|_| CalendarError::Persistence)?;
         Ok(())
     }
 
@@ -772,10 +790,7 @@ impl CalendarManager {
         if tokens.expires_at_ms() > now + TOKEN_REFRESH_SKEW_MS {
             return Ok(tokens.access_token().to_string());
         }
-        let oauth = self
-            .oauth
-            .clone()
-            .ok_or(CalendarError::ReauthRequired)?;
+        let oauth = self.oauth.clone().ok_or(CalendarError::ReauthRequired)?;
         let refreshed = match self
             .transport
             .refresh_tokens(&oauth, tokens.refresh_token())
@@ -899,7 +914,10 @@ fn validate_draft(
         }
         CalendarWriteOperation::Delete => {}
     }
-    if matches!(operation, CalendarWriteOperation::Update | CalendarWriteOperation::Delete) {
+    if matches!(
+        operation,
+        CalendarWriteOperation::Update | CalendarWriteOperation::Delete
+    ) {
         let event_id = draft.event_id.as_deref().unwrap_or("");
         if !field_within_limits(event_id, MAX_EVENT_FIELD_SCALARS) {
             return Err(CalendarError::InvalidDraft);
@@ -946,7 +964,12 @@ fn add_calendar_tools(guard: &mut DaemonState, agent_id: &str) -> Result<(), Cal
         .config
         .tools
         .as_ref()
-        .map(|tools| tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>())
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     for name in CALENDAR_TOOL_NAMES {
         if !names.iter().any(|existing| existing == name) {

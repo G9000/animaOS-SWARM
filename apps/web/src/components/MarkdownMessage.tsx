@@ -110,7 +110,7 @@ function CodeBlock({
   );
 
   return (
-    <div className="mt-2 overflow-hidden rounded-md border border-line bg-panel-2 text-ink">
+    <div className="studio-code mt-2 overflow-hidden rounded-md border border-line bg-panel-2 text-ink">
       <div className="flex items-center justify-between gap-3 border-b border-line px-3 py-2">
         <span className="min-w-0 truncate font-mono text-[11px] text-ink-3">
           {language}

@@ -1,5 +1,15 @@
 export { AgentsClient, action, agent, plugin } from './agents.js';
 export type { AgentMemory, AgentRunResponse, AgentSnapshot } from './agents.js';
+export type {
+  DaemonAgentConfig,
+  DaemonAgentMessage,
+  DaemonAgentSettings,
+  DaemonAgentState,
+  DaemonContent,
+  DaemonPluginDescriptor,
+  DaemonTaskResult,
+  DaemonToolDescriptor,
+} from './daemon-types.js';
 
 export {
   DaemonClient,

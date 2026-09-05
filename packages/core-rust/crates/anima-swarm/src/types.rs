@@ -36,6 +36,8 @@ pub struct SwarmConfig {
     ///
     /// Defaults to `workers.len() + 1` if unset.
     pub max_turns: Option<usize>,
+    /// Per-dispatch observed token budget. Blocks new work when exhausted;
+    /// already in-flight model calls may overshoot. None is unlimited, zero blocks all runs.
     pub token_budget: Option<u64>,
 }
 

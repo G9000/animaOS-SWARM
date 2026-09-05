@@ -1,4 +1,5 @@
 import type { AgentSettings, TaskResult } from '@animaOS-SWARM/core';
+import type { DaemonTaskResult } from '@animaOS-SWARM/sdk';
 import {
   PROVIDER_HELP_TEXT,
   resolveProviderConfig,
@@ -6,6 +7,17 @@ import {
 
 export function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+export function toRuntimeTaskResult<T>(
+  result: DaemonTaskResult<T>
+): TaskResult<T> {
+  return {
+    status: result.status,
+    ...(result.data == null ? {} : { data: result.data }),
+    ...(result.error == null ? {} : { error: result.error }),
+    durationMs: result.durationMs,
+  };
 }
 
 export function extractResultText(result: TaskResult): string | null {

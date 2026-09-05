@@ -44,7 +44,7 @@ export function CheckinsView({
 }) {
   return (
     <section
-      className="relative z-[1] flex min-w-0 flex-col"
+      className="studio-checkins relative z-[1] flex min-w-0 flex-col"
       aria-labelledby="checkins-heading"
     >
       {/* View header */}
@@ -88,6 +88,7 @@ export function CheckinsView({
               New proactive prompt
             </label>
             <input
+              aria-label="New proactive prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               onKeyDown={(e) => {
@@ -96,7 +97,7 @@ export function CheckinsView({
               placeholder="e.g. Check my goals and remind me what to focus on"
               className="field"
             />
-            <div className="mt-3 flex items-center justify-between gap-3">
+            <div className="studio-checkin-controls mt-3 flex items-center justify-between gap-3">
               <label className="flex items-center gap-2 font-mono text-[11px] text-ink-3">
                 deliver to
                 <select

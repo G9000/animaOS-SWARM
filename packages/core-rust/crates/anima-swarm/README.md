@@ -110,7 +110,7 @@ For custom agent construction (e.g., wiring up a real LLM backend), use `SwarmCo
 | `max_concurrent_agents` | `Option<usize>` | Hard cap on how many agent instances can be alive at one time. `None` means unlimited. |
 | `max_parallel_delegations` | `Option<usize>` | Maximum number of worker tasks that can run simultaneously in `Supervisor` mode. Defaults to the number of workers. |
 | `max_turns` | `Option<usize>` | Maximum number of turns or delegation rounds. In `RoundRobin` this is the total turn count. In `Supervisor`/`Dynamic` it bounds manager iterations. Defaults to `workers.len() + 1`. |
-| `token_budget` | `Option<u64>` | Reserved field for a future token-budget enforcement feature. Not enforced by the coordinator today. |
+| `token_budget` | `Option<u64>` | Per-dispatch observed token budget. Blocks further agent runs once reported total usage reaches the limit. `None` is unlimited; `Some(0)` blocks all runs. Hosts should call the factory context's `check_budget` before each model generation and publish live usage through the shell hook. Already in-flight calls can overshoot, so this is not a hard billing cap. |
 
 ---
 

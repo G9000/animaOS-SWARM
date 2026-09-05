@@ -56,7 +56,11 @@ describe('assistant command', () => {
     mockDaemonClient.agents.list.mockResolvedValue([
       {
         ...ASSISTANT_SNAPSHOT,
-        state: { ...ASSISTANT_SNAPSHOT.state, id: 'agent-other', name: 'other' },
+        state: {
+          ...ASSISTANT_SNAPSHOT.state,
+          id: 'agent-other',
+          name: 'other',
+        },
       },
     ]);
 
@@ -133,9 +137,19 @@ describe('assistant command', () => {
     });
 
     const readline = {
-      question: vi.fn((_prompt: string, callback: (input: string) => void) => {
-        callback('exit');
-      }),
+      question: vi.fn(
+        (
+          _prompt: string,
+          optionsOrCallback: object | ((input: string) => void),
+          callback?: (input: string) => void
+        ) => {
+          const answer =
+            typeof optionsOrCallback === 'function'
+              ? optionsOrCallback
+              : callback;
+          answer?.('exit');
+        }
+      ),
       close: vi.fn(),
     };
 
@@ -153,8 +167,16 @@ describe('assistant command', () => {
 
     const inputs = ['hi', 'exit'];
     readline.question.mockImplementation(
-      (_prompt: string, callback: (input: string) => void) => {
-        callback(inputs.shift() ?? 'exit');
+      (
+        _prompt: string,
+        optionsOrCallback: object | ((input: string) => void),
+        callback?: (input: string) => void
+      ) => {
+        const answer =
+          typeof optionsOrCallback === 'function'
+            ? optionsOrCallback
+            : callback;
+        answer?.(inputs.shift() ?? 'exit');
       }
     );
 
@@ -184,9 +206,19 @@ describe('assistant command', () => {
     mockDaemonClient.agents.list.mockResolvedValue([ASSISTANT_SNAPSHOT]);
 
     const readline = {
-      question: vi.fn((_prompt: string, callback: (input: string) => void) => {
-        callback('exit');
-      }),
+      question: vi.fn(
+        (
+          _prompt: string,
+          optionsOrCallback: object | ((input: string) => void),
+          callback?: (input: string) => void
+        ) => {
+          const answer =
+            typeof optionsOrCallback === 'function'
+              ? optionsOrCallback
+              : callback;
+          answer?.('exit');
+        }
+      ),
       close: vi.fn(),
     };
 

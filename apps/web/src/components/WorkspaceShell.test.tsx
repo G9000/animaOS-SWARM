@@ -35,6 +35,133 @@ afterEach(() => {
 });
 
 describe('WorkspaceShell', () => {
+  it('opens commands with Control K, filters actions and navigates with Enter', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    await user.keyboard('{Control>}k{/Control}');
+    expect(screen.getByRole('dialog', { name: 'Command menu' })).toBeVisible();
+    await user.type(
+      screen.getByRole('combobox', { name: 'Search commands' }),
+      'activity',
+    );
+    await user.keyboard('{Enter}');
+    expect(screen.getByText('Activity canvas')).toBeVisible();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  it('can enter and leave focus mode without losing the workspace', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Enter focus mode' }));
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+    expect(screen.getByText('Workspace canvas')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Exit focus mode' }));
+    expect(screen.getByRole('complementary')).toBeVisible();
+  });
+
+  it('contains keyboard focus in commands and restores the opener on Escape', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    const opener = screen.getByRole('button', { name: 'Open command menu' });
+    await user.click(opener);
+    const search = screen.getByRole('combobox', { name: 'Search commands' });
+    expect(search).toHaveFocus();
+    await user.tab();
+    expect(
+      screen.getByRole('button', { name: 'Close command menu' }),
+    ).toHaveFocus();
+    await user.tab();
+    expect(search).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(opener).toHaveFocus();
+  });
+
+  it('inserts a prompt from commands without invoking a send', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    const pick = vi.fn();
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+        onPickPrompt={pick}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Open command menu' }));
+    await user.type(
+      screen.getByRole('combobox', { name: 'Search commands' }),
+      'Plan my next hour',
+    );
+    await user.keyboard('{Enter}');
+    expect(pick).toHaveBeenCalledWith(
+      expect.stringContaining('Help me plan my next hour'),
+    );
+    expect(screen.getByText('Workspace canvas')).toBeVisible();
+  });
+
+  it('filters agents by provider and shows a useful empty state', async () => {
+    const user = userEvent.setup();
+    const nova = agent('agent-main', 'Nova', 1);
+    const scout = agent('scout', 'Scout', 2, { provider: 'anthropic' });
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova, scout]}
+        connection="online"
+        workspace={<div>Workspace canvas</div>}
+        activity={<div>Activity canvas</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole('button', { name: 'Agents' }));
+    await user.type(
+      screen.getByRole('searchbox', { name: 'Search agents' }),
+      'anthropic',
+    );
+    expect(screen.getByRole('article', { name: 'Scout agent' })).toBeVisible();
+    expect(
+      screen.queryByRole('article', { name: 'Nova agent' }),
+    ).not.toBeInTheDocument();
+    await user.type(
+      screen.getByRole('searchbox', { name: 'Search agents' }),
+      'missing',
+    );
+    expect(screen.getByText('No agents match your search.')).toBeVisible();
+  });
   it('shows a dedicated Telegram destination only when a connector exists', async () => {
     const user = userEvent.setup();
     const nova = agent('agent-main', 'Nova', 1);
@@ -223,12 +350,8 @@ describe('WorkspaceShell', () => {
     );
 
     const bar = screen.getByRole('banner');
-    expect(
-      within(bar).getByRole('heading', { name: 'Nova' }),
-    ).toBeVisible();
-    expect(
-      within(bar).getByRole('button', { name: 'Settings' }),
-    ).toBeVisible();
+    expect(within(bar).getByRole('heading', { name: 'Nova' })).toBeVisible();
+    expect(within(bar).getByRole('button', { name: 'Settings' })).toBeVisible();
   });
 
   it('marks the selected agent as Main and keeps additional agents read-only', async () => {

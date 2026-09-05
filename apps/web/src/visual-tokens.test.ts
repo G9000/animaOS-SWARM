@@ -71,8 +71,9 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-describe('Neon Rose spatial visual contract', () => {
+describe('Anima Studio visual contract', () => {
   const styles = read('styles.css');
+  const studio = read('studio.css');
   const productionPaths = [
     ...productionSources(sourceRoot),
     ...productionSources(resolve(sourceRoot, '../../../packages/ui/src')),
@@ -83,10 +84,10 @@ describe('Neon Rose spatial visual contract', () => {
     .join('\n');
 
   it('defines the approved palette anchors exactly', () => {
-    expect(styles).toContain('#090A0F');
-    expect(styles).toContain('#17171D');
-    expect(styles).toContain('#FF397F');
-    expect(styles).toContain('#64DFAD');
+    expect(styles).toContain('#F5F2EA');
+    expect(styles).toContain('#FFFDF8');
+    expect(styles).toContain('#AD3928');
+    expect(styles).toContain('#316448');
   });
 
   it('contains no legacy blue or purple accent tokens in production sources', () => {
@@ -156,8 +157,28 @@ describe('Neon Rose spatial visual contract', () => {
     expect(orbPulse).not.toContain('filter:');
   });
 
-  it('uses one shared Neon Rose RGB token for authored glow values', () => {
-    expect(styles).toContain('--color-accent-rgb: 255 57 127;');
+  it('keeps text on the dark sidebar and mobile header at AA contrast', () => {
+    for (const selector of ['.studio-sidebar', '.studio-mobile-presence']) {
+      const surface = cssRule(studio, selector);
+      for (const token of ['ink', 'ink-2', 'ink-3', 'accent']) {
+        expect(
+          contrastRatio(cssHexToken(surface, token), '#252D24'),
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it('clips the workspace frame without clipping avatar feedback', () => {
+    expect(cssRule(studio, '.studio-frame')).toContain('overflow: hidden');
+    expect(studio).not.toContain('.studio-shell > .relative.flex');
+    expect(cssRule(studio, '.studio-navigation')).toContain('overflow-y: auto');
+    expect(read('components/WorkspaceShell.tsx')).toContain(
+      'studio-frame relative flex',
+    );
+  });
+
+  it('uses the shared terracotta RGB token for authored glow values', () => {
+    expect(styles).toContain('--color-accent-rgb: 173 57 40;');
     expect(production).not.toMatch(
       /rgba?\(\s*255\s*,\s*57\s*,\s*127(?:\s*,|\s*\))/i,
     );
@@ -208,11 +229,9 @@ describe('Neon Rose spatial visual contract', () => {
 
     expect(bubble).toContain('bg-panel-2/90');
     expect(bubble).not.toContain('accent');
-    expect(suggestions).toContain('text-ink-3');
-    expect(suggestions).toContain('hover:border-line-strong');
-    expect(suggestions).toContain('hover:bg-white/[0.035]');
-    expect(suggestions).toContain('hover:shadow-black/30');
-    expect(suggestions).toContain('group-hover:text-ink-2');
+    expect(suggestions).toContain('studio-suggestion');
+    expect(suggestions).toContain('aria-label={`${s.title}. ${s.text}`}');
+    expect(suggestions).toContain('onClick={() => onPick(s.text)}');
     expect(suggestions).not.toContain('accent');
     expect(suggestions).not.toMatch(/255,\s*57,\s*127/);
   });

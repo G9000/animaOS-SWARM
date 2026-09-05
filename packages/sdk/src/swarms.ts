@@ -1,19 +1,24 @@
-import type { Content, TaskResult, TokenUsage } from '@animaOS-SWARM/core';
-import type { AgentMessage, SwarmConfig, SwarmState } from '@animaOS-SWARM/swarm';
+import type { Content, TokenUsage } from '@animaOS-SWARM/core';
+import type {
+  AgentMessage,
+  SwarmConfig,
+  SwarmState,
+} from '@animaOS-SWARM/swarm';
 
 import type { DaemonClient, DaemonEvent } from './client.js';
+import type { DaemonTaskResult } from './daemon-types.js';
 
 export interface SwarmRunResponse<
-  T = { text: string; [key: string]: unknown }
+  T = { text: string; [key: string]: unknown },
 > {
   swarm: SwarmState;
-  result: TaskResult<T>;
+  result: DaemonTaskResult<T>;
 }
 
 export interface SwarmEventPayload<T = unknown> {
   swarmId: string;
   state: SwarmState;
-  result: TaskResult<T> | null;
+  result: DaemonTaskResult<T> | null;
 }
 
 export interface SwarmMessagePayload {

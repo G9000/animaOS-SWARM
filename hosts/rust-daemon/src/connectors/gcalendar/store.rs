@@ -171,8 +171,8 @@ impl GoogleCredentialStore for OsKeyringGoogleCredentialStore {
                 Err(keyring::Error::NoEntry) => return Ok(None),
                 Err(_) => return Err(CredentialStoreError::BackendUnavailable),
             };
-            let decoded: LoadedGoogleCredential = serde_json::from_str(&payload)
-                .map_err(|_| CredentialStoreError::InvalidPayload)?;
+            let decoded: LoadedGoogleCredential =
+                serde_json::from_str(&payload).map_err(|_| CredentialStoreError::InvalidPayload)?;
             if decoded.version != CREDENTIAL_PAYLOAD_VERSION {
                 return Err(CredentialStoreError::UnsupportedPayloadVersion);
             }
@@ -243,9 +243,7 @@ impl GoogleCredentialStore for OsKeyringGoogleCredentialStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        GoogleOAuthTokens, GoogleCredentialStore, InMemoryGoogleCredentialStore,
-    };
+    use super::{GoogleCredentialStore, GoogleOAuthTokens, InMemoryGoogleCredentialStore};
     use zeroize::Zeroizing;
 
     fn tokens(access: &str, refresh: &str) -> GoogleOAuthTokens {
@@ -282,7 +280,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            store.load("gcalendar-1").await.unwrap().unwrap().access_token(),
+            store
+                .load("gcalendar-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token(),
             "access-2"
         );
         store.delete("gcalendar-1").await.unwrap();

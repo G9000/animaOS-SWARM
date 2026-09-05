@@ -114,34 +114,34 @@ export class DaemonClient {
   ): AsyncGenerator<DaemonEvent<T>> {
     const abortController = new AbortController();
     const detachAbortRelay = relayAbort(init.signal, abortController);
-    const response = await this.fetchWithConnectionErrors(path, {
-      ...init,
-      method: init.method ?? 'GET',
-      headers: {
-        accept: 'text/event-stream',
-        ...headersToObject(init.headers),
-      },
-      signal: abortController.signal,
-    });
-
-    if (!response.ok) {
-      detachAbortRelay();
-      throw new DaemonHttpError(
-        response.status,
-        await readResponseBody(response)
-      );
-    }
-
-    if (!response.body) {
-      detachAbortRelay();
-      throw new Error('daemon event stream did not include a response body');
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
     try {
+      const response = await this.fetchWithConnectionErrors(path, {
+        ...init,
+        method: init.method ?? 'GET',
+        headers: {
+          accept: 'text/event-stream',
+          ...headersToObject(init.headers),
+        },
+        signal: abortController.signal,
+      });
+
+      if (!response.ok) {
+        throw new DaemonHttpError(
+          response.status,
+          await readResponseBody(response)
+        );
+      }
+
+      if (!response.body) {
+        throw new Error('daemon event stream did not include a response body');
+      }
+
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
@@ -173,8 +173,10 @@ export class DaemonClient {
     } finally {
       abortController.abort();
       detachAbortRelay();
-      await reader.cancel('subscription closed').catch(() => undefined);
-      reader.releaseLock();
+      if (reader) {
+        await reader.cancel('subscription closed').catch(() => undefined);
+        reader.releaseLock();
+      }
     }
   }
 

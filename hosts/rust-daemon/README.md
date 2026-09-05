@@ -9,6 +9,31 @@ run inside this daemon; there is no second connector process.
 
 For an implementation walkthrough, see [Rust Daemon Architecture](../../docs/rust-daemon-architecture.md).
 
+## Long-running work safeguards
+
+- The scheduler keeps scanning while jobs run, admits at most eight scheduled jobs,
+  and holds at most one slot per agent through completion and persistence. Jobs
+  also share the daemon's global run limit. Excess due work stays unclaimed.
+- Each occurrence is persisted before execution. If startup finds a claimed
+  occurrence without a terminal outcome, it disables that schedule and records
+  `schedule_run_interrupted`. Review the agent's actions before explicitly
+  re-enabling it. Uncertain external actions are not automatically replayed.
+  If recovery cannot be persisted, schedule admission stays closed and retries.
+  The same reconciliation handles orphaned runs after a storage failure while
+  the daemon remains open; active jobs are excluded.
+- Swarm `tokenBudget` is a per-dispatch **observed** token limit shared by manager
+  and workers. The daemon checks it before each model request; the core also
+  checks before agent runs. Zero blocks execution and omission is unlimited.
+  Already in-flight requests may overshoot: this is not a hard billing cap.
+  Completed totals include retired managers and are stable under UI polling.
+- Browser disconnects and HTTP timeouts do not cancel admitted agent or swarm
+  runs. Swarm workers retain global admission and per-swarm serialization through
+  their final durable commit and completion event. Running intent is saved before
+  model execution; failed commits keep that marker for interrupted recovery.
+- Full checkpoint-based mission resume across daemon restarts is not yet
+  integrated into the host. Interactive runs are not drained on daemon shutdown;
+  persisted interrupted runs are reported as failed, not automatically replayed.
+
 ---
 
 ## Environment variables

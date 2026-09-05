@@ -562,6 +562,89 @@ describe('ViewHarness workspace controller', () => {
     ).toBeVisible();
   });
 
+  it('recovers a failed message without overwriting a newer draft or sending automatically', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    const send = vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+    render(<ViewHarness />);
+    const input = await screen.findByPlaceholderText('Message Nova…');
+    await user.type(input, 'Original request');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await user.type(input, 'New thought');
+    await act(async () => {
+      run.reject(new Error('Connection lost'));
+    });
+    await user.click(
+      await screen.findByRole('button', { name: 'Restore message' }),
+    );
+    expect(input).toHaveValue('New thought\n\nOriginal request');
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps every failed message until explicitly restored or dismissed', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    vi.spyOn(daemon, 'runAgent').mockRejectedValue(new Error('Network failed'));
+    render(<ViewHarness />);
+    const input = await screen.findByPlaceholderText('Message Nova…');
+    await user.type(input, 'First');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await screen.findByRole('button', { name: 'Restore message' });
+    await user.type(input, 'Second');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await user.click(
+      await screen.findByRole('button', { name: 'Restore message' }),
+    );
+    expect(input).toHaveValue('First');
+    await user.click(screen.getByRole('button', { name: 'Restore message' }));
+    expect(input).toHaveValue('First\n\nSecond');
+  });
+
+  it('recovers a send failure even when settings were saved during the request', async () => {
+    const user = userEvent.setup();
+    const nova = snapshot('agent-main', 'Nova', 1);
+    const updated = snapshot('agent-main', 'Nova Prime', 1);
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+    mockProviders();
+    vi.spyOn(daemon, 'updateAgent').mockResolvedValue({ agent: updated });
+    const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+    render(<ViewHarness />);
+    await user.type(
+      await screen.findByPlaceholderText('Message Nova…'),
+      'Keep this request',
+    );
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    await user.click(screen.getByRole('button', { name: 'Settings' }));
+    const nameField = screen.getByDisplayValue('Nova');
+    await user.clear(nameField);
+    await user.type(nameField, 'Nova Prime');
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole('heading', { name: 'Nova Prime', hidden: true }),
+      ).toBeInTheDocument(),
+    );
+    await user.click(screen.getByRole('button', { name: 'Close settings' }));
+    await act(async () => {
+      run.reject(new Error('Connection lost'));
+    });
+    await user.click(
+      await screen.findByRole('button', { name: 'Restore message' }),
+    );
+    expect(screen.getByPlaceholderText('Message Nova Prime…')).toHaveValue(
+      'Keep this request',
+    );
+  });
+
   it('does not surface a pre-existing workspace error as a settings failure', async () => {
     const user = userEvent.setup();
     const nova = snapshot('agent-main', 'Nova', 1);
@@ -876,6 +959,13 @@ describe('ViewHarness workspace controller', () => {
     ).toBeVisible();
     expect(screen.getByRole('navigation')).toBeVisible();
     expect(daemon.listAgents).toHaveBeenCalledTimes(2);
+    const runAgent = vi.spyOn(daemon, 'runAgent');
+    const input = screen.getByPlaceholderText('Message Nova…');
+    fireEvent.change(input, { target: { value: 'Keep drafting offline' } });
+    expect(input).toHaveValue('Keep drafting offline');
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(runAgent).not.toHaveBeenCalled();
   });
 
   it('does not re-add the previous main when its pending run resolves after poll replacement', async () => {

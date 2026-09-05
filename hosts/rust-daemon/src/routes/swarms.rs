@@ -3,6 +3,8 @@ pub(super) mod events;
 use anima_swarm::SwarmStatus;
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
+use tokio::sync::OwnedSemaphorePermit;
+use tracing::warn;
 
 use self::events::{publish_swarm_event, subscribe_swarm_events_response};
 use super::contracts::{
@@ -92,11 +94,49 @@ pub(crate) async fn handle_run_swarm(
     body: Vec<u8>,
     state: &SharedDaemonState,
     agent_runs: &AgentRunCoordinator,
+    permit: OwnedSemaphorePermit,
 ) -> Result<SwarmRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let content = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
+
+    let state = state.clone();
+    let agent_runs = agent_runs.clone();
+    let swarm_id = swarm_id.to_owned();
+    // The HTTP waiter may time out or disconnect; the admitted worker still
+    // owns execution, final persistence, cleanup, and its concurrency permit.
+    tokio::spawn(async move {
+        let _permit = permit;
+        let result = run_swarm_owned(&swarm_id, content, &state, &agent_runs).await;
+        if result.is_err() {
+            warn!(%swarm_id, "owned swarm run failed to execute or commit");
+        }
+        result
+    })
+    .await
+    .map_err(|error| {
+        warn!(%error, "swarm run worker stopped unexpectedly");
+        ApiError::service_unavailable("swarm run worker stopped unexpectedly")
+    })?
+}
+
+async fn run_swarm_owned(
+    swarm_id: &str,
+    content: anima_core::Content,
+    state: &SharedDaemonState,
+    agent_runs: &AgentRunCoordinator,
+) -> Result<SwarmRunEnvelope, ApiError> {
+    let run_lock = state
+        .read()
+        .await
+        .swarm_run_locks
+        .get(swarm_id)
+        .cloned()
+        .ok_or_else(ApiError::not_found)?;
+    // Core dispatch serialization ends before the host's durable final commit.
+    // Keep same-swarm requests serialized through that commit and publication.
+    let _run_guard = run_lock.lock_owned().await;
 
     let (coordinator, global_event_fanout, swarm_event_fanout) = {
         let guard = state.read().await;
@@ -115,12 +155,11 @@ pub(crate) async fn handle_run_swarm(
     let (previous_snapshot, persist_request) = {
         let mut running_snapshot = coordinator.get_state();
         running_snapshot.status = SwarmStatus::Running;
-        running_snapshot
-            .started_at
-            .get_or_insert_with(anima_core::primitives::now_millis);
+        running_snapshot.started_at = Some(anima_core::primitives::now_millis());
         running_snapshot.completed_at = None;
+        running_snapshot.token_usage = Default::default();
         let mut guard = state.write().await;
-        let previous_snapshot = guard.get_swarm(swarm_id);
+        let previous_snapshot = guard.swarm_snapshots.get(swarm_id).cloned();
         guard.store_swarm_snapshot(running_snapshot);
         (previous_snapshot, guard.control_plane_persist_request())
     };
@@ -151,7 +190,7 @@ pub(crate) async fn handle_run_swarm(
     let final_transaction = agent_runs.control_plane_transaction().await;
     let (previous_snapshot, persist_request) = {
         let mut guard = state.write().await;
-        let previous_snapshot = guard.get_swarm(swarm_id);
+        let previous_snapshot = guard.swarm_snapshots.get(swarm_id).cloned();
         guard.store_swarm_snapshot(snapshot.clone());
         (previous_snapshot, guard.control_plane_persist_request())
     };

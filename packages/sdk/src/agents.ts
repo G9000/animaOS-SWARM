@@ -1,19 +1,18 @@
-import type {
-  Action,
-  AgentConfig,
-  AgentState,
-  Content,
-  Plugin,
-  TaskResult,
-} from '@animaOS-SWARM/core';
+import type { Action, AgentConfig, Content, Plugin } from '@animaOS-SWARM/core';
 
 import type { DaemonClient } from './client.js';
+import type {
+  DaemonAgentMessage,
+  DaemonAgentState,
+  DaemonTaskResult,
+} from './daemon-types.js';
 
 export interface AgentSnapshot {
-  state: AgentState;
+  state: DaemonAgentState;
   messageCount: number;
+  messages: DaemonAgentMessage[];
   eventCount: number;
-  lastTask: TaskResult<Content> | null;
+  lastTask: DaemonTaskResult | null;
 }
 
 export interface AgentMemory {
@@ -33,7 +32,7 @@ export interface AgentMemory {
 
 export interface AgentRunResponse {
   agent: AgentSnapshot;
-  result: TaskResult<Content>;
+  result: DaemonTaskResult;
 }
 
 export function agent<T extends AgentConfig>(config: T): T {

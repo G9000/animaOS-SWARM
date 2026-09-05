@@ -3,12 +3,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anima_core::{
-    AgentConfig, AgentRuntime, Content, DataValue, EngineEvent, Message, ModelAdapter, Provider,
+    AgentConfig, AgentRuntime, Content, DataValue, EngineEvent, Message, ModelAdapter,
+    ModelGenerateRequest, ModelGenerateResponse, ModelStreamFrame, ModelStreamSink, Provider,
     ProviderResult, TokenUsage, ToolDescriptor,
 };
 use anima_swarm::coordinator::{
     CoordinatorAgentFactoryContext, CoordinatorAgentFactoryFn, CoordinatorAgentShell,
-    CoordinatorInboxFn, CoordinatorParticipantsFn,
+    CoordinatorBudgetCheckFn, CoordinatorInboxFn, CoordinatorParticipantsFn,
 };
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
@@ -51,6 +52,12 @@ impl DaemonState {
 
             Box::pin(async move {
                 let config = with_swarm_messaging_tools(context.config.clone(), &tool_registry);
+                let token_usage = Arc::new(Mutex::new(TokenUsage::default()));
+                let model_adapter: Arc<dyn ModelAdapter> = Arc::new(BudgetedSwarmModel {
+                    inner: model_adapter,
+                    check_budget: context.check_budget.clone(),
+                    usage: token_usage.clone(),
+                });
                 let tool_context = ToolExecutionContext::new(
                     Arc::clone(&memory),
                     Arc::clone(&memory_embeddings),
@@ -87,7 +94,6 @@ impl DaemonState {
                 }
                 let runtime = Arc::new(AsyncMutex::new(initial_runtime));
                 let config = config.clone();
-                let token_usage = Arc::new(Mutex::new(TokenUsage::default()));
                 let needs_reset = Arc::new(AtomicBool::new(false));
 
                 Ok(CoordinatorAgentShell {
@@ -218,6 +224,76 @@ impl DaemonState {
                 })
             })
         })
+    }
+}
+
+struct BudgetedSwarmModel {
+    inner: Arc<dyn ModelAdapter>,
+    check_budget: Arc<CoordinatorBudgetCheckFn>,
+    usage: Arc<Mutex<TokenUsage>>,
+}
+
+fn record_model_usage(usage: &Mutex<TokenUsage>, response: &TokenUsage) {
+    let mut usage = usage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    usage.prompt_tokens = usage.prompt_tokens.saturating_add(response.prompt_tokens);
+    usage.completion_tokens = usage
+        .completion_tokens
+        .saturating_add(response.completion_tokens);
+    usage.total_tokens = usage.total_tokens.saturating_add(response.total_tokens);
+}
+
+#[async_trait]
+impl ModelAdapter for BudgetedSwarmModel {
+    fn provider(&self) -> &str {
+        self.inner.provider()
+    }
+
+    async fn generate(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        (self.check_budget)()?;
+        let response = self.inner.generate(config, request).await?;
+        // Publish before returning: the manager may delegate before its entire run finishes.
+        record_model_usage(&self.usage, &response.usage);
+        Ok(response)
+    }
+
+    async fn stream(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn ModelStreamSink,
+    ) -> Result<(), String> {
+        (self.check_budget)()?;
+        self.inner
+            .stream(
+                config,
+                request,
+                &MeteredSwarmSink {
+                    sink,
+                    usage: &self.usage,
+                },
+            )
+            .await
+    }
+}
+
+struct MeteredSwarmSink<'a> {
+    sink: &'a dyn ModelStreamSink,
+    usage: &'a Mutex<TokenUsage>,
+}
+
+#[async_trait]
+impl ModelStreamSink for MeteredSwarmSink<'_> {
+    async fn emit(&self, frame: ModelStreamFrame) -> Result<(), String> {
+        if let ModelStreamFrame::Final(response) = &frame {
+            record_model_usage(self.usage, &response.usage);
+        }
+        self.sink.emit(frame).await
     }
 }
 
@@ -375,6 +451,191 @@ mod tests {
     use super::with_swarm_messaging_tools;
     use crate::tools::ToolRegistry;
     use anima_core::{AgentConfig, ToolDescriptor};
+
+    struct DelegatingAdapter(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl anima_core::ModelAdapter for DelegatingAdapter {
+        fn provider(&self) -> &str {
+            "test"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &anima_core::ModelGenerateRequest,
+        ) -> Result<anima_core::ModelGenerateResponse, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let delegate = config.name == "manager"
+                && !request
+                    .messages
+                    .iter()
+                    .any(|m| m.role == anima_core::MessageRole::Tool);
+            Ok(anima_core::ModelGenerateResponse {
+                content: anima_core::Content {
+                    text: "done".into(),
+                    ..Default::default()
+                },
+                tool_calls: delegate.then(|| {
+                    vec![anima_core::ToolCall {
+                        id: "delegate-1".into(),
+                        name: "delegate_task".into(),
+                        args: std::collections::BTreeMap::from([
+                            (
+                                "worker_name".into(),
+                                anima_core::DataValue::String("worker".into()),
+                            ),
+                            (
+                                "task".into(),
+                                anima_core::DataValue::String("research".into()),
+                            ),
+                        ]),
+                    }]
+                }),
+                usage: anima_core::TokenUsage {
+                    prompt_tokens: 3,
+                    completion_tokens: 2,
+                    total_tokens: 5,
+                },
+                stop_reason: if delegate {
+                    anima_core::ModelStopReason::ToolCall
+                } else {
+                    anima_core::ModelStopReason::End
+                },
+            })
+        }
+    }
+
+    async fn run_budgeted_supervisor(budget: u64) -> (anima_core::TaskStatus, usize, u64) {
+        let adapter =
+            std::sync::Arc::new(DelegatingAdapter(std::sync::atomic::AtomicUsize::new(0)));
+        let state = crate::state::DaemonState::with_model_adapter(adapter.clone());
+        let mut manager = agent_config();
+        manager.name = "manager".into();
+        let (coordinator, _) = state
+            .build_swarm(anima_swarm::SwarmConfig {
+                strategy: anima_swarm::SwarmStrategy::Supervisor,
+                manager,
+                workers: vec![agent_config()],
+                max_concurrent_agents: None,
+                max_parallel_delegations: Some(1),
+                max_turns: Some(4),
+                token_budget: Some(budget),
+            })
+            .unwrap();
+        coordinator.start().await.unwrap();
+        let result = coordinator.dispatch("work").await;
+        (
+            result.status,
+            adapter.0.load(std::sync::atomic::Ordering::SeqCst),
+            coordinator.get_state().token_usage.total_tokens,
+        )
+    }
+
+    #[tokio::test]
+    async fn manager_usage_is_visible_before_delegation_and_blocks_more_model_calls() {
+        assert_eq!(
+            run_budgeted_supervisor(5).await,
+            (anima_core::TaskStatus::Error, 1, 5)
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_usage_blocks_manager_follow_up_but_sufficient_budget_completes() {
+        assert_eq!(
+            run_budgeted_supervisor(10).await,
+            (anima_core::TaskStatus::Error, 2, 10)
+        );
+        assert_eq!(
+            run_budgeted_supervisor(20).await,
+            (anima_core::TaskStatus::Success, 3, 15)
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_wrapper_preserves_stream_frames_and_accounts_before_next_request() {
+        use super::*;
+        struct StreamingOnly;
+        #[async_trait]
+        impl ModelAdapter for StreamingOnly {
+            fn provider(&self) -> &str {
+                "streaming-test"
+            }
+            async fn generate(
+                &self,
+                _: &AgentConfig,
+                _: &ModelGenerateRequest,
+            ) -> Result<ModelGenerateResponse, String> {
+                Err("stream must not fall back to generate".into())
+            }
+            async fn stream(
+                &self,
+                _: &AgentConfig,
+                _: &ModelGenerateRequest,
+                sink: &dyn ModelStreamSink,
+            ) -> Result<(), String> {
+                sink.emit(ModelStreamFrame::TextDelta("hello".into()))
+                    .await?;
+                sink.emit(ModelStreamFrame::Final(ModelGenerateResponse {
+                    content: Content {
+                        text: "hello".into(),
+                        ..Default::default()
+                    },
+                    tool_calls: None,
+                    usage: TokenUsage {
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        total_tokens: 5,
+                    },
+                    stop_reason: anima_core::ModelStopReason::End,
+                }))
+                .await
+            }
+        }
+        struct RecordingSink(Mutex<Vec<ModelStreamFrame>>);
+        #[async_trait]
+        impl ModelStreamSink for RecordingSink {
+            async fn emit(&self, frame: ModelStreamFrame) -> Result<(), String> {
+                self.0.lock().unwrap().push(frame);
+                Ok(())
+            }
+        }
+        let usage = Arc::new(Mutex::new(TokenUsage::default()));
+        let observed = usage.clone();
+        let model = BudgetedSwarmModel {
+            inner: Arc::new(StreamingOnly),
+            usage: usage.clone(),
+            check_budget: Arc::new(move || {
+                if observed.lock().unwrap().total_tokens >= 5 {
+                    Err("budget exhausted".into())
+                } else {
+                    Ok(())
+                }
+            }),
+        };
+        let request = ModelGenerateRequest {
+            system: String::new(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+        let sink = RecordingSink(Mutex::new(Vec::new()));
+        assert_eq!(model.provider(), "streaming-test");
+        model
+            .stream(&agent_config(), &request, &sink)
+            .await
+            .unwrap();
+        assert_eq!(usage.lock().unwrap().total_tokens, 5);
+        assert_eq!(
+            sink.0.lock().unwrap()[0],
+            ModelStreamFrame::TextDelta("hello".into())
+        );
+        assert!(model
+            .stream(&agent_config(), &request, &sink)
+            .await
+            .is_err());
+        assert_eq!(sink.0.lock().unwrap().len(), 2);
+    }
 
     #[test]
     fn swarm_messaging_tools_use_registry_descriptors() {

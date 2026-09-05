@@ -1,4 +1,6 @@
+import { useState } from 'react';
 import { deriveAccessProfile } from '../lib/agent-access';
+import { formatTokens } from './ui-bits';
 import type { AgentDetail } from '../lib/types';
 import { ShieldIcon, SparkIcon } from './icons';
 
@@ -13,20 +15,26 @@ export function AgentsView({
   agents: readonly AgentDetail[];
   mainAgent: AgentDetail;
 }) {
+  const [query, setQuery] = useState('');
+  const visibleAgents = agents.filter((agent) =>
+    `${agent.name} ${agent.provider} ${agent.model} ${agent.status}`
+      .toLowerCase()
+      .includes(query.trim().toLowerCase()),
+  );
   return (
     <section
-      className="h-full overflow-y-auto px-4 py-7 sm:px-6"
+      className="studio-page h-full overflow-y-auto"
       aria-labelledby="agents-view-heading"
     >
       <div className="mx-auto w-full max-w-4xl">
         <div className="flex items-end justify-between gap-4">
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
-              Daemon collection
+              GOOD COMPANY
             </p>
             <h2
               id="agents-view-heading"
-              className="mt-1 font-display text-2xl font-semibold tracking-tight text-ink"
+              className="studio-page-title mt-3 text-ink"
             >
               Agents
             </h2>
@@ -35,16 +43,46 @@ export function AgentsView({
             {agents.length} total
           </span>
         </div>
+        <p className="studio-page-intro">
+          Different strengths. Shared purpose. Meet the intelligence behind your
+          workspace.
+        </p>
 
+        <div className="studio-agent-search">
+          <input
+            type="search"
+            className="field"
+            aria-label="Search agents"
+            placeholder="Search by name, model, provider, or status…"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <span role="status">
+            {visibleAgents.length} of {agents.length}
+          </span>
+        </div>
+        {!visibleAgents.length && (
+          <div className="studio-empty-result">
+            <span aria-hidden>⌕</span>
+            <p>No agents match your search.</p>
+            <button
+              type="button"
+              className="studio-tool-button"
+              onClick={() => setQuery('')}
+            >
+              Clear search
+            </button>
+          </div>
+        )}
         <div className="mt-6 grid gap-3 md:grid-cols-2">
-          {agents.map((agent) => {
+          {visibleAgents.map((agent) => {
             const isMain = agent.id === mainAgent.id;
             const access = titleCase(deriveAccessProfile(agent.toolNames));
             return (
               <article
                 key={agent.id}
                 aria-label={`${agent.name} agent`}
-                className="glass rounded-2xl p-4 transition hover:border-line-strong"
+                className="studio-agent-card glass transition hover:border-line-strong"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 items-center gap-3">
@@ -71,6 +109,17 @@ export function AgentsView({
                   </div>
                   <span className="rounded-full border border-line bg-white/[0.03] px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-ink-2">
                     {isMain ? 'Main' : 'Read only'}
+                  </span>
+                </div>
+                <div className="studio-agent-usage">
+                  <span>
+                    <strong>{agent.messages.length}</strong> messages
+                  </span>
+                  <span>
+                    <strong>
+                      {formatTokens(agent.token_usage.total_tokens)}
+                    </strong>{' '}
+                    tokens
                   </span>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2 font-mono text-[10px] text-ink-3">

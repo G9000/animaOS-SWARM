@@ -45,22 +45,20 @@ export function ActivityView(props: ActivityViewProps) {
       className="h-full overflow-y-auto"
       aria-labelledby="activity-heading"
     >
-      <div className="mx-auto w-full max-w-4xl px-4 pt-7 sm:px-6">
+      <div className="studio-page mx-auto w-full max-w-5xl">
         <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
-          Existing workspace history
+          THE BIGGER PICTURE
         </p>
-        <h2
-          id="activity-heading"
-          className="mt-1 font-display text-2xl font-semibold tracking-tight text-ink"
-        >
+        <h2 id="activity-heading" className="studio-page-title mt-3 text-ink">
           Activity
         </h2>
-        <div className="mt-5 grid grid-cols-3 gap-2">
+        <p className="studio-page-intro">
+          A pulse on your progress. See what’s happening, and give your next
+          good habit a little momentum.
+        </p>
+        <div className="mt-7 grid grid-cols-3 gap-3">
           {summaries.map((summary) => (
-            <div
-              key={summary.label}
-              className="glass rounded-xl px-3 py-3 sm:px-4"
-            >
+            <div key={summary.label} className="studio-stat glass">
               <div className="flex items-center gap-1.5 text-mint">
                 {summary.icon}
                 <span className="font-mono text-[9px] uppercase tracking-wider text-ink-3">
@@ -72,6 +70,29 @@ export function ActivityView(props: ActivityViewProps) {
               </p>
             </div>
           ))}
+        </div>
+        <div
+          className="studio-token-breakdown"
+          aria-label="Token usage breakdown"
+        >
+          <div>
+            <span className="studio-note-label">UNDER THE HOOD</span>
+            <h3>Every idea has an exchange.</h3>
+            <p>
+              Actual token usage from this agent. Includes conversation context
+              and generated responses.
+            </p>
+          </div>
+          <dl>
+            <div>
+              <dt>Input tokens</dt>
+              <dd>{agent.token_usage.prompt_tokens.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt>Output tokens</dt>
+              <dd>{agent.token_usage.completion_tokens.toLocaleString()}</dd>
+            </div>
+          </dl>
         </div>
       </div>
       <CheckinsView {...props} />

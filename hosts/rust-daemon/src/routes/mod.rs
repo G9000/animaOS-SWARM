@@ -1181,7 +1181,7 @@ async fn run_swarm_entry(
     Path(swarm_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
-    let _permit = match state.run_limiter.clone().try_acquire_owned() {
+    let permit = match state.run_limiter.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             return ApiError::service_unavailable("too many concurrent run requests")
@@ -1191,7 +1191,14 @@ async fn run_swarm_entry(
 
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => {
-            match swarms::handle_run_swarm(&swarm_id, body, &state.daemon, &state.agent_runs).await
+            match swarms::handle_run_swarm(
+                &swarm_id,
+                body,
+                &state.daemon,
+                &state.agent_runs,
+                permit,
+            )
+            .await
             {
                 Ok(response) => json_response(StatusCode::OK, &response),
                 Err(error) => error.into_response(),
@@ -1432,6 +1439,8 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
+    mod swarm_reliability;
+
     use super::{router, router_with_services, router_with_services_with_policies};
     use crate::agent_runs::AgentRunCoordinator;
     use crate::app::DaemonConfig;
@@ -2159,12 +2168,20 @@ mod tests {
             runs.clone(),
             manager.clone(),
         );
+        let calendar = crate::connectors::gcalendar::CalendarManager::new(
+            &state,
+            runs.clone(),
+            Arc::new(crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore::default()),
+            Arc::new(crate::connectors::gcalendar::client::UnconfiguredGoogleTransport),
+            None,
+        );
         let app = router_with_services_with_policies(
             Arc::clone(&state),
             DaemonConfig::default(),
             limiter,
             runs,
             manager,
+            calendar,
             scheduler,
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),

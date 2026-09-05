@@ -5,8 +5,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::{url_encode, CalendarEventDraft, GoogleOAuthConfig};
 use super::store::GoogleOAuthTokens;
+use super::{url_encode, CalendarEventDraft, GoogleOAuthConfig};
 
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_CALENDAR_API_BASE: &str = "https://www.googleapis.com/calendar/v3";
@@ -65,10 +65,7 @@ pub(crate) trait GoogleCalendarTransport: Send + Sync {
 
     /// Non-secret label for the connected account (the primary calendar id,
     /// which is normally the account email).
-    async fn primary_calendar(
-        &self,
-        access_token: &str,
-    ) -> Result<String, GoogleTransportError>;
+    async fn primary_calendar(&self, access_token: &str) -> Result<String, GoogleTransportError>;
 
     async fn list_events(
         &self,
@@ -124,10 +121,7 @@ impl GoogleCalendarTransport for UnconfiguredGoogleTransport {
         Err(GoogleTransportError::Configuration)
     }
 
-    async fn primary_calendar(
-        &self,
-        _access_token: &str,
-    ) -> Result<String, GoogleTransportError> {
+    async fn primary_calendar(&self, _access_token: &str) -> Result<String, GoogleTransportError> {
         Err(GoogleTransportError::Configuration)
     }
 
@@ -325,10 +319,7 @@ impl GoogleCalendarTransport for GoogleCalendarClient {
         tokens_from_response(parsed, Some(refresh_token))
     }
 
-    async fn primary_calendar(
-        &self,
-        access_token: &str,
-    ) -> Result<String, GoogleTransportError> {
+    async fn primary_calendar(&self, access_token: &str) -> Result<String, GoogleTransportError> {
         let response = self
             .client
             .get(format!("{GOOGLE_CALENDAR_API_BASE}/calendars/primary"))
@@ -368,7 +359,10 @@ impl GoogleCalendarTransport for GoogleCalendarClient {
             .map(|item| GoogleCalendarEvent {
                 id: item.id,
                 title: item.summary.unwrap_or_else(|| "(untitled)".to_string()),
-                start: item.start.map(GoogleEventDateTime::value).unwrap_or_default(),
+                start: item
+                    .start
+                    .map(GoogleEventDateTime::value)
+                    .unwrap_or_default(),
                 end: item.end.map(GoogleEventDateTime::value).unwrap_or_default(),
                 location: item.location,
                 description: item.description,

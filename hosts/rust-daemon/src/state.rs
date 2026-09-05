@@ -1190,6 +1190,7 @@ pub(crate) struct DaemonState {
     pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
     pub(crate) swarm_snapshots: HashMap<String, SwarmState>,
+    pub(crate) swarm_run_locks: HashMap<String, Arc<AsyncMutex<()>>>,
     pub(crate) connectors: HashMap<String, TelegramConnectorRecord>,
     pub(crate) credential_cleanup: HashMap<String, TelegramCredentialCleanupIntent>,
     pub(crate) inbound: HashMap<(String, i64), TelegramInboundRecord>,
@@ -1331,6 +1332,7 @@ impl DaemonState {
             swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
             swarm_snapshots: HashMap::new(),
+            swarm_run_locks: HashMap::new(),
             connectors: HashMap::new(),
             credential_cleanup: HashMap::new(),
             inbound: HashMap::new(),
@@ -1421,10 +1423,15 @@ impl DaemonState {
             .swarm_configs
             .iter()
             .filter_map(|(swarm_id, config)| {
-                self.get_swarm(swarm_id).map(|state| StoredSwarmSnapshot {
-                    config: config.clone(),
-                    state,
-                })
+                // Only transactionally published snapshots belong on disk.
+                // Live coordinator state may be ahead of its durable commit.
+                self.swarm_snapshots
+                    .get(swarm_id)
+                    .cloned()
+                    .map(|state| StoredSwarmSnapshot {
+                        config: config.clone(),
+                        state,
+                    })
             })
             .collect::<Vec<_>>();
         swarms.sort_by(|left, right| left.state.id.cmp(&right.state.id));
@@ -2107,6 +2114,8 @@ impl DaemonState {
             .insert(swarm_id.clone(), coordinator.config());
         self.swarms.insert(swarm_id.clone(), coordinator);
         self.swarm_events.insert(swarm_id.clone(), event_stream);
+        self.swarm_run_locks
+            .insert(swarm_id.clone(), Arc::new(AsyncMutex::new(())));
         self.swarm_snapshots.insert(swarm_id, snapshot.clone());
         snapshot
     }

@@ -310,6 +310,7 @@ describe('launch event bridge', () => {
         result: {
           status: 'success',
           data: { text: 'done' },
+          error: null,
           durationMs: 11,
         },
       },

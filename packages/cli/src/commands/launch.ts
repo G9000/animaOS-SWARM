@@ -40,6 +40,7 @@ import {
   extractResultText,
   getErrorMessage,
   resolveDaemonModelSettings,
+  toRuntimeTaskResult,
 } from './utils.js';
 import { MOD_TOOL_MAP } from '@animaOS-SWARM/tools';
 
@@ -281,7 +282,8 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
     'write_file',
     {
       name: 'write_file',
-      description: 'Write content to a workspace file, creating directories as needed.',
+      description:
+        'Write content to a workspace file, creating directories as needed.',
       parameters: daemonObjectToolParameters(
         {
           file_path: { type: 'string' },
@@ -310,7 +312,8 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
     'multi_edit',
     {
       name: 'multi_edit',
-      description: 'Apply multiple exact string edits to a workspace file atomically.',
+      description:
+        'Apply multiple exact string edits to a workspace file atomically.',
       parameters: daemonObjectToolParameters(
         {
           file_path: { type: 'string' },
@@ -370,7 +373,8 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
     'bash',
     {
       name: 'bash',
-      description: 'Execute a shell command inside the workspace and return its output.',
+      description:
+        'Execute a shell command inside the workspace and return its output.',
       parameters: daemonObjectToolParameters(
         {
           command: { type: 'string' },
@@ -413,7 +417,8 @@ const DAEMON_TOOL_DESCRIPTOR_MAP = new Map<string, DaemonToolDescriptor>([
     'bg_stop',
     {
       name: 'bg_stop',
-      description: 'Stop a background process and remove it from the process list.',
+      description:
+        'Stop a background process and remove it from the process list.',
       parameters: daemonObjectToolParameters(
         {
           id: { type: 'string' },
@@ -561,7 +566,9 @@ function reportSeedResult(
 ): void {
   if (!result) return;
   if (result.created > 0) {
-    console.log(`Seeded ${result.created} memories from agents/<slug>/memory/seed.json`);
+    console.log(
+      `Seeded ${result.created} memories from agents/<slug>/memory/seed.json`
+    );
   }
   for (const err of result.errors) {
     console.error('Warning:', err);
@@ -648,12 +655,7 @@ function agentDefToDaemonConfig(
     },
     warnings:
       unsupportedToolNames.length > 0
-        ? [
-            formatUnsupportedDaemonToolWarning(
-              agent.name,
-              unsupportedToolNames
-            ),
-          ]
+        ? [formatUnsupportedDaemonToolWarning(agent.name, unsupportedToolNames)]
         : [],
   };
 }
@@ -836,9 +838,14 @@ async function executeDaemonLaunchCommand(
 
             try {
               const swarm = await swarmSession.getSwarm();
-              const execution = await client.swarms.run(swarm.id, {
-                text: trimmed,
-              });
+              const execution = await client.swarms
+                .run(swarm.id, {
+                  text: trimmed,
+                })
+                .then((response) => ({
+                  ...response,
+                  result: toRuntimeTaskResult(response.result),
+                }));
               if (daemonWarning) {
                 printPlainTextDaemonRecovery();
                 daemonWarning = undefined;
@@ -875,7 +882,12 @@ async function executeDaemonLaunchCommand(
     console.log(
       `Launching "${agency.name}" with strategy "${agency.strategy}" and model ${agency.model}...\n`
     );
-    const execution = await client.swarms.run(swarm.id, { text: task });
+    const execution = await client.swarms
+      .run(swarm.id, { text: task })
+      .then((response) => ({
+        ...response,
+        result: toRuntimeTaskResult(response.result),
+      }));
     if (daemonWarning) {
       printPlainTextDaemonRecovery();
       daemonWarning = undefined;
@@ -979,6 +991,7 @@ async function executeDaemonTuiLaunchCommand(
 
         await emitLaunchTaskStart(bus, displayAgents, input);
         const execution = await client.swarms.run(swarm.id, { text: input });
+        const displayResult = toRuntimeTaskResult(execution.result);
         await Promise.race([subscription, sleep(2000)]);
         abortController.abort();
         await subscription;
@@ -997,14 +1010,14 @@ async function executeDaemonTuiLaunchCommand(
           });
         }
 
-        const text = resultText(execution.result);
-        appendLaunchHistory(opts.dir, historyEntry(input, execution.result));
+        const text = resultText(displayResult);
+        appendLaunchHistory(opts.dir, historyEntry(input, displayResult));
         writeFile(
           join(opts.dir, 'anima-result.md'),
           `# Task\n\n${input}\n\n# Result\n\n${text}\n`,
           () => {}
         );
-        return execution.result;
+        return displayResult;
       } catch (error) {
         swarmSession.invalidate();
         abortController?.abort();

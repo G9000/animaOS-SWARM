@@ -59,7 +59,7 @@ export function AgentPresence({
 }) {
   if (placement === 'mobile-bar') {
     return (
-      <header className="relative flex min-w-0 items-center justify-between gap-3 border-b border-line bg-abyss/65 px-4 py-2 backdrop-blur-2xl">
+      <header className="studio-mobile-presence relative flex min-w-0 items-center justify-between gap-3 border-b border-line bg-abyss/65 px-4 py-2 backdrop-blur-2xl">
         <div className="flex min-w-0 items-center gap-2.5">
           <WorkspaceAvatar
             placement="mobile-bar"
@@ -90,7 +90,7 @@ export function AgentPresence({
   }
 
   return (
-    <div className="flex items-center gap-3 border-b border-line/60 p-3">
+    <div className="studio-presence flex items-center gap-3 border-b border-line/60 p-3">
       <WorkspaceAvatar
         placement="sidebar"
         hasAvatar={hasAvatar}
