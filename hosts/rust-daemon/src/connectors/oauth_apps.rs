@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::{fmt, future::Future, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    sync::{Arc, RwLock},
+};
 use tokio::sync::{oneshot, Mutex, OwnedMutexGuard};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -229,6 +234,43 @@ impl OAuthVaultBackend for OsOAuthVault {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err(OAuthVaultError::Unavailable),
         }
+    }
+}
+
+/// Deterministic vault backend for daemon components and their tests.
+#[derive(Default)]
+pub(crate) struct InMemoryOAuthAppVault {
+    values: RwLock<HashMap<(String, String), Zeroizing<String>>>,
+}
+impl OAuthVaultBackend for InMemoryOAuthAppVault {
+    fn load(
+        &self,
+        service: &str,
+        account: &str,
+    ) -> Result<Option<Zeroizing<String>>, OAuthVaultError> {
+        Ok(self
+            .values
+            .read()
+            .map_err(|_| OAuthVaultError::Unavailable)?
+            .get(&(service.to_string(), account.to_string()))
+            .cloned())
+    }
+    fn put(&self, service: &str, account: &str, payload: &str) -> Result<(), OAuthVaultError> {
+        self.values
+            .write()
+            .map_err(|_| OAuthVaultError::Unavailable)?
+            .insert(
+                (service.to_string(), account.to_string()),
+                Zeroizing::new(payload.to_string()),
+            );
+        Ok(())
+    }
+    fn delete(&self, service: &str, account: &str) -> Result<(), OAuthVaultError> {
+        self.values
+            .write()
+            .map_err(|_| OAuthVaultError::Unavailable)?
+            .remove(&(service.to_string(), account.to_string()));
+        Ok(())
     }
 }
 
@@ -535,10 +577,11 @@ fn delete_verified(
     let seen = v
         .load(SERVICE, p.account())
         .map_err(|_| OAuthAppError::VaultStateUncertain)?;
+    if deletion.is_err() {
+        return Err(OAuthAppError::VaultUnavailable);
+    }
     if seen.is_none() {
         Ok(rev)
-    } else if deletion.is_err() {
-        Err(OAuthAppError::VaultUnavailable)
     } else {
         Err(OAuthAppError::VaultStateUncertain)
     }
@@ -565,8 +608,11 @@ fn hint(id: &str) -> String {
     format!("...{s}")
 }
 fn valid_text(v: String, max: usize) -> Option<String> {
+    if v.is_empty() || v.len() > max || v.chars().any(char::is_control) {
+        return None;
+    }
     let s = v.trim();
-    (!s.is_empty() && s.len() <= max && !s.chars().any(char::is_control)).then(|| s.to_string())
+    (!s.is_empty()).then(|| s.to_string())
 }
 fn tenant_for(p: OAuthProvider, t: Option<String>) -> Result<Option<String>, OAuthAppError> {
     if p == OAuthProvider::Google {
@@ -612,6 +658,7 @@ mod tests {
     enum DB {
         Normal,
         SucceedWithout,
+        FailAfter,
     }
     #[derive(Default)]
     struct Vault {
@@ -658,6 +705,10 @@ mod tests {
                     self.values.write().unwrap().remove(a);
                 }
                 DB::SucceedWithout => {}
+                DB::FailAfter => {
+                    self.values.write().unwrap().remove(a);
+                    return Err(OAuthVaultError::Unavailable);
+                }
             }
             Ok(())
         }
@@ -718,6 +769,19 @@ mod tests {
             OAuthAppCredentials::new(OAuthProvider::Microsoft, "i", "s", Some("x".repeat(256)))
                 .unwrap_err(),
             OAuthAppError::InvalidTenant
+        );
+        for raw in [" id\n", "\tid", "secret\t"] {
+            assert!(OAuthAppCredentials::new(OAuthProvider::Google, raw, "secret", None).is_err());
+        }
+        assert_eq!(
+            OAuthAppCredentials::new(
+                OAuthProvider::Google,
+                format!(" {} ", "x".repeat(2048)),
+                "secret",
+                None
+            )
+            .unwrap_err(),
+            OAuthAppError::InvalidClientId
         )
     }
     #[tokio::test]
@@ -851,13 +915,43 @@ mod tests {
                 .revision(),
             2
         );
-        assert_eq!(s.delete(OAuthProvider::Google).await.unwrap(), 3);
+        v.deletes.lock().unwrap().push_back(DB::FailAfter);
+        assert_eq!(
+            s.delete(OAuthProvider::Google).await.unwrap_err(),
+            OAuthAppError::VaultUnavailable
+        );
+        assert_eq!(
+            s.locked_config(OAuthProvider::Google)
+                .await
+                .unwrap()
+                .revision(),
+            2
+        );
+        s.put(
+            OAuthProvider::Google,
+            creds(OAuthProvider::Google, "restored"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(s.delete(OAuthProvider::Google).await.unwrap(), 4);
         assert_eq!(
             s.put(OAuthProvider::Google, creds(OAuthProvider::Google, "last"))
                 .await
                 .unwrap(),
-            4
+            5
         )
+    }
+    #[test]
+    fn reusable_in_memory_vault_has_keyring_semantics() {
+        let vault = InMemoryOAuthAppVault::default();
+        assert!(vault.load("service", "account").unwrap().is_none());
+        vault.put("service", "account", "payload").unwrap();
+        assert_eq!(
+            vault.load("service", "account").unwrap().unwrap().as_str(),
+            "payload"
+        );
+        vault.delete("service", "account").unwrap();
+        assert!(vault.load("service", "account").unwrap().is_none());
     }
     struct Blocking {
         value: RwLock<Option<Zeroizing<String>>>,
