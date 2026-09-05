@@ -607,9 +607,15 @@ fn delete_verified(
         .checked_add(1)
         .ok_or(OAuthAppError::VaultStateUncertain)?;
     let deletion = v.delete(SERVICE, p.account());
-    let seen = v
-        .load(SERVICE, p.account())
-        .map_err(|_| OAuthAppError::VaultStateUncertain)?;
+    let seen = match v.load(SERVICE, p.account()) {
+        Ok(seen) => seen,
+        Err(_) => {
+            return Ok(DeleteOutcome {
+                revision: rev,
+                response: Err(OAuthAppError::VaultStateUncertain),
+            });
+        }
+    };
     if deletion.is_err() {
         return if seen.is_none() {
             Ok(DeleteOutcome {
@@ -718,6 +724,7 @@ mod tests {
         Normal,
         SucceedWithout,
         FailAfter,
+        SucceedThenVerificationLoadFails,
     }
     #[derive(Default)]
     struct Vault {
@@ -725,9 +732,16 @@ mod tests {
         load_errors: StdMutex<VecDeque<OAuthVaultError>>,
         puts: StdMutex<VecDeque<PB>>,
         deletes: StdMutex<VecDeque<DB>>,
+        verification_load_fails: StdMutex<bool>,
     }
     impl OAuthVaultBackend for Vault {
         fn load(&self, _: &str, a: &str) -> Result<Option<Zeroizing<String>>, OAuthVaultError> {
+            let mut verification_load_fails = self.verification_load_fails.lock().unwrap();
+            if *verification_load_fails {
+                *verification_load_fails = false;
+                return Err(OAuthVaultError::Unavailable);
+            }
+            drop(verification_load_fails);
             if let Some(e) = self.load_errors.lock().unwrap().pop_front() {
                 return Err(e);
             }
@@ -767,6 +781,10 @@ mod tests {
                 DB::FailAfter => {
                     self.values.write().unwrap().remove(a);
                     return Err(OAuthVaultError::Unavailable);
+                }
+                DB::SucceedThenVerificationLoadFails => {
+                    self.values.write().unwrap().remove(a);
+                    *self.verification_load_fails.lock().unwrap() = true;
                 }
             }
             Ok(())
@@ -1012,7 +1030,18 @@ mod tests {
                 .await
                 .unwrap(),
             6
-        )
+        );
+        v.deletes
+            .lock()
+            .unwrap()
+            .push_back(DB::SucceedThenVerificationLoadFails);
+        assert_eq!(
+            s.delete(OAuthProvider::Google).await.unwrap_err(),
+            OAuthAppError::VaultStateUncertain
+        );
+        let lease = s.locked_config(OAuthProvider::Google).await.unwrap();
+        assert_eq!(lease.revision(), 7);
+        assert!(lease.config().is_none());
     }
     #[test]
     fn reusable_in_memory_vault_has_keyring_semantics() {
