@@ -1,4 +1,5 @@
 import { AgentsClient } from './agents.js';
+import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
 
@@ -9,6 +10,7 @@ type RequestHeaders = NonNullable<RequestInit['headers']>;
 type RequestBody = NonNullable<RequestInit['body']>;
 
 export interface DaemonClientOptions {
+  /** Daemon origin or path prefix. Use an empty string for same-origin browser requests. */
   baseUrl?: string;
   fetch?: FetchLike;
 }
@@ -55,6 +57,7 @@ export class DaemonConnectionError extends Error {
 
 export class DaemonClient {
   readonly agents: AgentsClient;
+  readonly connectors: ConnectorsClient;
   readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
 
@@ -71,6 +74,7 @@ export class DaemonClient {
 
     this.fetchImpl = fetchImpl;
     this.agents = new AgentsClient(this);
+    this.connectors = new ConnectorsClient(this);
     this.memories = new MemoriesClient(this);
     this.swarms = new SwarmsClient(this);
   }
