@@ -12,6 +12,7 @@ import { Composer, MessageList } from './components/ChatScreen';
 import { AlertIcon } from './components/icons';
 import { OnboardingFlow } from './components/onboarding/OnboardingFlow';
 import { SettingsPanel } from './components/SettingsPanel';
+import { ConnectorsView } from './components/ConnectorsView';
 import { TelegramSettings } from './components/TelegramSettings';
 import { TelegramThread } from './components/TelegramThread';
 import { WorkspaceShell } from './components/WorkspaceShell';
@@ -481,19 +482,6 @@ export function ViewHarness() {
       saveSettings={saveSettings}
       resetAgent={resetAgent}
       close={closeSettings}
-      integrations={
-        <TelegramSettings
-          connector={telegramConnector}
-          busy={integrations.connectorBusy}
-          error={integrations.connectorError}
-          connect={integrations.connectTelegram}
-          replace={integrations.replaceTelegram}
-          approve={integrations.approvePairing}
-          restart={integrations.restartTelegram}
-          disconnect={integrations.disconnectTelegram}
-          refresh={integrations.refresh}
-        />
-      }
     />
   ) : null;
 
@@ -516,6 +504,24 @@ export function ViewHarness() {
             setDraft((current) =>
               current.trim() ? `${current}\n\n${prompt}` : prompt,
             )
+          }
+          connectors={
+            <ConnectorsView
+              agentId={agent.id}
+              telegram={
+                <TelegramSettings
+                  connector={telegramConnector}
+                  busy={integrations.connectorBusy}
+                  error={integrations.connectorError}
+                  connect={integrations.connectTelegram}
+                  replace={integrations.replaceTelegram}
+                  approve={integrations.approvePairing}
+                  restart={integrations.restartTelegram}
+                  disconnect={integrations.disconnectTelegram}
+                  refresh={integrations.refresh}
+                />
+              }
+            />
           }
           workspaceState={workspace}
           workspace={

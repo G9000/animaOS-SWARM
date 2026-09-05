@@ -529,3 +529,22 @@ describe('WorkspaceShell', () => {
     ).not.toBeInTheDocument();
   });
 });
+
+it('opens Connectors independently of the Telegram conversation', async () => {
+  const nova = agent('main', 'Nova', 1);
+  render(
+    <WorkspaceShell
+      mainAgent={nova}
+      agents={[nova]}
+      connection="online"
+      workspace={<div>Workspace</div>}
+      activity={<div>Activity</div>}
+      connectors={<div>Manage connections</div>}
+      telegram={<div>Telegram conversation</div>}
+      onOpenSettings={vi.fn()}
+    />,
+  );
+  await userEvent.click(screen.getByRole('button', { name: 'Connectors' }));
+  expect(screen.getByText('Manage connections')).toBeVisible();
+  expect(screen.queryByText('Telegram conversation')).not.toBeInTheDocument();
+});

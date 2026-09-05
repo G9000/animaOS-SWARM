@@ -137,6 +137,9 @@ export function OnboardingFlow({
   const [verifyStatus, setVerifyStatus] =
     useState<WorkspaceVerifyStatus | null>(null);
   const [resumeMode, setResumeMode] = useState(false);
+  const [browsing, setBrowsing] = useState(false);
+  const browseInFlightRef = useRef(false);
+  const browseRequestIdRef = useRef(0);
   const [inspectPreview, setInspectPreview] =
     useState<WorkspaceInspectFound | null>(null);
   const [inspectNote, setInspectNote] = useState<string | null>(null);
@@ -380,6 +383,7 @@ export function OnboardingFlow({
   };
 
   const changeRootPath = (rootPath: string) => {
+    browseRequestIdRef.current += 1;
     // Invalidate any in-flight verify/inspect: their results were computed for
     // the old path and must not surface as state for the new one.
     verifyRequestIdRef.current += 1;
@@ -392,6 +396,7 @@ export function OnboardingFlow({
   };
 
   const changeResumeMode = (mode: boolean) => {
+    browseRequestIdRef.current += 1;
     // Invalidate any in-flight verify/inspect: their results describe the
     // mode being left and must not surface after the switch.
     verifyRequestIdRef.current += 1;
@@ -428,12 +433,14 @@ export function OnboardingFlow({
   };
 
   const goBack = () => {
+    browseRequestIdRef.current += 1;
     setBlockingError(null);
     setCreateError(null);
     setCurrentStep((step) => Math.max(0, step - 1));
   };
 
   const goNext = () => {
+    browseRequestIdRef.current += 1;
     setBlockingError(null);
 
     // Resume mode hides the nav, so this guard is defense-in-depth: the
@@ -540,8 +547,8 @@ export function OnboardingFlow({
     }
   };
 
-  const inspectWorkspace = async () => {
-    const rootPath = draft.workspace.rootPath.trim();
+  const inspectWorkspace = async (selectedPath?: string) => {
+    const rootPath = (selectedPath ?? draft.workspace.rootPath).trim();
     // Reuse the verify in-flight guard + spinner: verify and inspect are
     // mutually exclusive modes, so one busy state covers both.
     if (!rootPath || verifyInFlightRef.current) {
@@ -576,6 +583,32 @@ export function OnboardingFlow({
       if (mountedRef.current) {
         setVerifying(false);
       }
+    }
+  };
+
+  const browseWorkspace = async () => {
+    if (browseInFlightRef.current || verifyInFlightRef.current) return;
+    browseInFlightRef.current = true;
+    const requestId = ++browseRequestIdRef.current;
+    setBrowsing(true);
+    setVerifyStatus(null);
+    try {
+      const { rootPath } = await daemon.pickWorkspaceFolder();
+      if (
+        !mountedRef.current ||
+        requestId !== browseRequestIdRef.current ||
+        !rootPath
+      )
+        return;
+      changeRootPath(rootPath);
+      if (resumeMode) await inspectWorkspace(rootPath);
+    } catch (error) {
+      if (mountedRef.current && requestId === browseRequestIdRef.current) {
+        setVerifyStatus({ ok: false, message: errorMessage(error) });
+      }
+    } finally {
+      browseInFlightRef.current = false;
+      if (mountedRef.current) setBrowsing(false);
     }
   };
 
@@ -788,6 +821,8 @@ export function OnboardingFlow({
           onRootPathChange={changeRootPath}
           onValuesChange={(values) => updateWorkspace('values', values)}
           onVerify={() => void verifyWorkspace()}
+          browsing={browsing}
+          onBrowse={() => void browseWorkspace()}
           resumeMode={resumeMode}
           onResumeModeChange={changeResumeMode}
           onInspect={() => void inspectWorkspace()}
@@ -882,14 +917,18 @@ export function OnboardingFlow({
             MAKE YOURSELF AT HOME
           </p>
           <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
-            {showingResumeCard
-              ? 'Resume your workspace'
+            {resumeMode
+              ? showingResumeCard
+                ? 'Resume your workspace'
+                : 'Open existing workspace'
               : 'Set up your workspace'}
           </h1>
           <p className="mx-auto max-w-lg text-sm leading-relaxed text-ink-2">
-            {workspaceConfigured
-              ? 'Your workspace is ready — hire another agent.'
-              : 'Name your company, pick its folder, and hire your first agent.'}
+            {resumeMode
+              ? 'Choose your workspace folder and pick up where you left off.'
+              : workspaceConfigured
+                ? 'Your workspace is ready — hire another agent.'
+                : 'Name your company, pick its folder, and hire your first agent.'}
           </p>
           <div className="studio-onboarding-promise">
             <div className="studio-onboarding-art" aria-hidden>
@@ -921,15 +960,25 @@ export function OnboardingFlow({
           </div>
         </header>
 
-        <OnboardingProgress currentStep={currentStep} />
+        {currentStep === 0 && !workspaceConfigured && !resumeMode ? (
+          <button
+            type="button"
+            onClick={() => changeResumeMode(true)}
+            className="w-full rounded-xl border border-line bg-white/[0.02] px-4 py-3 text-sm font-medium text-ink transition hover:border-line-strong"
+          >
+            Open existing workspace
+          </button>
+        ) : null}
+        {!resumeMode && <OnboardingProgress currentStep={currentStep} />}
         <p
           role="status"
           aria-live="polite"
           aria-atomic="true"
           className="sr-only"
         >
-          Step {currentStep + 1} of {ONBOARDING_STEPS.length}:{' '}
-          {ONBOARDING_STEPS[currentStep]}
+          {resumeMode
+            ? 'Open existing workspace'
+            : `Step ${currentStep + 1} of ${ONBOARDING_STEPS.length}: ${ONBOARDING_STEPS[currentStep]}`}
         </p>
 
         <div className="glass-strong rounded-3xl p-5 shadow-2xl shadow-black/60 sm:p-8">

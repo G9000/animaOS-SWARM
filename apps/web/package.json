@@ -8,6 +8,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@animaOS-SWARM/sdk": "workspace:*",
     "@animaOS-SWARM/ui": "workspace:*",
     "prism-react-renderer": "^2.4.1",
     "react-markdown": "^10.1.0",

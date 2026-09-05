@@ -45,6 +45,37 @@ pub(super) enum LocalOwnerRejection {
 }
 
 impl LocalOwnerPolicy {
+    /// Read-only browser fetches may omit Origin. Fetch Metadata plus an
+    /// approved referrer allows these without relaxing the mutation policy.
+    pub(super) fn authorize_read(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Result<(), LocalOwnerRejection> {
+        if headers.contains_key(header::ORIGIN) {
+            return self.authorize(headers);
+        }
+        let approved_referrer = headers
+            .get(header::REFERER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .map(|url| {
+                self.allowed_origins
+                    .contains(&url.origin().ascii_serialization())
+            })
+            .unwrap_or(false);
+        if self.bind_is_loopback
+            && request_host_is_loopback(headers)
+            && !has_forwarding_headers(headers)
+            && headers
+                .get("sec-fetch-site")
+                .and_then(|value| value.to_str().ok())
+                == Some("same-origin")
+            && approved_referrer
+        {
+            return Ok(());
+        }
+        self.authorize(headers)
+    }
     pub(super) fn from_env(bind_is_loopback: bool) -> Self {
         let mut allowed_origins = DEFAULT_LOCAL_UI_ORIGINS
             .into_iter()
@@ -250,6 +281,18 @@ pub(super) async fn enforce_api_key(
     next: Next,
 ) -> Result<AxumResponse, AxumResponse> {
     let path = request.uri().path();
+    // OAuth redirects cannot carry the API key. These exact GET callbacks
+    // authenticate using their expiring, single-use OAuth state instead.
+    if request.method() == axum::http::Method::GET
+        && matches!(
+            path,
+            "/api/connectors/gcalendar/callback"
+                | "/api/connectors/mail/gmail/callback"
+                | "/api/connectors/mail/outlook/callback"
+        )
+    {
+        return Ok(next.run(request).await);
+    }
     if matches!(
         path,
         "/health"
@@ -299,7 +342,8 @@ pub(super) fn make_http_span<B>(request: &HttpRequest<B>) -> tracing::Span {
     info_span!(
         "http_request",
         method = %request.method(),
-        uri = %request.uri(),
+        // OAuth codes and state arrive in query strings. Never log them.
+        uri = %request.uri().path(),
         request_id = %request_id,
     )
 }
@@ -419,6 +463,87 @@ fn hex_value(byte: u8) -> Result<u8, ()> {
 #[derive(Default)]
 struct ContractJsonFormatter {
     inner: CompactFormatter,
+}
+
+#[cfg(test)]
+mod owner_read_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{HeaderMap, HeaderValue, Request},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    fn browser_headers() -> HeaderMap {
+        HeaderMap::from_iter([
+            (header::HOST, HeaderValue::from_static("127.0.0.1:8080")),
+            (
+                header::REFERER,
+                HeaderValue::from_static("http://localhost:4200/"),
+            ),
+            (
+                axum::http::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn same_origin_browser_reads_do_not_relax_mutations() {
+        let policy = LocalOwnerPolicy::for_test(true, None);
+        let headers = browser_headers();
+        assert!(policy.authorize_read(&headers).is_ok());
+        assert!(policy.authorize(&headers).is_err());
+        assert!(LocalOwnerPolicy::for_test(false, None)
+            .authorize_read(&headers)
+            .is_err());
+        for (name, value) in [
+            ("sec-fetch-site", "cross-site"),
+            ("referer", "https://untrusted.example/"),
+            ("host", "untrusted.example"),
+            ("x-forwarded-for", "127.0.0.1"),
+            ("origin", "https://untrusted.example"),
+        ] {
+            let mut headers = browser_headers();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+            assert!(policy.authorize_read(&headers).is_err(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn only_exact_get_oauth_callbacks_bypass_the_api_key() {
+        let app = Router::new().fallback(|| async { "callback" }).layer(
+            axum::middleware::from_fn_with_state(
+                ApiKeyPolicy::for_test(Some("key")),
+                enforce_api_key,
+            ),
+        );
+        for provider in ["mail/gmail", "mail/outlook", "gcalendar"] {
+            let path = format!("/api/connectors/{provider}/callback");
+            for (method, uri, expected) in [
+                ("GET", path.clone(), StatusCode::OK),
+                ("POST", path.clone(), StatusCode::UNAUTHORIZED),
+                ("GET", format!("{path}/extra"), StatusCode::UNAUTHORIZED),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected);
+            }
+        }
+    }
 }
 
 impl Formatter for ContractJsonFormatter {

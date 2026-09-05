@@ -30,6 +30,8 @@ export interface WorkspaceStepProps {
   onRootPathChange(value: string): void;
   onValuesChange(values: string[]): void;
   onVerify(): void;
+  browsing: boolean;
+  onBrowse(): void;
   resumeMode?: boolean;
   onResumeModeChange?(mode: boolean): void;
   onInspect?(): void;
@@ -51,6 +53,8 @@ export function WorkspaceStep({
   onRootPathChange,
   onValuesChange,
   onVerify,
+  browsing,
+  onBrowse,
   resumeMode = false,
   onResumeModeChange,
   onInspect,
@@ -86,7 +90,9 @@ export function WorkspaceStep({
           Workspace
         </h2>
         <p className="mt-1 max-w-xl text-sm leading-relaxed text-ink-2">
-          Name your company and pick the folder your agents will work in.
+          {resumeMode
+            ? 'Choose the folder containing your existing workspace.'
+            : 'Name your company and pick the folder your agents will work in.'}
         </p>
       </div>
 
@@ -130,11 +136,11 @@ export function WorkspaceStep({
         <label htmlFor="onboarding-root-path" className={labelCls}>
           Office location
         </label>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <input
             ref={rootPathInputRef}
             id="onboarding-root-path"
-            className="field flex-1"
+            className="field min-w-0 flex-1 basis-full sm:basis-0"
             value={rootPath}
             onChange={(event) => onRootPathChange(event.target.value)}
             autoComplete="off"
@@ -143,7 +149,7 @@ export function WorkspaceStep({
           <button
             type="button"
             onClick={resumeMode ? onInspect : onVerify}
-            disabled={verifying || !rootPath.trim()}
+            disabled={browsing || verifying || !rootPath.trim()}
             className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
           >
             {resumeMode
@@ -153,6 +159,14 @@ export function WorkspaceStep({
               : verifying
                 ? 'Verifying…'
                 : 'Verify'}
+          </button>
+          <button
+            type="button"
+            onClick={onBrowse}
+            disabled={browsing || verifying}
+            className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
+          >
+            {browsing ? 'Choosing folder…' : 'Browse…'}
           </button>
         </div>
         {verifyStatus?.ok ? (

@@ -5,14 +5,14 @@ description: DaemonClient structure, health checks, base URL configuration, and 
 
 import { Aside, Card, CardGrid } from '@astrojs/starlight/components';
 
-The SDK is organized around one `DaemonClient` instance. You create it once, point it at an animaOS-compatible host, and then work through the typed `agents`, `swarms`, and `memories` sub-clients.
+The SDK is organized around one `DaemonClient` instance. You create it once, point it at an animaOS-compatible host, and then work through the typed `agents`, `swarms`, `memories`, and `connectors` sub-clients.
 
 <CardGrid>
   <Card title="Health">
     Verify host reachability with `client.health()` before doing application work.
   </Card>
   <Card title="Domain Clients">
-    Use `client.agents`, `client.swarms`, and `client.memories` instead of raw request construction.
+    Use `client.agents`, `client.swarms`, `client.memories`, and `client.connectors` instead of raw request construction.
   </Card>
   <Card title="Transport Escape Hatches">
     Use `requestJson()` and `subscribe()` when you need lower-level control over JSON or SSE.
@@ -40,6 +40,7 @@ The client surface is intentionally small:
 - `agents` for single-agent lifecycle operations
 - `swarms` for multi-agent coordination and live SSE
 - `memories` for memory search, recall, evaluation, and graph operations
+- `connectors` for account connections, inbox reads, drafts and owner approvals
 - `requestJson()` and `subscribe()` for lower-level transport access
 
 ## Health and Reachability

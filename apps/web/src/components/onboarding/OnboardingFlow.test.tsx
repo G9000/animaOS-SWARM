@@ -1,9 +1,4 @@
-import {
-  act,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -178,9 +173,7 @@ describe('OnboardingFlow', () => {
       'Step 1 of 5: Workspace',
     );
 
-    expect(
-      await screen.findByDisplayValue('/Users/dev/anima'),
-    ).toBeVisible();
+    expect(await screen.findByDisplayValue('/Users/dev/anima')).toBeVisible();
   });
 
   it('blocks Next with an empty workspace draft and focuses the company input', async () => {
@@ -244,9 +237,9 @@ describe('OnboardingFlow', () => {
     expect(
       screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
     ).toHaveValue(WORKSPACE.mission);
-    expect(screen.getByRole('textbox', { name: 'Office location' })).toHaveValue(
-      WORKSPACE.rootPath,
-    );
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(WORKSPACE.rootPath);
 
     await user.click(screen.getByRole('button', { name: 'Verify' }));
     expect(await screen.findByText(/Folder will be created/)).toBeVisible();
@@ -416,9 +409,9 @@ describe('OnboardingFlow', () => {
     expect(
       screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
     ).toHaveValue(WORKSPACE.mission);
-    expect(screen.getByRole('textbox', { name: 'Office location' })).toHaveValue(
-      WORKSPACE.rootPath,
-    );
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(WORKSPACE.rootPath);
     expect(screen.getAllByRole('listitem')[0]).toHaveAttribute(
       'aria-current',
       'step',
@@ -453,9 +446,9 @@ describe('OnboardingFlow', () => {
     expect(
       screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
     ).toHaveValue(WORKSPACE.mission);
-    expect(screen.getByRole('textbox', { name: 'Office location' })).toHaveValue(
-      WORKSPACE.rootPath,
-    );
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(WORKSPACE.rootPath);
   });
 
   it('fills the bio, style, and instructions from the preset template when picking a preset', async () => {
@@ -508,9 +501,7 @@ describe('OnboardingFlow', () => {
       screen.getByRole('textbox', { name: /What do you want/ }),
       'Run my ops',
     );
-    await user.click(
-      screen.getByRole('button', { name: /generate profile/i }),
-    );
+    await user.click(screen.getByRole('button', { name: /generate profile/i }));
 
     await waitFor(() =>
       expect(screen.getByRole('textbox', { name: 'Bio' })).toHaveValue(
@@ -728,9 +719,7 @@ describe('OnboardingFlow', () => {
     const onCreated = vi.fn();
     renderFlow({ onCreated });
 
-    expect(
-      await screen.findByDisplayValue('Acme Corp'),
-    ).toBeVisible();
+    expect(await screen.findByDisplayValue('Acme Corp')).toBeVisible();
     expect(
       screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
     ).toHaveValue('Ship calmly');
@@ -961,6 +950,95 @@ describe('OnboardingFlow workspace resume', () => {
     expect(screen.getByRole('button', { name: 'Inspect' })).toBeVisible();
   });
 
+  it('browses and inspects an existing workspace without creating one', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'pickWorkspaceFolder').mockResolvedValue({
+      rootPath: RESUME_ROOT,
+    });
+    const inspect = vi
+      .spyOn(daemon, 'inspectWorkspace')
+      .mockResolvedValue(inspectPreview());
+    const { onCreated } = renderFlow();
+    await user.click(
+      screen.getByRole('button', { name: 'Open existing workspace' }),
+    );
+    expect(
+      screen.queryByRole('list', { name: 'Onboarding progress' }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Browse…' }));
+    expect(await screen.findByText('Northwind Research')).toBeVisible();
+    expect(inspect).toHaveBeenCalledWith(RESUME_ROOT);
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it('keeps the path when the folder dialog is cancelled', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'pickWorkspaceFolder').mockResolvedValue({
+      rootPath: null,
+    });
+    const inspect = vi.spyOn(daemon, 'inspectWorkspace');
+    renderFlow();
+    await enterResumeMode(user);
+    await user.click(screen.getByRole('button', { name: 'Browse…' }));
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(RESUME_ROOT);
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
+  it('shows picker errors and allows retrying', async () => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'pickWorkspaceFolder').mockRejectedValue(
+      new Error('Folder picker unavailable'),
+    );
+    renderFlow();
+    await user.click(screen.getByRole('button', { name: 'Browse…' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Folder picker unavailable',
+    );
+    expect(screen.getByRole('button', { name: 'Browse…' })).toBeEnabled();
+  });
+
+  it('ignores a folder selection after the user edits the path', async () => {
+    const user = userEvent.setup();
+    const pending = deferred<{ rootPath: string | null }>();
+    vi.spyOn(daemon, 'pickWorkspaceFolder').mockReturnValue(pending.promise);
+    renderFlow();
+    await user.click(screen.getByRole('button', { name: 'Browse…' }));
+    await user.type(
+      screen.getByRole('textbox', { name: 'Office location' }),
+      '/tmp/new-path',
+    );
+    await act(async () => pending.resolve({ rootPath: RESUME_ROOT }));
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue('/tmp/new-path');
+  });
+
+  it('ignores a folder selection after leaving resume mode', async () => {
+    const user = userEvent.setup();
+    const pending = deferred<{ rootPath: string | null }>();
+    const picker = vi
+      .spyOn(daemon, 'pickWorkspaceFolder')
+      .mockReturnValue(pending.promise);
+    const inspect = vi.spyOn(daemon, 'inspectWorkspace');
+    renderFlow();
+    await enterResumeMode(user);
+    await user.click(screen.getByRole('button', { name: 'Browse…' }));
+    expect(
+      screen.getByRole('button', { name: 'Choosing folder…' }),
+    ).toBeDisabled();
+    await user.click(
+      screen.getByRole('button', { name: /set up a new workspace instead/i }),
+    );
+    await act(async () => pending.resolve({ rootPath: '/tmp/other' }));
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(RESUME_ROOT);
+    expect(picker).toHaveBeenCalledTimes(1);
+    expect(inspect).not.toHaveBeenCalled();
+  });
+
   it('shows an inline note and keeps the wizard unchanged when inspect finds no workspace', async () => {
     const user = userEvent.setup();
     const inspectWorkspace = vi
@@ -1069,9 +1147,7 @@ describe('OnboardingFlow workspace resume', () => {
     );
 
     expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
-    expect(
-      screen.getByRole('textbox', { name: 'Company name' }),
-    ).toBeVisible();
+    expect(screen.getByRole('textbox', { name: 'Company name' })).toBeVisible();
     expect(
       screen.getByRole('textbox', { name: 'Mission (one sentence)' }),
     ).toBeVisible();
@@ -1131,9 +1207,7 @@ describe('OnboardingFlow workspace resume', () => {
     expect(
       screen.queryByRole('heading', { name: 'Resume your workspace' }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.getByRole('textbox', { name: 'Company name' }),
-    ).toBeVisible();
+    expect(screen.getByRole('textbox', { name: 'Company name' })).toBeVisible();
     expect(screen.getByRole('button', { name: 'Verify' })).toBeEnabled();
   });
 

@@ -13,6 +13,8 @@ anima-schedule = { path = "../../packages/core-rust/crates/anima-schedule" }
 anima-swarm = { path = "../../packages/core-rust/crates/anima-swarm" }
 atomicwrites = "0.4.4"
 async-trait = "0.1"
+base64 = "0.22"
+sha2 = "0.10"
 axum = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 chrono-tz = "0.10"
@@ -36,6 +38,9 @@ uuid = { version = "1", features = ["v4"] }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 zeroize = "1.8"
+
+[target.'cfg(windows)'.dependencies]
+rfd = "0.17.2"
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -10,6 +10,7 @@ export default new Map([
 ["src/content/docs/sdk/agents/lifecycle.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fagents%2Flifecycle.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/sdk/agents/tools.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fagents%2Ftools.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/sdk/client.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fclient.mdx&astroContentModuleFlag=true")],
+["src/content/docs/sdk/connectors.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fconnectors.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/sdk/memories.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fmemories.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/sdk/memories/operations.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fmemories%2Foperations.mdx&astroContentModuleFlag=true")],
 ["src/content/docs/sdk/memories/recall.mdx", () => import("astro:content-layer-deferred-module?astro%3Acontent-layer-deferred-module=&fileName=src%2Fcontent%2Fdocs%2Fsdk%2Fmemories%2Frecall.mdx&astroContentModuleFlag=true")],

@@ -49,6 +49,7 @@ export default defineConfig({
           items: [
             { label: 'Quick Start', link: '/sdk/quickstart/' },
             { label: 'Client Basics', link: '/sdk/client/' },
+            { label: 'Connectors', link: '/sdk/connectors/' },
             {
               label: 'Agents',
               collapsed: false,

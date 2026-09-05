@@ -99,6 +99,7 @@
       "name": "@animaOS-SWARM/web",
       "version": "0.0.1",
       "dependencies": {
+        "@animaOS-SWARM/sdk": "workspace:*",
         "@animaOS-SWARM/ui": "workspace:*",
         "prism-react-renderer": "^2.4.1",
         "react-markdown": "^10.1.0",

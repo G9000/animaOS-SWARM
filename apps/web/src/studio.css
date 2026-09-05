@@ -795,3 +795,14 @@
     padding: 16px;
   }
 }
+
+/* Keep all five destinations legible on the compact mobile dock. */
+@media (max-width: 767px) {
+  .safe-bottom-dock .studio-nav-item {
+    flex-basis: 0;
+    flex-direction: column;
+    gap: 3px;
+    padding: 6px 2px;
+    font-size: 9px;
+  }
+}

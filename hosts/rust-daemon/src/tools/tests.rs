@@ -42,6 +42,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock as AsyncRwLock;
 
+#[test]
+fn mail_tools_expose_read_and_draft_but_never_send_approval() {
+    let registry = ToolRegistry::new();
+    assert!(registry
+        .resolve_descriptors(["mail_list_messages", "mail_create_draft"])
+        .is_ok());
+    assert!(registry.resolve_descriptors(["mail_send"]).is_err());
+    assert!(registry
+        .resolve_descriptors(["mail_approve_draft"])
+        .is_err());
+}
+
 #[tokio::test]
 async fn tool_execution_context_rejects_registered_but_unconfigured_write_tool() {
     let relative_path = format!(
@@ -233,6 +245,12 @@ fn registry_defines_every_registered_tool_schema() {
             &["to_agent_id", "to_agent_name"][..],
         ),
         ("broadcast_message", &["message"][..], &[][..]),
+        ("mail_list_messages", &["provider"][..], &[][..]),
+        (
+            "mail_create_draft",
+            &["provider", "to", "subject", "body"][..],
+            &[][..],
+        ),
         (
             "calendar_list_events",
             &["time_min", "time_max"][..],

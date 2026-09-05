@@ -468,6 +468,11 @@ export const daemon = {
       `/workspace/inspect?rootPath=${encodeURIComponent(rootPath)}`,
     ),
 
+  pickWorkspaceFolder: () =>
+    request<{ rootPath: string | null }>('/workspace/pick-folder', {
+      method: 'POST',
+    }),
+
   resumeWorkspace: (rootPath: string) =>
     request<WorkspaceResumeResponse>('/workspace/resume', {
       method: 'POST',

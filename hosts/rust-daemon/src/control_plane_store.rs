@@ -81,6 +81,10 @@ pub(crate) struct ControlPlaneSnapshot {
     #[serde(default)]
     pub(crate) calendar_writes: Vec<CalendarPendingWriteRecord>,
     #[serde(default)]
+    pub(crate) mail_records: Vec<crate::connectors::mail::MailRecord>,
+    #[serde(default)]
+    pub(crate) mail_drafts: Vec<crate::connectors::mail::MailDraft>,
+    #[serde(default)]
     pub(crate) workspace: Option<WorkspaceConfig>,
 }
 
@@ -301,6 +305,8 @@ impl ControlPlaneSnapshot {
             inbound,
             outbound,
             schedules,
+            mail_records: vec![],
+            mail_drafts: vec![],
             calendar_connectors: vec![],
             calendar_writes: vec![],
             workspace: None,

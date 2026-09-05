@@ -2,9 +2,11 @@ mod agencies;
 mod agents;
 mod connectors;
 mod contracts;
+mod folder_picker;
 mod gcalendar;
 mod health;
 mod http;
+mod mail;
 mod memories;
 mod oauth_apps;
 mod profile;
@@ -99,6 +101,7 @@ use crate::runtime_model::provider_summaries;
         put_workspace_avatar_entry,
         bootstrap_workspace_entry,
         inspect_workspace_entry,
+        folder_picker::pick_folder,
         resume_workspace_entry,
         connectors::list_connectors,
         connectors::create_telegram_connector,
@@ -581,6 +584,11 @@ fn router_with_services_with_policies(
     Router::new()
         .merge(timed_routes)
         .merge(run_routes)
+        // A native dialog waits for the user, rather than the API request timeout.
+        .route(
+            "/api/workspace/pick-folder",
+            axum::routing::post(folder_picker::pick_folder),
+        )
         .route("/api/swarms/{swarm_id}/events", get(swarm_events_entry))
         // Auth gates everything mounted above this line; the middleware
         // exempts health/readiness/metrics/docs by path. When
@@ -2058,6 +2066,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn folder_picker_rejects_untrusted_requests_before_opening_a_dialog() {
+        let app = router(
+            Arc::new(RwLock::new(DaemonState::new())),
+            DaemonConfig::default(),
+        );
+        for origin in [None, Some("https://untrusted.example")] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/api/workspace/pick-folder")
+                .header("host", "127.0.0.1:8080");
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
     }
 
     #[tokio::test]

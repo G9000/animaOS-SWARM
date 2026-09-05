@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod credentials;
 pub(crate) mod gcalendar;
+pub(crate) mod mail;
 pub(crate) mod oauth_apps;
 pub(crate) mod runtime;
 pub(crate) mod telegram;

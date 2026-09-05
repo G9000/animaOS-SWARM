@@ -1199,6 +1199,9 @@ pub(crate) struct DaemonState {
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
     pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
     calendar_manager: Option<CalendarManager>,
+    pub(crate) mail_manager: Option<crate::connectors::mail::MailManager>,
+    pub(crate) mail_records: HashMap<String, crate::connectors::mail::MailRecord>,
+    pub(crate) mail_drafts: HashMap<String, crate::connectors::mail::MailDraft>,
     pub(crate) workspace: Option<WorkspaceConfig>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
     pub(crate) tool_registry: ToolRegistry,
@@ -1341,6 +1344,9 @@ impl DaemonState {
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
             calendar_manager: None,
+            mail_manager: None,
+            mail_records: HashMap::new(),
+            mail_drafts: HashMap::new(),
             workspace: None,
             model_adapter,
             tool_registry: ToolRegistry::new(),
@@ -1473,6 +1479,8 @@ impl DaemonState {
         );
         snapshot.calendar_connectors = calendar_connectors;
         snapshot.calendar_writes = calendar_writes;
+        snapshot.mail_records = self.mail_records.values().cloned().collect();
+        snapshot.mail_drafts = self.mail_drafts.values().cloned().collect();
         snapshot.workspace = self.workspace.clone();
         snapshot
     }
@@ -1523,6 +1531,31 @@ impl DaemonState {
             .into_iter()
             .map(|schedule| (schedule.id.clone(), schedule))
             .collect();
+        self.mail_records = snapshot
+            .mail_records
+            .into_iter()
+            .map(|r| (r.connector.id.clone(), r))
+            .collect();
+        self.mail_drafts = snapshot
+            .mail_drafts
+            .into_iter()
+            .map(|mut d| {
+                if d.state == crate::connectors::mail::DraftState::Sending {
+                    d.state = crate::connectors::mail::DraftState::Unknown;
+                    d.error = Some(
+                        "Send outcome is unknown; verify Sent mail before creating another draft"
+                            .into(),
+                    );
+                    d.resolved_at_ms = Some(crate::connectors::gcalendar::now_ms());
+                }
+                (d.id.clone(), d)
+            })
+            .collect();
+        for r in self.mail_records.values_mut() {
+            if r.connector.status == "pairing" {
+                r.connector.status = "reauthRequired".into();
+            }
+        }
         self.calendar_connectors = snapshot
             .calendar_connectors
             .into_iter()
@@ -2334,7 +2367,8 @@ impl DaemonState {
             Arc::clone(&self.process_manager),
             self.workspace.as_ref().map(|w| w.root_path.clone()),
             self.calendar_manager.clone(),
-        );
+        )
+        .with_mail(self.mail_manager.clone());
         Some((runtime, tool_context))
     }
 

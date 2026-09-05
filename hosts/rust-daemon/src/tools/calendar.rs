@@ -31,11 +31,11 @@ fn optional_string(tool_call: &ToolCall, name: &str) -> Option<String> {
 fn calendar_error(error: CalendarError) -> String {
     match error {
         CalendarError::NotConnected => {
-            "Google Calendar is not connected for this agent. Ask the owner to connect it in Settings → Google Calendar."
+            "Google Calendar is not connected for this agent. Ask the owner to connect it in Connectors → Google Calendar."
                 .to_string()
         }
         CalendarError::ReauthRequired => {
-            "Google Calendar access expired. Ask the owner to reconnect in Settings → Google Calendar."
+            "Google Calendar access expired. Ask the owner to reconnect in Connectors → Google Calendar."
                 .to_string()
         }
         CalendarError::Unconfigured => {
@@ -44,7 +44,7 @@ fn calendar_error(error: CalendarError) -> String {
         }
         CalendarError::InvalidDraft => "the calendar event details are invalid".to_string(),
         CalendarError::Conflict => {
-            "too many pending calendar changes are awaiting approval; ask the owner to resolve them in Settings → Google Calendar first"
+            "too many pending calendar changes are awaiting approval; ask the owner to resolve them in Connectors → Google Calendar first"
                 .to_string()
         }
         _ => format!("calendar request failed: {error:?}"),
@@ -146,7 +146,7 @@ fn submit_write(
             Ok(write) => TaskResult::success(
                 Content {
                     text: format!(
-                        "{} — pending owner confirmation (id: {}). Tell the user to approve or reject it in Settings → Google Calendar.",
+                        "{} — pending owner confirmation (id: {}). Tell the user to approve or reject it in Connectors → Google Calendar.",
                         write.summary, write.id
                     ),
                     ..Default::default()

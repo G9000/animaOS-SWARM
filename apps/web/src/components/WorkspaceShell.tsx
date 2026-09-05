@@ -12,6 +12,7 @@ import { formatTokens, ghostBtnCls } from './ui-bits';
 
 export type WorkspaceDestination =
   | 'workspace'
+  | 'connectors'
   | 'telegram'
   | 'activity'
   | 'agents';
@@ -24,6 +25,7 @@ const DESTINATIONS: Array<{
   icon: ReactNode;
 }> = [
   { id: 'workspace', label: 'Workspace', icon: <SparkIcon size={15} /> },
+  { id: 'connectors', label: 'Connectors', icon: <GearIcon size={15} /> },
   { id: 'activity', label: 'Activity', icon: <PulseIcon size={15} /> },
   { id: 'agents', label: 'Agents', icon: <AgentsIcon size={15} /> },
 ];
@@ -100,7 +102,7 @@ function DestinationNavigation({
             className={`studio-nav-item inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition ${
               sidebar
                 ? 'w-full justify-start py-2.5 text-left'
-                : 'flex-1 justify-center'
+                : 'flex-1 flex-col justify-center gap-1 px-1 text-[10px]'
             } ${
               active
                 ? 'bg-accent/12 text-accent shadow-[inset_0_0_0_1px_rgb(var(--color-accent-rgb)/0.18)]'
@@ -123,6 +125,7 @@ export function WorkspaceShell({
   workspace,
   activity,
   telegram = null,
+  connectors = null,
   workspaceState = null,
   onOpenSettings,
   onChangeWorkspaceAvatar = ignoreWorkspaceAvatarChange,
@@ -134,6 +137,7 @@ export function WorkspaceShell({
   workspace: ReactNode;
   activity: ReactNode;
   telegram?: ReactNode | null;
+  connectors?: ReactNode | null;
   workspaceState?: DaemonWorkspaceState | null;
   onOpenSettings: () => void;
   onChangeWorkspaceAvatar?: (file: File) => Promise<void>;
@@ -187,7 +191,7 @@ export function WorkspaceShell({
     {
       id: 'settings',
       title: 'Agent settings',
-      description: 'Identity, model, access, and integrations',
+      description: 'Identity, model, and access',
       group: 'Navigate',
       run: () => requestAnimationFrame(onOpenSettings),
     },
@@ -362,6 +366,8 @@ export function WorkspaceShell({
                 workspace
               ) : destination === 'telegram' && telegram !== null ? (
                 telegram
+              ) : destination === 'connectors' ? (
+                connectors
               ) : destination === 'activity' ? (
                 activity
               ) : (
