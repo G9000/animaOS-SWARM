@@ -101,6 +101,8 @@ pub(crate) struct BootstrapAgentRequest {
 pub(crate) struct WorkspaceBootstrapRequest {
     pub(crate) workspace: WorkspaceConfigRequest,
     pub(crate) agent: BootstrapAgentRequest,
+    #[serde(default)]
+    pub(crate) workers: Vec<BootstrapAgentRequest>,
 }
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
@@ -108,6 +110,7 @@ pub(crate) struct WorkspaceBootstrapRequest {
 pub(crate) struct WorkspaceBootstrapResponse {
     pub(crate) workspace: WorkspaceConfigResponse,
     pub(crate) agent: super::AgentRuntimeSnapshotResponse,
+    pub(crate) workers: Vec<super::AgentRuntimeSnapshotResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, ToSchema)]

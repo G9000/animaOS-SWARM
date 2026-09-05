@@ -64,6 +64,8 @@ impl PersistenceMode {
 pub struct DaemonConfig {
     pub max_request_bytes: usize,
     pub request_timeout: Duration,
+    /// Agent/tool runs can legitimately outlast ordinary API requests.
+    pub run_request_timeout: Duration,
     pub persistence_mode: PersistenceMode,
     pub max_concurrent_runs: usize,
     pub max_background_processes: usize,
@@ -82,6 +84,7 @@ impl Default for DaemonConfig {
         Self {
             max_request_bytes: 64 * 1024,
             request_timeout: Duration::from_secs(30),
+            run_request_timeout: Duration::from_secs(600),
             persistence_mode: PersistenceMode::Memory,
             max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,

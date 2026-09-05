@@ -51,5 +51,8 @@
     "implicitDependencies": [
       "@animaOS-SWARM/web"
     ]
+  },
+  "devDependencies": {
+    "@animaOS-SWARM/sdk": "workspace:*"
   }
 }

@@ -227,6 +227,7 @@ async fn bootstrap_creates_workspace_agency_file_and_agent() {
     let body: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(status, 201, "body: {body}");
     assert_eq!(body["workspace"]["companyName"], "Northwind Research");
+    assert_eq!(body["workers"], serde_json::json!([]));
     assert_eq!(
         body["agent"]["state"]["config"]["bio"],
         "A vigilant chief of staff."
@@ -1106,4 +1107,191 @@ async fn resumed_agents_survive_restart() {
         Some(canonical_root.display().to_string().as_str()),
         "{workspace_body}"
     );
+}
+
+fn team_bootstrap_body(root: &std::path::Path) -> serde_json::Value {
+    let mut body = bootstrap_body(root);
+    let mut worker = body["agent"].clone();
+    worker["name"] = serde_json::json!("Researcher");
+    worker["system"] = serde_json::json!("Research and cite evidence.");
+    body["workers"] = serde_json::json!([worker]);
+    body
+}
+
+#[tokio::test]
+async fn bootstrap_team_persists_yaml_and_can_resume() {
+    let root = support::use_temp_workspace_root("bootstrap-team");
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &team_bootstrap_body(root.path()).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["workers"][0]["state"]["name"], "Researcher");
+    assert_eq!(
+        body["agent"]["state"]["config"]["settings"]["additional"]["workspaceRole"],
+        "lead"
+    );
+    assert!(
+        body["workers"][0]["state"]["config"]["settings"]["additional"]["workspaceRole"].is_null()
+    );
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(root.path().join("anima.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(yaml["agents"][0]["name"], "Researcher");
+    let fresh = test_app();
+    let (status, body) = resume_workspace(&fresh, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let resumed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        resumed["orchestrator"]["state"]["config"]["settings"]["additional"]["workspaceRole"],
+        "lead"
+    );
+    let (_, agents) = send_empty_request(&fresh, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 2);
+}
+
+#[tokio::test]
+async fn bootstrap_team_validates_all_workers_before_mutation() {
+    let root = support::use_temp_workspace_root("bootstrap-team-invalid");
+    for (field, value) in [
+        ("name", serde_json::json!(" anima ")),
+        ("name", serde_json::json!(" ")),
+        ("system", serde_json::json!(" ")),
+        ("bio", serde_json::json!(" ")),
+        ("model", serde_json::json!(" ")),
+        ("provider", serde_json::json!("other-provider")),
+        ("tools", serde_json::json!([])),
+        ("presetId", serde_json::json!("missing-preset")),
+        ("tools", serde_json::json!(["missing_tool"])),
+    ] {
+        let app = test_app();
+        let candidate = root.path().join(field);
+        let mut request = team_bootstrap_body(&candidate);
+        request["workers"][0][field] = value;
+        let (status, body) = send_json_request(
+            &app,
+            "POST",
+            "/api/workspace/bootstrap",
+            &request.to_string(),
+        )
+        .await;
+        assert_eq!(status, 400, "{field}: {body}");
+        assert!(!candidate.exists(), "invalid team must not create root");
+        let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+        assert_eq!(roster(&agents).len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_team_rolls_back_every_agent_on_yaml_failure() {
+    let root = support::use_temp_workspace_root("bootstrap-team-rollback");
+    std::fs::create_dir(root.path().join("anima.yaml")).unwrap();
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &team_bootstrap_body(root.path()).to_string(),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 0);
+}
+
+#[tokio::test]
+async fn bootstrap_team_survives_restart_and_persist_failure_rolls_back() {
+    let workspace = support::use_temp_workspace_root("bootstrap-team-persist");
+    let control_plane_path = workspace.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    let root = workspace.path().join("team");
+    let app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    std::fs::remove_file(&control_plane_path).unwrap();
+    std::fs::create_dir(&control_plane_path).unwrap();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &team_bootstrap_body(&root).to_string(),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 0);
+    assert!(!root.join("anima.yaml").exists());
+    let (_, body) = send_empty_request(&app, "GET", "/api/workspace").await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["configured"],
+        false
+    );
+    std::fs::remove_dir(&control_plane_path).unwrap();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &team_bootstrap_body(&root).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    drop(app);
+    let restored = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    let (_, agents) = send_empty_request(&restored, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 2, "{agents}");
+    assert!(roster(&agents).iter().any(|(_, name)| name == "Researcher"));
+    let agents: serde_json::Value = serde_json::from_str(&agents).unwrap();
+    let lead = agents["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["state"]["name"] == "Anima")
+        .unwrap();
+    assert_eq!(
+        lead["state"]["config"]["settings"]["additional"]["workspaceRole"],
+        "lead"
+    );
+}
+
+#[tokio::test]
+async fn bootstrap_team_limit_and_concurrent_requests() {
+    let root = support::use_temp_workspace_root("bootstrap-team-race");
+    let app = test_app();
+    let mut request = team_bootstrap_body(root.path());
+    let worker = request["workers"][0].clone();
+    request["workers"] = serde_json::Value::Array(
+        (0..10)
+            .map(|i| {
+                let mut worker = worker.clone();
+                worker["name"] = serde_json::json!(format!("Worker {i}"));
+                worker
+            })
+            .collect(),
+    );
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &request.to_string(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    request["workers"].as_array_mut().unwrap().pop();
+    let request = request.to_string();
+    let (first, second) = tokio::join!(
+        send_json_request(&app, "POST", "/api/workspace/bootstrap", &request),
+        send_json_request(&app, "POST", "/api/workspace/bootstrap", &request)
+    );
+    let mut statuses = [first.0, second.0];
+    statuses.sort();
+    assert_eq!(statuses, [201, 409], "{first:?} {second:?}");
+    let (_, agents) = send_empty_request(&app, "GET", "/api/agents").await;
+    assert_eq!(roster(&agents).len(), 10);
 }

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anima_core::{AgentConfig, AgentRuntimeSnapshot, ToolDescriptor};
+use anima_core::{AgentConfig, AgentRuntimeSnapshot, AgentSettings, DataValue, ToolDescriptor};
 use atomicwrites::{AllowOverwrite, AtomicFile};
 
 use super::agencies::{load_agency_yaml, AgencyYamlAgent, AgencyYamlConfig};
@@ -27,7 +27,7 @@ fn workspace_avatar_path(root: &Path) -> PathBuf {
         .join(WORKSPACE_AVATAR_FILE)
 }
 
-fn detect_avatar_media_type(bytes: &[u8]) -> Option<&'static str> {
+pub(super) fn detect_avatar_media_type(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
@@ -277,39 +277,19 @@ pub(crate) async fn handle_put_workspace(
     handle_get_workspace(state).await
 }
 
-pub(crate) async fn handle_bootstrap_workspace(
-    body: Vec<u8>,
-    state: &SharedDaemonState,
-) -> Result<WorkspaceBootstrapResponse, ApiError> {
-    let request: WorkspaceBootstrapRequest = super::parse_json_body(body)?;
-
-    // Refuse to bootstrap twice: a configured workspace means this daemon was
-    // already bootstrapped.
-    {
-        let guard = state.read().await;
-        if guard.workspace.is_some() {
-            return Err(ApiError::conflict("workspace is already bootstrapped"));
-        }
+fn workspace_lead_settings() -> AgentSettings {
+    AgentSettings {
+        additional: BTreeMap::from([(
+            "workspaceRole".to_string(),
+            DataValue::String("lead".to_string()),
+        )]),
+        ..AgentSettings::default()
     }
+}
 
-    // 1. Validate EVERYTHING before any side effect. Workspace validation runs
-    //    with validate_only forced off so the root directory is created and
-    //    canonicalized up front.
-    let mut workspace_request = request.workspace;
-    workspace_request.validate_only = false;
-    let workspace_config = validate_workspace_request(&workspace_request)?;
-
-    // A leftover agency file at the target root also means the workspace was
-    // bootstrapped before (possibly by an earlier daemon run).
-    let yaml_path = workspace_config.root_path.join("anima.yaml");
-    if yaml_path.is_file() {
-        return Err(ApiError::conflict(format!(
-            "anima.yaml already exists at {}",
-            yaml_path.display()
-        )));
-    }
-
-    let agent = request.agent;
+fn prepare_bootstrap_agent(
+    agent: super::contracts::BootstrapAgentRequest,
+) -> Result<(AgentConfig, AgencyYamlAgent), ApiError> {
     let name = agent.name.trim().to_string();
     if name.is_empty() {
         return Err(ApiError::bad_request_static("agent.name is required"));
@@ -342,7 +322,7 @@ pub(crate) async fn handle_bootstrap_workspace(
         ));
     }
 
-    // 2. Build the AgentConfig with name-only tool descriptors; create_agent
+    // Build the AgentConfig with name-only tool descriptors; create_agent
     //    canonicalizes them against the registry before mutating state.
     let non_blank = |value: Option<String>| {
         value
@@ -392,35 +372,123 @@ pub(crate) async fn handle_bootstrap_workspace(
         settings: None,
     };
 
-    // 3. One state write: create the agent (tool slugs are validated before
-    //    any mutation inside create_agent) and set the workspace config.
-    let (snapshot, persist_request) = {
+    let yaml = AgencyYamlAgent::orchestrator(
+        name,
+        bio,
+        style,
+        system,
+        Some(model),
+        Some(tool_names),
+        adjectives,
+    );
+    Ok((config, yaml))
+}
+
+pub(crate) async fn handle_bootstrap_workspace(
+    body: Vec<u8>,
+    state: &SharedDaemonState,
+) -> Result<WorkspaceBootstrapResponse, ApiError> {
+    let request: WorkspaceBootstrapRequest = super::parse_json_body(body)?;
+
+    // Refuse to bootstrap twice: a configured workspace means this daemon was
+    // already bootstrapped.
+    {
+        let guard = state.read().await;
+        if guard.workspace.is_some() {
+            return Err(ApiError::conflict("workspace is already bootstrapped"));
+        }
+    }
+
+    if request.workers.len() > 9 {
+        return Err(ApiError::bad_request_static(
+            "workers must contain at most 9 agents",
+        ));
+    }
+    let mut names = std::collections::BTreeSet::new();
+    let mut team = std::iter::once(request.agent)
+        .chain(request.workers)
+        .map(prepare_bootstrap_agent)
+        .collect::<Result<Vec<_>, _>>()?;
+    // Persist identity independently of creation time: a team can share timestamps.
+    team[0].0.settings = Some(workspace_lead_settings());
+    let provider = team[0].0.provider.clone();
+    for (config, _) in &team {
+        if !names.insert(config.name.to_lowercase()) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate agent name '{}'",
+                config.name
+            )));
+        }
+        if config.provider != provider {
+            return Err(ApiError::bad_request_static(
+                "workers must use the lead agent's provider",
+            ));
+        }
+    }
+    {
+        let guard = state.read().await;
+        for (config, _) in &team {
+            guard
+                .tool_registry
+                .validate_tools(config.tools.as_deref())
+                .map_err(ApiError::bad_request)?;
+        }
+    }
+    // Validate the complete team before creating even the workspace directory.
+    let mut workspace_request = request.workspace;
+    workspace_request.validate_only = false;
+    let workspace_config = validate_workspace_request(&workspace_request)?;
+    let yaml_path = workspace_config.root_path.join("anima.yaml");
+    if yaml_path.is_file() {
+        return Err(ApiError::conflict(format!(
+            "anima.yaml already exists at {}",
+            yaml_path.display()
+        )));
+    }
+    let model = team[0].0.model.clone();
+    let mut snapshots = Vec::with_capacity(team.len());
+    let persist_request = {
         let mut guard = state.write().await;
-        let snapshot = guard.create_agent(config).map_err(ApiError::bad_request)?;
+        // Route callers hold the control-plane transaction for this whole handler.
+        // Recheck under the write lock as well, before creating any team members.
+        if guard.workspace.is_some() {
+            return Err(ApiError::conflict("workspace is already bootstrapped"));
+        }
+        for (config, _) in &team {
+            match guard.create_agent(config.clone()) {
+                Ok(snapshot) => snapshots.push(snapshot),
+                Err(error) => {
+                    for snapshot in &snapshots {
+                        guard.remove_agent(&snapshot.state.id);
+                    }
+                    return Err(ApiError::bad_request(error));
+                }
+            }
+        }
         guard.workspace = Some(workspace_config.clone());
-        (snapshot, guard.control_plane_persist_request())
+        guard.control_plane_persist_request()
     };
 
-    // 4. Write anima.yaml at the workspace root AFTER the agent exists,
+    // Write anima.yaml at the workspace root after the entire team exists,
     //    atomically (tmp file + rename within the same directory, i.e. the
     //    same filesystem). On IO failure roll back the state write so
     //    bootstrap stays atomic.
-    let agency_yaml = AgencyYamlConfig::single_orchestrator(
+    let (_, lead_yaml) = team.remove(0);
+    let mut agency_yaml = AgencyYamlConfig::single_orchestrator(
         workspace_config.company_name.clone(),
         workspace_config.mission.clone(),
         workspace_config.values.clone(),
         provider.unwrap_or_default(),
-        model.clone(),
-        AgencyYamlAgent::orchestrator(
-            name,
-            bio,
-            style,
-            system,
-            Some(model),
-            Some(tool_names),
-            adjectives,
-        ),
+        model,
+        lead_yaml,
     );
+    agency_yaml.agents = team
+        .into_iter()
+        .map(|(_, mut yaml)| {
+            yaml.position = None;
+            yaml
+        })
+        .collect();
     let tmp_path = workspace_config.root_path.join("anima.yaml.tmp");
     let write_result = serde_yaml::to_string(&agency_yaml)
         .map_err(|error| format!("failed to serialize agency yaml: {error}"))
@@ -430,29 +498,33 @@ pub(crate) async fn handle_bootstrap_workspace(
                 .map_err(|error| format!("failed to write anima.yaml: {error}"))
         });
     if let Err(message) = write_result {
-        rollback_bootstrap(state, &snapshot.state.id, &yaml_path, &tmp_path).await;
+        rollback_bootstrap(state, &snapshots, &yaml_path, &tmp_path).await;
         return Err(ApiError::service_unavailable(message));
     }
 
-    // 5. Persist the control-plane snapshot last; a failure here rolls back
+    // Persist the control-plane snapshot last; a failure here rolls back
     //    exactly like a yaml-write failure.
     if let Err(error) = persist_request.save().await {
-        rollback_bootstrap(state, &snapshot.state.id, &yaml_path, &tmp_path).await;
+        rollback_bootstrap(state, &snapshots, &yaml_path, &tmp_path).await;
         return Err(ApiError::service_unavailable(error.to_string()));
     }
 
     Ok(WorkspaceBootstrapResponse {
         workspace: config_response(&workspace_config),
-        agent: AgentRuntimeSnapshotResponse::from(&snapshot),
+        agent: AgentRuntimeSnapshotResponse::from(&snapshots[0]),
+        workers: snapshots[1..]
+            .iter()
+            .map(AgentRuntimeSnapshotResponse::from)
+            .collect(),
     })
 }
 
-/// Undo a partially applied bootstrap: drop the agent and workspace state,
+/// Undo a partially applied bootstrap: drop the team and workspace state,
 /// remove any written agency yaml files, and persist the rolled-back state on
 /// a best-effort basis.
 async fn rollback_bootstrap(
     state: &SharedDaemonState,
-    agent_id: &str,
+    snapshots: &[AgentRuntimeSnapshot],
     yaml_path: &Path,
     tmp_path: &Path,
 ) {
@@ -460,7 +532,9 @@ async fn rollback_bootstrap(
     std::fs::remove_file(yaml_path).ok();
     let rollback_request = {
         let mut guard = state.write().await;
-        guard.remove_agent(agent_id);
+        for snapshot in snapshots {
+            guard.remove_agent(&snapshot.state.id);
+        }
         guard.workspace = None;
         guard.control_plane_persist_request()
     };
@@ -583,7 +657,7 @@ pub(crate) async fn handle_resume_workspace(
                         .collect::<Vec<_>>()
                 }),
                 plugins: None,
-                settings: None,
+                settings: is_orchestrator.then(workspace_lead_settings),
             })
         };
     // Reject yaml-internal duplicate names before any mutation; create_agent

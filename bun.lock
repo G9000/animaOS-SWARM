@@ -114,6 +114,9 @@
     "apps/web-e2e": {
       "name": "@animaOS-SWARM/web-e2e",
       "version": "0.0.1",
+      "devDependencies": {
+        "@animaOS-SWARM/sdk": "workspace:*",
+      },
     },
     "mods/crypto-trader": {
       "name": "@animaOS-SWARM/crypto-trader",

@@ -36,7 +36,7 @@ export interface WorkspaceStepProps {
   onResumeModeChange?(mode: boolean): void;
   onInspect?(): void;
   companyInputRef: RefObject<HTMLInputElement | null>;
-  missionInputRef?: RefObject<HTMLInputElement | null>;
+  missionInputRef?: RefObject<HTMLTextAreaElement | null>;
   rootPathInputRef?: RefObject<HTMLInputElement | null>;
   validationErrorId?: string;
 }
@@ -80,7 +80,7 @@ export function WorkspaceStep({
   return (
     <section
       aria-labelledby="onboarding-workspace-heading"
-      className="space-y-5"
+      className="space-y-8"
     >
       <div>
         <h2
@@ -118,17 +118,24 @@ export function WorkspaceStep({
       {!resumeMode ? (
         <div>
           <label htmlFor="onboarding-mission" className={labelCls}>
-            Mission (one sentence)
+            Workspace brief
           </label>
-          <input
+          <textarea
             ref={missionInputRef}
             id="onboarding-mission"
-            className="field"
+            className="field min-h-48 resize-y leading-relaxed"
+            rows={7}
+            aria-describedby="onboarding-brief-help"
             value={mission}
             onChange={(event) => onMissionChange(event.target.value)}
             autoComplete="off"
-            placeholder="What is this company for?"
+            placeholder="Describe what you do, who you serve, and what you want to achieve. Include the content or services you need, channels, workflows, brand voice, constraints, and examples."
           />
+          <p id="onboarding-brief-help" className="mt-3 text-sm leading-relaxed text-ink-3">
+            Share as much useful detail as you can. We use this brief to shape
+            your custom team and guide your workspace manager. Paragraphs and
+            bullet points are welcome.
+          </p>
         </div>
       ) : null}
 

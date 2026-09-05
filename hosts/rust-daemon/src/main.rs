@@ -24,6 +24,10 @@ async fn main() -> io::Result<()> {
             default_config.request_timeout.as_secs(),
         )?),
         persistence_mode: parse_persistence_mode(default_config.persistence_mode)?,
+        run_request_timeout: Duration::from_secs(parse_env_u64(
+            "ANIMAOS_RS_RUN_REQUEST_TIMEOUT_SECS",
+            default_config.run_request_timeout.as_secs(),
+        )?),
         max_concurrent_runs: parse_env_usize(
             "ANIMAOS_RS_MAX_CONCURRENT_RUNS",
             default_config.max_concurrent_runs,
@@ -44,6 +48,7 @@ async fn main() -> io::Result<()> {
     info!(
         address = %local_addr,
         timeout_secs = config.request_timeout.as_secs(),
+        run_timeout_secs = config.run_request_timeout.as_secs(),
         persistence_mode = config.persistence_mode.as_str(),
         max_concurrent_runs = config.max_concurrent_runs,
         max_background_processes = config.max_background_processes,

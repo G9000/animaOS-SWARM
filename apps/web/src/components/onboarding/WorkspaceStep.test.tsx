@@ -28,7 +28,7 @@ describe('WorkspaceStep', () => {
   it('renders company, mission, folder, and values fields', () => {
     setup();
     expect(screen.getByLabelText(/company name/i)).toBeInTheDocument();
-    expect(screen.getByLabelText(/mission/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/workspace brief/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/office location/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/values/i)).toBeInTheDocument();
   });

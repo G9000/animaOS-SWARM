@@ -231,7 +231,8 @@ describe('SettingsPanel access', () => {
     const name = screen.getByDisplayValue('Nova');
     await user.clear(name);
     await user.type(name, 'Nova Prime');
-    const [provider, model] = screen.getAllByRole('combobox');
+    const provider = screen.getByRole('combobox', { name: 'Provider' });
+    const model = screen.getByRole('combobox', { name: 'Model' });
     await user.selectOptions(provider, 'anthropic');
     await user.selectOptions(model, '__custom__');
     await user.type(
@@ -389,4 +390,19 @@ describe('SettingsPanel access', () => {
       expect(close).toHaveBeenCalledTimes(3);
     },
   );
+});
+
+it('replaces a personality style saved at the start of an otherwise empty prompt', async () => {
+  renderPanel(
+    agent({ system: '[Personality style]\nBe calm.\n[/Personality style]' }),
+  );
+  fireEvent.change(screen.getByLabelText('Add a personality style'), {
+    target: { value: 'direct' },
+  });
+  const prompt = screen.getByRole('textbox', {
+    name: 'System prompt',
+  }) as HTMLTextAreaElement;
+  expect(prompt.value).toContain('Be direct, practical, and concise.');
+  expect(prompt.value).not.toContain('Be calm.');
+  expect(prompt.value.match(/\[Personality style\]/g)).toHaveLength(1);
 });

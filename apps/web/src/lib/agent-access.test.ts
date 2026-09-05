@@ -61,7 +61,11 @@ function agent(id: string, createdAtMs: number): AgentDetail {
 
 describe('workspace access profiles', () => {
   it('defines presentation metadata for every profile', () => {
-    expect(Object.keys(ACCESS_PROFILES)).toEqual(['observe', 'collaborate', 'operate']);
+    expect(Object.keys(ACCESS_PROFILES)).toEqual([
+      'observe',
+      'collaborate',
+      'operate',
+    ]);
 
     for (const profile of Object.values(ACCESS_PROFILES)) {
       expect(profile.label).not.toHaveLength(0);
@@ -94,9 +98,12 @@ describe('workspace access profiles', () => {
     ['observe', OBSERVE_TOOLS],
     ['collaborate', COLLABORATE_TOOLS],
     ['operate', OPERATE_TOOLS],
-  ] as const)('derives %s from the exact set regardless of order', (profile, tools) => {
-    expect(deriveAccessProfile([...tools].reverse())).toBe(profile);
-  });
+  ] as const)(
+    'derives %s from the exact set regardless of order',
+    (profile, tools) => {
+      expect(deriveAccessProfile([...tools].reverse())).toBe(profile);
+    },
+  );
 
   it('derives custom for an unmatched set', () => {
     expect(deriveAccessProfile(['read_file'])).toBe('custom');
@@ -108,6 +115,11 @@ describe('workspace access profiles', () => {
 });
 
 describe('selectMainAgent', () => {
+  it('prefers the persisted agency lead over creation-time ties or older workers', () => {
+    const worker = agent('a-worker', 10);
+    const lead = { ...agent('z-lead', 20), workspaceRole: 'lead' as const };
+    expect(selectMainAgent([worker, lead])).toBe(lead);
+  });
   it('returns null when no agents exist', () => {
     expect(selectMainAgent([])).toBeNull();
   });

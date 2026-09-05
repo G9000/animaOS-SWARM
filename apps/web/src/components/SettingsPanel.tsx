@@ -13,6 +13,8 @@ import {
   type DaemonWorkspaceState,
 } from '../lib/daemon-api';
 import { AlertIcon, TrashIcon, XIcon } from './icons';
+import { AgentProfileDetails, AgentMemoryView } from './AgentProfileDetails';
+import { AgentTasksView, AgentProactiveView } from './AgentWork';
 import {
   ErrorBanner,
   SectionTitle,
@@ -97,6 +99,9 @@ export function SettingsPanel({
   const derivedAccess = deriveAccessProfile(agent.toolNames);
 
   const [name, setName] = useState(agent.name);
+  const [profileTab, setProfileTab] = useState<
+    'profile' | 'tasks' | 'proactive' | 'memory' | 'activity'
+  >('profile');
   const [provider, setProvider] = useState(agent.provider);
   const [model, setModel] = useState(seedModel);
   const [customModel, setCustomModel] = useState(
@@ -288,285 +293,416 @@ export function SettingsPanel({
           </button>
         </div>
 
+        <nav
+          aria-label="Agent profile sections"
+          className="flex shrink-0 gap-1 overflow-x-auto border-b border-line px-3 py-3"
+        >
+          {(
+            ['profile', 'tasks', 'proactive', 'memory', 'activity'] as const
+          ).map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              aria-current={profileTab === tab ? 'page' : undefined}
+              className={`shrink-0 rounded-lg px-3 py-2 text-sm capitalize ${profileTab === tab ? 'bg-accent/15 font-semibold' : 'text-ink-3'}`}
+              onClick={() => setProfileTab(tab)}
+            >
+              {tab}
+            </button>
+          ))}
+        </nav>
         <div className="flex flex-1 flex-col gap-7 overflow-y-auto px-5 py-6 sm:px-6">
-          {/* Runtime info (read-only) */}
-          <section className="space-y-2.5">
-            <SectionTitle>Runtime</SectionTitle>
-            <InfoRow label="Status" value={agent.status.toLowerCase()} />
-            <InfoRow
-              label="Created"
-              value={new Date(agent.created_at_ms).toLocaleString([], {
-                month: 'short',
-                day: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-              })}
+          {profileTab === 'tasks' && (
+            <AgentTasksView
+              key={agent.id}
+              agentId={agent.id}
+              name={agent.name}
+              running={agent.status === 'Running'}
             />
-            <InfoRow
-              label="Tokens"
-              value={formatTokens(agent.token_usage.total_tokens)}
+          )}
+          {profileTab === 'proactive' && (
+            <AgentProactiveView
+              key={agent.id}
+              agentId={agent.id}
+              name={agent.name}
             />
-          </section>
-
-          {/* Workspace identity (read-only — editing is a follow-up) */}
-          {workspace?.configured && workspace.workspace !== null ? (
-            <section className="space-y-2.5">
-              <SectionTitle>Workspace</SectionTitle>
-              <InfoRow
-                label="Company"
-                value={workspace.workspace.companyName}
-                mono={false}
-              />
-              <InfoRow
-                label="Mission"
-                value={workspace.workspace.mission}
-                mono={false}
-              />
-              <InfoRow label="Folder" value={workspace.workspace.rootPath} />
-            </section>
-          ) : null}
-
-          {/* Editable identity */}
-          <section className="space-y-2.5">
-            <SectionTitle>Identity</SectionTitle>
-            <div>
-              <label className={labelCls}>Name</label>
-              <input
-                aria-label="Name"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                disabled={controlsDisabled}
-                className="field"
-              />
-            </div>
-            <div>
-              <label className={labelCls}>Provider</label>
-              <select
-                aria-label="Provider"
-                value={provider}
-                disabled={controlsDisabled}
-                onChange={(e) => {
-                  const next = e.target.value;
-                  setProvider(next);
-                  const options = MODEL_SUGGESTIONS[next] ?? [];
-                  setModel(options[0] ?? '__custom__');
-                }}
-                className="field"
-              >
-                {/* Keep the current provider selectable even if the daemon
-                    catalog is still loading or lacks it. */}
-                {(providers ?? [])
-                  .map((p) => p.id)
-                  .concat(
-                    providers?.some((p) => p.id === agent.provider) ||
-                      !agent.provider
-                      ? []
-                      : [agent.provider],
-                  )
-                  .filter((id, i, all) => all.indexOf(id) === i)
-                  .map((id) => (
-                    <option key={id} value={id}>
-                      {id}
-                    </option>
-                  ))}
-              </select>
-              {providers && (
-                <p className="mt-1.5 font-mono text-[10px] text-ink-3">
-                  {providers.find((p) => p.id === provider)?.configured
-                    ? 'key configured on the daemon'
-                    : 'no key configured for this provider on the daemon'}
+          )}
+          {profileTab === 'memory' && (
+            <AgentMemoryView key={agent.id} agentId={agent.id} />
+          )}
+          {profileTab === 'activity' && (
+            <section className="space-y-5" aria-label="Agent activity">
+              <h4 className="font-semibold">Recent activity</h4>
+              <InfoRow label="Status" value={agent.status.toLowerCase()} />
+              <p className="text-sm text-ink-3">
+                {agent.toolNames.length} tools available ·{' '}
+                {agent.messages.length} conversation entries
+              </p>
+              {agent.messages.length === 0 && (
+                <p className="text-sm text-ink-3">
+                  No activity yet. Start a conversation with {agent.name}.
                 </p>
               )}
-            </div>
-            <div>
-              <label className={labelCls}>Model</label>
-              <select
-                aria-label="Model"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                disabled={controlsDisabled}
-                className="field"
-              >
-                {(MODEL_SUGGESTIONS[provider] ?? []).map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-                <option value="__custom__">custom…</option>
-              </select>
-            </div>
-            {model === '__custom__' && (
-              <input
-                aria-label="Custom model"
-                value={customModel}
-                onChange={(e) => setCustomModel(e.target.value)}
-                disabled={controlsDisabled}
-                placeholder="model id, e.g. llama3.1"
-                className="field animate-fade-in"
-              />
-            )}
-          </section>
-
-          {/* Workspace access */}
-          <section className="space-y-2.5">
-            <SectionTitle>Workspace access</SectionTitle>
-            {derivedAccess === 'custom' ? (
-              <div className="rounded-xl border border-amber/25 bg-amber/[0.05] p-3.5">
-                <p className="text-sm font-semibold text-ink">Custom access</p>
-                <p className="mt-1 text-xs leading-relaxed text-ink-2">
-                  This agent has a custom tool set. Choose a standard profile to
-                  replace it when you save.
-                </p>
-                <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-ink-3">
-                  {agent.toolNames.length} tools configured
-                </p>
-                <p className="mt-1 break-words font-mono text-[10px] leading-relaxed text-ink-3">
-                  {agent.toolNames.join(', ') || 'No tools configured'}
-                </p>
-              </div>
-            ) : null}
-            <fieldset disabled={controlsDisabled} className="space-y-2">
-              <legend className={labelCls}>Access profile</legend>
-              {ACCESS_ORDER.map((profileName) => {
-                const profile = ACCESS_PROFILES[profileName];
-                const inputId = `settings-access-${profileName}`;
-
-                return (
-                  <div
-                    key={profileName}
-                    className={`rounded-xl border p-3.5 transition ${
-                      accessSelection === profileName
-                        ? 'border-accent/50 bg-accent/[0.07]'
-                        : 'border-line bg-white/[0.015] hover:border-line-strong'
-                    }`}
+              {agent.messages
+                .slice(-30)
+                .reverse()
+                .map((message) => (
+                  <article
+                    key={message.id}
+                    className="space-y-2 rounded-xl border border-line p-4"
                   >
-                    <input
-                      id={inputId}
-                      type="radio"
-                      name="settings-access"
-                      value={profileName}
-                      checked={accessSelection === profileName}
-                      onChange={() => {
-                        setAccessSelection(profileName);
-                        setAccessChanged(true);
-                      }}
-                      className="mr-3 h-4 w-4 align-top"
-                    />
-                    <label htmlFor={inputId} className="inline cursor-pointer">
-                      <span className="font-medium text-ink">
-                        {profile.label}
-                      </span>
-                      <span className="mt-1 block pl-7 text-sm text-ink-2">
-                        {profile.summary}
-                      </span>
-                      <span className="mt-1 block pl-7 text-xs text-ink-3">
-                        {profile.risk}
-                      </span>
-                    </label>
-                  </div>
-                );
-              })}
-            </fieldset>
-          </section>
-
-          {/* System prompt */}
-          <section className="space-y-2.5">
-            <SectionTitle>System prompt</SectionTitle>
-            <textarea
-              aria-label="System prompt"
-              value={system}
-              onChange={(e) => setSystem(e.target.value)}
-              disabled={controlsDisabled}
-              rows={6}
-              placeholder="Leave empty for the daemon default."
-              className="field resize-y leading-relaxed"
-            />
-            <p className="font-mono text-[10px] text-ink-3">
-              cleared = daemon builds its default prompt from the agent profile
-            </p>
-          </section>
-
-          {integrations}
-
-          {saveError ? (
-            <div
-              id="settings-save-error"
-              ref={saveErrorRef}
-              role="alert"
-              aria-live="assertive"
-              aria-atomic="true"
-              tabIndex={-1}
-            >
-              <ErrorBanner message={saveError} icon={<AlertIcon size={14} />} />
-            </div>
-          ) : null}
-          {resetError ? (
-            <div
-              id="settings-reset-error"
-              ref={resetErrorRef}
-              role="alert"
-              aria-live="assertive"
-              aria-atomic="true"
-              tabIndex={-1}
-            >
-              <ErrorBanner
-                message={resetError}
-                icon={<AlertIcon size={14} />}
+                    <p className="text-xs text-ink-3">
+                      {message.role} ·{' '}
+                      {message.roomId?.startsWith('peer:')
+                        ? 'Agent conversation'
+                        : 'Direct conversation'}{' '}
+                      · {new Date(message.created_at_ms).toLocaleString()}
+                    </p>
+                    <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">
+                      {message.content.text}
+                    </p>
+                  </article>
+                ))}
+            </section>
+          )}
+          {profileTab === 'profile' && (
+            <>
+              <AgentProfileDetails
+                key={agent.id}
+                agent={agent}
+                disabled={controlsDisabled}
               />
-            </div>
-          ) : null}
-          {resetting ? (
-            <p
-              role="status"
-              aria-live="polite"
-              aria-atomic="true"
-              className="sr-only"
-            >
-              Resetting agent…
-            </p>
-          ) : null}
+              {/* System prompt */}
+              <section className="space-y-2.5">
+                <SectionTitle>Personality & instructions</SectionTitle>
+                <p className="text-sm leading-relaxed text-ink-3">
+                  Describe their role, voice, priorities, and how you want them
+                  to work. These instructions shape the next conversation turn.
+                </p>
+                <label className={labelCls} htmlFor="personality-preset">
+                  Add a personality style
+                </label>
+                <select
+                  id="personality-preset"
+                  className="field"
+                  disabled={controlsDisabled}
+                  value=""
+                  onChange={(event) => {
+                    const styles: Record<string, string> = {
+                      calm: 'Be calm, patient, and thoughtful. Explain clearly and ask when the request is ambiguous.',
+                      creative:
+                        'Be imaginative, curious, and encouraging. Offer concrete creative options and help develop promising ideas.',
+                      direct:
+                        'Be direct, practical, and concise. Lead with the outcome and explain important trade-offs.',
+                      proactive:
+                        'Be organized and proactive during assigned work. Identify useful next steps within the agreed scope and existing tool permissions. Do not assume permission for external actions or background work.',
+                    };
+                    if (styles[event.target.value])
+                      setSystem(
+                        (current) =>
+                          `${current.replace(/(?:^|\n\n)\[Personality style\][\s\S]*?\[\/Personality style\]/g, '').trim()}\n\n[Personality style]\n${styles[event.target.value]}\n[/Personality style]`,
+                      );
+                  }}
+                >
+                  <option value="">Choose a style…</option>
+                  <option value="calm">Calm & thoughtful</option>
+                  <option value="creative">Creative & curious</option>
+                  <option value="direct">Direct & practical</option>
+                  <option value="proactive">Organized & proactive</option>
+                </select>
+                <textarea
+                  aria-label="System prompt"
+                  value={system}
+                  onChange={(e) => setSystem(e.target.value)}
+                  disabled={controlsDisabled}
+                  rows={6}
+                  placeholder="Leave empty for the daemon default."
+                  className="field resize-y leading-relaxed"
+                />
+                <p className="font-mono text-[10px] text-ink-3">
+                  cleared = daemon builds its default prompt from the agent
+                  profile
+                </p>
+              </section>
 
-          <button
-            onClick={save}
-            aria-describedby={saveError ? 'settings-save-error' : undefined}
-            disabled={
-              saving || resetting || !dirty || !resolvedModel || !name.trim()
-            }
-            className={`${primaryBtnCls} w-full py-2.5`}
-          >
-            {saving
-              ? 'Saving…'
-              : savedFlash
-                ? 'Saved ✓'
-                : dirty
-                  ? 'Save changes'
-                  : 'No changes'}
-          </button>
+              {/* Runtime info (read-only) */}
+              <section className="space-y-2.5">
+                <SectionTitle>Runtime</SectionTitle>
+                <InfoRow label="Status" value={agent.status.toLowerCase()} />
+                <InfoRow
+                  label="Created"
+                  value={new Date(agent.created_at_ms).toLocaleString([], {
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}
+                />
+                <InfoRow
+                  label="Tokens"
+                  value={formatTokens(agent.token_usage.total_tokens)}
+                />
+              </section>
 
-          {/* Danger zone */}
-          <section className="rounded-xl border border-danger/20 bg-danger/[0.04] p-4">
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <div className="text-xs font-semibold text-danger">
-                  Reset agent
+              {/* Workspace identity (read-only — editing is a follow-up) */}
+              {workspace?.configured && workspace.workspace !== null ? (
+                <section className="space-y-2.5">
+                  <SectionTitle>Workspace</SectionTitle>
+                  <InfoRow
+                    label="Company"
+                    value={workspace.workspace.companyName}
+                    mono={false}
+                  />
+                  <InfoRow
+                    label="Mission"
+                    value={workspace.workspace.mission}
+                    mono={false}
+                  />
+                  <InfoRow
+                    label="Folder"
+                    value={workspace.workspace.rootPath}
+                  />
+                </section>
+              ) : null}
+
+              {/* Editable identity */}
+              <section className="space-y-2.5">
+                <SectionTitle>Identity</SectionTitle>
+                <div>
+                  <label className={labelCls}>Name</label>
+                  <input
+                    aria-label="Name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    disabled={controlsDisabled}
+                    className="field"
+                  />
                 </div>
-                <div className="mt-0.5 text-[11px] leading-relaxed text-danger">
-                  deletes the agent and its entire conversation
+                <div>
+                  <label className={labelCls}>Provider</label>
+                  <select
+                    aria-label="Provider"
+                    value={provider}
+                    disabled={controlsDisabled}
+                    onChange={(e) => {
+                      const next = e.target.value;
+                      setProvider(next);
+                      const options = MODEL_SUGGESTIONS[next] ?? [];
+                      setModel(options[0] ?? '__custom__');
+                    }}
+                    className="field"
+                  >
+                    {/* Keep the current provider selectable even if the daemon
+                    catalog is still loading or lacks it. */}
+                    {(providers ?? [])
+                      .map((p) => p.id)
+                      .concat(
+                        providers?.some((p) => p.id === agent.provider) ||
+                          !agent.provider
+                          ? []
+                          : [agent.provider],
+                      )
+                      .filter((id, i, all) => all.indexOf(id) === i)
+                      .map((id) => (
+                        <option key={id} value={id}>
+                          {id}
+                        </option>
+                      ))}
+                  </select>
+                  {providers && (
+                    <p className="mt-1.5 font-mono text-[10px] text-ink-3">
+                      {providers.find((p) => p.id === provider)?.configured
+                        ? 'key configured on the daemon'
+                        : 'no key configured for this provider on the daemon'}
+                    </p>
+                  )}
                 </div>
-              </div>
+                <div>
+                  <label className={labelCls}>Model</label>
+                  <select
+                    aria-label="Model"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    disabled={controlsDisabled}
+                    className="field"
+                  >
+                    {(MODEL_SUGGESTIONS[provider] ?? []).map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                    <option value="__custom__">custom…</option>
+                  </select>
+                </div>
+                {model === '__custom__' && (
+                  <input
+                    aria-label="Custom model"
+                    value={customModel}
+                    onChange={(e) => setCustomModel(e.target.value)}
+                    disabled={controlsDisabled}
+                    placeholder="model id, e.g. llama3.1"
+                    className="field animate-fade-in"
+                  />
+                )}
+              </section>
+
+              {/* Workspace access */}
+              <section className="space-y-2.5">
+                <SectionTitle>Workspace access</SectionTitle>
+                {derivedAccess === 'custom' ? (
+                  <div className="rounded-xl border border-amber/25 bg-amber/[0.05] p-3.5">
+                    <p className="text-sm font-semibold text-ink">
+                      Custom access
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-ink-2">
+                      This agent has a custom tool set. Choose a standard
+                      profile to replace it when you save.
+                    </p>
+                    <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-ink-3">
+                      {agent.toolNames.length} tools configured
+                    </p>
+                    <p className="mt-1 break-words font-mono text-[10px] leading-relaxed text-ink-3">
+                      {agent.toolNames.join(', ') || 'No tools configured'}
+                    </p>
+                  </div>
+                ) : null}
+                <fieldset disabled={controlsDisabled} className="space-y-2">
+                  <legend className={labelCls}>Access profile</legend>
+                  {ACCESS_ORDER.map((profileName) => {
+                    const profile = ACCESS_PROFILES[profileName];
+                    const inputId = `settings-access-${profileName}`;
+
+                    return (
+                      <div
+                        key={profileName}
+                        className={`rounded-xl border p-3.5 transition ${
+                          accessSelection === profileName
+                            ? 'border-accent/50 bg-accent/[0.07]'
+                            : 'border-line bg-white/[0.015] hover:border-line-strong'
+                        }`}
+                      >
+                        <input
+                          id={inputId}
+                          type="radio"
+                          name="settings-access"
+                          value={profileName}
+                          checked={accessSelection === profileName}
+                          onChange={() => {
+                            setAccessSelection(profileName);
+                            setAccessChanged(true);
+                          }}
+                          className="mr-3 h-4 w-4 align-top"
+                        />
+                        <label
+                          htmlFor={inputId}
+                          className="inline cursor-pointer"
+                        >
+                          <span className="font-medium text-ink">
+                            {profile.label}
+                          </span>
+                          <span className="mt-1 block pl-7 text-sm text-ink-2">
+                            {profile.summary}
+                          </span>
+                          <span className="mt-1 block pl-7 text-xs text-ink-3">
+                            {profile.risk}
+                          </span>
+                        </label>
+                      </div>
+                    );
+                  })}
+                </fieldset>
+              </section>
+
+              {integrations}
+
+              {saveError ? (
+                <div
+                  id="settings-save-error"
+                  ref={saveErrorRef}
+                  role="alert"
+                  aria-live="assertive"
+                  aria-atomic="true"
+                  tabIndex={-1}
+                >
+                  <ErrorBanner
+                    message={saveError}
+                    icon={<AlertIcon size={14} />}
+                  />
+                </div>
+              ) : null}
+              {resetError ? (
+                <div
+                  id="settings-reset-error"
+                  ref={resetErrorRef}
+                  role="alert"
+                  aria-live="assertive"
+                  aria-atomic="true"
+                  tabIndex={-1}
+                >
+                  <ErrorBanner
+                    message={resetError}
+                    icon={<AlertIcon size={14} />}
+                  />
+                </div>
+              ) : null}
+              {resetting ? (
+                <p
+                  role="status"
+                  aria-live="polite"
+                  aria-atomic="true"
+                  className="sr-only"
+                >
+                  Resetting agent…
+                </p>
+              ) : null}
+
               <button
-                onClick={resetAgent}
-                aria-describedby={
-                  resetError ? 'settings-reset-error' : undefined
+                onClick={save}
+                aria-describedby={saveError ? 'settings-save-error' : undefined}
+                disabled={
+                  saving ||
+                  resetting ||
+                  !dirty ||
+                  !resolvedModel ||
+                  !name.trim()
                 }
-                disabled={resetting || saving}
-                className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-danger/30 bg-danger/10 px-3 py-1.5 text-xs font-medium text-danger transition hover:bg-danger/20 disabled:cursor-not-allowed disabled:opacity-50"
+                className={`${primaryBtnCls} w-full py-2.5`}
               >
-                <TrashIcon size={12} />
-                {resetting ? 'Resetting…' : 'Reset'}
+                {saving
+                  ? 'Saving…'
+                  : savedFlash
+                    ? 'Saved ✓'
+                    : dirty
+                      ? 'Save changes'
+                      : 'No changes'}
               </button>
-            </div>
-          </section>
+
+              {/* Danger zone */}
+              <section className="rounded-xl border border-danger/20 bg-danger/[0.04] p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold text-danger">
+                      Reset agent
+                    </div>
+                    <div className="mt-0.5 text-[11px] leading-relaxed text-danger">
+                      deletes the agent and its entire conversation
+                    </div>
+                  </div>
+                  <button
+                    onClick={resetAgent}
+                    aria-describedby={
+                      resetError ? 'settings-reset-error' : undefined
+                    }
+                    disabled={resetting || saving}
+                    className="flex shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-danger/30 bg-danger/10 px-3 py-1.5 text-xs font-medium text-danger transition hover:bg-danger/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <TrashIcon size={12} />
+                    {resetting ? 'Resetting…' : 'Reset'}
+                  </button>
+                </div>
+              </section>
+            </>
+          )}
         </div>
       </aside>
     </>

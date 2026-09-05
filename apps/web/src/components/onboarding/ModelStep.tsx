@@ -78,10 +78,10 @@ export function ModelStep({
           id="onboarding-model-heading"
           className="font-display text-2xl font-semibold tracking-tight text-ink"
         >
-          Intelligence
+          Model
         </h2>
         <p className="mt-1 text-sm text-ink-2">
-          Choose a provider configured on the daemon and a model to run.
+          Choose the AI model your manager and specialists will use.
         </p>
       </div>
 

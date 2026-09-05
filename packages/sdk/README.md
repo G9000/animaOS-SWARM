@@ -7,7 +7,7 @@ This package exports `createDaemonClient`, `AgentsClient`, `ConnectorsClient`, `
 Current SDK coverage includes:
 
 - daemon health checks via `client.health()`
-- agent create, list, get, run, and recent-memory reads
+- agent create, list, get, update, remove, run, peer messages, and recent-memory reads
 - memory create, search, recent-memory reads, entities, evaluated writes, hybrid recall, evidence trace, retention, readiness/eval reporting, and relationships
 - swarm create, get, run, and live SSE event subscriptions
 - Google Calendar connection management and write approvals; Gmail and Outlook connection management, inbox reads, local drafts, and owner-approved sending
@@ -42,6 +42,21 @@ console.log({
   memoryReady: memoryReadiness.passed,
 });
 ```
+
+## Agent conversations
+
+Pass a stable `roomId` to keep subsequent direct turns in the same conversation:
+
+```ts
+await client.agents.run(agentId, { text: 'Plan the release' }, { roomId: 'release-planning' });
+await client.agents.run(agentId, { text: 'Expand the testing steps' }, { roomId: 'release-planning' });
+const peer = await client.agents.sendMessage(agentId, reviewerId, 'Review the release plan');
+console.log(peer.agent.state.id, peer.result.data?.text);
+```
+
+The two-argument `run(agentId, content)` call remains supported. `sendMessage(senderId, toAgentId, message)` requests one bounded recipient run and returns the recipient's `{ agent, result }` envelope, including nullable daemon result fields. It does not start an automatic message loop.
+
+`update(agentId, patch)` supports `name`, `model`, `provider`, `system`, and JSON tool descriptors. Empty `provider` or `system` strings restore defaults; an empty `tools` array clears tools. It returns the updated snapshot. `remove(agentId)` deletes the agent and resolves without a value.
 
 ## Connectors
 
@@ -93,3 +108,15 @@ Integration tests build the Rust daemon with a separate compilation deadline, th
 Agent snapshots use the exported `DaemonAgentState` / `DaemonAgentConfig` types, not executable TypeScript runtime objects. Returned tools have JSON `parameters` and no callable `handler`; returned custom settings are under `settings.additional`. Optional response values are explicitly nullable. Create requests still use `AgentConfig` with flat custom settings: do not pass a returned snapshot config back as a create request unchanged.
 
 Provider credentials and base URLs are configured on the daemon host, not in agent settings. For authenticated deployments, supply a custom `fetch` wrapper that adds `X-Api-Key` while forwarding the request options (including the SSE abort signal).
+
+### Agent profiles and avatars
+
+Use `client.agents.update(id, { name, system })` to edit an agent without replacing its conversation. The system instructions apply on its next run. Use `client.agents.recentMemories(id, { limit: 100 })` to inspect its recorded memory.
+
+`client.agents.setAvatar(id, imageBlob)` stores a PNG, JPEG, or WebP image up to 5 MiB in the configured workspace. `client.agents.removeAvatar(id)` restores the UI fallback. Retrieve image bytes from `GET /api/agents/{agent_id}/avatar` on the daemon origin. Images are served with `Cache-Control: no-store`; they are separate from the workspace avatar and agent configuration JSON.
+
+### Per-agent tasks and proactive schedules
+
+`client.agents.tasks(id)` reads an agent's task list and revision. Pass both to `updateTasks(id, { tasks, revision })`; stale edits return HTTP 409, and UI task saves are rejected while the agent is running. The daemon's `todo_read` and `todo_write` tools use the same per-agent list. Existing shared `todos.json` files remain untouched; they are not copied to every agent.
+
+Use `schedules(id)`, `createSchedule(id, input)`, `updateSchedule(id, scheduleId, { enabled: false })`, and `removeSchedule(id, scheduleId)` to control that agent's proactive work. Schedules persist in the daemon and require it to remain running. Adding a task does not enable a schedule.

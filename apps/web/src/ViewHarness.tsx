@@ -114,13 +114,109 @@ export function ViewHarness() {
     () => agentSnapshots.map((snapshot) => toAgentDetail(snapshot)),
     [agentSnapshots],
   );
-  const agent = selectMainAgent(agents);
+  const mainAgent = selectMainAgent(agents);
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const agent = agents.find((item) => item.id === selectedAgentId) ?? mainAgent;
+  const availableAgentIdsRef = useRef(new Set<string>());
+  availableAgentIdsRef.current = new Set(agents.map((item) => item.id));
 
-  const [draft, setDraft] = useState('');
-  const [failedDrafts, setFailedDrafts] = useState<string[]>([]);
-  const failedDraft = failedDrafts[0] ?? null;
-  const [sending, setSending] = useState(false);
-  const [workspaceError, setWorkspaceError] = useState<string | null>(null);
+  type ChatState = {
+    draft: string;
+    failedDrafts: { requestId: string; text: string }[];
+    sending: boolean;
+    error: string | null;
+  };
+  const [chats, setChats] = useState<Record<string, ChatState>>({});
+  const emptyChat: ChatState = {
+    draft: '',
+    failedDrafts: [],
+    sending: false,
+    error: null,
+  };
+  const chat = chats[agent?.id ?? ''] ?? emptyChat;
+  const { draft, failedDrafts, sending, error: workspaceError } = chat;
+  const failedDraft = failedDrafts[0]?.text ?? null;
+  const updateChat = (
+    id: string,
+    patch: Partial<ChatState> | ((value: ChatState) => Partial<ChatState>),
+  ) => {
+    setChats((current) => {
+      const value = current[id] ?? emptyChat;
+      return {
+        ...current,
+        [id]: {
+          ...value,
+          ...(typeof patch === 'function' ? patch(value) : patch),
+        },
+      };
+    });
+  };
+  const setDraft = (value: string | ((current: string) => string)) => {
+    if (agent)
+      updateChat(agent.id, (current) => ({
+        draft: typeof value === 'function' ? value(current.draft) : value,
+      }));
+  };
+  const setFailedDrafts = (
+    value: (current: ChatState['failedDrafts']) => ChatState['failedDrafts'],
+  ) => {
+    if (agent)
+      updateChat(agent.id, (current) => ({
+        failedDrafts: value(current.failedDrafts),
+      }));
+  };
+  const setWorkspaceError = (error: string | null) => {
+    if (agent) updateChat(agent.id, { error });
+  };
+  const pendingSendsRef = useRef(new Set<string>());
+  const uncertainSendsRef = useRef(
+    new Map<string, { agentId: string; text: string; waiting: boolean }>(),
+  );
+  useEffect(() => {
+    for (const [requestId, pending] of uncertainSendsRef.current) {
+      const snapshot = agentSnapshots.find(
+        (item) => item.state.id === pending.agentId,
+      );
+      if (!snapshot) continue;
+      const delivered = snapshot.messages.some(
+        (message) =>
+          message.role === 'user' &&
+          message.content.metadata?.clientRequestId === requestId,
+      );
+      const running = snapshot.state.status === 'running';
+      if (!delivered && (!pending.waiting || running)) continue;
+      if (pending.waiting && running) continue;
+      if (delivered) uncertainSendsRef.current.delete(requestId);
+      else
+        uncertainSendsRef.current.set(requestId, {
+          ...pending,
+          waiting: false,
+        });
+      if (pending.waiting) pendingSendsRef.current.delete(pending.agentId);
+      updateChat(pending.agentId, (current) => {
+        const index = delivered
+          ? current.failedDrafts.findIndex(
+              (draft) => draft.requestId === requestId,
+            )
+          : -1;
+        const failedDrafts = current.failedDrafts.filter((_, i) => i !== index);
+        return {
+          failedDrafts,
+          sending: pending.waiting ? false : current.sending,
+          error:
+            current.sending && !pending.waiting
+              ? current.error
+              : delivered
+                ? snapshot.state.status === 'failed'
+                  ? 'The agent run failed. Check the conversation for details.'
+                  : failedDrafts.length
+                    ? current.error
+                    : null
+                : 'The daemon has not confirmed this message. Check the conversation before restoring it.',
+        };
+      });
+    }
+  }, [agentSnapshots]);
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null,
   );
@@ -137,17 +233,14 @@ export function ViewHarness() {
     string | null
   >(null);
 
-  const sendingRef = useRef(false);
   const savingSettingsRef = useRef(false);
   const agentOperationGenerationRef = useRef(0);
   const agentLifecycleGenerationRef = useRef(0);
-  const sendingOperationGenerationRef = useRef<number | null>(null);
   const settingsOperationGenerationRef = useRef<number | null>(null);
   const resetInFlightRef = useRef<AgentOperation | null>(null);
   const settingsTriggerRef = useRef<HTMLElement | null>(null);
   const currentAgentIdRef = useRef<string | null>(null);
   const previousSelectedMainIdRef = useRef<string | null>(null);
-  sendingRef.current = sending;
 
   const agentId = agent?.id ?? null;
   const integrations = useAgentIntegrations(agentId);
@@ -159,24 +252,18 @@ export function ViewHarness() {
     agentLifecycleGenerationRef.current += 1;
     agentOperationGenerationRef.current += 1;
     currentAgentIdRef.current = agentId;
-    sendingOperationGenerationRef.current = null;
     settingsOperationGenerationRef.current = null;
     resetInFlightRef.current = null;
     settingsTriggerRef.current = null;
-    sendingRef.current = false;
     savingSettingsRef.current = false;
 
-    setDraft('');
-    setFailedDrafts([]);
     setCiPrompt('');
     setCiIntervalMin(30);
     setCiTarget('workspace');
     setLegacyMigrationError(null);
-    setWorkspaceError(null);
     setSettingsSaveError(null);
     setResetError(null);
     setShowSettings(false);
-    setSending(false);
     setSavingSettings(false);
     setResetting(false);
   }, [agentId]);
@@ -376,6 +463,7 @@ export function ViewHarness() {
         agentOperationGenerationRef.current += 1;
         currentAgentIdRef.current = null;
       }
+      availableAgentIdsRef.current.delete(targetAgentId);
       removeAgentSnapshot(targetAgentId);
       try {
         clearCheckins(targetAgentId);
@@ -396,43 +484,57 @@ export function ViewHarness() {
       !text ||
       !agent ||
       connection !== 'online' ||
-      sendingRef.current ||
+      pendingSendsRef.current.has(agent.id) ||
       resetInFlightRef.current !== null
-    ) {
+    )
       return;
-    }
-    const operation = beginAgentOperation(agent.id);
-    sendingOperationGenerationRef.current = operation.generation;
-    sendingRef.current = true;
-    setSending(true);
-    setWorkspaceError(null);
-    setDraft('');
+    const targetId = agent.id;
+    const clientRequestId = crypto.randomUUID();
+    pendingSendsRef.current.add(targetId);
+    updateChat(targetId, { sending: true, error: null, draft: '' });
     try {
       const { agent: updatedAgent, result } = await daemon.runAgent(
-        agent.id,
+        targetId,
         text,
+        { clientRequestId },
+        `direct:${targetId}`,
       );
-      if (adoptAgentSnapshot(operation, updatedAgent)) {
-        if (result.status === 'error') {
-          setWorkspaceError(result.error ?? 'run failed');
-        }
+      if (
+        availableAgentIdsRef.current.has(targetId) &&
+        updatedAgent.state.id === targetId
+      ) {
+        acceptAgentSnapshot(updatedAgent);
+        if (result.status === 'error')
+          updateChat(targetId, { error: result.error ?? 'run failed' });
       }
     } catch (caught) {
-      if (
-        sendingOperationGenerationRef.current === operation.generation &&
-        operation.lifecycleGeneration === agentLifecycleGenerationRef.current &&
-        operation.targetAgentId === currentAgentIdRef.current
-      ) {
-        setFailedDrafts((current) => [...current, text]);
-        setWorkspaceError(
-          caught instanceof Error ? caught.message : String(caught),
-        );
+      if (availableAgentIdsRef.current.has(targetId)) {
+        const timedOut =
+          caught instanceof Error &&
+          'status' in caught &&
+          caught.status === 408;
+        uncertainSendsRef.current.set(clientRequestId, {
+          agentId: targetId,
+          text,
+          waiting: timedOut,
+        });
+        updateChat(targetId, (current) => ({
+          failedDrafts: [
+            ...current.failedDrafts,
+            { requestId: clientRequestId, text },
+          ],
+          error: timedOut
+            ? 'The response timed out. Checking the daemon for completion—do not resend yet.'
+            : caught instanceof Error
+              ? caught.message
+              : String(caught),
+        }));
+        if (timedOut) void refreshAgents();
       }
     } finally {
-      if (sendingOperationGenerationRef.current === operation.generation) {
-        sendingOperationGenerationRef.current = null;
-        sendingRef.current = false;
-        setSending(false);
+      if (!uncertainSendsRef.current.get(clientRequestId)?.waiting) {
+        pendingSendsRef.current.delete(targetId);
+        updateChat(targetId, { sending: false });
       }
     }
   };
@@ -494,8 +596,9 @@ export function ViewHarness() {
         inert={showSettings || undefined}
       >
         <WorkspaceShell
-          key={agent.id}
-          mainAgent={agent}
+          mainAgent={mainAgent ?? agent}
+          activeAgent={agent}
+          onSelectAgent={setSelectedAgentId}
           agents={agents}
           connection={connection}
           onOpenSettings={openSettings}
@@ -529,8 +632,80 @@ export function ViewHarness() {
               className="flex h-full min-h-0 flex-col"
               aria-label="Workspace"
             >
+              {agent.messages.some((message) =>
+                message.roomId?.startsWith('peer:'),
+              ) && (
+                <details className="shrink-0 border-b border-line px-4 py-2 text-xs text-ink-2">
+                  <summary className="cursor-pointer">
+                    Agent conversations
+                  </summary>
+                  <div
+                    className="mt-2 max-h-48 overflow-y-auto space-y-3"
+                    aria-label="Agent conversations"
+                  >
+                    {agent.messages
+                      .filter((message) => message.roomId?.startsWith('peer:'))
+                      .map((message) => {
+                        const ownCommunication = message.content.metadata
+                          ?.communication as
+                          | { fromAgentId?: string; toAgentId?: string }
+                          | undefined;
+                        const incomingCommunication = agent.messages.find(
+                          (item) =>
+                            item.roomId === message.roomId &&
+                            item.role === 'User' &&
+                            item.content.metadata?.communication,
+                        )?.content.metadata?.communication as
+                          | { fromAgentId?: string; toAgentId?: string }
+                          | undefined;
+                        const communication =
+                          ownCommunication ??
+                          (message.role === 'Assistant' ||
+                          message.role === 'Tool'
+                            ? {
+                                fromAgentId: incomingCommunication?.toAgentId,
+                                toAgentId: incomingCommunication?.fromAgentId,
+                              }
+                            : incomingCommunication);
+                        const from =
+                          agents.find(
+                            (item) => item.id === communication?.fromAgentId,
+                          )?.name ??
+                          communication?.fromAgentId ??
+                          agent.name;
+                        const to =
+                          agents.find(
+                            (item) => item.id === communication?.toAgentId,
+                          )?.name ??
+                          communication?.toAgentId ??
+                          'teammate';
+                        return (
+                          <article key={message.id}>
+                            <p className="font-medium">
+                              {from} to {to}
+                            </p>
+                            <p className="whitespace-pre-wrap break-words">
+                              {message.content.text}
+                            </p>
+                          </article>
+                        );
+                      })}
+                  </div>
+                </details>
+              )}
               <MessageList
-                agent={agent}
+                agent={{
+                  ...agent,
+                  messages: agent.messages.filter(
+                    (message) =>
+                      !message.roomId?.startsWith('peer:') &&
+                      (
+                        message.content.metadata?.communication as
+                          | { kind?: string }
+                          | undefined
+                      )?.kind !== 'peer',
+                  ),
+                }}
                 sending={sending}
                 scrollerRef={scrollerRef}
                 onSuggestion={setDraft}
@@ -546,7 +721,7 @@ export function ViewHarness() {
                 error={workspaceError}
                 onDismissError={() => setWorkspaceError(null)}
                 recovery={
-                  failedDraft
+                  failedDraft && !sending
                     ? {
                         count: failedDrafts.length,
                         text: failedDraft,

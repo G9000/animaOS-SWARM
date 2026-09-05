@@ -7,9 +7,11 @@ import { WorkspaceAvatar } from './WorkspaceAvatar';
 function AgentIdentity({
   agent,
   companyName,
+  isMain,
 }: {
   agent: AgentDetail;
   companyName: string | null;
+  isMain: boolean;
 }) {
   return (
     <div className="min-w-0">
@@ -34,7 +36,7 @@ function AgentIdentity({
           {agent.name}
         </h1>
         <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-accent">
-          Main
+          {isMain ? 'Main' : 'Teammate'}
         </span>
       </div>
     </div>
@@ -44,6 +46,7 @@ function AgentIdentity({
 export function AgentPresence({
   agent,
   companyName = null,
+  isMain = true,
   placement,
   hasAvatar,
   onChangeWorkspaceAvatar,
@@ -52,6 +55,7 @@ export function AgentPresence({
   agent: AgentDetail;
   connection: Exclude<DaemonConnection, 'unknown'>;
   companyName?: string | null;
+  isMain?: boolean;
   placement: 'sidebar' | 'mobile-bar';
   hasAvatar: boolean;
   onChangeWorkspaceAvatar(file: File): Promise<void>;
@@ -96,7 +100,7 @@ export function AgentPresence({
         hasAvatar={hasAvatar}
         uploadAvatar={onChangeWorkspaceAvatar}
       />
-      <AgentIdentity agent={agent} companyName={companyName} />
+      <AgentIdentity agent={agent} companyName={companyName} isMain={isMain} />
     </div>
   );
 }

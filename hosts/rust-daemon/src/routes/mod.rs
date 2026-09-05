@@ -1,5 +1,6 @@
 mod agencies;
 mod agents;
+mod agent_avatar;
 mod connectors;
 mod contracts;
 mod folder_picker;
@@ -88,6 +89,12 @@ use crate::runtime_model::provider_summaries;
         update_agent_entry,
         delete_agent_entry,
         run_agent_entry,
+        get_agent_avatar_entry,
+        get_agent_tasks_entry,
+        put_agent_tasks_entry,
+        put_agent_avatar_entry,
+        delete_agent_avatar_entry,
+        peer_message_entry,
         agent_recent_memories_entry,
         list_swarms_entry,
         create_swarm_entry,
@@ -217,6 +224,9 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -452,6 +462,14 @@ fn router_with_services_with_policies(
                 .delete(delete_agent_entry),
         )
         .route(
+            "/api/agents/{agent_id}/tasks",
+            get(get_agent_tasks_entry).put(put_agent_tasks_entry),
+        )
+        .route(
+            "/api/agents/{agent_id}/avatar",
+            get(get_agent_avatar_entry).put(put_agent_avatar_entry).delete(delete_agent_avatar_entry),
+        )
+        .route(
             "/api/agents/{agent_id}/memories/recent",
             get(agent_recent_memories_entry),
         )
@@ -565,6 +583,10 @@ fn router_with_services_with_policies(
         ));
     let run_routes = Router::new()
         .route(
+            "/api/agents/{agent_id}/messages",
+            axum::routing::post(peer_message_entry),
+        )
+        .route(
             "/api/agents/{agent_id}/run",
             axum::routing::post(run_agent_entry),
         )
@@ -578,7 +600,7 @@ fn router_with_services_with_policies(
         )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            config.request_timeout,
+            config.run_request_timeout,
         ));
 
     Router::new()
@@ -1196,6 +1218,42 @@ async fn run_agent_entry(
             }
         }
         Err(response) => response,
+    }
+}
+
+#[derive(serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct PeerMessageRequest {
+    to_agent_id: String,
+    message: String,
+}
+
+#[utoipa::path(post, path = "/api/agents/{agent_id}/messages", tag = "agents", params(("agent_id" = String, Path, description = "Sending agent ID")), request_body = PeerMessageRequest, responses((status = 200, description = "Recipient response and persisted conversation", body = AgentRunEnvelope), (status = 400, description = "Invalid peer route or permission escalation"), (status = 503, description = "Agent busy or capacity exhausted")))]
+async fn peer_message_entry(
+    State(state): State<AppState>,
+    Path(sender_id): Path<String>,
+    request: AxumRequest,
+) -> AxumResponse {
+    let body = match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let input: PeerMessageRequest = match parse_json_body(body) {
+        Ok(input) => input,
+        Err(error) => return error.into_response(),
+    };
+    match state
+        .agent_runs
+        .send_peer(
+            sender_id.clone(),
+            input.to_agent_id,
+            input.message,
+            anima_core::AgentCommunicationRoute::start(sender_id),
+        )
+        .await
+    {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -2069,6 +2127,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_message_api_and_direct_rooms_keep_histories_separate() {
+        let mut daemon = DaemonState::new();
+        let sender = daemon.create_agent(test_config("Alice")).unwrap().state.id;
+        let recipient = daemon.create_agent(test_config("Bob")).unwrap().state.id;
+        let state = Arc::new(RwLock::new(daemon));
+        let app = router(state.clone(), DaemonConfig::default());
+        for text in ["first direct message", "second direct message"] {
+            let response = app.clone().oneshot(Request::builder().method("POST").uri(format!("/api/agents/{recipient}/run")).header("content-type", "application/json").body(Body::from(serde_json::json!({"text": text, "roomId": format!("direct:{recipient}")}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{sender}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"toAgentId": recipient, "message": "Peer request"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot = state.read().await.get_agent(&recipient).unwrap();
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.room_id == format!("direct:{recipient}")
+                    && message.role == anima_core::MessageRole::User)
+                .count(),
+            2
+        );
+        assert!(snapshot
+            .messages
+            .iter()
+            .any(|message| message.room_id == format!("peer:{sender}:{recipient}")));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{sender}/messages"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"toAgentId": sender, "message": "Cycle"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn folder_picker_rejects_untrusted_requests_before_opening_a_dialog() {
         let app = router(
             Arc::new(RwLock::new(DaemonState::new())),
@@ -2481,7 +2596,7 @@ mod tests {
             transport.clone(),
         );
         let mut config = DaemonConfig::default();
-        config.request_timeout = Duration::from_millis(30);
+        config.run_request_timeout = Duration::from_millis(30);
         let app = router_with_services(
             Arc::clone(&state),
             config,
@@ -2782,8 +2897,18 @@ mod tests {
         assert_eq!(running_response.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn slow_run_uses_its_own_timeout_instead_of_standard_api_timeout() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            SlowModelAdapter { delay: Duration::from_millis(50), calls: AtomicUsize::new(0) },
+        ))));
+        let id = state.write().await.create_agent(test_config("slow-run")).unwrap().state.id;
+        let app = router(state, DaemonConfig { request_timeout: Duration::from_millis(1), run_request_timeout: Duration::from_secs(2), ..DaemonConfig::default() });
+        let response = app.oneshot(Request::builder().method("POST").uri(format!("/api/agents/{id}/run")).header("content-type", "application/json").body(Body::from(r#"{"text":"slow work"}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
     #[tokio::test(flavor = "multi_thread")]
-    async fn run_routes_respect_request_timeout() {
+    async fn run_routes_respect_run_request_timeout() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             SlowModelAdapter {
                 delay: Duration::from_millis(50),
@@ -2801,7 +2926,7 @@ mod tests {
         let app = router(
             Arc::clone(&state),
             DaemonConfig {
-                request_timeout: Duration::from_millis(10),
+                run_request_timeout: Duration::from_millis(10),
                 ..DaemonConfig::default()
             },
         );
@@ -2985,5 +3110,69 @@ mod tests {
             plugins: None,
             settings: Some(AgentSettings::default()),
         }
+    }
+}
+
+#[utoipa::path(get, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 200, description = "Agent avatar"), (status = 404, description = "No avatar")))]
+async fn get_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+    match agent_avatar::get(&id, &state.daemon).await {
+        Ok(avatar) => {
+            let mut response = avatar.bytes.into_response();
+            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(avatar.content_type));
+            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(put, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 204, description = "Avatar saved"), (status = 400, description = "Invalid image")))]
+async fn put_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>, request: AxumRequest) -> AxumResponse {
+    let content_type = request.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let body = match read_limited_body(request, workspace::MAX_WORKSPACE_AVATAR_BYTES + 1).await { Ok(body) => body, Err(response) => return response };
+    let _transaction = state.agent_runs.control_plane_transaction().await;
+    match agent_avatar::put(&id, body, content_type.as_deref(), &state.daemon).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response(),
+    }
+}
+
+#[utoipa::path(delete, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 204, description = "Avatar removed")))]
+async fn delete_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+    let _transaction = state.agent_runs.control_plane_transaction().await;
+    match agent_avatar::remove(&id, &state.daemon).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response(),
+    }
+}
+
+async fn agent_tasks_context(state: &AppState, id: &str) -> Result<(std::path::PathBuf, String), ApiError> {
+    let guard = state.daemon.read().await;
+    let runtime_id = guard.agent_runtime_id(id).ok_or_else(ApiError::not_found)?;
+    let root = guard.workspace.as_ref().ok_or_else(|| ApiError::conflict("workspace is not configured"))?.root_path.clone();
+    Ok((root, runtime_id))
+}
+
+#[utoipa::path(get, path = "/api/agents/{agent_id}/tasks", tag = "agents", params(("agent_id" = String, Path)), responses((status = 200, description = "Agent tasks", body = crate::tools::todo::AgentTodos)))]
+async fn get_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+    let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
+    match crate::tools::todo::read_agent_todos(Some(&root), &id) {
+        Ok(tasks) => json_response(StatusCode::OK, &tasks),
+        Err(error) => ApiError::service_unavailable(error).into_response(),
+    }
+}
+
+#[utoipa::path(put, path = "/api/agents/{agent_id}/tasks", tag = "agents", params(("agent_id" = String, Path)), request_body = crate::tools::todo::AgentTodos, responses((status = 200, description = "Agent tasks saved", body = crate::tools::todo::AgentTodos), (status = 409, description = "Tasks changed since read")))]
+async fn put_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<String>, request: AxumRequest) -> AxumResponse {
+    let body = match read_limited_body(request, state.config.max_request_bytes).await { Ok(body) => body, Err(response) => return response };
+    let input: crate::tools::todo::AgentTodos = match parse_json_body(body) { Ok(input) => input, Err(error) => return error.into_response() };
+    let _transaction = state.agent_runs.control_plane_transaction().await;
+    let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
+    if state.daemon.read().await.get_agent(&id).is_some_and(|snapshot| snapshot.state.status == anima_core::AgentStatus::Running) {
+        return ApiError::conflict("This agent is working. Wait for the current run to finish, then refresh tasks before saving.").into_response();
+    }
+    match crate::tools::todo::write_agent_todos(Some(&root), &id, &input.tasks, Some(&input.revision)) {
+        Ok(tasks) => json_response(StatusCode::OK, &tasks),
+        Err(error) if error.starts_with("Tasks changed.") => ApiError::conflict(error).into_response(),
+        Err(error) => ApiError::bad_request(error).into_response(),
     }
 }

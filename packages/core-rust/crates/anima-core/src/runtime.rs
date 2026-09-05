@@ -196,6 +196,13 @@ impl AgentRuntime {
         }
     }
 
+    /// Replace the complete configuration, preserving optional field shapes.
+    /// Hosts can use this to remove temporary per-run context before persistence.
+    pub fn replace_config(&mut self, config: AgentConfig) {
+        self.state.name = config.name.clone();
+        self.state.config = config;
+    }
+
     pub fn state(&self) -> AgentState {
         self.state.clone()
     }

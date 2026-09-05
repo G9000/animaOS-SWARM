@@ -354,7 +354,7 @@ describe('WorkspaceShell', () => {
     expect(within(bar).getByRole('button', { name: 'Settings' })).toBeVisible();
   });
 
-  it('marks the selected agent as Main and keeps additional agents read-only', async () => {
+  it('marks the main agent and identifies additional teammates', async () => {
     const user = userEvent.setup();
     const main = agent('agent-main', 'Nova', 1);
     const additional = agent('agent-other', 'Echo', 2, { status: 'Completed' });
@@ -374,7 +374,7 @@ describe('WorkspaceShell', () => {
     const mainEntry = screen.getByRole('article', { name: 'Nova agent' });
     const additionalEntry = screen.getByRole('article', { name: 'Echo agent' });
     expect(within(mainEntry).getByText('Main')).toBeVisible();
-    expect(within(additionalEntry).getByText('Read only')).toBeVisible();
+    expect(within(additionalEntry).getByText('Teammate')).toBeVisible();
     expect(within(additionalEntry).getByText('Agent Completed')).toBeVisible();
     expect(
       within(additionalEntry).queryByRole('button'),

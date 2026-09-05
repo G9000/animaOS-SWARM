@@ -30,6 +30,7 @@ impl Fixture {
             state.clone(),
             DaemonConfig {
                 request_timeout: timeout,
+                run_request_timeout: timeout,
                 max_concurrent_runs: limit,
                 ..DaemonConfig::default()
             },

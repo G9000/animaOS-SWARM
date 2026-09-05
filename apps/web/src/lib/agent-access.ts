@@ -58,13 +58,19 @@ export const ACCESS_PROFILES = {
   },
 } as const;
 
-const PROFILE_NAMES: readonly AccessProfile[] = ['observe', 'collaborate', 'operate'];
+const PROFILE_NAMES: readonly AccessProfile[] = [
+  'observe',
+  'collaborate',
+  'operate',
+];
 
 export function toolNamesForProfile(profile: AccessProfile): string[] {
   return [...ACCESS_PROFILES[profile].tools];
 }
 
-export function deriveAccessProfile(toolNames: readonly string[]): DerivedAccessProfile {
+export function deriveAccessProfile(
+  toolNames: readonly string[],
+): DerivedAccessProfile {
   const uniqueTools = new Set(toolNames);
   if (uniqueTools.size !== toolNames.length) {
     return 'custom';
@@ -83,12 +89,18 @@ export function deriveAccessProfile(toolNames: readonly string[]): DerivedAccess
   return 'custom';
 }
 
-export function selectMainAgent(agents: readonly AgentDetail[]): AgentDetail | null {
+export function selectMainAgent(
+  agents: readonly AgentDetail[],
+): AgentDetail | null {
   if (agents.length === 0) {
     return null;
   }
 
   return [...agents].sort((left, right) => {
+    const leadOrder =
+      Number(right.workspaceRole === 'lead') -
+      Number(left.workspaceRole === 'lead');
+    if (leadOrder !== 0) return leadOrder;
     const creationOrder = left.created_at_ms - right.created_at_ms;
     if (creationOrder !== 0) {
       return creationOrder;

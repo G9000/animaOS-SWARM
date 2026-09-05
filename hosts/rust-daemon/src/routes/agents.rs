@@ -152,6 +152,11 @@ pub(crate) async fn handle_run_agent(
     permit: AgentRunPermit,
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
+    let room = match request.room_id.as_deref() {
+        Some(id) if id.trim().is_empty() || id.len() > 256 || id.starts_with("peer:") => return Err(ApiError::bad_request_static("roomId must be non-empty, at most 256 bytes, and outside the reserved peer namespace")),
+        Some(id) => RunRoom::Stable(id.to_string()),
+        None => RunRoom::Generated,
+    };
     let content = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
@@ -161,7 +166,7 @@ pub(crate) async fn handle_run_agent(
             AgentRunRequest {
                 agent_id: agent_id.to_string(),
                 content,
-                room: RunRoom::Generated,
+                room,
                 idempotency_key: None,
             },
             permit,
@@ -343,7 +348,14 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ["read_file", "write_file", "bash"]
+            [
+                "read_file",
+                "write_file",
+                "bash",
+                "list_workspace_agents",
+                "send_message",
+                "broadcast_message"
+            ]
         );
         for tool in tools {
             assert!(!tool.description.is_empty());

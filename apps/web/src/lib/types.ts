@@ -9,6 +9,7 @@ export interface TokenUsage {
 }
 
 export interface ChatMessage {
+  roomId?: string;
   id: string;
   role: 'User' | 'Assistant' | 'System' | 'Tool';
   content: {
@@ -19,6 +20,7 @@ export interface ChatMessage {
 }
 
 export interface AgentDetail {
+  workspaceRole?: 'lead';
   id: string;
   name: string;
   provider: string;
@@ -42,11 +44,26 @@ export const PROVIDER_MODELS: Record<string, string[]> = {
   ],
   google: ['gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'],
   ollama: ['llama3.1', 'qwen2.5', 'mistral'],
-  groq: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'openai/gpt-oss-120b'],
+  groq: [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'openai/gpt-oss-120b',
+  ],
   xai: ['grok-4', 'grok-3', 'grok-3-mini'],
-  openrouter: ['openai/gpt-4o', 'anthropic/claude-sonnet-4.5', 'google/gemini-2.5-pro'],
-  mistral: ['mistral-large-latest', 'mistral-medium-latest', 'mistral-small-latest'],
-  together: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'Qwen/Qwen2.5-72B-Instruct-Turbo'],
+  openrouter: [
+    'openai/gpt-4o',
+    'anthropic/claude-sonnet-4.5',
+    'google/gemini-2.5-pro',
+  ],
+  mistral: [
+    'mistral-large-latest',
+    'mistral-medium-latest',
+    'mistral-small-latest',
+  ],
+  together: [
+    'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+    'Qwen/Qwen2.5-72B-Instruct-Turbo',
+  ],
   deepseek: ['deepseek-chat', 'deepseek-reasoner'],
   fireworks: ['accounts/fireworks/models/llama-v3p3-70b-instruct'],
   perplexity: ['sonar-pro', 'sonar'],

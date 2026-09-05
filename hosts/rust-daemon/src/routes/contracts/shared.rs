@@ -76,6 +76,7 @@ pub(crate) struct AttachmentRequest {
 #[derive(Clone, Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TaskRequest {
+    pub(crate) room_id: Option<String>,
     pub(crate) text: Option<String>,
     pub(crate) task: Option<String>,
     pub(crate) attachments: Option<Vec<AttachmentRequest>>,

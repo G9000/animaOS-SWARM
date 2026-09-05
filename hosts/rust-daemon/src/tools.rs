@@ -3,9 +3,10 @@ mod filesystem;
 mod mail;
 mod memory;
 mod process;
+mod team;
 #[cfg(test)]
 mod tests;
-mod todo;
+pub(crate) mod todo;
 mod utility;
 mod web;
 mod workspace;
@@ -54,6 +55,11 @@ struct ToolRegistration {
 
 #[derive(Clone)]
 pub(crate) struct ToolExecutionContext {
+    pub(super) team: Option<crate::agent_runs::AgentRunCoordinator>,
+    pub(super) can_delegate: bool,
+    delegated_parent: Option<String>,
+    pub(super) peer_route: Option<anima_core::AgentCommunicationRoute>,
+    peer_sources: Vec<String>,
     pub(super) memory: SharedMemoryStore,
     pub(super) memory_embeddings: SharedMemoryEmbeddings,
     pub(super) memory_store: Option<MemoryStoreConfig>,
@@ -76,6 +82,11 @@ impl ToolExecutionContext {
         calendar: Option<CalendarManager>,
     ) -> Self {
         Self {
+            team: None,
+            can_delegate: false,
+            delegated_parent: None,
+            peer_route: None,
+            peer_sources: vec![],
             memory,
             memory_embeddings,
             memory_store,
@@ -92,6 +103,31 @@ impl ToolExecutionContext {
         self
     }
 
+    pub(crate) fn with_team(
+        mut self,
+        coordinator: crate::agent_runs::AgentRunCoordinator,
+        can_delegate: bool,
+    ) -> Self {
+        self.team = Some(coordinator);
+        self.can_delegate = can_delegate;
+        self
+    }
+
+    pub(crate) fn with_delegated_parent(mut self, parent_id: Option<String>) -> Self {
+        self.delegated_parent = parent_id;
+        self
+    }
+
+    pub(crate) fn with_peer_route(
+        mut self,
+        route: anima_core::AgentCommunicationRoute,
+        sources: Vec<String>,
+    ) -> Self {
+        self.peer_route = Some(route);
+        self.peer_sources = sources;
+        self
+    }
+
     pub(crate) async fn execute_tool(
         self,
         agent: AgentState,
@@ -101,7 +137,34 @@ impl ToolExecutionContext {
         if !agent.config.allows_tool(&tool_call.name) {
             return TaskResult::error(tool_not_configured_error(&tool_call.name), 0);
         }
+        if let Some(parent_id) = &self.delegated_parent {
+            if let Some(coordinator) = &self.team {
+                if !coordinator
+                    .parent_allows_tool(parent_id, &tool_call.name)
+                    .await
+                {
+                    return TaskResult::error(
+                        "The manager no longer has permission for this delegated tool",
+                        0,
+                    );
+                }
+            } else {
+                return TaskResult::error("Delegated permission context is unavailable", 0);
+            }
+        }
         let handler = self.tool_registry.lookup(&tool_call.name);
+        for source in &self.peer_sources {
+            if let Some(coordinator) = &self.team {
+                if !coordinator.peer_allows_tool(source, &tool_call.name).await {
+                    return TaskResult::error(
+                        "An originating agent no longer permits this peer tool action",
+                        0,
+                    );
+                }
+            } else {
+                return TaskResult::error("Peer permission context is unavailable", 0);
+            }
+        }
         match handler {
             Some(handler) => handler(self, agent, user_message, tool_call).await,
             None => TaskResult::error(format!("Unknown tool: {}", tool_call.name), 0),
@@ -118,6 +181,8 @@ impl ToolRegistry {
         let mut registry = Self {
             registrations: HashMap::new(),
         };
+        registry.register(tool_descriptor("list_workspace_agents", "Read the actual live workspace agent roster, including IDs, roles, and current status.", object_parameters(vec![])), team::list_workspace_agents);
+        registry.register(tool_descriptor("delegate_to_agent", "Assign a bounded task to an existing specialist and wait for its recorded result. Use an agent ID from the roster. Delegation cannot grant tools or permissions you do not have.", object_parameters(vec![required_parameter("agent_id", non_blank_string_parameter("Existing specialist ID")), required_parameter("task", non_blank_string_parameter("Self-contained task, relevant context, and expected deliverable"))])), team::delegate_to_agent);
         registry.register(
             tool_descriptor(
                 "memory_search",
@@ -469,9 +534,8 @@ impl ToolRegistry {
         registry.register(
             tool_descriptor(
                 "send_message",
-                "Send a message to another live swarm agent by coordinator agent id or configured agent name",
-                with_any_required_parameter(
-                    object_parameters(vec![
+                "Send a bounded request to another agent by ID or unique name and receive its response. Provide at least one of to_agent_id or to_agent_name. In a swarm, deliver through the swarm message bus.",
+                object_parameters(vec![
                         optional_parameter(
                             "to_agent_id",
                             non_empty_string_parameter(
@@ -488,22 +552,20 @@ impl ToolRegistry {
                             "message",
                             non_empty_string_parameter("Message text to deliver"),
                         ),
-                    ]),
-                    &["to_agent_id", "to_agent_name"],
-                ),
+                ]),
             ),
-            execute_swarm_only_tool,
+            team::send_message,
         );
         registry.register(
             tool_descriptor(
                 "broadcast_message",
-                "Broadcast a message to every other live swarm agent",
+                "Contact other agents and return each peer's response or explicit delivery error. In a swarm, broadcast through its message bus.",
                 object_parameters(vec![required_parameter(
                     "message",
                     non_empty_string_parameter("Message text to broadcast"),
                 )]),
             ),
-            execute_swarm_only_tool,
+            team::broadcast_message,
         );
         registry.register(
             tool_descriptor(
@@ -745,27 +807,6 @@ fn object_parameter(parameters: Vec<SchemaParameter>) -> DataValue {
     DataValue::Object(object_parameters(parameters))
 }
 
-fn with_any_required_parameter(
-    mut parameters_schema: BTreeMap<String, DataValue>,
-    alternatives: &[&str],
-) -> BTreeMap<String, DataValue> {
-    parameters_schema.insert(
-        "anyOf".into(),
-        DataValue::Array(
-            alternatives
-                .iter()
-                .map(|name| {
-                    DataValue::Object(BTreeMap::from([(
-                        "required".into(),
-                        DataValue::Array(vec![DataValue::String((*name).into())]),
-                    )]))
-                })
-                .collect(),
-        ),
-    );
-    parameters_schema
-}
-
 fn string_parameter(description: &str) -> DataValue {
     typed_parameter("string", description)
 }
@@ -832,18 +873,4 @@ fn typed_parameter_schema(kind: &str, description: &str) -> BTreeMap<String, Dat
         ("type".into(), DataValue::String(kind.into())),
         ("description".into(), DataValue::String(description.into())),
     ])
-}
-
-fn execute_swarm_only_tool(
-    _context: ToolExecutionContext,
-    _agent: AgentState,
-    _user_message: Message,
-    tool_call: ToolCall,
-) -> BoxFuture<'static, TaskResult<Content>> {
-    Box::pin(async move {
-        TaskResult::error(
-            format!("{} is only available inside a swarm", tool_call.name),
-            0,
-        )
-    })
 }

@@ -85,6 +85,46 @@ function mockProviders() {
   vi.spyOn(daemon, 'listProviders').mockResolvedValue({ providers });
 }
 
+it('keeps individual drafts and failed sends while switching agents', async () => {
+  const user = userEvent.setup();
+  const alpha = snapshot('alpha', 'Alpha', 1);
+  const beta = snapshot('beta', 'Beta', 2);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
+  mockProviders();
+  const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+  vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+  render(<ViewHarness />);
+  await user.type(
+    await screen.findByPlaceholderText('Message Alpha…'),
+    'Alpha request',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.click(
+    screen.getByRole('button', { name: 'Message Beta', exact: true }),
+  );
+  await user.type(screen.getByPlaceholderText('Message Beta…'), 'Beta draft');
+  await act(async () => {
+    run.reject(new Error('Alpha disconnected'));
+  });
+  expect(screen.queryByText('Alpha disconnected')).not.toBeInTheDocument();
+  await user.click(
+    screen.getByRole('button', { name: 'Message Alpha', exact: true }),
+  );
+  await user.click(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  );
+  expect(screen.getByPlaceholderText('Message Alpha…')).toHaveValue(
+    'Alpha request',
+  );
+  await user.click(
+    screen.getByRole('button', { name: 'Message Beta', exact: true }),
+  );
+  expect(screen.getByPlaceholderText('Message Beta…')).toHaveValue(
+    'Beta draft',
+  );
+});
+
 function withMessage(source: DaemonSnapshot, text: string): DaemonSnapshot {
   const updated = structuredClone(source);
   updated.messages = [
@@ -100,6 +140,93 @@ function withMessage(source: DaemonSnapshot, text: string): DaemonSnapshot {
   updated.messageCount = 1;
   return updated;
 }
+
+it('retains a completed reply after switching away and scopes settings to the selected teammate', async () => {
+  const user = userEvent.setup();
+  const alpha = snapshot('alpha', 'Alpha', 1);
+  const beta = snapshot('beta', 'Beta', 2);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
+  mockProviders();
+  const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+  vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+  render(<ViewHarness />);
+  await user.type(
+    await screen.findByPlaceholderText('Message Alpha…'),
+    'Alpha request',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.click(screen.getByRole('button', { name: 'Agents' }));
+  await user.click(screen.getByRole('button', { name: 'Chat with Beta' }));
+  await act(async () => {
+    run.resolve({
+      agent: withMessage(alpha, 'Alpha finished'),
+      result: {
+        status: 'success',
+        durationMs: 1,
+        data: { text: 'Alpha finished' },
+      },
+    });
+  });
+  expect(screen.queryByText('Alpha finished')).not.toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Settings' }));
+  expect(
+    within(screen.getByRole('dialog')).getByDisplayValue('Beta'),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Close settings' }));
+  await user.click(
+    screen.getByRole('button', { name: 'Message Alpha', exact: true }),
+  );
+  expect(screen.getByText('Alpha finished')).toBeInTheDocument();
+});
+
+it('keeps peer messages separate from the owner conversation', async () => {
+  const alpha = withMessage(snapshot('alpha', 'Alpha', 1), 'Owner reply');
+  alpha.messages.push({
+    id: 'peer-message',
+    agentId: 'alpha',
+    roomId: 'peer:beta:alpha',
+    role: 'user',
+    content: {
+      text: 'Private teammate request',
+      metadata: {
+        communication: {
+          kind: 'peer',
+          fromAgentId: 'beta',
+          toAgentId: 'alpha',
+        },
+      },
+    },
+    createdAtMs: 3,
+  });
+  alpha.messages.push({
+    id: 'peer-reply',
+    agentId: 'alpha',
+    roomId: 'peer:beta:alpha',
+    role: 'assistant',
+    content: { text: 'Peer reply without metadata' },
+    createdAtMs: 4,
+  });
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [alpha, snapshot('beta', 'Beta', 2)],
+  });
+  mockProviders();
+  render(<ViewHarness />);
+  await screen.findByText('Owner reply');
+  expect(
+    within(screen.getByLabelText('Conversation with Alpha')).queryByText(
+      'Private teammate request',
+    ),
+  ).not.toBeInTheDocument();
+  expect(
+    within(screen.getByLabelText('Agent conversations')).getByText(
+      'Private teammate request',
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByText('Beta to Alpha')).toBeInTheDocument();
+  expect(screen.getByText('Alpha to Beta')).toBeInTheDocument();
+});
 
 function capturePollTimer() {
   let poll: (() => void) | undefined;
@@ -326,7 +453,12 @@ describe('ViewHarness workspace controller', () => {
     ).toBeVisible();
     await user.type(screen.getByPlaceholderText('Message Alpha…'), 'Hello');
     await user.click(screen.getByRole('button', { name: 'Send' }));
-    expect(runAgent).toHaveBeenCalledWith('agent-a', 'Hello');
+    expect(runAgent).toHaveBeenCalledWith(
+      'agent-a',
+      'Hello',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'direct:agent-a',
+    );
 
     await user.click(screen.getByRole('button', { name: 'Agents' }));
     expect(
@@ -334,7 +466,7 @@ describe('ViewHarness workspace controller', () => {
     ).toHaveTextContent('Main');
     expect(
       screen.getByRole('article', { name: 'Beta agent' }),
-    ).toHaveTextContent('Read only');
+    ).toHaveTextContent('Teammate');
 
     await user.click(screen.getByRole('button', { name: 'Settings' }));
     expect(
@@ -399,7 +531,12 @@ describe('ViewHarness workspace controller', () => {
     expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-first');
     await user.type(screen.getByPlaceholderText('Message Next…'), 'Continue');
     await user.click(screen.getByRole('button', { name: 'Send' }));
-    expect(runAgent).toHaveBeenCalledWith('agent-next', 'Continue');
+    expect(runAgent).toHaveBeenCalledWith(
+      'agent-next',
+      'Continue',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'direct:agent-next',
+    );
     expect(await screen.findByText('Next is responsive')).toBeVisible();
   });
 
@@ -442,7 +579,8 @@ describe('ViewHarness workspace controller', () => {
     const name = screen.getByDisplayValue('Nova');
     await user.clear(name);
     await user.type(name, 'Nova Prime');
-    const [provider, model] = screen.getAllByRole('combobox');
+    const provider = screen.getByRole('combobox', { name: 'Provider' });
+    const model = screen.getByRole('combobox', { name: 'Model' });
     await user.selectOptions(provider, 'anthropic');
     await user.selectOptions(model, 'claude-sonnet-4-6');
     const system = screen.getByPlaceholderText(
@@ -462,7 +600,13 @@ describe('ViewHarness workspace controller', () => {
     });
     expect(await screen.findByDisplayValue('Nova Prime')).toBeVisible();
     expect(screen.getByText('Existing conversation')).toBeVisible();
-    expect(screen.getByText('Nova Prime')).toBeVisible();
+    expect(
+      screen.getByRole('heading', {
+        name: 'Nova Prime',
+        exact: true,
+        hidden: true,
+      }),
+    ).toBeVisible();
     expect(
       screen.getByRole('heading', { name: 'Agent settings' }),
     ).toBeVisible();
@@ -694,7 +838,8 @@ describe('ViewHarness workspace controller', () => {
     const name = screen.getByDisplayValue('Nova');
     await user.clear(name);
     await user.type(name, 'Unsaved Nova');
-    const [provider, model] = screen.getAllByRole('combobox');
+    const provider = screen.getByRole('combobox', { name: 'Provider' });
+    const model = screen.getByRole('combobox', { name: 'Model' });
     await user.selectOptions(provider, 'anthropic');
     await user.selectOptions(model, '__custom__');
     await user.type(
@@ -737,7 +882,9 @@ describe('ViewHarness workspace controller', () => {
       screen.getByRole('button', { name: 'Save changes' }),
     ).not.toHaveAttribute('aria-describedby');
     expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
-    expect(screen.getAllByRole('combobox')[0]).toHaveValue('anthropic');
+    expect(screen.getByRole('combobox', { name: 'Provider' })).toHaveValue(
+      'anthropic',
+    );
     expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
     expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
     expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
@@ -778,7 +925,8 @@ describe('ViewHarness workspace controller', () => {
     const name = screen.getByDisplayValue('Nova');
     await user.clear(name);
     await user.type(name, 'Unsaved Nova');
-    const [provider, model] = screen.getAllByRole('combobox');
+    const provider = screen.getByRole('combobox', { name: 'Provider' });
+    const model = screen.getByRole('combobox', { name: 'Model' });
     await user.selectOptions(provider, 'anthropic');
     await user.selectOptions(model, '__custom__');
     await user.type(
@@ -820,7 +968,9 @@ describe('ViewHarness workspace controller', () => {
     expect(alert).toHaveAttribute('aria-live', 'assertive');
     expect(alert).toHaveFocus();
     expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
-    expect(screen.getAllByRole('combobox')[0]).toHaveValue('anthropic');
+    expect(screen.getByRole('combobox', { name: 'Provider' })).toHaveValue(
+      'anthropic',
+    );
     expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
     expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
     expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
@@ -957,7 +1107,9 @@ describe('ViewHarness workspace controller', () => {
     expect(
       screen.getByRole('heading', { name: 'Say something to Nova' }),
     ).toBeVisible();
-    expect(screen.getByRole('navigation')).toBeVisible();
+    expect(
+      screen.getByRole('navigation', { name: 'Workspace navigation' }),
+    ).toBeVisible();
     expect(daemon.listAgents).toHaveBeenCalledTimes(2);
     const runAgent = vi.spyOn(daemon, 'runAgent');
     const input = screen.getByPlaceholderText('Message Nova…');
@@ -989,7 +1141,12 @@ describe('ViewHarness workspace controller', () => {
       'Alpha work',
     );
     await user.click(screen.getByRole('button', { name: 'Send' }));
-    expect(daemon.runAgent).toHaveBeenCalledWith('agent-a', 'Alpha work');
+    expect(daemon.runAgent).toHaveBeenCalledWith(
+      'agent-a',
+      'Alpha work',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'direct:agent-a',
+    );
 
     act(() => poll());
     await act(async () => {
@@ -1069,4 +1226,165 @@ describe('ViewHarness workspace controller', () => {
       screen.queryByRole('article', { name: 'Alpha draft agent' }),
     ).not.toBeInTheDocument();
   });
+});
+
+it('reconciles a timed-out send with its saved request ID without offering a duplicate retry', async () => {
+  const user = userEvent.setup();
+  let current = snapshot('agent-main', 'Nova', 1);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
+    agents: [current],
+  }));
+  mockProviders();
+  const run = vi
+    .spyOn(daemon, 'runAgent')
+    .mockImplementation(async (id, text, metadata) => {
+      current = withMessage(
+        snapshot(id, 'Nova', 1),
+        'Completed despite timeout',
+      );
+      current.state.status = 'completed';
+      current.messages.unshift({
+        id: 'request',
+        agentId: id,
+        roomId: `direct:${id}`,
+        role: 'user',
+        content: { text, metadata },
+        createdAtMs: 2,
+      });
+      throw Object.assign(new Error('daemon request failed (408)'), {
+        status: 408,
+      });
+    });
+  render(<ViewHarness />);
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Commit',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await screen.findByText('Completed despite timeout');
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('button', { name: 'Restore message' }),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.queryByText(/response timed out/)).not.toBeInTheDocument();
+  expect(run).toHaveBeenCalledTimes(1);
+});
+
+it('does not mistake an older identical message for the timed-out request', async () => {
+  const user = userEvent.setup();
+  const current = snapshot('agent-main', 'Nova', 1);
+  current.messages.push({
+    id: 'old',
+    agentId: current.state.id,
+    role: 'user',
+    content: { text: 'Commit', metadata: { clientRequestId: 'older-request' } },
+    createdAtMs: 1,
+  });
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [current] });
+  mockProviders();
+  vi.spyOn(daemon, 'runAgent').mockRejectedValue(
+    Object.assign(new Error('timeout'), { status: 408 }),
+  );
+  render(<ViewHarness />);
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Commit',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  expect(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  ).toBeVisible();
+});
+
+it('keeps a timed-out running request locked until polling confirms its completion', async () => {
+  const user = userEvent.setup();
+  let current = snapshot('agent-main', 'Nova', 1);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
+    agents: [current],
+  }));
+  mockProviders();
+  let requestMetadata: Record<string, unknown> | undefined;
+  const run = vi
+    .spyOn(daemon, 'runAgent')
+    .mockImplementation(async (_id, _text, metadata) => {
+      requestMetadata = metadata;
+      current = { ...current, state: { ...current.state, status: 'running' } };
+      throw Object.assign(new Error('timeout'), { status: 408 });
+    });
+  render(<ViewHarness />);
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await user.type(input, 'Long work');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await screen.findByText(/Checking the daemon for completion/);
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+  current = withMessage(
+    snapshot('agent-main', 'Nova', 1),
+    'Long work completed',
+  );
+  current.state.status = 'completed';
+  current.messages.unshift({
+    id: 'long-request',
+    agentId: current.state.id,
+    role: 'user',
+    content: { text: 'Long work', metadata: requestMetadata },
+    createdAtMs: 2,
+  });
+  await screen.findByText('Long work completed', {}, { timeout: 5000 });
+  await waitFor(() =>
+    expect(
+      screen.queryByText(/Checking the daemon for completion/),
+    ).not.toBeInTheDocument(),
+  );
+  expect(run).toHaveBeenCalledTimes(1);
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+}, 10000);
+
+it('does not clear a newer recovery entry when an older identical send is confirmed', async () => {
+  const user = userEvent.setup();
+  let current = snapshot('agent-main', 'Nova', 1);
+  let firstMetadata: Record<string, unknown> | undefined;
+  let calls = 0;
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
+    agents: [current],
+  }));
+  mockProviders();
+  vi.spyOn(daemon, 'runAgent').mockImplementation(
+    async (id, text, metadata) => {
+      if (++calls === 1) {
+        firstMetadata = metadata;
+        throw new Error('Network lost');
+      }
+      current = snapshot(id, 'Nova', 1);
+      current.messages.push({
+        id: 'older',
+        agentId: id,
+        role: 'user',
+        content: { text, metadata: firstMetadata },
+        createdAtMs: 2,
+      });
+      throw Object.assign(new Error('timeout'), { status: 408 });
+    },
+  );
+  render(<ViewHarness />);
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await user.type(input, 'Commit');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Dismiss recoverable message' }),
+  );
+  await user.type(input, 'Commit');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  expect(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  ).toBeVisible();
+  expect(screen.getByText(/1 recoverable message/)).toBeVisible();
 });

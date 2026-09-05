@@ -210,6 +210,8 @@ fn registry_rejects_duplicate_registration() {
 fn registry_defines_every_registered_tool_schema() {
     let registry = ToolRegistry::new();
     let expectations = [
+        ("list_workspace_agents", &[][..], &[][..]),
+        ("delegate_to_agent", &["agent_id", "task"][..], &[][..]),
         ("memory_search", &["query"][..], &["limit"][..]),
         ("memory_add", &["content"][..], &["type", "importance"][..]),
         ("recent_memories", &[][..], &["limit"][..]),
@@ -361,36 +363,29 @@ fn registry_encodes_parameter_constraints() {
 }
 
 #[test]
-fn registry_send_message_requires_a_recipient_alternative() {
+fn registry_send_message_uses_anthropic_compatible_recipient_schema() {
     let registry = ToolRegistry::new();
     let descriptor = registry
         .descriptor("send_message")
         .expect("send_message descriptor");
-
     assert_required_parameters(&descriptor, &["message"]);
-    let alternatives = descriptor
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        assert!(
+            !descriptor.parameters_schema.contains_key(keyword),
+            "Anthropic rejects top-level {keyword}"
+        );
+    }
+    let properties = descriptor
         .parameters_schema
-        .get("anyOf")
-        .and_then(data_array)
-        .expect("send_message recipient alternatives");
-    let recipient_requirements = alternatives
-        .iter()
-        .map(|alternative| {
-            let schema = data_object(alternative).expect("recipient alternative schema");
-            schema_strings(
-                schema
-                    .get("required")
-                    .expect("recipient alternative required fields"),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        recipient_requirements,
-        vec![vec!["to_agent_id"], vec!["to_agent_name"]]
-    );
+        .get("properties")
+        .and_then(data_object)
+        .unwrap();
+    assert!(properties.contains_key("to_agent_id"));
+    assert!(properties.contains_key("to_agent_name"));
+    assert!(descriptor
+        .description
+        .contains("at least one of to_agent_id or to_agent_name"));
 }
-
 #[test]
 fn registry_marks_trim_rejected_strings_as_non_blank() {
     let registry = ToolRegistry::new();

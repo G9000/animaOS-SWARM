@@ -120,9 +120,9 @@ struct CrashAfterCommitStore {
 }
 
 impl CrashAfterCommitStore {
-    fn new(boundary: CrashAfterCommit) -> Self {
+    fn new(boundary: CrashAfterCommit, clock: Arc<anima_core::ManualExecutionClock>) -> Self {
         Self {
-            inner: InMemoryExecutionStore::default(),
+            inner: InMemoryExecutionStore::with_clock(clock),
             boundary,
             armed: AtomicBool::new(boundary != CrashAfterCommit::Never),
         }
@@ -490,11 +490,15 @@ async fn run_provider_restart(provider: &str, seed: u128, scenario: RestartScena
     )
     .unwrap();
     let queued = Run::queued(run_id, session.id(), &definition.id, definition.version).unwrap();
-    let store = Arc::new(CrashAfterCommitStore::new(match scenario {
-        RestartScenario::ModelCompleted => CrashAfterCommit::ModelCompleted,
-        RestartScenario::CapabilityCompleted => CrashAfterCommit::CapabilityCompleted,
-        RestartScenario::ApprovalResume => CrashAfterCommit::Never,
-    }));
+    let clock = Arc::new(anima_core::ManualExecutionClock::default());
+    let store = Arc::new(CrashAfterCommitStore::new(
+        match scenario {
+            RestartScenario::ModelCompleted => CrashAfterCommit::ModelCompleted,
+            RestartScenario::CapabilityCompleted => CrashAfterCommit::CapabilityCompleted,
+            RestartScenario::ApprovalResume => CrashAfterCommit::Never,
+        },
+        clock.clone(),
+    ));
     store
         .create_run(
             owner_id,
@@ -544,7 +548,7 @@ async fn run_provider_restart(provider: &str, seed: u128, scenario: RestartScena
         Arc::new(StaticDefinition(definition)),
         policy.clone(),
         runtime.clone(),
-        Arc::new(anima_core::ManualExecutionClock::default()),
+        clock.clone(),
         Arc::new(IgnoreLive),
         Arc::new(NeverCrash),
         DurableEngineConfig {
@@ -566,7 +570,7 @@ async fn run_provider_restart(provider: &str, seed: u128, scenario: RestartScena
             policy.approved.store(true, Ordering::SeqCst);
         }
     }
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    clock.advance_ms(10).unwrap();
     let outcome = engine.run(owner_id, run_id, &Continue).await.unwrap();
     assert!(
         matches!(

@@ -724,7 +724,7 @@ async fn swarm_event_stream_emits_todo_tool_results() {
         workspace_root
             .path()
             .join(".animaos-swarm")
-            .join("todos.json")
+            .join("agent-tasks")
             .exists(),
         "todo_write should persist the todo list inside the temp workspace"
     );

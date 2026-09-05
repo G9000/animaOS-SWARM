@@ -4,7 +4,9 @@ import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
 import type { DaemonWorkspaceState } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { AgentPresence } from './AgentPresence';
+import { AgentAvatar } from './AgentAvatar';
 import { AgentsView } from './AgentsView';
+import { WorkspaceHub } from './WorkspaceHub';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
 import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { AgentsIcon, GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
@@ -15,6 +17,7 @@ export type WorkspaceDestination =
   | 'connectors'
   | 'telegram'
   | 'activity'
+  | 'hub'
   | 'agents';
 
 const ignoreWorkspaceAvatarChange = async () => undefined;
@@ -25,6 +28,7 @@ const DESTINATIONS: Array<{
   icon: ReactNode;
 }> = [
   { id: 'workspace', label: 'Workspace', icon: <SparkIcon size={15} /> },
+  { id: 'hub', label: 'Work hub', icon: <PulseIcon size={15} /> },
   { id: 'connectors', label: 'Connectors', icon: <GearIcon size={15} /> },
   { id: 'activity', label: 'Activity', icon: <PulseIcon size={15} /> },
   { id: 'agents', label: 'Agents', icon: <AgentsIcon size={15} /> },
@@ -120,6 +124,8 @@ function DestinationNavigation({
 
 export function WorkspaceShell({
   mainAgent,
+  activeAgent = mainAgent,
+  onSelectAgent,
   agents,
   connection,
   workspace,
@@ -132,6 +138,8 @@ export function WorkspaceShell({
   onPickPrompt,
 }: {
   mainAgent: AgentDetail;
+  activeAgent?: AgentDetail;
+  onSelectAgent?: (agentId: string) => void;
   agents: readonly AgentDetail[];
   connection: Exclude<DaemonConnection, 'unknown'>;
   workspace: ReactNode;
@@ -240,7 +248,8 @@ export function WorkspaceShell({
       >
         {!desktopNavigation ? (
           <AgentPresence
-            agent={mainAgent}
+            agent={activeAgent}
+            isMain={activeAgent.id === mainAgent.id}
             connection={connection}
             companyName={companyName}
             placement="mobile-bar"
@@ -263,7 +272,8 @@ export function WorkspaceShell({
                 <span className="studio-edition">STUDIO / 01</span>
               </div>
               <AgentPresence
-                agent={mainAgent}
+                agent={activeAgent}
+                isMain={activeAgent.id === mainAgent.id}
                 connection={connection}
                 companyName={companyName}
                 placement="sidebar"
@@ -276,11 +286,63 @@ export function WorkspaceShell({
                 placement="sidebar"
                 hasTelegram={telegram !== null}
               />
-              <div className="studio-sidebar-note">
+              {onSelectAgent && (
+                <nav
+                  className="studio-agent-chats"
+                  aria-label="Direct messages"
+                >
+                  <div className="studio-agent-chats-heading">
+                    <span>Direct messages</span>
+                    <span>{agents.length}</span>
+                  </div>
+                  <div className="studio-agent-chat-list">
+                    {agents.map((item) => (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className="studio-agent-chat"
+                        aria-label={`Message ${item.name}`}
+                        aria-current={
+                          destination === 'workspace' &&
+                          item.id === activeAgent.id
+                            ? 'page'
+                            : undefined
+                        }
+                        onClick={() => {
+                          onSelectAgent(item.id);
+                          setDestination('workspace');
+                        }}
+                      >
+                        <span
+                          className="studio-agent-chat-avatar"
+                          aria-hidden="true"
+                        >
+                          <AgentAvatar id={item.id} name={item.name} />
+                          <i data-running={item.status === 'Running'} />
+                        </span>
+                        <span className="studio-agent-chat-name">
+                          {item.name}
+                        </span>
+                        {item.id === mainAgent.id && (
+                          <span className="studio-agent-chat-role">
+                            Manager
+                          </span>
+                        )}
+                        {item.status === 'Running' && (
+                          <span className="sr-only">Running</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                </nav>
+              )}
+              <div
+                className={`studio-sidebar-note ${onSelectAgent ? 'has-agent-chats' : ''}`}
+              >
                 <span className="studio-note-label">WORKSPACE PULSE</span>
                 <p className="studio-live-status">
                   <i aria-hidden />
-                  {mainAgent.status === 'Running'
+                  {activeAgent.status === 'Running'
                     ? 'Thinking with you'
                     : connection === 'offline'
                       ? 'Connection paused'
@@ -288,17 +350,17 @@ export function WorkspaceShell({
                 </p>
                 <div className="studio-sidebar-metrics">
                   <span>
-                    <strong>{mainAgent.messages.length}</strong> messages
+                    <strong>{activeAgent.messages.length}</strong> messages
                   </span>
                   <span>
                     <strong>
-                      {formatTokens(mainAgent.token_usage.total_tokens)}
+                      {formatTokens(activeAgent.token_usage.total_tokens)}
                     </strong>{' '}
                     tokens
                   </span>
                 </div>
                 <span>
-                  {mainAgent.provider} / {mainAgent.model}
+                  {activeAgent.provider} / {activeAgent.model}
                 </span>
               </div>
               <div className="border-t border-line/60 p-3">
@@ -307,7 +369,7 @@ export function WorkspaceShell({
                   onClick={onOpenSettings}
                   className={`${ghostBtnCls} w-full justify-start`}
                   aria-label="Settings"
-                  title={`Settings for ${mainAgent.name}`}
+                  title={`Settings for ${activeAgent.name}`}
                 >
                   <GearIcon size={13} />
                   <span>Settings</span>
@@ -361,6 +423,57 @@ export function WorkspaceShell({
                 )}
               </div>
             </div>
+            {onSelectAgent && (
+              <div className="flex shrink-0 min-w-0 items-center gap-3 border-b border-line px-4 py-2">
+                <label
+                  htmlFor={
+                    desktopNavigation && !focusMode ? undefined : 'active-agent'
+                  }
+                  className="shrink-0 text-xs text-ink-3"
+                >
+                  Chat with
+                </label>
+                {desktopNavigation && !focusMode ? (
+                  <span className="min-w-0 truncate text-sm font-semibold text-ink">
+                    {activeAgent.name}
+                  </span>
+                ) : (
+                  <select
+                    id="active-agent"
+                    aria-label="Chat with agent"
+                    className="field min-w-0 max-w-xs text-sm"
+                    value={activeAgent.id}
+                    onChange={(event) => {
+                      onSelectAgent(event.target.value);
+                      setDestination('workspace');
+                    }}
+                  >
+                    {agents.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                        {item.id === mainAgent.id ? ' (Manager)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <span className="hidden truncate font-mono text-[10px] text-ink-3 sm:block">
+                  {activeAgent.provider} / {activeAgent.model}
+                </span>
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  aria-label={`View ${activeAgent.name}'s profile`}
+                  className="ml-auto flex shrink-0 items-center gap-2 rounded-lg border border-line px-2 py-1 text-xs"
+                >
+                  <AgentAvatar
+                    id={activeAgent.id}
+                    name={activeAgent.name}
+                    size={24}
+                  />
+                  <span>Profile</span>
+                </button>
+              </div>
+            )}
             <div className="studio-view">
               {destination === 'workspace' ? (
                 workspace
@@ -370,8 +483,32 @@ export function WorkspaceShell({
                 connectors
               ) : destination === 'activity' ? (
                 activity
+              ) : destination === 'hub' ? (
+                <WorkspaceHub
+                  agents={agents}
+                  onSelectAgent={
+                    onSelectAgent
+                      ? (id) => {
+                          onSelectAgent(id);
+                          setDestination('workspace');
+                        }
+                      : undefined
+                  }
+                />
               ) : (
-                <AgentsView agents={agents} mainAgent={mainAgent} />
+                <AgentsView
+                  agents={agents}
+                  mainAgent={mainAgent}
+                  activeAgentId={activeAgent.id}
+                  onSelectAgent={
+                    onSelectAgent
+                      ? (id) => {
+                          onSelectAgent(id);
+                          setDestination('workspace');
+                        }
+                      : undefined
+                  }
+                />
               )}
             </div>
           </main>

@@ -7,6 +7,8 @@ pub(crate) struct AgencyGenerateRequest {
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) team_size: Option<u64>,
+    /// Let the model choose a team size up to this limit, including the orchestrator.
+    pub(crate) max_team_size: Option<u64>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) model_pool: Option<Vec<String>>,
@@ -18,6 +20,7 @@ pub(crate) struct AgencyCreateRequest {
     pub(crate) name: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) team_size: Option<u64>,
+    pub(crate) max_team_size: Option<u64>,
     pub(crate) provider: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) model_pool: Option<Vec<String>>,

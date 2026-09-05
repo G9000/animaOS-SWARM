@@ -22,7 +22,9 @@ export function AccessStep({ access, onAccessChange }: AccessStepProps) {
           Access
         </h2>
         <p className="mt-1 text-sm text-ink-2">
-          Set what your agent can inspect, change, and run in the workspace.
+          Set what your workspace manager and any specialists can inspect,
+          change, and run. Initiative changes working behavior; this level
+          controls their tool permissions.
         </p>
       </div>
 

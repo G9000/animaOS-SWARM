@@ -1,56 +1,40 @@
 export const ONBOARDING_STEPS = [
   'Workspace',
-  'Intelligence',
-  'Agent',
-  'Access',
-  'Review',
+  'Model',
+  'Team',
+  'Manager',
+  'Launch',
 ] as const;
 
 export interface OnboardingProgressProps {
   currentStep: number;
+  steps?: readonly string[];
 }
 
-export function OnboardingProgress({ currentStep }: OnboardingProgressProps) {
+export function OnboardingProgress({
+  currentStep,
+  steps = ONBOARDING_STEPS,
+}: OnboardingProgressProps) {
   return (
-    <ol
-      aria-label="Onboarding progress"
-      className="grid grid-cols-5 gap-1.5 sm:gap-2"
-    >
-      {ONBOARDING_STEPS.map((label, index) => {
+    <ol aria-label="Onboarding progress" className="setup-progress">
+      {steps.map((label, index) => {
         const active = index === currentStep;
         const complete = index < currentStep;
-
         return (
           <li
             key={label}
             aria-current={active ? 'step' : undefined}
-            className={`min-w-0 rounded-xl border px-2 py-2.5 text-center transition sm:px-3 ${
-              active
-                ? 'border-accent/45 bg-accent/[0.08]'
-                : complete
-                  ? 'border-mint/25 bg-mint/[0.04]'
-                  : 'border-line bg-panel/35'
-            }`}
+            className="setup-progress__step"
+            data-state={active ? 'current' : complete ? 'complete' : 'upcoming'}
           >
-            <span
-              className={`mx-auto flex h-5 w-5 items-center justify-center rounded-full font-mono text-[9px] ${
-                active
-                  ? 'bg-accent text-abyss'
-                  : complete
-                    ? 'bg-mint/15 text-mint'
-                    : 'bg-white/[0.04] text-ink-3'
-              }`}
-            >
-              {complete ? '✓' : index + 1}
+            <span className="setup-progress__number" aria-hidden="true">
+              {complete ? '✓' : String(index + 1).padStart(2, '0')}
             </span>
-            <span
-              className={`mt-1.5 block truncate text-[10px] sm:text-xs ${
-                active ? 'font-medium text-ink' : 'text-ink-3'
-              }`}
-              title={label}
-            >
-              {label}
-            </span>
+            <span className="setup-progress__label">{label}</span>
+            {complete && <span className="sr-only">, completed</span>}
+            {active && (
+              <span className="setup-progress__dot" aria-hidden="true" />
+            )}
           </li>
         );
       })}

@@ -2,6 +2,20 @@
 
 This repo is a host-agnostic agent runtime workspace. Keep the engine/runtime packages separate from runnable backend hosts.
 
+# Coding Agent Workflow
+
+Shared guidance for GPT-6 Astra and GPT-5.6 coding agents, adapted from the official [Astra guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-6-astra) and [GPT-5.6 guide](https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.6).
+
+- For explanation, review, diagnosis, or planning requests, inspect and report; implement only when requested. For change requests, carry the authorized work through implementation and relevant validation.
+- Resolve routine details from context. Ask when missing information materially affects correctness or scope, and continue independent work while awaiting the answer.
+- Prior authorization remains valid. Prepare a reviewable result before requesting any still-required approval for external, destructive, or scope-expanding actions.
+- Within system and developer constraints, explicit user instructions take precedence over skill guidelines. Do not infer an extra approval gate from a skill when the work is already authorized. If a skill blocks progress, link the exact `SKILL.md`, quote the blocking instruction, and explain its applicability.
+- Preserve the active objective when handling corrections and side questions unless the user changes it. Preserve unrelated local edits.
+- Lead with the outcome, use plain language, and report meaningful progress, validation evidence, and blockers. Match detail to the task; avoid repeated narration and stock phrases.
+- When delegation is permitted, delegate bounded, independent work only when it improves speed or quality. Assign clear ownership, keep messages readable, and verify the combined result.
+- Complete the required checks below. Add tests for meaningful behavior or regression risks; avoid tests that merely duplicate trivial edits. Repeat or broaden checks only when changes, failures, or unresolved concerns justify it.
+- Keep instructions lean: state each policy once and retain repository-specific constraints when simplifying prompts.
+
 # Repo Boundaries
 
 - `packages/core-rust` is the Rust host-agnostic core workspace. It contains reusable Rust engine crates such as `anima-core`, `anima-memory`, `anima-swarm`, `anima-schedule`, and `anima-harness` (an embeddable agent-harness crate composing `anima-core` + `anima-model-adapters`).

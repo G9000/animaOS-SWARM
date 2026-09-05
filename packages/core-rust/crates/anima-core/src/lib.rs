@@ -1,4 +1,6 @@
 pub mod agent;
+pub mod communication;
+pub use communication::{AgentCommunicationRoute, MAX_AGENT_COMMUNICATION_HOPS};
 pub mod capability;
 pub mod components;
 pub mod definition;

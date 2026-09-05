@@ -18,7 +18,18 @@ export type {
   OAuthAppProvider,
   OAuthAppStatus,
 } from './connectors.js';
-export type { AgentMemory, AgentRunResponse, AgentSnapshot } from './agents.js';
+export type {
+  AgentMemory,
+  AgentTask,
+  AgentTasks,
+  AgentSchedule,
+  AgentScheduleInput,
+  AgentRunOptions,
+  AgentRunResponse,
+  AgentSnapshot,
+  AgentToolInput,
+  AgentUpdateInput,
+} from './agents.js';
 export type {
   DaemonAgentConfig,
   DaemonAgentMessage,

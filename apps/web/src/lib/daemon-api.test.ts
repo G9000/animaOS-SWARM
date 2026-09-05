@@ -99,6 +99,11 @@ afterEach(() => {
 });
 
 describe('toAgentDetail', () => {
+  it('maps the durable agency lead role', () => {
+    const lead = snapshot();
+    lead.state.config.settings = { additional: { workspaceRole: 'lead' } };
+    expect(toAgentDetail(lead).workspaceRole).toBe('lead');
+  });
   it('maps canonical tool descriptors to ordered names and keeps message filtering', () => {
     const detail = toAgentDetail(snapshot());
 
@@ -269,10 +274,13 @@ describe('daemon workspace requests', () => {
 
   it('validateWorkspace PUTs with validateOnly', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(JSON.stringify({ ...workspaceState, rootPathExists: false }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      }),
+      new Response(
+        JSON.stringify({ ...workspaceState, rootPathExists: false }),
+        {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        },
+      ),
     );
     vi.stubGlobal('fetch', fetchMock);
 
@@ -337,7 +345,8 @@ describe('daemon workspace requests', () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       new Response(
         JSON.stringify({
-          error: 'PROFILE_GENERATION_UNAVAILABLE: no generative provider configured',
+          error:
+            'PROFILE_GENERATION_UNAVAILABLE: no generative provider configured',
         }),
         { status: 400, headers: { 'content-type': 'application/json' } },
       ),
@@ -359,19 +368,24 @@ describe('daemon workspace requests', () => {
       .catch((err: unknown) => err);
 
     expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message.startsWith(PROFILE_GENERATION_UNAVAILABLE)).toBe(
-      true,
-    );
+    expect(
+      (error as Error).message.startsWith(PROFILE_GENERATION_UNAVAILABLE),
+    ).toBe(true);
   });
 
   it('bootstrapWorkspace POSTs workspace and agent payloads', async () => {
     const created = snapshot();
-    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(
-        JSON.stringify({ workspace: workspaceState.workspace, agent: created }),
-        { status: 201, headers: { 'content-type': 'application/json' } },
-      ),
-    );
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            workspace: workspaceState.workspace,
+            agent: created,
+          }),
+          { status: 201, headers: { 'content-type': 'application/json' } },
+        ),
+      );
     vi.stubGlobal('fetch', fetchMock);
 
     const input = {

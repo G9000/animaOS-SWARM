@@ -1,3 +1,4 @@
+import { AgentAvatar } from './AgentAvatar';
 import { useState } from 'react';
 import { deriveAccessProfile } from '../lib/agent-access';
 import { formatTokens } from './ui-bits';
@@ -11,9 +12,13 @@ function titleCase(value: string) {
 export function AgentsView({
   agents,
   mainAgent,
+  activeAgentId = mainAgent.id,
+  onSelectAgent,
 }: {
   agents: readonly AgentDetail[];
   mainAgent: AgentDetail;
+  activeAgentId?: string;
+  onSelectAgent?: (agentId: string) => void;
 }) {
   const [query, setQuery] = useState('');
   const visibleAgents = agents.filter((agent) =>
@@ -93,7 +98,7 @@ export function AgentsView({
                           : 'bg-white/[0.04] text-ink-2'
                       }`}
                     >
-                      <SparkIcon size={16} />
+                      <AgentAvatar id={agent.id} name={agent.name} size={40} />
                     </div>
                     <div className="min-w-0">
                       <h3 className="truncate font-display text-sm font-semibold text-ink">
@@ -108,7 +113,7 @@ export function AgentsView({
                     </div>
                   </div>
                   <span className="rounded-full border border-line bg-white/[0.03] px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-ink-2">
-                    {isMain ? 'Main' : 'Read only'}
+                    {isMain ? 'Main' : 'Teammate'}
                   </span>
                 </div>
                 <div className="studio-agent-usage">
@@ -130,6 +135,16 @@ export function AgentsView({
                     <ShieldIcon size={11} /> Access {access}
                   </span>
                 </div>
+                {onSelectAgent && (
+                  <button
+                    type="button"
+                    className="mt-4 rounded-xl border border-line px-3 py-2 text-xs text-accent transition hover:bg-accent/10"
+                    onClick={() => onSelectAgent(agent.id)}
+                    aria-label={`Chat with ${agent.name}`}
+                  >
+                    {agent.id === activeAgentId ? 'Continue chat' : 'Open chat'}
+                  </button>
+                )}
               </article>
             );
           })}

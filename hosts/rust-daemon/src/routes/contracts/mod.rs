@@ -40,7 +40,8 @@ pub(crate) use swarms::{
     SwarmsEnvelope,
 };
 pub(crate) use workspace::{
-    WorkspaceBootstrapRequest, WorkspaceBootstrapResponse, WorkspaceConfigRequest,
-    WorkspaceConfigResponse, WorkspaceInspectAgentPreview, WorkspaceInspectQuery,
-    WorkspaceInspectResponse, WorkspaceResponse, WorkspaceResumeRequest, WorkspaceResumeResponse,
+    BootstrapAgentRequest, WorkspaceBootstrapRequest, WorkspaceBootstrapResponse,
+    WorkspaceConfigRequest, WorkspaceConfigResponse, WorkspaceInspectAgentPreview,
+    WorkspaceInspectQuery, WorkspaceInspectResponse, WorkspaceResponse, WorkspaceResumeRequest,
+    WorkspaceResumeResponse,
 };

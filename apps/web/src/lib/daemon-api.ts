@@ -5,6 +5,7 @@
 // (see vite.config.mts: '/api' -> UI_BACKEND_ORIGIN ?? http://localhost:8080).
 
 import { PROVIDER_MODELS, type AgentDetail, type ChatMessage } from './types';
+import type { AgentMemory, AgentTasks } from '@animaOS-SWARM/sdk';
 
 export interface DaemonProvider {
   id: string;
@@ -57,6 +58,7 @@ export interface DaemonSnapshot {
       adjectives?: string[] | null;
       style?: string | null;
       tools?: DaemonToolDescriptor[] | null;
+      settings?: { additional?: Record<string, unknown> } | null;
     };
     createdAtMs: number;
     tokenUsage: DaemonTokenUsage;
@@ -240,8 +242,24 @@ export interface AgentProfile {
   system: string;
 }
 
+export interface GeneratedAgency {
+  name: string;
+  mission?: string | null;
+  values?: string[] | null;
+  agents: Array<{
+    name: string;
+    role: string;
+    position?: string | null;
+    bio?: string | null;
+    system?: string | null;
+    style?: string | null;
+    adjectives?: string[] | null;
+  }>;
+}
+
 export interface BootstrapWorkspaceInput {
   workspace: WorkspaceConfigInput;
+  workers?: BootstrapWorkspaceInput['agent'][];
   agent: {
     name: string;
     presetId: string;
@@ -284,6 +302,13 @@ export interface WorkspaceResumeResponse {
 }
 
 export const daemon = {
+  agentTasks: (id: string) =>
+    request<AgentTasks>(`/agents/${encodeURIComponent(id)}/tasks`),
+  updateAgentTasks: (id: string, input: AgentTasks) =>
+    request<AgentTasks>(`/agents/${encodeURIComponent(id)}/tasks`, {
+      method: 'PUT',
+      body: JSON.stringify(input),
+    }),
   health: () => request<{ status: string }>('/health'),
 
   listProviders: () => request<{ providers: DaemonProvider[] }>('/providers'),
@@ -299,6 +324,7 @@ export const daemon = {
     tools: string[];
     provider?: string;
     system?: string;
+    settings?: { additional?: { workspaceRole?: 'lead' } };
   }) =>
     request<{ agent: DaemonSnapshot }>('/agents', {
       method: 'POST',
@@ -318,13 +344,37 @@ export const daemon = {
       body: JSON.stringify(patch),
     }),
 
+  recentAgentMemories: (id: string) =>
+    request<{ memories: AgentMemory[] }>(
+      `/agents/${encodeURIComponent(id)}/memories/recent?limit=100`,
+    ),
+  setAgentAvatar: (id: string, file: File) =>
+    request<void>(`/agents/${encodeURIComponent(id)}/avatar`, {
+      method: 'PUT',
+      body: file,
+      headers: { 'content-type': file.type },
+    }),
+  removeAgentAvatar: (id: string) =>
+    request<void>(`/agents/${encodeURIComponent(id)}/avatar`, {
+      method: 'DELETE',
+    }),
+
   /** Run one agent chat turn: user text in, task result out. */
-  runAgent: (id: string, text: string, metadata?: Record<string, unknown>) =>
+  runAgent: (
+    id: string,
+    text: string,
+    metadata?: Record<string, unknown>,
+    roomId?: string,
+  ) =>
     request<{ agent: DaemonSnapshot; result: DaemonRunResult }>(
       `/agents/${id}/run`,
       {
         method: 'POST',
-        body: JSON.stringify({ text, ...(metadata ? { metadata } : {}) }),
+        body: JSON.stringify({
+          text,
+          ...(metadata ? { metadata } : {}),
+          ...(roomId ? { roomId } : {}),
+        }),
       },
     ),
 
@@ -457,11 +507,25 @@ export const daemon = {
       body: JSON.stringify(input),
     }),
 
+  generateAgency: (input: {
+    name: string;
+    description: string;
+    teamSize?: number;
+    maxTeamSize?: number;
+    provider: string;
+    model: string;
+  }) =>
+    request<GeneratedAgency>('/agencies/generate', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
   bootstrapWorkspace: (input: BootstrapWorkspaceInput) =>
-    request<{ workspace: DaemonWorkspaceConfig; agent: DaemonSnapshot }>(
-      '/workspace/bootstrap',
-      { method: 'POST', body: JSON.stringify(input) },
-    ),
+    request<{
+      workspace: DaemonWorkspaceConfig;
+      agent: DaemonSnapshot;
+      workers?: DaemonSnapshot[];
+    }>('/workspace/bootstrap', { method: 'POST', body: JSON.stringify(input) }),
 
   inspectWorkspace: (rootPath: string) =>
     request<WorkspaceInspectResponse>(
@@ -511,6 +575,9 @@ function mapStatus(status: string): AgentDetail['status'] {
 export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
   const { state } = snapshot;
   return {
+    ...(state.config.settings?.additional?.workspaceRole === 'lead'
+      ? { workspaceRole: 'lead' as const }
+      : {}),
     id: state.id,
     name: state.name,
     provider: state.config.provider ?? 'default',
@@ -535,6 +602,7 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
       })
       .map((m) => ({
         id: m.id,
+        roomId: m.roomId,
         role: mapRole(m.role),
         content: { text: m.content.text, metadata: m.content.metadata },
         created_at_ms: m.createdAtMs,

@@ -5,25 +5,34 @@ import {
   type AccessProfile,
 } from '../../lib/agent-access';
 import {
-  presetById,
-  presetTemplate,
-  type PresetId,
-} from '../../lib/agent-presets';
+  workspaceManagerProfile,
+  type ManagerInitiative,
+  type ManagerCommunication,
+} from '../../lib/workspace-manager';
 import {
   daemon,
   MODEL_SUGGESTIONS,
-  PROFILE_GENERATION_UNAVAILABLE,
   type DaemonProvider,
   type DaemonSnapshot,
   type WorkspaceInspectFound,
 } from '../../lib/daemon-api';
 import { AccessStep } from './AccessStep';
-import { AgentStep } from './AgentStep';
+import { WorkspaceManagerStep } from './WorkspaceManagerStep';
 import { ModelStep, type ProviderCatalogState } from './ModelStep';
-import { ONBOARDING_STEPS, OnboardingProgress } from './OnboardingProgress';
+import { ONBOARDING_STEPS } from './OnboardingProgress';
+import { OnboardingLayout } from './OnboardingLayout';
 import { ResumeCard } from './ResumeCard';
 import { ReviewStep } from './ReviewStep';
 import { WorkspaceStep, type WorkspaceVerifyStatus } from './WorkspaceStep';
+import { AgencyPicker } from './AgencyPicker';
+import { AgencyTeam } from './AgencyTeam';
+import {
+  AGENCY_TEMPLATES,
+  generatedMembers,
+  teamError,
+  templateMembers,
+  type AgencyMember,
+} from '../../lib/agency-templates';
 
 export interface OnboardingFlowProps {
   providers: DaemonProvider[] | null;
@@ -42,12 +51,10 @@ interface WorkspaceDraft {
 interface OnboardingDraft {
   workspace: WorkspaceDraft;
   name: string;
-  presetId: PresetId;
-  intent: string;
-  bio: string;
-  adjectives: string[];
-  style: string;
-  system: string;
+  initiative: ManagerInitiative;
+  communication: ManagerCommunication;
+  priorities: string;
+  agencyBrief: string;
   provider: string;
   model: string;
   customModel: string;
@@ -57,12 +64,10 @@ interface OnboardingDraft {
 const INITIAL_DRAFT: OnboardingDraft = {
   workspace: { companyName: '', mission: '', rootPath: '', values: [] },
   name: 'Anima',
-  presetId: 'chief-of-staff',
-  intent: '',
-  bio: '',
-  adjectives: [],
-  style: '',
-  system: '',
+  initiative: 'balanced',
+  communication: 'concise',
+  priorities: '',
+  agencyBrief: '',
   provider: '',
   model: '',
   customModel: '',
@@ -70,10 +75,10 @@ const INITIAL_DRAFT: OnboardingDraft = {
 };
 
 const PROVIDER_CATALOG_CHANGED_ERROR =
-  'Provider catalog changed. Review your provider and model before creating the agent.';
+  'Provider catalog changed. Review your provider and model before creating the workspace manager.';
 const WORKSPACE_REQUIRED_ERROR =
-  'Enter a company name, mission, and workspace folder.';
-const NAME_REQUIRED_ERROR = 'Enter an agent name.';
+  'Enter a company name, workspace brief, and workspace folder.';
+const NAME_REQUIRED_ERROR = 'Enter a manager name.';
 const MODEL_REQUIRED_ERROR = 'Enter a model.';
 const WORKSPACE_ERROR_ID = 'onboarding-workspace-error';
 const NAME_ERROR_ID = 'onboarding-agent-name-error';
@@ -85,32 +90,6 @@ function defaultModel(provider: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function templateContext(draft: OnboardingDraft) {
-  return {
-    companyName: draft.workspace.companyName.trim(),
-    mission: draft.workspace.mission.trim(),
-    agentName: draft.name.trim(),
-  };
-}
-
-/** Fill only the profile fields that are still empty from the preset template. */
-function fillEmptyFromTemplate(
-  draft: OnboardingDraft,
-  presetId: PresetId = draft.presetId,
-): OnboardingDraft {
-  const template = presetTemplate(presetId, templateContext(draft));
-  return {
-    ...draft,
-    presetId,
-    bio: draft.bio || template.bio,
-    adjectives: draft.adjectives.length
-      ? draft.adjectives
-      : template.adjectives,
-    style: draft.style || template.style,
-    system: draft.system || template.system,
-  };
 }
 
 function workspaceComplete(workspace: WorkspaceDraft): boolean {
@@ -128,6 +107,17 @@ export function OnboardingFlow({
   onCreated,
 }: OnboardingFlowProps) {
   const [draft, setDraft] = useState<OnboardingDraft>(INITIAL_DRAFT);
+  const [agencyChoice, setAgencyChoice] = useState('scratch');
+  const [showAgencyPicker, setShowAgencyPicker] = useState(true);
+  const [maxTeamSize, setMaxTeamSize] = useState(4);
+  const [workers, setWorkers] = useState<AgencyMember[]>([]);
+  const [generatingTeam, setGeneratingTeam] = useState(false);
+  const [teamGenerationError, setTeamGenerationError] = useState<string | null>(
+    null,
+  );
+  const [teamGenerated, setTeamGenerated] = useState(false);
+  const teamRequestRef = useRef(0);
+  const teamInFlightRef = useRef(false);
   const [workspaceConfigured, setWorkspaceConfigured] = useState(false);
   const [currentStep, setCurrentStep] = useState(0);
   const [blockingError, setBlockingError] = useState<string | null>(null);
@@ -145,15 +135,12 @@ export function OnboardingFlow({
   const [inspectNote, setInspectNote] = useState<string | null>(null);
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState<string | null>(null);
-  const [generating, setGenerating] = useState(false);
-  const [generateAvailable, setGenerateAvailable] = useState(true);
-  const [generateError, setGenerateError] = useState<string | null>(null);
   const [providersRetrying, setProvidersRetrying] = useState(false);
   const [providerRetryError, setProviderRetryError] = useState<string | null>(
     null,
   );
   const companyInputRef = useRef<HTMLInputElement>(null);
-  const missionInputRef = useRef<HTMLInputElement>(null);
+  const missionInputRef = useRef<HTMLTextAreaElement>(null);
   const rootPathInputRef = useRef<HTMLInputElement>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const modelSelectRef = useRef<HTMLSelectElement>(null);
@@ -163,7 +150,6 @@ export function OnboardingFlow({
   const verifyRequestIdRef = useRef(0);
   const inspectRequestIdRef = useRef(0);
   const resumeInFlightRef = useRef(false);
-  const generateInFlightRef = useRef(false);
   const submitInFlightRef = useRef(false);
   const mountedRef = useRef(false);
 
@@ -259,6 +245,115 @@ export function OnboardingFlow({
     draft.model === '__custom__'
       ? draft.customModel.trim()
       : draft.model.trim();
+  const generationContext = JSON.stringify([
+    draft.workspace,
+    draft.provider,
+    resolvedModel,
+    agencyChoice,
+    maxTeamSize,
+  ]);
+  const generationContextRef = useRef(generationContext);
+  generationContextRef.current = generationContext;
+  const selectedTemplate = AGENCY_TEMPLATES.find(
+    (template) => template.id === agencyChoice,
+  );
+  const hasAgency = agencyChoice !== 'scratch' && !workspaceConfigured;
+  const visibleSteps = hasAgency
+    ? ONBOARDING_STEPS
+    : ONBOARDING_STEPS.filter((step) => step !== 'Team');
+  const visibleStepIndex =
+    !hasAgency && currentStep > 1 ? currentStep - 1 : currentStep;
+  const managerProfile = workspaceManagerProfile({
+    name: draft.name,
+    companyName: draft.workspace.companyName,
+    mission: draft.workspace.mission,
+    initiative: draft.initiative,
+    communication: draft.communication,
+    priorities: draft.priorities,
+    agencyBrief: hasAgency ? draft.agencyBrief : '',
+  });
+
+  const selectAgency = (choice: string) => {
+    teamRequestRef.current += 1;
+    setAgencyChoice(choice);
+    setShowAgencyPicker(false);
+    setTeamGenerationError(null);
+    setTeamGenerated(false);
+    setBlockingError(null);
+    const template = AGENCY_TEMPLATES.find(
+      (candidate) => candidate.id === choice,
+    );
+    const members = template ? templateMembers(template) : [];
+    setWorkers(members.slice(1));
+    setDraft((current) => ({
+      ...current,
+      agencyBrief: members[0]?.system ?? '',
+      workspace: template
+        ? {
+            ...current.workspace,
+            companyName:
+              !current.workspace.companyName ||
+              current.workspace.companyName.startsWith('My ')
+                ? `My ${template.name}`
+                : current.workspace.companyName,
+            mission: template.mission,
+            values: [...template.values],
+          }
+        : current.workspace,
+    }));
+  };
+
+  const generateTeam = async () => {
+    if (teamInFlightRef.current || !intelligenceReady || !resolvedModel) return;
+    teamInFlightRef.current = true;
+    const requestId = ++teamRequestRef.current;
+    const context = generationContextRef.current;
+    setGeneratingTeam(true);
+    setTeamGenerationError(null);
+    try {
+      const agency = await daemon.generateAgency({
+        name: draft.workspace.companyName.trim(),
+        description: draft.workspace.mission.trim(),
+        maxTeamSize,
+        provider: draft.provider,
+        model: resolvedModel,
+      });
+      if (
+        !mountedRef.current ||
+        requestId !== teamRequestRef.current ||
+        context !== generationContextRef.current
+      )
+        return;
+      const [lead, ...specialists] = generatedMembers(agency);
+      if (specialists.length + 1 > maxTeamSize || specialists.length === 0) {
+        throw new Error(
+          'The generated team is outside your selected size limit.',
+        );
+      }
+      setDraft((current) => ({
+        ...current,
+        agencyBrief: selectedTemplate
+          ? `${lead.system}\n\nReusable starter:\n${selectedTemplate.starter.content}`
+          : lead.system,
+      }));
+      setWorkers(specialists);
+      setTeamGenerated(true);
+      setBlockingError(null);
+    } catch (error) {
+      if (
+        mountedRef.current &&
+        requestId === teamRequestRef.current &&
+        context === generationContextRef.current
+      ) {
+        setTeamGenerationError(
+          `${errorMessage(error)} Your current team is unchanged. Retry or go back to choose a template.`,
+        );
+      }
+    } finally {
+      teamInFlightRef.current = false;
+      if (mountedRef.current) setGeneratingTeam(false);
+    }
+  };
   const providerError = providerRetryError ?? providersError;
   const selectedProviderConfigured =
     providers?.some(
@@ -289,7 +384,7 @@ export function OnboardingFlow({
       ? CUSTOM_MODEL_ERROR_ID
       : undefined;
   const nameValidationErrorId =
-    currentStep === 2 && blockingError === NAME_REQUIRED_ERROR
+    currentStep === 3 && blockingError === NAME_REQUIRED_ERROR
       ? NAME_ERROR_ID
       : undefined;
   const blockingErrorId =
@@ -349,7 +444,7 @@ export function OnboardingFlow({
       return;
     }
 
-    if (currentStep === 2 && !draft.name.trim()) {
+    if (currentStep === 3 && !draft.name.trim()) {
       nameInputRef.current?.focus();
     }
   }, [
@@ -418,25 +513,14 @@ export function OnboardingFlow({
     setBlockingError(null);
   };
 
-  const changePreset = (presetId: PresetId) => {
-    setDraft((current) => {
-      const untouched =
-        !current.bio &&
-        current.adjectives.length === 0 &&
-        !current.style &&
-        !current.system;
-      return untouched
-        ? fillEmptyFromTemplate(current, presetId)
-        : { ...current, presetId };
-    });
-    setBlockingError(null);
-  };
-
   const goBack = () => {
+    teamRequestRef.current += 1;
     browseRequestIdRef.current += 1;
     setBlockingError(null);
     setCreateError(null);
-    setCurrentStep((step) => Math.max(0, step - 1));
+    setCurrentStep((step) =>
+      step === 3 && !hasAgency ? 1 : Math.max(0, step - 1),
+    );
   };
 
   const goNext = () => {
@@ -472,20 +556,36 @@ export function OnboardingFlow({
     }
 
     if (currentStep === 2) {
+      if (hasAgency) {
+        const error =
+          agencyChoice === 'generate' && !teamGenerated
+            ? 'Generate your team first, or go back to choose a template.'
+            : workers.length + 1 > maxTeamSize
+              ? 'Your preview exceeds the team size limit. Remove specialists or generate a new team.'
+              : teamError(null, workers);
+        if (error) {
+          setBlockingError(error);
+          return;
+        }
+      }
+    }
+    if (currentStep === 3) {
       if (!draft.name.trim()) {
         setBlockingError(NAME_REQUIRED_ERROR);
         nameInputRef.current?.focus();
         return;
       }
-
-      if (!draft.system.trim()) {
-        // Guarantee a valid profile before Review: fill any still-empty
-        // profile fields (system, bio, adjectives, style) from the template.
-        setDraft((current) => fillEmptyFromTemplate(current));
+      if (hasAgency && teamError(draft.name, workers)) {
+        setBlockingError(teamError(draft.name, workers));
+        return;
       }
     }
 
-    setCurrentStep((step) => Math.min(ONBOARDING_STEPS.length - 1, step + 1));
+    setCurrentStep((step) =>
+      step === 1 && !hasAgency
+        ? 3
+        : Math.min(ONBOARDING_STEPS.length - 1, step + 1),
+    );
   };
 
   const handleRetryProviders = async () => {
@@ -650,69 +750,13 @@ export function OnboardingFlow({
     setBlockingError(null);
   };
 
-  const generateProfile = async () => {
-    if (generateInFlightRef.current) {
-      return;
-    }
-
-    generateInFlightRef.current = true;
-    setGenerating(true);
-    setGenerateError(null);
-    // Snapshot the profile fields so a successful generation only overwrites
-    // fields the user has not touched while the request was in flight.
-    const before = {
-      bio: draft.bio,
-      adjectives: draft.adjectives,
-      style: draft.style,
-      system: draft.system,
-    };
-    try {
-      const { profile } = await daemon.generateProfile({
-        presetId: draft.presetId,
-        intent: draft.intent.trim(),
-        provider: draft.provider,
-        model: resolvedModel,
-        workspace: {
-          companyName: draft.workspace.companyName.trim(),
-          mission: draft.workspace.mission.trim(),
-          values: draft.workspace.values,
-        },
-      });
-      if (!mountedRef.current) {
-        return;
-      }
-      setDraft((current) => ({
-        ...current,
-        bio: current.bio === before.bio ? profile.bio : current.bio,
-        adjectives:
-          current.adjectives === before.adjectives
-            ? profile.adjectives
-            : current.adjectives,
-        style: current.style === before.style ? profile.style : current.style,
-        system:
-          current.system === before.system ? profile.system : current.system,
-      }));
-    } catch (error) {
-      if (!mountedRef.current) {
-        return;
-      }
-      const message = errorMessage(error);
-      if (message.startsWith(PROFILE_GENERATION_UNAVAILABLE)) {
-        setGenerateAvailable(false);
-        setDraft((current) => fillEmptyFromTemplate(current));
-      } else {
-        setGenerateError(message);
-      }
-    } finally {
-      generateInFlightRef.current = false;
-      if (mountedRef.current) {
-        setGenerating(false);
-      }
-    }
-  };
-
   const submit = async () => {
     if (submitInFlightRef.current) {
+      return;
+    }
+    if (hasAgency && teamError(draft.name, workers)) {
+      setBlockingError(teamError(draft.name, workers));
+      setCurrentStep(2);
       return;
     }
 
@@ -731,7 +775,7 @@ export function OnboardingFlow({
     if (!name) {
       setCreateError(null);
       setBlockingError(NAME_REQUIRED_ERROR);
-      setCurrentStep(2);
+      setCurrentStep(3);
       return;
     }
 
@@ -759,10 +803,11 @@ export function OnboardingFlow({
         // Note: createAgent's wire type carries no bio/adjectives/style, so
         // those profile fields are folded into `system` only.
         const response = await daemon.createAgent({
+          settings: { additional: { workspaceRole: 'lead' } },
           name,
           ...(draft.provider ? { provider: draft.provider } : {}),
           model: resolvedModel,
-          ...(draft.system.trim() ? { system: draft.system.trim() } : {}),
+          system: managerProfile.system,
           tools: toolNamesForProfile(draft.access),
         });
         if (mountedRef.current) {
@@ -772,6 +817,19 @@ export function OnboardingFlow({
       }
 
       const response = await daemon.bootstrapWorkspace({
+        ...(hasAgency
+          ? {
+              workers: workers.map((worker) => ({
+                ...worker,
+                name: worker.name.trim(),
+                bio: worker.bio.trim(),
+                system: `Workspace: ${draft.workspace.companyName.trim()}\nMission: ${draft.workspace.mission.trim()}\n\n${worker.system.trim()}`,
+                provider: draft.provider,
+                model: resolvedModel,
+                tools: toolNamesForProfile(draft.access),
+              })),
+            }
+          : {}),
         workspace: {
           rootPath: draft.workspace.rootPath.trim(),
           companyName: draft.workspace.companyName.trim(),
@@ -780,11 +838,8 @@ export function OnboardingFlow({
         },
         agent: {
           name,
-          presetId: draft.presetId,
-          bio: draft.bio.trim(),
-          ...(draft.adjectives.length ? { adjectives: draft.adjectives } : {}),
-          ...(draft.style.trim() ? { style: draft.style.trim() } : {}),
-          system: draft.system.trim(),
+          presetId: 'chief-of-staff',
+          ...managerProfile,
           ...(draft.provider ? { provider: draft.provider } : {}),
           model: resolvedModel,
           tools: toolNamesForProfile(draft.access),
@@ -809,28 +864,68 @@ export function OnboardingFlow({
   switch (currentStep) {
     case 0:
       stepContent = (
-        <WorkspaceStep
-          companyName={draft.workspace.companyName}
-          mission={draft.workspace.mission}
-          rootPath={draft.workspace.rootPath}
-          values={draft.workspace.values}
-          verifying={verifying}
-          verifyStatus={verifyStatus}
-          onCompanyNameChange={(value) => updateWorkspace('companyName', value)}
-          onMissionChange={(value) => updateWorkspace('mission', value)}
-          onRootPathChange={changeRootPath}
-          onValuesChange={(values) => updateWorkspace('values', values)}
-          onVerify={() => void verifyWorkspace()}
-          browsing={browsing}
-          onBrowse={() => void browseWorkspace()}
-          resumeMode={resumeMode}
-          onResumeModeChange={changeResumeMode}
-          onInspect={() => void inspectWorkspace()}
-          companyInputRef={companyInputRef}
-          missionInputRef={missionInputRef}
-          rootPathInputRef={rootPathInputRef}
-          validationErrorId={workspaceValidationErrorId}
-        />
+        <>
+          {!resumeMode && !workspaceConfigured && showAgencyPicker && (
+            <AgencyPicker selected={agencyChoice} onSelect={selectAgency} />
+          )}
+          {!resumeMode && !workspaceConfigured && !showAgencyPicker && (
+            <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-line bg-white/40 p-4">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold text-ink">
+                  {selectedTemplate?.name ??
+                    (agencyChoice === 'generate'
+                      ? 'Custom agency'
+                      : 'Manager only')}
+                </p>
+                <p className="mt-1 text-xs text-ink-2">
+                  {hasAgency
+                    ? `Your manager and ${workers.length} specialists`
+                    : 'Your own workspace, with Anima to help.'}
+                </p>
+              </div>
+              <button
+                type="button"
+                className="shrink-0 text-sm font-medium text-accent"
+                onClick={() => setShowAgencyPicker(true)}
+              >
+                Change template
+              </button>
+            </div>
+          )}
+          <WorkspaceStep
+            companyName={draft.workspace.companyName}
+            mission={draft.workspace.mission}
+            rootPath={draft.workspace.rootPath}
+            values={draft.workspace.values}
+            verifying={verifying}
+            verifyStatus={verifyStatus}
+            onCompanyNameChange={(value) =>
+              updateWorkspace('companyName', value)
+            }
+            onMissionChange={(value) => updateWorkspace('mission', value)}
+            onRootPathChange={changeRootPath}
+            onValuesChange={(values) => updateWorkspace('values', values)}
+            onVerify={() => void verifyWorkspace()}
+            browsing={browsing}
+            onBrowse={() => void browseWorkspace()}
+            resumeMode={resumeMode}
+            onResumeModeChange={changeResumeMode}
+            onInspect={() => void inspectWorkspace()}
+            companyInputRef={companyInputRef}
+            missionInputRef={missionInputRef}
+            rootPathInputRef={rootPathInputRef}
+            validationErrorId={workspaceValidationErrorId}
+          />
+          {hasAgency && !resumeMode && (
+            <p className="mt-3 text-xs leading-relaxed text-ink-3">
+              Use the workspace brief to describe your audience, goals, content
+              channels, or routines.{' '}
+              {agencyChoice === 'generate'
+                ? 'Choose your model next, then generate and review your team.'
+                : 'Your template includes a full team. Personalize it after choosing your model.'}
+            </p>
+          )}
+        </>
       );
       break;
     case 1:
@@ -854,45 +949,158 @@ export function OnboardingFlow({
       break;
     case 2:
       stepContent = (
-        <AgentStep
-          name={draft.name}
-          presetId={draft.presetId}
-          intent={draft.intent}
-          bio={draft.bio}
-          adjectives={draft.adjectives}
-          style={draft.style}
-          system={draft.system}
-          generating={generating}
-          generateAvailable={generateAvailable}
-          generateError={generateError}
-          onNameChange={(name) => updateDraft('name', name)}
-          onPresetChange={changePreset}
-          onIntentChange={(intent) => updateDraft('intent', intent)}
-          onBioChange={(bio) => updateDraft('bio', bio)}
-          onStyleChange={(style) => updateDraft('style', style)}
-          onSystemChange={(system) => updateDraft('system', system)}
-          onGenerate={() => void generateProfile()}
-          nameInputRef={nameInputRef}
-          validationErrorId={nameValidationErrorId}
-        />
+        <>
+          {hasAgency && (
+            <div className="mb-5 space-y-3 rounded-2xl border border-accent/25 bg-accent/[0.04] p-4">
+              <h2 className="font-display text-xl font-semibold text-ink">
+                Shape your team
+              </h2>
+              <p className="text-sm text-ink-2">
+                {agencyChoice === 'generate'
+                  ? 'Propose specialists and agency responsibilities from your workspace brief, then review them below.'
+                  : 'Your template is ready. Keep it as-is, edit the team below, or generate a new proposal from your workspace brief.'}
+              </p>
+              <p className="text-xs text-ink-3">
+                Generation replaces this team preview and uses your selected
+                model.
+              </p>
+              <div className="space-y-2 py-3">
+                <label
+                  htmlFor="onboarding-team-limit"
+                  className="block text-sm font-medium text-ink"
+                >
+                  Maximum team size
+                </label>
+                <select
+                  id="onboarding-team-limit"
+                  className="field"
+                  value={maxTeamSize}
+                  disabled={generatingTeam}
+                  onChange={(event) => {
+                    setMaxTeamSize(Number(event.target.value));
+                    setTeamGenerationError(null);
+                    setBlockingError(null);
+                  }}
+                >
+                  {Array.from({ length: 9 }, (_, index) => index + 2).map(
+                    (size) => (
+                      <option key={size} value={size}>
+                        {size} agents total · 1 manager + up to {size - 1}{' '}
+                        specialists
+                      </option>
+                    ),
+                  )}
+                </select>
+                <p className="text-xs leading-relaxed text-ink-3">
+                  AI chooses the smallest useful team from your brief, up to
+                  this limit. This includes your workspace manager. Review or
+                  remove specialists before creating.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void generateTeam()}
+                disabled={generatingTeam || draft.provider === 'deterministic'}
+                className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-abyss disabled:opacity-50"
+              >
+                {generatingTeam ? 'Generating team…' : 'Generate team'}
+              </button>
+              {draft.provider === 'deterministic' && (
+                <p className="text-xs text-ink-3">
+                  Choose a generative provider in Model to generate a team.
+                  Ready-made templates work without generation.
+                </p>
+              )}
+              {teamGenerationError && (
+                <p role="alert" className="text-sm text-danger">
+                  {teamGenerationError}
+                </p>
+              )}
+              {teamGenerated && (
+                <p role="status" className="text-sm text-mint">
+                  Your team preview is ready. Review it before creating.
+                </p>
+              )}
+            </div>
+          )}
+          <fieldset disabled={generatingTeam} className="min-w-0">
+            {hasAgency && (
+              <AgencyTeam
+                workers={workers}
+                onChange={(index, field, value) => {
+                  setWorkers((current) =>
+                    current.map((worker, i) =>
+                      i === index ? { ...worker, [field]: value } : worker,
+                    ),
+                  );
+                  setBlockingError(null);
+                }}
+                onRemove={(index) =>
+                  setWorkers((current) => current.filter((_, i) => i !== index))
+                }
+              />
+            )}
+          </fieldset>
+          {selectedTemplate && (
+            <details className="mt-5 rounded-xl border border-line p-4">
+              <summary className="cursor-pointer text-sm font-medium text-ink">
+                Starter template: {selectedTemplate.starter.title}
+              </summary>
+              <p className="mt-2 text-xs text-ink-3">
+                Included in your manager’s instructions. Ask your manager to
+                start with this template.
+              </p>
+              <pre className="mt-3 whitespace-pre-wrap break-words text-xs leading-relaxed text-ink-2">
+                {selectedTemplate.starter.content}
+              </pre>
+            </details>
+          )}
+        </>
       );
       break;
     case 3:
       stepContent = (
-        <AccessStep
-          access={draft.access}
-          onAccessChange={(access) => updateDraft('access', access)}
-        />
+        <>
+          <WorkspaceManagerStep
+            name={draft.name}
+            initiative={draft.initiative}
+            communication={draft.communication}
+            priorities={draft.priorities}
+            instructions={managerProfile.system}
+            onNameChange={(name) => updateDraft('name', name)}
+            onInitiativeChange={(initiative) =>
+              updateDraft('initiative', initiative)
+            }
+            onCommunicationChange={(communication) =>
+              updateDraft('communication', communication)
+            }
+            onPrioritiesChange={(priorities) =>
+              updateDraft('priorities', priorities)
+            }
+            nameInputRef={nameInputRef}
+            validationErrorId={nameValidationErrorId}
+          />
+
+          <div className="mt-7 border-t border-line pt-6">
+            <AccessStep
+              access={draft.access}
+              onAccessChange={(access) => updateDraft('access', access)}
+            />
+          </div>
+        </>
       );
       break;
     default:
       stepContent = (
         <ReviewStep
+          showActions={false}
+          workers={hasAgency ? workers : undefined}
           workspace={draft.workspace}
-          presetLabel={presetById(draft.presetId)?.label ?? draft.presetId}
-          bio={draft.bio}
+          initiative={draft.initiative}
+          communication={draft.communication}
+          bio={managerProfile.bio}
           name={draft.name}
-          system={draft.system}
+          system={managerProfile.system}
           provider={draft.provider}
           model={resolvedModel}
           access={draft.access}
@@ -906,136 +1114,115 @@ export function OnboardingFlow({
       );
   }
 
+  const creationSubject = workspaceConfigured
+    ? 'manager'
+    : hasAgency
+      ? 'agency'
+      : 'workspace';
+  const title = resumeMode
+    ? showingResumeCard
+      ? 'Resume your workspace'
+      : 'Open existing workspace'
+    : 'Set up your workspace';
+  const subtitle = resumeMode
+    ? 'Pick up where you left off.'
+    : workspaceConfigured
+      ? 'Your workspace is ready — set up its manager.'
+      : 'A little setup. A workspace that works your way.';
+
   return (
-    <div className="studio-onboarding relative z-[1] flex flex-1 items-start justify-center overflow-y-auto px-4 py-6 sm:px-6 sm:py-10">
-      <div className="w-full max-w-2xl space-y-6">
-        <header className="space-y-2 text-center">
-          <div className="studio-onboarding-brand">
-            <span aria-hidden>✳</span> animaOS
-          </div>
-          <p className="font-mono text-[10px] uppercase tracking-[0.22em] text-ink-3">
-            MAKE YOURSELF AT HOME
-          </p>
-          <h1 className="font-display text-3xl font-semibold tracking-[-0.035em] text-ink sm:text-4xl">
-            {resumeMode
-              ? showingResumeCard
-                ? 'Resume your workspace'
-                : 'Open existing workspace'
-              : 'Set up your workspace'}
-          </h1>
-          <p className="mx-auto max-w-lg text-sm leading-relaxed text-ink-2">
-            {resumeMode
-              ? 'Choose your workspace folder and pick up where you left off.'
-              : workspaceConfigured
-                ? 'Your workspace is ready — hire another agent.'
-                : 'Name your company, pick its folder, and hire your first agent.'}
-          </p>
-          <div className="studio-onboarding-promise">
-            <div className="studio-onboarding-art" aria-hidden>
-              <span>✳</span>
-              <i />
-              <b>YOUR NEXT CHAPTER</b>
-            </div>
-            <div>
-              <span>01</span>
-              <p>
-                <strong>Your space, your rules.</strong>Choose a folder and
-                decide how your agent can help.
-              </p>
-            </div>
-            <div>
-              <span>02</span>
-              <p>
-                <strong>Intelligence with intention.</strong>Pick a model, shape
-                a personality, and start a conversation.
-              </p>
-            </div>
-            <div>
-              <span>03</span>
-              <p>
-                <strong>Start small. Go somewhere.</strong>You can refine your
-                agent’s settings as you work.
-              </p>
-            </div>
-          </div>
-        </header>
-
-        {currentStep === 0 && !workspaceConfigured && !resumeMode ? (
-          <button
-            type="button"
-            onClick={() => changeResumeMode(true)}
-            className="w-full rounded-xl border border-line bg-white/[0.02] px-4 py-3 text-sm font-medium text-ink transition hover:border-line-strong"
-          >
-            Open existing workspace
-          </button>
-        ) : null}
-        {!resumeMode && <OnboardingProgress currentStep={currentStep} />}
-        <p
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-          className="sr-only"
-        >
-          {resumeMode
-            ? 'Open existing workspace'
-            : `Step ${currentStep + 1} of ${ONBOARDING_STEPS.length}: ${ONBOARDING_STEPS[currentStep]}`}
-        </p>
-
-        <div className="glass-strong rounded-3xl p-5 shadow-2xl shadow-black/60 sm:p-8">
-          {showingResumeCard && inspectPreview ? (
-            <ResumeCard
-              preview={inspectPreview}
-              rootPath={draft.workspace.rootPath.trim()}
-              resuming={resuming}
-              resumeError={resumeError}
-              onResume={() => void resumeWorkspace()}
-              onSetupFresh={setupFresh}
-            />
-          ) : (
-            stepContent
-          )}
-
-          {!showingResumeCard && inspectNote ? (
-            <p className="mt-5 rounded-xl border border-line bg-white/[0.02] p-3 text-sm text-ink-2">
-              {inspectNote}
-            </p>
-          ) : null}
-
-          {blockingError && !showingResumeCard ? (
-            <p
-              id={blockingErrorId}
-              role="alert"
-              className="mt-5 rounded-xl border border-danger/30 bg-danger/5 p-3 text-sm text-danger"
-            >
-              {blockingError}
-            </p>
-          ) : null}
-
-          {currentStep < ONBOARDING_STEPS.length - 1 && !resumeMode ? (
-            <div className="mt-6 flex items-center justify-between gap-3">
-              {currentStep > 0 ? (
-                <button
-                  type="button"
-                  className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink"
-                  onClick={goBack}
-                >
-                  Back
-                </button>
-              ) : (
-                <span />
-              )}
+    <OnboardingLayout
+      steps={visibleSteps}
+      currentStep={visibleStepIndex}
+      title={title}
+      subtitle={subtitle}
+      resumeMode={resumeMode}
+      summary={{
+        workspace: draft.workspace.companyName.trim() || 'Your workspace',
+        template:
+          selectedTemplate?.name ??
+          (agencyChoice === 'generate' ? 'Custom agency' : 'Manager only'),
+        team: hasAgency
+          ? agencyChoice === 'generate' && !teamGenerated
+            ? 'Team not generated yet'
+            : `1 manager + ${workers.length} specialists`
+          : '1 workspace manager',
+      }}
+      footer={
+        !resumeMode ? (
+          <div className="setup-actions">
+            {currentStep > 0 ? (
               <button
                 type="button"
-                disabled={currentStep === 1 && !intelligenceReady}
-                className="rounded-xl bg-accent px-5 py-2 text-sm font-semibold text-abyss shadow-lg shadow-accent/20 transition hover:bg-accent/90 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
-                onClick={goNext}
+                className="setup-back"
+                onClick={goBack}
+                disabled={creating}
               >
-                Next
+                Back
               </button>
-            </div>
-          ) : null}
-        </div>
-      </div>
-    </div>
+            ) : (
+              <span />
+            )}
+            <span className="setup-next-hint">
+              {currentStep === 4
+                ? 'Everything can be refined later.'
+                : `Next: ${visibleSteps[visibleStepIndex + 1]}`}
+            </span>
+            <button
+              type="button"
+              className="setup-next"
+              onClick={currentStep === 4 ? () => void submit() : goNext}
+              disabled={
+                creating ||
+                generatingTeam ||
+                (currentStep === 1 && !intelligenceReady)
+              }
+            >
+              {currentStep === 4
+                ? creating
+                  ? `Creating ${creationSubject}…`
+                  : `Create ${creationSubject}`
+                : 'Next'}
+            </button>
+          </div>
+        ) : undefined
+      }
+    >
+      {currentStep === 0 && !workspaceConfigured && !resumeMode && (
+        <button
+          type="button"
+          className="mb-5 text-sm font-medium text-accent"
+          onClick={() => changeResumeMode(true)}
+        >
+          Open existing workspace
+        </button>
+      )}
+      {showingResumeCard && inspectPreview ? (
+        <ResumeCard
+          preview={inspectPreview}
+          rootPath={draft.workspace.rootPath.trim()}
+          resuming={resuming}
+          resumeError={resumeError}
+          onResume={() => void resumeWorkspace()}
+          onSetupFresh={setupFresh}
+        />
+      ) : (
+        stepContent
+      )}
+      {!showingResumeCard && inspectNote && (
+        <p className="mt-5 rounded-xl border border-line p-3 text-sm text-ink-2">
+          {inspectNote}
+        </p>
+      )}
+      {blockingError && !showingResumeCard && (
+        <p
+          id={blockingErrorId}
+          role="alert"
+          className="mt-5 rounded-xl border border-danger/30 bg-danger/5 p-3 text-sm text-danger"
+        >
+          {blockingError}
+        </p>
+      )}
+    </OnboardingLayout>
   );
 }
