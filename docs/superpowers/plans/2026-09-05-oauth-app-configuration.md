@@ -46,9 +46,9 @@
 - Test: `hosts/rust-daemon/src/routes/mod.rs`
 
 - [ ] Write failing route tests for GET/PUT/DELETE envelopes, stable error codes, authorization before body parsing, request-size enforcement, secret redaction, and exact provider paths.
-- [ ] Run the focused route tests and confirm expected failures.
+- [ ] Run `bun x nx run rust-daemon:test --excludeTaskDependencies --args='routes::oauth_apps::tests' --skipNxCache` and confirm expected failures.
 - [ ] Add `/api/connectors/oauth-apps/{provider}` routes using the bounded body reader and local-owner authorization, then register schemas and paths in OpenAPI.
-- [ ] Rerun focused route tests and confirm they pass.
+- [ ] Rerun the same `routes::oauth_apps::tests` command and confirm it passes.
 
 ### Task 4: Typed SDK
 
