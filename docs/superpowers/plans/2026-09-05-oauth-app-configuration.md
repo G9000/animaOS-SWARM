@@ -82,8 +82,10 @@
 - Modify: `docs/superpowers/plans/2026-09-05-oauth-app-configuration.md`
 
 - [x] Replace terminal-first setup guidance with the UI flow while retaining environment-variable fallback documentation.
-- [ ] Run `bun x nx run rust-daemon:lint --skipNxCache` and `$env:RUST_TEST_THREADS='1'; bun x nx run rust-daemon:test --skipNxCache` (using `CI=1` and a separate `CARGO_TARGET_DIR` if the live Windows daemon locks the default target).
-- [ ] Run `bun x nx run-many -t test typecheck build --projects=@animaOS-SWARM/web,@animaOS-SWARM/sdk --skipNxCache` and `bun x nx run @animaOS-SWARM/docs:build --skipNxCache`.
-- [ ] Run an isolated daemon smoke test with fake app credentials, confirm only redacted status is returned and Gmail/Calendar readiness changes without restart, then remove the fake credentials without starting provider OAuth.
-- [ ] Restart the existing workspace launcher with its environment preserved, reload the saved workspace if the control plane is ephemeral, and verify the Connectors UI/API is live without writing real provider credentials.
-- [ ] Mark this plan complete with current verification evidence.
+- [x] Run `bun x nx run rust-daemon:lint --skipNxCache` and `$env:RUST_TEST_THREADS='1'; bun x nx run rust-daemon:test --skipNxCache` (using `CI=1` and a separate `CARGO_TARGET_DIR` if the live Windows daemon locks the default target).
+- [x] Run `bun x nx run-many -t test typecheck build --projects=@animaOS-SWARM/web,@animaOS-SWARM/sdk --skipNxCache` and `bun x nx run @animaOS-SWARM/docs:build --skipNxCache`.
+- [x] Run an isolated daemon smoke test with fake app credentials, confirm only redacted status is returned and Gmail/Calendar readiness changes without restart, then remove the fake credentials without starting provider OAuth.
+- [x] Restart the existing workspace launcher with its environment preserved, reload the saved workspace if the control plane is ephemeral, and verify the Connectors UI/API is live without writing real provider credentials.
+- [x] Mark this plan complete with current verification evidence.
+
+Final evidence: Rust formatting and the serial Rust daemon/core suites passed in the isolated Windows validation target. SDK and web tests, typechecks, and production builds passed; web reported 253 tests and SDK 23 tests. The docs build produced 22 pages. The isolated daemon accepted fake Google and Microsoft app credentials, returned redacted vault status, enabled Gmail, Calendar, and Outlook immediately, then removed and verified absence of both fake credentials. The live launcher restarted with its prior environment, the saved workspace and one idle agent were restored, both OAuth status routes return 200 through the web proxy, and a headless browser rendered both setup cards with zero page errors.
