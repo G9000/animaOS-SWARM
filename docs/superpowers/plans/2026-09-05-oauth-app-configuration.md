@@ -43,7 +43,7 @@
 - Create: `hosts/rust-daemon/src/routes/oauth_apps.rs`
 - Modify: `hosts/rust-daemon/src/routes/mod.rs`
 - Modify: `hosts/rust-daemon/src/routes/http.rs`
-- Test: `hosts/rust-daemon/src/routes/mod.rs`
+- Test: `hosts/rust-daemon/src/routes/oauth_apps.rs`
 
 - [ ] Write failing route tests for GET/PUT/DELETE envelopes, stable error codes, authorization before body parsing, request-size enforcement, secret redaction, and exact provider paths.
 - [ ] Run `bun x nx run rust-daemon:test --excludeTaskDependencies --args='routes::oauth_apps::tests' --skipNxCache` and confirm expected failures.
