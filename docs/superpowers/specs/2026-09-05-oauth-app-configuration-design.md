@@ -16,7 +16,11 @@ The Rust daemon owns a new OAuth application configuration service. Production u
 
 The service exposes owner-only HTTP JSON endpoints under `/api/connectors/oauth-apps/{provider}`. The SDK wraps these endpoints. Calendar and mail managers resolve the current OAuth configuration from this shared service at operation time instead of retaining an immutable startup snapshot. This makes Save effective without restarting the daemon.
 
-Google and Microsoft are daemon-level application settings, while connected accounts remain agent-scoped. Removing application settings is rejected while the corresponding provider has an active or pairing connector, preventing a silently broken connection. The owner disconnects accounts first, then removes the app credentials.
+Each provider has one shared lifecycle lock and a monotonically increasing configuration revision. Configuration reads, writes, OAuth start/callback, token refresh, disconnect and removal use that provider lock. An OAuth flow records the revision at start, and its callback is rejected if the revision changed. This prevents a callback or refresh from crossing a credential replacement boundary.
+
+Google and Microsoft are daemon-level application settings, while connected accounts remain agent-scoped. Replacing or removing application settings is rejected while the provider has any non-deleted connector or pending authorization, including reauthorization/error/disabled states that may retain tokens. The owner disconnects every dependent account first. The dependency check and configuration mutation happen while holding the same provider lifecycle lock used by OAuth and token operations.
+
+Environment configuration is used only when the vault reports that no entry exists. A vault read or decode failure returns `503`; it never silently falls back to environment values.
 
 ## API contract
 
@@ -36,9 +40,9 @@ Google and Microsoft are daemon-level application settings, while connected acco
 }
 ```
 
-`PUT /api/connectors/oauth-apps/{provider}` accepts `clientId`, `clientSecret`, and optional `tenant` for Microsoft. Both credential fields are required and trimmed. Values have conservative size limits, reject control characters, and Microsoft tenant accepts `common`, `organizations`, `consumers`, or a tenant ID/domain using the daemon's current safe character set. The operation replaces the provider's vault configuration atomically and returns the redacted status envelope.
+`PUT /api/connectors/oauth-apps/{provider}` accepts `clientId`, `clientSecret`, and optional `tenant` for Microsoft. Both credential fields are required and trimmed. Values have conservative size limits, reject control characters, and Microsoft tenant accepts `common`, `organizations`, `consumers`, or a tenant ID/domain using the daemon's current safe character set. The operation replaces the provider's vault configuration atomically, increments its revision, and returns the redacted status envelope. It returns `409` if any dependent connector or pending authorization exists.
 
-`DELETE /api/connectors/oauth-apps/{provider}` removes only a vault-managed configuration and returns `204`. It returns `409` if a dependent connector exists or the effective configuration comes only from environment variables.
+`DELETE /api/connectors/oauth-apps/{provider}` removes only a vault-managed configuration, increments its revision, and returns `204`. It returns `409` if any non-deleted connector or pending authorization exists, or if the effective configuration comes only from environment variables.
 
 All three operations use the existing local-owner authorization boundary. They are included in OpenAPI. Responses use `400` for invalid input/provider, `403` for owner failure, `409` for a lifecycle conflict, and `503` for credential-vault failure. Secrets are zeroized in memory, excluded from debug output, omitted from logs and never included in response/error text.
 
