@@ -158,6 +158,51 @@ struct AppState {
     local_owner: self::http::LocalOwnerPolicy,
 }
 
+impl AppState {
+    pub(super) async fn put_oauth_app_if_unused(
+        &self,
+        provider: crate::connectors::oauth_apps::OAuthProvider,
+        credentials: crate::connectors::oauth_apps::OAuthAppCredentials,
+    ) -> Result<u64, crate::connectors::oauth_apps::OAuthAppError> {
+        let calendar = self.calendar.clone();
+        let mail = self.mail.clone();
+        self.oauth_apps
+            .put_if_unused(provider, credentials, move || async move {
+                match provider {
+                    crate::connectors::oauth_apps::OAuthProvider::Google => {
+                        calendar.has_provider_dependency(provider).await
+                            || mail.has_provider_dependency(provider).await
+                    }
+                    crate::connectors::oauth_apps::OAuthProvider::Microsoft => {
+                        mail.has_provider_dependency(provider).await
+                    }
+                }
+            })
+            .await
+    }
+
+    pub(super) async fn delete_oauth_app_if_unused(
+        &self,
+        provider: crate::connectors::oauth_apps::OAuthProvider,
+    ) -> Result<u64, crate::connectors::oauth_apps::OAuthAppError> {
+        let calendar = self.calendar.clone();
+        let mail = self.mail.clone();
+        self.oauth_apps
+            .delete_if_unused(provider, move || async move {
+                match provider {
+                    crate::connectors::oauth_apps::OAuthProvider::Google => {
+                        calendar.has_provider_dependency(provider).await
+                            || mail.has_provider_dependency(provider).await
+                    }
+                    crate::connectors::oauth_apps::OAuthProvider::Microsoft => {
+                        mail.has_provider_dependency(provider).await
+                    }
+                }
+            })
+            .await
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ApiError {
     status: StatusCode,

@@ -1,5 +1,7 @@
 use super::*;
+use crate::connectors::gcalendar::client::UnconfiguredGoogleTransport;
 use crate::connectors::gcalendar::store::InMemoryGoogleCredentialStore;
+use crate::connectors::gcalendar::CalendarManager;
 use crate::connectors::oauth_apps::{
     InMemoryOAuthAppVault, OAuthAppCredentials, OAuthAppService, OAuthEnvironment, OAuthProvider,
 };
@@ -327,6 +329,49 @@ async fn google_config_mutation_waits_for_gmail_oauth_callback() {
     release.add_permits(1);
     assert_eq!(callback.await.unwrap().unwrap().id, pairing.id);
     mutation.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn calendar_oauth_waits_for_gmail_oauth_on_the_shared_google_lifecycle() {
+    let (state, mail, transport, agent) = fixture(false).await;
+    let calendar = CalendarManager::new(
+        &state,
+        AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(2))),
+        Arc::new(InMemoryGoogleCredentialStore::default()),
+        Arc::new(UnconfiguredGoogleTransport),
+        mail.oauth_apps.clone(),
+    );
+    let (_, url) = mail.begin_connect(&agent, Provider::Gmail).await.unwrap();
+    let nonce = reqwest::Url::parse(&url)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .unwrap()
+        .1
+        .into_owned();
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    *transport.exchange_entered.lock().unwrap() = Some(entered.clone());
+    *transport.exchange_gate.lock().unwrap() = Some(release.clone());
+
+    let gmail_callback = {
+        let mail = mail.clone();
+        tokio::spawn(async move { mail.complete_connect(Provider::Gmail, &nonce, "code").await })
+    };
+    entered.acquire().await.unwrap().forget();
+    let calendar_begin = tokio::spawn(async move { calendar.begin_connect(&agent).await });
+
+    assert!(tokio::time::timeout(Duration::from_millis(50), async {
+        while !calendar_begin.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_err());
+
+    release.add_permits(1);
+    gmail_callback.await.unwrap().unwrap();
+    calendar_begin.await.unwrap().unwrap();
 }
 
 async fn connect(manager: &MailManager, agent: &str) -> MailConnector {
