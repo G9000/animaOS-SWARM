@@ -7,12 +7,14 @@ import { AgentPresence } from './AgentPresence';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentsView } from './AgentsView';
 import { WorkspaceHub } from './WorkspaceHub';
+import { WorkspaceDashboard } from './WorkspaceDashboard';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
 import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { AgentsIcon, GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
 import { formatTokens, ghostBtnCls } from './ui-bits';
 
 export type WorkspaceDestination =
+  | 'dashboard'
   | 'workspace'
   | 'connectors'
   | 'telegram'
@@ -28,6 +30,7 @@ const DESTINATIONS: Array<{
   icon: ReactNode;
 }> = [
   { id: 'workspace', label: 'Workspace', icon: <SparkIcon size={15} /> },
+  { id: 'dashboard', label: 'Dashboard', icon: <PulseIcon size={15} /> },
   { id: 'hub', label: 'Work hub', icon: <PulseIcon size={15} /> },
   { id: 'connectors', label: 'Connectors', icon: <GearIcon size={15} /> },
   { id: 'activity', label: 'Activity', icon: <PulseIcon size={15} /> },
@@ -86,7 +89,7 @@ function DestinationNavigation({
       className={
         sidebar
           ? 'studio-navigation flex min-h-0 flex-1 flex-col gap-1 p-3'
-          : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center justify-around gap-1 rounded-2xl p-1.5 shadow-2xl shadow-black/50'
+          : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center gap-1 overflow-x-auto rounded-2xl p-1.5 shadow-2xl shadow-black/50'
       }
     >
       {sidebar ? (
@@ -106,7 +109,7 @@ function DestinationNavigation({
             className={`studio-nav-item inline-flex min-w-0 items-center gap-2 rounded-xl px-3 py-2 text-xs font-medium transition ${
               sidebar
                 ? 'w-full justify-start py-2.5 text-left'
-                : 'flex-1 flex-col justify-center gap-1 px-1 text-[10px]'
+                : 'min-w-16 flex-1 shrink-0 flex-col justify-center gap-1 px-1 text-[10px]'
             } ${
               active
                 ? 'bg-accent/12 text-accent shadow-[inset_0_0_0_1px_rgb(var(--color-accent-rgb)/0.18)]'
@@ -153,6 +156,9 @@ export function WorkspaceShell({
 }) {
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
+  const [hubSection, setHubSection] = useState<'Notes' | 'Tasks' | 'Schedules'>(
+    'Notes',
+  );
   const [destination, setDestination] =
     useState<WorkspaceDestination>('workspace');
   const desktopNavigation = useDesktopNavigation();
@@ -423,7 +429,7 @@ export function WorkspaceShell({
                 )}
               </div>
             </div>
-            {onSelectAgent && (
+            {onSelectAgent && destination !== 'dashboard' && (
               <div className="flex shrink-0 min-w-0 items-center gap-3 border-b border-line px-4 py-2">
                 <label
                   htmlFor={
@@ -483,8 +489,25 @@ export function WorkspaceShell({
                 connectors
               ) : destination === 'activity' ? (
                 activity
+              ) : destination === 'dashboard' ? (
+                <WorkspaceDashboard
+                  agents={agents}
+                  companyName={companyName}
+                  mission={workspaceState?.workspace?.mission}
+                  online={connection === 'online'}
+                  onChat={(id) => {
+                    onSelectAgent?.(id);
+                    setDestination('workspace');
+                  }}
+                  onOpenWork={(section) => {
+                    setHubSection(section);
+                    setDestination('hub');
+                  }}
+                  onOpenTeam={() => setDestination('agents')}
+                />
               ) : destination === 'hub' ? (
                 <WorkspaceHub
+                  initialSection={hubSection}
                   agents={agents}
                   onSelectAgent={
                     onSelectAgent

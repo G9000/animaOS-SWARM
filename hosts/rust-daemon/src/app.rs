@@ -154,6 +154,7 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
         config.max_background_processes,
     )));
     configure_persistence(&state, &config).await?;
+    state.write().await.chatgpt_auth = crate::chatgpt_auth::ChatGptAuth::new();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
     state
         .write()
@@ -165,10 +166,11 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
+    let chatgpt_auth = crate::chatgpt_auth::ChatGptAuth::new();
     let event_fanout = EventFanout::new(config.event_buffer);
     let state = Arc::new(RwLock::new(
         DaemonState::with_model_adapter_and_events_and_limits(
-            Arc::new(RuntimeModelAdapter::from_env()),
+            Arc::new(RuntimeModelAdapter::from_env(chatgpt_auth.clone())),
             event_fanout,
             config.max_background_processes,
         ),
@@ -176,6 +178,7 @@ pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()
 
     configure_persistence(&state, &config).await?;
 
+    state.write().await.chatgpt_auth = chatgpt_auth;
     serve_with_state(listener, state, config).await
 }
 

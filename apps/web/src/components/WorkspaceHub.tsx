@@ -17,17 +17,42 @@ type LoadResult = {
   errors: { agentId: string; message: string }[];
 };
 
+function noteText(content: string, tags?: string[] | null): string {
+  if (!tags?.includes('user-stated')) return content;
+  const text = content.replace(/^user stated (?:memory|preference|profile):\s*/i, '').trim();
+  // Older extractors saved requests containing "my" as profile facts.
+  // Hide those records without deleting the underlying memory.
+  if (/^(?:(?:can|could|would|will) you\b|(?:please )?remind me\b|(?:please )?remember to\b|i want you to\b)/i.test(text)) return '';
+  return text.replace(/^(?:please )?remember (?:that\s+)?/i, '');
+}
+
+function noteLabel(content: string, type: string, tags?: string[] | null): string {
+  if (tags?.includes('user-stated')) {
+    if (/^user stated preference:/i.test(content)) return 'Preference';
+    if (/^user stated profile:/i.test(content)) return 'About you';
+  }
+  if (tags?.includes('tool-memory-add')) return 'Saved note';
+  return type === 'observation' ? 'Observation' : 'Saved fact';
+}
+
 async function loadEntries(
   agentId: string,
   section: Section,
 ): Promise<Entry[]> {
   if (section === 'Notes') {
     const { memories } = await daemon.recentAgentMemories(agentId);
-    return memories.map((item) => ({
+    // Runtime task results and evaluator reflections are internal records.
+    // Preserve deliberate memory_add saves, regardless of their chosen type.
+    return memories.filter((item) =>
+      noteText(item.content, item.tags).trim().length > 0 && (
+        item.type === 'fact' || item.type === 'observation' ||
+        item.tags?.includes('tool-memory-add')
+      ),
+    ).map((item) => ({
       id: item.id,
       agentId,
-      content: item.content,
-      detail: [item.scope, item.type, ...(item.tags ?? [])].join(' · '),
+      content: noteText(item.content, item.tags),
+      detail: noteLabel(item.content, item.type, item.tags),
       timestamp: new Date(item.createdAt).getTime(),
     }));
   }
@@ -73,11 +98,13 @@ async function loadEntries(
 export function WorkspaceHub({
   agents,
   onSelectAgent,
+  initialSection = 'Notes',
 }: {
   agents: readonly AgentDetail[];
   onSelectAgent?: (id: string) => void;
+  initialSection?: Section;
 }) {
-  const [section, setSection] = useState<Section>('Notes');
+  const [section, setSection] = useState<Section>(initialSection);
   const [agentFilter, setAgentFilter] = useState('');
   const [query, setQuery] = useState('');
   const [revision, setRevision] = useState(0);
@@ -239,7 +266,7 @@ export function WorkspaceHub({
             >
               <p className="text-sm leading-relaxed text-ink-3">
                 {section === 'Notes'
-                  ? 'Saved agent memories, newest first. Shows up to the latest 100 per agent. Search applies to these loaded notes.'
+                  ? 'Saved facts and notes, newest first. Recent notes only; search applies to the notes shown.'
                   : section === 'Tasks'
                     ? 'Each agent keeps their own task list. Choose an agent below to add tasks or update progress.'
                     : 'Schedules run through the daemon, even when this page is closed. Choose an agent to create, pause, or remove a schedule.'}
@@ -312,7 +339,7 @@ export function WorkspaceHub({
               ) : (
                 <>
                   <p className="text-xs text-ink-3">
-                    {entries?.length} {section.toLowerCase()} shown
+                    {entries?.length} {entries?.length === 1 ? section.toLowerCase().slice(0, -1) : section.toLowerCase()} shown
                     {errors?.length ? ' · Some agents could not be loaded' : ''}
                   </p>
                   {entries?.length === 0 && (

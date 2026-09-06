@@ -1,5 +1,40 @@
 # anima-daemon
 
+## ChatGPT subscription
+
+In the web console, open agent settings and choose **ChatGPT subscription** as
+the provider. Click **Connect ChatGPT**, follow **Continue on OpenAI**, and enter
+the displayed code. Device-code login must be enabled in your ChatGPT security
+settings (or allowed by your workspace administrator). Codes expire after 15
+minutes. After connection, select a model available to your account and save
+the agent settings. `gpt-5.5` is a suggestion; custom model IDs are supported.
+
+The `chatgpt` provider uses subscription inference directly while Anima retains
+its agent loop, conversation history, tools, and permission checks. It does not
+require Codex CLI or an API key and does not fall back to API-key billing when
+subscription limits are reached. Model access and quota depend on the signed-in
+account. This does not provide subscription billing for the separate embedding
+provider.
+
+The daemon owns device polling, token refresh, and OS credential-store
+persistence. Tokens never go to the web client or workspace files. Disconnect
+removes Anima's local credential; it does not sign out of ChatGPT in your browser.
+Account endpoints require local-owner access and return `Cache-Control: no-store`:
+
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| GET | `/api/providers/chatgpt/status` | Redacted account and pending login status |
+| POST | `/api/providers/chatgpt/login` | Start or recover pending device authorization |
+| DELETE | `/api/providers/chatgpt/login` | Cancel pending sign-in |
+| DELETE | `/api/providers/chatgpt` | Disconnect Anima's subscription account |
+
+SDK callers can use `client.chatgpt.status()`, `.login()`, `.cancel()`, and
+`.disconnect()`. The production host uses the OS vault; deterministic test
+routers use isolated memory and cannot initiate real authorization.
+
+Protocol references: [OpenAI device authorization](https://learn.chatgpt.com/docs/auth#preferred-device-code-authentication-beta)
+and [OpenClaw's direct subscription transport](https://github.com/openclaw/openclaw/blob/main/packages/ai/src/providers/openai-chatgpt-responses.ts).
+
 `anima-daemon` is the runnable Rust host in `hosts/rust-daemon`. It is the
 current Axum HTTP/SSE boundary for animaOS, wiring the reusable crates in
 `packages/core-rust` to real infrastructure such as model providers, optional

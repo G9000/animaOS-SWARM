@@ -574,6 +574,7 @@ export function ViewHarness() {
 
   const settingsPanel = showSettings ? (
     <SettingsPanel
+      refreshProviders={retryProviders}
       agent={agent}
       providers={providers}
       workspace={workspace}

@@ -2,6 +2,7 @@ import { useEffect, useRef, type RefObject } from 'react';
 
 import { MODEL_SUGGESTIONS, type DaemonProvider } from '../../lib/daemon-api';
 import { labelCls } from '../ui-bits';
+import { ChatGptConnection } from '../ChatGptConnection';
 
 export interface ModelStepProps {
   providers: DaemonProvider[] | null;
@@ -27,6 +28,10 @@ export type ProviderCatalogState =
   | 'ready';
 
 function providerGuidance(provider: DaemonProvider): string {
+  if (provider.id === 'chatgpt')
+    return provider.configured
+      ? 'ChatGPT connected'
+      : 'Connect your ChatGPT subscription below';
   if (provider.configured) {
     return 'Configured';
   }
@@ -59,6 +64,7 @@ export function ModelStep({
   const retryButtonRef = useRef<HTMLButtonElement>(null);
   const providerCatalogBusy =
     catalogState === 'loading' || catalogState === 'retrying';
+  const chatGpt = providers?.find((candidate) => candidate.id === 'chatgpt');
 
   useEffect(() => {
     if (catalogState === 'error' || catalogState === 'empty') {
@@ -85,6 +91,38 @@ export function ModelStep({
         </p>
       </div>
 
+      {chatGpt && (
+        <div className="space-y-3 rounded-2xl border border-accent/30 bg-accent/[0.04] p-4">
+          <div>
+            <h3 className="text-base font-semibold">Start with your ChatGPT subscription</h3>
+            <p className="mt-1 text-sm text-ink-2">
+              Sign in and use your plan for your manager and specialists. No other
+              AI provider connection or API key is needed.
+            </p>
+          </div>
+          <ChatGptConnection onConnectionChange={onRetryProviders} />
+          <button
+            ref={provider === 'chatgpt' ? selectedProviderRef : undefined}
+            type="button"
+            disabled={!chatGpt.configured || catalogState !== 'ready'}
+            aria-pressed={provider === 'chatgpt'}
+            onClick={() => onProviderChange('chatgpt')}
+            className="rounded-xl border border-accent/40 bg-accent/10 px-4 py-2.5 text-sm font-medium disabled:opacity-50"
+          >
+            {provider === 'chatgpt' ? 'ChatGPT subscription selected' : 'Use ChatGPT subscription'}
+          </button>
+          <p className="text-xs text-ink-3">
+            {provider === 'chatgpt'
+              ? 'Choose a model below, then continue. You can add other providers later.'
+              : 'Connect above, then select your subscription to continue.'}
+          </p>
+        </div>
+      )}
+
+      <details open={!chatGpt || provider !== 'chatgpt'} className="space-y-3">
+        <summary className="cursor-pointer text-sm font-medium text-ink-2">
+          {chatGpt ? 'Other AI providers (optional)' : 'AI providers'}
+        </summary>
       <div
         role="group"
         aria-label="Provider catalog"
@@ -128,7 +166,7 @@ export function ModelStep({
         ) : (
           <>
             <div className="grid gap-2 sm:grid-cols-2">
-              {(providers ?? []).map((candidate) => {
+              {(providers ?? []).filter((candidate) => candidate.id !== 'chatgpt').map((candidate) => {
                 const guidance = providerGuidance(candidate);
                 const selected = candidate.id === provider;
 
@@ -163,8 +201,9 @@ export function ModelStep({
             {catalogState === 'empty' ? (
               <div className="space-y-3 rounded-xl border border-amber/30 bg-amber/5 p-4">
                 <p id="provider-catalog-empty" className="text-sm text-ink-2">
-                  No providers are configured. Add a provider credential to the
-                  daemon environment, then retry.
+                  {chatGpt
+                    ? 'Connect your ChatGPT subscription above, or configure another provider and retry.'
+                    : 'No providers are configured. Add a provider credential to the daemon environment, then retry.'}
                 </p>
                 <button
                   ref={retryButtonRef}
@@ -180,6 +219,7 @@ export function ModelStep({
           </>
         )}
       </div>
+      </details>
 
       {catalogState === 'ready' ? (
         <>

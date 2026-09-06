@@ -1,5 +1,7 @@
 export { AgentsClient, action, agent, plugin } from './agents.js';
 export { ConnectorsClient } from './connectors.js';
+export { ChatGptClient } from './chatgpt.js';
+export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {
   CalendarConnector,
   CalendarConnectResult,

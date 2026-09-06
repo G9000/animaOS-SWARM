@@ -1,6 +1,7 @@
 mod agencies;
-mod agents;
 mod agent_avatar;
+mod agents;
+mod chatgpt;
 mod connectors;
 mod contracts;
 mod folder_picker;
@@ -102,6 +103,7 @@ use crate::runtime_model::provider_summaries;
         run_swarm_entry,
         swarm_events_entry,
         list_providers_entry,
+        chatgpt::status, chatgpt::login, chatgpt::cancel, chatgpt::disconnect,
         get_workspace_entry,
         put_workspace_entry,
         get_workspace_avatar_entry,
@@ -479,6 +481,15 @@ fn router_with_services_with_policies(
         )
         .route("/api/swarms/{swarm_id}", get(get_swarm_entry))
         .route("/api/providers", get(list_providers_entry))
+        .route("/api/providers/chatgpt/status", get(chatgpt::status))
+        .route(
+            "/api/providers/chatgpt/login",
+            axum::routing::post(chatgpt::login).delete(chatgpt::cancel),
+        )
+        .route(
+            "/api/providers/chatgpt",
+            axum::routing::delete(chatgpt::disconnect),
+        )
         .route(
             "/api/agents/{agent_id}/schedules",
             get(schedules::list_schedules).post(schedules::create_schedule),
@@ -1413,8 +1424,8 @@ async fn swarm_events_entry(
     tag = "providers",
     responses((status = 200, description = "Supported model providers", body = ProvidersEnvelope))
 )]
-async fn list_providers_entry() -> AxumResponse {
-    let providers = provider_summaries()
+async fn list_providers_entry(State(state): State<AppState>) -> AxumResponse {
+    let mut providers = provider_summaries()
         .into_iter()
         .map(|summary| ProviderResponse {
             id: summary.id.to_string(),
@@ -1424,6 +1435,14 @@ async fn list_providers_entry() -> AxumResponse {
             api_key_envs: summary.api_key_envs.iter().map(|s| s.to_string()).collect(),
         })
         .collect::<Vec<_>>();
+    let auth = state.daemon.read().await.chatgpt_auth.clone();
+    providers.push(ProviderResponse {
+        id: "chatgpt".into(),
+        label: "ChatGPT subscription".into(),
+        requires_key: false,
+        configured: auth.status().await.is_ok_and(|s| s.connected),
+        api_key_envs: vec![],
+    });
     json_response(StatusCode::OK, &ProvidersEnvelope { providers })
 }
 

@@ -77,11 +77,15 @@ fn provider_summaries_for_config(config: &ProviderAdapterConfig) -> Vec<Provider
 #[derive(Clone)]
 pub(crate) struct RuntimeModelAdapter {
     providers: ProviderModelAdapter,
+    chatgpt_auth: crate::chatgpt_auth::ChatGptAuth,
 }
 
 impl RuntimeModelAdapter {
-    pub(crate) fn from_env() -> Self {
-        Self::from_config(provider_config_from_env())
+    pub(crate) fn from_env(chatgpt_auth: crate::chatgpt_auth::ChatGptAuth) -> Self {
+        Self {
+            providers: ProviderModelAdapter::new(provider_config_from_env()),
+            chatgpt_auth,
+        }
     }
 
     #[cfg(test)]
@@ -89,9 +93,11 @@ impl RuntimeModelAdapter {
         Self::from_config(config)
     }
 
+    #[cfg(test)]
     fn from_config(config: ProviderAdapterConfig) -> Self {
         Self {
             providers: ProviderModelAdapter::new(config),
+            chatgpt_auth: crate::chatgpt_auth::ChatGptAuth::in_memory(),
         }
     }
 }
@@ -117,7 +123,34 @@ impl ModelAdapter for RuntimeModelAdapter {
 
         match provider.as_str() {
             "deterministic" | "test" => DeterministicModelAdapter.generate(config, request).await,
+            "chatgpt" => {
+                let (access_token, account_id) = self.chatgpt_auth.usable_credential().await?;
+                anima_model_adapters::ChatGptResponsesAdapter::new(access_token, account_id)?
+                    .generate(config, request)
+                    .await
+            }
             _ => self.providers.generate(config, request).await,
         }
+    }
+    async fn stream(
+        &self,
+        config: &AgentConfig,
+        request: &ModelGenerateRequest,
+        sink: &dyn anima_core::ModelStreamSink,
+    ) -> Result<(), String> {
+        if config
+            .provider
+            .as_deref()
+            .is_some_and(|p| p.trim().eq_ignore_ascii_case("chatgpt"))
+        {
+            let (access_token, account_id) = self.chatgpt_auth.usable_credential().await?;
+            return anima_model_adapters::ChatGptResponsesAdapter::new(access_token, account_id)?
+                .stream(config, request, sink)
+                .await;
+        }
+        sink.emit(anima_core::ModelStreamFrame::Final(
+            self.generate(config, request).await?,
+        ))
+        .await
     }
 }
