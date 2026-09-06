@@ -19,3 +19,4 @@ pub use app::{
     app, app_with_config, app_with_configured_persistence, app_with_database, serve, DaemonConfig,
     PersistenceMode,
 };
+mod chatgpt_auth;

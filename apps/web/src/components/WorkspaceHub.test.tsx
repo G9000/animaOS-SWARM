@@ -17,6 +17,56 @@ const agents: AgentDetail[] = ['Alpha', 'Beta'].map((name) => ({
 }));
 afterEach(() => vi.restoreAllMocks());
 
+it('presents extracted notes as readable text and hides legacy misclassified reminders', async () => {
+  vi.spyOn(daemon, 'recentAgentMemories').mockResolvedValue({
+    memories: [
+      'user stated profile: can you remind me to draft my brand guideline by end of week',
+      'user stated preference: I prefer concise summaries.',
+      'user stated memory: Remember that the brand is Ardenta.',
+    ].map((content, index) => ({
+      id: String(index), content, agentId: 'alpha', agentName: 'Alpha',
+      type: 'fact' as const, scope: 'room' as const, importance: 0.8,
+      tags: ['runtime', 'memory-evaluator', 'user-stated', 'relation:general_profile'],
+      createdAt: '2026-09-06T00:00:00Z',
+    })),
+  });
+  render(<WorkspaceHub agents={[agents[0]]} />);
+  expect(await screen.findByText('I prefer concise summaries.')).toBeVisible();
+  expect(screen.getByText('the brand is Ardenta.')).toBeVisible();
+  expect(screen.getByText(/^Preference ·/)).toBeVisible();
+  expect(screen.queryByText(/user stated|memory-evaluator|general_profile|brand guideline/)).not.toBeInTheDocument();
+  expect(screen.getByText('2 notes shown')).toBeVisible();
+  fireEvent.change(screen.getByLabelText('Search'), { target: { value: 'Ardenta' } });
+  expect(screen.getByText('1 note shown')).toBeVisible();
+});
+
+it('shows saved knowledge and explicit notes without exposing automatic run records', async () => {
+  vi.spyOn(daemon, 'recentAgentMemories').mockResolvedValue({
+    memories: [
+      { type: 'task_result' as const, content: 'Hey — I’m here.', tags: ['runtime', 'task-result'] },
+      { type: 'reflection' as const, content: 'evaluated response: Hey — I’m here.', tags: ['runtime', 'memory-evaluator'] },
+      { type: 'fact' as const, content: 'The campaign launches Friday.' },
+      { type: 'observation' as const, content: 'Short posts perform better.' },
+      { type: 'reflection' as const, content: 'Saved campaign retrospective', tags: ['runtime', 'tool-memory-add'] },
+      { type: 'task_result' as const, content: 'Saved campaign results', tags: ['runtime', 'tool-memory-add'] },
+      { type: 'fact' as const, content: '   ' },
+    ].map((item, index) => ({
+      ...item, id: `memory-${index}`, agentId: 'alpha', agentName: 'Alpha',
+      scope: 'private' as const, importance: 0.8, createdAt: '2026-09-06T00:00:00Z',
+    })),
+  });
+  render(<WorkspaceHub agents={[agents[0]]} />);
+  expect(await screen.findByText('The campaign launches Friday.')).toBeVisible();
+  expect(screen.getByText('Short posts perform better.')).toBeVisible();
+  expect(screen.getByText('Saved campaign retrospective')).toBeVisible();
+  expect(screen.getByText('Saved campaign results')).toBeVisible();
+  expect(screen.queryByText('Hey — I’m here.')).not.toBeInTheDocument();
+  expect(screen.queryByText(/evaluated response:/)).not.toBeInTheDocument();
+  expect(screen.getByText('4 notes shown')).toBeVisible();
+  fireEvent.change(screen.getByLabelText('Search'), { target: { value: 'Hey' } });
+  expect(screen.getByText('No matches. Try another search.')).toBeVisible();
+});
+
 it('keeps the editor open during a save and retains a failed draft', async () => {
   vi.spyOn(daemon, 'recentAgentMemories').mockResolvedValue({ memories: [] });
   vi.spyOn(daemon, 'agentTasks').mockResolvedValue({

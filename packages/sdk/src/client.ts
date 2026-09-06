@@ -1,4 +1,5 @@
 import { AgentsClient } from './agents.js';
+import { ChatGptClient } from './chatgpt.js';
 import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
@@ -56,6 +57,7 @@ export class DaemonConnectionError extends Error {
 }
 
 export class DaemonClient {
+  readonly chatgpt: ChatGptClient;
   readonly agents: AgentsClient;
   readonly connectors: ConnectorsClient;
   readonly memories: MemoriesClient;
@@ -74,6 +76,7 @@ export class DaemonClient {
 
     this.fetchImpl = fetchImpl;
     this.agents = new AgentsClient(this);
+    this.chatgpt = new ChatGptClient(this);
     this.connectors = new ConnectorsClient(this);
     this.memories = new MemoriesClient(this);
     this.swarms = new SwarmsClient(this);

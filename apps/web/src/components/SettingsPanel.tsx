@@ -13,6 +13,7 @@ import {
   type DaemonWorkspaceState,
 } from '../lib/daemon-api';
 import { AlertIcon, TrashIcon, XIcon } from './icons';
+import { ChatGptConnection } from './ChatGptConnection';
 import { AgentProfileDetails, AgentMemoryView } from './AgentProfileDetails';
 import { AgentTasksView, AgentProactiveView } from './AgentWork';
 import {
@@ -78,6 +79,7 @@ export function SettingsPanel({
   resetAgent,
   close,
   integrations,
+  refreshProviders,
 }: {
   agent: AgentDetail;
   providers: DaemonProvider[] | null;
@@ -90,6 +92,7 @@ export function SettingsPanel({
   resetAgent: () => void;
   close: () => void;
   integrations?: ReactNode;
+  refreshProviders?: () => void | Promise<void>;
 }) {
   const seedModel = useMemo(() => {
     const options = MODEL_SUGGESTIONS[agent.provider] ?? [];
@@ -505,11 +508,14 @@ export function SettingsPanel({
                       .filter((id, i, all) => all.indexOf(id) === i)
                       .map((id) => (
                         <option key={id} value={id}>
-                          {id}
+                          {id === 'chatgpt'
+                            ? 'ChatGPT subscription'
+                            : (providers?.find((p) => p.id === id)?.label ??
+                              id)}
                         </option>
                       ))}
                   </select>
-                  {providers && (
+                  {providers && provider !== 'chatgpt' && (
                     <p className="mt-1.5 font-mono text-[10px] text-ink-3">
                       {providers.find((p) => p.id === provider)?.configured
                         ? 'key configured on the daemon'
@@ -543,6 +549,9 @@ export function SettingsPanel({
                     placeholder="model id, e.g. llama3.1"
                     className="field animate-fade-in"
                   />
+                )}
+                {provider === 'chatgpt' && (
+                  <ChatGptConnection onConnectionChange={refreshProviders} />
                 )}
               </section>
 

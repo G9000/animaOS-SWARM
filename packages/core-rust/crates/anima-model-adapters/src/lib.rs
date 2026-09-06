@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 mod adapter;
 mod anthropic;
 mod catalog;
+mod chatgpt;
 mod common;
 mod google;
 mod ollama;
@@ -11,6 +12,7 @@ mod stream;
 
 pub use adapter::ProviderModelAdapter;
 pub use catalog::provider_definitions;
+pub use chatgpt::ChatGptResponsesAdapter;
 pub use stream::DeterministicModelAdapter;
 
 #[derive(Clone)]

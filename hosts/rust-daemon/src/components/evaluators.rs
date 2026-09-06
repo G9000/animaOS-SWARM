@@ -315,6 +315,24 @@ fn extract_explicit_user_memory(text: &str) -> Option<ExtractedUserMemory> {
         return None;
     }
     let normalized = normalized_for_matching(text);
+    // Commands and questions are not durable facts about the user. In particular,
+    // possession within a request ("draft my guideline") is not a profile statement.
+    if [
+        "can you ",
+        "could you ",
+        "would you ",
+        "will you ",
+        "remind me ",
+        "please remind me ",
+        "remember to ",
+        "please remember to ",
+        "i want you to ",
+    ]
+    .iter()
+    .any(|prefix| normalized.starts_with(prefix))
+    {
+        return None;
+    }
     let remember_request =
         normalized.starts_with("remember ") || normalized.starts_with("please remember ");
     let preference_statement = contains_any(
@@ -340,9 +358,8 @@ fn extract_explicit_user_memory(text: &str) -> Option<ExtractedUserMemory> {
             "i work",
             "i study",
             "i m",
-            "my",
         ],
-    );
+    ) || normalized.starts_with("my ");
     if !remember_request && !preference_statement && !profile_statement {
         return None;
     }
@@ -744,6 +761,17 @@ mod tests {
 
     #[test]
     fn extract_explicit_user_memory_ignores_non_profile_requests() {
-        assert!(extract_explicit_user_memory("What is the weather today?").is_none());
+        for request in [
+            "What is the weather today?",
+            "can you remind me to draft my brand guideline by end of week",
+            "Please remind me to review my campaign",
+            "Remember to draft my brand guideline",
+            "I want you to update my profile",
+            "Draft my brand guideline",
+        ] {
+            assert!(extract_explicit_user_memory(request).is_none(), "{request}");
+        }
+        assert!(extract_explicit_user_memory("My brand is Ardenta").is_some());
+        assert!(extract_explicit_user_memory("Remember that my brand is Ardenta").is_some());
     }
 }

@@ -1204,6 +1204,7 @@ pub(crate) struct DaemonState {
     pub(crate) mail_drafts: HashMap<String, crate::connectors::mail::MailDraft>,
     pub(crate) workspace: Option<WorkspaceConfig>,
     pub(crate) model_adapter: Arc<dyn ModelAdapter>,
+    pub(crate) chatgpt_auth: crate::chatgpt_auth::ChatGptAuth,
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) process_manager: SharedProcessManager,
     pub(crate) event_fanout: EventFanout,
@@ -1320,6 +1321,7 @@ impl DaemonState {
         Self {
             memory,
             memory_embeddings,
+            chatgpt_auth: crate::chatgpt_auth::ChatGptAuth::in_memory(),
             memory_store: None,
             control_plane_store: None,
             control_plane_revision: 0,
