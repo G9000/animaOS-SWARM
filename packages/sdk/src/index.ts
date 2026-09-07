@@ -46,6 +46,9 @@ export type {
 } from './connectors.js';
 export type {
   AgentMemory,
+  AgentJob,
+  AgentJobInput,
+  AgentJobRetryInput,
   AgentTask,
   AgentTasks,
   AgentSchedule,

@@ -17,6 +17,28 @@ const agents: AgentDetail[] = ['Alpha', 'Beta'].map((name) => ({
 }));
 afterEach(() => vi.restoreAllMocks());
 
+it('keeps Runs inside Work and scopes queueing to the selected agent', async () => {
+  const list = vi.spyOn(daemon, 'agentJobs').mockResolvedValue([]);
+  const tasks = vi.spyOn(daemon, 'agentTasks');
+  const schedules = vi.spyOn(daemon, 'listSchedules');
+  render(<WorkspaceHub agents={agents} initialSection="Runs" />);
+  expect(screen.getByRole('tab', { name: 'Runs' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  expect(await screen.findByText('No runs yet.')).toBeVisible();
+  expect(list).toHaveBeenCalledWith('alpha', expect.anything());
+  fireEvent.change(screen.getByLabelText('Agent'), {
+    target: { value: 'beta' },
+  });
+  await waitFor(() =>
+    expect(list).toHaveBeenLastCalledWith('beta', expect.anything()),
+  );
+  expect(screen.getByRole('button', { name: 'Queue run' })).toBeVisible();
+  expect(tasks).not.toHaveBeenCalled();
+  expect(schedules).not.toHaveBeenCalled();
+});
+
 it('presents extracted notes as readable text and hides legacy misclassified reminders', async () => {
   vi.spyOn(daemon, 'recentAgentMemories').mockResolvedValue({
     memories: [

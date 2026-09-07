@@ -52,6 +52,41 @@ export interface AgentTasks {
   revision: string;
 }
 
+export interface AgentJob {
+  id: string;
+  agentId: string;
+  title: string;
+  prompt: string;
+  requestKey: string;
+  status:
+    | 'queued'
+    | 'running'
+    | 'completed'
+    | 'failed'
+    | 'needs_review'
+    | 'cancelled';
+  revision: number;
+  attempt: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+  startedAtMs: number | null;
+  finishedAtMs: number | null;
+  result: string | null;
+  error: string | null;
+}
+
+export interface AgentJobInput {
+  title: string;
+  prompt: string;
+  /** Retain this key when retrying an uncertain create with identical input. */
+  requestKey: string;
+}
+
+export interface AgentJobRetryInput {
+  revision: number;
+  acknowledgeUncertain: boolean;
+}
+
 export interface AgentScheduleInput {
   prompt: string;
   trigger:
@@ -170,6 +205,47 @@ export class AgentsClient {
   async tasks(agentId: string): Promise<AgentTasks> {
     return this.client.requestJson(
       `/api/agents/${encodeURIComponent(agentId)}/tasks`,
+    );
+  }
+
+  async jobs(
+    agentId: string,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<AgentJob[]> {
+    const result = await this.client.requestJson<{ jobs: AgentJob[] }>(
+      `/api/agents/${encodeURIComponent(agentId)}/jobs`,
+      options,
+    );
+    return result.jobs;
+  }
+
+  /** Explicitly queues execution; requires daemon control-plane persistence. */
+  async createJob(agentId: string, input: AgentJobInput): Promise<AgentJob> {
+    return this.client.requestJson(
+      `/api/agents/${encodeURIComponent(agentId)}/jobs`,
+      { method: 'POST', body: input },
+    );
+  }
+
+  async cancelJob(
+    agentId: string,
+    jobId: string,
+    input: { revision: number },
+  ): Promise<AgentJob> {
+    return this.client.requestJson(
+      `/api/agents/${encodeURIComponent(agentId)}/jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: 'POST', body: input },
+    );
+  }
+
+  async retryJob(
+    agentId: string,
+    jobId: string,
+    input: AgentJobRetryInput,
+  ): Promise<AgentJob> {
+    return this.client.requestJson(
+      `/api/agents/${encodeURIComponent(agentId)}/jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: 'POST', body: input },
     );
   }
 

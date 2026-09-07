@@ -77,6 +77,8 @@ pub(crate) struct ControlPlaneSnapshot {
     #[serde(default)]
     pub(crate) schedules: Vec<ScheduledPromptRecord>,
     #[serde(default)]
+    pub(crate) jobs: Vec<crate::jobs::AgentJobRecord>,
+    #[serde(default)]
     pub(crate) calendar_connectors: Vec<GoogleCalendarConnectorRecord>,
     #[serde(default)]
     pub(crate) calendar_writes: Vec<CalendarPendingWriteRecord>,
@@ -306,6 +308,7 @@ impl ControlPlaneSnapshot {
             outbound,
             schedules,
             mail_records: vec![],
+            jobs: vec![],
             mail_drafts: vec![],
             calendar_connectors: vec![],
             calendar_writes: vec![],

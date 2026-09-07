@@ -25,7 +25,7 @@ Work is on `codex/persistent-workplace-foundation`. The checkout was clean when 
 
 This is a foundation increment, not the complete UI replacement or a finished autonomous startup operating system.
 
-1. Wire durable job ownership/checkpoints/reconciliation into the daemon. Current interrupted runs become failed/reviewable; arbitrary work does not automatically continue after process termination.
+1. The subsequent [durable jobs increment](2026-09-08-durable-jobs-handoff.md) now wires queued job ownership and restart reconciliation into the daemon. Mid-tool checkpoints and arbitrary interrupted-work continuation remain unimplemented.
 2. Add owner-visible goal budgets, approval/review lifecycle, and artifact records. Existing task lists and messaging limits are useful but not that complete workflow.
 3. Implement the portable capability execution/installation bridge and process isolation before accepting third-party executable modules.
 4. Deliver format-aware document processing and browser/computer-use engines. Text file and shell tools are already native; they are not a dedicated PDF/Word/spreadsheet engine.

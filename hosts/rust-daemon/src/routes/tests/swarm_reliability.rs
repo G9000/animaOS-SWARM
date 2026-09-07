@@ -29,7 +29,9 @@ impl Fixture {
         let app = router(
             state.clone(),
             DaemonConfig {
-                request_timeout: timeout,
+                // Only execution has the short deadline under test. Persisting
+                // fixture agents/swarms must tolerate parallel test I/O.
+                request_timeout: Duration::from_secs(5),
                 run_request_timeout: timeout,
                 max_concurrent_runs: limit,
                 ..DaemonConfig::default()

@@ -234,6 +234,12 @@ impl AgentRunCoordinator {
         Arc::clone(&self.control_plane_transactions)
     }
 
+    /// Advisory admission check; the serialized runner remains authoritative.
+    pub(crate) fn is_agent_busy(&self, agent_id: &str) -> bool {
+        self.agent_locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id).is_some_and(|lock| lock.try_lock().is_err())
+    }
+
     #[allow(dead_code)] // Used by daemon-owned connector and scheduler workers.
     pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
         let permit = self.try_admit()?;

@@ -362,6 +362,7 @@ mod tests {
             Arc::new(DeterministicMailTransport),
             oauth_apps.clone(),
         );
+        let jobs = crate::jobs::JobService::new(state.clone(), runs.clone());
         super::super::router_with_services_with_policies(
             state,
             DaemonConfig {
@@ -375,6 +376,7 @@ mod tests {
             mail,
             oauth_apps,
             scheduler,
+            jobs,
             LocalOwnerPolicy::for_test(true, None),
             ApiKeyPolicy::for_test(None),
         )

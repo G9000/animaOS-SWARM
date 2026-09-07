@@ -12,6 +12,8 @@ import {
   type WorkspaceBootstrapRequest,
   type AgentMemory,
   type AgentTasks,
+  type AgentJobInput,
+  type AgentJobRetryInput,
 } from '@animaOS-SWARM/sdk';
 
 const setupClient = createDaemonClient({
@@ -316,6 +318,14 @@ export const daemon = {
   readWorkspaceFile: (path: string) => setupClient.workspace.readFile(path),
   agentTasks: (id: string) =>
     request<AgentTasks>(`/agents/${encodeURIComponent(id)}/tasks`),
+  agentJobs: (id: string, options?: { signal?: AbortSignal }) =>
+    setupClient.agents.jobs(id, options),
+  createAgentJob: (id: string, input: AgentJobInput) =>
+    setupClient.agents.createJob(id, input),
+  cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
+    setupClient.agents.cancelJob(id, jobId, input),
+  retryAgentJob: (id: string, jobId: string, input: AgentJobRetryInput) =>
+    setupClient.agents.retryJob(id, jobId, input),
   updateAgentTasks: (id: string, input: AgentTasks) =>
     request<AgentTasks>(`/agents/${encodeURIComponent(id)}/tasks`, {
       method: 'PUT',
