@@ -9,6 +9,7 @@ import { AgentsView } from './AgentsView';
 import { WorkspaceHub } from './WorkspaceHub';
 import { WorkspaceDashboard } from './WorkspaceDashboard';
 import { WorkspaceFiles } from './WorkspaceFiles';
+import { WorkspaceCapabilities } from './WorkspaceCapabilities';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
 import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { AgentsIcon, GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
@@ -17,6 +18,7 @@ import { formatTokens, ghostBtnCls } from './ui-bits';
 export type WorkspaceDestination =
   | 'overview'
   | 'files'
+  | 'capabilities'
   | 'workspace'
   | 'connectors'
   | 'telegram'
@@ -35,6 +37,7 @@ const DESTINATIONS: Array<{
   { id: 'hub', label: 'Work', icon: <PulseIcon size={15} /> },
   { id: 'agents', label: 'Team', icon: <AgentsIcon size={15} /> },
   { id: 'files', label: 'Files', icon: <PulseIcon size={15} /> },
+  { id: 'capabilities', label: 'Capabilities', icon: <SparkIcon size={15} /> },
   { id: 'workspace', label: 'Chat', icon: <SendIcon size={15} /> },
   { id: 'connectors', label: 'Connectors', icon: <GearIcon size={15} /> },
   { id: 'activity', label: 'Activity', icon: <PulseIcon size={15} /> },
@@ -516,6 +519,7 @@ export function WorkspaceShell({
                   }}
                   onOpenTeam={() => setDestination('agents')}
                   onOpenFiles={() => setDestination('files')}
+                  onOpenCapabilities={() => setDestination('capabilities')}
                   onStartAssignment={onStartAssignment ? (prompt) => {
                     onSelectAgent?.(mainAgent.id);
                     setDestination('workspace');
@@ -524,6 +528,8 @@ export function WorkspaceShell({
                 />
               ) : destination === 'files' ? (
                 <WorkspaceFiles online={connection === 'online'} />
+              ) : destination === 'capabilities' ? (
+                <WorkspaceCapabilities online={connection === 'online'} />
               ) : destination === 'hub' ? (
                 <WorkspaceHub
                   initialSection={hubSection}

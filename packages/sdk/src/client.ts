@@ -5,6 +5,7 @@ import { ChatGptClient } from './chatgpt.js';
 import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
+import type { DaemonCapabilities } from './capabilities.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
 
@@ -90,6 +91,11 @@ export class DaemonClient {
 
   async health(): Promise<DaemonHealth> {
     return this.requestJson<DaemonHealth>('/health');
+  }
+
+  /** Discover native handlers and planned modules without granting access. */
+  async capabilities(): Promise<DaemonCapabilities> {
+    return this.requestJson<DaemonCapabilities>('/api/capabilities');
   }
 
   async requestJson<T>(

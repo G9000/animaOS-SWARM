@@ -37,6 +37,42 @@
   color: var(--color-ink-3);
   font-size: 12px;
 }
+.setup-shell__welcome h2 {
+  margin: 14px 0 10px;
+  font-family: var(--font-display);
+  font-size: 27px;
+  line-height: 1.2;
+  letter-spacing: -0.04em;
+}
+.setup-shell__welcome p,
+.setup-shell__authority {
+  color: var(--color-ink-3);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.setup-shell__authority {
+  margin: 28px 12px 0;
+}
+.setup-shell__promise {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 22px;
+  padding: 12px 14px;
+  border: 1px solid rgb(var(--color-accent-rgb) / 0.16);
+  border-radius: 12px;
+  background: rgb(var(--color-accent-rgb) / 0.05);
+  color: var(--color-ink-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.setup-shell__promise > span {
+  color: var(--color-accent);
+  font-size: 20px;
+}
+.setup-shell__promise p {
+  margin: 0;
+}
 .setup-shell__body {
   display: grid;
   grid-template-columns: 240px minmax(0, 1fr);

@@ -69,6 +69,81 @@ pub(crate) async fn save_memory_manager(
     save_memory_snapshot(config, &manager.snapshot()).await
 }
 
+/// Keeps a mutation private under the caller's memory write lock until saved.
+/// Early errors and cancellation restore canonical records and the text index.
+/// A confirmed replacement with uncertain durability must retain the new state.
+pub(crate) struct MemoryMutation<'a> {
+    manager: &'a mut MemoryManager,
+    previous: Option<MemoryManagerSnapshot>,
+}
+
+impl<'a> MemoryMutation<'a> {
+    pub(crate) fn new(manager: &'a mut MemoryManager) -> Self {
+        Self {
+            previous: Some(manager.snapshot()),
+            manager,
+        }
+    }
+
+    pub(crate) async fn persist(&mut self, config: Option<&MemoryStoreConfig>) -> io::Result<()> {
+        let result = save_memory_manager(config, self.manager).await;
+        self.finish_persist(result)
+    }
+
+    fn finish_persist(&mut self, result: io::Result<()>) -> io::Result<()> {
+        if result.is_ok()
+            || result.as_ref().err().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|source| source.is::<SnapshotDurabilityUncertain>())
+            })
+        {
+            self.previous = None;
+        }
+        result
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotDurabilityUncertain(io::Error);
+
+impl std::fmt::Display for SnapshotDurabilityUncertain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "snapshot committed; durability uncertain: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SnapshotDurabilityUncertain {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl std::ops::Deref for MemoryMutation<'_> {
+    type Target = MemoryManager;
+    fn deref(&self) -> &Self::Target {
+        self.manager
+    }
+}
+
+impl std::ops::DerefMut for MemoryMutation<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.manager
+    }
+}
+
+impl Drop for MemoryMutation<'_> {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            self.manager.replace_snapshot(previous);
+        }
+    }
+}
+
 pub(crate) async fn load_memory_snapshot(
     config: &MemoryStoreConfig,
 ) -> io::Result<Option<MemoryManagerSnapshot>> {
@@ -91,10 +166,43 @@ async fn save_memory_snapshot(
 }
 
 fn save_json_snapshot(path: &Path, snapshot: &MemoryManagerSnapshot) -> io::Result<()> {
+    save_json_snapshot_with_writer(path, snapshot, |file, payload| {
+        use std::io::Write;
+        file.write_all(payload)?;
+        file.sync_all()
+    })
+}
+
+fn save_json_snapshot_with_writer(
+    path: &Path,
+    snapshot: &MemoryManagerSnapshot,
+    write: impl FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    save_json_snapshot_with_commit(path, snapshot, |path, payload| {
+        atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
+            .write(|file| write(file, payload))
+    })
+}
+
+fn save_json_snapshot_with_commit(
+    path: &Path,
+    snapshot: &MemoryManagerSnapshot,
+    commit: impl FnOnce(&Path, &[u8]) -> Result<(), atomicwrites::Error<io::Error>>,
+) -> io::Result<()> {
     ensure_parent_dir(path)?;
     let store = StoredMemoryStore::from(snapshot);
     let payload = serde_json::to_string_pretty(&store).map_err(serde_error)?;
-    fs::write(path, payload)
+    // atomicwrites already syncs the parent directories on Unix. Its Internal
+    // errors can occur after rename, so confirm the destination before deciding
+    // whether the caller can roll its in-memory mutation back.
+    commit(path, payload.as_bytes()).map_err(|error| match error {
+        atomicwrites::Error::Internal(error)
+            if fs::read(path).is_ok_and(|committed| committed == payload.as_bytes()) =>
+        {
+            io::Error::new(error.kind(), SnapshotDurabilityUncertain(error))
+        }
+        atomicwrites::Error::Internal(error) | atomicwrites::Error::User(error) => error,
+    })
 }
 
 fn load_json_snapshot(path: &Path) -> io::Result<Option<MemoryManagerSnapshot>> {
@@ -762,6 +870,119 @@ mod tests {
     use super::*;
 
     static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn memory_json_post_commit_error_keeps_memory_aligned_with_disk() {
+        let path = temp_path("post-commit-error", "json");
+        let mut manager = sample_manager();
+        save_json_snapshot(&path, &manager.snapshot()).unwrap();
+        let error = {
+            let mut mutation = MemoryMutation::new(&mut manager);
+            mutation.clear(None);
+            let result =
+                save_json_snapshot_with_commit(&path, &mutation.snapshot(), |path, payload| {
+                    use std::io::Write;
+                    atomicwrites::AtomicFile::new(path, atomicwrites::AllowOverwrite)
+                        .write(|file| file.write_all(payload))?;
+                    Err(atomicwrites::Error::Internal(io::Error::other(
+                        "injected directory sync failure",
+                    )))
+                });
+            mutation.finish_persist(result).unwrap_err()
+        };
+        let disk = load_json_snapshot(&path).unwrap().unwrap();
+        assert_eq!(
+            manager.size(),
+            disk.memories.len(),
+            "a committed snapshot must not be rolled back in memory"
+        );
+        assert_eq!(manager.size(), 0);
+        assert!(error
+            .to_string()
+            .contains("snapshot committed; durability uncertain"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memory_json_partial_write_failure_preserves_previous_disk_snapshot() {
+        let directory =
+            std::env::temp_dir().join(format!("memory-atomic-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("memory.json");
+        let previous = sample_manager().snapshot();
+        save_json_snapshot(&path, &previous).unwrap();
+        let previous_bytes = fs::read(&path).unwrap();
+        let replacement = MemoryManager::new().snapshot();
+        let error = save_json_snapshot_with_writer(&path, &replacement, |file, _| {
+            use std::io::Write;
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected partial write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(&path).unwrap(), previous_bytes);
+        assert_eq!(
+            load_json_snapshot(&path).unwrap().unwrap().memories.len(),
+            previous.memories.len()
+        );
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            1,
+            "failed temporary writer must be cleaned up"
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn memory_mutation_restores_graph_and_search_after_failed_save() {
+        let path = temp_path("mutation-failure", "json");
+        fs::create_dir_all(&path).unwrap();
+        let config = MemoryStoreConfig::Json(path.clone());
+        let mut manager = sample_manager();
+        let before = serde_json::to_value(StoredMemoryStore::from(&manager.snapshot())).unwrap();
+        {
+            let mut mutation = MemoryMutation::new(&mut manager);
+            mutation.clear(None);
+            assert!(mutation.persist(Some(&config)).await.is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(StoredMemoryStore::from(&manager.snapshot())).unwrap(),
+            before
+        );
+        assert!(!manager
+            .search("rollback review", MemorySearchOptions::default())
+            .is_empty());
+        fs::remove_dir(&path).unwrap();
+        {
+            let mut mutation = MemoryMutation::new(&mut manager);
+            mutation.clear(None);
+            mutation.persist(Some(&config)).await.unwrap();
+        }
+        assert_eq!(manager.size(), 0);
+        assert!(load_memory_snapshot(&config)
+            .await
+            .unwrap()
+            .unwrap()
+            .memories
+            .is_empty());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memory_mutation_rolls_back_early_return_before_persistence() {
+        let mut manager = sample_manager();
+        let before = serde_json::to_value(StoredMemoryStore::from(&manager.snapshot())).unwrap();
+        {
+            let mut mutation = MemoryMutation::new(&mut manager);
+            mutation.clear(None);
+            // Models a validation error or cancelled request after the first mutation.
+        }
+        assert_eq!(
+            serde_json::to_value(StoredMemoryStore::from(&manager.snapshot())).unwrap(),
+            before
+        );
+    }
 
     #[test]
     fn json_round_trip_preserves_memory_graph_and_temporal_records() {

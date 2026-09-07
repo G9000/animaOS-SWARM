@@ -57,6 +57,14 @@ afterEach(() => {
 });
 
 describe('WorkspaceShell', () => {
+  it('opens capabilities from workplace navigation', async () => {
+    vi.spyOn(daemon, 'capabilities').mockResolvedValue({ schemaVersion: 1, tools: [], persistence: { controlPlane: 'file', memory: 'file', executionJournal: false }, extensions: [], limitations: [] });
+    const nova = agent('agent-main', 'Nova', 1);
+    render(<WorkspaceShell mainAgent={nova} agents={[nova]} connection="online" workspace={<div>Conversation</div>} activity={<div>Activity</div>} onOpenSettings={vi.fn()} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Capabilities', exact: true }));
+    expect(await screen.findByText('Tools follow your authority')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Capabilities', exact: true })).toHaveAttribute('aria-current', 'page');
+  });
   it('opens commands with Control K, filters actions and navigates with Enter', async () => {
     const user = userEvent.setup();
     const nova = agent('agent-main', 'Nova', 1);

@@ -99,9 +99,9 @@ export function WorkspaceBrief({
         id="onboarding-brief-help"
         className="mt-3 text-sm leading-relaxed text-ink-3"
       >
-        Share as much useful detail as you can. We use this brief to shape your
-        custom team and guide your workspace manager. Paragraphs and bullet
-        points are welcome.
+        Describe the first useful result you want, who it is for, and what a good
+        outcome looks like. Include constraints and context your team should keep
+        in mind. Paragraphs and bullet points are welcome.
       </p>
     </div>
   );

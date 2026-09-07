@@ -26,6 +26,7 @@ export function WorkspaceDashboard({
   managerId,
   onStartAssignment,
   onOpenFiles,
+  onOpenCapabilities,
 }: {
   agents: readonly AgentDetail[];
   companyName?: string | null;
@@ -37,6 +38,7 @@ export function WorkspaceDashboard({
   managerId?: string;
   onStartAssignment?(text: string): void;
   onOpenFiles?(): void;
+  onOpenCapabilities?(): void;
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [refresh, setRefresh] = useState(0);
@@ -156,13 +158,13 @@ export function WorkspaceDashboard({
   return (
     <section
       aria-labelledby="dashboard-heading"
-      className="h-full overflow-y-auto p-5 pb-28 sm:p-8 md:pb-8"
+      className="h-full overflow-y-auto bg-[radial-gradient(ellipse_at_top_left,rgb(var(--color-accent-rgb)/0.05),transparent_65%)] p-5 pb-28 sm:p-8 md:pb-8"
     >
       <div className="mx-auto max-w-6xl space-y-6">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="max-w-2xl">
             <p className="text-xs font-medium uppercase tracking-widest text-accent">
-              {companyName || 'Your workspace'}
+              {companyName || 'Your workspace'} · A place to move work forward
             </p>
             <h2
               id="dashboard-heading"
@@ -171,7 +173,7 @@ export function WorkspaceDashboard({
               Overview
             </h2>
             <p className="mt-3 text-xs font-semibold uppercase tracking-widest text-ink-3">Your goal</p>
-            <p className="mt-2 text-sm leading-relaxed text-ink-2">
+            <p className="mt-2 break-words font-display text-lg leading-relaxed text-ink-2 sm:text-xl">
               {goal ||
                 'A clear view of your team, your work, and what comes next.'}
             </p>
@@ -202,6 +204,21 @@ export function WorkspaceDashboard({
           </div>
         </div>
 
+        <dl aria-label="Workplace at a glance" className="grid grid-cols-2 overflow-hidden rounded-2xl border border-line bg-surface sm:grid-cols-4">
+          {[
+            ['Team members', String(agents.length), 'People responsible for your work'],
+            ['Working now', online ? String(running.length) : 'Unavailable', 'Live agent runs'],
+            ['Open tasks', !online || tasksIncomplete ? 'Unavailable' : String(tasks.length), 'Owned tasks to move forward'],
+            ['Enabled routines', !online || schedulesIncomplete ? 'Unavailable' : String(upcoming.length), 'Run while the daemon is active'],
+          ].map(([label, value, description]) => (
+            <div key={label} className="min-w-0 border-b border-line p-4 odd:border-r sm:border-b-0 sm:border-r sm:last:border-r-0 sm:p-5">
+              <dt className="text-xs font-medium text-ink-3">{label}</dt>
+              <dd className={`mt-2 font-display font-semibold ${value === 'Unavailable' ? 'text-base text-ink-3' : 'text-2xl'}`}>{value}</dd>
+              <p className="mt-1 text-xs leading-relaxed text-ink-3">{description}</p>
+            </div>
+          ))}
+        </dl>
+
         {snapshot?.errors.length ? (
           <p
             role="alert"
@@ -212,7 +229,7 @@ export function WorkspaceDashboard({
           </p>
         ) : null}
         <section
-          className="rounded-2xl border border-accent/20 bg-accent/5 p-5 sm:p-7"
+          className="relative overflow-hidden rounded-2xl border border-accent/20 bg-accent/5 p-5 sm:p-8"
           aria-labelledby="overview-next-step"
         >
           <p className="text-xs font-semibold uppercase tracking-widest text-accent">
@@ -255,6 +272,24 @@ export function WorkspaceDashboard({
             </p>
           )}
         </section>
+
+        <div className="grid gap-3 sm:grid-cols-3" aria-label="Explore your workplace">
+          <button className={`${panel} text-left transition hover:border-accent/40`} onClick={() => onOpenWork('Tasks')}>
+            <span className="text-xs font-medium text-accent">01 / Organize</span>
+            <span className="mt-2 block font-semibold">Give your next outcome an owner →</span>
+            <span className="mt-2 block text-sm leading-relaxed text-ink-3">Manage each agent’s tasks and choose which routines should run.</span>
+          </button>
+          {onOpenFiles && <button className={`${panel} text-left transition hover:border-accent/40`} onClick={onOpenFiles}>
+            <span className="text-xs font-medium text-accent">02 / Review</span>
+            <span className="mt-2 block font-semibold">Find the work in your folder →</span>
+            <span className="mt-2 block text-sm leading-relaxed text-ink-3">Read saved briefs, drafts, and code alongside your team’s conversations.</span>
+          </button>}
+          {onOpenCapabilities && <button className={`${panel} text-left transition hover:border-accent/40`} onClick={onOpenCapabilities}>
+            <span className="text-xs font-medium text-accent">03 / Equip</span>
+            <span className="mt-2 block font-semibold">Explore what your team can use →</span>
+            <span className="mt-2 block text-sm leading-relaxed text-ink-3">Inspect registered tools, access requirements, and what persists.</span>
+          </button>}
+        </div>
 
         <div className="grid gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
           <div className="min-w-0 space-y-5">

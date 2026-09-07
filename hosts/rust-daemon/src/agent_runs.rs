@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::app::SharedDaemonState;
-use crate::memory_store::save_memory_manager;
+use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::state::DaemonState;
 
@@ -727,6 +727,7 @@ async fn persist_task_result_memory(
 
     let persist_result: Result<_, String> = {
         let mut memory_guard = memory.write().await;
+        let mut memory_guard = MemoryMutation::new(&mut memory_guard);
         match memory_guard.add(NewMemory {
             agent_id: runtime_id.to_string(),
             agent_name: runtime_name.to_string(),
@@ -739,7 +740,7 @@ async fn persist_task_result_memory(
             world_id: None,
             session_id: None,
         }) {
-            Ok(memory) => match save_memory_manager(memory_store.as_ref(), &memory_guard).await {
+            Ok(memory) => match memory_guard.persist(memory_store.as_ref()).await {
                 Ok(()) => Ok(memory),
                 Err(error) => Err(format!("failed to persist memory: {error}")),
             },
@@ -784,6 +785,53 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::{RwLock, Semaphore};
+
+    #[tokio::test]
+    async fn failed_task_memory_save_does_not_publish_or_leak_into_later_save() {
+        let blocked_path = snapshot_path("memory-write-failure");
+        std::fs::create_dir_all(&blocked_path).unwrap();
+        let memory = Arc::new(RwLock::new(anima_memory::MemoryManager::new()));
+        let embeddings = Arc::new(RwLock::new(
+            crate::memory_embeddings::MemoryEmbeddingRuntime::disabled(),
+        ));
+        let result = anima_core::TaskResult::success(
+            Content {
+                text: "uncommitted task memory".into(),
+                ..Content::default()
+            },
+            0,
+        );
+        super::persist_task_result_memory(
+            &result,
+            "worker",
+            "Worker",
+            memory.clone(),
+            embeddings,
+            Some(crate::memory_store::MemoryStoreConfig::Json(
+                blocked_path.clone(),
+            )),
+        )
+        .await;
+        assert_eq!(
+            memory.read().await.size(),
+            0,
+            "failed memory must not become visible"
+        );
+        std::fs::remove_dir(&blocked_path).unwrap();
+        let store = crate::memory_store::MemoryStoreConfig::Json(blocked_path.clone());
+        crate::memory_store::save_memory_manager(Some(&store), &*memory.read().await)
+            .await
+            .unwrap();
+        let restored = crate::memory_store::load_memory_snapshot(&store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            restored.memories.is_empty(),
+            "a later save must not persist the rejected memory"
+        );
+        std::fs::remove_file(blocked_path).unwrap();
+    }
 
     struct PeerModelAdapter;
     #[async_trait]

@@ -1,6 +1,7 @@
 mod agencies;
 mod agent_avatar;
 mod agents;
+mod capabilities;
 mod chatgpt;
 mod connectors;
 mod contracts;
@@ -68,6 +69,7 @@ use crate::runtime_model::provider_summaries;
 #[openapi(
     paths(
         api_health_entry,
+        capabilities_entry,
         ready_entry,
         create_agency_entry,
         generate_agency_entry,
@@ -400,6 +402,7 @@ fn router_with_services_with_policies(
         .route("/ready", get(ready_entry))
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
+        .route("/api/capabilities", get(capabilities_entry))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -667,6 +670,26 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
 
 async fn health_entry() -> AxumResponse {
     json_response(StatusCode::OK, &health::handle_health())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/capabilities",
+    tag = "capabilities",
+    responses(
+        (status = 200, description = "Registered native tools, configured storage, and planned modules. Discovery grants no access.", body = capabilities::CapabilityInventory),
+        (status = 403, description = "Local owner authorization required", body = ErrorBody)
+    )
+)]
+async fn capabilities_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
+    let mut response = if state.local_owner.authorize_read(request.headers()).is_err() {
+        ApiError { status: StatusCode::FORBIDDEN, message: "local owner authorization required".into() }.into_response()
+    } else {
+        let guard = state.daemon.read().await;
+        json_response(StatusCode::OK, &capabilities::inventory(&guard))
+    };
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn openapi_entry() -> AxumResponse {
@@ -1722,6 +1745,7 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
+    mod capabilities;
     mod swarm_reliability;
 
     use super::{router, router_with_services, router_with_services_with_policies};

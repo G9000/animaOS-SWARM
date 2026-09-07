@@ -311,6 +311,7 @@ export interface WorkspaceResumeResponse {
 }
 
 export const daemon = {
+  capabilities: () => setupClient.capabilities(),
   listWorkspaceFiles: () => setupClient.workspace.listFiles(),
   readWorkspaceFile: (path: string) => setupClient.workspace.readFile(path),
   agentTasks: (id: string) =>

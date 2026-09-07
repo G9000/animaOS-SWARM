@@ -81,6 +81,7 @@ export type {
 } from './client.js';
 
 export { MemoriesClient } from './memories.js';
+export type { DaemonCapabilities, DaemonCapabilityTool } from './capabilities.js';
 export type {
   CreateAgentRelationshipInput,
   CreateMemoryEntityInput,
