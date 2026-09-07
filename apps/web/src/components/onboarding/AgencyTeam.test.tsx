@@ -94,7 +94,7 @@ describe('AgencyTeam', () => {
     );
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
     expect(
-      screen.getByText('Your workspace manager will be created on its own.'),
+      screen.getByText('Add at least one specialist, or choose Manager only.'),
     ).toBeVisible();
   });
 

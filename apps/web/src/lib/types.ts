@@ -23,6 +23,7 @@ export interface AgentDetail {
   workspaceRole?: 'lead';
   id: string;
   name: string;
+  bio?: string | null;
   provider: string;
   model: string;
   toolNames: string[];

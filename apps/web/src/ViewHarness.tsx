@@ -478,20 +478,20 @@ export function ViewHarness() {
     }
   };
 
-  const send = async () => {
-    const text = draft.trim();
+  const sendToAgent = async (targetId: string, content: string, preserveDraft = false) => {
+    const text = content.trim();
     if (
       !text ||
-      !agent ||
+      !availableAgentIdsRef.current.has(targetId) ||
       connection !== 'online' ||
-      pendingSendsRef.current.has(agent.id) ||
+      pendingSendsRef.current.has(targetId) ||
+      agents.find((item) => item.id === targetId)?.status === 'Running' ||
       resetInFlightRef.current !== null
     )
       return;
-    const targetId = agent.id;
     const clientRequestId = crypto.randomUUID();
     pendingSendsRef.current.add(targetId);
-    updateChat(targetId, { sending: true, error: null, draft: '' });
+    updateChat(targetId, { sending: true, error: null, ...(preserveDraft ? {} : { draft: '' }) });
     try {
       const { agent: updatedAgent, result } = await daemon.runAgent(
         targetId,
@@ -538,6 +538,7 @@ export function ViewHarness() {
       }
     }
   };
+  const send = () => agent ? sendToAgent(agent.id, draft) : Promise.resolve();
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {
     return <ConnectingState />;
@@ -604,6 +605,10 @@ export function ViewHarness() {
           connection={connection}
           onOpenSettings={openSettings}
           onChangeWorkspaceAvatar={changeWorkspaceAvatar}
+          onStartAssignment={(id, prompt) => {
+            setSelectedAgentId(id);
+            void sendToAgent(id, prompt, true);
+          }}
           onPickPrompt={(prompt) =>
             setDraft((current) =>
               current.trim() ? `${current}\n\n${prompt}` : prompt,

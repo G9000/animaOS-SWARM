@@ -1,4 +1,28 @@
 export { AgentsClient, action, agent, plugin } from './agents.js';
+export { AgenciesClient } from './agencies.js';
+export type {
+  AgencyGenerateRequest,
+  AgencyGenerateResponse,
+  AgentDefinitionResponse,
+} from './agencies.js';
+export { WorkspaceClient } from './workspace.js';
+export type {
+  WorkspaceConfigRequest,
+  WorkspaceConfigResponse,
+  WorkspaceResponse,
+  WorkspaceValidationResponse,
+  BootstrapAgentRequest,
+  WorkspaceBootstrapRequest,
+  WorkspaceBootstrapResponse,
+  WorkspaceInspectAgentPreview,
+  WorkspaceInspectResponse,
+  WorkspaceResumeRequest,
+  WorkspaceResumeResponse,
+  WorkspacePickFolderResponse,
+  WorkspaceFileEntry,
+  WorkspaceFilesResponse,
+  WorkspaceFileResponse,
+} from './workspace.js';
 export { ConnectorsClient } from './connectors.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';

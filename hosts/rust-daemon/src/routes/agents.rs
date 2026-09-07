@@ -93,25 +93,50 @@ pub(crate) async fn handle_update_agent(
     state: &SharedDaemonState,
 ) -> Result<AgentEnvelope, ApiError> {
     let request: AgentUpdateRequest = super::parse_json_body(body)?;
-    let patch = request
+    let mut patch = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
 
-    let (snapshot, persist_request) = {
-        let mut guard = state.write().await;
-        let snapshot = match guard.update_agent(agent_id, patch) {
-            Ok(snapshot) => snapshot,
-            Err(UpdateAgentError::InvalidTools(message)) => {
-                return Err(ApiError::bad_request(message));
-            }
-            Err(UpdateAgentError::NotFound) => return Err(ApiError::not_found()),
-        };
-        (snapshot, guard.control_plane_persist_request())
+    // The route owns the control-plane transaction. Keep runtime readers and
+    // publishers out until both durable representations agree. Saving a prepared
+    // persistence request does not acquire the daemon state lock.
+    let mut guard = state.write().await;
+    let previous = guard.get_agent(agent_id).ok_or_else(ApiError::not_found)?;
+    let yaml_update = guard
+        .workspace
+        .as_ref()
+        .map(|workspace| {
+            super::workspace_agent_yaml::WorkspaceAgentYamlUpdate::prepare(
+                &workspace.root_path,
+                &previous.state.name,
+                &mut patch,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let snapshot = match guard.update_agent(agent_id, patch) {
+        Ok(snapshot) => snapshot,
+        Err(UpdateAgentError::InvalidTools(message)) => return Err(ApiError::bad_request(message)),
+        Err(UpdateAgentError::NotFound) => return Err(ApiError::not_found()),
     };
-    persist_request
-        .save()
-        .await
-        .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    if let Some(update) = &yaml_update {
+        if let Err(error) = update.apply() {
+            guard.restore_agent_config(agent_id, previous.state.config);
+            return Err(error);
+        }
+    }
+    if let Err(error) = guard.control_plane_persist_request().save().await {
+        guard.restore_agent_config(agent_id, previous.state.config);
+        if let Some(update) = &yaml_update {
+            update.rollback().map_err(|rollback| {
+                ApiError::service_unavailable(format!(
+                    "Agent persistence failed ({error}); anima.yaml rollback also failed: {}",
+                    rollback.message
+                ))
+            })?;
+        }
+        return Err(ApiError::service_unavailable(error.to_string()));
+    }
 
     Ok(AgentEnvelope {
         agent: AgentRuntimeSnapshotResponse::from(&snapshot),

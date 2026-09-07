@@ -182,21 +182,18 @@ pub(crate) async fn handle_inspect_workspace(
             "anima.yaml: mission or description is required",
         ));
     }
-    let provider = {
-        let provider = config.provider.trim();
-        if provider.is_empty() {
-            "openai".to_string()
-        } else {
-            provider.to_string()
-        }
-    };
     // providerAvailable mirrors the providers catalog: unknown or
     // unconfigured providers (and the deterministic adapter) report false.
-    let provider_available = provider_summaries()
-        .into_iter()
-        .find(|summary| summary.id == provider)
-        .map(|summary| summary.configured && summary.id != "deterministic")
-        .unwrap_or(false);
+    // Every agent must be ready, including explicit per-agent overrides.
+    let providers = provider_summaries();
+    let provider_available = std::iter::once(&config.orchestrator)
+        .chain(&config.agents)
+        .all(|agent| {
+            let provider = agent.effective_provider(&config.provider);
+            providers.iter().any(|summary| {
+                summary.id == provider && summary.configured && summary.id != "deterministic"
+            })
+        });
     let preview = |agent: &AgencyYamlAgent, include_bio: bool| WorkspaceInspectAgentPreview {
         name: agent.name.clone(),
         bio: if include_bio {
@@ -204,7 +201,7 @@ pub(crate) async fn handle_inspect_workspace(
         } else {
             None
         },
-        provider: provider.clone(),
+        provider: agent.effective_provider(&config.provider),
         model: agent.model.clone().unwrap_or_else(|| config.model.clone()),
     };
     Ok(WorkspaceInspectResponse {
@@ -372,7 +369,7 @@ fn prepare_bootstrap_agent(
         settings: None,
     };
 
-    let yaml = AgencyYamlAgent::orchestrator(
+    let mut yaml = AgencyYamlAgent::orchestrator(
         name,
         bio,
         style,
@@ -381,6 +378,7 @@ fn prepare_bootstrap_agent(
         Some(tool_names),
         adjectives,
     );
+    yaml.provider = provider;
     Ok((config, yaml))
 }
 
@@ -412,17 +410,16 @@ pub(crate) async fn handle_bootstrap_workspace(
     // Persist identity independently of creation time: a team can share timestamps.
     team[0].0.settings = Some(workspace_lead_settings());
     let provider = team[0].0.provider.clone();
-    for (config, _) in &team {
+    for (config, yaml) in &mut team {
         if !names.insert(config.name.to_lowercase()) {
             return Err(ApiError::bad_request(format!(
                 "duplicate agent name '{}'",
                 config.name
             )));
         }
-        if config.provider != provider {
-            return Err(ApiError::bad_request_static(
-                "workers must use the lead agent's provider",
-            ));
+        if config.provider.is_none() {
+            config.provider = provider.clone();
+            yaml.provider = provider.clone();
         }
     }
     {
@@ -636,14 +633,7 @@ pub(crate) async fn handle_resume_workspace(
                 topics: agent.topics.clone(),
                 adjectives: agent.adjectives.clone(),
                 style: agent.style.clone(),
-                provider: {
-                    let provider = agency.provider.trim().to_string();
-                    if provider.is_empty() {
-                        None
-                    } else {
-                        Some(provider)
-                    }
-                },
+                provider: Some(agent.effective_provider(&agency.provider)),
                 system: Some(system),
                 tools: agent.tools.as_ref().map(|tools| {
                     tools

@@ -671,16 +671,19 @@ function buildDaemonSwarmConfig(
   agency: AgencyConfig,
   opts: Pick<LaunchOptions, 'apiKey'>
 ): { swarmConfig: DaemonSwarmConfig; warnings: string[] } {
-  const settings = resolveDaemonModelSettings(agency.provider, opts.apiKey);
-  const manager = agentDefToDaemonConfig(
-    agency.orchestrator,
-    agency.model,
-    agency.provider,
-    settings
-  );
-  const workers = agency.agents.map((agent) =>
-    agentDefToDaemonConfig(agent, agency.model, agency.provider, settings)
-  );
+  const configureAgent = (agent: AgentDefinition) => {
+    const provider = agent.provider?.trim() || agency.provider;
+    // A single flag key belongs to the agency provider. Other providers use
+    // their own environment settings or credentials stored by the daemon.
+    const apiKey = provider.trim().toLowerCase() === agency.provider.trim().toLowerCase()
+      ? opts.apiKey
+      : undefined;
+    return agentDefToDaemonConfig(
+      agent, agency.model, provider, resolveDaemonModelSettings(provider, apiKey)
+    );
+  };
+  const manager = configureAgent(agency.orchestrator);
+  const workers = agency.agents.map(configureAgent);
 
   return {
     swarmConfig: {

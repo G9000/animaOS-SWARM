@@ -40,35 +40,39 @@ export function AgencyPicker({
               {template.description}
             </span>
             <span className="mt-3 block font-mono text-[10px] text-ink-3">
-              1 manager + {template.members.length - 1} specialists · {template.starter.title}
+              1 manager + {template.members.length - 1} specialists ·{' '}
+              {template.starter.title}
             </span>
           </button>
         ))}
       </div>
-      <div className="grid gap-2 sm:grid-cols-2">
-        {[
-          [
-            'generate',
-            'Generate my agency',
-            'Describe your goals and let AI propose your team.',
-          ],
-          [
-            'scratch',
-            'Start from scratch',
-            'Start with your workspace manager and add specialists later.',
-          ],
-        ].map(([id, title, description]) => (
-          <button
-            key={id}
-            type="button"
-            aria-pressed={selected === id}
-            onClick={() => onSelect(id)}
-            className={`rounded-xl border p-3 text-left transition hover:border-accent/60 ${selected === id ? 'border-accent bg-accent/[0.08]' : 'border-line'}`}
-          >
-            <span className="block text-sm font-medium text-ink">{title}</span>
-            <span className="mt-1 block text-xs text-ink-3">{description}</span>
-          </button>
-        ))}
+      <button
+        type="button"
+        aria-pressed={selected === 'generate'}
+        onClick={() => onSelect('generate')}
+        className={`w-full rounded-xl border p-4 text-left transition hover:border-accent/60 ${selected === 'generate' ? 'border-accent bg-accent/[0.08]' : 'border-line'}`}
+      >
+        <span className="block text-sm font-medium text-ink">
+          Create a custom agency
+        </span>
+        <span className="mt-1 block text-xs text-ink-3">
+          Describe your own goal, then generate or build a team with the number
+          of agents you choose.
+        </span>
+      </button>
+      <div className="flex flex-wrap items-center gap-2 text-sm text-ink-3">
+        <span>Only need one agent?</span>
+        <button
+          type="button"
+          aria-pressed={selected === 'scratch'}
+          onClick={() => onSelect('scratch')}
+          className={`rounded-lg px-2 py-1 font-medium underline underline-offset-4 ${selected === 'scratch' ? 'text-accent' : 'text-ink-2'}`}
+        >
+          Manager only
+        </button>
+        {selected === 'scratch' && (
+          <span className="text-xs">Selected · no specialist team</span>
+        )}
       </div>
     </section>
   );

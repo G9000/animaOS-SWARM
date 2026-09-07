@@ -5,7 +5,19 @@
 // (see vite.config.mts: '/api' -> UI_BACKEND_ORIGIN ?? http://localhost:8080).
 
 import { PROVIDER_MODELS, type AgentDetail, type ChatMessage } from './types';
-import type { AgentMemory, AgentTasks } from '@animaOS-SWARM/sdk';
+import {
+  createDaemonClient,
+  type AgencyGenerateRequest,
+  type AgencyGenerateResponse,
+  type WorkspaceBootstrapRequest,
+  type AgentMemory,
+  type AgentTasks,
+} from '@animaOS-SWARM/sdk';
+
+const setupClient = createDaemonClient({
+  baseUrl: '',
+  fetch: (...args) => globalThis.fetch(...args),
+});
 
 export interface DaemonProvider {
   id: string;
@@ -243,22 +255,18 @@ export interface AgentProfile {
   system: string;
 }
 
-export interface GeneratedAgency {
-  name: string;
-  mission?: string | null;
-  values?: string[] | null;
-  agents: Array<{
-    name: string;
-    role: string;
-    position?: string | null;
-    bio?: string | null;
-    system?: string | null;
-    style?: string | null;
-    adjectives?: string[] | null;
-  }>;
-}
+// UI drafts tolerate partial previews in tests; real generation uses the SDK wire contract.
+export type GeneratedAgency = Pick<AgencyGenerateResponse, 'name'> &
+  Partial<Omit<AgencyGenerateResponse, 'name' | 'agents'>> & {
+    agents: Array<
+      Pick<AgencyGenerateResponse['agents'][number], 'name' | 'role'> &
+        Partial<
+          Omit<AgencyGenerateResponse['agents'][number], 'name' | 'role'>
+        > & { provider?: string | null }
+    >;
+  };
 
-export interface BootstrapWorkspaceInput {
+export interface BootstrapWorkspaceInput extends WorkspaceBootstrapRequest {
   workspace: WorkspaceConfigInput;
   workers?: BootstrapWorkspaceInput['agent'][];
   agent: {
@@ -303,6 +311,8 @@ export interface WorkspaceResumeResponse {
 }
 
 export const daemon = {
+  listWorkspaceFiles: () => setupClient.workspace.listFiles(),
+  readWorkspaceFile: (path: string) => setupClient.workspace.readFile(path),
   agentTasks: (id: string) =>
     request<AgentTasks>(`/agents/${encodeURIComponent(id)}/tasks`),
   updateAgentTasks: (id: string, input: AgentTasks) =>
@@ -481,7 +491,8 @@ export const daemon = {
       { method: 'POST', body: JSON.stringify(input) },
     ),
 
-  getWorkspace: () => request<DaemonWorkspaceState>('/workspace'),
+  getWorkspace: (): Promise<DaemonWorkspaceState> =>
+    setupClient.workspace.get(),
 
   uploadWorkspaceAvatar: (file: File) =>
     request<void>('/workspace/avatar', {
@@ -490,17 +501,13 @@ export const daemon = {
       body: file,
     }),
 
-  putWorkspace: (input: WorkspaceConfigInput) =>
-    request<DaemonWorkspaceState>('/workspace', {
-      method: 'PUT',
-      body: JSON.stringify(input),
-    }),
+  putWorkspace: (input: WorkspaceConfigInput): Promise<DaemonWorkspaceState> =>
+    setupClient.workspace.put(input),
 
-  validateWorkspace: (input: WorkspaceConfigInput) =>
-    request<DaemonWorkspaceValidation>('/workspace', {
-      method: 'PUT',
-      body: JSON.stringify({ ...input, validateOnly: true }),
-    }),
+  validateWorkspace: (
+    input: WorkspaceConfigInput,
+  ): Promise<DaemonWorkspaceValidation> =>
+    setupClient.workspace.validate(input),
 
   generateProfile: (input: GenerateProfileInput) =>
     request<{ profile: AgentProfile }>('/agents/generate-profile', {
@@ -508,41 +515,45 @@ export const daemon = {
       body: JSON.stringify(input),
     }),
 
-  generateAgency: (input: {
-    name: string;
-    description: string;
-    teamSize?: number;
-    maxTeamSize?: number;
-    provider: string;
-    model: string;
-  }) =>
-    request<GeneratedAgency>('/agencies/generate', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
+  generateAgency: (input: AgencyGenerateRequest): Promise<GeneratedAgency> =>
+    setupClient.agencies.generate(input),
 
-  bootstrapWorkspace: (input: BootstrapWorkspaceInput) =>
-    request<{
-      workspace: DaemonWorkspaceConfig;
-      agent: DaemonSnapshot;
-      workers?: DaemonSnapshot[];
-    }>('/workspace/bootstrap', { method: 'POST', body: JSON.stringify(input) }),
+  bootstrapWorkspace: (
+    input: BootstrapWorkspaceInput,
+  ): Promise<{
+    workspace: DaemonWorkspaceConfig;
+    agent: DaemonSnapshot;
+    workers?: DaemonSnapshot[];
+  }> => setupClient.workspace.bootstrap(input),
 
-  inspectWorkspace: (rootPath: string) =>
-    request<WorkspaceInspectResponse>(
-      `/workspace/inspect?rootPath=${encodeURIComponent(rootPath)}`,
-    ),
+  inspectWorkspace: async (
+    rootPath: string,
+  ): Promise<WorkspaceInspectResponse> => {
+    const response = await setupClient.workspace.inspect(rootPath);
+    if (!response.found) return { found: false };
+    if (
+      response.companyName === undefined ||
+      !response.orchestrator ||
+      !response.workers ||
+      response.providerAvailable === undefined
+    )
+      throw new Error(
+        'The workspace preview is incomplete. Inspect the folder again.',
+      );
+    return {
+      ...response,
+      found: true,
+      companyName: response.companyName,
+      orchestrator: response.orchestrator,
+      workers: response.workers,
+      providerAvailable: response.providerAvailable,
+    };
+  },
 
-  pickWorkspaceFolder: () =>
-    request<{ rootPath: string | null }>('/workspace/pick-folder', {
-      method: 'POST',
-    }),
+  pickWorkspaceFolder: () => setupClient.workspace.pickFolder(),
 
-  resumeWorkspace: (rootPath: string) =>
-    request<WorkspaceResumeResponse>('/workspace/resume', {
-      method: 'POST',
-      body: JSON.stringify({ rootPath }),
-    }),
+  resumeWorkspace: (rootPath: string): Promise<WorkspaceResumeResponse> =>
+    setupClient.workspace.resume(rootPath),
 };
 
 /* ── adapters: daemon wire format → UI view model ── */
@@ -581,6 +592,7 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
       : {}),
     id: state.id,
     name: state.name,
+    ...(state.config.bio ? { bio: state.config.bio } : {}),
     provider: state.config.provider ?? 'default',
     model: state.config.model,
     toolNames: state.config.tools?.map((tool) => tool.name) ?? [],

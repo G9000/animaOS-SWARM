@@ -12,6 +12,8 @@ anima-memory = { path = "../../packages/core-rust/crates/anima-memory", features
 anima-schedule = { path = "../../packages/core-rust/crates/anima-schedule" }
 anima-swarm = { path = "../../packages/core-rust/crates/anima-swarm" }
 atomicwrites = "0.4.4"
+cap-std = "3.4.5"
+cap-fs-ext = "3.4.5"
 async-trait = "0.1"
 base64 = "0.22"
 sha2 = "0.10"

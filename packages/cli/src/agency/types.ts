@@ -10,6 +10,8 @@ export interface AgentDefinition {
   system: string;
   role?: 'orchestrator' | 'worker';
   model?: string;
+  /** Overrides the agency provider; omitted values inherit the agency default. */
+  provider?: string;
   tools?: string[];
   /** Names of other agents this one frequently collaborates with — drives the org chart edges. */
   collaboratesWith?: string[];

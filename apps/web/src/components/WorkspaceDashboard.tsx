@@ -3,6 +3,7 @@ import type { AgentTask } from '@animaOS-SWARM/sdk';
 import { daemon, type DaemonSchedule } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { AgentAvatar } from './AgentAvatar';
+import { selectMainAgent } from '../lib/agent-access';
 
 type Snapshot = {
   tasks: (AgentTask & { agentId: string })[];
@@ -22,6 +23,9 @@ export function WorkspaceDashboard({
   onChat,
   onOpenWork,
   onOpenTeam,
+  managerId,
+  onStartAssignment,
+  onOpenFiles,
 }: {
   agents: readonly AgentDetail[];
   companyName?: string | null;
@@ -30,6 +34,9 @@ export function WorkspaceDashboard({
   onChat(id: string): void;
   onOpenWork(section: 'Tasks' | 'Schedules'): void;
   onOpenTeam(): void;
+  managerId?: string;
+  onStartAssignment?(text: string): void;
+  onOpenFiles?(): void;
 }) {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [refresh, setRefresh] = useState(0);
@@ -114,36 +121,37 @@ export function WorkspaceDashboard({
     !snapshot || snapshot.errors.some((error) => error.endsWith(':tasks'));
   const schedulesIncomplete =
     !snapshot || snapshot.errors.some((error) => error.endsWith(':schedules'));
-  const stats = [
-    {
-      label: 'Working now',
-      value: online
-        ? agents.filter((agent) => agent.status === 'Running').length
-        : '—',
-      detail: `Across ${agents.length} team members`,
-    },
-    {
-      label: 'Open tasks',
-      value: tasksIncomplete ? '—' : tasks.length,
-      detail: tasksIncomplete
-        ? 'Task data unavailable'
-        : `${snapshot!.tasks.filter((task) => task.status === 'in_progress').length} in progress`,
-    },
-    {
-      label: 'Active schedules',
-      value: schedulesIncomplete ? '—' : upcoming.length,
-      detail: schedulesIncomplete
-        ? 'Schedule data unavailable'
-        : 'Upcoming scheduled work',
-    },
-    {
-      label: 'Completed tasks',
-      value: tasksIncomplete
-        ? '—'
-        : snapshot!.tasks.filter((task) => task.status === 'completed').length,
-      detail: 'From your current task lists',
-    },
-  ];
+  const manager = managerId
+    ? agents.find((agent) => agent.id === managerId)
+    : selectMainAgent(agents);
+  const marker =
+    'Prepared first assignment (do not start until the owner asks):\n';
+  const assignment =
+    manager?.system
+      ?.split(marker)[1]
+      ?.split('\n\nTeam responsibilities:')[0]
+      ?.trim() ?? '';
+  const canStart =
+    online &&
+    !!onStartAssignment &&
+    !!assignment &&
+    !!manager &&
+    manager.status === 'Idle' &&
+    !manager.messages.some((message) => message.role === 'User') &&
+    !agents.some((agent) => agent.status === 'Running');
+  const completed =
+    snapshot?.tasks.filter((task) => task.status === 'completed') ?? [];
+  const running = agents.filter((agent) => agent.status === 'Running');
+  const goal = mission?.trim().split(/\n\s*\n/)[0].replace(/^Goal\s*\n/i, '').trim();
+  const nextStep = !online
+    ? 'Reconnect to see what your agency needs next.'
+    : failed.length || scheduleErrors.length
+      ? 'Review the reported failures with your manager.'
+      : canStart
+        ? 'Your first assignment is prepared. Start it when you are ready.'
+        : running.length
+          ? 'Your team is working. Follow their progress or ask your manager for an update.'
+          : 'Ask your manager to turn your goal into the next useful piece of work.';
 
   return (
     <section
@@ -151,7 +159,7 @@ export function WorkspaceDashboard({
       className="h-full overflow-y-auto p-5 pb-28 sm:p-8 md:pb-8"
     >
       <div className="mx-auto max-w-6xl space-y-6">
-        <header className="flex flex-wrap items-start justify-between gap-4">
+        <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="max-w-2xl">
             <p className="text-xs font-medium uppercase tracking-widest text-accent">
               {companyName || 'Your workspace'}
@@ -160,12 +168,19 @@ export function WorkspaceDashboard({
               id="dashboard-heading"
               className="mt-2 font-display text-3xl font-semibold tracking-tight"
             >
-              Dashboard
+              Overview
             </h2>
-            <p className="mt-2 text-sm leading-relaxed text-ink-3">
-              {mission ||
+            <p className="mt-3 text-xs font-semibold uppercase tracking-widest text-ink-3">Your goal</p>
+            <p className="mt-2 text-sm leading-relaxed text-ink-2">
+              {goal ||
                 'A clear view of your team, your work, and what comes next.'}
             </p>
+            {mission && mission.trim() !== goal && (
+              <details className="mt-3 text-sm text-ink-3">
+                <summary className="cursor-pointer">Read workspace brief</summary>
+                <p className="mt-3 whitespace-pre-wrap break-words leading-relaxed">{mission}</p>
+              </details>
+            )}
           </div>
           <div className="space-y-2 text-right">
             <button
@@ -173,7 +188,7 @@ export function WorkspaceDashboard({
               disabled={busy || !online}
               onClick={() => setRefresh((value) => value + 1)}
             >
-              Refresh dashboard
+              Refresh overview
             </button>
             <p className="text-xs text-ink-3" role="status">
               {!online
@@ -185,7 +200,7 @@ export function WorkspaceDashboard({
                     : 'Waiting for data'}
             </p>
           </div>
-        </header>
+        </div>
 
         {snapshot?.errors.length ? (
           <p
@@ -196,19 +211,50 @@ export function WorkspaceDashboard({
             are shown; refresh to retry.
           </p>
         ) : null}
-        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          {stats.map((stat) => (
-            <div key={stat.label} className={panel}>
-              <p className="text-sm text-ink-3">{stat.label}</p>
-              <p className="mt-3 text-3xl font-semibold tabular-nums">
-                {busy && !snapshot ? '…' : stat.value}
-              </p>
-              <p className="mt-2 text-xs leading-relaxed text-ink-3">
-                {stat.detail}
-              </p>
-            </div>
-          ))}
-        </div>
+        <section
+          className="rounded-2xl border border-accent/20 bg-accent/5 p-5 sm:p-7"
+          aria-labelledby="overview-next-step"
+        >
+          <p className="text-xs font-semibold uppercase tracking-widest text-accent">
+            What comes next
+          </p>
+          <h3
+            id="overview-next-step"
+            className="mt-2 max-w-3xl font-display text-xl font-semibold leading-relaxed"
+          >
+            {nextStep}
+          </h3>
+          {canStart && (
+            <p className="mt-3 max-w-3xl whitespace-pre-line text-sm leading-relaxed text-ink-2">
+              {assignment}
+            </p>
+          )}
+          <div className="mt-5 flex flex-wrap gap-3">
+            {canStart && (
+              <button
+                className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-abyss hover:opacity-90"
+                onClick={() => onStartAssignment?.(assignment)}
+              >
+                Start first assignment
+              </button>
+            )}
+            {manager && (
+              <button className={action} onClick={() => onChat(manager.id)}>
+                Ask your manager
+              </button>
+            )}
+            {onOpenFiles && (
+              <button className={action} onClick={onOpenFiles}>
+                Open files
+              </button>
+            )}
+          </div>
+          {canStart && (
+            <p className="mt-3 text-xs text-ink-3">
+              Prepared during setup. Nothing starts until you click.
+            </p>
+          )}
+        </section>
 
         <div className="grid gap-5 lg:grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)]">
           <div className="min-w-0 space-y-5">
@@ -252,7 +298,7 @@ export function WorkspaceDashboard({
             </section>
             <section className={panel} aria-labelledby="dashboard-recent">
               <h3 id="dashboard-recent" className="font-semibold">
-                Recent conversations
+                Recent outputs
               </h3>
               {recent.length ? (
                 <ul className="mt-3 divide-y divide-line">
@@ -272,7 +318,9 @@ export function WorkspaceDashboard({
                           {message.content.text}
                         </p>
                         <span className="mt-1 block text-xs text-ink-3">
-                          {new Date(message.created_at_ms).toLocaleString()}
+                          Assistant reply ·{' '}
+                          {new Date(message.created_at_ms).toLocaleString()} ·
+                          Open source chat
                         </span>
                       </button>
                     </li>
@@ -283,12 +331,43 @@ export function WorkspaceDashboard({
                   Your team’s latest replies will appear here.
                 </p>
               )}
+              {!!completed.length && (
+                <div className="mt-4 border-t border-line pt-4">
+                  <p className="text-xs text-ink-3">
+                    Completed tasks from current task lists; completion dates
+                    are not recorded.
+                  </p>
+                  <ul className="mt-2 divide-y divide-line">
+                    {completed.slice(0, 5).map((task, index) => (
+                      <li
+                        key={`${task.agentId}:completed:${index}`}
+                        className="py-3"
+                      >
+                        <button
+                          className="w-full text-left"
+                          onClick={() => onChat(task.agentId)}
+                        >
+                          <p className="break-words text-sm font-medium">
+                            {task.content}
+                          </p>
+                          <p className="mt-1 text-xs text-ink-3">
+                            Completed task · completion time unavailable
+                          </p>
+                          <p className="mt-1 text-xs text-accent">
+                            {owner(task.agentId)} · Open source chat
+                          </p>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </section>
           </div>
           <div className="min-w-0 space-y-5">
             <section className={panel} aria-labelledby="dashboard-attention">
               <h3 id="dashboard-attention" className="font-semibold">
-                Needs attention
+                Needs your attention
               </h3>
               {!online && (
                 <p className="mt-3 text-sm text-ink-3">
@@ -377,6 +456,16 @@ export function WorkspaceDashboard({
                   <span className="block truncate text-sm font-medium">
                     {agent.name}
                   </span>
+                  <span className="mt-1 block line-clamp-3 text-xs leading-relaxed text-ink-2">
+                    {agent.bio?.trim() || (agent.id === manager?.id
+                      ? 'Coordinates priorities and keeps the team moving.'
+                      : 'Open the agent’s profile to review its responsibilities.')}
+                  </span>
+                  {online && agent.status === 'Running' && (
+                    <span className="mt-2 block text-xs text-accent">
+                      {tasks.find((task) => task.agentId === agent.id && task.status === 'in_progress')?.activeForm || 'Working now'}
+                    </span>
+                  )}
                   <span className="block text-xs text-ink-3">
                     {online ? agent.status : 'Status unavailable'} ·{' '}
                     {agent.provider === 'chatgpt'

@@ -1118,6 +1118,534 @@ fn team_bootstrap_body(root: &std::path::Path) -> serde_json::Value {
     body
 }
 
+async fn send_workspace_files_request(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+) -> (StatusCode, String) {
+    send_request(
+        app,
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "127.0.0.1:8080")
+            .header("origin", "http://localhost:4200")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn workspace_files_are_confined_filtered_and_bounded() {
+    let root = support::use_temp_workspace_root("workspace-files");
+    let app = test_app();
+    let (status, _) = send_workspace_files_request(&app, "GET", "/api/workspace/files").await;
+    assert_eq!(status, 409);
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &bootstrap_body(root.path()).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    std::fs::create_dir(root.path().join("docs")).unwrap();
+    std::fs::write(root.path().join("docs/readme.md"), "Hello workspace").unwrap();
+    for secret in [
+        ".env",
+        "credentials.json",
+        "private.key",
+        "control-plane.json",
+    ] {
+        std::fs::write(root.path().join(secret), "SECRET_SENTINEL").unwrap();
+    }
+    std::fs::create_dir(root.path().join("node_modules")).unwrap();
+    std::fs::write(root.path().join("node_modules/hidden.txt"), "excluded").unwrap();
+    let (status, body) = send_workspace_files_request(&app, "GET", "/api/workspace/files").await;
+    assert_eq!(status, 200, "{body}");
+    let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(list["truncated"], false);
+    assert!(list["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| file["path"] == "docs/readme.md" && file["sizeBytes"] == 15));
+    assert!(!body.contains("credentials.json"));
+    assert!(!body.contains("node_modules"));
+    for path in [
+        "../escape",
+        "/absolute",
+        "C:\\outside.txt",
+        "docs/../../escape",
+        "docs\\..\\.env",
+        ".env",
+        "credentials.json",
+        "private.key",
+        "control-plane.json",
+        "node_modules/hidden.txt",
+    ] {
+        let (status, body) = send_workspace_files_request(
+            &app,
+            "GET",
+            &support::query_uri("/api/workspace/file", "path", path),
+        )
+        .await;
+        assert_eq!(status, 400, "{path}: {body}");
+        assert!(!body.contains("SECRET_SENTINEL"));
+    }
+    let (status, body) = send_workspace_files_request(
+        &app,
+        "GET",
+        &support::query_uri("/api/workspace/file", "path", "docs/readme.md"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let file: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(file["content"], "Hello workspace");
+    assert_eq!(file["path"], "docs/readme.md");
+    assert_eq!(file["truncated"], false);
+    for number in 0..205 {
+        std::fs::write(root.path().join(format!("file-{number}.txt")), "ok").unwrap();
+    }
+    let (_, body) = send_workspace_files_request(&app, "GET", "/api/workspace/files").await;
+    let list: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(list["files"].as_array().unwrap().len(), 200);
+    assert_eq!(list["truncated"], true);
+}
+
+#[tokio::test]
+async fn workspace_file_preview_rejects_binary_and_truncates_utf8_safely() {
+    let root = support::use_temp_workspace_root("workspace-file-preview");
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &bootstrap_body(root.path()).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    std::fs::write(
+        root.path().join("large.txt"),
+        format!("x{}", "🦊".repeat(40000)),
+    )
+    .unwrap();
+    std::fs::write(root.path().join("binary.txt"), [0, 255, 0]).unwrap();
+    std::fs::write(
+        root.path().join("config.txt"),
+        r#"{"apiKey" : "SECRET_SENTINEL"}"#,
+    )
+    .unwrap();
+    let (status, body) = send_workspace_files_request(
+        &app,
+        "GET",
+        &support::query_uri("/api/workspace/file", "path", "large.txt"),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let file: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(file["truncated"], true);
+    let content = file["content"].as_str().unwrap();
+    assert!(content.len() <= 128 * 1024);
+    assert!(!content.contains('�'));
+    let (status, _) = send_workspace_files_request(
+        &app,
+        "GET",
+        &support::query_uri("/api/workspace/file", "path", "binary.txt"),
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (status, _) = send_workspace_files_request(
+        &app,
+        "GET",
+        &support::query_uri("/api/workspace/file", "path", "missing.txt"),
+    )
+    .await;
+    assert_eq!(status, 404);
+    let (status, body) = send_workspace_files_request(
+        &app,
+        "GET",
+        &support::query_uri("/api/workspace/file", "path", "config.txt"),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert!(!body.contains("SECRET_SENTINEL"));
+}
+
+#[tokio::test]
+async fn workspace_files_reject_directory_links_outside_the_configured_root() {
+    let root = support::use_temp_workspace_root("workspace-file-links");
+    let workspace = root.path().join("workspace");
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("outside.txt"), "OUTSIDE_SENTINEL").unwrap();
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &bootstrap_body(&workspace).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let link = workspace.join("linked");
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let (status, body) = send_workspace_files_request(&app, "GET", "/api/workspace/files").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(!body.contains("linked"));
+    let (status, body) = send_workspace_files_request(
+        &app,
+        "GET",
+        &support::query_uri("/api/workspace/file", "path", "linked/outside.txt"),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(!body.contains("OUTSIDE_SENTINEL"));
+}
+
+#[tokio::test]
+async fn team_model_overrides_survive_yaml_resume_and_restart() {
+    let root = support::use_temp_workspace_root("team-model-overrides");
+    let control_plane_path = root.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    let mut request = team_bootstrap_body(root.path());
+    request["agent"]["model"] = serde_json::json!("setup-model");
+    request["workers"][0]["provider"] = serde_json::json!("ollama");
+    request["workers"][0]["model"] = serde_json::json!("worker-model");
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &request.to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(root.path().join("anima.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(yaml["orchestrator"]["model"], "setup-model");
+    assert_eq!(yaml["orchestrator"]["provider"], "deterministic");
+    assert_eq!(yaml["agents"][0]["model"], "worker-model");
+    assert_eq!(yaml["agents"][0]["provider"], "ollama");
+    let (status, body) = send_empty_request(&app, "GET", &inspect_uri(root.path())).await;
+    assert_eq!(status, 200, "{body}");
+    let inspected: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(inspected["orchestrator"]["model"], "setup-model");
+    assert_eq!(inspected["workers"][0]["provider"], "ollama");
+    assert_eq!(inspected["workers"][0]["model"], "worker-model");
+    let fresh = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    let (status, body) = resume_workspace(&fresh, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    assert_team_model_overrides(&fresh).await;
+    drop(fresh);
+    let restarted = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    assert_team_model_overrides(&restarted).await;
+}
+
+async fn assert_team_model_overrides(app: &axum::Router) {
+    let (_, body) = send_empty_request(app, "GET", "/api/agents").await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let agents = body["agents"].as_array().unwrap();
+    for (name, model, provider) in [
+        ("Anima", "setup-model", "deterministic"),
+        ("Researcher", "worker-model", "ollama"),
+    ] {
+        let agent = agents
+            .iter()
+            .find(|agent| agent["state"]["name"] == name)
+            .unwrap();
+        assert_eq!(agent["state"]["config"]["model"], model);
+        assert_eq!(agent["state"]["config"]["provider"], provider);
+    }
+}
+
+#[tokio::test]
+async fn settings_model_updates_preserve_yaml_fields_and_survive_resume_and_restart() {
+    let root = support::use_temp_workspace_root("settings-yaml-sync");
+    let control_plane_path = root.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    let yaml_path = root.path().join("anima.yaml");
+    let mut original: serde_yaml::Value = serde_yaml::from_str(VALID_AGENCY_YAML).unwrap();
+    original["custom"] = serde_yaml::from_str("retained: [one, two]").unwrap();
+    original["agents"][0]["customAgent"] = serde_yaml::Value::String("retain me".into());
+    std::fs::write(&yaml_path, serde_yaml::to_string(&original).unwrap()).unwrap();
+    let app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let (_, body) = send_empty_request(&app, "GET", "/api/agents").await;
+    let roster = roster(&body);
+    let lead = &roster.iter().find(|(_, name)| name == "Anima").unwrap().0;
+    let worker = &roster.iter().find(|(_, name)| name == "Scout").unwrap().0;
+    let (status, body) = send_json_request(
+        &app,
+        "PATCH",
+        &format!("/api/agents/{lead}"),
+        r#"{"model":"lead-new","provider":"ollama"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let after_lead: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&yaml_path).unwrap()).unwrap();
+    assert_eq!(after_lead["orchestrator"]["model"], "lead-new");
+    assert_eq!(after_lead["orchestrator"]["provider"], "ollama");
+    assert_eq!(after_lead["agents"], original["agents"]);
+    assert_eq!(after_lead["provider"], "moonshot");
+    assert_eq!(after_lead["model"], "kimi-k2");
+    let inherited = test_app();
+    let (status, body) = resume_workspace(&inherited, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let (_, body) = send_empty_request(&inherited, "GET", "/api/agents").await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let inherited_worker = body["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["state"]["name"] == "Scout")
+        .unwrap();
+    assert_eq!(inherited_worker["state"]["config"]["provider"], "moonshot");
+    assert_eq!(inherited_worker["state"]["config"]["model"], "kimi-k2");
+    let (status, body) = send_json_request(
+        &app,
+        "PATCH",
+        &format!("/api/agents/{worker}"),
+        r#"{"name":"Scout renamed","model":"worker-new","provider":"openai"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = send_json_request(
+        &app,
+        "PATCH",
+        &format!("/api/agents/{worker}"),
+        r#"{"model":"worker-final"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let updated: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&yaml_path).unwrap()).unwrap();
+    assert_eq!(updated["custom"], original["custom"]);
+    assert_eq!(updated["agents"][0]["customAgent"], "retain me");
+    assert_eq!(updated["agents"][0]["name"], "Scout renamed");
+    assert_eq!(updated["agents"][0]["provider"], "openai");
+    assert_eq!(updated["agents"][0]["model"], "worker-final");
+    drop(app);
+    let restarted = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    let fresh = test_app();
+    let (status, body) = resume_workspace(&fresh, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    for instance in [&restarted, &fresh] {
+        let (_, body) = send_empty_request(instance, "GET", "/api/agents").await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        for (name, model, provider) in [
+            ("Anima", "lead-new", "ollama"),
+            ("Scout renamed", "worker-final", "openai"),
+        ] {
+            let agent = body["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|agent| agent["state"]["name"] == name)
+                .unwrap();
+            assert_eq!(agent["state"]["config"]["model"], model);
+            assert_eq!(agent["state"]["config"]["provider"], provider);
+        }
+    }
+}
+
+#[tokio::test]
+async fn settings_yaml_and_persistence_failures_leave_runtime_unchanged() {
+    let root = support::use_temp_workspace_root("settings-yaml-failure");
+    let control_plane_path = root.path().join("control-plane.json");
+    let _guard = EnvVarGuard::set("ANIMAOS_RS_CONTROL_PLANE_FILE", &control_plane_path);
+    let app = app_with_configured_persistence(DaemonConfig::default())
+        .await
+        .unwrap();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &team_bootstrap_body(root.path()).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (_, before) = send_empty_request(&app, "GET", "/api/agents").await;
+    let id = roster(&before)[0].0.clone();
+    let yaml_path = root.path().join("anima.yaml");
+    let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+    for failure in ["malformed", "unwritable", "persistence"] {
+        match failure {
+            "malformed" => std::fs::write(&yaml_path, "invalid: [").unwrap(),
+            "unwritable" => {
+                std::fs::remove_file(&yaml_path).unwrap();
+                std::fs::create_dir(&yaml_path).unwrap();
+            }
+            _ => {
+                std::fs::remove_file(&control_plane_path).unwrap();
+                std::fs::create_dir(&control_plane_path).unwrap();
+            }
+        }
+        let (status, body) = send_json_request(
+            &app,
+            "PATCH",
+            &format!("/api/agents/{id}"),
+            r#"{"model":"must-not-stick","provider":"ollama"}"#,
+        )
+        .await;
+        assert!(
+            status.is_client_error() || status.is_server_error(),
+            "{failure}: {status} {body}"
+        );
+        let (_, after) = send_empty_request(&app, "GET", "/api/agents").await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&before).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&after).unwrap(),
+            "{failure}"
+        );
+        if failure == "unwritable" {
+            std::fs::remove_dir(&yaml_path).unwrap();
+        }
+        if failure == "persistence" {
+            assert_eq!(std::fs::read_to_string(&yaml_path).unwrap(), yaml);
+        }
+        std::fs::write(&yaml_path, &yaml).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn settings_concurrent_updates_preserve_both_agents_and_reject_name_collisions() {
+    let root = support::use_temp_workspace_root("settings-yaml-concurrency");
+    let app = test_app();
+    let (status, body) = send_json_request(
+        &app,
+        "POST",
+        "/api/workspace/bootstrap",
+        &team_bootstrap_body(root.path()).to_string(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (_, before) = send_empty_request(&app, "GET", "/api/agents").await;
+    let agents = roster(&before);
+    let lead = &agents.iter().find(|(_, name)| name == "Anima").unwrap().0;
+    let worker = &agents
+        .iter()
+        .find(|(_, name)| name == "Researcher")
+        .unwrap()
+        .0;
+    let lead_uri = format!("/api/agents/{lead}");
+    let worker_uri = format!("/api/agents/{worker}");
+    let (first, second) = tokio::join!(
+        send_json_request(
+            &app,
+            "PATCH",
+            &lead_uri,
+            r#"{"model":"lead-concurrent","provider":"ollama"}"#
+        ),
+        send_json_request(
+            &app,
+            "PATCH",
+            &worker_uri,
+            r#"{"model":"worker-concurrent","provider":"openai"}"#
+        ),
+    );
+    assert_eq!(first.0, 200, "{}", first.1);
+    assert_eq!(second.0, 200, "{}", second.1);
+    let yaml_path = root.path().join("anima.yaml");
+    let before_collision = std::fs::read_to_string(&yaml_path).unwrap();
+    let yaml: serde_yaml::Value = serde_yaml::from_str(&before_collision).unwrap();
+    assert_eq!(yaml["orchestrator"]["model"], "lead-concurrent");
+    assert_eq!(yaml["agents"][0]["model"], "worker-concurrent");
+    let (status, body) = send_json_request(
+        &app,
+        "PATCH",
+        &worker_uri,
+        r#"{"name":"Anima","model":"collision"}"#,
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        std::fs::read_to_string(&yaml_path).unwrap(),
+        before_collision
+    );
+    let (status, body) = send_json_request(&app, "PATCH", &worker_uri, r#"{"provider":""}"#).await;
+    assert_eq!(status, 200, "{body}");
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        body["agent"]["state"]["config"]["provider"],
+        "deterministic"
+    );
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&yaml_path).unwrap()).unwrap();
+    assert!(yaml["agents"][0]["provider"].is_null());
+    assert_eq!(yaml["orchestrator"]["provider"], "ollama");
+}
+
+#[tokio::test]
+async fn legacy_yaml_agents_inherit_global_model_and_provider() {
+    let root = support::use_temp_workspace_root("legacy-team-provider");
+    std::fs::write(root.path().join("anima.yaml"), VALID_AGENCY_YAML).unwrap();
+    let app = test_app();
+    let (status, body) = resume_workspace(&app, root.path()).await;
+    assert_eq!(status, 201, "{body}");
+    let (_, body) = send_empty_request(&app, "GET", "/api/agents").await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    for agent in body["agents"].as_array().unwrap() {
+        assert_eq!(agent["state"]["config"]["provider"], "moonshot");
+        assert_eq!(agent["state"]["config"]["model"], "kimi-k2");
+    }
+}
+
+#[tokio::test]
+async fn inspect_checks_every_effective_provider() {
+    let root = support::use_temp_workspace_root("inspect-team-providers");
+    let _key = EnvVarGuard::set("MOONSHOT_API_KEY", std::path::Path::new("test-inspect-key"));
+    for (lead_provider, worker_provider, expected) in [
+        ("moonshot", "missing-provider", false),
+        ("missing-provider", "moonshot", false),
+        ("  ", "moonshot", true),
+    ] {
+        let mut yaml: serde_yaml::Value = serde_yaml::from_str(VALID_AGENCY_YAML).unwrap();
+        yaml["orchestrator"]["provider"] = serde_yaml::Value::String(lead_provider.into());
+        yaml["agents"][0]["provider"] = serde_yaml::Value::String(worker_provider.into());
+        std::fs::write(
+            root.path().join("anima.yaml"),
+            serde_yaml::to_string(&yaml).unwrap(),
+        )
+        .unwrap();
+        let (status, body) =
+            send_empty_request(&test_app(), "GET", &inspect_uri(root.path())).await;
+        assert_eq!(status, 200, "{body}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["providerAvailable"], expected, "{body}");
+        if lead_provider.trim().is_empty() {
+            assert_eq!(body["orchestrator"]["provider"], "moonshot");
+        }
+    }
+}
+
 #[tokio::test]
 async fn bootstrap_team_persists_yaml_and_can_resume() {
     let root = support::use_temp_workspace_root("bootstrap-team");
@@ -1164,7 +1692,6 @@ async fn bootstrap_team_validates_all_workers_before_mutation() {
         ("system", serde_json::json!(" ")),
         ("bio", serde_json::json!(" ")),
         ("model", serde_json::json!(" ")),
-        ("provider", serde_json::json!("other-provider")),
         ("tools", serde_json::json!([])),
         ("presetId", serde_json::json!("missing-preset")),
         ("tools", serde_json::json!(["missing_tool"])),

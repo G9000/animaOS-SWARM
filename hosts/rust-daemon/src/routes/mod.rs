@@ -15,6 +15,8 @@ mod profile;
 mod schedules;
 mod swarms;
 mod workspace;
+mod workspace_agent_yaml;
+mod workspace_files;
 
 use std::sync::Arc;
 
@@ -110,6 +112,8 @@ use crate::runtime_model::provider_summaries;
         put_workspace_avatar_entry,
         bootstrap_workspace_entry,
         inspect_workspace_entry,
+        workspace_files_entry,
+        workspace_file_entry,
         folder_picker::pick_folder,
         resume_workspace_entry,
         connectors::list_connectors,
@@ -410,6 +414,8 @@ fn router_with_services_with_policies(
             axum::routing::post(bootstrap_workspace_entry),
         )
         .route("/api/workspace/inspect", get(inspect_workspace_entry))
+        .route("/api/workspace/files", get(workspace_files_entry))
+        .route("/api/workspace/file", get(workspace_file_entry))
         .route(
             "/api/workspace/resume",
             axum::routing::post(resume_workspace_entry),
@@ -417,10 +423,6 @@ fn router_with_services_with_policies(
         .route(
             "/api/agencies/create",
             axum::routing::post(create_agency_entry),
-        )
-        .route(
-            "/api/agencies/generate",
-            axum::routing::post(generate_agency_entry),
         )
         .route("/api/memories", axum::routing::post(create_memory_entry))
         .route("/api/memories/search", get(memories_search_entry))
@@ -593,6 +595,10 @@ fn router_with_services_with_policies(
             config.request_timeout,
         ));
     let run_routes = Router::new()
+        .route(
+            "/api/agencies/generate",
+            axum::routing::post(generate_agency_entry),
+        )
         .route(
             "/api/agents/{agent_id}/messages",
             axum::routing::post(peer_message_entry),
@@ -1189,10 +1195,19 @@ async fn update_agent_entry(
 ) -> AxumResponse {
     match read_limited_body(request, state.config.max_request_bytes).await {
         Ok(body) => {
-            let _transaction = state.agent_runs.control_plane_transaction().await;
-            match agents::handle_update_agent(&agent_id, body, &state.daemon).await {
-                Ok(response) => json_response(StatusCode::OK, &response),
-                Err(error) => error.into_response(),
+            // Keep the transaction alive through YAML and durable-state writes even
+            // if the HTTP caller disconnects or its response timeout expires.
+            let operation = tokio::spawn(async move {
+                let _transaction = state.agent_runs.control_plane_transaction().await;
+                agents::handle_update_agent(&agent_id, body, &state.daemon).await
+            });
+            match operation.await {
+                Ok(Ok(response)) => json_response(StatusCode::OK, &response),
+                Ok(Err(error)) => error.into_response(),
+                Err(error) => {
+                    ApiError::service_unavailable(format!("agent update failed: {error}"))
+                        .into_response()
+                }
             }
         }
         Err(response) => response,
@@ -1592,6 +1607,73 @@ async fn inspect_workspace_entry(Query(query): Query<WorkspaceInspectQuery>) -> 
 }
 
 #[utoipa::path(
+    get,
+    path = "/api/workspace/files",
+    tag = "workspace",
+    responses(
+        (status = 200, description = "Bounded workspace file index", body = workspace_files::WorkspaceFilesResponse),
+        (status = 409, description = "No configured workspace", body = ErrorBody)
+    )
+)]
+async fn workspace_files_entry(
+    State(state): State<AppState>,
+    request: AxumRequest,
+) -> AxumResponse {
+    if state.local_owner.authorize_read(request.headers()).is_err() {
+        return ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "local owner authorization required".into(),
+        }
+        .into_response();
+    }
+    let mut response = match workspace_files::list(&state.daemon).await {
+        Ok(files) => json_response(StatusCode::OK, &files),
+        Err(error) => error.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/workspace/file",
+    tag = "workspace",
+    params(("path" = String, Query, description = "Relative workspace file path")),
+    responses(
+        (status = 200, description = "Bounded UTF-8 text preview", body = workspace_files::WorkspaceFileResponse),
+        (status = 400, description = "Excluded path or unsupported content", body = ErrorBody),
+        (status = 404, description = "File not found", body = ErrorBody),
+        (status = 409, description = "No configured workspace", body = ErrorBody)
+    )
+)]
+async fn workspace_file_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
+    if state.local_owner.authorize_read(request.headers()).is_err() {
+        return ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "local owner authorization required".into(),
+        }
+        .into_response();
+    }
+    let path = match request_query(request.uri()) {
+        Ok(query) => match query.get("path") {
+            Some(path) => path.clone(),
+            None => return ApiError::bad_request_static("path is required").into_response(),
+        },
+        Err(()) => return ApiError::malformed_request().into_response(),
+    };
+    let mut response = match workspace_files::preview(&state.daemon, path).await {
+        Ok(file) => json_response(StatusCode::OK, &file),
+        Err(error) => error.into_response(),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[utoipa::path(
     post,
     path = "/api/workspace/resume",
     tag = "workspace",
@@ -1726,6 +1808,37 @@ mod tests {
     struct SlowModelAdapter {
         delay: Duration,
         calls: AtomicUsize,
+    }
+
+    struct SlowAgencyModelAdapter;
+
+    #[async_trait]
+    impl ModelAdapter for SlowAgencyModelAdapter {
+        fn provider(&self) -> &str {
+            "slow-agency-test"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: r#"{"agents":[{"name":"Manager","role":"orchestrator"},{"name":"Researcher","role":"worker"}]}"#.into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                },
+                stop_reason: ModelStopReason::End,
+            })
+        }
     }
 
     struct GateFirstModelAdapter {
@@ -2925,6 +3038,101 @@ mod tests {
         let app = router(state, DaemonConfig { request_timeout: Duration::from_millis(1), run_request_timeout: Duration::from_secs(2), ..DaemonConfig::default() });
         let response = app.oneshot(Request::builder().method("POST").uri(format!("/api/agents/{id}/run")).header("content-type", "application/json").body(Body::from(r#"{"text":"slow work"}"#)).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn workspace_file_reads_authorize_owner_before_query_and_workspace_access() {
+        for route in ["/api/workspace/files", "/api/workspace/file?path=%FF"] {
+            for (origin, fetch, expected) in [
+                (None, false, StatusCode::FORBIDDEN),
+                (
+                    Some("https://hostile.example"),
+                    false,
+                    StatusCode::FORBIDDEN,
+                ),
+                (Some("http://localhost:4200"), false, StatusCode::CONFLICT),
+                (None, true, StatusCode::CONFLICT),
+            ] {
+                let app = router(
+                    Arc::new(RwLock::new(DaemonState::new())),
+                    DaemonConfig::default(),
+                );
+                let mut request = Request::builder()
+                    .uri(route)
+                    .header("host", "127.0.0.1:8080");
+                if let Some(origin) = origin {
+                    request = request.header("origin", origin);
+                }
+                if fetch {
+                    request = request
+                        .header("sec-fetch-site", "same-origin")
+                        .header("referer", "http://localhost:4200/");
+                }
+                let response = app
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                // Authorized malformed-query requests may fail parsing before the
+                // missing-workspace check, but unauthorized ones must always be 403.
+                if expected == StatusCode::CONFLICT && route.contains('?') {
+                    assert!(matches!(
+                        response.status(),
+                        StatusCode::BAD_REQUEST | StatusCode::CONFLICT
+                    ));
+                } else {
+                    assert_eq!(response.status(), expected, "{route}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agency_generation_uses_bounded_run_timeout() {
+        for (request_timeout, run_timeout, expected) in [
+            (
+                Duration::from_millis(1),
+                Duration::from_secs(2),
+                StatusCode::OK,
+            ),
+            (
+                Duration::from_secs(2),
+                Duration::from_millis(1),
+                StatusCode::REQUEST_TIMEOUT,
+            ),
+        ] {
+            let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+                SlowAgencyModelAdapter,
+            ))));
+            let app = router(
+                Arc::clone(&state),
+                DaemonConfig {
+                    request_timeout,
+                    run_request_timeout: run_timeout,
+                    ..DaemonConfig::default()
+                },
+            );
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/agencies/generate")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"name":"Studio","description":"Research topics","teamSize":2}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["teamSize"], 2);
+                assert_eq!(body["agents"][0]["role"], "orchestrator");
+            }
+            assert!(state.read().await.list_agents().is_empty());
+        }
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn run_routes_respect_run_request_timeout() {

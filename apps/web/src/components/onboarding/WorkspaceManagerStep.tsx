@@ -9,6 +9,7 @@ export interface WorkspaceManagerStepProps {
   priorities: string;
   instructions: string;
   onNameChange(value: string): void;
+  onNameCommit?(): void;
   onInitiativeChange(value: WorkspaceManagerStepProps['initiative']): void;
   onCommunicationChange(
     value: WorkspaceManagerStepProps['communication'],
@@ -64,6 +65,7 @@ export function WorkspaceManagerStep({
   priorities,
   instructions,
   onNameChange,
+  onNameCommit,
   onInitiativeChange,
   onCommunicationChange,
   onPrioritiesChange,
@@ -111,6 +113,7 @@ export function WorkspaceManagerStep({
           id="onboarding-manager-name"
           className="field"
           value={name}
+          onBlur={onNameCommit}
           onChange={(event) => onNameChange(event.target.value)}
           autoComplete="off"
           aria-invalid={Boolean(validationErrorId)}

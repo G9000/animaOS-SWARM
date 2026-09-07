@@ -1,6 +1,7 @@
 import { useEffect, useState, type RefObject } from 'react';
 
 import { labelCls } from '../ui-bits';
+import { WorkspaceBrief } from './WorkspaceBrief';
 
 const MAX_VALUES = 5;
 
@@ -19,6 +20,7 @@ export interface WorkspaceVerifyStatus {
 }
 
 export interface WorkspaceStepProps {
+  mode?: 'all' | 'goal' | 'workspace';
   companyName: string;
   mission: string;
   rootPath: string;
@@ -42,6 +44,7 @@ export interface WorkspaceStepProps {
 }
 
 export function WorkspaceStep({
+  mode = 'all',
   companyName,
   mission,
   rootPath,
@@ -87,16 +90,18 @@ export function WorkspaceStep({
           id="onboarding-workspace-heading"
           className="font-display text-2xl font-semibold tracking-tight text-ink"
         >
-          Workspace
+          {mode === 'goal' ? 'Your goal' : 'Workspace'}
         </h2>
         <p className="mt-1 max-w-xl text-sm leading-relaxed text-ink-2">
           {resumeMode
             ? 'Choose the folder containing your existing workspace.'
-            : 'Name your company and pick the folder your agents will work in.'}
+            : mode === 'goal'
+              ? 'Describe the outcome you want. Connect your model next, then give your team a workspace.'
+              : 'Choose the folder your agents will work in.'}
         </p>
       </div>
 
-      {!resumeMode ? (
+      {!resumeMode && mode !== 'workspace' ? (
         <div>
           <label htmlFor="onboarding-company-name" className={labelCls}>
             Company name
@@ -115,101 +120,87 @@ export function WorkspaceStep({
         </div>
       ) : null}
 
-      {!resumeMode ? (
-        <div>
-          <label htmlFor="onboarding-mission" className={labelCls}>
-            Workspace brief
-          </label>
-          <textarea
-            ref={missionInputRef}
-            id="onboarding-mission"
-            className="field min-h-48 resize-y leading-relaxed"
-            rows={7}
-            aria-describedby="onboarding-brief-help"
-            value={mission}
-            onChange={(event) => onMissionChange(event.target.value)}
-            autoComplete="off"
-            placeholder="Describe what you do, who you serve, and what you want to achieve. Include the content or services you need, channels, workflows, brand voice, constraints, and examples."
-          />
-          <p id="onboarding-brief-help" className="mt-3 text-sm leading-relaxed text-ink-3">
-            Share as much useful detail as you can. We use this brief to shape
-            your custom team and guide your workspace manager. Paragraphs and
-            bullet points are welcome.
-          </p>
-        </div>
+      {!resumeMode && mode !== 'workspace' ? (
+        <WorkspaceBrief
+          value={mission}
+          onChange={onMissionChange}
+          inputRef={missionInputRef}
+        />
       ) : null}
 
-      <div>
-        <label htmlFor="onboarding-root-path" className={labelCls}>
-          Office location
-        </label>
-        <div className="flex flex-wrap gap-2">
-          <input
-            ref={rootPathInputRef}
-            id="onboarding-root-path"
-            className="field min-w-0 flex-1 basis-full sm:basis-0"
-            value={rootPath}
-            onChange={(event) => onRootPathChange(event.target.value)}
-            autoComplete="off"
-            spellCheck={false}
-          />
-          <button
-            type="button"
-            onClick={resumeMode ? onInspect : onVerify}
-            disabled={browsing || verifying || !rootPath.trim()}
-            className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
-          >
-            {resumeMode
-              ? verifying
-                ? 'Inspecting…'
-                : 'Inspect'
-              : verifying
-                ? 'Verifying…'
-                : 'Verify'}
-          </button>
-          <button
-            type="button"
-            onClick={onBrowse}
-            disabled={browsing || verifying}
-            className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
-          >
-            {browsing ? 'Choosing folder…' : 'Browse…'}
-          </button>
+      {mode !== 'goal' && (
+        <div>
+          <label htmlFor="onboarding-root-path" className={labelCls}>
+            Office location
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <input
+              ref={rootPathInputRef}
+              id="onboarding-root-path"
+              className="field min-w-0 flex-1 basis-full sm:basis-0"
+              value={rootPath}
+              onChange={(event) => onRootPathChange(event.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button
+              type="button"
+              onClick={resumeMode ? onInspect : onVerify}
+              disabled={browsing || verifying || !rootPath.trim()}
+              className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
+            >
+              {resumeMode
+                ? verifying
+                  ? 'Inspecting…'
+                  : 'Inspect'
+                : verifying
+                  ? 'Verifying…'
+                  : 'Verify'}
+            </button>
+            <button
+              type="button"
+              onClick={onBrowse}
+              disabled={browsing || verifying}
+              className="rounded-xl border border-line bg-white/[0.02] px-4 py-2 text-sm font-medium text-ink-2 transition hover:border-line-strong hover:text-ink disabled:opacity-50"
+            >
+              {browsing ? 'Choosing folder…' : 'Browse…'}
+            </button>
+          </div>
+          {verifyStatus?.ok ? (
+            <p role="status" className="mt-2 text-sm text-mint">
+              ✓{' '}
+              {verifyStatus.willCreate
+                ? 'Folder will be created'
+                : 'Folder exists'}{' '}
+              — the daemon will use this as the workspace root.
+            </p>
+          ) : null}
+          {verifyStatus && !verifyStatus.ok ? (
+            <p role="alert" className="mt-2 text-sm text-danger">
+              {verifyStatus.message ?? 'Could not verify that folder.'}
+            </p>
+          ) : null}
+          {resumeMode ? (
+            <button
+              type="button"
+              onClick={() => onResumeModeChange?.(false)}
+              className="mt-2 text-sm text-ink-3 underline underline-offset-2 transition hover:text-ink-2"
+            >
+              or set up a new workspace instead
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onResumeModeChange?.(true)}
+              className="mt-2 text-sm text-ink-3 underline underline-offset-2 transition hover:text-ink-2"
+            >
+              Already have a workspace? Point to it
+            </button>
+          )}
         </div>
-        {verifyStatus?.ok ? (
-          <p role="status" className="mt-2 text-sm text-mint">
-            ✓{' '}
-            {verifyStatus.willCreate
-              ? 'Folder will be created'
-              : 'Folder exists'}{' '}
-            — the daemon will use this as the workspace root.
-          </p>
-        ) : null}
-        {verifyStatus && !verifyStatus.ok ? (
-          <p role="alert" className="mt-2 text-sm text-danger">
-            {verifyStatus.message ?? 'Could not verify that folder.'}
-          </p>
-        ) : null}
-        {resumeMode ? (
-          <button
-            type="button"
-            onClick={() => onResumeModeChange?.(false)}
-            className="mt-2 text-sm text-ink-3 underline underline-offset-2 transition hover:text-ink-2"
-          >
-            or set up a new workspace instead
-          </button>
-        ) : (
-          <button
-            type="button"
-            onClick={() => onResumeModeChange?.(true)}
-            className="mt-2 text-sm text-ink-3 underline underline-offset-2 transition hover:text-ink-2"
-          >
-            Already have a workspace? Point to it
-          </button>
-        )}
-      </div>
+      )}
 
-      {!resumeMode ? (
+      {!resumeMode && mode !== 'workspace' ? (
         <div>
           <label htmlFor="onboarding-values" className={labelCls}>
             Values (optional, up to 5, comma-separated)

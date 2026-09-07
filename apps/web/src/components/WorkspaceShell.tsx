@@ -8,13 +8,15 @@ import { AgentAvatar } from './AgentAvatar';
 import { AgentsView } from './AgentsView';
 import { WorkspaceHub } from './WorkspaceHub';
 import { WorkspaceDashboard } from './WorkspaceDashboard';
+import { WorkspaceFiles } from './WorkspaceFiles';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
 import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { AgentsIcon, GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
 import { formatTokens, ghostBtnCls } from './ui-bits';
 
 export type WorkspaceDestination =
-  | 'dashboard'
+  | 'overview'
+  | 'files'
   | 'workspace'
   | 'connectors'
   | 'telegram'
@@ -29,12 +31,13 @@ const DESTINATIONS: Array<{
   label: string;
   icon: ReactNode;
 }> = [
-  { id: 'workspace', label: 'Workspace', icon: <SparkIcon size={15} /> },
-  { id: 'dashboard', label: 'Dashboard', icon: <PulseIcon size={15} /> },
-  { id: 'hub', label: 'Work hub', icon: <PulseIcon size={15} /> },
+  { id: 'overview', label: 'Overview', icon: <SparkIcon size={15} /> },
+  { id: 'hub', label: 'Work', icon: <PulseIcon size={15} /> },
+  { id: 'agents', label: 'Team', icon: <AgentsIcon size={15} /> },
+  { id: 'files', label: 'Files', icon: <PulseIcon size={15} /> },
+  { id: 'workspace', label: 'Chat', icon: <SendIcon size={15} /> },
   { id: 'connectors', label: 'Connectors', icon: <GearIcon size={15} /> },
   { id: 'activity', label: 'Activity', icon: <PulseIcon size={15} /> },
-  { id: 'agents', label: 'Agents', icon: <AgentsIcon size={15} /> },
 ];
 
 const DESKTOP_NAVIGATION_QUERY = '(min-width: 768px)';
@@ -139,6 +142,7 @@ export function WorkspaceShell({
   onOpenSettings,
   onChangeWorkspaceAvatar = ignoreWorkspaceAvatarChange,
   onPickPrompt,
+  onStartAssignment,
 }: {
   mainAgent: AgentDetail;
   activeAgent?: AgentDetail;
@@ -153,14 +157,15 @@ export function WorkspaceShell({
   onOpenSettings: () => void;
   onChangeWorkspaceAvatar?: (file: File) => Promise<void>;
   onPickPrompt?: (prompt: string) => void;
+  onStartAssignment?: (agentId: string, prompt: string) => void;
 }) {
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
   const [hubSection, setHubSection] = useState<'Notes' | 'Tasks' | 'Schedules'>(
-    'Notes',
+    'Tasks',
   );
   const [destination, setDestination] =
-    useState<WorkspaceDestination>('workspace');
+    useState<WorkspaceDestination>('overview');
   const desktopNavigation = useDesktopNavigation();
   const companyName =
     workspaceState?.configured && workspaceState.workspace !== null
@@ -292,7 +297,7 @@ export function WorkspaceShell({
                 placement="sidebar"
                 hasTelegram={telegram !== null}
               />
-              {onSelectAgent && (
+              {onSelectAgent && destination === 'workspace' && (
                 <nav
                   className="studio-agent-chats"
                   aria-label="Direct messages"
@@ -342,7 +347,7 @@ export function WorkspaceShell({
                   </div>
                 </nav>
               )}
-              <div
+              {destination === 'workspace' && <div
                 className={`studio-sidebar-note ${onSelectAgent ? 'has-agent-chats' : ''}`}
               >
                 <span className="studio-note-label">WORKSPACE PULSE</span>
@@ -368,7 +373,7 @@ export function WorkspaceShell({
                 <span>
                   {activeAgent.provider} / {activeAgent.model}
                 </span>
-              </div>
+              </div>}
               <div className="border-t border-line/60 p-3">
                 <button
                   type="button"
@@ -390,10 +395,8 @@ export function WorkspaceShell({
                 <span>{companyName || 'Personal space'}</span>
                 <span aria-hidden>/</span>
                 <strong>
-                  {destination === 'telegram'
-                    ? 'Telegram'
-                    : destination.charAt(0).toUpperCase() +
-                      destination.slice(1)}
+                  {destination === 'telegram' ? 'Telegram' :
+                    DESTINATIONS.find((item) => item.id === destination)?.label}
                 </strong>
               </div>
               <span
@@ -403,6 +406,13 @@ export function WorkspaceShell({
                 {connection === 'online' ? 'Connected' : 'Offline'}
               </span>
               <div className="studio-topbar-actions">
+                {destination !== 'workspace' && (
+                  <button type="button" className="studio-tool-button"
+                    aria-label="Open manager chat" onClick={() => {
+                      onSelectAgent?.(mainAgent.id);
+                      setDestination('workspace');
+                    }}>Ask your manager</button>
+                )}
                 <button
                   type="button"
                   className="studio-command-trigger"
@@ -429,7 +439,7 @@ export function WorkspaceShell({
                 )}
               </div>
             </div>
-            {onSelectAgent && destination !== 'dashboard' && (
+            {onSelectAgent && destination === 'workspace' && (
               <div className="flex shrink-0 min-w-0 items-center gap-3 border-b border-line px-4 py-2">
                 <label
                   htmlFor={
@@ -489,9 +499,10 @@ export function WorkspaceShell({
                 connectors
               ) : destination === 'activity' ? (
                 activity
-              ) : destination === 'dashboard' ? (
+              ) : destination === 'overview' ? (
                 <WorkspaceDashboard
                   agents={agents}
+                  managerId={mainAgent.id}
                   companyName={companyName}
                   mission={workspaceState?.workspace?.mission}
                   online={connection === 'online'}
@@ -504,7 +515,15 @@ export function WorkspaceShell({
                     setDestination('hub');
                   }}
                   onOpenTeam={() => setDestination('agents')}
+                  onOpenFiles={() => setDestination('files')}
+                  onStartAssignment={onStartAssignment ? (prompt) => {
+                    onSelectAgent?.(mainAgent.id);
+                    setDestination('workspace');
+                    onStartAssignment(mainAgent.id, prompt);
+                  } : undefined}
                 />
+              ) : destination === 'files' ? (
+                <WorkspaceFiles online={connection === 'online'} />
               ) : destination === 'hub' ? (
                 <WorkspaceHub
                   initialSection={hubSection}

@@ -1,4 +1,6 @@
 import { AgentsClient } from './agents.js';
+import { AgenciesClient } from './agencies.js';
+import { WorkspaceClient } from './workspace.js';
 import { ChatGptClient } from './chatgpt.js';
 import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
@@ -57,6 +59,8 @@ export class DaemonConnectionError extends Error {
 }
 
 export class DaemonClient {
+  readonly agencies: AgenciesClient;
+  readonly workspace: WorkspaceClient;
   readonly chatgpt: ChatGptClient;
   readonly agents: AgentsClient;
   readonly connectors: ConnectorsClient;
@@ -75,6 +79,8 @@ export class DaemonClient {
     }
 
     this.fetchImpl = fetchImpl;
+    this.agencies = new AgenciesClient(this);
+    this.workspace = new WorkspaceClient(this);
     this.agents = new AgentsClient(this);
     this.chatgpt = new ChatGptClient(this);
     this.connectors = new ConnectorsClient(this);
@@ -90,7 +96,7 @@ export class DaemonClient {
     path: string,
     init: Omit<RequestInit, 'body'> & {
       body?: unknown;
-    } = {}
+    } = {},
   ): Promise<T> {
     const { body, isJson } = prepareRequestBody(init.body);
     const headers: Record<string, string> = {
@@ -117,7 +123,7 @@ export class DaemonClient {
 
   async *subscribe<T = unknown>(
     path: string,
-    init: RequestInit = {}
+    init: RequestInit = {},
   ): AsyncGenerator<DaemonEvent<T>> {
     const abortController = new AbortController();
     const detachAbortRelay = relayAbort(init.signal, abortController);
@@ -137,7 +143,7 @@ export class DaemonClient {
       if (!response.ok) {
         throw new DaemonHttpError(
           response.status,
-          await readResponseBody(response)
+          await readResponseBody(response),
         );
       }
 
@@ -160,7 +166,7 @@ export class DaemonClient {
         while (separatorIndex >= 0) {
           const chunk = buffer.slice(0, separatorIndex);
           buffer = buffer.slice(
-            separatorIndex + eventSeparatorLength(buffer, separatorIndex)
+            separatorIndex + eventSeparatorLength(buffer, separatorIndex),
           );
 
           const event = parseSseEvent(chunk);
@@ -193,7 +199,7 @@ export class DaemonClient {
 
   private async fetchWithConnectionErrors(
     path: string,
-    init: RequestInit
+    init: RequestInit,
   ): Promise<Response> {
     try {
       return await this.fetchImpl(this.url(path), init);
@@ -208,7 +214,7 @@ export class DaemonClient {
 }
 
 export function createDaemonClient(
-  options: DaemonClientOptions = {}
+  options: DaemonClientOptions = {},
 ): DaemonClient {
   return new DaemonClient(options);
 }
@@ -239,7 +245,7 @@ function headersToObject(headers?: RequestHeaders): Record<string, string> {
   }
 
   for (const [key, value] of Object.entries(
-    headers as Record<string, string | readonly string[]>
+    headers as Record<string, string | readonly string[]>,
   )) {
     normalized[key] = typeof value === 'string' ? value : value.join(', ');
   }
@@ -369,7 +375,7 @@ function parseJsonLike(value: string): unknown {
 
 function relayAbort(
   source: AbortSignal | null | undefined,
-  target: AbortController
+  target: AbortController,
 ): () => void {
   if (!source) {
     return () => {};

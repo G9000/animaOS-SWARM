@@ -25,6 +25,7 @@ function loadAgent(a: Record<string, unknown>) {
     style: a.style as string | undefined,
     system: (a.system as string) ?? '',
     model: a.model as string | undefined,
+    provider: typeof a.provider === 'string' ? a.provider.trim() || undefined : undefined,
     tools: a.tools as string[] | undefined,
   };
 }

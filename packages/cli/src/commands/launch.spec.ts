@@ -109,9 +109,33 @@ describe('launch command daemon plain-text mode', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
     rmSync(agencyDir, { recursive: true, force: true });
     process.exitCode = undefined;
+  });
+
+  it('launches per-agent model providers without leaking the global API key across providers', async () => {
+    writeFileSync(join(agencyDir, 'anima.yaml'), JSON.stringify({
+      name: 'Mixed team', provider: 'openai', model: 'default-model',
+      orchestrator: { name: 'Manager', bio: 'Lead', system: 'Coordinate', provider: 'anthropic', model: 'lead-model' },
+      agents: [{ name: 'Legacy', bio: 'Work', system: 'Work' }, { name: 'Override', bio: 'Work', system: 'Work', provider: 'google', model: 'worker-model' }],
+    }));
+    vi.stubEnv('ANTHROPIC_API_KEY', 'anthropic-env');
+    vi.stubEnv('GOOGLE_API_KEY', 'google-env');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const client = { swarms: mockSwarms({
+      create: vi.fn().mockResolvedValue({ id: 'mixed' }),
+      run: vi.fn().mockResolvedValue({ result: { status: 'success', durationMs: 1 } }),
+    }) };
+    await executeLaunchCommand('Work', { dir: agencyDir, tui: false, apiKey: 'openai-flag' }, { client });
+    expect(client.swarms.create).toHaveBeenCalledWith(expect.objectContaining({
+      manager: expect.objectContaining({ provider: 'anthropic', model: 'lead-model', settings: expect.objectContaining({ apiKey: 'anthropic-env' }) }),
+      workers: [
+        expect.objectContaining({ provider: 'openai', model: 'default-model', settings: expect.objectContaining({ apiKey: 'openai-flag' }) }),
+        expect.objectContaining({ provider: 'google', model: 'worker-model', settings: expect.objectContaining({ apiKey: 'google-env' }) }),
+      ],
+    }));
   });
 
   it('creates and runs a daemon swarm for single-shot plain-text launch', async () => {

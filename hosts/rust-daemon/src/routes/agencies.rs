@@ -110,12 +110,27 @@ pub(crate) struct AgencyYamlAgent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) collaborates_with: Option<Vec<String>>,
 }
 
 impl AgencyYamlAgent {
+    pub(crate) fn effective_provider(&self, agency_provider: &str) -> String {
+        self.provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .or_else(|| {
+                let provider = agency_provider.trim();
+                (!provider.is_empty()).then_some(provider)
+            })
+            .unwrap_or("openai")
+            .to_string()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn orchestrator(
         name: String,
@@ -137,6 +152,7 @@ impl AgencyYamlAgent {
             style,
             system,
             model,
+            provider: None,
             tools,
             collaborates_with: None,
         }
@@ -303,10 +319,15 @@ fn prepare_generate_request(
             "maxTeamSize must be between 2 and 10, including the manager",
         ));
     }
-    let team_size = request
+    if request
         .team_size
-        .map(|n| n.clamp(TEAM_MIN, TEAM_MAX))
-        .unwrap_or(DEFAULT_TEAM_SIZE);
+        .is_some_and(|count| !(TEAM_MIN..=TEAM_MAX).contains(&count))
+    {
+        return Err(ApiError::bad_request_static(
+            "teamSize must be between 2 and 10, including the manager",
+        ));
+    }
+    let team_size = request.team_size.unwrap_or(DEFAULT_TEAM_SIZE);
 
     let provider = request
         .provider
@@ -413,9 +434,7 @@ async fn generate_agency_from_prepared(
 
     let agents = parse_agents_payload(&response.content.text, &tool_registry)?;
     let (mission, values, definitions) = agents;
-    if let Some(limit) = max_team_size {
-        validate_generated_team_size(definitions.len(), limit)?;
-    }
+    validate_generated_team_size(definitions.len(), team_size, max_team_size)?;
     let team_size = definitions.len() as u64;
 
     Ok(AgencyGenerateResponse {
@@ -870,6 +889,7 @@ fn agency_yaml_agent(agent: &AgentDefinitionResponse) -> AgencyYamlAgent {
         style: agent.style.clone(),
         system: agent.system.clone().unwrap_or_default(),
         model: agent.model.clone(),
+        provider: None,
         tools: agent.tools.clone(),
         collaborates_with: agent.collaborates_with.clone(),
     }
@@ -1161,10 +1181,18 @@ fn require_trimmed(value: Option<String>, message: &'static str) -> Result<Strin
     }
 }
 
-fn validate_generated_team_size(count: usize, limit: u64) -> Result<(), ApiError> {
-    if count < TEAM_MIN as usize || count > limit as usize {
+fn validate_generated_team_size(
+    count: usize,
+    team_size: u64,
+    max_team_size: Option<u64>,
+) -> Result<(), ApiError> {
+    let valid = match max_team_size {
+        Some(limit) => (TEAM_MIN..=limit).contains(&(count as u64)),
+        None => count as u64 == team_size,
+    };
+    if !valid {
         return Err(ApiError::bad_request_static(
-            "Generated team is outside the requested size limit. Try again.",
+            "Generated team does not match the requested size. Try again.",
         ));
     }
     Ok(())
@@ -1279,7 +1307,10 @@ fn build_prompt(
         "  \"values\": string[] — 3-5 cultural principles the team operates under (short phrases)"
             .into(),
     );
-    lines.push("  \"agents\": AgentObject[]  — exactly the requested size".into());
+    lines.push(match max_team_size {
+        Some(limit) => format!("  \"agents\": AgentObject[]  — between 2 and {limit} agents, choosing the smallest useful team"),
+        None => "  \"agents\": AgentObject[]  — exactly the requested size".into(),
+    });
     lines.push("}".into());
     lines.push(String::new());
     lines.push("Each AgentObject must have:".into());
@@ -1403,6 +1434,16 @@ fn parse_agents_payload(
         .map(map_agent_definition)
         .collect::<Vec<_>>();
 
+    if agents
+        .iter()
+        .filter(|agent| agent.role == "orchestrator")
+        .count()
+        != 1
+    {
+        return Err(ApiError::bad_request_static(
+            "Generated team must have exactly one orchestrator. Try again.",
+        ));
+    }
     let agents = normalize_agent_definitions(agents, tool_registry);
 
     Ok((mission, values, agents))
@@ -1509,16 +1550,71 @@ pub(super) fn strip_code_fences(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn exact_team_size_rejects_out_of_range_requests() {
+        for count in [0, 1, 11, u64::MAX] {
+            let request = serde_json::from_value(serde_json::json!({
+                "name": "Studio", "description": "Make videos", "teamSize": count
+            }))
+            .unwrap();
+            assert!(
+                super::prepare_generate_request(request).is_err(),
+                "count {count}"
+            );
+        }
+        for count in [2, 4, 10] {
+            let request = serde_json::from_value(serde_json::json!({
+                "name": "Studio", "description": "Make videos", "teamSize": count
+            }))
+            .unwrap();
+            assert_eq!(
+                super::prepare_generate_request(request).unwrap().team_size,
+                count
+            );
+        }
+    }
+
+    #[test]
+    fn generated_payload_requires_exactly_one_orchestrator() {
+        let registry = ToolRegistry::new();
+        for roles in [
+            vec!["worker", "worker"],
+            vec!["orchestrator", "orchestrator"],
+            vec![],
+        ] {
+            let agents: Vec<_> = roles
+                .into_iter()
+                .map(|role| serde_json::json!({"name": "Agent", "role": role}))
+                .collect();
+            let raw = serde_json::json!({"agents": agents}).to_string();
+            assert!(parse_agents_payload(&raw, &registry).is_err());
+        }
+    }
+
+    #[test]
     fn automatic_team_size_uses_a_ceiling_and_validates_results() {
         let prompt = super::build_prompt("Studio", "Make videos", 4, Some(6), &[], &[]);
         assert!(prompt.contains("between 2 and 6 agents TOTAL"));
         assert!(!prompt.contains("Generate EXACTLY"));
-        assert!(super::validate_generated_team_size(2, 6).is_ok());
-        assert!(super::validate_generated_team_size(6, 6).is_ok());
-        assert!(super::validate_generated_team_size(7, 6).is_err());
-        assert!(super::validate_generated_team_size(1, 6).is_err());
+        assert!(!prompt.contains("exactly the requested size"));
+        assert!(super::validate_generated_team_size(2, 4, Some(6)).is_ok());
+        assert!(super::validate_generated_team_size(6, 4, Some(6)).is_ok());
+        assert!(super::validate_generated_team_size(7, 4, Some(6)).is_err());
+        assert!(super::validate_generated_team_size(1, 4, Some(6)).is_err());
         let exact = super::build_prompt("Studio", "Make videos", 4, None, &[], &[]);
         assert!(exact.contains("Generate EXACTLY 4 agents"));
+    }
+
+    #[test]
+    fn exact_generated_team_size_rejects_under_and_over_generation() {
+        for requested in 2..=10 {
+            for actual in 0..=11 {
+                assert_eq!(
+                    super::validate_generated_team_size(actual, requested, None).is_ok(),
+                    actual as u64 == requested,
+                    "requested {requested}, actual {actual}"
+                );
+            }
+        }
     }
 
     #[test]

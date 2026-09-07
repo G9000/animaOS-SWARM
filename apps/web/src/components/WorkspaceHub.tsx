@@ -165,11 +165,11 @@ export function WorkspaceHub({
   return (
     <section
       className="h-full min-w-0 overflow-y-auto p-5 pb-28 sm:p-8 md:pb-8"
-      aria-label="Work hub"
+      aria-label="Work"
     >
       <div className="mx-auto max-w-4xl space-y-7">
         <header className="space-y-2">
-          <h2 className="text-2xl font-semibold">Work hub</h2>
+          <h2 className="text-2xl font-semibold">Work</h2>
           <p className="text-sm leading-relaxed text-ink-3">
             Your team’s notes, tasks, and schedules, together in one place.
           </p>

@@ -1,8 +1,8 @@
 export const ONBOARDING_STEPS = [
-  'Workspace',
+  'Goal',
   'Model',
   'Team',
-  'Manager',
+  'Workspace',
   'Launch',
 ] as const;
 

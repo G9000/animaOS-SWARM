@@ -104,6 +104,9 @@ async function fillWorkspace(user: ReturnType<typeof userEvent.setup>) {
     screen.getByRole('textbox', { name: 'Workspace brief' }),
     WORKSPACE.mission,
   );
+}
+
+async function fillFolder(user: ReturnType<typeof userEvent.setup>) {
   const rootPath = screen.getByRole('textbox', { name: 'Office location' });
   await user.clear(rootPath);
   await user.type(rootPath, WORKSPACE.rootPath);
@@ -118,9 +121,8 @@ async function goToIntelligence(user: ReturnType<typeof userEvent.setup>) {
 async function goToManager(user: ReturnType<typeof userEvent.setup>) {
   await goToIntelligence(user);
   await user.click(screen.getByRole('button', { name: 'Next' }));
-  expect(
-    screen.getByRole('heading', { name: 'Workspace Manager' }),
-  ).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
+  await fillFolder(user);
 }
 
 async function goToReview(user: ReturnType<typeof userEvent.setup>) {
@@ -142,6 +144,68 @@ afterEach(() => {
 });
 
 describe('OnboardingFlow', () => {
+  it('connects intelligence before requiring a workspace folder', async () => {
+    const user = userEvent.setup();
+    renderFlow();
+    expect(
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
+    await user.type(
+      screen.getByRole('textbox', { name: 'Company name' }),
+      'Studio',
+    );
+    await user.type(
+      screen.getByRole('textbox', { name: 'Workspace brief' }),
+      'Build useful software',
+    );
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByRole('heading', { name: 'Model' })).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('workspace folder');
+  });
+
+  it('requests an exact total and rejects a mismatched generated preview', async () => {
+    const user = userEvent.setup();
+    const generate = vi.spyOn(daemon, 'generateAgency').mockResolvedValue({
+      name: 'Studio',
+      agents: [
+        {
+          name: 'Lead',
+          role: 'orchestrator',
+          bio: 'Coordinate',
+          system: 'Lead',
+        },
+        { name: 'Writer', role: 'worker', bio: 'Write', system: 'Write' },
+      ],
+    });
+    renderFlow();
+    await user.click(screen.getByRole('button', { name: /Marketing Agency/ }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(
+      screen.getByRole('radio', { name: 'Choose an exact number' }),
+    );
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Exact team size' }),
+      '3',
+    );
+    await user.click(screen.getByRole('button', { name: 'Generate team' }));
+    await waitFor(() =>
+      expect(generate).toHaveBeenCalledWith(
+        expect.objectContaining({ teamSize: 3 }),
+      ),
+    );
+    expect(generate.mock.calls[0][0]).not.toHaveProperty('maxTeamSize');
+    expect(await screen.findByRole('alert')).toHaveTextContent('selected size');
+    expect(
+      screen.getByRole('button', { name: 'Edit Strategist' }),
+    ).toBeVisible();
+  });
+
   it('provides a valid predefined manager without profile generation or editable personality fields', async () => {
     const user = userEvent.setup();
     const generate = vi.spyOn(daemon, 'generateProfile');
@@ -221,10 +285,6 @@ describe('OnboardingFlow', () => {
     vi.spyOn(daemon, 'generateAgency').mockReturnValue(pending.promise);
     renderFlow();
     await user.click(screen.getByRole('button', { name: /Marketing Agency/ }));
-    await user.type(
-      screen.getByRole('textbox', { name: 'Office location' }),
-      '/tmp/marketing',
-    );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Generate team' }));
@@ -233,7 +293,6 @@ describe('OnboardingFlow', () => {
     ).toBeDisabled();
     await user.click(screen.getByRole('button', { name: 'Back' }));
     await user.click(screen.getByRole('button', { name: 'Back' }));
-    await user.click(screen.getByRole('button', { name: 'Change template' }));
     await user.click(screen.getByRole('button', { name: /Life Agency/ }));
     await act(async () =>
       pending.resolve({
@@ -277,7 +336,7 @@ describe('OnboardingFlow', () => {
     });
     renderFlow();
     await user.click(
-      screen.getByRole('button', { name: /Generate my agency/ }),
+      screen.getByRole('button', { name: /Create a custom agency/ }),
     );
     await goToIntelligence(user);
     await user.click(screen.getByRole('button', { name: 'Next' }));
@@ -289,6 +348,7 @@ describe('OnboardingFlow', () => {
     await user.click(screen.getByRole('button', { name: 'Generate team' }));
     await screen.findByRole('button', { name: 'Edit Editor' });
     await user.click(screen.getByRole('button', { name: 'Next' }));
+    await fillFolder(user);
     await user.clear(screen.getByRole('textbox', { name: 'Manager name' }));
     await user.type(
       screen.getByRole('textbox', { name: 'Manager name' }),
@@ -348,10 +408,6 @@ describe('OnboardingFlow', () => {
     const user = userEvent.setup();
     renderFlow();
     await user.click(screen.getByRole('button', { name: /Marketing Agency/ }));
-    await user.type(
-      screen.getByRole('textbox', { name: 'Office location' }),
-      '/tmp/marketing',
-    );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.selectOptions(
@@ -372,13 +428,10 @@ describe('OnboardingFlow', () => {
     const user = userEvent.setup();
     renderFlow();
     await user.click(screen.getByRole('button', { name: /Marketing Agency/ }));
-    await user.type(
-      screen.getByRole('textbox', { name: 'Office location' }),
-      '/tmp/marketing',
-    );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
+    await fillFolder(user);
     await user.clear(screen.getByRole('textbox', { name: 'Manager name' }));
     await user.click(screen.getByRole('button', { name: 'Back' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
@@ -404,10 +457,6 @@ describe('OnboardingFlow', () => {
     );
     renderFlow();
     await user.click(screen.getByRole('button', { name: /Marketing Agency/ }));
-    await user.type(
-      screen.getByRole('textbox', { name: 'Office location' }),
-      '/tmp/marketing',
-    );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Generate team' }));
@@ -433,10 +482,6 @@ describe('OnboardingFlow', () => {
     expect(screen.getByRole('textbox', { name: 'Company name' })).toHaveValue(
       'My Creator Studio',
     );
-    await user.type(
-      screen.getByRole('textbox', { name: 'Office location' }),
-      '/tmp/studio',
-    );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(
@@ -452,6 +497,7 @@ describe('OnboardingFlow', () => {
       screen.getByRole('button', { name: 'Remove Community Manager' }),
     );
     await user.click(screen.getByRole('button', { name: 'Next' }));
+    await fillFolder(user);
     await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(
       within(
@@ -479,10 +525,6 @@ describe('OnboardingFlow', () => {
     const user = userEvent.setup();
     renderFlow();
     await user.click(screen.getByRole('button', { name: /Life Agency/ }));
-    await user.type(
-      screen.getByRole('textbox', { name: 'Office location' }),
-      '/tmp/life',
-    );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Next' }));
     await user.click(screen.getByRole('button', { name: 'Edit Planner' }));
@@ -497,12 +539,14 @@ describe('OnboardingFlow', () => {
     await user.clear(worker);
     await user.type(worker, 'Anima');
     await user.click(screen.getByRole('button', { name: 'Next' }));
+    await fillFolder(user);
     await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByRole('alert')).toHaveTextContent('unique');
     expect(screen.getByRole('textbox', { name: 'Manager name' })).toBeVisible();
   });
 
-  it('renders the Workspace step first and pre-fills the daemon default root', async () => {
+  it('renders Goal first and pre-fills the daemon default root at Workspace', async () => {
+    const user = userEvent.setup();
     vi.spyOn(daemon, 'getWorkspace').mockResolvedValue({
       configured: false,
       workspace: null,
@@ -510,7 +554,7 @@ describe('OnboardingFlow', () => {
     });
     renderFlow();
 
-    expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Your goal' })).toBeVisible();
     expect(
       screen.getByRole('heading', { name: 'Set up your workspace' }),
     ).toBeVisible();
@@ -523,10 +567,13 @@ describe('OnboardingFlow', () => {
       'aria-current',
       'step',
     );
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Step 1 of 4: Workspace',
-    );
+    expect(screen.getByRole('status')).toHaveTextContent('Step 1 of 4: Goal');
 
+    expect(
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
+    await goToIntelligence(user);
+    await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(await screen.findByDisplayValue('/Users/dev/anima')).toBeVisible();
   });
 
@@ -536,7 +583,7 @@ describe('OnboardingFlow', () => {
 
     await user.click(screen.getByRole('button', { name: 'Next' }));
 
-    expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Your goal' })).toBeVisible();
     const alert = screen.getByRole('alert');
     expect(alert).toHaveTextContent(
       'Enter a company name, workspace brief, and workspace folder.',
@@ -573,7 +620,7 @@ describe('OnboardingFlow', () => {
         rootPathExists: false,
       });
     renderFlow();
-    await fillWorkspace(user);
+    await goToManager(user);
 
     await user.click(screen.getByRole('button', { name: 'Verify' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
@@ -585,12 +632,16 @@ describe('OnboardingFlow', () => {
       mission: WORKSPACE.mission,
       values: [],
     });
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await user.click(screen.getByRole('button', { name: 'Back' }));
     expect(screen.getByRole('textbox', { name: 'Company name' })).toHaveValue(
       WORKSPACE.companyName,
     );
     expect(
       screen.getByRole('textbox', { name: 'Workspace brief' }),
     ).toHaveValue(WORKSPACE.mission);
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(
       screen.getByRole('textbox', { name: 'Office location' }),
     ).toHaveValue(WORKSPACE.rootPath);
@@ -628,6 +679,8 @@ describe('OnboardingFlow', () => {
       WORKSPACE.mission,
     );
     await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(
       screen.getByRole('textbox', { name: 'Office location' }),
     ).toHaveFocus();
@@ -639,7 +692,7 @@ describe('OnboardingFlow', () => {
       deferred<Awaited<ReturnType<typeof daemon.validateWorkspace>>>();
     vi.spyOn(daemon, 'validateWorkspace').mockReturnValue(pending.promise);
     renderFlow();
-    await fillWorkspace(user);
+    await goToManager(user);
 
     await user.click(screen.getByRole('button', { name: 'Verify' }));
     await user.type(
@@ -669,9 +722,7 @@ describe('OnboardingFlow', () => {
     renderFlow();
 
     expect(screen.getAllByRole('listitem')).toHaveLength(4);
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Step 1 of 4: Workspace',
-    );
+    expect(screen.getByRole('status')).toHaveTextContent('Step 1 of 4: Goal');
 
     await fillWorkspace(user);
     await user.click(screen.getByRole('button', { name: 'Next' }));
@@ -683,8 +734,9 @@ describe('OnboardingFlow', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByRole('status')).toHaveTextContent(
-      'Step 3 of 4: Manager',
+      'Step 3 of 4: Workspace',
     );
+    await fillFolder(user);
 
     const name = screen.getByRole('textbox', { name: 'Manager name' });
     await user.clear(name);
@@ -706,6 +758,9 @@ describe('OnboardingFlow', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Step 4 of 4: Launch');
 
     await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue(WORKSPACE.rootPath);
     expect(screen.getByRole('radio', { name: /Operate/ })).toBeChecked();
     expect(screen.getByRole('textbox', { name: 'Manager name' })).toHaveValue(
       'Nova',
@@ -727,8 +782,8 @@ describe('OnboardingFlow', () => {
       screen.getByRole('textbox', { name: 'Workspace brief' }),
     ).toHaveValue(WORKSPACE.mission);
     expect(
-      screen.getByRole('textbox', { name: 'Office location' }),
-    ).toHaveValue(WORKSPACE.rootPath);
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
     expect(screen.getAllByRole('listitem')[0]).toHaveAttribute(
       'aria-current',
       'step',
@@ -764,8 +819,8 @@ describe('OnboardingFlow', () => {
       screen.getByRole('textbox', { name: 'Workspace brief' }),
     ).toHaveValue(WORKSPACE.mission);
     expect(
-      screen.getByRole('textbox', { name: 'Office location' }),
-    ).toHaveValue(WORKSPACE.rootPath);
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
   });
 
   it('summarizes the workspace, manager role and settings, provider/model, and access on Review', async () => {
@@ -912,8 +967,8 @@ describe('OnboardingFlow', () => {
       screen.getByRole('textbox', { name: 'Workspace brief' }),
     ).toHaveValue('Ship calmly');
     expect(
-      screen.getByRole('textbox', { name: 'Office location' }),
-    ).toHaveValue('/srv/acme');
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
     await waitFor(() =>
       expect(screen.getByRole('textbox', { name: /Values/ })).toHaveValue(
         'cite sources',
@@ -926,6 +981,9 @@ describe('OnboardingFlow', () => {
     await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByRole('heading', { name: 'Model' })).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(
+      screen.getByRole('textbox', { name: 'Office location' }),
+    ).toHaveValue('/srv/acme');
     const name = screen.getByRole('textbox', { name: 'Manager name' });
     await user.clear(name);
     await user.type(name, 'Nova');
@@ -1029,9 +1087,7 @@ describe('OnboardingFlow', () => {
     await user.type(customModel, 'custom/great-model');
     expect(customModel).toHaveAttribute('aria-invalid', 'false');
     await user.click(screen.getByRole('button', { name: 'Next' }));
-    expect(
-      screen.getByRole('heading', { name: 'Workspace Manager' }),
-    ).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
 
     await user.click(screen.getByRole('button', { name: 'Back' }));
     expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue(
@@ -1072,12 +1128,44 @@ describe('OnboardingFlow', () => {
     const ollama = screen.getByRole('button', {
       name: /Ollama.*configured/i,
     });
-    await waitFor(() => expect(ollama).toHaveAttribute('aria-pressed', 'true'));
-    expect(ollama).toHaveFocus();
+    expect(ollama).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('gpt-4o');
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
     expect(
       screen.queryByRole('button', { name: 'Create workspace' }),
     ).not.toBeInTheDocument();
     expect(bootstrapWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('retains the chosen subscription and custom model through disconnect and reconnect', async () => {
+    const user = userEvent.setup();
+    const chatgpt: DaemonProvider = {
+      id: 'chatgpt', label: 'ChatGPT subscription', configured: true,
+      requiresKey: false, apiKeyEnvs: [],
+    };
+    const catalog = [...configuredProviders, chatgpt];
+    const view = renderFlow({ providers: catalog });
+    await goToIntelligence(user);
+    await user.click(screen.getByRole('button', { name: 'Use ChatGPT subscription' }));
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Model' }), '__custom__');
+    await user.type(screen.getByRole('textbox', { name: 'Custom model' }), 'my-selected-model');
+    const refresh = (providers: DaemonProvider[] | null) => view.rerender(
+      <OnboardingFlow providers={providers} providersError={null}
+        retryProviders={view.retryProviders} onCreated={view.onCreated} />,
+    );
+    refresh([...configuredProviders, { ...chatgpt, configured: false }]);
+    expect(screen.getByRole('button', { name: 'ChatGPT subscription selected' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('textbox', { name: 'Custom model' })).toHaveValue('my-selected-model');
+    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
+    refresh(null);
+    refresh(catalog);
+    expect(screen.getByRole('button', { name: 'Next' })).toBeEnabled();
+    await user.click(screen.getByRole('button', { name: 'ChatGPT subscription selected' }));
+    expect(screen.getByRole('textbox', { name: 'Custom model' })).toHaveValue('my-selected-model');
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    await fillFolder(user);
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText('ChatGPT subscription / my-selected-model')).toBeVisible();
   });
 });
 
@@ -1109,7 +1197,7 @@ describe('OnboardingFlow workspace resume', () => {
     rootPath: string = RESUME_ROOT,
   ) {
     await user.click(
-      screen.getByRole('button', { name: /already have a workspace/i }),
+      screen.getByRole('button', { name: 'Open existing workspace' }),
     );
     await user.type(
       screen.getByRole('textbox', { name: 'Office location' }),
@@ -1133,7 +1221,7 @@ describe('OnboardingFlow workspace resume', () => {
     renderFlow();
 
     await user.click(
-      screen.getByRole('button', { name: /already have a workspace/i }),
+      screen.getByRole('button', { name: 'Open existing workspace' }),
     );
 
     expect(
@@ -1193,6 +1281,9 @@ describe('OnboardingFlow workspace resume', () => {
       new Error('Folder picker unavailable'),
     );
     renderFlow();
+    await user.click(
+      screen.getByRole('button', { name: 'Open existing workspace' }),
+    );
     await user.click(screen.getByRole('button', { name: 'Browse…' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Folder picker unavailable',
@@ -1205,6 +1296,9 @@ describe('OnboardingFlow workspace resume', () => {
     const pending = deferred<{ rootPath: string | null }>();
     vi.spyOn(daemon, 'pickWorkspaceFolder').mockReturnValue(pending.promise);
     renderFlow();
+    await user.click(
+      screen.getByRole('button', { name: 'Open existing workspace' }),
+    );
     await user.click(screen.getByRole('button', { name: 'Browse…' }));
     await user.type(
       screen.getByRole('textbox', { name: 'Office location' }),
@@ -1233,6 +1327,12 @@ describe('OnboardingFlow workspace resume', () => {
       screen.getByRole('button', { name: /set up a new workspace instead/i }),
     );
     await act(async () => pending.resolve({ rootPath: '/tmp/other' }));
+    expect(
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole('button', { name: 'Open existing workspace' }),
+    );
     expect(
       screen.getByRole('textbox', { name: 'Office location' }),
     ).toHaveValue(RESUME_ROOT);
@@ -1347,11 +1447,16 @@ describe('OnboardingFlow workspace resume', () => {
       screen.getByRole('button', { name: 'Set up fresh instead' }),
     );
 
-    expect(screen.getByRole('heading', { name: 'Workspace' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'Your goal' })).toBeVisible();
     expect(screen.getByRole('textbox', { name: 'Company name' })).toBeVisible();
     expect(
       screen.getByRole('textbox', { name: 'Workspace brief' }),
     ).toBeVisible();
+    expect(
+      screen.queryByRole('textbox', { name: 'Office location' }),
+    ).not.toBeInTheDocument();
+    await goToIntelligence(user);
+    await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(
       screen.getByRole('textbox', { name: 'Office location' }),
     ).toHaveValue(RESUME_ROOT);
@@ -1409,7 +1514,9 @@ describe('OnboardingFlow workspace resume', () => {
       screen.queryByRole('heading', { name: 'Resume your workspace' }),
     ).not.toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: 'Company name' })).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Verify' })).toBeEnabled();
+    expect(
+      screen.queryByRole('button', { name: 'Verify' }),
+    ).not.toBeInTheDocument();
   });
 
   it('ignores a verify response that resolves after entering resume mode', async () => {
@@ -1418,11 +1525,13 @@ describe('OnboardingFlow workspace resume', () => {
       deferred<Awaited<ReturnType<typeof daemon.validateWorkspace>>>();
     vi.spyOn(daemon, 'validateWorkspace').mockReturnValue(pending.promise);
     renderFlow();
-    await fillWorkspace(user);
+    await goToManager(user);
 
     await user.click(screen.getByRole('button', { name: 'Verify' }));
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    await user.click(screen.getByRole('button', { name: 'Back' }));
     await user.click(
-      screen.getByRole('button', { name: /already have a workspace/i }),
+      screen.getByRole('button', { name: 'Open existing workspace' }),
     );
 
     await act(async () => {
@@ -1446,7 +1555,7 @@ describe('OnboardingFlow workspace resume', () => {
     renderFlow();
 
     await user.click(
-      screen.getByRole('button', { name: /already have a workspace/i }),
+      screen.getByRole('button', { name: 'Open existing workspace' }),
     );
 
     expect(

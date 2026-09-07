@@ -2221,6 +2221,16 @@ impl DaemonState {
         Ok(snapshot)
     }
 
+    pub(crate) fn restore_agent_config(&mut self, agent_id: &str, config: AgentConfig) {
+        if let Some(runtime) = self.agents.get_mut(agent_id) {
+            runtime.replace_config(config.clone());
+        }
+        if let Some(snapshot) = self.agent_snapshots.get_mut(agent_id) {
+            snapshot.state.name = config.name.clone();
+            snapshot.state.config = config;
+        }
+    }
+
     /// Apply a fully validated partial config update to an existing agent and
     /// refresh its snapshot.
     pub(crate) fn update_agent(

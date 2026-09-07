@@ -41,7 +41,7 @@ export function AgentsView({
               id="agents-view-heading"
               className="studio-page-title mt-3 text-ink"
             >
-              Agents
+              Team
             </h2>
           </div>
           <span className="font-mono text-[11px] text-ink-3">

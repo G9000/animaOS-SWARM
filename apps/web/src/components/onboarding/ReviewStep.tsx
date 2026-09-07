@@ -1,6 +1,10 @@
 import { useEffect, useRef } from 'react';
 
-import { ACCESS_PROFILES, type AccessProfile } from '../../lib/agent-access';
+import {
+  ACCESS_PROFILES,
+  toolNamesForProfile,
+  type AccessProfile,
+} from '../../lib/agent-access';
 import type { DaemonProvider } from '../../lib/daemon-api';
 import type { AgencyMember } from '../../lib/agency-templates';
 import type {
@@ -9,6 +13,8 @@ import type {
 } from '../../lib/workspace-manager';
 
 export interface ReviewStepProps {
+  firstTask?: string;
+  onFirstTaskChange?(value: string): void;
   showActions?: boolean;
   workers?: AgencyMember[];
   workspace: {
@@ -34,6 +40,8 @@ export interface ReviewStepProps {
 }
 
 export function ReviewStep({
+  firstTask = '',
+  onFirstTaskChange,
   showActions = true,
   workers,
   workspace,
@@ -80,7 +88,7 @@ export function ReviewStep({
         </h2>
         <p className="mt-1 text-sm text-ink-2">
           {workers
-            ? `Confirm your workspace manager and ${workers.length} specialists. The selected model and access apply to everyone.`
+            ? `Confirm your workspace manager and ${workers.length} specialists, including each role’s model and access.`
             : 'Confirm your workspace manager and how it will work with you.'}
         </p>
       </div>
@@ -167,11 +175,50 @@ export function ReviewStep({
                 {worker.name}
               </summary>
               <p className="mt-2 text-sm text-ink-2">{worker.bio}</p>
+              <p className="mt-2 text-xs text-ink-2">
+                {worker.provider || provider} / {worker.model || model} ·{' '}
+                {ACCESS_PROFILES[worker.access ?? access].label}
+              </p>
+              <p className="mt-2 text-xs text-ink-3">
+                {ACCESS_PROFILES[worker.access ?? access].risk}
+              </p>
+              <p className="mt-2 break-words text-xs text-ink-3">
+                Granted tools:{' '}
+                {toolNamesForProfile(worker.access ?? access)
+                  .filter(
+                    (tool) => !worker.tools || worker.tools.includes(tool),
+                  )
+                  .join(', ') || 'None'}
+              </p>
               <p className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-ink-3">
                 {worker.system}
               </p>
             </details>
           ))}
+        </div>
+      )}
+
+      {onFirstTaskChange && (
+        <div className="rounded-2xl border border-line p-4">
+          <label
+            htmlFor="onboarding-first-task"
+            className="text-sm font-semibold text-ink"
+          >
+            First assignment (optional)
+          </label>
+          <textarea
+            id="onboarding-first-task"
+            className="field mt-3"
+            rows={4}
+            value={firstTask}
+            onChange={(event) => onFirstTaskChange(event.target.value)}
+            disabled={creating}
+            placeholder="What should your manager help you start with? Include the outcome and any constraints."
+          />
+          <p className="mt-2 text-xs text-ink-3">
+            Saved in your manager’s instructions. Nothing runs automatically;
+            ask your manager to begin when you’re ready.
+          </p>
         </div>
       )}
 

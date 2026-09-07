@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { DaemonHttpError } from '@animaOS-SWARM/sdk';
 
 import {
   toolNamesForProfile,
@@ -31,6 +32,9 @@ import {
   generatedMembers,
   teamError,
   templateMembers,
+  templateBrief,
+  renameTeamReferences,
+  teamNameRenames,
   type AgencyMember,
 } from '../../lib/agency-templates';
 
@@ -51,6 +55,7 @@ interface WorkspaceDraft {
 interface OnboardingDraft {
   workspace: WorkspaceDraft;
   name: string;
+  referenceName?: string;
   initiative: ManagerInitiative;
   communication: ManagerCommunication;
   priorities: string;
@@ -108,8 +113,9 @@ export function OnboardingFlow({
 }: OnboardingFlowProps) {
   const [draft, setDraft] = useState<OnboardingDraft>(INITIAL_DRAFT);
   const [agencyChoice, setAgencyChoice] = useState('scratch');
-  const [showAgencyPicker, setShowAgencyPicker] = useState(true);
   const [maxTeamSize, setMaxTeamSize] = useState(4);
+  const [sizeMode, setSizeMode] = useState<'automatic' | 'exact'>('automatic');
+  const [firstTask, setFirstTask] = useState('');
   const [workers, setWorkers] = useState<AgencyMember[]>([]);
   const [generatingTeam, setGeneratingTeam] = useState(false);
   const [teamGenerationError, setTeamGenerationError] = useState<string | null>(
@@ -206,22 +212,14 @@ export function OnboardingFlow({
   }, []);
 
   useEffect(() => {
-    if (!providers) {
-      return;
-    }
-
-    const selectedProvider = providers.find(
-      (candidate) => candidate.id === draft.provider && candidate.configured,
-    );
-    if (selectedProvider) {
+    // Pick an initial default only. A refresh or lost connection must never
+    // replace the user's provider/model with another connected provider.
+    if (!providers || draft.provider) {
       return;
     }
 
     const firstConfigured = providers.find((candidate) => candidate.configured);
     if (!firstConfigured) {
-      if (draft.provider || draft.model) {
-        setDraft((current) => ({ ...current, provider: '', model: '' }));
-      }
       return;
     }
 
@@ -251,6 +249,7 @@ export function OnboardingFlow({
     resolvedModel,
     agencyChoice,
     maxTeamSize,
+    sizeMode,
   ]);
   const generationContextRef = useRef(generationContext);
   generationContextRef.current = generationContext;
@@ -263,7 +262,7 @@ export function OnboardingFlow({
     : ONBOARDING_STEPS.filter((step) => step !== 'Team');
   const visibleStepIndex =
     !hasAgency && currentStep > 1 ? currentStep - 1 : currentStep;
-  const managerProfile = workspaceManagerProfile({
+  const baseManagerProfile = workspaceManagerProfile({
     name: draft.name,
     companyName: draft.workspace.companyName,
     mission: draft.workspace.mission,
@@ -272,11 +271,49 @@ export function OnboardingFlow({
     priorities: draft.priorities,
     agencyBrief: hasAgency ? draft.agencyBrief : '',
   });
+  const managerProfile = {
+    ...baseManagerProfile,
+    system: [
+      baseManagerProfile.system,
+      hasAgency
+        ? `Team responsibilities:\n${workers.map((worker) => `${worker.name}: ${worker.bio}`).join('\n')}\nCoordinate the team within available tools and access. Ask the owner to resolve blocked handoffs.`
+        : '',
+      firstTask.trim()
+        ? `Prepared first assignment (do not start until the owner asks):\n${firstTask.trim()}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n\n'),
+  };
+  const workerSettingsError = () => {
+    for (const worker of workers) {
+      const provider = worker.provider || draft.provider;
+      if (
+        !providers?.some((entry) => entry.id === provider && entry.configured)
+      )
+        return `Connect a provider for ${worker.name}, or select the team provider.`;
+      if (
+        worker.provider &&
+        worker.provider !== draft.provider &&
+        !worker.model?.trim()
+      )
+        return `Enter a model for ${worker.name}'s selected provider.`;
+      if (worker.model !== undefined && !worker.model.trim())
+        return `Enter a model for ${worker.name}, or clear it to use the team model.`;
+    }
+    return null;
+  };
+  const workerTools = (worker: AgencyMember) => {
+    const allowed = toolNamesForProfile(worker.access ?? draft.access);
+    return worker.tools
+      ? allowed.filter((tool) => worker.tools!.includes(tool))
+      : allowed;
+  };
 
   const selectAgency = (choice: string) => {
+    if (choice === agencyChoice) return;
     teamRequestRef.current += 1;
     setAgencyChoice(choice);
-    setShowAgencyPicker(false);
     setTeamGenerationError(null);
     setTeamGenerated(false);
     setBlockingError(null);
@@ -284,10 +321,13 @@ export function OnboardingFlow({
       (candidate) => candidate.id === choice,
     );
     const members = template ? templateMembers(template) : [];
+    setFirstTask(template?.firstTask ?? '');
+    setMaxTeamSize(Math.max(2, members.length || 4));
     setWorkers(members.slice(1));
     setDraft((current) => ({
       ...current,
       agencyBrief: members[0]?.system ?? '',
+      referenceName: members[0]?.name,
       workspace: template
         ? {
             ...current.workspace,
@@ -296,7 +336,7 @@ export function OnboardingFlow({
               current.workspace.companyName.startsWith('My ')
                 ? `My ${template.name}`
                 : current.workspace.companyName,
-            mission: template.mission,
+            mission: templateBrief(template),
             values: [...template.values],
           }
         : current.workspace,
@@ -309,12 +349,13 @@ export function OnboardingFlow({
     const requestId = ++teamRequestRef.current;
     const context = generationContextRef.current;
     setGeneratingTeam(true);
+    setTeamGenerated(false);
     setTeamGenerationError(null);
     try {
       const agency = await daemon.generateAgency({
         name: draft.workspace.companyName.trim(),
         description: draft.workspace.mission.trim(),
-        maxTeamSize,
+        ...(sizeMode === 'exact' ? { teamSize: maxTeamSize } : { maxTeamSize }),
         provider: draft.provider,
         model: resolvedModel,
       });
@@ -325,17 +366,30 @@ export function OnboardingFlow({
       )
         return;
       const [lead, ...specialists] = generatedMembers(agency);
-      if (specialists.length + 1 > maxTeamSize || specialists.length === 0) {
+      if (
+        specialists.length + 1 > maxTeamSize ||
+        specialists.length === 0 ||
+        (sizeMode === 'exact' && specialists.length + 1 !== maxTeamSize)
+      ) {
         throw new Error(
           'The generated team is outside your selected size limit.',
         );
       }
       setDraft((current) => ({
         ...current,
+        referenceName: lead.name,
         agencyBrief: selectedTemplate
-          ? `${lead.system}\n\nReusable starter:\n${selectedTemplate.starter.content}`
+          ? `${lead.system}\n\n${renameTeamReferences(
+              `Team workflow:\n${selectedTemplate.workflow.join('\n')}\n\nExpected deliverables:\n${selectedTemplate.deliverables.join('\n')}\n\nReusable starter:\n${selectedTemplate.starter.content}`,
+              [[selectedTemplate.members[0].name, current.name]],
+            )}`
           : lead.system,
       }));
+      setFirstTask((current) =>
+        current.trim()
+          ? current
+          : `Review our goal: ${draft.workspace.mission.trim()}\nIdentify missing context, propose the first deliverable, and assign responsibilities for my review.`,
+      );
       setWorkers(specialists);
       setTeamGenerated(true);
       setBlockingError(null);
@@ -346,7 +400,11 @@ export function OnboardingFlow({
         context === generationContextRef.current
       ) {
         setTeamGenerationError(
-          `${errorMessage(error)} Your current team is unchanged. Retry or go back to choose a template.`,
+          `${
+            error instanceof DaemonHttpError && error.status === 408
+              ? 'Team generation timed out. Retry or choose a faster model.'
+              : errorMessage(error)
+          } Your current team is unchanged. You can keep it or go back to choose a template.`,
         );
       }
     } finally {
@@ -374,7 +432,8 @@ export function OnboardingFlow({
   const intelligenceReady =
     providerCatalogState === 'ready' && selectedProviderConfigured;
   const workspaceValidationErrorId =
-    currentStep === 0 && blockingError === WORKSPACE_REQUIRED_ERROR
+    (currentStep === 0 || currentStep === 3) &&
+    blockingError === WORKSPACE_REQUIRED_ERROR
       ? WORKSPACE_ERROR_ID
       : undefined;
   const customModelValidationErrorId =
@@ -430,7 +489,10 @@ export function OnboardingFlow({
       return;
     }
 
-    if (currentStep === 0 && !workspaceComplete(draft.workspace)) {
+    if (
+      (currentStep === 0 || currentStep === 3) &&
+      !workspaceComplete(draft.workspace)
+    ) {
       focusFirstEmptyWorkspaceField();
       return;
     }
@@ -497,6 +559,7 @@ export function OnboardingFlow({
     verifyRequestIdRef.current += 1;
     inspectRequestIdRef.current += 1;
     setResumeMode(mode);
+    if (mode) setCurrentStep(0);
     setBlockingError(null);
     setVerifyStatus(null);
     setInspectPreview(null);
@@ -505,12 +568,42 @@ export function OnboardingFlow({
   };
 
   const changeProvider = (provider: string) => {
-    setDraft((current) => ({
-      ...current,
-      provider,
-      model: defaultModel(provider),
-    }));
+    setDraft((current) =>
+      current.provider === provider
+        ? current
+        : { ...current, provider, model: defaultModel(provider) },
+    );
     setBlockingError(null);
+  };
+
+  const syncTeamNames = () => {
+    const names = [draft.name, ...workers.map((worker) => worker.name)]
+      .map((name) => name.trim().toLowerCase());
+    // Keep the original references through blank or duplicate intermediate
+    // input, so a completed rename (including a swap) can be applied safely.
+    if (names.some((name) => !name) || new Set(names).size !== names.length) return;
+    const renames: [string, string][] = [
+      [draft.referenceName ?? draft.name, draft.name],
+      ...workers.map((worker): [string, string] => [worker.referenceName ?? worker.name, worker.name]),
+    ];
+    if (!renames.some(([before, after]) => before.trim() !== after.trim())) return;
+    applyTeamRenames(renames);
+  };
+
+  const applyTeamRenames = (renames: [string, string][]) => {
+    const references = teamNameRenames(renames);
+    const rename = (text: string) => renameTeamReferences(text, references);
+    setWorkers((current) => current.map((worker) => ({
+      ...worker, referenceName: undefined,
+      bio: rename(worker.bio), system: rename(worker.system),
+    })));
+    setDraft((current) => ({
+      ...current, referenceName: undefined,
+      agencyBrief: rename(current.agencyBrief),
+      priorities: rename(current.priorities),
+      workspace: { ...current.workspace, mission: rename(current.workspace.mission) },
+    }));
+    setFirstTask(rename);
   };
 
   const goBack = () => {
@@ -524,6 +617,7 @@ export function OnboardingFlow({
   };
 
   const goNext = () => {
+    syncTeamNames();
     browseRequestIdRef.current += 1;
     setBlockingError(null);
 
@@ -532,7 +626,7 @@ export function OnboardingFlow({
     if (
       currentStep === 0 &&
       !resumeMode &&
-      !workspaceComplete(draft.workspace)
+      (!draft.workspace.companyName.trim() || !draft.workspace.mission.trim())
     ) {
       setBlockingError(WORKSPACE_REQUIRED_ERROR);
       focusFirstEmptyWorkspaceField();
@@ -558,11 +652,15 @@ export function OnboardingFlow({
     if (currentStep === 2) {
       if (hasAgency) {
         const error =
-          agencyChoice === 'generate' && !teamGenerated
+          agencyChoice === 'generate' && !teamGenerated && !workers.length
             ? 'Generate your team first, or go back to choose a template.'
-            : workers.length + 1 > maxTeamSize
-              ? 'Your preview exceeds the team size limit. Remove specialists or generate a new team.'
-              : teamError(null, workers);
+            : !workers.length
+              ? 'An agency needs at least one specialist. Add a specialist or choose Manager only.'
+              : workers.length + 1 > maxTeamSize
+                ? 'Your preview exceeds the team size limit. Remove specialists or generate a new team.'
+                : sizeMode === 'exact' && workers.length + 1 !== maxTeamSize
+                  ? `Your preview must contain exactly ${maxTeamSize} agents including the manager. Add or remove specialists, or generate a new team.`
+                  : teamError(null, workers) || workerSettingsError();
         if (error) {
           setBlockingError(error);
           return;
@@ -570,6 +668,11 @@ export function OnboardingFlow({
       }
     }
     if (currentStep === 3) {
+      if (!workspaceComplete(draft.workspace)) {
+        setBlockingError(WORKSPACE_REQUIRED_ERROR);
+        focusFirstEmptyWorkspaceField();
+        return;
+      }
       if (!draft.name.trim()) {
         setBlockingError(NAME_REQUIRED_ERROR);
         nameInputRef.current?.focus();
@@ -759,6 +862,20 @@ export function OnboardingFlow({
       setCurrentStep(2);
       return;
     }
+    if (
+      hasAgency &&
+      (workerSettingsError() ||
+        !workers.length ||
+        workers.length + 1 > maxTeamSize ||
+        (sizeMode === 'exact' && workers.length + 1 !== maxTeamSize))
+    ) {
+      setBlockingError(
+        workerSettingsError() ||
+          'Review your team: the preview does not match the selected size.',
+      );
+      setCurrentStep(2);
+      return;
+    }
 
     // The guards below are defense-in-depth: goNext already revalidates each
     // step before advancing, so submit can only be reached with a valid
@@ -767,7 +884,7 @@ export function OnboardingFlow({
     if (!workspaceComplete(draft.workspace)) {
       setCreateError(null);
       setBlockingError(WORKSPACE_REQUIRED_ERROR);
-      setCurrentStep(0);
+      setCurrentStep(3);
       return;
     }
 
@@ -820,13 +937,13 @@ export function OnboardingFlow({
         ...(hasAgency
           ? {
               workers: workers.map((worker) => ({
-                ...worker,
+                presetId: worker.presetId,
                 name: worker.name.trim(),
                 bio: worker.bio.trim(),
                 system: `Workspace: ${draft.workspace.companyName.trim()}\nMission: ${draft.workspace.mission.trim()}\n\n${worker.system.trim()}`,
-                provider: draft.provider,
-                model: resolvedModel,
-                tools: toolNamesForProfile(draft.access),
+                provider: worker.provider || draft.provider,
+                model: worker.model?.trim() || resolvedModel,
+                tools: workerTools(worker),
               })),
             }
           : {}),
@@ -860,62 +977,41 @@ export function OnboardingFlow({
     }
   };
 
+  const workspaceStep = (mode: 'all' | 'goal' | 'workspace') => (
+    <WorkspaceStep
+      mode={mode}
+      companyName={draft.workspace.companyName}
+      mission={draft.workspace.mission}
+      rootPath={draft.workspace.rootPath}
+      values={draft.workspace.values}
+      verifying={verifying}
+      verifyStatus={verifyStatus}
+      onCompanyNameChange={(value) => updateWorkspace('companyName', value)}
+      onMissionChange={(value) => updateWorkspace('mission', value)}
+      onRootPathChange={changeRootPath}
+      onValuesChange={(values) => updateWorkspace('values', values)}
+      onVerify={() => void verifyWorkspace()}
+      browsing={browsing}
+      onBrowse={() => void browseWorkspace()}
+      resumeMode={resumeMode}
+      onResumeModeChange={changeResumeMode}
+      onInspect={() => void inspectWorkspace()}
+      companyInputRef={companyInputRef}
+      missionInputRef={missionInputRef}
+      rootPathInputRef={rootPathInputRef}
+      validationErrorId={workspaceValidationErrorId}
+    />
+  );
+
   let stepContent;
   switch (currentStep) {
     case 0:
       stepContent = (
         <>
-          {!resumeMode && !workspaceConfigured && showAgencyPicker && (
+          {!resumeMode && !workspaceConfigured && (
             <AgencyPicker selected={agencyChoice} onSelect={selectAgency} />
           )}
-          {!resumeMode && !workspaceConfigured && !showAgencyPicker && (
-            <div className="mb-6 flex items-center justify-between gap-3 rounded-xl border border-line bg-white/40 p-4">
-              <div className="min-w-0">
-                <p className="text-sm font-semibold text-ink">
-                  {selectedTemplate?.name ??
-                    (agencyChoice === 'generate'
-                      ? 'Custom agency'
-                      : 'Manager only')}
-                </p>
-                <p className="mt-1 text-xs text-ink-2">
-                  {hasAgency
-                    ? `Your manager and ${workers.length} specialists`
-                    : 'Your own workspace, with Anima to help.'}
-                </p>
-              </div>
-              <button
-                type="button"
-                className="shrink-0 text-sm font-medium text-accent"
-                onClick={() => setShowAgencyPicker(true)}
-              >
-                Change template
-              </button>
-            </div>
-          )}
-          <WorkspaceStep
-            companyName={draft.workspace.companyName}
-            mission={draft.workspace.mission}
-            rootPath={draft.workspace.rootPath}
-            values={draft.workspace.values}
-            verifying={verifying}
-            verifyStatus={verifyStatus}
-            onCompanyNameChange={(value) =>
-              updateWorkspace('companyName', value)
-            }
-            onMissionChange={(value) => updateWorkspace('mission', value)}
-            onRootPathChange={changeRootPath}
-            onValuesChange={(values) => updateWorkspace('values', values)}
-            onVerify={() => void verifyWorkspace()}
-            browsing={browsing}
-            onBrowse={() => void browseWorkspace()}
-            resumeMode={resumeMode}
-            onResumeModeChange={changeResumeMode}
-            onInspect={() => void inspectWorkspace()}
-            companyInputRef={companyInputRef}
-            missionInputRef={missionInputRef}
-            rootPathInputRef={rootPathInputRef}
-            validationErrorId={workspaceValidationErrorId}
-          />
+          {workspaceStep(resumeMode ? 'all' : 'goal')}
           {hasAgency && !resumeMode && (
             <p className="mt-3 text-xs leading-relaxed text-ink-3">
               Use the workspace brief to describe your audience, goals, content
@@ -965,11 +1061,40 @@ export function OnboardingFlow({
                 model.
               </p>
               <div className="space-y-2 py-3">
+                <fieldset
+                  className="flex flex-wrap gap-4"
+                  disabled={generatingTeam}
+                >
+                  <legend className="mb-2 text-sm font-medium text-ink">
+                    Team size
+                  </legend>
+                  {(['automatic', 'exact'] as const).map((mode) => (
+                    <label
+                      key={mode}
+                      className="flex items-center gap-2 text-sm text-ink-2"
+                    >
+                      <input
+                        type="radio"
+                        name="team-size-mode"
+                        checked={sizeMode === mode}
+                        onChange={() => {
+                          setSizeMode(mode);
+                          setBlockingError(null);
+                        }}
+                      />
+                      {mode === 'automatic'
+                        ? 'Let AI decide'
+                        : 'Choose an exact number'}
+                    </label>
+                  ))}
+                </fieldset>
                 <label
                   htmlFor="onboarding-team-limit"
                   className="block text-sm font-medium text-ink"
                 >
-                  Maximum team size
+                  {sizeMode === 'exact'
+                    ? 'Exact team size'
+                    : 'Maximum team size'}
                 </label>
                 <select
                   id="onboarding-team-limit"
@@ -985,16 +1110,19 @@ export function OnboardingFlow({
                   {Array.from({ length: 9 }, (_, index) => index + 2).map(
                     (size) => (
                       <option key={size} value={size}>
-                        {size} agents total · 1 manager + up to {size - 1}{' '}
-                        specialists
+                        {size} agents total · 1 manager +{' '}
+                        {sizeMode === 'automatic' ? 'up to ' : ''}
+                        {size - 1} specialists
                       </option>
                     ),
                   )}
                 </select>
                 <p className="text-xs leading-relaxed text-ink-3">
-                  AI chooses the smallest useful team from your brief, up to
-                  this limit. This includes your workspace manager. Review or
-                  remove specialists before creating.
+                  {sizeMode === 'automatic'
+                    ? 'AI chooses the smallest useful team within this limit. '
+                    : 'Generate exactly this many agents, combining responsibilities when needed. '}
+                  The total includes your manager. Add, edit, or remove
+                  specialists before creating.
                 </p>
               </div>
               <button
@@ -1027,13 +1155,66 @@ export function OnboardingFlow({
             {hasAgency && (
               <AgencyTeam
                 workers={workers}
-                onChange={(index, field, value) => {
+                providers={providers ?? []}
+                defaultProvider={draft.provider}
+                defaultModel={resolvedModel}
+                defaultAccess={draft.access}
+                onSettingsChange={(index, settings) => {
                   setWorkers((current) =>
                     current.map((worker, i) =>
-                      i === index ? { ...worker, [field]: value } : worker,
+                      i === index ? { ...worker, ...settings } : worker,
                     ),
                   );
                   setBlockingError(null);
+                }}
+                onAdd={() => {
+                  setWorkers((current) => [
+                    ...current,
+                    {
+                      name: '',
+                      bio: '',
+                      system: '',
+                      presetId: 'creative-partner',
+                    },
+                  ]);
+                  setBlockingError(null);
+                }}
+                onChange={(index, field, value) => {
+                  setWorkers((current) =>
+                    current.map((worker, i) =>
+                      i === index ? {
+                        ...worker,
+                        ...(field === 'name' ? { referenceName: worker.referenceName ?? worker.name } : {}),
+                        [field]: value,
+                      } : worker,
+                    ),
+                  );
+                  setBlockingError(null);
+                }}
+                onNameCommit={syncTeamNames}
+                onRepairName={(index, previousName) => {
+                  const previous = previousName.trim();
+                  if (!previous) return 'Enter the old name appearing in the text.';
+                  const others = [draft.name, ...workers.filter((_, i) => i !== index).map((worker) => worker.name)];
+                  if (others.some((name) => name.trim().toLowerCase() === previous.toLowerCase() ||
+                    name.trim().split(/\s+/)[0].toLowerCase() === previous.toLowerCase()))
+                    return 'That name belongs to another team member. Edit the text directly to resolve the reference.';
+                  const names = [draft.name, ...workers.map((worker) => worker.name)].map((name) => name.trim().toLowerCase());
+                  if (names.some((name) => !name) || new Set(names).size !== names.length)
+                    return 'Finish entering the team names first.';
+                  const renames: [string, string][] = [
+                    [draft.referenceName ?? draft.name, draft.name],
+                    ...workers.map((worker, i): [string, string] => [
+                      i === index ? previous : worker.referenceName ?? worker.name, worker.name,
+                    ]),
+                  ];
+                  const references = teamNameRenames(renames);
+                  const texts = [draft.agencyBrief, draft.priorities, draft.workspace.mission, firstTask,
+                    ...workers.flatMap((worker) => [worker.bio, worker.system])];
+                  if (!texts.some((text) => renameTeamReferences(text, references) !== text))
+                    return 'No matching old-name references found. Check the spelling in the text.';
+                  applyTeamRenames(renames);
+                  return null;
                 }}
                 onRemove={(index) =>
                   setWorkers((current) => current.filter((_, i) => i !== index))
@@ -1041,6 +1222,27 @@ export function OnboardingFlow({
               />
             )}
           </fieldset>
+          {selectedTemplate && (
+            <div className="mt-5 space-y-4 rounded-xl border border-line p-4">
+              <h3 className="text-sm font-semibold text-ink">
+                How this team works
+              </h3>
+              <ol className="list-decimal space-y-2 pl-5 text-sm text-ink-2">
+                {selectedTemplate.workflow.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+              <p className="text-xs text-ink-3">
+                Deliverables: {selectedTemplate.deliverables.join(' · ')}
+              </p>
+              <p className="text-xs text-ink-3">
+                Optional connections after setup:{' '}
+                {selectedTemplate.suggestedConnections.join(', ') ||
+                  'None required'}
+                .
+              </p>
+            </div>
+          )}
           {selectedTemplate && (
             <details className="mt-5 rounded-xl border border-line p-4">
               <summary className="cursor-pointer text-sm font-medium text-ink">
@@ -1061,13 +1263,17 @@ export function OnboardingFlow({
     case 3:
       stepContent = (
         <>
+          <div className="mb-8">{workspaceStep('workspace')}</div>
           <WorkspaceManagerStep
             name={draft.name}
             initiative={draft.initiative}
             communication={draft.communication}
             priorities={draft.priorities}
             instructions={managerProfile.system}
-            onNameChange={(name) => updateDraft('name', name)}
+            onNameChange={(name) => setDraft((current) => ({
+              ...current, referenceName: current.referenceName ?? current.name, name,
+            }))}
+            onNameCommit={syncTeamNames}
             onInitiativeChange={(initiative) =>
               updateDraft('initiative', initiative)
             }
@@ -1093,6 +1299,8 @@ export function OnboardingFlow({
     default:
       stepContent = (
         <ReviewStep
+          firstTask={firstTask}
+          onFirstTaskChange={setFirstTask}
           showActions={false}
           workers={hasAgency ? workers : undefined}
           workspace={draft.workspace}
@@ -1143,7 +1351,7 @@ export function OnboardingFlow({
           selectedTemplate?.name ??
           (agencyChoice === 'generate' ? 'Custom agency' : 'Manager only'),
         team: hasAgency
-          ? agencyChoice === 'generate' && !teamGenerated
+          ? agencyChoice === 'generate' && !teamGenerated && !workers.length
             ? 'Team not generated yet'
             : `1 manager + ${workers.length} specialists`
           : '1 workspace manager',
