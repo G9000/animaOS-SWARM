@@ -10,6 +10,7 @@ mod gcalendar;
 mod health;
 mod http;
 mod jobs;
+mod goals;
 mod mail;
 mod memories;
 mod oauth_apps;
@@ -75,6 +76,12 @@ use crate::runtime_model::provider_summaries;
         jobs::create_job,
         jobs::cancel_job,
         jobs::retry_job,
+        jobs::approve_job,
+        jobs::review_job,
+        goals::list_goals,
+        goals::create_goal,
+        goals::change_status,
+        goals::goal_jobs,
         ready_entry,
         create_agency_entry,
         generate_agency_entry,
@@ -415,9 +422,14 @@ fn router_with_services_with_policies(
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/capabilities", get(capabilities_entry))
+        .route("/api/goals", get(goals::list_goals).post(goals::create_goal))
+        .route("/api/goals/{goal_id}/status", axum::routing::post(goals::change_status))
+        .route("/api/goals/{goal_id}/jobs", get(goals::goal_jobs))
         .route("/api/agents/{agent_id}/jobs", get(jobs::list_jobs).post(jobs::create_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/cancel", axum::routing::post(jobs::cancel_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/retry", axum::routing::post(jobs::retry_job))
+        .route("/api/agents/{agent_id}/jobs/{job_id}/approve", axum::routing::post(jobs::approve_job))
+        .route("/api/agents/{agent_id}/jobs/{job_id}/review", axum::routing::post(jobs::review_job))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -1761,6 +1773,7 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 #[cfg(test)]
 mod tests {
     mod jobs;
+    mod goals;
     mod capabilities;
     mod swarm_reliability;
 

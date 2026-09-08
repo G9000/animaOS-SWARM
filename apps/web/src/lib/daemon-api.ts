@@ -14,6 +14,9 @@ import {
   type AgentTasks,
   type AgentJobInput,
   type AgentJobRetryInput,
+  type AgentJobReviewInput,
+  type GoalInput,
+  type GoalStatus,
 } from '@animaOS-SWARM/sdk';
 
 const setupClient = createDaemonClient({
@@ -322,10 +325,23 @@ export const daemon = {
     setupClient.agents.jobs(id, options),
   createAgentJob: (id: string, input: AgentJobInput) =>
     setupClient.agents.createJob(id, input),
+  goals: (options: { signal?: AbortSignal } = {}) =>
+    setupClient.goals.list(options),
+  createGoal: (input: GoalInput) => setupClient.goals.create(input),
+  setGoalStatus: (
+    id: string,
+    input: { revision: number; status: GoalStatus },
+  ) => setupClient.goals.setStatus(id, input),
+  goalJobs: (id: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.goals.jobs(id, options),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),
   retryAgentJob: (id: string, jobId: string, input: AgentJobRetryInput) =>
     setupClient.agents.retryJob(id, jobId, input),
+  approveAgentJob: (id: string, jobId: string, input: { revision: number }) =>
+    setupClient.agents.approveJob(id, jobId, input),
+  reviewAgentJob: (id: string, jobId: string, input: AgentJobReviewInput) =>
+    setupClient.agents.reviewJob(id, jobId, input),
   updateAgentTasks: (id: string, input: AgentTasks) =>
     request<AgentTasks>(`/agents/${encodeURIComponent(id)}/tasks`, {
       method: 'PUT',

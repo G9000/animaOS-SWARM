@@ -24,6 +24,6 @@ The next workplace increment adds a daemon-owned job queue and an agent-scoped *
 
 This queue does not resume a partially executed tool or implement the portable execution journal. Running-job cancellation is intentionally unavailable until the runner has a verified cancellation boundary. Unexpected worker panics retain the saved running claim for review at restart. Graceful shutdown waits for admitted work.
 
-The next product slice should add owner-visible goal budgets, approvals, and artifact records, then connect the portable capability execution boundary. Third-party modules, rich document engines, camera/voice/home control, and the full visual redesign remain broader product work. Record retention/archive controls are also needed before lifting the fixed history cap.
+The subsequent [run supervision increment](2026-09-08-run-supervision-handoff.md) adds owner approvals, per-job attempt budgets, and saved output reviews. Aggregate goal budgets, file artifact records, and the portable capability execution boundary remain next work. Third-party modules, rich document engines, camera/voice/home control, and the full visual redesign remain broader product work. Record retention/archive controls are also needed before lifting the fixed history cap.
 
 Restart the daemon with the normal `bun dev --host rust` workflow to load the new routes and worker. This change is left uncommitted for review.

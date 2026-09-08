@@ -1,4 +1,5 @@
 import { AgentsClient } from './agents.js';
+import { GoalsClient } from './goals.js';
 import { AgenciesClient } from './agencies.js';
 import { WorkspaceClient } from './workspace.js';
 import { ChatGptClient } from './chatgpt.js';
@@ -64,6 +65,7 @@ export class DaemonClient {
   readonly workspace: WorkspaceClient;
   readonly chatgpt: ChatGptClient;
   readonly agents: AgentsClient;
+  readonly goals: GoalsClient;
   readonly connectors: ConnectorsClient;
   readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
@@ -83,6 +85,7 @@ export class DaemonClient {
     this.agencies = new AgenciesClient(this);
     this.workspace = new WorkspaceClient(this);
     this.agents = new AgentsClient(this);
+    this.goals = new GoalsClient(this);
     this.chatgpt = new ChatGptClient(this);
     this.connectors = new ConnectorsClient(this);
     this.memories = new MemoriesClient(this);

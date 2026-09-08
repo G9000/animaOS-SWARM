@@ -1,9 +1,21 @@
 import { useEffect, useRef, useState } from 'react';
-import { DaemonHttpError, type AgentJob } from '@animaOS-SWARM/sdk';
+import {
+  DaemonHttpError,
+  type AgentJob,
+  type GoalView,
+} from '@animaOS-SWARM/sdk';
 import { daemon } from '../lib/daemon-api';
 
-type Draft = { title: string; prompt: string; requestKey: string };
+type Draft = {
+  title: string;
+  prompt: string;
+  requestKey: string;
+  maxAttempts: number;
+  requiresApproval: boolean;
+  goalId: string | null;
+};
 const labels: Record<AgentJob['status'], string> = {
+  awaiting_approval: 'Awaiting approval',
   queued: 'Queued',
   running: 'Running',
   completed: 'Completed',
@@ -15,6 +27,9 @@ const freshDraft = (): Draft => ({
   title: '',
   prompt: '',
   requestKey: crypto.randomUUID(),
+  maxAttempts: 3,
+  requiresApproval: false,
+  goalId: null,
 });
 const storageKey = (id: string) => `anima:run-draft:${id}`;
 function readDraft(id: string): Draft {
@@ -26,7 +41,16 @@ function readDraft(id: string): Draft {
       typeof saved.prompt === 'string' &&
       typeof saved.requestKey === 'string'
     )
-      return saved;
+      return {
+        title: saved.title,
+        prompt: saved.prompt,
+        requestKey: saved.requestKey,
+        maxAttempts: [1, 2, 3].includes(saved.maxAttempts)
+          ? saved.maxAttempts
+          : 3,
+        requiresApproval: saved.requiresApproval === true,
+        goalId: typeof saved.goalId === 'string' ? saved.goalId : null,
+      };
   } catch {
     /* A draft still works when browser storage is unavailable. */
   }
@@ -57,6 +81,24 @@ function AgentRuns({ agentId }: { agentId: string }) {
   const [refresh, setRefresh] = useState(0);
   const [pollingPaused, setPollingPaused] = useState(false);
   const [acknowledged, setAcknowledged] = useState<Record<string, boolean>>({});
+  const [feedback, setFeedback] = useState<Record<string, string>>({});
+  const [goals, setGoals] = useState<GoalView[]>([]);
+  const [goalError, setGoalError] = useState('');
+  useEffect(() => {
+    const controller = new AbortController();
+    void daemon
+      .goals({ signal: controller.signal })
+      .then((value) => {
+        if (!controller.signal.aborted) {
+          setGoals(value);
+          setGoalError('');
+        }
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setGoalError(message(error));
+      });
+    return () => controller.abort();
+  }, [refresh]);
   const live = useRef(true);
   useEffect(() => {
     live.current = true;
@@ -97,7 +139,7 @@ function AgentRuns({ agentId }: { agentId: string }) {
     };
   }, [agentId, refresh]);
 
-  function change(patch: Partial<Pick<Draft, 'title' | 'prompt'>>) {
+  function change(patch: Partial<Omit<Draft, 'requestKey'>>) {
     const next = {
       ...draftRef.current,
       ...patch,
@@ -182,12 +224,86 @@ function AgentRuns({ agentId }: { agentId: string }) {
             onChange={(event) => change({ prompt: event.target.value })}
           />
         </label>
+        <label className="block space-y-2 text-sm">
+          Maximum attempts
+          <select
+            className="field"
+            value={draft.maxAttempts}
+            onChange={(event) =>
+              change({ maxAttempts: Number(event.target.value) })
+            }
+          >
+            {[1, 2, 3].map((count) => (
+              <option key={count} value={count}>
+                {count}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="block space-y-2 text-sm">
+          Goal
+          <select
+            className="field"
+            value={draft.goalId ?? ''}
+            onChange={(event) => change({ goalId: event.target.value || null })}
+          >
+            <option value="">No goal</option>
+            {draft.goalId &&
+              !goals.some((goal) => goal.id === draft.goalId) && (
+                <option value={draft.goalId}>Saved goal · unavailable</option>
+              )}
+            {goals.map((goal) => (
+              <option
+                key={goal.id}
+                value={goal.id}
+                disabled={goal.status === 'completed'}
+              >
+                {goal.title} · {goal.status} · {goal.remainingAttempts} attempts
+                available
+              </option>
+            ))}
+          </select>
+        </label>
+        {goalError && (
+          <p role="alert" className="text-sm text-danger">
+            Could not load goals: {goalError}. Refresh runs to retry. Your
+            selected goal is retained.
+          </p>
+        )}
+        {goals.find((goal) => goal.id === draft.goalId)?.status ===
+          'paused' && (
+          <p className="text-sm text-ink-3">
+            This goal is paused. You may save a proposal; work can start after
+            the goal resumes.
+          </p>
+        )}
+        {goals.find((goal) => goal.id === draft.goalId)?.remainingAttempts ===
+          0 && (
+          <p className="text-sm text-ink-3">
+            This goal has no attempts available. A proposal will wait until a
+            reservation is freed; consumed attempts are not refunded.
+          </p>
+        )}
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={draft.requiresApproval}
+            onChange={(event) =>
+              change({ requiresApproval: event.target.checked })
+            }
+          />
+          Require approval before each attempt
+        </label>
+        <p className="text-xs text-ink-3">
+          Retries are always started explicitly. Approval applies to starting
+          the assignment; existing tool permissions still apply.
+        </p>
         <button
           type="submit"
           className="rounded-xl bg-accent px-4 py-3 text-sm text-accent-fg disabled:opacity-50"
           disabled={busy || !draft.title.trim() || !draft.prompt.trim()}
         >
-          Queue run
+          {draft.requiresApproval ? 'Save proposal' : 'Queue run'}
         </button>
         {busy && (
           <p role="status" className="text-sm">
@@ -241,7 +357,7 @@ function AgentRuns({ agentId }: { agentId: string }) {
               <span className="text-sm">{labels[job.status]}</span>
             </div>
             <p className="text-xs text-ink-3">
-              Attempt {job.attempt} of 3 · Updated{' '}
+              Attempt {job.attempt} of {job.maxAttempts} · Updated{' '}
               {new Date(job.updatedAtMs).toLocaleString()}
             </p>
             <details>
@@ -250,7 +366,7 @@ function AgentRuns({ agentId }: { agentId: string }) {
                 {job.prompt}
               </p>
             </details>
-            {job.result !== null && (
+            {job.attempts.length === 0 && job.result !== null && (
               <div>
                 <h5 className="text-sm font-semibold">Result</h5>
                 <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words font-sans text-sm">
@@ -263,13 +379,143 @@ function AgentRuns({ agentId }: { agentId: string }) {
                 {job.error}
               </p>
             )}
+            {job.attempts.map((attempt) => (
+              <details
+                key={attempt.attempt}
+                className="space-y-2 rounded-xl border border-line p-3"
+                open={attempt.attempt === job.attempt}
+              >
+                <summary className="cursor-pointer text-sm font-semibold">
+                  Saved attempt {attempt.attempt} · {labels[attempt.status]}
+                </summary>
+                <p className="text-xs text-ink-3">
+                  Finished {new Date(attempt.finishedAtMs).toLocaleString()}
+                </p>
+                {attempt.result !== null && (
+                  <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-words font-sans text-sm">
+                    {attempt.result}
+                  </pre>
+                )}
+                {attempt.resultTruncated && (
+                  <p className="text-xs text-ink-3">
+                    Output was truncated to the saved text limit.
+                  </p>
+                )}
+                {attempt.error && (
+                  <p className="whitespace-pre-wrap break-words text-sm text-danger">
+                    {attempt.error}
+                  </p>
+                )}
+                {attempt.review && (
+                  <div className="space-y-1 text-sm">
+                    <p className="font-semibold">
+                      {attempt.review.decision === 'accepted'
+                        ? 'Result accepted'
+                        : 'Changes requested'}
+                    </p>
+                    <p className="whitespace-pre-wrap break-words">
+                      {attempt.review.note}
+                    </p>
+                  </div>
+                )}
+              </details>
+            ))}
+            {job.status === 'completed' &&
+              !job.attempts.find((attempt) => attempt.attempt === job.attempt)
+                ?.review && (
+                <div className="space-y-3">
+                  <p className="text-sm text-ink-3">
+                    Execution completed. Review the saved output to accept it or
+                    request changes. This does not authorize external actions.
+                  </p>
+                  <label className="block space-y-2 text-sm">
+                    Review feedback
+                    <textarea
+                      className="field min-h-20"
+                      value={feedback[`${job.id}:${job.attempt}`] ?? ''}
+                      onChange={(event) =>
+                        setFeedback((current) => ({
+                          ...current,
+                          [`${job.id}:${job.attempt}`]: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                  {new TextEncoder().encode(
+                    feedback[`${job.id}:${job.attempt}`] ?? '',
+                  ).length > 4000 && (
+                    <p className="text-sm text-danger">
+                      Feedback must be at most 4,000 bytes.
+                    </p>
+                  )}
+                  <div className="flex flex-wrap gap-4">
+                    {(['accepted', 'changes_requested'] as const).map(
+                      (decision) => (
+                        <button
+                          key={decision}
+                          type="button"
+                          className="text-sm underline disabled:opacity-50"
+                          disabled={
+                            busy ||
+                            !!loadError ||
+                            new TextEncoder().encode(
+                              feedback[`${job.id}:${job.attempt}`] ?? '',
+                            ).length > 4000 ||
+                            (decision === 'changes_requested' &&
+                              !(
+                                feedback[`${job.id}:${job.attempt}`] ?? ''
+                              ).trim())
+                          }
+                          onClick={() =>
+                            void mutate(() =>
+                              daemon.reviewAgentJob(agentId, job.id, {
+                                revision: job.revision,
+                                decision,
+                                note:
+                                  feedback[`${job.id}:${job.attempt}`] ?? '',
+                              }),
+                            )
+                          }
+                        >
+                          {decision === 'accepted'
+                            ? 'Accept result'
+                            : 'Request changes'}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                </div>
+              )}
+            {job.status === 'awaiting_approval' && (
+              <div className="space-y-2">
+                <p className="text-sm text-ink-3">
+                  The daemon will wait for approval before starting this
+                  attempt.
+                </p>
+                <button
+                  type="button"
+                  className="rounded-xl bg-accent px-4 py-2 text-sm text-accent-fg disabled:opacity-50"
+                  disabled={busy || !!loadError}
+                  onClick={() =>
+                    void mutate(() =>
+                      daemon.approveAgentJob(agentId, job.id, {
+                        revision: job.revision,
+                      }),
+                    )
+                  }
+                >
+                  Approve and start
+                </button>
+              </div>
+            )}
             {job.status === 'needs_review' && (
               <p className="text-sm text-ink-3">
                 Execution was interrupted or its outcome is uncertain. Review
                 any external effects before retrying.
               </p>
             )}
-            {job.status === 'queued' && (
+            {(job.status === 'queued' ||
+              job.status === 'awaiting_approval') && (
               <button
                 type="button"
                 className="text-sm underline disabled:opacity-50"
@@ -282,14 +528,26 @@ function AgentRuns({ agentId }: { agentId: string }) {
                   )
                 }
               >
-                Cancel queued run
+                {job.status === 'awaiting_approval'
+                  ? 'Cancel proposal'
+                  : 'Cancel queued run'}
               </button>
             )}
-            {(job.status === 'failed' || job.status === 'needs_review') &&
-              (job.attempt >= 3 ? (
+            {(job.status === 'failed' ||
+              job.status === 'needs_review' ||
+              (job.status === 'completed' &&
+                job.attempts.find((attempt) => attempt.attempt === job.attempt)
+                  ?.review?.decision === 'changes_requested')) &&
+              (job.attempt >= job.maxAttempts ? (
                 <p className="text-sm text-ink-3">Attempt limit reached.</p>
               ) : (
                 <div className="space-y-3">
+                  {job.requiresApproval && (
+                    <p className="text-sm text-ink-3">
+                      Retrying saves a new proposal that requires approval
+                      before it starts.
+                    </p>
+                  )}
                   {job.status === 'needs_review' && (
                     <label className="flex items-start gap-2 text-sm">
                       <input

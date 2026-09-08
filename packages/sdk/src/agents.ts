@@ -52,13 +52,36 @@ export interface AgentTasks {
   revision: string;
 }
 
+export interface AgentJobReviewInput {
+  revision: number;
+  decision: 'accepted' | 'changes_requested';
+  note?: string;
+}
+
+export interface AgentJobAttempt {
+  attempt: number;
+  status: 'completed' | 'failed' | 'needs_review';
+  startedAtMs: number;
+  finishedAtMs: number;
+  result: string | null;
+  error: string | null;
+  resultTruncated: boolean;
+  review: {
+    decision: 'accepted' | 'changes_requested';
+    note: string;
+    reviewedAtMs: number;
+  } | null;
+}
+
 export interface AgentJob {
+  goalId: string | null;
   id: string;
   agentId: string;
   title: string;
   prompt: string;
   requestKey: string;
   status:
+    | 'awaiting_approval'
     | 'queued'
     | 'running'
     | 'completed'
@@ -67,6 +90,10 @@ export interface AgentJob {
     | 'cancelled';
   revision: number;
   attempt: number;
+  maxAttempts: number;
+  requiresApproval: boolean;
+  approvedAtMs: number | null;
+  attempts: AgentJobAttempt[];
   createdAtMs: number;
   updatedAtMs: number;
   startedAtMs: number | null;
@@ -76,6 +103,9 @@ export interface AgentJob {
 }
 
 export interface AgentJobInput {
+  goalId?: string | null;
+  maxAttempts?: number;
+  requiresApproval?: boolean;
   title: string;
   prompt: string;
   /** Retain this key when retrying an uncertain create with identical input. */
@@ -245,6 +275,28 @@ export class AgentsClient {
   ): Promise<AgentJob> {
     return this.client.requestJson(
       `/api/agents/${encodeURIComponent(agentId)}/jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: 'POST', body: input },
+    );
+  }
+
+  async approveJob(
+    agentId: string,
+    jobId: string,
+    input: { revision: number },
+  ): Promise<AgentJob> {
+    return this.client.requestJson(
+      `/api/agents/${encodeURIComponent(agentId)}/jobs/${encodeURIComponent(jobId)}/approve`,
+      { method: 'POST', body: input },
+    );
+  }
+
+  async reviewJob(
+    agentId: string,
+    jobId: string,
+    input: AgentJobReviewInput,
+  ): Promise<AgentJob> {
+    return this.client.requestJson(
+      `/api/agents/${encodeURIComponent(agentId)}/jobs/${encodeURIComponent(jobId)}/review`,
       { method: 'POST', body: input },
     );
   }

@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::{json_response, parse_json_body, read_limited_body, ApiError, AppState};
-use crate::jobs::{AgentJobRecord, JobError};
+use crate::jobs::{AgentJobRecord, JobError, JobReviewDecision};
 
 #[derive(Serialize, ToSchema)]
 pub(super) struct JobsResponse {
-    jobs: Vec<AgentJobRecord>,
+    pub(super) jobs: Vec<AgentJobRecord>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -18,6 +18,25 @@ pub(super) struct CreateJobRequest {
     title: String,
     prompt: String,
     request_key: String,
+    #[serde(default = "default_max_attempts")]
+    max_attempts: u32,
+    #[serde(default)]
+    requires_approval: bool,
+    #[serde(default)]
+    goal_id: Option<String>,
+}
+
+fn default_max_attempts() -> u32 {
+    3
+}
+
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReviewJobRequest {
+    revision: u64,
+    decision: JobReviewDecision,
+    #[serde(default)]
+    note: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -34,14 +53,14 @@ pub(super) struct RetryJobRequest {
     acknowledge_uncertain: bool,
 }
 
-fn no_store(mut response: Response) -> Response {
+pub(super) fn no_store(mut response: Response) -> Response {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
-fn authorize(state: &AppState, request: &Request, read: bool) -> Result<(), Response> {
+pub(super) fn authorize(state: &AppState, request: &Request, read: bool) -> Result<(), Response> {
     let result = if read {
         state.local_owner.authorize_read(request.headers())
     } else {
@@ -58,7 +77,7 @@ fn authorize(state: &AppState, request: &Request, read: bool) -> Result<(), Resp
     })
 }
 
-fn error_response(error: JobError) -> Response {
+pub(super) fn error_response(error: JobError) -> Response {
     let error = match error {
         JobError::NotFound => ApiError::not_found(),
         JobError::Validation(message) => ApiError::bad_request(message),
@@ -75,7 +94,7 @@ fn job_response(result: Result<AgentJobRecord, JobError>) -> Response {
     }
 }
 
-async fn body<T: serde::de::DeserializeOwned>(
+pub(super) async fn body<T: serde::de::DeserializeOwned>(
     state: &AppState,
     request: Request,
 ) -> Result<T, Response> {
@@ -120,7 +139,62 @@ pub(super) async fn create_job(
     job_response(
         state
             .jobs
-            .create(&agent_id, &input.title, &input.prompt, &input.request_key)
+            .create_with_goal(
+                &agent_id,
+                &input.title,
+                &input.prompt,
+                &input.request_key,
+                input.max_attempts,
+                input.requires_approval,
+                input.goal_id.as_deref(),
+            )
+            .await,
+    )
+}
+
+#[utoipa::path(post, path = "/api/agents/{agent_id}/jobs/{job_id}/approve", tag = "jobs",
+    params(("agent_id" = String, Path), ("job_id" = String, Path)), request_body = CancelJobRequest,
+    responses((status = 200, description = "Owner approved this attempt for dispatch", body = AgentJobRecord), (status = 409, description = "Stale revision, invalid state, or capacity"), (status = 403, description = "Local owner required")))]
+pub(super) async fn approve_job(
+    State(state): State<AppState>,
+    Path((agent_id, job_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let input: CancelJobRequest = match body(&state, request).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    job_response(state.jobs.approve(&agent_id, &job_id, input.revision).await)
+}
+
+#[utoipa::path(post, path = "/api/agents/{agent_id}/jobs/{job_id}/review", tag = "jobs",
+    params(("agent_id" = String, Path), ("job_id" = String, Path)), request_body = ReviewJobRequest,
+    responses((status = 200, description = "Owner decision saved against the latest completed output", body = AgentJobRecord), (status = 400, description = "Invalid review feedback"), (status = 409, description = "Stale revision or already reviewed output"), (status = 403, description = "Local owner required")))]
+pub(super) async fn review_job(
+    State(state): State<AppState>,
+    Path((agent_id, job_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    let input: ReviewJobRequest = match body(&state, request).await {
+        Ok(input) => input,
+        Err(response) => return response,
+    };
+    job_response(
+        state
+            .jobs
+            .review_output(
+                &agent_id,
+                &job_id,
+                input.revision,
+                input.decision,
+                &input.note,
+            )
             .await,
     )
 }

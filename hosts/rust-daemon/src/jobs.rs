@@ -5,101 +5,22 @@ use crate::{
     state::DaemonState,
 };
 use anima_core::{Content, TaskStatus};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{watch, Mutex, Notify};
-use utoipa::ToSchema;
 
 const MAX_JOBS: usize = 200;
 const MAX_ACTIVE: usize = 8;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum AgentJobStatus {
-    Queued,
-    Running,
-    Completed,
-    Failed,
-    NeedsReview,
-    Cancelled,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AgentJobRecord {
-    pub(crate) id: String,
-    pub(crate) agent_id: String,
-    pub(crate) title: String,
-    pub(crate) prompt: String,
-    pub(crate) request_key: String,
-    pub(crate) status: AgentJobStatus,
-    pub(crate) revision: u64,
-    pub(crate) attempt: u32,
-    pub(crate) created_at_ms: u64,
-    pub(crate) updated_at_ms: u64,
-    pub(crate) started_at_ms: Option<u64>,
-    pub(crate) finished_at_ms: Option<u64>,
-    pub(crate) result: Option<String>,
-    pub(crate) error: Option<String>,
-}
-
-impl AgentJobRecord {
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.id.trim().is_empty()
-            || self.agent_id.trim().is_empty()
-            || self.title.trim().is_empty()
-            || self.title.chars().count() > 160
-            || self.prompt.trim().is_empty()
-            || self.prompt.len() > 32 * 1024
-            || self.request_key.trim().is_empty()
-            || self.request_key.len() > 128
-            || self.revision == 0
-            || self.attempt > 3
-            || self.result.as_ref().is_some_and(|v| v.len() > 64 * 1024)
-            || self.error.as_ref().is_some_and(|v| v.len() > 64 * 1024)
-            || self.updated_at_ms < self.created_at_ms
-            || self
-                .started_at_ms
-                .is_some_and(|t| t < self.created_at_ms || t > self.updated_at_ms)
-            || self
-                .finished_at_ms
-                .is_some_and(|t| t < self.created_at_ms || t > self.updated_at_ms)
-        {
-            return Err("Invalid durable job bounds or timestamps".into());
-        }
-        match self.status {
-            AgentJobStatus::Queued
-                if self.attempt >= 3
-                    || self.started_at_ms.is_some()
-                    || self.finished_at_ms.is_some() =>
-            {
-                Err("Invalid queued job".into())
-            }
-            AgentJobStatus::Running
-                if self.attempt == 0
-                    || self.started_at_ms.is_none()
-                    || self.finished_at_ms.is_some() =>
-            {
-                Err("Invalid running job".into())
-            }
-            AgentJobStatus::Completed | AgentJobStatus::Failed | AgentJobStatus::NeedsReview
-                if self.attempt == 0
-                    || self.started_at_ms.is_none()
-                    || self.finished_at_ms.is_none() =>
-            {
-                Err("Invalid finished job".into())
-            }
-            AgentJobStatus::Cancelled if self.finished_at_ms.is_none() => {
-                Err("Invalid cancelled job".into())
-            }
-            _ => Ok(()),
-        }
-    }
-}
+mod goals;
+pub(crate) use goals::{validate_goals, GoalRecord, GoalStatus, GoalView};
+mod records;
+pub(crate) use records::{
+    AgentJobAttempt, AgentJobRecord, AgentJobStatus, JobOutputReview, JobReviewDecision,
+};
 
 #[derive(Debug)]
 pub(crate) enum JobError {
@@ -145,18 +66,21 @@ impl JobService {
                         "Durable jobs require control-plane persistence".into(),
                     ));
                 }
-                let before = state.jobs.clone();
+                let before = (state.jobs.clone(), state.goals.clone());
                 let value = match action(&mut state) {
                     Ok(value) => value,
                     Err(error) => {
-                        state.jobs = before;
+                        state.jobs = before.0;
+                        state.goals = before.1;
                         return Err(error);
                     }
                 };
                 (before, value, state.control_plane_persist_request())
             };
             if let Err(error) = persist.save().await {
-                service.state.write().await.jobs = before;
+                let mut state = service.state.write().await;
+                state.jobs = before.0;
+                state.goals = before.1;
                 return Err(JobError::Unavailable(error.to_string()));
             }
             service.wake.notify_one();
@@ -194,6 +118,47 @@ impl JobService {
         prompt: &str,
         request_key: &str,
     ) -> Result<AgentJobRecord, JobError> {
+        self.create_with_controls(agent_id, title, prompt, request_key, 3, false)
+            .await
+    }
+
+    pub(crate) async fn create_with_controls(
+        &self,
+        agent_id: &str,
+        title: &str,
+        prompt: &str,
+        request_key: &str,
+        max_attempts: u32,
+        requires_approval: bool,
+    ) -> Result<AgentJobRecord, JobError> {
+        self.create_with_goal(
+            agent_id,
+            title,
+            prompt,
+            request_key,
+            max_attempts,
+            requires_approval,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn create_with_goal(
+        &self,
+        agent_id: &str,
+        title: &str,
+        prompt: &str,
+        request_key: &str,
+        max_attempts: u32,
+        requires_approval: bool,
+        goal_id: Option<&str>,
+    ) -> Result<AgentJobRecord, JobError> {
+        let goal_id = goal_id.map(str::to_owned);
+        if !(1..=3).contains(&max_attempts) {
+            return Err(JobError::Validation(
+                "Maximum attempts must be between 1 and 3".into(),
+            ));
+        }
         if title.trim().is_empty()
             || title.chars().count() > 160
             || prompt.trim().is_empty()
@@ -218,7 +183,13 @@ impl JobService {
                 .values()
                 .find(|j| j.agent_id == agent_id && j.request_key == request_key)
             {
-                return if job.agent_id == agent_id && job.title == title && job.prompt == prompt {
+                return if job.agent_id == agent_id
+                    && job.title == title
+                    && job.prompt == prompt
+                    && job.max_attempts == max_attempts
+                    && job.requires_approval == requires_approval
+                    && job.goal_id == goal_id
+                {
                     Ok(job.clone())
                 } else {
                     Err(JobError::Conflict(
@@ -231,7 +202,10 @@ impl JobService {
                     "Job history capacity is exhausted".into(),
                 ));
             }
-            ensure_capacity(&state.jobs)?;
+            goals::check_link(state, goal_id.as_deref(), !requires_approval)?;
+            if !requires_approval {
+                ensure_capacity(&state.jobs)?;
+            }
             let now = now_ms();
             let job = AgentJobRecord {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -239,7 +213,11 @@ impl JobService {
                 title,
                 prompt,
                 request_key,
-                status: AgentJobStatus::Queued,
+                status: if requires_approval {
+                    AgentJobStatus::AwaitingApproval
+                } else {
+                    AgentJobStatus::Queued
+                },
                 revision: 1,
                 attempt: 0,
                 created_at_ms: now,
@@ -248,6 +226,11 @@ impl JobService {
                 finished_at_ms: None,
                 result: None,
                 error: None,
+                max_attempts,
+                requires_approval,
+                approved_at_ms: None,
+                attempts: vec![],
+                goal_id,
             };
             state.jobs.insert(job.id.clone(), job.clone());
             Ok(job)
@@ -264,9 +247,12 @@ impl JobService {
         let (agent_id, id) = (agent_id.to_owned(), id.to_owned());
         self.mutate(move |state| {
             let job = checked_job(state, &agent_id, &id, revision)?;
-            if job.status != AgentJobStatus::Queued {
+            if !matches!(
+                job.status,
+                AgentJobStatus::Queued | AgentJobStatus::AwaitingApproval
+            ) {
                 return Err(JobError::Conflict(
-                    "Only queued jobs can be cancelled".into(),
+                    "Only queued jobs or pending proposals can be cancelled".into(),
                 ));
             }
             job.status = AgentJobStatus::Cancelled;
@@ -286,15 +272,22 @@ impl JobService {
     ) -> Result<AgentJobRecord, JobError> {
         let (agent_id, id) = (agent_id.to_owned(), id.to_owned());
         self.mutate(move |state| {
-            ensure_capacity(&state.jobs)?;
+            let checked = checked_job(state, &agent_id, &id, revision)?;
+            let requires_approval = checked.requires_approval;
+            let goal_id = checked.goal_id.clone();
+            goals::check_link(state, goal_id.as_deref(), !requires_approval)?;
+            if !requires_approval { ensure_capacity(&state.jobs)?; }
             let job = checked_job(state, &agent_id, &id, revision)?;
-            if !matches!(
+            job.preserve_legacy_attempt();
+            let changes_requested = job.status == AgentJobStatus::Completed && job.attempts.last()
+                .and_then(|a| a.review.as_ref()).is_some_and(|r| r.decision == JobReviewDecision::ChangesRequested);
+            if !changes_requested && !matches!(
                 job.status,
                 AgentJobStatus::Failed | AgentJobStatus::NeedsReview
-            ) || job.attempt >= 3
+            ) || job.attempt >= job.max_attempts
             {
                 return Err(JobError::Conflict(
-                    "Only failed or review jobs below three attempts can be retried".into(),
+                    "Only failed, uncertain, or changes-requested jobs below their attempt limit can be retried".into(),
                 ));
             }
             if job.status == AgentJobStatus::NeedsReview && !acknowledge_uncertain {
@@ -302,12 +295,84 @@ impl JobService {
                     "Acknowledge that retrying uncertain work may repeat external effects".into(),
                 ));
             }
-            job.status = AgentJobStatus::Queued;
+            job.status = if job.requires_approval { AgentJobStatus::AwaitingApproval } else { AgentJobStatus::Queued };
+            job.approved_at_ms = None;
             advance(job);
             job.started_at_ms = None;
             job.finished_at_ms = None;
             job.result = None;
             job.error = None;
+            Ok(job.clone())
+        })
+        .await
+    }
+
+    pub(crate) async fn approve(
+        &self,
+        agent_id: &str,
+        id: &str,
+        revision: u64,
+    ) -> Result<AgentJobRecord, JobError> {
+        let (agent_id, id) = (agent_id.to_owned(), id.to_owned());
+        self.mutate(move |state| {
+            let goal_id = checked_job(state, &agent_id, &id, revision)?
+                .goal_id
+                .clone();
+            goals::check_link(state, goal_id.as_deref(), true)?;
+            ensure_capacity(&state.jobs)?;
+            let job = checked_job(state, &agent_id, &id, revision)?;
+            if job.status != AgentJobStatus::AwaitingApproval {
+                return Err(JobError::Conflict(
+                    "Only pending proposals can be approved".into(),
+                ));
+            }
+            job.status = AgentJobStatus::Queued;
+            advance(job);
+            job.approved_at_ms = Some(job.updated_at_ms);
+            Ok(job.clone())
+        })
+        .await
+    }
+
+    pub(crate) async fn review_output(
+        &self,
+        agent_id: &str,
+        id: &str,
+        revision: u64,
+        decision: JobReviewDecision,
+        note: &str,
+    ) -> Result<AgentJobRecord, JobError> {
+        if note.len() > 4000
+            || (decision == JobReviewDecision::ChangesRequested && note.trim().is_empty())
+        {
+            return Err(JobError::Validation(
+                "Feedback must be at most 4000 bytes; requesting changes requires a note".into(),
+            ));
+        }
+        let (agent_id, id, note) = (agent_id.to_owned(), id.to_owned(), note.to_owned());
+        self.mutate(move |state| {
+            let job = checked_job(state, &agent_id, &id, revision)?;
+            if job.status != AgentJobStatus::Completed {
+                return Err(JobError::Conflict(
+                    "Only the latest completed output can be reviewed".into(),
+                ));
+            }
+            job.preserve_legacy_attempt();
+            if job
+                .attempts
+                .last()
+                .is_none_or(|a| a.attempt != job.attempt || a.review.is_some())
+            {
+                return Err(JobError::Conflict(
+                    "Output is missing or has already been reviewed".into(),
+                ));
+            }
+            advance(job);
+            job.attempts.last_mut().unwrap().review = Some(JobOutputReview {
+                decision,
+                note,
+                reviewed_at_ms: job.updated_at_ms,
+            });
             Ok(job.clone())
         })
         .await
@@ -387,15 +452,17 @@ impl JobService {
             if *stop.borrow() {
                 break;
             }
-            let mut queued: Vec<_> = self
-                .state
-                .read()
-                .await
-                .jobs
-                .values()
-                .filter(|j| j.status == AgentJobStatus::Queued)
-                .cloned()
-                .collect();
+            let mut queued: Vec<_> = {
+                let state = self.state.read().await;
+                state
+                    .jobs
+                    .values()
+                    .filter(|job| {
+                        job.status == AgentJobStatus::Queued && goals::dispatch_allowed(&state, job)
+                    })
+                    .cloned()
+                    .collect()
+            };
             queued.sort_by_key(|j| (j.created_at_ms, j.id.clone()));
             for candidate in queued {
                 if agents.contains(&candidate.agent_id)
@@ -409,11 +476,17 @@ impl JobService {
                 let id = candidate.id.clone();
                 let claimed = self
                     .mutate(move |state| {
+                        let candidate = state.jobs.get(&id).ok_or(JobError::NotFound)?;
+                        if !goals::dispatch_allowed(state, candidate) {
+                            return Err(JobError::Conflict("Goal is paused or unavailable".into()));
+                        }
                         let job = state.jobs.get_mut(&id).ok_or(JobError::NotFound)?;
                         if job.status != AgentJobStatus::Queued {
                             return Err(JobError::Conflict("Job is no longer queued".into()));
                         }
-                        if job.attempt >= 3 {
+                        if job.attempt >= job.max_attempts
+                            || (job.requires_approval && job.approved_at_ms.is_none())
+                        {
                             return Err(JobError::Conflict("Attempt limit reached".into()));
                         }
                         job.status = AgentJobStatus::Running;
@@ -448,7 +521,7 @@ impl JobService {
                 AgentRunRequest {
                     agent_id: job.agent_id.clone(),
                     content: Content {
-                        text: job.prompt.clone(),
+                        text: job_prompt(&job),
                         attachments: None,
                         metadata: None,
                     },
@@ -471,6 +544,11 @@ impl JobService {
                     current.error = result.error.as_ref().map(|e| preview(e));
                     advance(current);
                     current.finished_at_ms = Some(current.updated_at_ms);
+                    current.preserve_legacy_attempt();
+                    if let Some(attempt) = current.attempts.last_mut() {
+                        attempt.result_truncated =
+                            result.data.as_ref().is_some_and(|c| c.text.len() > 65536);
+                    }
                     Ok(())
                 },
                 move |state, _baseline| {
@@ -571,6 +649,22 @@ fn review(job: &mut AgentJobRecord, error: &str) {
     job.error = Some(error.into());
     advance(job);
     job.finished_at_ms = Some(job.updated_at_ms);
+    job.preserve_legacy_attempt();
+}
+fn job_prompt(job: &AgentJobRecord) -> String {
+    let feedback = job
+        .attempts
+        .iter()
+        .rev()
+        .filter_map(|a| a.review.as_ref())
+        .find(|r| r.decision == JobReviewDecision::ChangesRequested);
+    match feedback {
+        Some(review) => format!(
+            "{}\n\nOwner feedback on the previous attempt:\n{}",
+            job.prompt, review.note
+        ),
+        None => job.prompt.clone(),
+    }
 }
 fn preview(value: &str) -> String {
     let mut end = value.len().min(64 * 1024);

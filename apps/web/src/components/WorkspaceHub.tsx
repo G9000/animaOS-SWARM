@@ -2,10 +2,11 @@ import { useEffect, useState } from 'react';
 import { daemon } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
 import { AgentRunsView } from './AgentRuns';
+import { WorkspaceGoals } from './WorkspaceGoals';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentProactiveView, AgentTasksView } from './AgentWork';
 
-type Section = 'Notes' | 'Tasks' | 'Schedules' | 'Runs';
+type Section = 'Notes' | 'Tasks' | 'Schedules' | 'Runs' | 'Goals';
 type Entry = {
   id: string;
   agentId: string;
@@ -117,7 +118,7 @@ export function WorkspaceHub({
   useEffect(() => {
     let cancelled = false;
     setResult(null);
-    if (section === 'Runs') return;
+    if (section === 'Runs' || section === 'Goals') return;
     const ids = JSON.parse(agentIds) as string[];
     void Promise.allSettled(ids.map((id) => loadEntries(id, section))).then(
       (responses) => {
@@ -217,7 +218,7 @@ export function WorkspaceHub({
               aria-label="Work categories"
               className="flex flex-wrap gap-2 border-b border-line pb-3"
             >
-              {(['Notes', 'Tasks', 'Schedules', 'Runs'] as const).map(
+              {(['Notes', 'Tasks', 'Schedules', 'Runs', 'Goals'] as const).map(
                 (item) => (
                   <button
                     key={item}
@@ -231,6 +232,7 @@ export function WorkspaceHub({
                         'Tasks',
                         'Schedules',
                         'Runs',
+                        'Goals',
                       ];
                       const offset =
                         event.key === 'ArrowRight'
@@ -274,7 +276,7 @@ export function WorkspaceHub({
               aria-labelledby={`hub-tab-${section}`}
               className="space-y-6"
             >
-              {section === 'Runs' ? (
+              {section === 'Goals' ? <WorkspaceGoals agents={agents} /> : section === 'Runs' ? (
                 <div className="space-y-5">
                   <label className="block space-y-2 text-sm">
                     Agent

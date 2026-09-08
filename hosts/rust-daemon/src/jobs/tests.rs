@@ -390,3 +390,8 @@ async fn restart_recovers_queued_but_never_replays_running() {
         .any(|j| j.id == queued.id && j.status == AgentJobStatus::Completed));
     let _ = std::fs::remove_file(path);
 }
+
+include!("supervision_tests.rs");
+
+#[path = "goal_tests.rs"]
+mod goal_tests;
