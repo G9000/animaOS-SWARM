@@ -1,36 +1,39 @@
 @import 'tailwindcss';
 @import './studio.css';
 @import './cockpit.css';
+@import './operator.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 
 @theme {
-  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
-  --font-display:
-    'Space Grotesk', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  --font-display: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 
-  /* Anima Studio palette */
+  /* Live Fixer dashboard / worker-site palette (ports 3000 and 3002). */
   /* prettier-ignore */
-  --color-abyss: #F5F2EA;
+  --color-abyss: #111114;
   /* prettier-ignore */
-  --color-panel: #FFFDF8;
-  --color-panel-2: #eae6dd;
-  --color-line: rgba(40, 42, 35, 0.13);
-  --color-line-strong: rgba(40, 42, 35, 0.27);
-  --color-ink: #252820;
-  --color-ink-2: #53564b;
-  --color-ink-3: #696b60;
+  --color-panel: #1c1c20;
+  --color-panel-2: #202026;
+  --color-line: #303038;
+  --color-line-strong: #343439;
+  --color-ink: #f4f4f5;
+  --color-ink-2: #a4a4b1;
+  --color-ink-3: #a4a4b1;
   /* prettier-ignore */
-  --color-accent: #AD3928;
+  --color-accent: #e94dab;
+  --color-action: #e978be;
+  --color-accent-fg: #191119;
   /* prettier-ignore */
-  --color-mint: #316448;
-  --color-danger: #b33232;
-  --color-amber: #825a17;
+  --color-mint: #6fd69a;
+  --color-danger: #f08c8c;
+  --color-amber: #e3bb70;
 }
 
 :root {
-  --color-accent-rgb: 173 57 40;
+  color-scheme: dark;
+  --color-accent-rgb: 233 77 171;
   --safe-area-top: env(safe-area-inset-top, 0px);
   --safe-area-right: env(safe-area-inset-right, 0px);
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
@@ -113,12 +116,12 @@ input[type='radio'] {
 }
 
 *::-webkit-scrollbar-thumb {
-  background: rgba(168, 162, 158, 0.18);
+  background: rgba(164, 164, 177, 0.18);
   border-radius: 999px;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background: rgba(168, 162, 158, 0.32);
+  background: rgba(164, 164, 177, 0.32);
 }
 
 /* Neutral spatial field: atmosphere and grid without a chromatic wash. */
@@ -154,28 +157,28 @@ input[type='radio'] {
   position: absolute;
   inset: 0;
   background-image:
-    linear-gradient(rgba(168, 162, 158, 0.034) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(168, 162, 158, 0.034) 1px, transparent 1px);
+    linear-gradient(rgba(164, 164, 177, 0.034) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(164, 164, 177, 0.034) 1px, transparent 1px);
   background-size: 48px 48px;
   mask-image: radial-gradient(72% 58% at 50% 34%, black, transparent);
 }
 
-/* Warm paper surfaces */
+/* Solid console surfaces */
 .glass {
-  background: rgba(255, 253, 248, 0.8);
+  background: var(--color-panel);
   border: 1px solid var(--color-line);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.025),
-    0 8px 24px -18px rgba(38, 40, 32, 0.16);
+    0 8px 24px -18px rgba(17, 17, 20, 0.16);
   backdrop-filter: blur(16px);
 }
 
 .glass-strong {
-  background: #fffdf8;
+  background: var(--color-panel);
   border: 1px solid var(--color-line-strong);
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.035),
-    0 18px 50px -28px rgba(38, 40, 32, 0.2);
+    0 18px 50px -28px rgba(17, 17, 20, 0.2);
   backdrop-filter: blur(22px);
 }
 
@@ -210,9 +213,9 @@ input[type='radio'] {
 /* Form controls */
 .field {
   width: 100%;
-  border-radius: 0.8rem;
+  border-radius: 6px;
   border: 1px solid var(--color-line);
-  background: #f5f2ea;
+  background: var(--color-abyss);
   padding: 0.68rem 0.85rem;
   font-size: 0.875rem;
   color: var(--color-ink);
@@ -230,7 +233,7 @@ input[type='radio'] {
 .field:focus-visible {
   border-color: rgb(var(--color-accent-rgb) / 0.58);
   box-shadow: 0 0 0 3px rgb(var(--color-accent-rgb) / 0.12);
-  background: #fffdf8;
+  background: var(--color-panel);
 }
 
 select.field {
@@ -282,15 +285,15 @@ select.field option {
     ),
     radial-gradient(
       circle at 48% 42%,
-      #ff6b9f 0,
+      #f28ec9 0,
       var(--color-accent) 38%,
-      #b91450 100%
+      #281e27 100%
     );
   border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow:
     0 0 0 8px rgb(var(--color-accent-rgb) / 0.055),
     0 0 42px -8px rgb(var(--color-accent-rgb) / 0.72),
-    inset -8px -10px 18px rgba(80, 0, 28, 0.35);
+    inset -8px -10px 18px rgba(17, 17, 20, 0.35);
 }
 
 .agent-orb-core {

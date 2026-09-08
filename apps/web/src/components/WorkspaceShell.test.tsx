@@ -7,17 +7,32 @@ import type { AgentDetail } from '../lib/types';
 import { WorkspaceShell } from './WorkspaceShell';
 import { daemon } from '../lib/daemon-api';
 
-it('lands on the overview and opens the manager conversation deliberately', async () => {
-  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({ tasks: [], revision: '1' });
+it('lands on operations and opens the manager conversation deliberately', async () => {
+  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({
+    tasks: [],
+    revision: '1',
+  });
   vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
   const main = agent('main', 'Nova', 1);
   const select = vi.fn();
-  render(<WorkspaceShell mainAgent={main} agents={[main]} connection="online"
-    workspace={<div>Conversation canvas</div>} activity={<div>Activity</div>}
-    onSelectAgent={select} onOpenSettings={vi.fn()} />);
-  expect(screen.getByRole('button', { name: 'Overview', exact: true })).toHaveAttribute('aria-current', 'page');
+  render(
+    <WorkspaceShell
+      mainAgent={main}
+      agents={[main]}
+      connection="online"
+      workspace={<div>Conversation canvas</div>}
+      activity={<div>Activity</div>}
+      onSelectAgent={select}
+      onOpenSettings={vi.fn()}
+    />,
+  );
+  expect(
+    screen.getByRole('button', { name: 'Operations', exact: true }),
+  ).toHaveAttribute('aria-current', 'page');
   expect(screen.queryByText('Conversation canvas')).not.toBeInTheDocument();
-  await userEvent.click(screen.getByRole('button', { name: 'Ask your manager' }));
+  await userEvent.click(
+    screen.getByRole('button', { name: 'Open manager chat' }),
+  );
   expect(select).toHaveBeenCalledWith('main');
   expect(screen.getByText('Conversation canvas')).toBeVisible();
 });
@@ -47,7 +62,11 @@ function agent(
 }
 
 beforeEach(() => {
-  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({ tasks: [], revision: '1' });
+  vi.spyOn(daemon, 'agentJobs').mockResolvedValue([]);
+  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({
+    tasks: [],
+    revision: '1',
+  });
   vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
 });
 
@@ -58,12 +77,37 @@ afterEach(() => {
 
 describe('WorkspaceShell', () => {
   it('opens capabilities from workplace navigation', async () => {
-    vi.spyOn(daemon, 'capabilities').mockResolvedValue({ schemaVersion: 1, tools: [], persistence: { controlPlane: 'file', memory: 'file', executionJournal: false }, extensions: [], limitations: [] });
+    vi.spyOn(daemon, 'capabilities').mockResolvedValue({
+      schemaVersion: 1,
+      tools: [],
+      persistence: {
+        controlPlane: 'file',
+        memory: 'file',
+        executionJournal: false,
+      },
+      extensions: [],
+      limitations: [],
+    });
     const nova = agent('agent-main', 'Nova', 1);
-    render(<WorkspaceShell mainAgent={nova} agents={[nova]} connection="online" workspace={<div>Conversation</div>} activity={<div>Activity</div>} onOpenSettings={vi.fn()} />);
-    await userEvent.click(screen.getByRole('button', { name: 'Capabilities', exact: true }));
-    expect(await screen.findByText('Tools follow your authority')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Capabilities', exact: true })).toHaveAttribute('aria-current', 'page');
+    render(
+      <WorkspaceShell
+        mainAgent={nova}
+        agents={[nova]}
+        connection="online"
+        workspace={<div>Conversation</div>}
+        activity={<div>Activity</div>}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Capabilities', exact: true }),
+    );
+    expect(
+      await screen.findByText('Tools follow your authority'),
+    ).toBeVisible();
+    expect(
+      screen.getByRole('button', { name: 'Capabilities', exact: true }),
+    ).toHaveAttribute('aria-current', 'page');
   });
   it('opens commands with Control K, filters actions and navigates with Enter', async () => {
     const user = userEvent.setup();
@@ -104,7 +148,9 @@ describe('WorkspaceShell', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Enter focus mode' }));
     expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+    expect(
+      screen.getByRole('heading', { name: 'Operations', exact: true }),
+    ).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Exit focus mode' }));
     expect(screen.getByRole('complementary')).toBeVisible();
   });
@@ -248,7 +294,7 @@ describe('WorkspaceShell', () => {
     expect(sidebar).not.toBeNull();
     expect(sidebar?.nextElementSibling?.tagName).toBe('MAIN');
     expect(
-      within(navigation).getByRole('button', { name: 'Overview' }),
+      within(navigation).getByRole('button', { name: 'Operations' }),
     ).toHaveAttribute('aria-current', 'page');
     expect(
       within(navigation).getByRole('button', { name: 'Activity' }),
@@ -256,7 +302,9 @@ describe('WorkspaceShell', () => {
     expect(
       within(navigation).getByRole('button', { name: 'Team' }),
     ).toBeVisible();
-    expect(screen.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+    expect(
+      screen.getByRole('heading', { name: 'Operations', exact: true }),
+    ).toBeVisible();
 
     await user.click(
       within(navigation).getByRole('button', { name: 'Activity' }),
@@ -264,9 +312,7 @@ describe('WorkspaceShell', () => {
     expect(screen.getByText('Activity canvas')).toBeVisible();
     expect(screen.queryByText('Workspace canvas')).not.toBeInTheDocument();
 
-    await user.click(
-      within(navigation).getByRole('button', { name: 'Team' }),
-    );
+    await user.click(within(navigation).getByRole('button', { name: 'Team' }));
     expect(screen.getByRole('heading', { name: 'Team' })).toBeVisible();
     expect(
       within(screen.getByRole('article', { name: 'Nova agent' })).getByText(
@@ -471,9 +517,9 @@ describe('WorkspaceShell', () => {
     expect(content.parentElement?.nextElementSibling).toBe(navigation);
     expect(
       screen
-        .getByRole('button', { name: 'Ask your manager' })
+        .getByRole('button', { name: 'Open manager chat' })
         .compareDocumentPosition(
-          screen.getByRole('button', { name: 'Overview' }),
+          screen.getByRole('button', { name: 'Operations' }),
         ) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
   });

@@ -8,6 +8,8 @@ import { AgentAvatar } from './AgentAvatar';
 import { AgentsView } from './AgentsView';
 import { WorkspaceHub } from './WorkspaceHub';
 import { WorkspaceDashboard } from './WorkspaceDashboard';
+import { WorkspaceOperations } from './WorkspaceOperations';
+import { WorkspaceGoals } from './WorkspaceGoals';
 import { WorkspaceFiles } from './WorkspaceFiles';
 import { WorkspaceCapabilities } from './WorkspaceCapabilities';
 import { CommandMenu, type StudioCommand } from './CommandMenu';
@@ -16,6 +18,8 @@ import { AgentsIcon, GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
 import { formatTokens, ghostBtnCls } from './ui-bits';
 
 export type WorkspaceDestination =
+  | 'operations'
+  | 'goals'
   | 'overview'
   | 'files'
   | 'capabilities'
@@ -33,6 +37,8 @@ const DESTINATIONS: Array<{
   label: string;
   icon: ReactNode;
 }> = [
+  { id: 'operations', label: 'Operations', icon: <PulseIcon size={15} /> },
+  { id: 'goals', label: 'Goals', icon: <SparkIcon size={15} /> },
   { id: 'overview', label: 'Overview', icon: <SparkIcon size={15} /> },
   { id: 'hub', label: 'Work', icon: <PulseIcon size={15} /> },
   { id: 'agents', label: 'Team', icon: <AgentsIcon size={15} /> },
@@ -100,7 +106,7 @@ function DestinationNavigation({
     >
       {sidebar ? (
         <p className="mb-2 px-3 font-mono text-[9px] uppercase tracking-[0.18em] text-ink-3">
-          Your space
+          Workspace
         </p>
       ) : null}
       {destinations.map((item) => {
@@ -168,7 +174,7 @@ export function WorkspaceShell({
     'Tasks',
   );
   const [destination, setDestination] =
-    useState<WorkspaceDestination>('overview');
+    useState<WorkspaceDestination>('operations');
   const desktopNavigation = useDesktopNavigation();
   const companyName =
     workspaceState?.configured && workspaceState.workspace !== null
@@ -283,7 +289,7 @@ export function WorkspaceShell({
                 <span>
                   anima<span className="studio-brand-suffix">OS</span>
                 </span>
-                <span className="studio-edition">STUDIO / 01</span>
+                <span className="studio-edition">OPERATOR</span>
               </div>
               <AgentPresence
                 agent={activeAgent}
@@ -350,33 +356,35 @@ export function WorkspaceShell({
                   </div>
                 </nav>
               )}
-              {destination === 'workspace' && <div
-                className={`studio-sidebar-note ${onSelectAgent ? 'has-agent-chats' : ''}`}
-              >
-                <span className="studio-note-label">WORKSPACE PULSE</span>
-                <p className="studio-live-status">
-                  <i aria-hidden />
-                  {activeAgent.status === 'Running'
-                    ? 'Thinking with you'
-                    : connection === 'offline'
-                      ? 'Connection paused'
-                      : 'Ready when you are'}
-                </p>
-                <div className="studio-sidebar-metrics">
+              {destination === 'workspace' && (
+                <div
+                  className={`studio-sidebar-note ${onSelectAgent ? 'has-agent-chats' : ''}`}
+                >
+                  <span className="studio-note-label">WORKSPACE PULSE</span>
+                  <p className="studio-live-status">
+                    <i aria-hidden />
+                    {activeAgent.status === 'Running'
+                      ? 'Thinking with you'
+                      : connection === 'offline'
+                        ? 'Connection paused'
+                        : 'Ready when you are'}
+                  </p>
+                  <div className="studio-sidebar-metrics">
+                    <span>
+                      <strong>{activeAgent.messages.length}</strong> messages
+                    </span>
+                    <span>
+                      <strong>
+                        {formatTokens(activeAgent.token_usage.total_tokens)}
+                      </strong>{' '}
+                      tokens
+                    </span>
+                  </div>
                   <span>
-                    <strong>{activeAgent.messages.length}</strong> messages
-                  </span>
-                  <span>
-                    <strong>
-                      {formatTokens(activeAgent.token_usage.total_tokens)}
-                    </strong>{' '}
-                    tokens
+                    {activeAgent.provider} / {activeAgent.model}
                   </span>
                 </div>
-                <span>
-                  {activeAgent.provider} / {activeAgent.model}
-                </span>
-              </div>}
+              )}
               <div className="border-t border-line/60 p-3">
                 <button
                   type="button"
@@ -395,11 +403,13 @@ export function WorkspaceShell({
           <main className="studio-main spatial-canvas workspace-mobile-safe relative min-h-0 min-w-0 flex-1">
             <div className="studio-topbar">
               <div className="studio-breadcrumb">
-                <span>{companyName || 'Personal space'}</span>
+                <span>{companyName || 'Workspace'}</span>
                 <span aria-hidden>/</span>
                 <strong>
-                  {destination === 'telegram' ? 'Telegram' :
-                    DESTINATIONS.find((item) => item.id === destination)?.label}
+                  {destination === 'telegram'
+                    ? 'Telegram'
+                    : DESTINATIONS.find((item) => item.id === destination)
+                        ?.label}
                 </strong>
               </div>
               <span
@@ -410,11 +420,17 @@ export function WorkspaceShell({
               </span>
               <div className="studio-topbar-actions">
                 {destination !== 'workspace' && (
-                  <button type="button" className="studio-tool-button"
-                    aria-label="Open manager chat" onClick={() => {
+                  <button
+                    type="button"
+                    className="studio-tool-button"
+                    aria-label="Open manager chat"
+                    onClick={() => {
                       onSelectAgent?.(mainAgent.id);
                       setDestination('workspace');
-                    }}>Ask your manager</button>
+                    }}
+                  >
+                    Ask your manager
+                  </button>
                 )}
                 <button
                   type="button"
@@ -494,7 +510,29 @@ export function WorkspaceShell({
               </div>
             )}
             <div className="studio-view">
-              {destination === 'workspace' ? (
+              {destination === 'operations' ? (
+                <WorkspaceOperations
+                  agents={agents}
+                  online={connection === 'online'}
+                  onChat={(id) => {
+                    onSelectAgent?.(id);
+                    setDestination('workspace');
+                  }}
+                />
+              ) : destination === 'goals' ? (
+                <section
+                  className="operator-goals h-full overflow-y-auto p-5"
+                  aria-label="Goals"
+                >
+                  <header className="operator-page-heading">
+                    <h1>Goals</h1>
+                    <p>
+                      Define outcomes and allocate attempts across assignments.
+                    </p>
+                  </header>
+                  <WorkspaceGoals agents={agents} />
+                </section>
+              ) : destination === 'workspace' ? (
                 workspace
               ) : destination === 'telegram' && telegram !== null ? (
                 telegram
@@ -520,11 +558,15 @@ export function WorkspaceShell({
                   onOpenTeam={() => setDestination('agents')}
                   onOpenFiles={() => setDestination('files')}
                   onOpenCapabilities={() => setDestination('capabilities')}
-                  onStartAssignment={onStartAssignment ? (prompt) => {
-                    onSelectAgent?.(mainAgent.id);
-                    setDestination('workspace');
-                    onStartAssignment(mainAgent.id, prompt);
-                  } : undefined}
+                  onStartAssignment={
+                    onStartAssignment
+                      ? (prompt) => {
+                          onSelectAgent?.(mainAgent.id);
+                          setDestination('workspace');
+                          onStartAssignment(mainAgent.id, prompt);
+                        }
+                      : undefined
+                  }
                 />
               ) : destination === 'files' ? (
                 <WorkspaceFiles online={connection === 'online'} />

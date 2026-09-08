@@ -108,7 +108,7 @@
   position: fixed;
   inset: 0;
   z-index: 80;
-  background: #1d261d70;
+  background: #11111470;
   backdrop-filter: blur(9px);
   display: flex;
   align-items: flex-start;
@@ -123,7 +123,7 @@
   background: var(--color-panel);
   border: 1px solid var(--color-line);
   border-radius: 20px;
-  box-shadow: 0 24px 100px #17201640;
+  box-shadow: 0 24px 100px #11111440;
   overflow: hidden;
 }
 .studio-command-search {
@@ -164,8 +164,8 @@
   cursor: pointer;
 }
 .studio-command-option[aria-selected='true'] {
-  background: #e8eddb;
-  border-color: #d3dac5;
+  background: #1c1c20;
+  border-color: #303038;
 }
 .studio-command-symbol {
   flex-shrink: 0;
@@ -173,7 +173,7 @@
   place-items: center;
   width: 34px;
   height: 34px;
-  background: #ffffff80;
+  background: #1c1c20;
   border: 1px solid var(--color-line);
   border-radius: 10px;
   color: var(--color-accent);
@@ -283,7 +283,7 @@
 }
 .studio-message-anchor[data-search-match='true'] {
   outline-color: var(--color-accent);
-  background: #ad39280a;
+  background: #e94dab0a;
 }
 .studio-message-meta {
   display: flex;
@@ -317,13 +317,13 @@
   border: 1px solid var(--color-line-strong);
   background: var(--color-panel);
   color: var(--color-ink);
-  box-shadow: 0 5px 18px #252d241c;
+  box-shadow: 0 5px 18px #1111141c;
   font-size: 11px;
   cursor: pointer;
 }
 .studio-draft-recovery {
   border: 1px solid var(--color-line-strong);
-  background: #eee6db;
+  background: #1c1c20;
   border-radius: 12px;
   padding: 12px 14px;
   margin-bottom: 10px;
@@ -497,7 +497,7 @@
     overflow: hidden;
     margin-bottom: 25px;
     border-radius: 15px;
-    background: #e9eddd;
+    background: #1c1c20;
   }
   .studio-onboarding-art > span {
     display: grid;
@@ -507,20 +507,20 @@
     border-radius: 50%;
     background: radial-gradient(
       circle at 30% 20%,
-      #ffdaa8,
-      #ce5836 60%,
-      #783921
+      #f28ec9,
+      #e94dab 60%,
+      #281e27
     );
     font: 80px var(--font-display) !important;
-    color: #ffe7b1 !important;
+    color: #f4f4f5 !important;
     padding: 0 !important;
     transform: rotate(-18deg);
-    box-shadow: 0 14px 30px -10px #602b3035;
+    box-shadow: 0 14px 30px -10px #11111435;
   }
   .studio-onboarding-art i {
     width: 215px;
     height: 85px;
-    border: 1px solid #869474;
+    border: 1px solid #303038;
     border-radius: 50%;
     position: absolute;
     transform: rotate(-23deg);
@@ -531,7 +531,7 @@
     right: 12px;
     font: 7px var(--font-mono);
     letter-spacing: 1px;
-    color: #535f44;
+    color: #a4a4b1;
   }
 }
 @media (max-width: 1100px) {

@@ -113,7 +113,7 @@ export function TelegramThread({
             aria-label="Send to Telegram"
             disabled={busy !== null || !draft.trim()}
             onClick={() => void submit()}
-            className="flex h-9 w-9 items-center justify-center rounded-xl bg-accent text-abyss disabled:opacity-25"
+            className="flex h-9 w-9 items-center justify-center rounded-xl bg-accent text-accent-fg disabled:opacity-25"
           >
             <SendIcon size={15} />
           </button>

@@ -82,7 +82,9 @@ function snapshot(
 }
 
 async function openChat() {
-  fireEvent.click(await screen.findByRole('button', { name: 'Chat', exact: true }));
+  fireEvent.click(
+    await screen.findByRole('button', { name: 'Chat', exact: true }),
+  );
 }
 
 function mockProviders() {
@@ -92,7 +94,8 @@ function mockProviders() {
 it('starts the prepared assignment only on click, targets the manager and preserves chat drafts', async () => {
   const user = userEvent.setup();
   const alpha = snapshot('alpha', 'Alpha', 1);
-  alpha.state.config.system = 'Coordinate the team.\n\nPrepared first assignment (do not start until the owner asks):\nDraft a weekly plan.';
+  alpha.state.config.system =
+    'Coordinate the team.\n\nPrepared first assignment (do not start until the owner asks):\nDraft a weekly plan.';
   const beta = snapshot('beta', 'Beta', 2);
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
@@ -100,22 +103,53 @@ it('starts the prepared assignment only on click, targets the manager and preser
   const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
   const send = vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
   render(<ViewHarness />);
-  expect(await screen.findByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
+  expect(
+    await screen.findByRole('heading', { name: 'Operations', exact: true }),
+  ).toBeVisible();
   expect(send).not.toHaveBeenCalled();
   await user.click(screen.getByRole('button', { name: 'Chat', exact: true }));
-  await user.type(screen.getByPlaceholderText('Message Alpha…'), 'Keep my manager draft');
-  await user.click(screen.getByRole('button', { name: 'Message Beta', exact: true }));
-  await user.type(screen.getByPlaceholderText('Message Beta…'), 'Keep my specialist draft');
-  await user.click(screen.getByRole('button', { name: 'Overview', exact: true }));
-  await user.click(screen.getByRole('button', { name: 'Start first assignment' }));
-  expect(send).toHaveBeenCalledExactlyOnceWith('alpha', 'Draft a weekly plan.',
-    { clientRequestId: expect.any(String) }, 'direct:alpha');
-  expect(screen.getByPlaceholderText('Message Alpha…')).toHaveValue('Keep my manager draft');
-  await user.click(screen.getByRole('button', { name: 'Message Beta', exact: true }));
-  expect(screen.getByPlaceholderText('Message Beta…')).toHaveValue('Keep my specialist draft');
-  await act(async () => run.resolve({ agent: withMessage(alpha, 'Weekly plan ready'), result: {
-    status: 'success', durationMs: 1, data: { text: 'Weekly plan ready' },
-  } }));
+  await user.type(
+    screen.getByPlaceholderText('Message Alpha…'),
+    'Keep my manager draft',
+  );
+  await user.click(
+    screen.getByRole('button', { name: 'Message Beta', exact: true }),
+  );
+  await user.type(
+    screen.getByPlaceholderText('Message Beta…'),
+    'Keep my specialist draft',
+  );
+  await user.click(
+    screen.getByRole('button', { name: 'Overview', exact: true }),
+  );
+  await user.click(
+    screen.getByRole('button', { name: 'Start first assignment' }),
+  );
+  expect(send).toHaveBeenCalledExactlyOnceWith(
+    'alpha',
+    'Draft a weekly plan.',
+    { clientRequestId: expect.any(String) },
+    'direct:alpha',
+  );
+  expect(screen.getByPlaceholderText('Message Alpha…')).toHaveValue(
+    'Keep my manager draft',
+  );
+  await user.click(
+    screen.getByRole('button', { name: 'Message Beta', exact: true }),
+  );
+  expect(screen.getByPlaceholderText('Message Beta…')).toHaveValue(
+    'Keep my specialist draft',
+  );
+  await act(async () =>
+    run.resolve({
+      agent: withMessage(alpha, 'Weekly plan ready'),
+      result: {
+        status: 'success',
+        durationMs: 1,
+        data: { text: 'Weekly plan ready' },
+      },
+    }),
+  );
 });
 
 it('keeps individual drafts and failed sends while switching agents', async () => {
@@ -283,7 +317,10 @@ function capturePollTimer() {
 }
 
 beforeEach(() => {
-  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({ tasks: [], revision: '1' });
+  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({
+    tasks: [],
+    revision: '1',
+  });
   vi.spyOn(daemon, 'listConnectors').mockResolvedValue({ connectors: [] });
   vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
   vi.spyOn(daemon, 'importLegacySchedules').mockResolvedValue({
@@ -374,7 +411,7 @@ describe('ViewHarness workspace controller', () => {
     const runAgent = vi.spyOn(daemon, 'runAgent');
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await waitFor(() =>
       expect(daemon.importLegacySchedules).toHaveBeenCalled(),
@@ -485,7 +522,7 @@ describe('ViewHarness workspace controller', () => {
     });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     expect(
       await screen.findByRole('heading', { name: 'Say something to Alpha' }),
@@ -524,7 +561,7 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to First' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -560,7 +597,7 @@ describe('ViewHarness workspace controller', () => {
       });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to First' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -614,7 +651,7 @@ describe('ViewHarness workspace controller', () => {
       .mockResolvedValue({ agent: updated });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByText('Existing conversation');
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -677,7 +714,7 @@ describe('ViewHarness workspace controller', () => {
       .mockResolvedValue({ deleted: true });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -724,7 +761,7 @@ describe('ViewHarness workspace controller', () => {
     const updateAgent = vi.spyOn(daemon, 'updateAgent');
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -759,7 +796,7 @@ describe('ViewHarness workspace controller', () => {
     const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
     const send = vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
     const input = await screen.findByPlaceholderText('Message Nova…');
     await user.type(input, 'Original request');
     await user.click(screen.getByRole('button', { name: 'Send' }));
@@ -782,7 +819,7 @@ describe('ViewHarness workspace controller', () => {
     mockProviders();
     vi.spyOn(daemon, 'runAgent').mockRejectedValue(new Error('Network failed'));
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
     const input = await screen.findByPlaceholderText('Message Nova…');
     await user.type(input, 'First');
     await user.click(screen.getByRole('button', { name: 'Send' }));
@@ -808,7 +845,7 @@ describe('ViewHarness workspace controller', () => {
     const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
     vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
     await user.type(
       await screen.findByPlaceholderText('Message Nova…'),
       'Keep this request',
@@ -847,7 +884,7 @@ describe('ViewHarness workspace controller', () => {
     );
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await user.type(
@@ -880,7 +917,7 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'deleteAgent').mockReturnValue(deletion.promise);
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -967,7 +1004,7 @@ describe('ViewHarness workspace controller', () => {
       .mockReturnValue(update.promise);
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByText('Existing conversation');
     expect(screen.getByText('Welcome back')).toBeVisible();
@@ -1045,7 +1082,7 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Only' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -1071,7 +1108,7 @@ describe('ViewHarness workspace controller', () => {
       });
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Only' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -1109,7 +1146,7 @@ describe('ViewHarness workspace controller', () => {
     }) as typeof window.setTimeout);
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
 
     await screen.findByRole('heading', { name: 'Say something to Nova' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -1189,7 +1226,7 @@ describe('ViewHarness workspace controller', () => {
     const poll = capturePollTimer();
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
     await screen.findByRole('heading', { name: 'Say something to Alpha' });
     await user.type(
       screen.getByPlaceholderText('Message Alpha…'),
@@ -1248,7 +1285,7 @@ describe('ViewHarness workspace controller', () => {
     const poll = capturePollTimer();
 
     render(<ViewHarness />);
-  await openChat();
+    await openChat();
     await screen.findByRole('heading', { name: 'Say something to Alpha' });
     await user.click(screen.getByRole('button', { name: 'Settings' }));
     const name = screen.getByDisplayValue('Alpha');

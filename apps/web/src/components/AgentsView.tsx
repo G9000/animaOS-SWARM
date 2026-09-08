@@ -35,7 +35,7 @@ export function AgentsView({
         <div className="flex items-end justify-between gap-4">
           <div>
             <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-ink-3">
-              GOOD COMPANY
+              ASSIGNMENT OWNERS
             </p>
             <h2
               id="agents-view-heading"
@@ -49,8 +49,7 @@ export function AgentsView({
           </span>
         </div>
         <p className="studio-page-intro">
-          Different strengths. Shared purpose. Meet the intelligence behind your
-          workspace.
+          Inspect your agents, their access, and current activity.
         </p>
 
         <div className="studio-agent-search">

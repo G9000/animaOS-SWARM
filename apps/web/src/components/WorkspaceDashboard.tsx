@@ -249,7 +249,7 @@ export function WorkspaceDashboard({
           <div className="mt-5 flex flex-wrap gap-3">
             {canStart && (
               <button
-                className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-abyss hover:opacity-90"
+                className="rounded-xl bg-accent px-4 py-2.5 text-sm font-semibold text-accent-fg hover:opacity-90"
                 onClick={() => onStartAssignment?.(assignment)}
               >
                 Start first assignment

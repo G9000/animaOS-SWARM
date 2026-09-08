@@ -62,23 +62,23 @@ const SUGGESTIONS = [
   {
     icon: <Sparkle />,
     text: 'What can you do for me?',
-    title: 'Explore the possibilities',
+    title: 'Inspect capabilities',
     label: 'DISCOVER',
-    detail: 'Meet your new thinking partner.',
+    detail: 'Understand the agent’s tools and access.',
   },
   {
     icon: <BoltIcon size={13} />,
     text: 'Help me plan my day',
-    title: 'Make room for what matters',
+    title: 'Plan the next assignment',
     label: 'MAKE A PLAN',
-    detail: 'Turn a busy day into a clear one.',
+    detail: 'Define the objective and next steps.',
   },
   {
     icon: <PulseIcon size={13} />,
     text: 'Check in on me every hour',
-    title: 'Keep the momentum',
+    title: 'Set a check-in',
     label: 'STAY IN SYNC',
-    detail: 'A gentle nudge, right on time.',
+    detail: 'Agree on a schedule for progress updates.',
   },
 ];
 
@@ -98,24 +98,20 @@ function EmptyState({
       <div className="studio-hero">
         <div className="studio-hero-copy">
           <p className="studio-eyebrow">
-            <span aria-hidden /> A SPACE FOR YOUR NEXT BIG THING
+            <span aria-hidden /> AGENT CONVERSATION
           </p>
           <h2
             aria-label={`Say something to ${agentName}`}
             className="studio-hero-title"
           >
-            Less busy.
-            <br />
-            <span>More possibility.</span>
+            Work with <span>{agentName}.</span>
           </h2>
           <p className="studio-hero-description">
-            Think out loud. Find your focus. Make something happen.
-            <br className="hidden lg:block" /> {agentName} is here to help you
-            move things forward.
+            Clarify an objective, inspect progress, or plan the next assignment.
+            Use Operations to dispatch and track durable work.
           </p>
           <div className="studio-hero-signature">
-            <span aria-hidden>↗</span> Human ambition. A little extra
-            intelligence.
+            <span aria-hidden>↗</span> Direct conversation with your agent
           </div>
         </div>
         <div className="studio-sculpture" aria-hidden data-motion="agent-orb">
@@ -376,7 +372,7 @@ export function Composer({
             onClick={onSend}
             disabled={disabled || sending || offline || !draft.trim()}
             aria-label="Send"
-            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-abyss shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
+            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-accent-fg shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
           >
             <SendIcon size={15} />
           </button>
