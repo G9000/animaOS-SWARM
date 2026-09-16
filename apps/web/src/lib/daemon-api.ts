@@ -616,6 +616,8 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
   return {
     ...(state.config.settings?.additional?.workspaceRole === 'lead'
       ? { workspaceRole: 'lead' as const }
+      : state.config.settings?.additional?.workspaceRole === 'helper'
+        ? { workspaceRole: 'helper' as const }
       : {}),
     id: state.id,
     name: state.name,

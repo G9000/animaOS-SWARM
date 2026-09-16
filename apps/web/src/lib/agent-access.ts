@@ -92,11 +92,12 @@ export function deriveAccessProfile(
 export function selectMainAgent(
   agents: readonly AgentDetail[],
 ): AgentDetail | null {
-  if (agents.length === 0) {
+  const companions = agents.filter((agent) => agent.workspaceRole !== 'helper');
+  if (companions.length === 0) {
     return null;
   }
 
-  return [...agents].sort((left, right) => {
+  return [...companions].sort((left, right) => {
     const leadOrder =
       Number(right.workspaceRole === 'lead') -
       Number(left.workspaceRole === 'lead');

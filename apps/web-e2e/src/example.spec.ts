@@ -11,14 +11,15 @@ test('main workspace agent: healthy zero-agent daemon opens onboarding', async (
         ? { status: 'ok' }
         : path === '/agents'
           ? { agents: [] }
-          : path === '/providers'
-            ? { providers: [] }
-            : { error: `unexpected fixture request: ${path}` };
+          : path === '/workspace'
+            ? { configured: false, workspace: null, defaultRoot: '/workspace' }
+            : path === '/providers'
+              ? { providers: [] }
+              : { error: `unexpected fixture request: ${path}` };
     await route.fulfill({
-      status:
-        path === '/health' || path === '/agents' || path === '/providers'
-          ? 200
-          : 404,
+      status: ['/health', '/agents', '/providers', '/workspace'].includes(path)
+        ? 200
+        : 404,
       contentType: 'application/json',
       body: JSON.stringify(body),
     });
@@ -26,7 +27,7 @@ test('main workspace agent: healthy zero-agent daemon opens onboarding', async (
   await page.goto('/');
 
   await expect(
-    page.getByRole('heading', { name: 'Create your main agent' }),
+    page.getByRole('heading', { name: 'Set up your companion' }),
   ).toBeVisible();
   await expect(page.getByRole('navigation')).toHaveCount(0);
 });

@@ -1,0 +1,85 @@
+{
+	email {$ACME_EMAIL}
+	admin off
+	servers {
+		protocols h1 h2
+	}
+}
+
+# Container-local probe only; port 9090 is never published.
+http://127.0.0.1:9090 {
+	bind 127.0.0.1
+	respond /health "ok" 200
+}
+
+{$ANIMA_DOMAIN} {
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy same-origin
+		Strict-Transport-Security "max-age=31536000"
+	}
+
+	# Keep security checks in this explicit order before injecting owner authority.
+	route {
+		basic_auth {
+			{$ANIMA_OWNER_USER} {$ANIMA_OWNER_PASSWORD_HASH}
+		}
+
+		@backend path /api /api/* /health /ready /metrics /openapi.json /docs /docs/*
+		handle @backend {
+			# OAuth state is validated by the daemon. Only these exact GET routes
+			# may arrive through a cross-site navigation from an identity provider.
+			@notCallback {
+				not {
+					method GET
+					path /api/connectors/gcalendar/callback /api/connectors/mail/gmail/callback /api/connectors/mail/outlook/callback
+				}
+			}
+			invoke @notCallback check_browser_origin
+
+			reverse_proxy 127.0.0.1:8080 {
+				# Caddy is the authenticated owner boundary. Browser credentials
+				# never reach the daemon, and daemon credentials never reach JS.
+				header_up Host 127.0.0.1:8080
+				header_up Authorization "Bearer {$ANIMA_LOCAL_ADMIN_TOKEN}"
+				header_up X-Api-Key {$ANIMA_INTERNAL_API_KEY}
+				header_up -Origin
+				header_up -Forwarded
+				header_up -Via
+				header_up -X-Forwarded-*
+				header_up -X-Real-IP
+				header_up -Client-IP
+				header_up -True-Client-IP
+				header_up -CF-Connecting-IP
+				flush_interval -1
+			}
+		}
+
+		handle {
+			root * /srv
+			try_files {path} /index.html
+			file_server
+		}
+	}
+}
+
+&(check_browser_origin) {
+	@wrongOrigin {
+		header Origin *
+		not header Origin https://{$ANIMA_DOMAIN}
+	}
+	respond @wrongOrigin "Origin rejected" 403
+	@crossSite header_regexp Sec-Fetch-Site ^(cross-site|same-site)$
+	respond @crossSite "Cross-site request rejected" 403
+	@unsafeWithoutOrigin {
+		not method GET HEAD OPTIONS
+		not header Origin https://{$ANIMA_DOMAIN}
+	}
+	respond @unsafeWithoutOrigin "Same-origin request required" 403
+	@websocketWithoutOrigin {
+		header Upgrade websocket
+		not header Origin https://{$ANIMA_DOMAIN}
+	}
+	respond @websocketWithoutOrigin "Same-origin websocket required" 403
+}

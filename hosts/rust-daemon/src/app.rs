@@ -224,6 +224,18 @@ pub(crate) async fn serve_with_state(
 }
 
 fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result<DaemonRuntime> {
+    let public_origin = match std::env::var("ANIMA_PUBLIC_BASE_URL") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ANIMA_PUBLIC_BASE_URL must be valid Unicode",
+            ))
+        }
+    };
+    let oauth_apps =
+        crate::connectors::oauth_apps::OAuthAppService::new_for_origin(public_origin.as_deref())?;
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
     let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
     let transport = TelegramClient::new()
@@ -236,7 +248,6 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
     );
     let google_transport = crate::connectors::gcalendar::client::GoogleCalendarClient::new()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-    let oauth_apps = crate::connectors::oauth_apps::OAuthAppService::new();
     let calendar = crate::connectors::gcalendar::CalendarManager::new(
         &state,
         agent_runs.clone(),

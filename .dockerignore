@@ -6,6 +6,12 @@
 .claude
 .superpowers
 .worktrees
+.animaos
+**/.animaos
+.agents
+.codex
+.tmp
+.vscode
 
 node_modules
 target
@@ -17,6 +23,18 @@ coverage
 
 .env
 .env.local
+**/.env*
+!**/.env.example
+**/node_modules
+**/dist
+**/target
+**/.nx
+**/*.tsbuildinfo
+**/data
+**/backups
+**/secrets
+work
+scratchboard
 *.log
 *.tmp
 Thumbs.db

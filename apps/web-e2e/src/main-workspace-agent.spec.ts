@@ -9,23 +9,6 @@ interface FixtureMessage {
   createdAtMs: number;
 }
 
-interface BrowserElement {
-  ownerDocument: {
-    defaultView: {
-      getComputedStyle(target: unknown): {
-        animationDuration: string;
-        animationIterationCount: string;
-        height: string;
-        paddingBottom: string;
-        paddingLeft: string;
-        paddingRight: string;
-        paddingTop: string;
-        transitionDuration: string;
-      };
-    } | null;
-  };
-}
-
 const providers = [
   {
     id: 'openai',
@@ -143,13 +126,25 @@ async function installApiFixture(
       await fulfillJson(route, { agents: state.agents });
       return;
     }
-    if (path === '/agents' && request.method() === 'POST') {
+    if (path === '/workspace') {
+      await fulfillJson(route, {
+        configured: false,
+        workspace: null,
+        defaultRoot: '/workspace',
+      });
+      return;
+    }
+    if (path.includes('/connectors')) {
+      await fulfillJson(route, { connectors: [] });
+      return;
+    }
+    if (path === '/workspace/bootstrap' && request.method() === 'POST') {
       state.createAttempts += 1;
       if (options.failFirstCreate && state.createAttempts === 1) {
         await fulfillJson(route, { error: 'creation refused' }, 500);
         return;
       }
-      const input = request.postDataJSON() as {
+      const input = request.postDataJSON().agent as {
         name: string;
         model: string;
         provider: string;
@@ -218,134 +213,95 @@ async function installApiFixture(
   return state;
 }
 
-async function completeDraftToReview(page: Page, name = 'Nova') {
-  await page.getByRole('textbox', { name: 'Agent name' }).fill(name);
-  await page.getByRole('button', { name: 'Next' }).click();
-  await page.getByRole('button', { name: 'Next' }).click();
-  await page.getByRole('button', { name: 'Next' }).click();
-  await expect(page.getByRole('heading', { name: 'Review' })).toBeVisible();
-}
-
-function longestCssDurationSeconds(value: string) {
-  return Math.max(
-    ...value.split(',').map((duration) => {
-      const trimmed = duration.trim();
-      return trimmed.endsWith('ms')
-        ? Number.parseFloat(trimmed) / 1_000
-        : Number.parseFloat(trimmed);
-    }),
-  );
-}
-
-test('main workspace agent: zero-agent daemon shows onboarding without workspace navigation', async ({
+test('empty workspace opens companion setup without agency navigation', async ({
   page,
 }) => {
   await installApiFixture(page);
   await page.goto('/');
-
   await expect(
-    page.getByRole('heading', { name: 'Create your main agent' }),
+    page.getByRole('heading', { name: 'Set up your companion' }),
   ).toBeVisible();
   await expect(page.getByRole('navigation')).toHaveCount(0);
+  await expect(
+    page.getByRole('button', { name: 'Start chatting' }),
+  ).toBeEnabled();
 });
 
-test('main workspace agent: provider retry preserves Identity and continues onboarding', async ({
+test('provider retry preserves companion identity and preferences', async ({
   page,
 }) => {
   await installApiFixture(page, { failFirstProviders: true });
   await page.goto('/');
-
-  const name = page.getByRole('textbox', { name: 'Agent name' });
-  const instructions = page.getByRole('textbox', {
-    name: 'Instructions (optional)',
-  });
-  await name.fill('Retry Nova');
-  await instructions.fill('Keep this draft');
-  await page.getByRole('button', { name: 'Next' }).click();
-
+  await page.getByLabel('Companion name').fill('Retry Nova');
+  await page
+    .getByText('Personalize and set permissions', { exact: true })
+    .click();
+  const preferences = page.getByLabel(
+    'What should your companion know about you?',
+  );
+  await preferences.fill('Keep this draft');
   await expect(page.getByRole('alert')).toContainText(
     'provider catalog unavailable',
   );
   await page.getByRole('button', { name: 'Retry providers' }).click();
-  await expect(page.getByRole('button', { name: /^OpenAI/ })).toBeVisible();
-
-  await page.getByRole('button', { name: 'Back' }).click();
-  await expect(name).toHaveValue('Retry Nova');
-  await expect(instructions).toHaveValue('Keep this draft');
-  await page.getByRole('button', { name: 'Next' }).click();
-  await page.getByRole('button', { name: 'Next' }).click();
-  await expect(page.getByRole('status')).toContainText('Step 3 of 4: Access');
+  await expect(
+    page.getByRole('button', { name: 'Start chatting' }),
+  ).toBeEnabled();
+  await expect(page.getByLabel('Companion name')).toHaveValue('Retry Nova');
+  await expect(preferences).toHaveValue('Keep this draft');
 });
 
-test('main workspace agent: failed POST preserves the complete onboarding draft', async ({
+test('failed bootstrap preserves the draft and retry creates one companion', async ({
   page,
 }) => {
-  await installApiFixture(page, { failFirstCreate: true });
+  const fixture = await installApiFixture(page, { failFirstCreate: true });
   await page.goto('/');
-  await page.getByRole('textbox', { name: 'Agent name' }).fill('Nova');
+  await page.getByLabel('Companion name').fill('Nova');
   await page
-    .getByRole('textbox', { name: 'Instructions (optional)' })
+    .getByText('Personalize and set permissions', { exact: true })
+    .click();
+  await page
+    .getByLabel('What should your companion know about you?')
     .fill('Be exact');
-  await page.getByRole('button', { name: 'Next' }).click();
-
   await page.getByRole('button', { name: /^Anthropic/ }).click();
-  await page.getByLabel('Model').selectOption('__custom__');
+  await page
+    .getByRole('combobox', { name: 'Model', exact: true })
+    .selectOption('__custom__');
   await page.getByLabel('Custom model').fill('claude-review-custom');
-  await page.getByRole('button', { name: 'Next' }).click();
   await page.getByRole('radio', { name: /^Operate/ }).check();
-  await page.getByRole('button', { name: 'Next' }).click();
-
-  await expect(page.getByRole('status')).toContainText('Step 4 of 4: Review');
-  await expect(
-    page.getByText('Anthropic / claude-review-custom'),
-  ).toBeVisible();
-  await expect(page.getByText('Operate', { exact: true })).toBeVisible();
-
-  await page.getByRole('button', { name: 'Create agent' }).click();
-
+  await page.getByRole('button', { name: 'Start chatting' }).click();
   await expect(page.getByRole('alert')).toContainText('creation refused');
-  await expect(page.getByRole('heading', { name: 'Review' })).toBeVisible();
-  await expect(page.getByText('Nova')).toBeVisible();
-  await expect(page.getByText('Be exact')).toBeVisible();
+  await expect(page.getByLabel('Companion name')).toHaveValue('Nova');
   await expect(
-    page.getByText('Anthropic / claude-review-custom'),
-  ).toBeVisible();
-  await expect(page.getByText('Operate', { exact: true })).toBeVisible();
+    page.getByLabel('What should your companion know about you?'),
+  ).toHaveValue('Be exact');
+  await expect(page.getByLabel('Custom model')).toHaveValue(
+    'claude-review-custom',
+  );
+  await expect(page.getByRole('radio', { name: /^Operate/ })).toBeChecked();
+  await page.getByRole('button', { name: 'Start chatting' }).click();
+  await expect(page.getByPlaceholder('Message Nova…')).toBeVisible();
+  expect(fixture.agents).toHaveLength(1);
+  expect(fixture.agents[0].state.config).toMatchObject({
+    provider: 'anthropic',
+    model: 'claude-review-custom',
+  });
+  expect(fixture.agents[0].state.config.system).toContain('Be exact');
 });
 
-test('main workspace agent: successful POST transitions directly into the centered workspace', async ({
-  page,
-}) => {
-  await installApiFixture(page);
-  await page.goto('/');
-  await completeDraftToReview(page, 'Nova');
-
-  await page.getByRole('button', { name: 'Create agent' }).click();
-
-  await expect(
-    page.getByRole('heading', { name: 'Say something to Nova' }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole('navigation', { name: 'Workspace navigation' }),
-  ).toBeVisible();
-  await expect(page.getByLabel('Daemon online')).toBeVisible();
-  await expect(page.getByText('Agent Idle')).toBeVisible();
-  await expect(page.getByText('Access Collaborate')).toBeVisible();
-});
-
-test('main workspace agent: failed PATCH keeps settings draft and prior main-agent state', async ({
+test('failed settings save preserves draft, conversation and original identity', async ({
   page,
 }) => {
   const main = agentSnapshot(
-    'agent-main',
+    'main',
     'Nova',
     1,
     [],
     [
       {
         id: 'message-1',
-        agentId: 'agent-main',
-        roomId: 'room-1',
+        agentId: 'main',
+        roomId: 'direct:main',
         role: 'assistant',
         content: { text: 'Existing conversation' },
         createdAtMs: 2,
@@ -357,336 +313,106 @@ test('main workspace agent: failed PATCH keeps settings draft and prior main-age
     failFirstPatch: true,
   });
   await page.goto('/');
-
   await expect(page.getByText('Existing conversation')).toBeVisible();
-  await page.getByRole('button', { name: 'Settings' }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const settings = page.getByRole('dialog', { name: 'Agent settings' });
   await expect(settings).toHaveAttribute('aria-modal', 'true');
-  const closeSettings = page.getByRole('button', { name: 'Close settings' });
-  await expect(closeSettings).toBeFocused();
   await expect(page.getByTestId('workspace-background')).toHaveAttribute(
-    'aria-hidden',
-    'true',
+    'inert',
+    '',
   );
-  await page.keyboard.press('Shift+Tab');
-  await expect(settings.getByRole('button', { name: 'Reset' })).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(closeSettings).toBeFocused();
-  const name = settings.locator('input.field').first();
-  const provider = settings.getByRole('combobox').nth(0);
-  const model = settings.getByRole('combobox').nth(1);
+  const name = settings.getByLabel('Name', { exact: true });
   await name.fill('Nova Draft');
-  await provider.selectOption('anthropic');
-  await model.selectOption('__custom__');
-  const customModel = settings.getByPlaceholder('model id, e.g. llama3.1');
-  await customModel.fill('claude-settings-custom');
-  const system = settings.getByPlaceholder(
-    'Leave empty for the daemon default.',
-  );
-  await system.fill('Draft system prompt');
-
   await settings.getByRole('button', { name: 'Save changes' }).click();
-
   await expect(settings.getByText('settings refused')).toBeVisible();
-  await expect(
-    settings.getByRole('heading', { name: 'Agent settings' }),
-  ).toBeVisible();
   await expect(name).toHaveValue('Nova Draft');
-  await expect(provider).toHaveValue('anthropic');
-  await expect(model).toHaveValue('__custom__');
-  await expect(customModel).toHaveValue('claude-settings-custom');
-  await expect(system).toHaveValue('Draft system prompt');
-  await closeSettings.click();
-  await expect(page.getByRole('button', { name: 'Settings' })).toBeFocused();
-  await expect(page.getByTestId('workspace-background')).not.toHaveAttribute(
-    'aria-hidden',
-    'true',
-  );
+  await settings.getByRole('button', { name: 'Close settings' }).click();
   await expect(
-    page.getByRole('heading', { name: 'Nova', exact: true }),
-  ).toBeVisible();
+    page.getByRole('button', { name: 'Settings', exact: true }),
+  ).toBeFocused();
   await expect(page.getByText('Existing conversation')).toBeVisible();
-  expect(fixture.agents[0]?.state.name).toBe('Nova');
-  expect(fixture.agents[0]?.state.config).toMatchObject({
-    name: 'Nova',
-    provider: 'openai',
-    model: 'gpt-4.1',
-    system: 'Be precise',
-  });
-  expect(fixture.agents[0]?.messages).toHaveLength(1);
+  expect(fixture.agents[0].state.name).toBe('Nova');
+  expect(fixture.agents[0].messages).toHaveLength(1);
 });
 
-test('main workspace agent: multiple agents select the oldest then id and identify Main', async ({
+test('existing agents remain intact while the oldest identity is selected', async ({
   page,
 }) => {
-  await installApiFixture(page, {
+  const fixture = await installApiFixture(page, {
     agents: [
-      agentSnapshot('agent-later', 'Later', 20),
-      agentSnapshot('agent-b', 'Beta', 10),
-      agentSnapshot('agent-a', 'Alpha', 10),
+      agentSnapshot('later', 'Later', 20),
+      agentSnapshot('b', 'Beta', 10),
+      agentSnapshot('a', 'Alpha', 10),
     ],
   });
   await page.goto('/');
-
+  await expect(page.getByPlaceholder('Message Alpha…')).toBeVisible();
   await expect(
-    page.getByRole('heading', { name: 'Say something to Alpha' }),
-  ).toBeVisible();
-  const desktopNavigation = page.getByRole('navigation', {
-    name: 'Workspace navigation',
-  });
-  expect((await desktopNavigation.boundingBox())?.y).toBeLessThan(180);
-  await page.getByRole('button', { name: 'Agents' }).click();
+    page.getByRole('combobox', { name: 'Chat with agent' }),
+  ).toHaveCount(0);
   await expect(
-    page.getByRole('article', { name: 'Alpha agent' }),
-  ).toContainText('Main');
-  await expect(page.getByRole('article', { name: 'Beta agent' })).toContainText(
-    'Read only',
-  );
+    page.getByRole('button', { name: 'Team', exact: true }),
+  ).toHaveCount(0);
+  expect(fixture.agents.map((agent) => agent.state.id)).toEqual([
+    'later',
+    'b',
+    'a',
+  ]);
+  expect(fixture.createAttempts).toBe(0);
 });
 
-test('main workspace agent: offline daemon shows focused recovery without onboarding', async ({
-  page,
-}) => {
+test('offline daemon shows recovery without onboarding', async ({ page }) => {
   await installApiFixture(page, { offline: true });
   await page.goto('/');
-
   await expect(page.getByRole('alert')).toContainText('Offline');
-  await expect(page.getByRole('alert')).toContainText('bun dev --host rust');
   await expect(
     page.getByRole('button', { name: 'Retry connection' }),
   ).toBeFocused();
   await expect(
-    page.getByRole('heading', { name: 'Create your main agent' }),
+    page.getByRole('heading', { name: 'Set up your companion' }),
   ).toHaveCount(0);
-  await expect(page.getByRole('navigation')).toHaveCount(0);
 });
 
-test('main workspace agent: 390x844 viewport places the same destinations in a bottom dock', async ({
+test('mobile chat keeps a bounded navigation dock and reports disconnection', async ({
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await installApiFixture(page, {
-    agents: [agentSnapshot('agent-main', 'Nova', 1)],
+    agents: [agentSnapshot('main', 'Nova', 1)],
     failAgentListsAfterFirst: true,
   });
   await page.goto('/');
-
-  await expect(page.getByTestId('compact-daemon-status')).toContainText(
-    'Daemon Online',
-  );
-  const appHeight = await page.locator('.app-viewport').evaluate((element) => {
-    const browserElement = element as unknown as BrowserElement;
-    const style =
-      browserElement.ownerDocument.defaultView?.getComputedStyle(
-        browserElement,
-      );
-    if (!style) throw new Error('app viewport has no browser view');
-    return Number.parseFloat(style.height);
-  });
-  expect(appHeight).toBe(844);
-
   const navigation = page.getByRole('navigation', {
     name: 'Workspace navigation',
   });
+  await expect(navigation).toHaveAttribute('data-placement', 'bottom-dock');
   await expect(
-    page.locator('main + nav[data-placement="bottom-dock"]'),
-  ).toBeVisible();
-  await expect(
-    navigation.getByRole('button', { name: 'Workspace' }),
-  ).toBeVisible();
-  await expect(
-    navigation.getByRole('button', { name: 'Activity' }),
-  ).toBeVisible();
-  await expect(
-    navigation.getByRole('button', { name: 'Agents' }),
+    navigation.getByRole('button', { name: 'Chat', exact: true }),
   ).toBeVisible();
   const box = await navigation.boundingBox();
-  expect(box?.y).toBeGreaterThan(740);
-  expect((box?.y ?? 0) + (box?.height ?? 0)).toBeLessThanOrEqual(844);
-  await expect(page.getByTestId('compact-daemon-status')).toContainText(
-    'Daemon Offline',
-    { timeout: 7_000 },
-  );
-});
-
-test('main workspace agent: landscape safe-area insets protect workspace and settings chrome', async ({
-  page,
-}) => {
-  await page.setViewportSize({ width: 844, height: 390 });
-  await installApiFixture(page, {
-    agents: [agentSnapshot('agent-main', 'Nova', 1)],
-  });
-  await page.goto('/');
-  await page.locator('html').evaluate((element) => {
-    const style = (
-      element as unknown as {
-        style: { setProperty(property: string, value: string): void };
-      }
-    ).style;
-    style.setProperty('--safe-area-top', '13px');
-    style.setProperty('--safe-area-right', '29px');
-    style.setProperty('--safe-area-bottom', '17px');
-    style.setProperty('--safe-area-left', '23px');
-  });
-
-  const safePadding = async (selector: string) =>
-    page.locator(selector).evaluate((element) => {
-      const browserElement = element as unknown as BrowserElement;
-      const style =
-        browserElement.ownerDocument.defaultView?.getComputedStyle(
-          browserElement,
-        );
-      if (!style) throw new Error('safe-area surface has no browser view');
-      return [
-        style.paddingTop,
-        style.paddingRight,
-        style.paddingBottom,
-        style.paddingLeft,
-      ];
-    });
-
-  expect(await safePadding('.app-viewport')).toEqual([
-    '13px',
-    '29px',
-    '17px',
-    '23px',
-  ]);
-  const headerBox = await page.locator('header').boundingBox();
-  expect(headerBox?.x).toBeGreaterThanOrEqual(23);
-  expect((headerBox?.x ?? 0) + (headerBox?.width ?? 0)).toBeLessThanOrEqual(
-    844 - 29,
-  );
-
-  await page.getByRole('button', { name: 'Settings' }).click();
-  expect(await safePadding('[role="dialog"]')).toEqual([
-    '13px',
-    '29px',
-    '17px',
-    '23px',
-  ]);
-});
-
-test('main workspace agent: reduced motion keeps the workspace operable with near-instant motion', async ({
-  page,
-}) => {
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  await installApiFixture(page, {
-    agents: [agentSnapshot('agent-main', 'Nova', 1)],
-  });
-  await page.goto('/');
-
-  const orb = page.locator('[data-motion="agent-orb"]');
-  await expect(orb).toBeVisible();
-  const orbMotion = await orb.evaluate((element) => {
-    const browserElement = element as unknown as BrowserElement;
-    const style =
-      browserElement.ownerDocument.defaultView?.getComputedStyle(
-        browserElement,
-      );
-    if (!style) {
-      throw new Error('orb has no browser view');
-    }
-    return {
-      animationDuration: style.animationDuration,
-      animationIterationCount: style.animationIterationCount,
-    };
+  expect(box!.y).toBeGreaterThan(700);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+  await expect(page.getByText('Offline', { exact: true })).toBeVisible({
+    timeout: 7000,
   });
   expect(
-    longestCssDurationSeconds(orbMotion.animationDuration),
-  ).toBeLessThanOrEqual(0.001);
-  expect(orbMotion.animationIterationCount).toBe('1');
-
-  const agentsDestination = page.getByRole('button', { name: 'Agents' });
-  const destinationTransition = await agentsDestination.evaluate((element) => {
-    const browserElement = element as unknown as BrowserElement;
-    const style =
-      browserElement.ownerDocument.defaultView?.getComputedStyle(
-        browserElement,
-      );
-    if (!style) {
-      throw new Error('destination has no browser view');
-    }
-    return style.transitionDuration;
-  });
-  expect(longestCssDurationSeconds(destinationTransition)).toBeLessThanOrEqual(
-    0.001,
-  );
-  await agentsDestination.click();
-  await expect(page.getByRole('heading', { name: 'Agents' })).toBeVisible();
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
 });
 
-test('main workspace agent: keyboard steps announce progress, focus invalid fields, and expose status labels', async ({
+test('keyboard can submit companion setup after entering a valid name', async ({
   page,
 }) => {
   await installApiFixture(page);
   await page.goto('/');
-
-  const name = page.getByRole('textbox', { name: 'Agent name' });
-  await expect(name).toBeVisible();
-  await page.keyboard.press('Tab');
-  await expect(name).toBeFocused();
-  await page.keyboard.press('Control+A');
-  await page.keyboard.press('Backspace');
-  await page.keyboard.press('Tab');
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(name).toBeFocused();
-  await expect(page.getByRole('alert')).toContainText('Enter an agent name.');
-
-  await page.keyboard.type('Nova');
-  await page.keyboard.press('Tab');
-  await page.keyboard.type('Keyboard-only instructions');
-  await page.keyboard.press('Shift+Tab');
-  await expect(name).toBeFocused();
-  await page.keyboard.press('Tab');
-  await page.keyboard.press('Tab');
-  await page.keyboard.press('Enter');
-  await expect(page.getByRole('status')).toContainText(
-    'Step 2 of 4: Intelligence',
-  );
-  await expect(page.getByRole('button', { name: /^OpenAI/ })).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: /^Anthropic/ })).toBeFocused();
-  await page.keyboard.press('Space');
-  await page.keyboard.press('Tab');
-  await expect(page.getByLabel('Model')).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(page.getByRole('status')).toContainText('Step 3 of 4: Access');
-
-  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
-  await page.keyboard.press('Shift+Tab');
-  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
-  await page.keyboard.press('Shift+Tab');
-  await expect(page.getByRole('radio', { name: /^Collaborate/ })).toBeFocused();
-  await page.keyboard.press('ArrowDown');
-  await expect(page.getByRole('radio', { name: /^Operate/ })).toBeFocused();
-  await page.keyboard.press('Space');
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'Next' })).toBeFocused();
-  await page.keyboard.press('Enter');
-  await expect(page.getByRole('status')).toContainText('Step 4 of 4: Review');
-  await expect(page.getByText('Keyboard-only instructions')).toBeVisible();
-  await expect(page.getByText('Operate', { exact: true })).toBeVisible();
-
-  await page.keyboard.press('Tab');
-  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
-  await page.keyboard.press('Tab');
+  const name = page.getByLabel('Companion name');
+  await name.fill('');
   await expect(
-    page.getByRole('button', { name: 'Create agent' }),
-  ).toBeFocused();
-  await page.keyboard.press('Shift+Tab');
-  await expect(page.getByRole('button', { name: 'Back' })).toBeFocused();
-  await page.keyboard.press('Tab');
-  await page.keyboard.press('Enter');
-
-  await expect(page.getByLabel('Daemon online')).toBeVisible();
-  await expect(page.getByLabel('Agent idle')).toBeVisible();
-  await expect(page.getByLabel('Operate access profile')).toBeVisible();
+    page.getByRole('button', { name: 'Start chatting' }),
+  ).toBeDisabled();
+  await name.fill('Keyboard Nova');
+  await name.press('Enter');
+  await expect(page.getByPlaceholder('Message Keyboard Nova…')).toBeVisible();
 });

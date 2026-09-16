@@ -7,14 +7,8 @@ import type { AgentDetail } from '../lib/types';
 import { WorkspaceShell } from './WorkspaceShell';
 import { daemon } from '../lib/daemon-api';
 
-it('lands on operations and opens the manager conversation deliberately', async () => {
-  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({
-    tasks: [],
-    revision: '1',
-  });
-  vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
+it('lands on the companion conversation without dispatching work', () => {
   const main = agent('main', 'Nova', 1);
-  const select = vi.fn();
   render(
     <WorkspaceShell
       mainAgent={main}
@@ -22,19 +16,16 @@ it('lands on operations and opens the manager conversation deliberately', async 
       connection="online"
       workspace={<div>Conversation canvas</div>}
       activity={<div>Activity</div>}
-      onSelectAgent={select}
       onOpenSettings={vi.fn()}
     />,
   );
   expect(
-    screen.getByRole('button', { name: 'Operations', exact: true }),
+    screen.getByRole('button', { name: 'Chat', exact: true }),
   ).toHaveAttribute('aria-current', 'page');
-  expect(screen.queryByText('Conversation canvas')).not.toBeInTheDocument();
-  await userEvent.click(
-    screen.getByRole('button', { name: 'Open manager chat' }),
-  );
-  expect(select).toHaveBeenCalledWith('main');
   expect(screen.getByText('Conversation canvas')).toBeVisible();
+  expect(
+    screen.queryByRole('button', { name: 'Operations' }),
+  ).not.toBeInTheDocument();
 });
 
 function agent(
@@ -148,9 +139,7 @@ describe('WorkspaceShell', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Enter focus mode' }));
     expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
-    expect(
-      screen.getByRole('heading', { name: 'Operations', exact: true }),
-    ).toBeVisible();
+    expect(screen.getByText('Workspace canvas')).toBeVisible();
     await user.click(screen.getByRole('button', { name: 'Exit focus mode' }));
     expect(screen.getByRole('complementary')).toBeVisible();
   });
@@ -209,10 +198,9 @@ describe('WorkspaceShell', () => {
     expect(screen.getByText('Workspace canvas')).toBeVisible();
   });
 
-  it('filters agents by provider and shows a useful empty state', async () => {
-    const user = userEvent.setup();
+  it('keeps helpers out of the top-level navigation', () => {
     const nova = agent('agent-main', 'Nova', 1);
-    const scout = agent('scout', 'Scout', 2, { provider: 'anthropic' });
+    const scout = agent('scout', 'Scout', 2);
     render(
       <WorkspaceShell
         mainAgent={nova}
@@ -223,21 +211,15 @@ describe('WorkspaceShell', () => {
         onOpenSettings={vi.fn()}
       />,
     );
-    await user.click(screen.getByRole('button', { name: 'Team' }));
-    await user.type(
-      screen.getByRole('searchbox', { name: 'Search agents' }),
-      'anthropic',
-    );
-    expect(screen.getByRole('article', { name: 'Scout agent' })).toBeVisible();
     expect(
-      screen.queryByRole('article', { name: 'Nova agent' }),
+      screen.queryByRole('button', { name: 'Team' }),
     ).not.toBeInTheDocument();
-    await user.type(
-      screen.getByRole('searchbox', { name: 'Search agents' }),
-      'missing',
-    );
-    expect(screen.getByText('No agents match your search.')).toBeVisible();
+    expect(
+      screen.queryByRole('button', { name: 'Message Scout' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText('Workspace canvas')).toBeVisible();
   });
+
   it('shows a dedicated Telegram destination only when a connector exists', async () => {
     const user = userEvent.setup();
     const nova = agent('agent-main', 'Nova', 1);
@@ -270,10 +252,8 @@ describe('WorkspaceShell', () => {
     expect(screen.getByText('Telegram canvas')).toBeVisible();
   });
 
-  it('uses a left sidebar for desktop workspace navigation', async () => {
-    const user = userEvent.setup();
+  it('uses a left sidebar and returns to the mounted conversation', async () => {
     const nova = agent('agent-main', 'Nova', 1);
-
     render(
       <WorkspaceShell
         mainAgent={nova}
@@ -284,41 +264,26 @@ describe('WorkspaceShell', () => {
         onOpenSettings={vi.fn()}
       />,
     );
-
     const navigation = screen.getByRole('navigation', {
       name: 'Workspace navigation',
     });
     expect(navigation).toHaveAttribute('data-placement', 'sidebar');
     expect(navigation).toHaveAttribute('aria-orientation', 'vertical');
-    const sidebar = navigation.closest('aside');
-    expect(sidebar).not.toBeNull();
-    expect(sidebar?.nextElementSibling?.tagName).toBe('MAIN');
+    expect(navigation.closest('aside')?.nextElementSibling?.tagName).toBe(
+      'MAIN',
+    );
     expect(
-      within(navigation).getByRole('button', { name: 'Operations' }),
+      within(navigation).getByRole('button', { name: 'Chat' }),
     ).toHaveAttribute('aria-current', 'page');
-    expect(
-      within(navigation).getByRole('button', { name: 'Activity' }),
-    ).toBeVisible();
-    expect(
-      within(navigation).getByRole('button', { name: 'Team' }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole('heading', { name: 'Operations', exact: true }),
-    ).toBeVisible();
-
-    await user.click(
+    await userEvent.click(
       within(navigation).getByRole('button', { name: 'Activity' }),
     );
     expect(screen.getByText('Activity canvas')).toBeVisible();
-    expect(screen.queryByText('Workspace canvas')).not.toBeInTheDocument();
-
-    await user.click(within(navigation).getByRole('button', { name: 'Team' }));
-    expect(screen.getByRole('heading', { name: 'Team' })).toBeVisible();
-    expect(
-      within(screen.getByRole('article', { name: 'Nova agent' })).getByText(
-        'Main',
-      ),
-    ).toBeVisible();
+    expect(screen.getByText('Workspace canvas')).not.toBeVisible();
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Open companion chat' }),
+    );
+    expect(screen.getByText('Workspace canvas')).toBeVisible();
   });
 
   it('shows the main agent identity in the sidebar presence block', () => {
@@ -340,7 +305,7 @@ describe('WorkspaceShell', () => {
       within(sidebar).getByRole('heading', { name: 'Nova' }),
     ).toBeVisible();
     expect(within(sidebar).getByText('Welcome back')).toBeVisible();
-    expect(within(sidebar).getByText('Main')).toBeVisible();
+    expect(within(sidebar).getByText('Companion')).toBeVisible();
   });
 
   it('shows the persisted workspace avatar and uploads a replacement', async () => {
@@ -430,33 +395,22 @@ describe('WorkspaceShell', () => {
     expect(within(bar).getByRole('button', { name: 'Settings' })).toBeVisible();
   });
 
-  it('marks the main agent and identifies additional teammates', async () => {
-    const user = userEvent.setup();
+  it('shows working helpers as status without introducing another persona', () => {
     const main = agent('agent-main', 'Nova', 1);
-    const additional = agent('agent-other', 'Echo', 2, { status: 'Completed' });
-
+    const helper = agent('helper', 'Research', 2, { status: 'Running' });
     render(
       <WorkspaceShell
         mainAgent={main}
-        agents={[additional, main]}
+        agents={[helper, main]}
         connection="online"
         workspace={<div>Workspace canvas</div>}
-        activity={<div>Activity canvas</div>}
+        activity={null}
         onOpenSettings={vi.fn()}
       />,
     );
-
-    await user.click(screen.getByRole('button', { name: 'Team' }));
-    const mainEntry = screen.getByRole('article', { name: 'Nova agent' });
-    const additionalEntry = screen.getByRole('article', { name: 'Echo agent' });
-    expect(within(mainEntry).getByText('Main')).toBeVisible();
-    expect(within(additionalEntry).getByText('Teammate')).toBeVisible();
-    expect(within(additionalEntry).getByText('Agent Completed')).toBeVisible();
+    expect(screen.getByText('1 helper is working')).toBeVisible();
     expect(
-      within(additionalEntry).queryByRole('button'),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole('button', { name: /create agent/i }),
+      screen.queryByRole('article', { name: 'Research agent' }),
     ).not.toBeInTheDocument();
   });
 
@@ -517,9 +471,9 @@ describe('WorkspaceShell', () => {
     expect(content.parentElement?.nextElementSibling).toBe(navigation);
     expect(
       screen
-        .getByRole('button', { name: 'Open manager chat' })
+        .getByRole('button', { name: 'Workspace action' })
         .compareDocumentPosition(
-          screen.getByRole('button', { name: 'Operations' }),
+          screen.getByRole('button', { name: 'Chat', exact: true }),
         ) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).not.toBe(0);
   });

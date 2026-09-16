@@ -212,6 +212,7 @@ fn registry_defines_every_registered_tool_schema() {
     let expectations = [
         ("list_workspace_agents", &[][..], &[][..]),
         ("delegate_to_agent", &["agent_id", "task"][..], &[][..]),
+        ("spawn_helper", &["name", "task"][..], &[][..]),
         ("memory_search", &["query"][..], &["limit"][..]),
         ("memory_add", &["content"][..], &["type", "importance"][..]),
         ("recent_memories", &[][..], &["limit"][..]),

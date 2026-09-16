@@ -10,7 +10,7 @@ import {
 import { ActivityView } from './components/ActivityView';
 import { Composer, MessageList } from './components/ChatScreen';
 import { AlertIcon } from './components/icons';
-import { OnboardingFlow } from './components/onboarding/OnboardingFlow';
+import { CompanionSetup } from './components/onboarding/CompanionSetup';
 import { SettingsPanel } from './components/SettingsPanel';
 import { ConnectorsView } from './components/ConnectorsView';
 import { TelegramSettings } from './components/TelegramSettings';
@@ -115,8 +115,8 @@ export function ViewHarness() {
     [agentSnapshots],
   );
   const mainAgent = selectMainAgent(agents);
-  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const agent = agents.find((item) => item.id === selectedAgentId) ?? mainAgent;
+  // Helpers are implementation details, never a second top-level persona.
+  const agent = mainAgent;
   const availableAgentIdsRef = useRef(new Set<string>());
   availableAgentIdsRef.current = new Set(agents.map((item) => item.id));
 
@@ -478,7 +478,11 @@ export function ViewHarness() {
     }
   };
 
-  const sendToAgent = async (targetId: string, content: string, preserveDraft = false) => {
+  const sendToAgent = async (
+    targetId: string,
+    content: string,
+    preserveDraft = false,
+  ) => {
     const text = content.trim();
     if (
       !text ||
@@ -491,7 +495,11 @@ export function ViewHarness() {
       return;
     const clientRequestId = crypto.randomUUID();
     pendingSendsRef.current.add(targetId);
-    updateChat(targetId, { sending: true, error: null, ...(preserveDraft ? {} : { draft: '' }) });
+    updateChat(targetId, {
+      sending: true,
+      error: null,
+      ...(preserveDraft ? {} : { draft: '' }),
+    });
     try {
       const { agent: updatedAgent, result } = await daemon.runAgent(
         targetId,
@@ -538,7 +546,7 @@ export function ViewHarness() {
       }
     }
   };
-  const send = () => agent ? sendToAgent(agent.id, draft) : Promise.resolve();
+  const send = () => (agent ? sendToAgent(agent.id, draft) : Promise.resolve());
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {
     return <ConnectingState />;
@@ -551,7 +559,7 @@ export function ViewHarness() {
   const onboardingLifecycleGeneration = agentLifecycleGenerationRef.current;
   if (!agent) {
     return (
-      <OnboardingFlow
+      <CompanionSetup
         providers={providers}
         providersError={providersError}
         retryProviders={retryProviders}
@@ -599,16 +607,10 @@ export function ViewHarness() {
       >
         <WorkspaceShell
           mainAgent={mainAgent ?? agent}
-          activeAgent={agent}
-          onSelectAgent={setSelectedAgentId}
           agents={agents}
           connection={connection}
           onOpenSettings={openSettings}
           onChangeWorkspaceAvatar={changeWorkspaceAvatar}
-          onStartAssignment={(id, prompt) => {
-            setSelectedAgentId(id);
-            void sendToAgent(id, prompt, true);
-          }}
           onPickPrompt={(prompt) =>
             setDraft((current) =>
               current.trim() ? `${current}\n\n${prompt}` : prompt,
@@ -642,12 +644,10 @@ export function ViewHarness() {
                 message.roomId?.startsWith('peer:'),
               ) && (
                 <details className="shrink-0 border-b border-line px-4 py-2 text-xs text-ink-2">
-                  <summary className="cursor-pointer">
-                    Agent conversations
-                  </summary>
+                  <summary className="cursor-pointer">Delegated work</summary>
                   <div
                     className="mt-2 max-h-48 overflow-y-auto space-y-3"
-                    aria-label="Agent conversations"
+                    aria-label="Delegated work"
                   >
                     {agent.messages
                       .filter((message) => message.roomId?.startsWith('peer:'))
@@ -684,7 +684,7 @@ export function ViewHarness() {
                             (item) => item.id === communication?.toAgentId,
                           )?.name ??
                           communication?.toAgentId ??
-                          'teammate';
+                          'helper';
                         return (
                           <article key={message.id}>
                             <p className="font-medium">
@@ -712,7 +712,7 @@ export function ViewHarness() {
                       )?.kind !== 'peer',
                   ),
                 }}
-                sending={sending}
+                sending={sending || agent.status === 'Running'}
                 scrollerRef={scrollerRef}
                 onSuggestion={setDraft}
               />
@@ -721,7 +721,7 @@ export function ViewHarness() {
                 draft={draft}
                 setDraft={setDraft}
                 sending={sending}
-                disabled={resetting}
+                disabled={resetting || agent.status === 'Running'}
                 offline={connection === 'offline'}
                 onSend={send}
                 error={workspaceError}

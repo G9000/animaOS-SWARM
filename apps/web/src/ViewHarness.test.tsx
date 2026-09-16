@@ -91,105 +91,52 @@ function mockProviders() {
   vi.spyOn(daemon, 'listProviders').mockResolvedValue({ providers });
 }
 
-it('starts the prepared assignment only on click, targets the manager and preserves chat drafts', async () => {
-  const user = userEvent.setup();
+it('opens the main companion without automatically executing a prepared assignment', async () => {
   const alpha = snapshot('alpha', 'Alpha', 1);
   alpha.state.config.system =
-    'Coordinate the team.\n\nPrepared first assignment (do not start until the owner asks):\nDraft a weekly plan.';
+    'Prepared first assignment (do not start until the owner asks):\\nDraft a weekly plan.';
   const beta = snapshot('beta', 'Beta', 2);
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
   mockProviders();
-  const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
-  const send = vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+  const send = vi.spyOn(daemon, 'runAgent');
   render(<ViewHarness />);
-  expect(
-    await screen.findByRole('heading', { name: 'Operations', exact: true }),
-  ).toBeVisible();
+  expect(await screen.findByPlaceholderText('Message Alpha…')).toBeVisible();
   expect(send).not.toHaveBeenCalled();
-  await user.click(screen.getByRole('button', { name: 'Chat', exact: true }));
-  await user.type(
-    screen.getByPlaceholderText('Message Alpha…'),
-    'Keep my manager draft',
-  );
-  await user.click(
-    screen.getByRole('button', { name: 'Message Beta', exact: true }),
-  );
-  await user.type(
-    screen.getByPlaceholderText('Message Beta…'),
-    'Keep my specialist draft',
-  );
-  await user.click(
-    screen.getByRole('button', { name: 'Overview', exact: true }),
-  );
-  await user.click(
-    screen.getByRole('button', { name: 'Start first assignment' }),
-  );
-  expect(send).toHaveBeenCalledExactlyOnceWith(
-    'alpha',
-    'Draft a weekly plan.',
-    { clientRequestId: expect.any(String) },
-    'direct:alpha',
-  );
-  expect(screen.getByPlaceholderText('Message Alpha…')).toHaveValue(
-    'Keep my manager draft',
-  );
-  await user.click(
-    screen.getByRole('button', { name: 'Message Beta', exact: true }),
-  );
-  expect(screen.getByPlaceholderText('Message Beta…')).toHaveValue(
-    'Keep my specialist draft',
-  );
-  await act(async () =>
-    run.resolve({
-      agent: withMessage(alpha, 'Weekly plan ready'),
-      result: {
-        status: 'success',
-        durationMs: 1,
-        data: { text: 'Weekly plan ready' },
-      },
-    }),
-  );
+  expect(
+    screen.queryByRole('button', { name: 'Team' }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: 'Message Beta' }),
+  ).not.toBeInTheDocument();
 });
 
-it('keeps individual drafts and failed sends while switching agents', async () => {
+it('keeps the companion draft and failed send while inspecting activity', async () => {
   const user = userEvent.setup();
   const alpha = snapshot('alpha', 'Alpha', 1);
-  const beta = snapshot('beta', 'Beta', 2);
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha] });
   mockProviders();
   const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
   vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
   render(<ViewHarness />);
-  await openChat();
   await user.type(
     await screen.findByPlaceholderText('Message Alpha…'),
     'Alpha request',
   );
   await user.click(screen.getByRole('button', { name: 'Send' }));
   await user.click(
-    screen.getByRole('button', { name: 'Message Beta', exact: true }),
+    screen.getByRole('button', { name: 'Activity', exact: true }),
   );
-  await user.type(screen.getByPlaceholderText('Message Beta…'), 'Beta draft');
   await act(async () => {
     run.reject(new Error('Alpha disconnected'));
   });
-  expect(screen.queryByText('Alpha disconnected')).not.toBeInTheDocument();
-  await user.click(
-    screen.getByRole('button', { name: 'Message Alpha', exact: true }),
-  );
+  await user.click(screen.getByRole('button', { name: 'Chat', exact: true }));
   await user.click(
     await screen.findByRole('button', { name: 'Restore message' }),
   );
   expect(screen.getByPlaceholderText('Message Alpha…')).toHaveValue(
     'Alpha request',
-  );
-  await user.click(
-    screen.getByRole('button', { name: 'Message Beta', exact: true }),
-  );
-  expect(screen.getByPlaceholderText('Message Beta…')).toHaveValue(
-    'Beta draft',
   );
 });
 
@@ -209,7 +156,7 @@ function withMessage(source: DaemonSnapshot, text: string): DaemonSnapshot {
   return updated;
 }
 
-it('retains a completed reply after switching away and scopes settings to the selected teammate', async () => {
+it('retains a completed reply after checking activity and keeps settings on the companion', async () => {
   const user = userEvent.setup();
   const alpha = snapshot('alpha', 'Alpha', 1);
   const beta = snapshot('beta', 'Beta', 2);
@@ -219,15 +166,15 @@ it('retains a completed reply after switching away and scopes settings to the se
   const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
   vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
   render(<ViewHarness />);
-  await openChat();
   await user.type(
     await screen.findByPlaceholderText('Message Alpha…'),
     'Alpha request',
   );
   await user.click(screen.getByRole('button', { name: 'Send' }));
-  await user.click(screen.getByRole('button', { name: 'Team' }));
-  await user.click(screen.getByRole('button', { name: 'Chat with Beta' }));
-  await act(async () => {
+  await user.click(
+    screen.getByRole('button', { name: 'Activity', exact: true }),
+  );
+  await act(async () =>
     run.resolve({
       agent: withMessage(alpha, 'Alpha finished'),
       result: {
@@ -235,18 +182,16 @@ it('retains a completed reply after switching away and scopes settings to the se
         durationMs: 1,
         data: { text: 'Alpha finished' },
       },
-    });
-  });
-  expect(screen.queryByText('Alpha finished')).not.toBeInTheDocument();
+    }),
+  );
+  expect(screen.getByText('Alpha finished')).not.toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Settings' }));
   expect(
-    within(screen.getByRole('dialog')).getByDisplayValue('Beta'),
+    within(screen.getByRole('dialog')).getByDisplayValue('Alpha'),
   ).toBeInTheDocument();
   await user.click(screen.getByRole('button', { name: 'Close settings' }));
-  await user.click(
-    screen.getByRole('button', { name: 'Message Alpha', exact: true }),
-  );
-  expect(screen.getByText('Alpha finished')).toBeInTheDocument();
+  await user.click(screen.getByRole('button', { name: 'Chat', exact: true }));
+  expect(screen.getByText('Alpha finished')).toBeVisible();
 });
 
 it('keeps peer messages separate from the owner conversation', async () => {
@@ -290,7 +235,7 @@ it('keeps peer messages separate from the owner conversation', async () => {
     ),
   ).not.toBeInTheDocument();
   expect(
-    within(screen.getByLabelText('Agent conversations')).getByText(
+    within(screen.getByLabelText('Delegated work')).getByText(
       'Private teammate request',
     ),
   ).toBeInTheDocument();
@@ -500,7 +445,7 @@ describe('ViewHarness workspace controller', () => {
     render(<ViewHarness />);
 
     expect(
-      await screen.findByRole('heading', { name: 'Set up your workspace' }),
+      await screen.findByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
     expect(screen.queryByText('Welcome back')).not.toBeInTheDocument();
@@ -536,13 +481,10 @@ describe('ViewHarness workspace controller', () => {
       'direct:agent-a',
     );
 
-    await user.click(screen.getByRole('button', { name: 'Team' }));
+    expect(screen.getByText('Companion')).toBeVisible();
     expect(
-      screen.getByRole('article', { name: 'Alpha agent' }),
-    ).toHaveTextContent('Main');
-    expect(
-      screen.getByRole('article', { name: 'Beta agent' }),
-    ).toHaveTextContent('Teammate');
+      screen.queryByRole('button', { name: 'Message Beta' }),
+    ).not.toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Settings' }));
     expect(
@@ -783,7 +725,7 @@ describe('ViewHarness workspace controller', () => {
       await deletion.promise;
     });
     expect(
-      await screen.findByRole('heading', { name: 'Set up your workspace' }),
+      await screen.findByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
   });
 
@@ -1089,7 +1031,7 @@ describe('ViewHarness workspace controller', () => {
     await user.click(screen.getByRole('button', { name: 'Reset' }));
 
     expect(
-      await screen.findByRole('heading', { name: 'Set up your workspace' }),
+      await screen.findByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
   });
@@ -1115,7 +1057,7 @@ describe('ViewHarness workspace controller', () => {
     await user.click(screen.getByRole('button', { name: 'Reset' }));
 
     expect(
-      await screen.findByRole('heading', { name: 'Set up your workspace' }),
+      await screen.findByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
     expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-only');
     expect(screen.queryByRole('navigation')).not.toBeInTheDocument();
@@ -1159,7 +1101,7 @@ describe('ViewHarness workspace controller', () => {
       await deletion.promise;
     });
     expect(
-      await screen.findByRole('heading', { name: 'Set up your workspace' }),
+      await screen.findByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
 
     await act(async () => {
@@ -1167,7 +1109,7 @@ describe('ViewHarness workspace controller', () => {
       await stalePoll.promise;
     });
     expect(
-      screen.getByRole('heading', { name: 'Set up your workspace' }),
+      screen.getByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
     expect(
       screen.queryByRole('heading', { name: 'Say something to Nova' }),
@@ -1263,10 +1205,9 @@ describe('ViewHarness workspace controller', () => {
       screen.getByRole('heading', { name: 'Say something to Beta' }),
     ).toBeVisible();
     expect(screen.queryByText('Stale Alpha reply')).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Team' }));
-    expect(screen.getByRole('article', { name: 'Beta agent' })).toBeVisible();
+    expect(screen.getByPlaceholderText('Message Beta…')).toBeVisible();
     expect(
-      screen.queryByRole('article', { name: 'Alpha agent' }),
+      screen.queryByPlaceholderText('Message Alpha…'),
     ).not.toBeInTheDocument();
   });
 
@@ -1314,9 +1255,8 @@ describe('ViewHarness workspace controller', () => {
     expect(
       screen.queryByRole('heading', { name: 'Agent settings' }),
     ).not.toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Team' }));
     expect(
-      screen.queryByRole('article', { name: 'Alpha draft agent' }),
+      screen.queryByPlaceholderText('Message Alpha draft…'),
     ).not.toBeInTheDocument();
   });
 });

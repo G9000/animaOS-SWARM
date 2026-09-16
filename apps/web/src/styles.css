@@ -2,6 +2,7 @@
 @import './studio.css';
 @import './cockpit.css';
 @import './operator.css';
+@import './companion.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 

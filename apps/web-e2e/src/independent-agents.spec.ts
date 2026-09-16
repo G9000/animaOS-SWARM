@@ -48,12 +48,12 @@ for (const viewport of [
   { width: 1280, height: 900 },
   { width: 390, height: 844 },
 ]) {
-  test(`independent agent conversations at ${viewport.width}px`, async ({
+  test(`single companion preserves independent agents at ${viewport.width}px`, async ({
     page,
   }, testInfo) => {
     await page.setViewportSize(viewport);
     const manager = agent('manager', 'Anima', 1, true);
-    const researcher = agent('researcher', 'Researcher', 2);
+    const researcher = agent('researcher', 'Researcher', 0);
     researcher.messages.push({
       id: 'peer-1',
       agentId: 'researcher',
@@ -247,117 +247,36 @@ for (const viewport of [
       return json(route, { error: `Unexpected fixture route ${path}` }, 404);
     });
 
+    const researcherBefore = structuredClone(researcher);
     await page.goto('/');
-    const selector = page.getByRole('combobox', { name: 'Chat with agent' });
-    const agentButton = (id: string) =>
-      page
-        .getByRole('navigation', { name: 'Direct messages' })
-        .getByRole('button', {
-          name: id === 'manager' ? 'Message Anima' : 'Message Researcher',
-          exact: true,
-        });
-    const selectAgent = async (id: string) => {
-      if (viewport.width >= 1024) await agentButton(id).click();
-      else await selector.selectOption(id);
-    };
-    const expectSelectedAgent = async (id: string) => {
-      if (viewport.width >= 1024)
-        await expect(agentButton(id)).toHaveAttribute('aria-current', 'page');
-      else await expect(selector).toHaveValue(id);
-    };
-    await expectSelectedAgent('manager');
-    await page
-      .getByRole('textbox', { name: 'Message Anima', exact: true })
-      .fill('Manager draft stays here');
-    await page.getByRole('button', { name: 'Agents', exact: true }).click();
-    await page
-      .getByRole('button', { name: 'Chat with Researcher', exact: true })
-      .click();
-    await expectSelectedAgent('researcher');
-    const researchComposer = page.getByRole('textbox', {
-      name: 'Message Researcher',
-      exact: true,
-    });
-    await expect(researchComposer).toHaveValue('');
-    await researchComposer.fill('Researcher draft stays here');
-    await selectAgent('manager');
+    const composer = page.getByPlaceholder('Message Anima…');
+    await expect(composer).toBeVisible();
     await expect(
-      page.getByRole('textbox', { name: 'Message Anima', exact: true }),
-    ).toHaveValue('Manager draft stays here');
-    await selectAgent('researcher');
-    await expect(researchComposer).toHaveValue('Researcher draft stays here');
+      page.getByRole('combobox', { name: 'Chat with agent' }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole('navigation', { name: 'Direct messages' }),
+    ).toHaveCount(0);
+    await expect(
+      page.getByText('I compared the sources for Anima.', { exact: true }),
+    ).toHaveCount(0);
+    await composer.fill('Companion draft stays here');
+    await page.getByRole('button', { name: 'Activity', exact: true }).click();
+    await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await expect(composer).toHaveValue('Companion draft stays here');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(
-      page.getByText('Researcher completed its own request.', { exact: true }),
+      page.getByText('Anima completed its own request.', { exact: true }),
     ).toBeVisible();
     expect(runs).toEqual([
       {
-        agentId: 'researcher',
-        text: 'Researcher draft stays here',
-        roomId: 'direct:researcher',
+        agentId: 'manager',
+        text: 'Companion draft stays here',
+        roomId: 'direct:manager',
       },
     ]);
-    const directConversation = page.getByLabel('Conversation with Researcher', {
-      exact: true,
-    });
-    await expect(
-      directConversation.getByText(
-        'Compare the research sources for the team.',
-        { exact: true },
-      ),
-    ).toHaveCount(0);
-    await page
-      .locator('summary')
-      .filter({ hasText: 'Agent conversations' })
-      .click();
-    await expect(
-      page
-        .getByLabel('Agent conversations', { exact: true })
-        .getByText('Compare the research sources for the team.', {
-          exact: true,
-        }),
-    ).toBeVisible();
-    await expect(
-      page.getByText('Anima to Researcher', { exact: true }),
-    ).toBeVisible();
-    await expect(
-      page.getByText('Researcher to Anima', { exact: true }),
-    ).toBeVisible();
-    await page.screenshot({
-      path: testInfo.outputPath(`researcher-${viewport.width}.png`),
-      fullPage: false,
-      animations: 'disabled',
-    });
 
-    await selectAgent('manager');
-    await expect(
-      page.getByText('Researcher completed its own request.', { exact: true }),
-    ).toHaveCount(0);
-    await page.getByRole('button', { name: 'Send', exact: true }).click();
-    await expect(
-      page.getByText('Anima completed its own request.', { exact: true }),
-    ).toBeVisible();
-    expect(runs[1]).toEqual({
-      agentId: 'manager',
-      text: 'Manager draft stays here',
-      roomId: 'direct:manager',
-    });
-    await page.screenshot({
-      path: testInfo.outputPath(`manager-${viewport.width}.png`),
-      fullPage: false,
-      animations: 'disabled',
-    });
-    await selectAgent('researcher');
-    await expect(
-      page.getByText('Researcher completed its own request.', { exact: true }),
-    ).toBeVisible();
-    await expect(
-      page.getByText('Anima completed its own request.', { exact: true }),
-    ).toHaveCount(0);
-    await expect(page.getByText('Offline', { exact: true })).toHaveCount(0);
-    await page
-      .getByRole('button', { name: "View Researcher's profile" })
-      .click();
+    await page.getByRole('button', { name: 'Settings', exact: true }).click();
     const profile = page.getByRole('dialog', { name: 'Agent settings' });
     await profile.getByRole('button', { name: 'tasks', exact: true }).click();
     await profile
@@ -372,12 +291,8 @@ for (const viewport of [
     await expect(
       profile.getByRole('button', { name: 'Tasks saved', exact: true }),
     ).toBeVisible();
-    expect(taskLists.get('researcher')?.tasks).toHaveLength(1);
-    expect(taskLists.has('manager')).toBe(false);
-    await page.screenshot({
-      path: testInfo.outputPath(`tasks-${viewport.width}.png`),
-      animations: 'disabled',
-    });
+    expect(taskLists.get('manager')?.tasks).toHaveLength(1);
+    expect(taskLists.has('researcher')).toBe(false);
     await profile
       .getByRole('button', { name: 'proactive', exact: true })
       .click();
@@ -386,95 +301,24 @@ for (const viewport of [
     await expect(
       profile.getByRole('button', { name: 'Pause', exact: true }),
     ).toBeVisible();
-    expect(schedules.get('researcher')?.[0].enabled).toBe(true);
-    expect(schedules.has('manager')).toBe(false);
+    expect(schedules.get('manager')?.[0].enabled).toBe(true);
     await profile.getByRole('button', { name: 'Pause', exact: true }).click();
     await expect(
       profile.getByRole('button', { name: 'Resume', exact: true }),
     ).toBeVisible();
-    expect(schedules.get('researcher')?.[0].enabled).toBe(false);
-    await page.screenshot({
-      path: testInfo.outputPath(`proactive-${viewport.width}.png`),
-      animations: 'disabled',
-    });
-    await profile.getByRole('button', { name: 'profile', exact: true }).click();
-    await profile.getByLabel('Change agent avatar').setInputFiles({
-      name: 'avatar.png',
-      mimeType: 'image/png',
-      buffer: Buffer.from(
-        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
-        'base64',
-      ),
-    });
-    await expect(
-      profile.getByText('Avatar saved.', { exact: true }),
-    ).toBeVisible();
-    expect(avatars.has('researcher')).toBe(true);
-    expect(avatars.has('manager')).toBe(false);
-    await profile
-      .getByLabel('Add a personality style')
-      .selectOption('creative');
-    await expect(
-      profile.getByRole('textbox', { name: 'System prompt' }),
-    ).toHaveValue(/Research independently\.[\s\S]*Be imaginative/);
-    await profile.getByRole('button', { name: 'Save changes' }).click();
-    await expect(
-      profile.getByRole('button', { name: 'Saved ✓' }),
-    ).toBeVisible();
-    expect(manager.state.config.system).toBe('Coordinate the workspace.');
-    await profile.getByRole('button', { name: 'memory', exact: true }).click();
-    await expect(
-      profile.getByText('The owner prefers primary research sources.'),
-    ).toBeVisible();
-    await page.screenshot({
-      path: testInfo.outputPath(`profile-memory-${viewport.width}.png`),
-      animations: 'disabled',
-    });
-    await profile.getByRole('button', { name: 'profile', exact: true }).click();
-    await page.screenshot({
-      path: testInfo.outputPath(`profile-${viewport.width}.png`),
-      animations: 'disabled',
-    });
+    expect(schedules.get('manager')?.[0].enabled).toBe(false);
+    expect(schedules.has('researcher')).toBe(false);
     await profile.getByRole('button', { name: 'Close settings' }).click();
-    await page
-      .getByRole('navigation', { name: 'Workspace navigation' })
-      .getByRole('button', { name: 'Work hub', exact: true })
-      .click();
-    const hub = page.getByRole('region', { name: 'Work hub', exact: true });
-    await expect(
-      hub.getByText('The owner prefers primary research sources.').first(),
-    ).toBeVisible();
-    await hub.getByRole('tab', { name: 'Tasks', exact: true }).click();
-    await expect(
-      hub.getByText('Find primary sources for the campaign', { exact: true }),
-    ).toBeVisible();
-    await hub.getByLabel('Agent', { exact: true }).selectOption('manager');
-    await expect(hub.getByText('No tasks yet for this agent.')).toBeVisible();
-    await hub.getByLabel('Agent', { exact: true }).selectOption('researcher');
-    await hub
-      .getByRole('button', { name: 'Manage Researcher’s tasks' })
-      .click();
-    await expect(hub.getByLabel('Task 1', { exact: true })).toHaveValue(
-      'Find primary sources for the campaign',
-    );
-    await hub.getByRole('button', { name: 'Back to tasks' }).click();
-    await hub.getByRole('tab', { name: 'Schedules', exact: true }).click();
-    await expect(hub.getByText(/Paused · Every/)).toBeVisible();
-    await hub.getByText(/Paused · Every/).scrollIntoViewIfNeeded();
-    await page.screenshot({
-      path: testInfo.outputPath(`hub-${viewport.width}.png`),
-      animations: 'disabled',
-    });
-    await hub
-      .getByRole('button', { name: 'Chat with Researcher', exact: true })
-      .click();
-    await expect(
-      page.getByRole('textbox', { name: 'Message Researcher' }),
-    ).toBeVisible();
+    expect(researcher).toEqual(researcherBefore);
+    expect(agents).toHaveLength(2);
     expect(
       await page.evaluate(
         () => document.documentElement.scrollWidth <= window.innerWidth,
       ),
     ).toBe(true);
+    await page.screenshot({
+      path: testInfo.outputPath('companion-preserved-agents.png'),
+      animations: 'disabled',
+    });
   });
 }

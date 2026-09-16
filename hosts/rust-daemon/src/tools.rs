@@ -13,6 +13,7 @@ mod workspace;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{atomic::AtomicUsize, Arc};
 
 use anima_core::{
     tool_not_configured_error, AgentState, Content, DataValue, Message, TaskResult, ToolCall,
@@ -57,6 +58,7 @@ struct ToolRegistration {
 pub(crate) struct ToolExecutionContext {
     pub(super) team: Option<crate::agent_runs::AgentRunCoordinator>,
     pub(super) can_delegate: bool,
+    pub(super) helper_starts: Arc<AtomicUsize>,
     delegated_parent: Option<String>,
     pub(super) peer_route: Option<anima_core::AgentCommunicationRoute>,
     peer_sources: Vec<String>,
@@ -84,6 +86,7 @@ impl ToolExecutionContext {
         Self {
             team: None,
             can_delegate: false,
+            helper_starts: Arc::new(AtomicUsize::new(0)),
             delegated_parent: None,
             peer_route: None,
             peer_sources: vec![],
@@ -137,6 +140,19 @@ impl ToolExecutionContext {
         if !agent.config.allows_tool(&tool_call.name) {
             return TaskResult::error(tool_not_configured_error(&tool_call.name), 0);
         }
+        if is_process_tool(&tool_call.name)
+            && agent
+                .config
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.additional.get("workspaceRole"))
+                == Some(&DataValue::String("helper".into()))
+        {
+            return TaskResult::error(
+                "Process tools are unavailable to helpers until process cancellation is supported",
+                0,
+            );
+        }
         if let Some(parent_id) = &self.delegated_parent {
             if let Some(coordinator) = &self.team {
                 if !coordinator
@@ -176,6 +192,16 @@ pub(crate) fn ctx_workspace_root(context: &ToolExecutionContext) -> Option<&Path
     context.workspace_root.as_deref()
 }
 
+/// Process lifetimes are not coupled to the future awaiting their tool result.
+/// Generated helpers must not receive or execute these handlers until cancellation
+/// owns and settles every child process before releasing the helper's capacity.
+pub(crate) fn is_process_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash" | "bg_start" | "bg_output" | "bg_stop" | "bg_list"
+    )
+}
+
 impl ToolRegistry {
     pub(crate) fn new() -> Self {
         let mut registry = Self {
@@ -183,6 +209,7 @@ impl ToolRegistry {
         };
         registry.register(tool_descriptor("list_workspace_agents", "Read the actual live workspace agent roster, including IDs, roles, and current status.", object_parameters(vec![])), team::list_workspace_agents);
         registry.register(tool_descriptor("delegate_to_agent", "Assign a bounded task to an existing specialist and wait for its recorded result. Use an agent ID from the roster. Delegation cannot grant tools or permissions you do not have.", object_parameters(vec![required_parameter("agent_id", non_blank_string_parameter("Existing specialist ID")), required_parameter("task", non_blank_string_parameter("Self-contained task, relevant context, and expected deliverable"))])), team::delegate_to_agent);
+        registry.register(tool_descriptor("spawn_helper", "Run a bounded task with a helper and wait for its saved result. Reuses an idle helper or creates one, up to four busy helpers and four starts per companion run. Only the companion can spawn helpers; helpers inherit its current tool permissions except shell/background-process tools, and cannot contact or create other agents. Each helper has at most eight tool turns and a two-minute execution deadline; completed effects are not rolled back. Future companion runs receive a fresh start allowance and reuse idle slots.", object_parameters(vec![required_parameter("name", non_blank_string_parameter("Short helper label, at most 80 bytes")), required_parameter("task", non_blank_string_parameter("Self-contained task, relevant context, and expected deliverable, at most 32768 bytes"))])), team::spawn_helper);
         registry.register(
             tool_descriptor(
                 "memory_search",

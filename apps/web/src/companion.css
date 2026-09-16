@@ -1,0 +1,182 @@
+/* Single-companion surface. Keep the shared palette, simplify the console. */
+.companion-shell .studio-sidebar {
+  width: 244px;
+  background: #17171b;
+}
+.companion-shell .studio-brand {
+  min-height: 68px;
+  border: 0;
+  padding: 20px 24px;
+  font-size: 21px;
+}
+.companion-shell .studio-brand-mark {
+  color: var(--color-ink);
+}
+.companion-shell .studio-presence {
+  margin: 4px 12px 14px;
+  background: transparent;
+  border: 0;
+  padding: 10px;
+  box-shadow: none;
+}
+.companion-shell .studio-presence h1 {
+  font-size: 14px;
+}
+.companion-shell .studio-navigation {
+  gap: 4px;
+  padding: 8px 12px;
+}
+.companion-shell .studio-nav-item {
+  color: var(--color-ink-2);
+  border-radius: 9px;
+  font-size: 13px;
+}
+.companion-shell .studio-nav-item:hover {
+  background: rgb(255 255 255 / 4%);
+  color: var(--color-ink);
+}
+.companion-shell .studio-nav-item[aria-current='page'] {
+  color: var(--color-ink);
+  background: rgb(255 255 255 / 7%);
+  box-shadow: none;
+}
+.companion-shell .studio-topbar {
+  background: transparent;
+  border-bottom: 0;
+  min-height: 64px;
+  padding: 12px 28px;
+}
+.companion-shell .studio-breadcrumb {
+  gap: 12px;
+}
+.companion-model {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+.companion-status {
+  margin: 20px 22px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-ink-2);
+}
+.companion-status p {
+  margin: 0 0 4px;
+  color: var(--color-ink);
+}
+.companion-status span {
+  font-size: 11px;
+}
+.companion-chat-panel {
+  height: 100%;
+  min-height: 0;
+}
+.companion-chat-panel[hidden] {
+  display: none;
+}
+.companion-shell .studio-welcome {
+  max-width: 780px;
+  margin: auto;
+  padding: clamp(32px, 10vh, 120px) 28px 28px;
+}
+.companion-shell .studio-hero {
+  display: block;
+  padding: 0;
+  min-height: 0;
+  background: transparent;
+  border: 0;
+}
+.companion-shell .studio-hero-copy {
+  max-width: 620px;
+  margin: auto;
+  text-align: center;
+}
+.companion-shell .studio-eyebrow {
+  justify-content: center;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--color-ink-3);
+}
+.companion-shell .studio-hero-title {
+  font-size: clamp(28px, 4vw, 40px);
+  line-height: 1.2;
+  letter-spacing: -0.04em;
+  margin: 18px 0;
+}
+.companion-shell .studio-hero-description {
+  max-width: 440px;
+  margin: auto;
+  font-size: 15px;
+  line-height: 1.7;
+}
+.companion-shell .studio-hero-signature,
+.companion-shell .studio-sculpture,
+.companion-shell .studio-section-rule {
+  display: none;
+}
+.companion-shell .studio-suggestions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 34px 0 0;
+}
+.companion-shell .studio-suggestion {
+  min-height: 108px;
+  border-radius: 14px;
+  padding: 16px;
+  background: transparent;
+  box-shadow: none;
+}
+.companion-shell .studio-suggestion:hover {
+  background: rgb(255 255 255 / 3%);
+  transform: none;
+}
+.companion-shell .studio-suggestion > span:last-child {
+  display: none;
+}
+.companion-shell .studio-composer {
+  padding-bottom: 18px;
+}
+.companion-shell .studio-composer .glass-strong {
+  box-shadow: none;
+}
+.companion-shell .studio-messages .glass {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  padding-left: 0;
+}
+.companion-shell .studio-main {
+  background: var(--color-abyss);
+}
+@media (max-width: 767px) {
+  .companion-shell .studio-topbar {
+    min-height: 50px;
+    padding: 8px 14px;
+  }
+  .companion-model {
+    display: none;
+  }
+  .companion-shell .studio-welcome {
+    padding: 32px 18px 20px;
+  }
+  .companion-shell .studio-suggestions {
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-top: 24px;
+  }
+  .companion-shell .studio-suggestion {
+    min-height: 64px;
+    padding: 12px 14px;
+  }
+  .companion-shell .safe-bottom-dock .studio-nav-item {
+    font-size: 10px;
+    padding: 8px;
+  }
+  .companion-shell .studio-composer {
+    padding-bottom: 8px;
+  }
+}

@@ -62,14 +62,14 @@ const SUGGESTIONS = [
   {
     icon: <Sparkle />,
     text: 'What can you do for me?',
-    title: 'Inspect capabilities',
+    title: 'Explore what I can do',
     label: 'DISCOVER',
     detail: 'Understand the agent’s tools and access.',
   },
   {
     icon: <BoltIcon size={13} />,
     text: 'Help me plan my day',
-    title: 'Plan the next assignment',
+    title: 'Make space for your day',
     label: 'MAKE A PLAN',
     detail: 'Define the objective and next steps.',
   },
@@ -98,20 +98,20 @@ function EmptyState({
       <div className="studio-hero">
         <div className="studio-hero-copy">
           <p className="studio-eyebrow">
-            <span aria-hidden /> AGENT CONVERSATION
+            <span aria-hidden /> YOUR PERSONAL COMPANION
           </p>
           <h2
             aria-label={`Say something to ${agentName}`}
             className="studio-hero-title"
           >
-            Work with <span>{agentName}.</span>
+            What’s on your mind?
           </h2>
           <p className="studio-hero-description">
-            Clarify an objective, inspect progress, or plan the next assignment.
-            Use Operations to dispatch and track durable work.
+            I’m {agentName}. Let’s make a plan, work through an idea, or take
+            something off your list.
           </p>
           <div className="studio-hero-signature">
-            <span aria-hidden>↗</span> Direct conversation with your agent
+            One companion. A little less to carry.
           </div>
         </div>
         <div className="studio-sculpture" aria-hidden data-motion="agent-orb">

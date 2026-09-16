@@ -91,6 +91,8 @@ fn metadata(name: &str) -> (&'static str, Vec<&'static str>) {
             ("terminal", vec!["Shell access. Programs run with the daemon user's operating-system permissions."]),
         "memory_search" | "memory_add" | "recent_memories" =>
             ("memory", vec!["Agent memory access. Persistence depends on the configured memory storage."]),
+        "spawn_helper" =>
+            ("team", vec!["A direct companion run. Reuses idle helpers, up to four busy helpers, with current companion tool permissions except shell/background-process tools and no recursive communication. Execution deadlines do not roll back completed effects."]),
         "list_workspace_agents" | "delegate_to_agent" | "send_message" | "broadcast_message" =>
             ("team", vec!["Existing workspace agents and permitted communication. Delegation is bounded by the manager's current authority."]),
         "web_fetch" =>

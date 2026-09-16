@@ -176,10 +176,10 @@ impl OAuthConfig {
             provider,
             client_id: resolved.credentials().client_id().to_string(),
             secret: resolved.credentials().client_secret().to_string().into(),
-            redirect: format!(
-                "http://127.0.0.1:8080/api/connectors/mail/{}/callback",
+            redirect: resolved.callback_uri(&format!(
+                "/api/connectors/mail/{}/callback",
                 provider.name()
-            ),
+            )),
             tenant: resolved
                 .credentials()
                 .tenant()

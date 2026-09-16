@@ -14,6 +14,31 @@ const GOOGLE_MAIL: &str = "http://127.0.0.1:8080/api/connectors/mail/gmail/callb
 const GOOGLE_CALENDAR: &str = "http://127.0.0.1:8080/api/connectors/gcalendar/callback";
 const MICROSOFT_MAIL: &str = "http://127.0.0.1:8080/api/connectors/mail/outlook/callback";
 
+fn public_origin(value: Option<&str>) -> Result<String, std::io::Error> {
+    let Some(value) = value else {
+        return Ok("http://127.0.0.1:8080".into());
+    };
+    let invalid = || {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput,
+        "ANIMA_PUBLIC_BASE_URL must be a canonical HTTPS origin without credentials, path, query, or fragment (HTTP is allowed only for loopback)")
+    };
+    let url = reqwest::Url::parse(value).map_err(|_| invalid())?;
+    let loopback = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    let origin = url.origin().ascii_serialization();
+    if !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || (value != origin && value != format!("{origin}/"))
+    {
+        return Err(invalid());
+    }
+    Ok(origin)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum OAuthProvider {
@@ -126,12 +151,16 @@ impl fmt::Debug for OAuthAppCredentials {
 
 #[derive(Clone)]
 pub(crate) struct ResolvedOAuthApp {
+    public_origin: String,
     provider: OAuthProvider,
     credentials: OAuthAppCredentials,
     source: OAuthAppSource,
     revision: u64,
 }
 impl ResolvedOAuthApp {
+    pub(crate) fn callback_uri(&self, path: &str) -> String {
+        format!("{}{path}", self.public_origin)
+    }
     pub(crate) fn provider(&self) -> OAuthProvider {
         self.provider
     }
@@ -300,6 +329,7 @@ struct Lifecycle {
     revision: u64,
 }
 struct Inner {
+    public_origin: String,
     vault: Arc<dyn OAuthVaultBackend>,
     environment: Arc<dyn OAuthEnvironment>,
     google: Arc<Mutex<Lifecycle>>,
@@ -310,6 +340,13 @@ pub(crate) struct OAuthAppService {
     inner: Arc<Inner>,
 }
 impl OAuthAppService {
+    pub(crate) fn new_for_origin(origin: Option<&str>) -> Result<Self, std::io::Error> {
+        Ok(Self::build(
+            Arc::new(OsOAuthVault),
+            Arc::new(ProcessEnvironment),
+            public_origin(origin)?,
+        ))
+    }
     pub(crate) fn new() -> Self {
         Self::with_backends(Arc::new(OsOAuthVault), Arc::new(ProcessEnvironment))
     }
@@ -323,8 +360,16 @@ impl OAuthAppService {
         vault: Arc<dyn OAuthVaultBackend>,
         environment: Arc<dyn OAuthEnvironment>,
     ) -> Self {
+        Self::build(vault, environment, "http://127.0.0.1:8080".into())
+    }
+    fn build(
+        vault: Arc<dyn OAuthVaultBackend>,
+        environment: Arc<dyn OAuthEnvironment>,
+        public_origin: String,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                public_origin,
                 vault,
                 environment,
                 google: Arc::new(Mutex::new(Lifecycle::default())),
@@ -368,7 +413,11 @@ impl OAuthAppService {
         provider: OAuthProvider,
     ) -> Result<OAuthAppStatus, OAuthAppError> {
         let lease = self.locked_config(provider).await?;
-        Ok(make_status(provider, lease.resolved.as_ref()))
+        Ok(make_status(
+            provider,
+            lease.resolved.as_ref(),
+            &self.inner.public_origin,
+        ))
     }
     pub(crate) async fn statuses(&self) -> Result<Vec<OAuthAppStatus>, OAuthAppError> {
         let mut out = Vec::new();
@@ -549,6 +598,7 @@ async fn resolve(
         let (c, r) = decode(p, raw.as_str())?;
         state.revision = state.revision.max(r);
         return Ok(Some(ResolvedOAuthApp {
+            public_origin: inner.public_origin.clone(),
             provider: p,
             credentials: c,
             source: OAuthAppSource::Vault,
@@ -559,6 +609,7 @@ async fn resolve(
         return Ok(None);
     };
     Ok(Some(ResolvedOAuthApp {
+        public_origin: inner.public_origin.clone(),
         provider: p,
         credentials: c,
         source: OAuthAppSource::Environment,
@@ -709,13 +760,17 @@ fn delete_verified(
         Err(OAuthAppError::VaultStateUncertain)
     }
 }
-fn make_status(p: OAuthProvider, c: Option<&ResolvedOAuthApp>) -> OAuthAppStatus {
+fn make_status(p: OAuthProvider, c: Option<&ResolvedOAuthApp>, origin: &str) -> OAuthAppStatus {
     OAuthAppStatus {
         provider: p,
         configured: c.is_some(),
         source: c.map(|x| x.source),
         client_id_hint: c.map(|x| hint(x.credentials.client_id())),
-        redirect_uris: p.redirect_uris().iter().map(|x| x.to_string()).collect(),
+        redirect_uris: p
+            .redirect_uris()
+            .iter()
+            .map(|uri| uri.replacen("http://127.0.0.1:8080", origin, 1))
+            .collect(),
         tenant: c.and_then(|x| x.credentials.tenant.clone()),
     }
 }
@@ -876,6 +931,70 @@ mod tests {
                 .collect())),
         )
     }
+    #[test]
+    fn public_oauth_origin_accepts_https_and_preserves_local_default() {
+        assert_eq!(public_origin(None).unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(
+            public_origin(Some("https://companion.example.com/")).unwrap(),
+            "https://companion.example.com"
+        );
+        assert_eq!(
+            public_origin(Some("http://127.0.0.1:4271")).unwrap(),
+            "http://127.0.0.1:4271"
+        );
+    }
+
+    #[test]
+    fn public_oauth_origin_rejects_unsafe_or_ambiguous_configuration() {
+        for value in [
+            "",
+            "http://companion.example.com",
+            "https://user:password@example.com",
+            "https://example.com/subpath",
+            "https://example.com/?query=1",
+            "https://example.com/#fragment",
+            "javascript:alert(1)",
+            "https://example.com\n",
+            "https://example.com/../",
+        ] {
+            assert!(public_origin(Some(value)).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_oauth_origin_is_shared_by_status_and_resolved_credentials() {
+        let service = OAuthAppService::build(
+            Arc::new(InMemoryOAuthAppVault::default()),
+            Arc::new(EmptyEnvironment),
+            public_origin(Some("https://companion.example.com")).unwrap(),
+        );
+        let status = service.status(OAuthProvider::Google).await.unwrap();
+        assert_eq!(
+            status.redirect_uris,
+            vec![
+                "https://companion.example.com/api/connectors/mail/gmail/callback",
+                "https://companion.example.com/api/connectors/gcalendar/callback"
+            ]
+        );
+        service
+            .put(OAuthProvider::Google, creds(OAuthProvider::Google, "test"))
+            .await
+            .unwrap();
+        let lease = service.locked_config(OAuthProvider::Google).await.unwrap();
+        assert_eq!(
+            lease
+                .config()
+                .unwrap()
+                .callback_uri("/api/connectors/gcalendar/callback"),
+            status.redirect_uris[1]
+        );
+        let microsoft = service.status(OAuthProvider::Microsoft).await.unwrap();
+        assert_eq!(
+            microsoft.redirect_uris,
+            vec!["https://companion.example.com/api/connectors/mail/outlook/callback"]
+        );
+    }
+
     #[test]
     fn validation_defaults_and_redirects() {
         assert_eq!(

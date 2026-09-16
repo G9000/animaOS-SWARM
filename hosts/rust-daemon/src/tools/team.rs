@@ -146,3 +146,56 @@ pub(super) fn delegate_to_agent(
         }
     })
 }
+
+pub(super) fn spawn_helper(
+    context: ToolExecutionContext,
+    agent: AgentState,
+    _message: Message,
+    call: ToolCall,
+) -> BoxFuture<'static, TaskResult<Content>> {
+    Box::pin(async move {
+        if !context.can_delegate {
+            return TaskResult::error(
+                "Only the companion can spawn helpers; recursive or peer spawning is not allowed",
+                0,
+            );
+        }
+        let Some(coordinator) = context.team else {
+            return TaskResult::error(
+                "Helper creation is unavailable in this execution context",
+                0,
+            );
+        };
+        let arg = |key: &str| match call.args.get(key) {
+            Some(DataValue::String(value)) => Some(value.trim().to_owned()),
+            _ => None,
+        };
+        let (Some(name), Some(task)) = (arg("name"), arg("task")) else {
+            return TaskResult::error("name and task are required", 0);
+        };
+        if context
+            .helper_starts
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |count| (count < 4).then_some(count + 1),
+            )
+            .is_err()
+        {
+            return TaskResult::error(
+                "The four-helper start limit for this companion run has been reached",
+                0,
+            );
+        }
+        match coordinator.spawn_helper(agent.id, name, task).await {
+            Ok(text) => TaskResult::success(
+                Content {
+                    text,
+                    ..Content::default()
+                },
+                0,
+            ),
+            Err(error) => TaskResult::error(error, 0),
+        }
+    })
+}
