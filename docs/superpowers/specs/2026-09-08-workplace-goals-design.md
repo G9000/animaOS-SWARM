@@ -1,0 +1,17 @@
+# Workplace goals
+
+Add persistent, owner-managed goals around existing jobs. Preserve the prior uncommitted run supervision work. This is an aggregate attempt budget, not a token/spending limit or portable execution journal. Saved text outputs are grouped deliverables; file provenance remains later.
+
+Goal record: `{id,title,objective,requestKey,maxAttempts,status,revision,createdAtMs,updatedAtMs}`. Status active/paused/completed. Bounds: 50 goals, title160chars, objective32KiB, key128bytes, maxAttempts1..100. Creation keys are globally unique among goals, exact equivalent inputs deduplicate. Fields are immutable except revision-checked status. Defaults for old snapshots are an empty goals map; jobs get nullable goalId default None.
+
+Views flatten the goal record with `{consumedAttempts,reservedAttempts,remainingAttempts,jobCount,acceptedOutputs}`. Compute counts from linked persisted jobs: consumed=sum(job.attempt), reserved=count(queued). Running already counts as consumed. remaining=max-consumed-reserved. Uncertain/failed attempts still count. Pending approval reserves no slot. Never delete linked history or refund consumed attempts. Cancel queued work frees its reservation. At enqueue (create/retry/approve) atomically verify active goal and remaining>0 in the existing control-plane transaction. Paused goals hold queued work without dispatch; resume enables it. Dispatch checks goal state before claiming. Goal linkage is immutable and part of job request equivalence.
+
+Complete a goal only when it has at least one accepted latest output and every linked job is cancelled or completed with latest output accepted. Pending/queued/running/failed/needs_review/changes_requested work prevents completion. Completed goals cannot reopen or accept jobs. Pause does not abort running effects; running completion still persists. Pending proposals may be created for paused goals, but completed/unknown goals reject linkage. Goal views contain linked jobs across agents, while each job retains original agent ownership/permission checks.
+
+HTTP owner-before-body/state, no-store: GET/POST `/api/goals` -> `{goals:GoalView[]}` / direct GoalView; POST `/api/goals/{goal_id}/status` `{revision,status}` -> GoalView; GET `/api/goals/{goal_id}/jobs` -> `{jobs:AgentJobRecord[]}`. Existing job POST accepts optional `goalId`; missing/null preserves old behavior. Validate stored goal identities/keys/status/timestamps, missing goal links, total consumed+reserved over budget, and completed goal invariants. Historical deleted-agent jobs remain valid.
+
+Implementation: keep goal lifecycle and budget helpers under jobs/goals.rs, sharing JobService transaction and job dispatch. Include goals in mutation rollback and control-plane snapshots. No model calls while holding transaction.
+
+UI: add Goals tab to Work with create/list/select, budget counts, explicit pause/resume/complete, honest errors, grouped outputs and agent ownership. Runs creation offers optional goal selection with retained draft/key (old drafts default no goal); show paused/exhausted goals clearly and preserve errors. Use existing tokens/accessibility/responsive conventions. No silent work creation, approval or budget increases.
+
+Tests: concurrent last-slot contention, failed save rollback jobs+goals, cancelled reservation released, failed/uncertain attempts consumed, paused/restart gating, completion preconditions, idempotency/link isolation, old snapshot compatibility, HTTP authorization, SDK and UI actions. Bounded deterministic tests only.

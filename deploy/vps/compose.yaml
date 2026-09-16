@@ -1,0 +1,90 @@
+name: anima-companion
+
+services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deploy/vps/web.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ANIMA_DOMAIN: ${ANIMA_DOMAIN:?Set a public DNS hostname}
+      ACME_EMAIL: ${ACME_EMAIL:?Set a certificate contact email}
+      ANIMA_OWNER_USER: ${ANIMA_OWNER_USER:?Set the owner login name}
+      ANIMA_OWNER_PASSWORD_HASH: ${ANIMA_OWNER_PASSWORD_HASH:?Generate a Caddy password hash}
+      ANIMA_INTERNAL_API_KEY: ${ANIMA_INTERNAL_API_KEY:?Generate a random API key}
+      ANIMA_LOCAL_ADMIN_TOKEN: ${ANIMA_LOCAL_ADMIN_TOKEN:?Generate a distinct random admin token}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  daemon:
+    build:
+      context: ../..
+      dockerfile: deploy/vps/daemon.Dockerfile
+    restart: unless-stopped
+    init: true
+    # The daemon's local-owner guard intentionally rejects non-loopback binds.
+    # Share only the network namespace; its filesystem/processes remain separate.
+    network_mode: service:gateway
+    depends_on:
+      gateway:
+        condition: service_healthy
+        restart: true
+    environment:
+      ANIMAOS_RS_HOST: 127.0.0.1
+      ANIMAOS_RS_PORT: "8080"
+      ANIMA_PUBLIC_BASE_URL: https://${ANIMA_DOMAIN:?Set a public DNS hostname}
+      ANIMAOS_RS_API_KEY: ${ANIMA_INTERNAL_API_KEY:?Generate a random API key}
+      ANIMA_LOCAL_ADMIN_TOKEN: ${ANIMA_LOCAL_ADMIN_TOKEN:?Generate a distinct random admin token}
+      ANIMAOS_RS_PERSISTENCE_MODE: memory
+      ANIMAOS_RS_CONTROL_PLANE_FILE: /state/control-plane.json
+      ANIMAOS_RS_MEMORY_SQLITE_FILE: /state/memory.sqlite
+      ANIMAOS_RS_MEMORY_EMBEDDINGS: local
+      ANIMAOS_WORKSPACE_ROOT: /workspace
+      ANIMA_KEYRING_PASSWORD: ${ANIMA_KEYRING_PASSWORD:?Generate and retain a keyring password}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    volumes:
+      - daemon_state:/state
+      - workspace:/workspace
+      - daemon_home:/home/anima
+    tmpfs:
+      - /tmp:mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 45s
+      retries: 3
+    stop_grace_period: 45s
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  daemon_state:
+  workspace:
+  daemon_home:
+  caddy_data:
+  caddy_config:

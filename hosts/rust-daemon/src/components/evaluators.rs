@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::memory_embeddings::SharedMemoryEmbeddings;
-use crate::memory_store::{save_memory_manager, MemoryStoreConfig};
+use crate::memory_store::{MemoryMutation, MemoryStoreConfig};
 use crate::state::SharedMemoryStore;
 
 pub(super) struct ReflectionMemoryEvaluator {
@@ -68,6 +68,7 @@ impl Evaluator for ReflectionMemoryEvaluator {
 
         let (outcome, extracted_outcome, extracted_temporal_fact, relationship, embedded_memories) = {
             let mut memory_guard = self.memory.write().await;
+            let mut memory_guard = MemoryMutation::new(&mut memory_guard);
             let outcome = memory_guard
                 .add_evaluated(
                     NewMemory {
@@ -177,7 +178,8 @@ impl Evaluator for ReflectionMemoryEvaluator {
                 ),
                 _ => None,
             };
-            save_memory_manager(self.memory_store.as_ref(), &memory_guard)
+            memory_guard
+                .persist(self.memory_store.as_ref())
                 .await
                 .map_err(|error| format!("failed to persist evaluated memory: {error}"))?;
             let embedded_memories = outcome

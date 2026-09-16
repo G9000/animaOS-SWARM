@@ -88,8 +88,8 @@ export function ModelStep({
           Model
         </h2>
         <p className="mt-1 text-sm text-ink-2">
-          Connect the model that will help shape your agency. This is the
-          default for your team; specialists can use a different model.
+          Choose the model your companion will use. You can change it later
+          without starting over.
         </p>
       </div>
 
@@ -107,7 +107,7 @@ export function ModelStep({
               Start with your ChatGPT subscription
             </h3>
             <p className="mt-1 text-sm text-ink-2">
-              Sign in and use your plan for your manager and specialists. No
+              Sign in and use your plan for your companion. No
               other AI provider connection or API key is needed.
             </p>
           </div>

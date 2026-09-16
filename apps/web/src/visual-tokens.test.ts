@@ -71,7 +71,7 @@ function contrastRatio(foreground: string, background: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
-describe('Anima Studio visual contract', () => {
+describe('Anima operator visual contract', () => {
   const styles = read('styles.css');
   const studio = read('studio.css');
   const productionPaths = [
@@ -84,10 +84,16 @@ describe('Anima Studio visual contract', () => {
     .join('\n');
 
   it('defines the approved palette anchors exactly', () => {
-    expect(styles).toContain('#F5F2EA');
-    expect(styles).toContain('#FFFDF8');
-    expect(styles).toContain('#AD3928');
-    expect(styles).toContain('#316448');
+    expect(styles).toContain('#111114');
+    expect(styles).toContain('#1c1c20');
+    expect(styles).toContain('#e94dab');
+    expect(styles).toContain('#6fd69a');
+    expect(cssHexToken(styles, 'line')).toBe('#303038');
+    expect(cssHexToken(styles, 'ink')).toBe('#f4f4f5');
+    expect(cssHexToken(styles, 'ink-2')).toBe('#a4a4b1');
+    expect(cssHexToken(styles, 'ink-3')).toBe('#a4a4b1');
+    expect(cssHexToken(styles, 'accent-fg')).toBe('#191119');
+    expect(cssHexToken(styles, 'action')).toBe('#e978be');
   });
 
   it('contains no legacy blue or purple accent tokens in production sources', () => {
@@ -98,23 +104,22 @@ describe('Anima Studio visual contract', () => {
     );
   });
 
-  it('keeps core text and primary action pairs at AA contrast', () => {
+  it('keeps core text at AA contrast and matches Fixer primary button colors', () => {
     const abyss = cssHexToken(styles, 'abyss');
     const panel = cssHexToken(styles, 'panel');
-    const accent = cssHexToken(styles, 'accent');
 
     for (const [foreground, background] of [
       [cssHexToken(styles, 'ink'), abyss],
       [cssHexToken(styles, 'ink-2'), abyss],
       [cssHexToken(styles, 'ink-3'), abyss],
       [cssHexToken(styles, 'ink-3'), panel],
-      [abyss, accent],
+      [cssHexToken(styles, 'accent-fg'), cssHexToken(styles, 'action')],
     ]) {
       expect(contrastRatio(foreground, background)).toBeGreaterThanOrEqual(4.5);
     }
     expect(production).not.toMatch(/bg-accent[^'"\r\n]*text-white/);
     expect(read('components/ui-bits.tsx')).toMatch(
-      /bg-accent[^'"\r\n]*text-abyss/,
+      /bg-accent[^'"\r\n]*text-accent-fg/,
     );
   });
 
@@ -136,7 +141,10 @@ describe('Anima Studio visual contract', () => {
     expect(appFrame).toContain('padding-right: var(--safe-area-right)');
     expect(appFrame).toContain('padding-bottom: var(--safe-area-bottom)');
     expect(appFrame).toContain('padding-left: var(--safe-area-left)');
-    const onboardingShell = cssRule(read('components/onboarding/onboarding-layout.css'), '.setup-shell');
+    const onboardingShell = cssRule(
+      read('components/onboarding/onboarding-layout.css'),
+      '.setup-shell',
+    );
     expect(onboardingShell).toContain('flex: 1');
     expect(onboardingShell).toContain('min-height: 0');
     expect(onboardingShell).toContain('overflow-y: auto');
@@ -164,7 +172,7 @@ describe('Anima Studio visual contract', () => {
       const surface = cssRule(studio, selector);
       for (const token of ['ink', 'ink-2', 'ink-3', 'accent']) {
         expect(
-          contrastRatio(cssHexToken(surface, token), '#252D24'),
+          contrastRatio(cssHexToken(surface, token), '#111114'),
         ).toBeGreaterThanOrEqual(4.5);
       }
     }
@@ -179,8 +187,8 @@ describe('Anima Studio visual contract', () => {
     );
   });
 
-  it('uses the shared terracotta RGB token for authored glow values', () => {
-    expect(styles).toContain('--color-accent-rgb: 173 57 40;');
+  it('uses the shared pink RGB token for authored glow values', () => {
+    expect(styles).toContain('--color-accent-rgb: 233 77 171;');
     expect(production).not.toMatch(
       /rgba?\(\s*255\s*,\s*57\s*,\s*127(?:\s*,|\s*\))/i,
     );
@@ -240,14 +248,13 @@ describe('Anima Studio visual contract', () => {
 
   it('keeps onboarding decorative copy neutral', () => {
     const onboarding = read('components/onboarding/OnboardingLayout.tsx');
-    const header = between(
-      onboarding,
-      '<header',
-      '</header>',
-    );
+    const header = between(onboarding, '<header', '</header>');
 
     expect(header).toContain('setup-shell__context');
-    const context = cssRule(read('components/onboarding/onboarding-layout.css'), '.setup-shell__context');
+    const context = cssRule(
+      read('components/onboarding/onboarding-layout.css'),
+      '.setup-shell__context',
+    );
     expect(context).toContain('color: var(--color-ink-3)');
     expect(context).not.toContain('--color-accent');
   });

@@ -1,8 +1,22 @@
 # animaOS-SWARM
 
-Agent swarm framework. Command and control your AI agents -- spawn, coordinate, and manage swarms that get things done.
+A personal AI companion backed by a Rust agent runtime, with workspace memory, connected tools, and delegated helpers.
 
-## Quick Start (CLI + TUI)
+## Quick Start (Companion Web)
+
+With Bun and Rust installed, start the companion locally:
+
+```bash
+bun install --frozen-lockfile
+bun x nx run @animaOS-SWARM/sdk:build
+bun dev --host rust
+```
+
+Open [localhost:4200](http://localhost:4200), set up your companion, and connect a model provider. The default view is one conversation; settings provide access to models, tools, connections, and memory.
+
+For a persistent, single-owner companion on a Linux VPS, see the [Docker deployment guide](deploy/vps/README.md), including HTTPS/authentication, credential storage, backups, and current limitations.
+
+## Advanced / Legacy CLI and SDK Workflow
 
 Create and run an agency in 3 steps - **no code required**:
 
@@ -22,7 +36,7 @@ bun run animaos launch "Write a blog post about AI"
 
 See [docs/SDK_USAGE.md](docs/SDK_USAGE.md) for full documentation and SDK examples.
 
-The terminal UI is the primary local operator surface. The web UI is secondary and currently less mature.
+The CLI and terminal UI remain available for advanced agency and SDK workflows.
 
 ## Runtime Architecture
 
@@ -62,8 +76,8 @@ bun run daemon
 # Start the server app
 bun run server
 
-# Start the web UI (secondary surface)
-bun run ui
+# Start the companion web UI only (daemon must already be running)
+bun run web
 ```
 
 ## Local CLI

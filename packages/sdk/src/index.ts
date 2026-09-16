@@ -46,6 +46,11 @@ export type {
 } from './connectors.js';
 export type {
   AgentMemory,
+  AgentJob,
+  AgentJobInput,
+  AgentJobRetryInput,
+  AgentJobReviewInput,
+  AgentJobAttempt,
   AgentTask,
   AgentTasks,
   AgentSchedule,
@@ -81,6 +86,12 @@ export type {
 } from './client.js';
 
 export { MemoriesClient } from './memories.js';
+export { GoalsClient } from './goals.js';
+export type { GoalInput, GoalView, GoalStatus } from './goals.js';
+export type {
+  DaemonCapabilities,
+  DaemonCapabilityTool,
+} from './capabilities.js';
 export type {
   CreateAgentRelationshipInput,
   CreateMemoryEntityInput,

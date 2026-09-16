@@ -46,6 +46,7 @@ export function OnboardingLayout({
           <p className="setup-shell__eyebrow">
             {resumeMode ? 'Your workspace' : 'Make yourself at home'}
           </p>
+          {!resumeMode && <div className="setup-shell__welcome"><h2>A team with a purpose.</h2><p>Start with the outcome you want. Give your team the context, tools, and boundaries to get there.</p></div>}
           {!resumeMode && (
             <OnboardingProgress currentStep={currentStep} steps={steps} />
           )}
@@ -66,6 +67,7 @@ export function OnboardingLayout({
               </div>
             </dl>
           </section>
+          {!resumeMode && <p className="setup-shell__authority">You choose the access. Routines run only when you enable them, while the daemon is active.</p>}
         </aside>
         <main className="setup-shell__main" aria-labelledby={headingId}>
           {!resumeMode && (
@@ -104,6 +106,7 @@ export function OnboardingLayout({
                 {title}
               </h1>
               <p className="setup-shell__subtitle">{subtitle}</p>
+              {!resumeMode && <div className="setup-shell__promise"><span aria-hidden="true">✳</span><p>Your goal shapes the team. Your permissions set its boundaries.</p></div>}
             </header>
             <div className="setup-shell__content">{children}</div>
             {footer && (

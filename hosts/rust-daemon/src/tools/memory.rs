@@ -5,7 +5,7 @@ use anima_memory::{MemoryRecallOptions, MemorySearchOptions, MemoryType, NewMemo
 use futures::future::BoxFuture;
 use tracing::warn;
 
-use crate::memory_store::save_memory_manager;
+use crate::memory_store::MemoryMutation;
 
 use super::ToolExecutionContext;
 
@@ -122,6 +122,7 @@ pub(super) fn execute_memory_add(
 
         let memory = {
             let mut memory_guard = context.memory.write().await;
+            let mut memory_guard = MemoryMutation::new(&mut memory_guard);
             let memory = match memory_guard.add(NewMemory {
                 agent_id: agent.id.clone(),
                 agent_name: agent.name.clone(),
@@ -137,9 +138,7 @@ pub(super) fn execute_memory_add(
                 Ok(memory) => memory,
                 Err(error) => return TaskResult::error(error.message(), 0),
             };
-            if let Err(error) =
-                save_memory_manager(context.memory_store.as_ref(), &memory_guard).await
-            {
+            if let Err(error) = memory_guard.persist(context.memory_store.as_ref()).await {
                 return TaskResult::error(format!("failed to persist memory: {error}"), 0);
             }
             memory

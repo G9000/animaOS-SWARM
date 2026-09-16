@@ -1,10 +1,12 @@
 import { AgentsClient } from './agents.js';
+import { GoalsClient } from './goals.js';
 import { AgenciesClient } from './agencies.js';
 import { WorkspaceClient } from './workspace.js';
 import { ChatGptClient } from './chatgpt.js';
 import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
+import type { DaemonCapabilities } from './capabilities.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
 
@@ -63,6 +65,7 @@ export class DaemonClient {
   readonly workspace: WorkspaceClient;
   readonly chatgpt: ChatGptClient;
   readonly agents: AgentsClient;
+  readonly goals: GoalsClient;
   readonly connectors: ConnectorsClient;
   readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
@@ -82,6 +85,7 @@ export class DaemonClient {
     this.agencies = new AgenciesClient(this);
     this.workspace = new WorkspaceClient(this);
     this.agents = new AgentsClient(this);
+    this.goals = new GoalsClient(this);
     this.chatgpt = new ChatGptClient(this);
     this.connectors = new ConnectorsClient(this);
     this.memories = new MemoriesClient(this);
@@ -90,6 +94,11 @@ export class DaemonClient {
 
   async health(): Promise<DaemonHealth> {
     return this.requestJson<DaemonHealth>('/health');
+  }
+
+  /** Discover native handlers and planned modules without granting access. */
+  async capabilities(): Promise<DaemonCapabilities> {
+    return this.requestJson<DaemonCapabilities>('/api/capabilities');
   }
 
   async requestJson<T>(

@@ -277,7 +277,7 @@ export const AGENCY_TEMPLATES: AgencyTemplate[] = [
       'Validation report and release checklist',
     ],
     firstTask:
-      'Prepare a delivery brief for my software idea. Ask who it serves, what problem matters most, and what code already exists, then propose a small first milestone with acceptance criteria and a validation plan.',
+      'Prepare a startup delivery brief for my software idea. Ask who it serves, what problem matters most, and what code already exists. Inspect supplied workspace material only with granted access. Propose a small first milestone with named owners, acceptance criteria, a validation plan, and the assumptions we must test. Prepare the brief for my review and save it as docs/startup-brief.md only if file-writing access is granted; otherwise return it in chat. Do not deploy, contact customers, purchase services, or enable a routine without my explicit authorization.',
     suggestedConnections: [
       'Source repository',
       'Issue tracker',

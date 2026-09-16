@@ -115,6 +115,12 @@ describe('workspace access profiles', () => {
 });
 
 describe('selectMainAgent', () => {
+  it('never promotes a generated helper into the companion identity', () => {
+    const helper = { ...agent('helper', 1), workspaceRole: 'helper' as const };
+    expect(selectMainAgent([helper])).toBeNull();
+    const companion = agent('companion', 2);
+    expect(selectMainAgent([helper, companion])).toBe(companion);
+  });
   it('prefers the persisted agency lead over creation-time ties or older workers', () => {
     const worker = agent('a-worker', 10);
     const lead = { ...agent('z-lead', 20), workspaceRole: 'lead' as const };

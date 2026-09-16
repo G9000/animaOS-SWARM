@@ -1,156 +1,142 @@
-/// <reference lib="dom" />
 import { test, expect } from '@playwright/test';
 
+// Agency templates are no longer the front door. A configured workspace with
+// only retained helpers must gain one companion without being bootstrapped again.
 for (const viewport of [
   { width: 1280, height: 900 },
   { width: 390, height: 844 },
 ]) {
-  test(`agency template review at ${viewport.width}px`, async ({
+  test(`configured workspace gains one companion and retains helper data at ${viewport.width}px`, async ({
     page,
-  }, testInfo) => {
+  }) => {
     await page.setViewportSize(viewport);
-    await page.route('**/api/**', async (route) => {
-      const path = new URL(route.request().url()).pathname.replace(
-        /^\/api/,
-        '',
-      );
-      const fixtures: Record<string, unknown> = {
-        '/health': { status: 'ok' },
-        '/agents': { agents: [] },
-        '/workspace': {
-          configured: false,
-          workspace: null,
-          defaultRoot: '/tmp/agency-preview',
+    const helper = {
+      state: {
+        id: 'retained-helper',
+        name: 'Existing helper',
+        status: 'idle',
+        createdAtMs: 1,
+        config: {
+          name: 'Existing helper',
+          provider: 'openai',
+          model: 'test-model',
+          tools: [],
+          settings: {
+            additional: {
+              workspaceRole: 'helper',
+              parentAgentId: 'former-companion',
+            },
+          },
         },
-        '/providers': {
+        tokenUsage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+      },
+      messages: [
+        {
+          id: 'old-result',
+          role: 'assistant',
+          agentId: 'retained-helper',
+          roomId: 'saved-room',
+          content: { text: 'Preserved helper result' },
+          createdAtMs: 2,
+        },
+      ],
+      messageCount: 1,
+      eventCount: 0,
+    };
+    const original = structuredClone(helper);
+    const agents: unknown[] = [helper];
+    const mutations: string[] = [];
+    let submitted: Record<string, unknown> | undefined;
+    await page.route('**/api/**', async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      if (request.method() !== 'GET')
+        mutations.push(`${request.method()} ${path}`);
+      let body: unknown;
+      if (path === '/api/health') body = { status: 'ok' };
+      else if (path === '/api/workspace')
+        body = {
+          configured: true,
+          workspace: {
+            rootPath: '/saved-workspace',
+            companyName: 'Existing',
+            mission: 'Preserve my original mission',
+            values: [],
+            hasAvatar: false,
+          },
+          defaultRoot: '/workspace',
+        };
+      else if (path === '/api/providers')
+        body = {
           providers: [
             {
-              id: 'deterministic',
-              label: 'Deterministic',
+              id: 'openai',
+              label: 'OpenAI',
               configured: true,
-              requiresKey: false,
-              apiKeyEnvs: [],
+              requiresKey: true,
+              apiKeyEnvs: ['OPENAI_API_KEY'],
             },
           ],
-        },
-      };
+        };
+      else if (path === '/api/agents' && request.method() === 'POST') {
+        submitted = request.postDataJSON();
+        const created = {
+          state: {
+            ...helper.state,
+            id: 'companion',
+            name: submitted!.name,
+            config: submitted,
+          },
+          messages: [],
+          messageCount: 0,
+          eventCount: 0,
+        };
+        agents.push(created);
+        body = { agent: created };
+      } else if (path === '/api/agents') body = { agents };
+      else if (path.includes('/connectors')) body = { connectors: [] };
+      else
+        return route.fulfill({
+          status: 404,
+          contentType: 'application/json',
+          body: JSON.stringify({ error: `Unexpected request: ${path}` }),
+        });
       await route.fulfill({
-        status: path in fixtures ? 200 : 404,
         contentType: 'application/json',
-        body: JSON.stringify(
-          fixtures[path] ?? { error: 'Not in preview fixture' },
-        ),
+        body: JSON.stringify(body),
       });
     });
     await page.goto('/');
-    await page.getByRole('button', { name: /Creator Studio/ }).click();
     await expect(
-      page.getByRole('button', { name: 'Change template', exact: true }),
+      page.getByRole('heading', { name: 'Set up your companion' }),
     ).toBeVisible();
     await expect(
-      page.getByRole('button', { name: /Start from scratch/ }),
+      page.getByRole('button', { name: /Creator Studio|Create agency/ }),
     ).toHaveCount(0);
-    await expect(
-      page.getByRole('textbox', { name: 'Company name' }),
-    ).toHaveValue('My Creator Studio');
-    await page.screenshot({
-      path: testInfo.outputPath('agency-picker.png'),
-      fullPage: false,
-      animations: 'disabled',
-    });
-    await page.getByRole('button', { name: 'Next', exact: true }).click();
-    await page.getByRole('button', { name: 'Next', exact: true }).click();
-    await expect(
-      page.getByRole('heading', { name: 'Shape your team', exact: true }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole('textbox', { name: 'Manager name' }),
-    ).toHaveCount(0);
-    await page.screenshot({
-      path: testInfo.outputPath('agency-team.png'),
-      fullPage: false,
-      animations: 'disabled',
-    });
     await page
-      .getByRole('button', { name: 'Edit Content Planner', exact: true })
+      .getByText('Personalize and set permissions', { exact: true })
       .click();
-    await expect(
-      page.getByRole('textbox', { name: 'Specialist 1 name' }),
-    ).toHaveValue('Content Planner');
-    await page
-      .getByRole('textbox', { name: 'Specialist 1 name' })
-      .fill('Editorial Planner');
-    await page
-      .getByRole('button', { name: 'Remove Community Manager' })
-      .click();
-    await page.getByRole('button', { name: 'Next', exact: true }).click();
-    await expect(
-      page.getByRole('heading', { name: 'Workspace Manager' }),
-    ).toBeVisible();
-    await expect(
-      page.getByRole('textbox', { name: 'Manager name' }),
-    ).toHaveValue('Anima');
-    await expect(page.getByRole('radio', { name: /^Balanced/ })).toBeChecked();
-    await expect(page.getByRole('radio', { name: /^Concise/ })).toBeChecked();
-    await page.getByRole('radio', { name: /^Proactive/ }).check();
-    await page.getByRole('radio', { name: /^Detailed/ }).check();
-    await page
-      .getByRole('textbox', { name: 'Workspace preferences' })
-      .fill('Keep the editorial calendar current.');
-    await page.getByText('View manager instructions').click();
-    await expect(
-      page.getByText(/You are Anima, the workspace manager/),
-    ).toContainText('Keep the editorial calendar current.');
-    await page.getByText('View manager instructions').click();
-    await page
-      .getByRole('heading', { name: 'Workspace Manager' })
-      .scrollIntoViewIfNeeded();
-    await page.screenshot({
-      path: testInfo.outputPath('workspace-manager.png'),
-      fullPage: false,
-      animations: 'disabled',
-    });
-    await page.getByRole('radio', { name: /^Observe/ }).check();
-    await page.getByRole('button', { name: 'Next', exact: true }).click();
-    await expect(
-      page.getByRole('heading', { name: 'Review', exact: true }),
-    ).toBeVisible();
-    await expect(
-      page
-        .getByRole('region', { name: 'Review', exact: true })
-        .getByText('Editorial Planner', { exact: true }),
-    ).toBeVisible();
-    await expect(
-      page
-        .getByRole('region', { name: 'Review', exact: true })
-        .getByText('Workspace Manager', { exact: true }),
-    ).toBeVisible();
-    await expect(page.getByText(/^Proactive$/i)).toBeVisible();
-    await expect(page.getByText(/^Detailed$/i)).toBeVisible();
-    await expect(
-      page.getByRole('button', { name: 'Create agency' }),
-    ).toBeEnabled();
-    const overflow = await page.evaluate(() =>
-      Array.from(document.querySelectorAll('body *'))
-        .filter((element) => {
-          const rect = element.getBoundingClientRect();
-          const style = getComputedStyle(element);
-          return (
-            style.position !== 'absolute' &&
-            style.position !== 'fixed' &&
-            rect.width > innerWidth + 1
-          );
-        })
-        .map((element) => element.tagName),
+    await expect(page.getByLabel('Workspace folder on the server')).toHaveValue(
+      '/saved-workspace',
     );
-    expect(overflow).toEqual([]);
-    await page.locator('.setup-shell').evaluate((element) => {
-      element.scrollTop = 0;
+    await expect(
+      page.getByLabel('Workspace folder on the server'),
+    ).toHaveAttribute('readonly', '');
+    await page.getByLabel('Companion name').fill('Nova');
+    await page.getByRole('button', { name: 'Start chatting' }).click();
+    await expect(page.getByPlaceholder('Message Nova…')).toBeVisible();
+    expect(mutations).toEqual(['POST /api/agents']);
+    expect(submitted).toMatchObject({
+      name: 'Nova',
+      settings: { additional: { workspaceRole: 'lead' } },
     });
-    await page.screenshot({
-      path: testInfo.outputPath('agency-review.png'),
-      fullPage: false,
-      animations: 'disabled',
-    });
+    expect(submitted!.system).toContain('Preserve my original mission');
+    expect(agents).toHaveLength(2);
+    expect(helper).toEqual(original);
+    expect(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= innerWidth,
+      ),
+    ).toBe(true);
   });
 }

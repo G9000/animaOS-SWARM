@@ -7,7 +7,7 @@ use anima_swarm::{AgentMessage, SwarmConfig};
 use tracing::warn;
 
 use crate::memory_embeddings::SharedMemoryEmbeddings;
-use crate::memory_store::{save_memory_manager, MemoryStoreConfig};
+use crate::memory_store::{MemoryMutation, MemoryStoreConfig};
 
 use super::SharedMemoryStore;
 
@@ -38,6 +38,7 @@ pub(super) async fn persist_swarm_message_relationship(
 
     let evidence_memory = {
         let mut memory_guard = memory.write().await;
+        let mut memory_guard = MemoryMutation::new(&mut memory_guard);
         let evidence_memory = match memory_guard.add(NewMemory {
             agent_id: message.from.clone(),
             agent_name: source_name.clone(),
@@ -88,13 +89,14 @@ pub(super) async fn persist_swarm_message_relationship(
             return;
         }
 
-        if let Err(error) = save_memory_manager(memory_store.as_ref(), &memory_guard).await {
+        if let Err(error) = memory_guard.persist(memory_store.as_ref()).await {
             warn!(
                 swarm_id = %swarm_id,
                 message_id = %message.id,
                 error = %error,
                 "failed to persist swarm message memory store"
             );
+            return;
         }
 
         evidence_memory

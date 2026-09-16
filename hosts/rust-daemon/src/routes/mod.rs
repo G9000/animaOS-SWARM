@@ -1,6 +1,7 @@
 mod agencies;
 mod agent_avatar;
 mod agents;
+mod capabilities;
 mod chatgpt;
 mod connectors;
 mod contracts;
@@ -8,6 +9,8 @@ mod folder_picker;
 mod gcalendar;
 mod health;
 mod http;
+mod jobs;
+mod goals;
 mod mail;
 mod memories;
 mod oauth_apps;
@@ -68,6 +71,17 @@ use crate::runtime_model::provider_summaries;
 #[openapi(
     paths(
         api_health_entry,
+        capabilities_entry,
+        jobs::list_jobs,
+        jobs::create_job,
+        jobs::cancel_job,
+        jobs::retry_job,
+        jobs::approve_job,
+        jobs::review_job,
+        goals::list_goals,
+        goals::create_goal,
+        goals::change_status,
+        goals::goal_jobs,
         ready_entry,
         create_agency_entry,
         generate_agency_entry,
@@ -175,6 +189,7 @@ struct AppState {
     connector_manager: ConnectorManager,
     calendar: crate::connectors::gcalendar::CalendarManager,
     scheduler: SchedulerService,
+    jobs: crate::jobs::JobService,
     local_owner: self::http::LocalOwnerPolicy,
 }
 
@@ -310,6 +325,7 @@ pub(crate) fn router_with_services(
         Arc::new(crate::app::DeterministicMailTransport),
         oauth_apps.clone(),
     );
+    let jobs = crate::jobs::JobService::new(Arc::clone(&state), agent_runs.clone());
     router_with_all_services(
         state,
         config,
@@ -320,6 +336,7 @@ pub(crate) fn router_with_services(
         mail,
         oauth_apps,
         scheduler,
+        jobs,
         bind_is_loopback,
     )
 }
@@ -334,6 +351,7 @@ pub(crate) fn router_with_all_services(
     mail: crate::connectors::mail::MailManager,
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
+    jobs: crate::jobs::JobService,
     bind_is_loopback: bool,
 ) -> Router {
     router_with_services_with_policies(
@@ -346,6 +364,7 @@ pub(crate) fn router_with_all_services(
         mail,
         oauth_apps,
         scheduler,
+        jobs,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
     )
@@ -361,6 +380,7 @@ fn router_with_services_with_policies(
     mail: crate::connectors::mail::MailManager,
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
+    jobs: crate::jobs::JobService,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
@@ -378,6 +398,7 @@ fn router_with_services_with_policies(
         connector_manager,
         calendar,
         scheduler,
+        jobs,
         local_owner,
     };
     let request_middleware = ServiceBuilder::new()
@@ -400,6 +421,15 @@ fn router_with_services_with_policies(
         .route("/ready", get(ready_entry))
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
+        .route("/api/capabilities", get(capabilities_entry))
+        .route("/api/goals", get(goals::list_goals).post(goals::create_goal))
+        .route("/api/goals/{goal_id}/status", axum::routing::post(goals::change_status))
+        .route("/api/goals/{goal_id}/jobs", get(goals::goal_jobs))
+        .route("/api/agents/{agent_id}/jobs", get(jobs::list_jobs).post(jobs::create_job))
+        .route("/api/agents/{agent_id}/jobs/{job_id}/cancel", axum::routing::post(jobs::cancel_job))
+        .route("/api/agents/{agent_id}/jobs/{job_id}/retry", axum::routing::post(jobs::retry_job))
+        .route("/api/agents/{agent_id}/jobs/{job_id}/approve", axum::routing::post(jobs::approve_job))
+        .route("/api/agents/{agent_id}/jobs/{job_id}/review", axum::routing::post(jobs::review_job))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -667,6 +697,26 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
 
 async fn health_entry() -> AxumResponse {
     json_response(StatusCode::OK, &health::handle_health())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/capabilities",
+    tag = "capabilities",
+    responses(
+        (status = 200, description = "Registered native tools, configured storage, and planned modules. Discovery grants no access.", body = capabilities::CapabilityInventory),
+        (status = 403, description = "Local owner authorization required", body = ErrorBody)
+    )
+)]
+async fn capabilities_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
+    let mut response = if state.local_owner.authorize_read(request.headers()).is_err() {
+        ApiError { status: StatusCode::FORBIDDEN, message: "local owner authorization required".into() }.into_response()
+    } else {
+        let guard = state.daemon.read().await;
+        json_response(StatusCode::OK, &capabilities::inventory(&guard))
+    };
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn openapi_entry() -> AxumResponse {
@@ -1722,6 +1772,9 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
+    mod jobs;
+    mod goals;
+    mod capabilities;
     mod swarm_reliability;
 
     use super::{router, router_with_services, router_with_services_with_policies};
@@ -2577,6 +2630,7 @@ mod tests {
             Arc::new(crate::app::DeterministicMailTransport),
             oauth_apps.clone(),
         );
+        let jobs = crate::jobs::JobService::new(Arc::clone(&state), runs.clone());
         let app = router_with_services_with_policies(
             Arc::clone(&state),
             DaemonConfig::default(),
@@ -2587,6 +2641,7 @@ mod tests {
             mail,
             oauth_apps,
             scheduler,
+            jobs,
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),
         );

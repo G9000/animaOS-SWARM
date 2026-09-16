@@ -1129,7 +1129,7 @@ export function OnboardingFlow({
                 type="button"
                 onClick={() => void generateTeam()}
                 disabled={generatingTeam || draft.provider === 'deterministic'}
-                className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-abyss disabled:opacity-50"
+                className="rounded-xl bg-accent px-4 py-2 text-sm font-semibold text-accent-fg disabled:opacity-50"
               >
                 {generatingTeam ? 'Generating team…' : 'Generate team'}
               </button>

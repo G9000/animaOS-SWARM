@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react';
 import { daemon } from '../lib/daemon-api';
 import type { AgentDetail } from '../lib/types';
+import { AgentRunsView } from './AgentRuns';
+import { WorkspaceGoals } from './WorkspaceGoals';
 import { AgentAvatar } from './AgentAvatar';
 import { AgentProactiveView, AgentTasksView } from './AgentWork';
 
-type Section = 'Notes' | 'Tasks' | 'Schedules';
+type Section = 'Notes' | 'Tasks' | 'Schedules' | 'Runs' | 'Goals';
 type Entry = {
   id: string;
   agentId: string;
@@ -116,6 +118,7 @@ export function WorkspaceHub({
   useEffect(() => {
     let cancelled = false;
     setResult(null);
+    if (section === 'Runs' || section === 'Goals') return;
     const ids = JSON.parse(agentIds) as string[];
     void Promise.allSettled(ids.map((id) => loadEntries(id, section))).then(
       (responses) => {
@@ -171,7 +174,8 @@ export function WorkspaceHub({
         <header className="space-y-2">
           <h2 className="text-2xl font-semibold">Work</h2>
           <p className="text-sm leading-relaxed text-ink-3">
-            Your team’s notes, tasks, and schedules, together in one place.
+            Your team’s notes, tasks, schedules, and runs, together in one
+            place.
           </p>
         </header>
         {managed && section !== 'Notes' ? (
@@ -212,51 +216,59 @@ export function WorkspaceHub({
             <div
               role="tablist"
               aria-label="Work categories"
-              className="flex gap-2 border-b border-line pb-3"
+              className="flex flex-wrap gap-2 border-b border-line pb-3"
             >
-              {(['Notes', 'Tasks', 'Schedules'] as const).map((item) => (
-                <button
-                  key={item}
-                  id={`hub-tab-${item}`}
-                  type="button"
-                  role="tab"
-                  tabIndex={section === item ? 0 : -1}
-                  onKeyDown={(event) => {
-                    const tabs: Section[] = ['Notes', 'Tasks', 'Schedules'];
-                    const offset =
-                      event.key === 'ArrowRight'
-                        ? 1
-                        : event.key === 'ArrowLeft'
-                          ? -1
-                          : 0;
-                    const next =
-                      event.key === 'Home'
-                        ? tabs[0]
-                        : event.key === 'End'
-                          ? tabs[2]
-                          : offset
-                            ? tabs[
-                                (tabs.indexOf(item) + offset + tabs.length) %
-                                  tabs.length
-                              ]
-                            : null;
-                    if (!next) return;
-                    event.preventDefault();
-                    setSection(next);
-                    setQuery('');
-                    document.getElementById(`hub-tab-${next}`)?.focus();
-                  }}
-                  aria-selected={section === item}
-                  aria-controls="hub-panel"
-                  className={`rounded-xl px-4 py-3 text-sm ${section === item ? 'bg-accent/15 font-semibold text-accent' : 'text-ink-3 hover:bg-accent/5'}`}
-                  onClick={() => {
-                    setSection(item);
-                    setQuery('');
-                  }}
-                >
-                  {item}
-                </button>
-              ))}
+              {(['Notes', 'Tasks', 'Schedules', 'Runs', 'Goals'] as const).map(
+                (item) => (
+                  <button
+                    key={item}
+                    id={`hub-tab-${item}`}
+                    type="button"
+                    role="tab"
+                    tabIndex={section === item ? 0 : -1}
+                    onKeyDown={(event) => {
+                      const tabs: Section[] = [
+                        'Notes',
+                        'Tasks',
+                        'Schedules',
+                        'Runs',
+                        'Goals',
+                      ];
+                      const offset =
+                        event.key === 'ArrowRight'
+                          ? 1
+                          : event.key === 'ArrowLeft'
+                            ? -1
+                            : 0;
+                      const next =
+                        event.key === 'Home'
+                          ? tabs[0]
+                          : event.key === 'End'
+                            ? tabs[tabs.length - 1]
+                            : offset
+                              ? tabs[
+                                  (tabs.indexOf(item) + offset + tabs.length) %
+                                    tabs.length
+                                ]
+                              : null;
+                      if (!next) return;
+                      event.preventDefault();
+                      setSection(next);
+                      setQuery('');
+                      document.getElementById(`hub-tab-${next}`)?.focus();
+                    }}
+                    aria-selected={section === item}
+                    aria-controls="hub-panel"
+                    className={`rounded-xl px-4 py-3 text-sm ${section === item ? 'bg-accent/15 font-semibold text-accent' : 'text-ink-3 hover:bg-accent/5'}`}
+                    onClick={() => {
+                      setSection(item);
+                      setQuery('');
+                    }}
+                  >
+                    {item}
+                  </button>
+                ),
+              )}
             </div>
             <div
               role="tabpanel"
@@ -264,134 +276,171 @@ export function WorkspaceHub({
               aria-labelledby={`hub-tab-${section}`}
               className="space-y-6"
             >
-              <p className="text-sm leading-relaxed text-ink-3">
-                {section === 'Notes'
-                  ? 'Saved facts and notes, newest first. Recent notes only; search applies to the notes shown.'
-                  : section === 'Tasks'
-                    ? 'Each agent keeps their own task list. Choose an agent below to add tasks or update progress.'
-                    : 'Schedules run through the daemon, even when this page is closed. Choose an agent to create, pause, or remove a schedule.'}
-              </p>
-              <div className="flex flex-wrap items-end gap-4">
-                <label className="min-w-40 flex-1 space-y-2 text-sm">
-                  Agent
-                  <select
-                    className="field"
-                    aria-label="Agent"
-                    value={selectedId}
-                    onChange={(event) => setAgentFilter(event.target.value)}
-                  >
-                    <option value="">All agents</option>
-                    {agents.map((agent) => (
-                      <option key={agent.id} value={agent.id}>
-                        {agent.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="min-w-40 flex-[2] space-y-2 text-sm">
-                  Search
-                  <input
-                    className="field"
-                    value={query}
-                    placeholder={`Search ${section.toLowerCase()}…`}
-                    onChange={(event) => setQuery(event.target.value)}
-                  />
-                </label>
-                <button
-                  type="button"
-                  className="rounded-xl border border-line px-4 py-3 text-sm"
-                  onClick={() => setRevision((value) => value + 1)}
-                >
-                  Refresh
-                </button>
-              </div>
-              {section !== 'Notes' && (
-                <div className="flex flex-wrap gap-3">
-                  {agents
-                    .filter((agent) => !selectedId || agent.id === selectedId)
-                    .map((agent) => (
-                      <button
-                        key={agent.id}
-                        type="button"
-                        className="flex items-center gap-2 rounded-xl border border-line px-4 py-3 text-sm"
-                        onClick={() => setManagedId(agent.id)}
-                      >
-                        <AgentAvatar id={agent.id} name={agent.name} />
-                        Manage {agent.name}’s {section.toLowerCase()}
-                      </button>
-                    ))}
-                </div>
-              )}
-              {errors?.map((error) => (
-                <p
-                  key={error.agentId}
-                  role="alert"
-                  className="rounded-xl border border-danger/30 p-4 text-sm text-danger"
-                >
-                  Could not load {section.toLowerCase()} for{' '}
-                  {agents.find((agent) => agent.id === error.agentId)?.name ??
-                    error.agentId}
-                  : {error.message}. Use Refresh to retry.
-                </p>
-              ))}
-              {!result ? (
-                <p role="status">Loading {section.toLowerCase()}…</p>
-              ) : (
-                <>
-                  <p className="text-xs text-ink-3">
-                    {entries?.length} {entries?.length === 1 ? section.toLowerCase().slice(0, -1) : section.toLowerCase()} shown
-                    {errors?.length ? ' · Some agents could not be loaded' : ''}
-                  </p>
-                  {entries?.length === 0 && (
-                    <p className="rounded-2xl border border-dashed border-line p-8 text-sm text-ink-3">
-                      {query
-                        ? 'No matches. Try another search.'
-                        : errors?.length
-                          ? 'No items available from the agents that loaded.'
-                          : `No ${section.toLowerCase()} yet${selectedId ? ' for this agent' : ''}.`}
+              {section === 'Goals' ? <WorkspaceGoals agents={agents} /> : section === 'Runs' ? (
+                <div className="space-y-5">
+                  <label className="block space-y-2 text-sm">
+                    Agent
+                    <select
+                      className="field"
+                      aria-label="Agent"
+                      value={selectedId || agents[0]?.id || ''}
+                      onChange={(event) => setAgentFilter(event.target.value)}
+                    >
+                      {agents.map((agent) => (
+                        <option key={agent.id} value={agent.id}>
+                          {agent.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {agents.length ? (
+                    <AgentRunsView agentId={selectedId || agents[0].id} />
+                  ) : (
+                    <p className="text-sm text-ink-3">
+                      Create an agent to queue an assignment.
                     </p>
                   )}
-                  <div className="space-y-4">
-                    {entries?.map((entry) => {
-                      const agent = agents.find(
-                        (item) => item.id === entry.agentId,
-                      );
-                      return (
-                        <article
-                          key={`${entry.agentId}:${entry.id}`}
-                          className="space-y-4 rounded-2xl border border-line bg-surface p-5 sm:p-6"
-                        >
-                          <div className="flex flex-wrap items-center gap-3">
-                            <AgentAvatar
-                              id={entry.agentId}
-                              name={agent?.name ?? entry.agentId}
-                            />
-                            <span className="text-sm font-semibold">
-                              {agent?.name ?? entry.agentId}
-                            </span>
-                            {onSelectAgent && (
-                              <button
-                                type="button"
-                                className="ml-auto text-xs underline"
-                                onClick={() => onSelectAgent(entry.agentId)}
-                              >
-                                Chat with {agent?.name ?? entry.agentId}
-                              </button>
-                            )}
-                          </div>
-                          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">
-                            {entry.content}
-                          </p>
-                          <p className="break-words text-xs leading-relaxed text-ink-3">
-                            {entry.detail}
-                            {section === 'Notes' && entry.timestamp != null
-                              ? ` · ${new Date(entry.timestamp).toLocaleString()}`
-                              : ''}
-                          </p>
-                        </article>
-                      );
-                    })}
+                </div>
+              ) : (
+                <>
+                  <p className="text-sm leading-relaxed text-ink-3">
+                    {section === 'Notes'
+                      ? 'Saved facts and notes, newest first. Recent notes only; search applies to the notes shown.'
+                      : section === 'Tasks'
+                        ? 'Each agent keeps their own task list. Choose an agent below to add tasks or update progress.'
+                        : 'Schedules run through the daemon, even when this page is closed. Choose an agent to create, pause, or remove a schedule.'}
+                  </p>
+                  <div className="flex flex-wrap items-end gap-4">
+                    <label className="min-w-40 flex-1 space-y-2 text-sm">
+                      Agent
+                      <select
+                        className="field"
+                        aria-label="Agent"
+                        value={selectedId}
+                        onChange={(event) => setAgentFilter(event.target.value)}
+                      >
+                        <option value="">All agents</option>
+                        {agents.map((agent) => (
+                          <option key={agent.id} value={agent.id}>
+                            {agent.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="min-w-40 flex-[2] space-y-2 text-sm">
+                      Search
+                      <input
+                        className="field"
+                        value={query}
+                        placeholder={`Search ${section.toLowerCase()}…`}
+                        onChange={(event) => setQuery(event.target.value)}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="rounded-xl border border-line px-4 py-3 text-sm"
+                      onClick={() => setRevision((value) => value + 1)}
+                    >
+                      Refresh
+                    </button>
                   </div>
+                  {section !== 'Notes' && (
+                    <div className="flex flex-wrap gap-3">
+                      {agents
+                        .filter(
+                          (agent) => !selectedId || agent.id === selectedId,
+                        )
+                        .map((agent) => (
+                          <button
+                            key={agent.id}
+                            type="button"
+                            className="flex items-center gap-2 rounded-xl border border-line px-4 py-3 text-sm"
+                            onClick={() => setManagedId(agent.id)}
+                          >
+                            <AgentAvatar id={agent.id} name={agent.name} />
+                            Manage {agent.name}’s {section.toLowerCase()}
+                          </button>
+                        ))}
+                    </div>
+                  )}
+                  {errors?.map((error) => (
+                    <p
+                      key={error.agentId}
+                      role="alert"
+                      className="rounded-xl border border-danger/30 p-4 text-sm text-danger"
+                    >
+                      Could not load {section.toLowerCase()} for{' '}
+                      {agents.find((agent) => agent.id === error.agentId)
+                        ?.name ?? error.agentId}
+                      : {error.message}. Use Refresh to retry.
+                    </p>
+                  ))}
+                  {!result ? (
+                    <p role="status">Loading {section.toLowerCase()}…</p>
+                  ) : (
+                    <>
+                      <p className="text-xs text-ink-3">
+                        {entries?.length}{' '}
+                        {entries?.length === 1
+                          ? section.toLowerCase().slice(0, -1)
+                          : section.toLowerCase()}{' '}
+                        shown
+                        {errors?.length
+                          ? ' · Some agents could not be loaded'
+                          : ''}
+                      </p>
+                      {entries?.length === 0 && (
+                        <p className="rounded-2xl border border-dashed border-line p-8 text-sm text-ink-3">
+                          {query
+                            ? 'No matches. Try another search.'
+                            : errors?.length
+                              ? 'No items available from the agents that loaded.'
+                              : `No ${section.toLowerCase()} yet${selectedId ? ' for this agent' : ''}.`}
+                        </p>
+                      )}
+                      <div className="space-y-4">
+                        {entries?.map((entry) => {
+                          const agent = agents.find(
+                            (item) => item.id === entry.agentId,
+                          );
+                          return (
+                            <article
+                              key={`${entry.agentId}:${entry.id}`}
+                              className="space-y-4 rounded-2xl border border-line bg-surface p-5 sm:p-6"
+                            >
+                              <div className="flex flex-wrap items-center gap-3">
+                                <AgentAvatar
+                                  id={entry.agentId}
+                                  name={agent?.name ?? entry.agentId}
+                                />
+                                <span className="text-sm font-semibold">
+                                  {agent?.name ?? entry.agentId}
+                                </span>
+                                {onSelectAgent && (
+                                  <button
+                                    type="button"
+                                    className="ml-auto text-xs underline"
+                                    onClick={() => onSelectAgent(entry.agentId)}
+                                  >
+                                    Chat with {agent?.name ?? entry.agentId}
+                                  </button>
+                                )}
+                              </div>
+                              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed">
+                                {entry.content}
+                              </p>
+                              <p className="break-words text-xs leading-relaxed text-ink-3">
+                                {entry.detail}
+                                {section === 'Notes' && entry.timestamp != null
+                                  ? ` · ${new Date(entry.timestamp).toLocaleString()}`
+                                  : ''}
+                              </p>
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </>
+                  )}
                 </>
               )}
             </div>

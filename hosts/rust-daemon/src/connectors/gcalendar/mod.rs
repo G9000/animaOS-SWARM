@@ -172,7 +172,7 @@ impl GoogleOAuthConfig {
         Self {
             client_id: resolved.credentials().client_id().to_string(),
             client_secret: Zeroizing::new(resolved.credentials().client_secret().to_string()),
-            redirect_uri: DEFAULT_REDIRECT_URI.to_string(),
+            redirect_uri: resolved.callback_uri("/api/connectors/gcalendar/callback"),
         }
     }
     #[cfg(test)]
