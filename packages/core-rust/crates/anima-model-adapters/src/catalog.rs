@@ -147,6 +147,15 @@ const PROVIDERS: &[ProviderDefinition] = &[
         base_url_envs: &["MOONSHOT_BASE_URL", "KIMI_BASE_URL"],
         default_base_url: "https://api.moonshot.ai/v1",
     },
+    ProviderDefinition {
+        id: "vllm",
+        label: "vLLM (local)",
+        aliases: &[],
+        requires_key: false,
+        api_key_envs: &["VLLM_API_KEY"],
+        base_url_envs: &["VLLM_BASE_URL"],
+        default_base_url: "http://127.0.0.1:8000/v1",
+    },
 ];
 
 pub fn provider_definitions() -> &'static [ProviderDefinition] {

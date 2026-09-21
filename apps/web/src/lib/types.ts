@@ -69,4 +69,10 @@ export const PROVIDER_MODELS: Record<string, string[]> = {
   fireworks: ['accounts/fireworks/models/llama-v3p3-70b-instruct'],
   perplexity: ['sonar-pro', 'sonar'],
   moonshot: ['kimi-k2-0905-preview', 'moonshot-v1-128k', 'moonshot-v1-32k'],
+  vllm: [
+    'meta-llama/Llama-3.3-70B-Instruct',
+    'mistralai/Mistral-7B-Instruct-v0.3',
+    'Qwen/Qwen2.5-72B-Instruct',
+    'gemma-4-26b',
+  ],
 };

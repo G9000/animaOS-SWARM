@@ -258,7 +258,8 @@ fn provider_definitions_expose_current_non_secret_metadata() {
             "deepseek",
             "fireworks",
             "perplexity",
-            "moonshot"
+            "moonshot",
+            "vllm"
         ]
     );
     assert!(definitions
