@@ -23,7 +23,8 @@ pub struct ModelInfo {
     pub provider: &'static str,
     /// Lowercase API model id prefix; the longest matching prefix wins.
     pub model_prefix: &'static str,
-    pub context_window: u32,
+    /// `None` when the provider does not publish a context window.
+    pub context_window: Option<u32>,
     /// `None` when the provider does not publish a maximum output.
     pub max_output: Option<u32>,
     pub vision: bool,
@@ -50,7 +51,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-fable-5-1",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -63,7 +64,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-opus-5-5",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -76,7 +77,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-sonnet-5",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -89,7 +90,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-haiku-4-5",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(64_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -102,7 +103,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-fable-5",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -115,7 +116,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-opus-5",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -128,7 +129,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-opus-4-8",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -141,7 +142,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-opus-4-7",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -154,7 +155,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-opus-4-6",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -167,7 +168,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-opus-4-5",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(64_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -180,7 +181,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-sonnet-4-6",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -193,7 +194,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "anthropic",
         model_prefix: "claude-sonnet-4-5",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(64_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -203,11 +204,11 @@ static MODELS: &[ModelInfo] = &[
         }),
         source: "https://platform.claude.com/docs/en/about-claude/pricing",
     },
-    // openai (31 rows)
+    // openai (31 rows + 5 Notes-only priced variants below)
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-6-astra",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -220,7 +221,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-6-sol",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -233,7 +234,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-6-luna",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -246,7 +247,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.6-sol",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -259,7 +260,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.6-terra",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -272,7 +273,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.6-luna",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -285,7 +286,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.5",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -298,7 +299,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.5-pro",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -311,7 +312,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.4",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -324,7 +325,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.4-mini",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -337,7 +338,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.4-nano",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -350,7 +351,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.4-pro",
-        context_window: 1_050_000,
+        context_window: Some(1_050_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -363,7 +364,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.2",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -376,7 +377,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.2-pro",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -389,7 +390,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5.1",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -402,7 +403,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -415,7 +416,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5-mini",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -428,7 +429,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5-nano",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(128_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -441,7 +442,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-5-pro",
-        context_window: 400_000,
+        context_window: Some(400_000),
         max_output: Some(272_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -454,7 +455,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-4.1",
-        context_window: 1_047_576,
+        context_window: Some(1_047_576),
         max_output: Some(32_768),
         vision: true,
         pricing: Some(ModelPricing {
@@ -467,7 +468,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-4.1-mini",
-        context_window: 1_047_576,
+        context_window: Some(1_047_576),
         max_output: Some(32_768),
         vision: true,
         pricing: Some(ModelPricing {
@@ -480,7 +481,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-4.1-nano",
-        context_window: 1_047_576,
+        context_window: Some(1_047_576),
         max_output: Some(32_768),
         vision: true,
         pricing: Some(ModelPricing {
@@ -493,7 +494,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-4o",
-        context_window: 128_000,
+        context_window: Some(128_000),
         max_output: Some(16_384),
         vision: true,
         pricing: Some(ModelPricing {
@@ -506,7 +507,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-4o-2024-05-13",
-        context_window: 128_000,
+        context_window: Some(128_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -519,7 +520,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "gpt-4o-mini",
-        context_window: 128_000,
+        context_window: Some(128_000),
         max_output: Some(16_384),
         vision: true,
         pricing: Some(ModelPricing {
@@ -532,7 +533,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "o3",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(100_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -545,7 +546,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "o3-pro",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(100_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -558,7 +559,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "o4-mini",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(100_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -571,7 +572,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "o3-mini",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(100_000),
         vision: false,
         pricing: Some(ModelPricing {
@@ -584,7 +585,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "o1",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(100_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -597,7 +598,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         model_prefix: "o1-pro",
-        context_window: 200_000,
+        context_window: Some(200_000),
         max_output: Some(100_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -607,11 +608,80 @@ static MODELS: &[ModelInfo] = &[
         }),
         source: "https://developers.openai.com/api/docs/pricing",
     },
+    // From the data file's Notes ("Priced but not tabulated"): priced variants that
+    // are not given their own table row upstream, so they fall through prefix
+    // matching to a cheaper family row unless listed here. Context window is not
+    // published for these; treated as unknown rather than guessed.
+    ModelInfo {
+        provider: "openai",
+        model_prefix: "gpt-5.6-cyber",
+        context_window: None,
+        max_output: None,
+        vision: false,
+        pricing: Some(ModelPricing {
+            input_micros_per_mtok: 12_500_000,
+            output_micros_per_mtok: 75_000_000,
+            cached_input_micros_per_mtok: Some(1_250_000),
+        }),
+        source: "https://developers.openai.com/api/docs/pricing",
+    },
+    ModelInfo {
+        provider: "openai",
+        model_prefix: "gpt-5.5-cyber",
+        context_window: None,
+        max_output: None,
+        vision: false,
+        pricing: Some(ModelPricing {
+            input_micros_per_mtok: 12_500_000,
+            output_micros_per_mtok: 75_000_000,
+            cached_input_micros_per_mtok: Some(1_250_000),
+        }),
+        source: "https://developers.openai.com/api/docs/pricing",
+    },
+    ModelInfo {
+        provider: "openai",
+        model_prefix: "gpt-5.3-codex",
+        context_window: None,
+        max_output: None,
+        vision: false,
+        pricing: Some(ModelPricing {
+            input_micros_per_mtok: 1_750_000,
+            output_micros_per_mtok: 14_000_000,
+            cached_input_micros_per_mtok: Some(175_000),
+        }),
+        source: "https://developers.openai.com/api/docs/pricing",
+    },
+    ModelInfo {
+        provider: "openai",
+        model_prefix: "chat-latest",
+        context_window: None,
+        max_output: None,
+        vision: false,
+        pricing: Some(ModelPricing {
+            input_micros_per_mtok: 5_000_000,
+            output_micros_per_mtok: 30_000_000,
+            cached_input_micros_per_mtok: Some(500_000),
+        }),
+        source: "https://developers.openai.com/api/docs/pricing",
+    },
+    ModelInfo {
+        provider: "openai",
+        model_prefix: "gpt-5-search-api",
+        context_window: None,
+        max_output: None,
+        vision: false,
+        pricing: Some(ModelPricing {
+            input_micros_per_mtok: 1_250_000,
+            output_micros_per_mtok: 10_000_000,
+            cached_input_micros_per_mtok: Some(125_000),
+        }),
+        source: "https://developers.openai.com/api/docs/pricing",
+    },
     // google (11 rows)
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.8-flash",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -624,7 +694,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.7-flash",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -637,7 +707,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.6-flash",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -650,7 +720,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.5-flash",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -663,7 +733,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.5-flash-lite",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -676,7 +746,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.1-flash-lite",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -689,7 +759,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3.1-pro-preview",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -702,7 +772,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-3-flash-preview",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -715,7 +785,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-2.5-pro",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -728,7 +798,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-2.5-flash",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -741,7 +811,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         model_prefix: "gemini-2.5-flash-lite",
-        context_window: 1_048_576,
+        context_window: Some(1_048_576),
         max_output: Some(65_536),
         vision: true,
         pricing: Some(ModelPricing {
@@ -755,7 +825,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "deepseek",
         model_prefix: "deepseek-flash",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(384_000),
         vision: true,
         pricing: Some(ModelPricing {
@@ -768,7 +838,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "deepseek",
         model_prefix: "deepseek-v4-pro",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: Some(384_000),
         vision: false,
         pricing: Some(ModelPricing {
@@ -782,7 +852,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "xai",
         model_prefix: "grok-4.7",
-        context_window: 500_000,
+        context_window: Some(500_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -795,7 +865,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "xai",
         model_prefix: "grok-4.6",
-        context_window: 500_000,
+        context_window: Some(500_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -808,7 +878,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "xai",
         model_prefix: "grok-4.5",
-        context_window: 500_000,
+        context_window: Some(500_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -821,7 +891,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "xai",
         model_prefix: "grok-4.3",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -834,7 +904,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "xai",
         model_prefix: "grok-4.20",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -847,7 +917,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "xai",
         model_prefix: "grok-build-0.1",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -861,7 +931,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "mistral-medium-3-5",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -874,7 +944,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "mistral-large-2512",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -887,7 +957,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "mistral-small-2603",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -900,7 +970,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "ministral-14b-2512",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -913,7 +983,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "ministral-8b-2512",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -926,7 +996,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "ministral-3b-2512",
-        context_window: 256_000,
+        context_window: Some(256_000),
         max_output: None,
         vision: true,
         pricing: Some(ModelPricing {
@@ -939,7 +1009,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "codestral-2508",
-        context_window: 128_000,
+        context_window: Some(128_000),
         max_output: None,
         vision: false,
         pricing: Some(ModelPricing {
@@ -952,7 +1022,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "zai-glm-5-3",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: None,
         vision: false,
         pricing: Some(ModelPricing {
@@ -965,7 +1035,7 @@ static MODELS: &[ModelInfo] = &[
     ModelInfo {
         provider: "mistral",
         model_prefix: "zai-glm-5-2",
-        context_window: 1_000_000,
+        context_window: Some(1_000_000),
         max_output: None,
         vision: false,
         pricing: Some(ModelPricing {
@@ -1049,7 +1119,7 @@ mod tests {
         ModelInfo {
             provider: "openai",
             model_prefix: prefix,
-            context_window: 100_000,
+            context_window: Some(100_000),
             max_output: Some(10_000),
             vision: true,
             pricing: Some(PRICED),
@@ -1154,9 +1224,12 @@ mod tests {
                 info.provider
             );
             assert_eq!(info.model_prefix, info.model_prefix.to_ascii_lowercase());
-            assert!(info.context_window > 0, "{}", info.model_prefix);
-            if let Some(max_output) = info.max_output {
-                assert!(max_output <= info.context_window, "{}", info.model_prefix);
+            if let Some(context_window) = info.context_window {
+                assert!(context_window > 0, "{}", info.model_prefix);
+            }
+            if let (Some(max_output), Some(context_window)) = (info.max_output, info.context_window)
+            {
+                assert!(max_output <= context_window, "{}", info.model_prefix);
             }
             assert!(info.source.starts_with("https://"), "{}", info.model_prefix);
             if let Some(pricing) = info.pricing {
@@ -1177,7 +1250,7 @@ mod tests {
     #[test]
     fn table_resolves_representative_models_through_aliases() {
         let sonnet = model_info("anthropic", "claude-sonnet-5").expect("sonnet 5 row");
-        assert_eq!(sonnet.context_window, 1_000_000);
+        assert_eq!(sonnet.context_window, Some(1_000_000));
         assert_eq!(
             sonnet.pricing,
             Some(ModelPricing {
@@ -1212,6 +1285,31 @@ mod tests {
         assert_eq!(
             model_info("gemini", "gemini-2.5-flash").map(|info| info.provider),
             Some("google")
+        );
+    }
+
+    #[test]
+    fn priced_variants_do_not_fall_back_to_a_cheaper_family_row() {
+        assert_eq!(
+            model_info("openai", "gpt-5.6-cyber-2026-09-01")
+                .unwrap()
+                .model_prefix,
+            "gpt-5.6-cyber"
+        );
+        assert_eq!(
+            model_info("openai", "gpt-5.3-codex").unwrap().model_prefix,
+            "gpt-5.3-codex"
+        );
+
+        let usage = TokenUsage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            total_tokens: 1_000_000,
+            ..TokenUsage::default()
+        };
+        assert_eq!(
+            estimate_cost_micros("openai", "gpt-5.5-cyber", &usage),
+            CostEstimate::Priced { micros: 12_500_000 }
         );
     }
 }
