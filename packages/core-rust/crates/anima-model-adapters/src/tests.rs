@@ -1130,3 +1130,65 @@ async fn google_usage_counts_thinking_tokens_as_completion_tokens() {
     assert_eq!(response.usage.cached_prompt_tokens, 3);
     assert_eq!(response.usage.reasoning_tokens, 7);
 }
+
+#[tokio::test]
+async fn openai_stream_rejects_explicit_null_total_usage() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":6,\"total_tokens\":null}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    let error = adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, "provider stream parse failed");
+}
+
+#[tokio::test]
+async fn openai_stream_tolerates_null_usage_details() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":6,\"total_tokens\":16,\"prompt_tokens_details\":{\"cached_tokens\":null},\"completion_tokens_details\":{\"reasoning_tokens\":null}}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.usage.prompt_tokens, 10);
+    assert_eq!(response.usage.completion_tokens, 6);
+    assert_eq!(response.usage.total_tokens, 16);
+    assert_eq!(response.usage.cached_prompt_tokens, 0);
+    assert_eq!(response.usage.reasoning_tokens, 0);
+}

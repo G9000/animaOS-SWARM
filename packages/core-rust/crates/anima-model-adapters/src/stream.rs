@@ -367,13 +367,13 @@ impl StreamUsage {
             usage.get("completion_tokens"),
             usage.get("total_tokens"),
         )?;
-        merge_usage_value(
+        merge_detail_value(
             &mut self.cached_prompt,
             usage
                 .get("prompt_tokens_details")
                 .and_then(|details| details.get("cached_tokens")),
         )?;
-        merge_usage_value(
+        merge_detail_value(
             &mut self.reasoning,
             usage
                 .get("completion_tokens_details")
@@ -385,7 +385,7 @@ impl StreamUsage {
         let Some(usage) = usage else { return Ok(()) };
         let cache_read = optional_usage_value(usage.get("cache_read_input_tokens"))?;
         let cache_write = optional_usage_value(usage.get("cache_creation_input_tokens"))?;
-        if let Some(input) = optional_usage_value(usage.get("input_tokens"))? {
+        if let Some(input) = strict_usage_value(usage.get("input_tokens"))? {
             let prompt = input
                 .checked_add(cache_read.unwrap_or(0))
                 .and_then(|value| value.checked_add(cache_write.unwrap_or(0)))
@@ -434,6 +434,18 @@ impl StreamUsage {
     }
 }
 
+/// Parses a usage field where an absent key is ignored but an explicit JSON `null` (or
+/// any non-integer value) is malformed input. Used for the original prompt/completion/
+/// total fields and Anthropic's `input_tokens`, which providers have always populated
+/// on every usage payload; a `null` there indicates a stream we cannot trust.
+fn strict_usage_value(value: Option<&Value>) -> Result<Option<u64>, String> {
+    let Some(value) = value else { return Ok(None) };
+    value.as_u64().map(Some).ok_or_else(stream_parse_error)
+}
+
+/// Parses a usage field where both an absent key and an explicit JSON `null` are
+/// tolerated as "not reported". Used for the newer cache/reasoning detail fields,
+/// which some providers omit entirely or send as `null` when unavailable.
 fn optional_usage_value(value: Option<&Value>) -> Result<Option<u64>, String> {
     match value {
         None | Some(Value::Null) => Ok(None),
@@ -441,7 +453,17 @@ fn optional_usage_value(value: Option<&Value>) -> Result<Option<u64>, String> {
     }
 }
 
+/// Strict merge for the original usage fields: see [`strict_usage_value`].
 fn merge_usage_value(target: &mut Option<u64>, value: Option<&Value>) -> Result<(), String> {
+    match strict_usage_value(value)? {
+        Some(value) => merge_usage_number(target, value),
+        None => Ok(()),
+    }
+}
+
+/// Null-tolerant merge for the newer cache/reasoning detail fields: see
+/// [`optional_usage_value`].
+fn merge_detail_value(target: &mut Option<u64>, value: Option<&Value>) -> Result<(), String> {
     match optional_usage_value(value)? {
         Some(value) => merge_usage_number(target, value),
         None => Ok(()),
