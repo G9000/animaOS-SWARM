@@ -108,6 +108,6 @@ pub use primitives::{
     MessageRole, RoomId, TaskResult, TaskStatus, UuidString,
 };
 pub use runtime::{
-    new_room_id, AgentRuntime, AgentRuntimeSnapshot, RuntimeRunBase, RuntimeRunDelta,
-    RuntimeRunUndo, MAX_RETAINED_EVENTS,
+    content_retry_key, new_room_id, AgentRuntime, AgentRuntimeSnapshot, RuntimeRunBase,
+    RuntimeRunDelta, RuntimeRunUndo, MAX_RETAINED_EVENTS,
 };

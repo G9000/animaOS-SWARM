@@ -237,3 +237,156 @@ fn new_room_ids_are_unique_generated_rooms() {
     assert_ne!(first, second);
     assert!(first.starts_with("room-") && second.starts_with("room-"));
 }
+
+use crate::agent::{AgentState, ToolDescriptor};
+use crate::model::ToolCall;
+use crate::persistence::{in_memory::InMemoryAdapter, StepStatus};
+use crate::primitives::{Message, TaskResult};
+use std::collections::BTreeMap;
+
+/// Asks for `memory_search` once, then answers.
+struct SearchOnceModel;
+
+#[async_trait]
+impl ModelAdapter for SearchOnceModel {
+    fn provider(&self) -> &str {
+        "search-once"
+    }
+
+    async fn generate(
+        &self,
+        _config: &AgentConfig,
+        request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        if request
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::Tool)
+        {
+            return Ok(ModelGenerateResponse {
+                content: text("done"),
+                tool_calls: None,
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::End,
+            });
+        }
+        Ok(ModelGenerateResponse {
+            content: Content::default(),
+            tool_calls: Some(vec![ToolCall {
+                id: "search-1".into(),
+                name: "memory_search".into(),
+                args: BTreeMap::new(),
+            }]),
+            usage: TokenUsage::default(),
+            stop_reason: ModelStopReason::ToolCall,
+        })
+    }
+}
+
+fn search_config() -> AgentConfig {
+    AgentConfig {
+        tools: Some(vec![ToolDescriptor {
+            name: "memory_search".into(),
+            description: "Search memories".into(),
+            parameters_schema: BTreeMap::new(),
+            examples: None,
+        }]),
+        ..config()
+    }
+}
+
+#[test]
+fn step_keys_include_the_run_id_unless_a_durable_retry_key_is_present() {
+    let message = Message {
+        id: "msg-1".into(),
+        agent_id: "agent-1".into(),
+        room_id: "room-a".into(),
+        content: text("search"),
+        role: MessageRole::User,
+        created_at_ms: 1,
+    };
+    let call = ToolCall {
+        id: "search-1".into(),
+        name: "memory_search".into(),
+        args: BTreeMap::new(),
+    };
+    let key = |run_id: Option<&str>, message: &Message| {
+        super::tool_step_idempotency_key("agent-1", run_id, message, 1, 0, &call)
+    };
+
+    assert_ne!(key(Some("run_a"), &message), key(Some("run_b"), &message));
+    assert_ne!(key(Some("run_a"), &message), key(None, &message));
+
+    let mut keyed = message.clone();
+    keyed.content.metadata = Some(BTreeMap::from([(
+        "idempotencyKey".to_string(),
+        DataValue::String("telegram-a:update:42".into()),
+    )]));
+    assert_eq!(
+        key(Some("run_a"), &keyed),
+        key(Some("run_b"), &keyed),
+        "a durable retry key keeps tool steps replay-safe when a restart re-runs the work under a new run"
+    );
+    assert_eq!(key(Some("run_a"), &keyed), key(None, &keyed));
+}
+
+#[test]
+fn copies_running_concurrently_record_distinct_tool_steps() {
+    let db = Arc::new(InMemoryAdapter::new());
+    let mut canonical = AgentRuntime::new(search_config(), Arc::new(SearchOnceModel));
+    canonical.init();
+    let tool = |_: AgentState, _: Message, _: ToolCall| async move {
+        TaskResult::success(text("hit"), 1)
+    };
+    let mut steps_per_run = Vec::new();
+    for run_id in ["run_a", "run_b"] {
+        let mut copy =
+            AgentRuntime::from_snapshot(canonical.run_snapshot(Vec::new()), Arc::new(SearchOnceModel));
+        copy.set_database(db.clone());
+        copy.set_run_id(run_id);
+        assert_eq!(copy.run_id(), Some(run_id));
+        let base = copy.run_base();
+        let result = block_on(copy.run_in_room_with_context_and_tools(
+            new_room_id(),
+            Vec::new(),
+            text("search"),
+            tool,
+        ));
+        assert_eq!(result.status, TaskStatus::Success);
+        steps_per_run.push(copy.run_delta_since(&base).step_count);
+    }
+
+    let steps = db.recorded_steps();
+    assert_eq!(steps_per_run, [1, 1]);
+    assert_eq!(
+        steps.len(),
+        2,
+        "copies share a starting step index but keep separate step rows"
+    );
+    assert_eq!(steps[0].step_index, steps[1].step_index);
+    assert_ne!(steps[0].idempotency_key, steps[1].idempotency_key);
+    assert!(steps.iter().all(|step| step.status == StepStatus::Done));
+}
+
+#[test]
+fn content_retry_key_reads_the_supported_metadata_names() {
+    for name in ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"] {
+        let content = Content {
+            metadata: Some(BTreeMap::from([(
+                name.to_string(),
+                DataValue::String("key-1".into()),
+            )])),
+            ..Content::default()
+        };
+        assert_eq!(super::content_retry_key(&content), Some("key-1"), "{name}");
+    }
+    let blank = Content {
+        metadata: Some(BTreeMap::from([(
+            "idempotencyKey".to_string(),
+            DataValue::String(String::new()),
+        )])),
+        ..Content::default()
+    };
+    assert_eq!(super::content_retry_key(&blank), None);
+    assert_eq!(super::content_retry_key(&Content::default()), None);
+}

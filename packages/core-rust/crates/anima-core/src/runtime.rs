@@ -65,6 +65,9 @@ pub struct AgentRuntime {
     db: Option<Arc<dyn DatabaseAdapter>>,
     persistence_agent_id: Option<String>,
     step_counter: u64,
+    /// Host run this runtime executes; scopes tool step keys (see
+    /// `tool_step_idempotency_key`). Never persisted.
+    run_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +112,7 @@ impl AgentRuntime {
             db: None,
             persistence_agent_id: None,
             step_counter: 0,
+            run_id: None,
         }
     }
 
@@ -147,6 +151,7 @@ impl AgentRuntime {
             db: None,
             persistence_agent_id: None,
             step_counter: snapshot.step_count,
+            run_id: None,
         }
     }
 
@@ -160,6 +165,17 @@ impl AgentRuntime {
 
     pub fn set_persistence_agent_id(&mut self, agent_id: impl Into<String>) {
         self.persistence_agent_id = Some(agent_id.into());
+    }
+
+    /// Scopes persisted tool step keys to one host run so concurrent runs that
+    /// start from the same canonical record never share step-log rows. A
+    /// durable retry key on the input still takes precedence.
+    pub fn set_run_id(&mut self, run_id: impl Into<String>) {
+        self.run_id = Some(run_id.into());
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 
     pub fn init(&mut self) {
@@ -904,10 +920,12 @@ impl AgentRuntime {
         let mut prepared_steps = Vec::with_capacity(tool_calls.len());
         let db = self.db.clone();
         let persistence_agent_id = self.persistence_agent_id().to_string();
+        let run_id = self.run_id.clone();
 
         for (i, tool_call) in tool_calls.iter().cloned().enumerate() {
             let idempotency_key = tool_step_idempotency_key(
                 &persistence_agent_id,
+                run_id.as_deref(),
                 user_message,
                 iteration,
                 i,
@@ -1056,6 +1074,7 @@ fn tool_after_event_data(
 
 fn tool_step_idempotency_key(
     agent_id: &str,
+    run_id: Option<&str>,
     message: &Message,
     iteration: usize,
     tool_position: usize,
@@ -1070,25 +1089,41 @@ fn tool_step_idempotency_key(
     );
 
     if let Some(retry_key) = message_retry_key(message) {
+        // A durable retry key names one logical unit of work across re-runs
+        // (for example a Telegram update re-run after a restart under a new
+        // host run), so the run id is deliberately left out: recovery must
+        // find the earlier run's steps.
         let seed = format!("{}\n{}\n{}", agent_id, retry_key, step_seed);
         return Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()).to_string();
     }
 
-    let seed = format!(
-        "{}\n{}\n{}\n{}",
-        agent_id, message.id, message.room_id, step_seed,
-    );
+    let seed = match run_id {
+        Some(run_id) => format!(
+            "{}\n{}\n{}\n{}\n{}",
+            agent_id, run_id, message.id, message.room_id, step_seed,
+        ),
+        None => format!(
+            "{}\n{}\n{}\n{}",
+            agent_id, message.id, message.room_id, step_seed,
+        ),
+    };
     Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 
-fn message_retry_key(message: &Message) -> Option<&str> {
-    let metadata = message.content.metadata.as_ref()?;
+/// The durable retry key a host put on a run's input, if any (`retryKey`,
+/// `retry_key`, `idempotencyKey`, or `idempotency_key` metadata).
+pub fn content_retry_key(content: &Content) -> Option<&str> {
+    let metadata = content.metadata.as_ref()?;
     ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"]
         .iter()
         .find_map(|key| match metadata.get(*key) {
             Some(DataValue::String(value)) if !value.is_empty() => Some(value.as_str()),
             _ => None,
         })
+}
+
+fn message_retry_key(message: &Message) -> Option<&str> {
+    content_retry_key(&message.content)
 }
 
 fn next_id(prefix: &str, counter: &AtomicU64) -> String {
