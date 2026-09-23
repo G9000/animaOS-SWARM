@@ -156,6 +156,7 @@ pub(crate) fn resolve_workspace_write_path(
     reject_disallowed_components(file_path, tool_name)?;
     let canonical_root = canonical_workspace_root(workspace_root, tool_name)?;
     let resolved = resolve_input_path(&canonical_root, file_path);
+    reject_workspace_root_target(&canonical_root, &resolved, tool_name, file_path)?;
     ensure_write_path_within_workspace(&canonical_root, &resolved, tool_name, file_path)?;
     ensure_symlink_target_within_workspace(&canonical_root, &resolved, tool_name, file_path)?;
     Ok(resolved)
@@ -183,6 +184,30 @@ pub(crate) fn write_workspace_bytes(
     fs::write(&target, bytes)
         .map_err(|error| format!("{tool_name} failed to write {file_path}: {error}"))?;
     Ok(target)
+}
+
+/// Rejects a write target that resolves to the workspace root itself (`.`, an empty
+/// path, or the absolute workspace root). A caller such as `agencies.rs` may pass this
+/// resolved path to `remove_dir_all` under `overwrite: true`, so allowing it through
+/// here would risk deleting the whole workspace.
+fn reject_workspace_root_target(
+    canonical_root: &Path,
+    resolved: &Path,
+    tool_name: &str,
+    user_path: &str,
+) -> Result<(), String> {
+    if !resolved.exists() {
+        return Ok(());
+    }
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|error| format!("{tool_name} path could not be resolved: {user_path} ({error})"))?;
+    if canonical == canonical_root {
+        return Err(format!(
+            "{tool_name} path must name a file or directory inside the workspace: {user_path}"
+        ));
+    }
+    Ok(())
 }
 
 fn reject_disallowed_components(user_path: &str, tool_name: &str) -> Result<(), String> {

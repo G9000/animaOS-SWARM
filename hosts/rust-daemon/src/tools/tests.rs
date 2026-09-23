@@ -1093,6 +1093,49 @@ fn resolve_workspace_write_path_rejects_parent_components_for_every_writer() {
 }
 
 #[test]
+fn resolve_workspace_write_path_rejects_the_workspace_root_itself() {
+    let workspace = create_temp_workspace("write-root-agency");
+
+    let error = super::resolve_workspace_write_path(&workspace, ".", "agency_create")
+        .expect_err("the workspace root itself must not be a write target");
+
+    assert_eq!(
+        error,
+        "agency_create path must name a file or directory inside the workspace: ."
+    );
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
+fn write_workspace_file_rejects_the_workspace_root_itself() {
+    let workspace = create_temp_workspace("write-root-dot");
+
+    let error = write_workspace_file_from_root(&workspace, ".", "leak")
+        .expect_err("the workspace root itself must not be a write target via '.'");
+
+    assert_eq!(
+        error,
+        "write_file path must name a file or directory inside the workspace: ."
+    );
+
+    let workspace_str = workspace
+        .to_str()
+        .expect("workspace path is utf-8")
+        .to_owned();
+    let error = write_workspace_file_from_root(&workspace, &workspace_str, "leak")
+        .expect_err("the absolute workspace root itself must not be a write target");
+
+    assert_eq!(
+        error,
+        format!(
+            "write_file path must name a file or directory inside the workspace: {workspace_str}"
+        )
+    );
+
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
 fn write_workspace_bytes_creates_parents_and_returns_the_target() {
     let workspace = create_temp_workspace("write-bytes");
 
