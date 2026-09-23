@@ -22,6 +22,10 @@ use crate::runtime_serde::{
     tool_step_input_json, tool_step_output_json,
 };
 
+#[path = "runtime/run_delta.rs"]
+mod run_delta;
+pub use run_delta::{new_room_id, RuntimeRunBase, RuntimeRunDelta, RuntimeRunUndo};
+
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
@@ -1095,3 +1099,7 @@ fn next_id(prefix: &str, counter: &AtomicU64) -> String {
 #[cfg(test)]
 #[path = "runtime/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runtime/run_tests.rs"]
+mod run_tests;
