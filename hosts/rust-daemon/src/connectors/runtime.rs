@@ -94,6 +94,7 @@ pub(crate) enum ConnectorRuntimeStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectorManagerError {
     AgentNotFound,
+    AgentBusy,
     ConnectorNotFound,
     AgentAlreadyConnected,
     PendingPairingNotFound,
@@ -112,6 +113,7 @@ impl fmt::Display for ConnectorManagerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::AgentNotFound => "agent not found",
+            Self::AgentBusy => "agent has a run in progress",
             Self::ConnectorNotFound => "connector not found",
             Self::AgentAlreadyConnected => "agent already has an active Telegram connector",
             Self::PendingPairingNotFound => "Telegram pairing candidate was not found",
@@ -1503,8 +1505,15 @@ impl ConnectorManager {
         tokio::spawn(async move {
             let _lifecycle = manager.lifecycle_lock.lock().await;
             manager.ensure_open()?;
-            if manager.state.read().await.get_agent(&agent_id).is_none() {
-                return Err(ConnectorManagerError::AgentNotFound);
+            {
+                let state = manager.state.read().await;
+                if state.get_agent(&agent_id).is_none() {
+                    return Err(ConnectorManagerError::AgentNotFound);
+                }
+                // Deleting mid-run would discard that run's commit (spec §4.4 item 6).
+                if state.in_flight_runs(&agent_id) > 0 {
+                    return Err(ConnectorManagerError::AgentBusy);
+                }
             }
             let connectors = manager
                 .state
@@ -1545,6 +1554,12 @@ impl ConnectorManager {
             }
 
             let _transaction = manager.mutation_lock.lock().await;
+            // A run can start between the first check and this transaction; runs
+            // record themselves under this same transaction, so this check is final.
+            if manager.state.read().await.in_flight_runs(&agent_id) > 0 {
+                manager.restore_agent_delete_configuration(&previous).await?;
+                return Err(ConnectorManagerError::AgentBusy);
+            }
             let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, persist) = {
                 let mut state = manager.state.write().await;
                 let agent_snapshot = state.get_agent(&agent_id);
@@ -6757,6 +6772,84 @@ mod tests {
         }
         assert_eq!(delay, super::POLL_RETRY_MAX);
         assert_eq!(super::next_poll_backoff(delay), super::POLL_RETRY_MAX);
+    }
+
+    #[tokio::test]
+    async fn agent_deletion_is_rejected_while_a_run_is_in_flight() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:busy-delete").unwrap(),
+            )
+            .await
+            .unwrap();
+        let running = {
+            let runs = manager.runs.clone();
+            let agent_id = agent_id.clone();
+            tokio::spawn(async move {
+                runs.run(AgentRunRequest {
+                    agent_id,
+                    content: Content {
+                        text: "stay busy".into(),
+                        ..Content::default()
+                    },
+                    room: RunRoom::Stable("direct:busy".into()),
+                    idempotency_key: None,
+                    source: RunSource::Api,
+                    source_ref: None,
+                })
+                .await
+            })
+        };
+        entered
+            .acquire()
+            .await
+            .expect("the run should enter the model")
+            .forget();
+
+        assert_eq!(
+            manager.delete_agent(agent_id.clone()).await.unwrap_err(),
+            super::ConnectorManagerError::AgentBusy
+        );
+        assert!(state.read().await.get_agent(&agent_id).is_some());
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:busy-delete"
+        );
+        assert_eq!(manager.worker_count().await, 1);
+
+        release.add_permits(1);
+        running
+            .await
+            .unwrap()
+            .expect("the run commits normally");
+        manager
+            .delete_agent(agent_id.clone())
+            .await
+            .expect("deletion succeeds once no run is in flight");
+        assert!(state.read().await.get_agent(&agent_id).is_none());
+        manager.shutdown().await;
     }
 
     fn invalid_snapshot_directory(label: &str) -> std::path::PathBuf {

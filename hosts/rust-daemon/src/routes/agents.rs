@@ -11,6 +11,9 @@ use crate::app::SharedDaemonState;
 use crate::runs::RunSource;
 use crate::state::UpdateAgentError;
 
+pub(crate) const AGENT_BUSY_MESSAGE: &str =
+    "Agent has a run in progress; wait for it to finish before deleting it";
+
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
     state: &SharedDaemonState,
@@ -77,6 +80,9 @@ pub(crate) async fn handle_delete_agent(
 ) -> Result<DeleteResponse, ApiError> {
     let persist_request = {
         let mut guard = state.write().await;
+        if guard.in_flight_runs(agent_id) > 0 {
+            return Err(ApiError::conflict(AGENT_BUSY_MESSAGE));
+        }
         guard.remove_agent(agent_id);
         guard.control_plane_persist_request()
     };
@@ -205,8 +211,8 @@ pub(crate) async fn handle_run_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_create_agent, handle_run_agent as handle_run_agent_with_coordinator,
-        handle_update_agent,
+        handle_create_agent, handle_delete_agent,
+        handle_run_agent as handle_run_agent_with_coordinator, handle_update_agent,
     };
     use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
     use crate::app::SharedDaemonState;
@@ -604,6 +610,71 @@ mod tests {
             persisted.runs.is_empty(),
             "the discarded run belonged to a deleted agent"
         );
+
+        let _ = std::fs::remove_file(store_path);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_with_a_run_in_flight_is_rejected_until_the_run_finishes() {
+        let store_path = std::env::temp_dir().join(format!(
+            "anima-delete-busy-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        let store_config = ControlPlaneStoreConfig::Json(store_path.clone());
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let agent_id = {
+            let mut guard = state.write().await;
+            guard.set_control_plane_store(Some(store_config.clone()));
+            guard
+                .create_agent(test_config("operator"))
+                .expect("agent should be created")
+                .state
+                .id
+        };
+        let run_state = Arc::clone(&state);
+        let run_agent_id = agent_id.clone();
+        let run = tokio::spawn(async move {
+            handle_run_agent(
+                &run_agent_id,
+                br#"{"text":"run pending task"}"#.to_vec(),
+                &run_state,
+            )
+            .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("run should enter model")
+            .forget();
+
+        let error = handle_delete_agent(&agent_id, &state)
+            .await
+            .expect_err("an in-flight run blocks deletion");
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error.message(),
+            "Agent has a run in progress; wait for it to finish before deleting it"
+        );
+        assert!(state.read().await.get_agent(&agent_id).is_some());
+
+        release.add_permits(1);
+        run.await
+            .expect("run task should join")
+            .expect("the run commits normally");
+        handle_delete_agent(&agent_id, &state)
+            .await
+            .expect("deletion succeeds once the run finished");
+        assert!(state.read().await.get_agent(&agent_id).is_none());
+        let persisted = load_control_plane_snapshot(&store_config)
+            .await
+            .expect("control-plane snapshot should load")
+            .expect("control-plane snapshot should exist");
+        assert!(persisted.agents.is_empty());
 
         let _ = std::fs::remove_file(store_path);
     }

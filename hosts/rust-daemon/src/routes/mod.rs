@@ -1202,7 +1202,8 @@ async fn get_agent_entry(
     responses(
         (status = 200, description = "Agent deleted", body = DeleteResponse),
         (status = 403, description = "Local owner authorization required", body = ErrorBody),
-        (status = 404, description = "Not found", body = ErrorBody)
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "The agent has a run in progress", body = ErrorBody)
     )
 )]
 async fn delete_agent_entry(
@@ -1226,8 +1227,17 @@ async fn delete_agent_entry(
     }
     match state.connector_manager.delete_agent(agent_id).await {
         Ok(()) => json_response(StatusCode::OK, &DeleteResponse { deleted: true }),
-        Err(ConnectorManagerError::AgentNotFound) => ApiError::not_found().into_response(),
-        Err(error) => ApiError::service_unavailable(error.to_string()).into_response(),
+        Err(error) => delete_agent_error(error),
+    }
+}
+
+fn delete_agent_error(error: ConnectorManagerError) -> AxumResponse {
+    match error {
+        ConnectorManagerError::AgentNotFound => ApiError::not_found().into_response(),
+        ConnectorManagerError::AgentBusy => {
+            ApiError::conflict(agents::AGENT_BUSY_MESSAGE).into_response()
+        }
+        error => ApiError::service_unavailable(error.to_string()).into_response(),
     }
 }
 
@@ -1788,7 +1798,7 @@ mod tests {
     use crate::connectors::credentials::{
         ConnectorCredentialStore, CredentialStoreError, InMemoryCredentialStore, TelegramBotToken,
     };
-    use crate::connectors::runtime::{ConnectorManager, TelegramTransport};
+    use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError, TelegramTransport};
     use crate::connectors::telegram::{
         TelegramClient, TelegramSentMessage, TelegramTransportError, TelegramUpdateBatch,
     };
@@ -3384,6 +3394,85 @@ mod tests {
         assert_eq!(valid.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn agent_deletion_errors_map_to_http_statuses() {
+        assert_eq!(
+            super::delete_agent_error(ConnectorManagerError::AgentBusy).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            super::delete_agent_error(ConnectorManagerError::AgentNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            super::delete_agent_error(ConnectorManagerError::Persistence).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn put_agent_tasks_is_rejected_while_a_run_is_in_flight() {
+        use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
+
+        let workspace = WorkspaceAvatarTemp::new("tasks-in-flight");
+        let state = workspace.state();
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let app = router(Arc::clone(&state), DaemonConfig::default());
+        let revision = crate::tools::todo::read_agent_todos(Some(&workspace.root), &agent_id)
+            .expect("tasks should read")
+            .revision;
+        let body = serde_json::json!({
+            "revision": revision,
+            "tasks": [{"content": "Research", "activeForm": "Researching", "status": "pending"}]
+        })
+        .to_string();
+        let put = |body: String| {
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/agents/{agent_id}/tasks"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request builds")
+        };
+        let run_id = {
+            let mut guard = state.write().await;
+            let record = RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: "direct:operator".into(),
+                    source: RunSource::Api,
+                    source_ref: None,
+                    idempotency_key: None,
+                    text: "working".into(),
+                    model: "gpt-5.4".into(),
+                    provider: None,
+                    parent_run_id: None,
+                },
+                anima_core::primitives::now_millis(),
+            );
+            let run_id = record.id.clone();
+            guard.runs.insert(record);
+            run_id
+        };
+
+        let busy = app.clone().oneshot(put(body.clone())).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+
+        state.write().await.runs.get_mut(&run_id).unwrap().finish(
+            RunStatus::Completed,
+            None,
+            anima_core::primitives::now_millis(),
+        );
+        let saved = app.oneshot(put(body)).await.unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+    }
+
     fn test_config(name: &str) -> AgentConfig {
         AgentConfig {
             name: name.into(),
@@ -3457,7 +3546,7 @@ async fn put_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<Str
     let input: crate::tools::todo::AgentTodos = match parse_json_body(body) { Ok(input) => input, Err(error) => return error.into_response() };
     let _transaction = state.agent_runs.control_plane_transaction().await;
     let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
-    if state.daemon.read().await.get_agent(&id).is_some_and(|snapshot| snapshot.state.status == anima_core::AgentStatus::Running) {
+    if state.daemon.read().await.in_flight_runs(&id) > 0 {
         return ApiError::conflict("This agent is working. Wait for the current run to finish, then refresh tasks before saving.").into_response();
     }
     match crate::tools::todo::write_agent_todos(Some(&root), &id, &input.tasks, Some(&input.revision)) {
