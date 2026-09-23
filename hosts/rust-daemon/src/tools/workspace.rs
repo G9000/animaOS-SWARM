@@ -153,7 +153,7 @@ pub(crate) fn resolve_workspace_write_path(
     file_path: &str,
     tool_name: &str,
 ) -> Result<PathBuf, String> {
-    reject_parent_components(file_path, tool_name)?;
+    reject_disallowed_components(file_path, tool_name)?;
     let canonical_root = canonical_workspace_root(workspace_root, tool_name)?;
     let resolved = resolve_input_path(&canonical_root, file_path);
     ensure_write_path_within_workspace(&canonical_root, &resolved, tool_name, file_path)?;
@@ -185,15 +185,26 @@ pub(crate) fn write_workspace_bytes(
     Ok(target)
 }
 
-fn reject_parent_components(user_path: &str, tool_name: &str) -> Result<(), String> {
-    if Path::new(user_path)
-        .components()
+fn reject_disallowed_components(user_path: &str, tool_name: &str) -> Result<(), String> {
+    let path = Path::new(user_path);
+
+    // Reject any parent directory references anywhere in the path
+    if path.components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        Err(format!("{tool_name} path must not contain '..': {user_path}"))
-    } else {
-        Ok(())
+        return Err(format!("{tool_name} path must not contain '..': {user_path}"));
     }
+
+    // Reject root and drive-prefix components in relative paths
+    if !path.is_absolute() {
+        if path.components()
+            .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
+        {
+            return Err(format!("{tool_name} path has an unsupported root or drive prefix: {user_path}"));
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_symlink_target_within_workspace(

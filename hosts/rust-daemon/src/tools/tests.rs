@@ -1162,6 +1162,44 @@ fn write_workspace_file_writes_through_symlink_inside_workspace() {
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 
+#[cfg(windows)]
+#[test]
+fn write_workspace_file_rejects_drive_relative_and_rooted_relative_paths() {
+    let workspace = create_temp_workspace("write-drive-relative");
+
+    for user_path in &["C:evil.txt", "\\evil.txt"] {
+        let error = write_workspace_file_from_root(&workspace, user_path, "x")
+            .expect_err("drive-relative and rooted relative paths must be rejected");
+
+        assert_eq!(
+            error,
+            format!("write_file path has an unsupported root or drive prefix: {user_path}")
+        );
+        assert!(!workspace.join("evil.txt").exists(), "{user_path}");
+        assert!(!workspace.join("C:evil.txt").exists(), "{user_path}");
+    }
+
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
+fn write_workspace_file_accepts_absolute_path_inside_workspace() {
+    let workspace = create_temp_workspace("write-absolute");
+    let abs_path = workspace.join("abs.txt");
+    let abs_path_str = abs_path.to_string_lossy().to_string();
+
+    let result = write_workspace_file_from_root(&workspace, &abs_path_str, "hello absolute")
+        .expect("absolute path inside workspace");
+
+    assert_eq!(result, "Wrote 14 chars to ".to_string() + &abs_path_str);
+    assert_eq!(
+        fs::read_to_string(&abs_path).expect("read file"),
+        "hello absolute"
+    );
+
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
 #[test]
 fn edit_workspace_file_applies_over_escaped_match() {
     let workspace = create_temp_workspace("edit-file");
