@@ -2,6 +2,7 @@ mod runtime_events;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
+mod run_commit;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -2414,11 +2415,7 @@ impl DaemonState {
         Ok(snapshot.clone())
     }
 
-    fn restore_agent_snapshot(&mut self, mut snapshot: AgentRuntimeSnapshot) -> Result<(), String> {
-        snapshot.state.config.tools =
-            self.resolve_restored_agent_tools(snapshot.state.config.tools)?;
-        let agent_id = snapshot.state.id.clone();
-        let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
+    fn wire_runtime(&self, runtime: &mut AgentRuntime) {
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
         runtime.set_evaluators(default_evaluators(
             Arc::clone(&self.memory),
@@ -2428,6 +2425,14 @@ impl DaemonState {
         if let Some(db) = &self.db {
             runtime.set_database(Arc::clone(db));
         }
+    }
+
+    fn restore_agent_snapshot(&mut self, mut snapshot: AgentRuntimeSnapshot) -> Result<(), String> {
+        snapshot.state.config.tools =
+            self.resolve_restored_agent_tools(snapshot.state.config.tools)?;
+        let agent_id = snapshot.state.id.clone();
+        let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
+        self.wire_runtime(&mut runtime);
         if runtime.state().status == AgentStatus::Running {
             runtime.mark_failed("daemon restarted before task completed", 0);
         }
@@ -2445,7 +2450,10 @@ impl DaemonState {
             snapshots.insert(agent_id.clone(), runtime.snapshot());
         }
 
-        let mut snapshots: Vec<_> = snapshots.into_values().collect();
+        let mut snapshots: Vec<_> = snapshots
+            .into_values()
+            .map(|snapshot| self.with_derived_status(snapshot))
+            .collect();
         snapshots.sort_by(|left, right| {
             left.state
                 .created_at_ms
@@ -2460,6 +2468,7 @@ impl DaemonState {
             .get(agent_id)
             .map(AgentRuntime::snapshot)
             .or_else(|| self.agent_snapshots.get(agent_id).cloned())
+            .map(|snapshot| self.with_derived_status(snapshot))
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: &str) {
