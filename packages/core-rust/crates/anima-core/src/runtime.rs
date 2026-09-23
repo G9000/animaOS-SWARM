@@ -951,12 +951,7 @@ impl AgentRuntime {
     }
 
     fn apply_token_usage(&mut self, usage: &TokenUsage) {
-        let total = &mut self.state.token_usage;
-        total.prompt_tokens += usage.prompt_tokens;
-        total.completion_tokens += usage.completion_tokens;
-        total.total_tokens += usage.total_tokens;
-        total.cached_prompt_tokens += usage.cached_prompt_tokens;
-        total.reasoning_tokens += usage.reasoning_tokens;
+        self.state.token_usage.saturating_add(usage);
     }
 
     fn record_token_event(&mut self) {

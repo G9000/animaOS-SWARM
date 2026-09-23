@@ -1818,6 +1818,45 @@ fn get_state_refreshes_live_token_usage_for_persistent_workers() {
 }
 
 #[test]
+fn get_state_refreshes_live_cached_and_reasoning_tokens_for_persistent_workers() {
+    let harness = TestHarness::new(HashMap::from([(
+        "worker-a".into(),
+        TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            cached_prompt_tokens: 4,
+            reasoning_tokens: 5,
+        },
+    )]));
+    let coordinator = SwarmCoordinator::with_hooks(
+        base_config(&["worker-a"]),
+        Arc::new(|_| Box::pin(async { TaskResult::success(text_content("unused"), 0) })),
+        harness.factory(),
+    );
+
+    block_on(coordinator.start()).expect("start should succeed");
+    let state = coordinator.get_state();
+    assert_eq!(state.token_usage.cached_prompt_tokens, 4);
+    assert_eq!(state.token_usage.reasoning_tokens, 5);
+
+    harness.set_tokens(
+        "worker-a",
+        TokenUsage {
+            prompt_tokens: 5,
+            completion_tokens: 6,
+            total_tokens: 11,
+            cached_prompt_tokens: 40,
+            reasoning_tokens: 50,
+        },
+    );
+
+    let state = coordinator.get_state();
+    assert_eq!(state.token_usage.cached_prompt_tokens, 40);
+    assert_eq!(state.token_usage.reasoning_tokens, 50);
+}
+
+#[test]
 fn dispatch_releases_agents_lock_before_clear_task_state_hooks() {
     let hook_gate = Arc::new(Mutex::new(()));
     let (hook_entered_tx, hook_entered_rx) = mpsc::channel();

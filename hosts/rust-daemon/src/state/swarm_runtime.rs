@@ -240,11 +240,7 @@ fn record_model_usage(usage: &Mutex<TokenUsage>, response: &TokenUsage) {
     let mut usage = usage
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    usage.prompt_tokens = usage.prompt_tokens.saturating_add(response.prompt_tokens);
-    usage.completion_tokens = usage
-        .completion_tokens
-        .saturating_add(response.completion_tokens);
-    usage.total_tokens = usage.total_tokens.saturating_add(response.total_tokens);
+    usage.saturating_add(response);
 }
 
 #[async_trait]
@@ -640,6 +636,67 @@ mod tests {
             .await
             .is_err());
         assert_eq!(sink.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn budgeted_swarm_model_records_cached_and_reasoning_tokens() {
+        use super::*;
+        struct WithCacheAndReasoning;
+        #[async_trait]
+        impl ModelAdapter for WithCacheAndReasoning {
+            fn provider(&self) -> &str {
+                "cache-test"
+            }
+            async fn generate(
+                &self,
+                _: &AgentConfig,
+                _: &ModelGenerateRequest,
+            ) -> Result<ModelGenerateResponse, String> {
+                Ok(ModelGenerateResponse {
+                    content: Content {
+                        text: "hello".into(),
+                        ..Default::default()
+                    },
+                    tool_calls: None,
+                    usage: TokenUsage {
+                        prompt_tokens: 3,
+                        completion_tokens: 2,
+                        total_tokens: 5,
+                        cached_prompt_tokens: 7,
+                        reasoning_tokens: 9,
+                    },
+                    stop_reason: anima_core::ModelStopReason::End,
+                })
+            }
+            async fn stream(
+                &self,
+                _: &AgentConfig,
+                _: &ModelGenerateRequest,
+                _: &dyn ModelStreamSink,
+            ) -> Result<(), String> {
+                Err("generate-only adapter".into())
+            }
+        }
+
+        let usage = Arc::new(Mutex::new(TokenUsage::default()));
+        let model = BudgetedSwarmModel {
+            inner: Arc::new(WithCacheAndReasoning),
+            usage: usage.clone(),
+            check_budget: Arc::new(|| Ok(())),
+        };
+        let request = ModelGenerateRequest {
+            system: String::new(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+        };
+
+        model.generate(&agent_config(), &request).await.unwrap();
+
+        let recorded = usage.lock().unwrap();
+        assert_eq!(recorded.total_tokens, 5);
+        assert_eq!(recorded.cached_prompt_tokens, 7);
+        assert_eq!(recorded.reasoning_tokens, 9);
     }
 
     #[test]
