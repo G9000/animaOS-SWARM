@@ -1102,8 +1102,18 @@ fn model_info_in<'a>(table: &'a [ModelInfo], provider: &str, model: &str) -> Opt
     }
     table
         .iter()
-        .filter(|info| info.provider == provider && model.starts_with(info.model_prefix))
+        .filter(|info| info.provider == provider && prefix_matches(&model, info.model_prefix))
         .max_by_key(|info| info.model_prefix.len())
+}
+
+/// A prefix matches only when `model` equals it exactly or the next character after the
+/// prefix is a `-`, `@`, or `:` boundary. Without this, an unlisted id that merely shares
+/// a numeric prefix (`gpt-5.7`, no row) would silently price as the shorter `gpt-5` row.
+fn prefix_matches(model: &str, prefix: &str) -> bool {
+    match model.strip_prefix(prefix) {
+        Some(rest) => rest.is_empty() || matches!(rest.as_bytes()[0], b'-' | b'@' | b':'),
+        None => false,
+    }
 }
 
 pub fn estimate_cost_micros(provider: &str, model: &str, usage: &TokenUsage) -> CostEstimate {
@@ -1398,6 +1408,28 @@ mod tests {
         assert_eq!(
             estimate_cost_micros("chatgpt", "gpt-5.5", &usage),
             CostEstimate::Subscription
+        );
+    }
+
+    #[test]
+    fn prefix_match_requires_a_boundary_character() {
+        assert!(model_info("openai", "gpt-5.7").is_none());
+        assert!(model_info("openai", "gpt-5.6").is_none());
+        assert_eq!(
+            model_info("openai", "gpt-5.5-2026-04-23")
+                .unwrap()
+                .model_prefix,
+            "gpt-5.5"
+        );
+        assert_eq!(
+            model_info("anthropic", "claude-haiku-4-5-20251001")
+                .unwrap()
+                .model_prefix,
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            model_info("openai", "o3-2025-04-16").unwrap().model_prefix,
+            "o3"
         );
     }
 }
