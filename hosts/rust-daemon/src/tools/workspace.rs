@@ -164,6 +164,11 @@ pub(crate) fn resolve_workspace_write_path(
 
 /// Writes bytes to a workspace path with the same checks as `write_file`,
 /// re-verifying the parent after directories are created.
+///
+/// Returns the resolved target path. That path is **not** canonicalized (it is
+/// `workspace_root` joined with `file_path`, or `file_path` itself when absolute); callers
+/// that need a workspace-relative path must canonicalize it themselves. The write truncates
+/// any existing file at the target and is not atomic.
 pub(crate) fn write_workspace_bytes(
     workspace_root: &Path,
     file_path: &str,

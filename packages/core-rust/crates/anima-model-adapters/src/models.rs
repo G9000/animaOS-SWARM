@@ -1116,6 +1116,11 @@ fn prefix_matches(model: &str, prefix: &str) -> bool {
     }
 }
 
+/// Prices one model call's usage at the base (standard, short-context) tier from the
+/// model table. Long-context, batch, priority/fast-mode, and regional-endpoint tiers and
+/// modifiers documented in `docs/superpowers/plans/data/2026-09-23-model-table.md`'s Notes
+/// are not modeled; callers should not treat the result as exact for requests that cross
+/// those thresholds.
 pub fn estimate_cost_micros(provider: &str, model: &str, usage: &TokenUsage) -> CostEstimate {
     let Some(provider) = canonical_provider(provider) else {
         return CostEstimate::Unknown;
@@ -1134,7 +1139,9 @@ pub fn estimate_cost_micros(provider: &str, model: &str, usage: &TokenUsage) -> 
     }
 }
 
-/// Prices usage in micro-USD, rounding half up.
+/// Prices one model call's usage in micro-USD at the given (base-tier) `pricing`,
+/// rounding half up. Long-context tiers are not modeled: `pricing` must already be the
+/// rate that applies to this call.
 pub fn price_usage(pricing: &ModelPricing, usage: &TokenUsage) -> u64 {
     let cached = usage.cached_prompt_tokens.min(usage.prompt_tokens);
     let uncached = usage.prompt_tokens - cached;

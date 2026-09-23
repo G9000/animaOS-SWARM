@@ -38,7 +38,11 @@ pub struct AgentRuntimeSnapshot {
     pub state: AgentState,
     pub message_count: usize,
     pub messages: Vec<Message>,
+    /// Running total of events ever recorded by this agent, including ones no longer
+    /// present in `events` because they were trimmed.
     pub event_count: usize,
+    /// At most the newest [`MAX_RETAINED_EVENTS`] events. May hold fewer events than
+    /// `event_count` once older events have been trimmed.
     pub events: Vec<EngineEvent>,
     pub last_task: Option<TaskResult<Content>>,
     pub step_count: u64,

@@ -85,7 +85,9 @@ impl Harness {
         &self.adapter
     }
 
-    /// Capture the full runtime state for later [`Harness::restore`].
+    /// Capture the runtime state for later [`Harness::restore`]. The event log is capped:
+    /// `snapshot().events` holds at most the newest `MAX_RETAINED_EVENTS`, which may be
+    /// fewer than `event_count`.
     pub fn snapshot(&self) -> AgentRuntimeSnapshot {
         self.runtime.snapshot()
     }
