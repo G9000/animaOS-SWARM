@@ -1,0 +1,640 @@
+//! Durable run ledger (spec §4.1): one record per coordinator run, kept in the
+//! control-plane snapshot, with restart recovery (spec §4.8) and retention.
+
+use std::collections::{HashMap, HashSet};
+
+use anima_core::TokenUsage;
+use serde::{Deserialize, Serialize};
+
+/// Terminal runs stay in the control plane for 24 hours (spec §4.1).
+pub(crate) const TERMINAL_RUN_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
+/// ...and at most this many per agent, newest first (spec §4.1).
+pub(crate) const MAX_TERMINAL_RUNS_PER_AGENT: usize = 50;
+/// Stored run input text is capped at 32 KiB (spec §4.1, §16).
+pub(crate) const MAX_RUN_INPUT_TEXT_BYTES: usize = 32 * 1024;
+/// Distinct tool names kept per run (spec §4.1).
+pub(crate) const MAX_RUN_TOOLS_STARTED: usize = 50;
+
+pub(crate) const RESTART_BEFORE_START: &str = "restart_before_start";
+pub(crate) const RESTART_DURING_RUN: &str = "restart_during_run";
+pub(crate) const RUN_FAILED: &str = "run_failed";
+pub(crate) const RUN_ABORTED: &str = "run_aborted";
+pub(crate) const COMMIT_REJECTED: &str = "commit_rejected";
+pub(crate) const COMMIT_FAILED: &str = "commit_failed";
+pub(crate) const AGENT_DELETED: &str = "agent_deleted";
+
+/// Ledger states (spec §4.1). M1 produces `Running`, `Completed`, `Failed`,
+/// and `Interrupted`; the others arrive with async runs and approvals.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunStatus {
+    Queued,
+    Running,
+    AwaitingApproval,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl RunStatus {
+    pub(crate) const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+
+    /// Running or awaiting approval: the agent counts as working (spec §4.4 item 5).
+    pub(crate) const fn is_in_flight(self) -> bool {
+        matches!(self, Self::Running | Self::AwaitingApproval)
+    }
+}
+
+/// What started a run (spec §4.1). `Web` arrives with the async runs route.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunSource {
+    Web,
+    Api,
+    Telegram,
+    Schedule,
+    Job,
+    Delegation,
+    Peer,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunInput {
+    pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) attachment_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) skill: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunError {
+    pub(crate) code: String,
+    pub(crate) message: String,
+}
+
+impl RunError {
+    pub(crate) fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+/// A persisted stop request (spec §4.6); set from M3 on.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunStopRequest {
+    pub(crate) requested_at_ms: u64,
+}
+
+/// Usage of one model call (spec §4.1 `steps`); recorded from M3's observer.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunStepUsage {
+    pub(crate) step_id: String,
+    #[serde(default)]
+    pub(crate) usage: TokenUsage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunRecord {
+    pub(crate) id: String,
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    pub(crate) source: RunSource,
+    #[serde(default)]
+    pub(crate) source_ref: Option<String>,
+    pub(crate) status: RunStatus,
+    #[serde(default)]
+    pub(crate) idempotency_key: Option<String>,
+    #[serde(default)]
+    pub(crate) input: RunInput,
+    pub(crate) created_at_ms: u64,
+    #[serde(default)]
+    pub(crate) started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) finished_at_ms: Option<u64>,
+    #[serde(default)]
+    pub(crate) error: Option<RunError>,
+    #[serde(default)]
+    pub(crate) stop: Option<RunStopRequest>,
+    #[serde(default)]
+    pub(crate) tools_started: Vec<String>,
+    #[serde(default)]
+    pub(crate) steps: Vec<RunStepUsage>,
+    #[serde(default)]
+    pub(crate) usage: TokenUsage,
+    #[serde(default)]
+    pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) provider: Option<String>,
+    #[serde(default)]
+    pub(crate) parent_run_id: Option<String>,
+    /// Set once the history store holds this record (M2); always false in M1.
+    #[serde(default)]
+    pub(crate) mirrored: bool,
+}
+
+/// What the coordinator knows when a run starts.
+#[derive(Clone, Debug)]
+pub(crate) struct RunStart {
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    pub(crate) source: RunSource,
+    pub(crate) source_ref: Option<String>,
+    pub(crate) idempotency_key: Option<String>,
+    pub(crate) text: String,
+    pub(crate) model: String,
+    pub(crate) provider: Option<String>,
+    pub(crate) parent_run_id: Option<String>,
+}
+
+impl RunRecord {
+    /// A run that starts executing now.
+    pub(crate) fn running(start: RunStart, now_ms: u64) -> Self {
+        Self {
+            id: format!("run_{}", uuid::Uuid::new_v4()),
+            agent_id: start.agent_id,
+            session_id: start.session_id,
+            source: start.source,
+            source_ref: start.source_ref,
+            status: RunStatus::Running,
+            idempotency_key: start.idempotency_key,
+            input: RunInput {
+                text: truncate_to_bytes(&start.text, MAX_RUN_INPUT_TEXT_BYTES),
+                attachment_ids: Vec::new(),
+                skill: None,
+            },
+            created_at_ms: now_ms,
+            started_at_ms: Some(now_ms),
+            finished_at_ms: None,
+            error: None,
+            stop: None,
+            tools_started: Vec::new(),
+            steps: Vec::new(),
+            usage: TokenUsage::default(),
+            model: start.model,
+            provider: start.provider,
+            parent_run_id: start.parent_run_id,
+            mirrored: false,
+        }
+    }
+
+    /// Records a terminal status; a later call (for example a rolled-back
+    /// commit) replaces an earlier one.
+    pub(crate) fn finish(&mut self, status: RunStatus, error: Option<RunError>, now_ms: u64) {
+        self.status = status;
+        self.error = error;
+        self.finished_at_ms = Some(now_ms.max(self.created_at_ms));
+    }
+
+    fn recover_after_restart(&mut self, now_ms: u64) {
+        let (code, message) = match self.status {
+            RunStatus::Queued => (
+                RESTART_BEFORE_START,
+                "The daemon restarted before this run started; it is safe to send it again.",
+            ),
+            RunStatus::Running | RunStatus::AwaitingApproval => (
+                RESTART_DURING_RUN,
+                "The daemon restarted while this run was in progress; tools it started may have had effects.",
+            ),
+            _ => return,
+        };
+        self.finish(
+            RunStatus::Interrupted,
+            Some(RunError::new(code, message)),
+            now_ms,
+        );
+    }
+}
+
+fn truncate_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RunLedger {
+    records: HashMap<String, RunRecord>,
+}
+
+impl RunLedger {
+    pub(crate) fn insert(&mut self, record: RunRecord) {
+        self.records.insert(record.id.clone(), record);
+    }
+
+    pub(crate) fn get(&self, run_id: &str) -> Option<&RunRecord> {
+        self.records.get(run_id)
+    }
+
+    pub(crate) fn get_mut(&mut self, run_id: &str) -> Option<&mut RunRecord> {
+        self.records.get_mut(run_id)
+    }
+
+    pub(crate) fn remove(&mut self, run_id: &str) -> Option<RunRecord> {
+        self.records.remove(run_id)
+    }
+
+    pub(crate) fn in_flight_count(&self, agent_id: &str) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.agent_id == agent_id && record.status.is_in_flight())
+            .count()
+    }
+
+    pub(crate) fn has_in_flight_idempotency_key(&self, agent_id: &str, key: &str) -> bool {
+        self.records.values().any(|record| {
+            record.agent_id == agent_id
+                && record.status.is_in_flight()
+                && record.idempotency_key.as_deref() == Some(key)
+        })
+    }
+
+    /// This agent's runs, oldest first. Read by M3's runs routes; tests use it now.
+    #[allow(dead_code)]
+    pub(crate) fn for_agent(&self, agent_id: &str) -> Vec<&RunRecord> {
+        let mut records = self
+            .records
+            .values()
+            .filter(|record| record.agent_id == agent_id)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        records
+    }
+
+    /// Keeps every non-terminal run plus, per agent, terminal runs from the last
+    /// 24 hours up to 50 (spec §4.1). M2 adds "and only once mirrored".
+    pub(crate) fn prune(&mut self, now_ms: u64) {
+        let cutoff = now_ms.saturating_sub(TERMINAL_RUN_RETENTION_MS);
+        let expired: Vec<String> = {
+            let mut terminal: HashMap<&str, Vec<(u64, &str)>> = HashMap::new();
+            for record in self
+                .records
+                .values()
+                .filter(|record| record.status.is_terminal())
+            {
+                terminal.entry(record.agent_id.as_str()).or_default().push((
+                    record.finished_at_ms.unwrap_or(record.created_at_ms),
+                    record.id.as_str(),
+                ));
+            }
+            let mut expired = Vec::new();
+            for runs in terminal.values_mut() {
+                runs.sort_unstable_by(|left, right| right.cmp(left));
+                for (index, (finished_at_ms, run_id)) in runs.iter().enumerate() {
+                    if index >= MAX_TERMINAL_RUNS_PER_AGENT || *finished_at_ms < cutoff {
+                        expired.push((*run_id).to_string());
+                    }
+                }
+            }
+            expired
+        };
+        for run_id in expired {
+            self.records.remove(&run_id);
+        }
+    }
+
+    /// Records to save, sorted, without runs of agents that no longer exist.
+    pub(crate) fn snapshot_records(&self, live_agents: &HashSet<String>) -> Vec<RunRecord> {
+        let mut records = self
+            .records
+            .values()
+            .filter(|record| live_agents.contains(&record.agent_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.agent_id
+                .cmp(&right.agent_id)
+                .then_with(|| left.created_at_ms.cmp(&right.created_at_ms))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        records
+    }
+
+    pub(crate) fn validate(records: &[RunRecord]) -> Result<(), String> {
+        let mut ids = HashSet::new();
+        for record in records {
+            if record.id.trim().is_empty() || !ids.insert(record.id.as_str()) {
+                return Err(format!(
+                    "duplicate or empty run id in snapshot: {}",
+                    record.id
+                ));
+            }
+            if record.agent_id.trim().is_empty() || record.session_id.trim().is_empty() {
+                return Err(format!(
+                    "run '{}' has an empty agent or session id",
+                    record.id
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The ledger after a restart: runs of missing agents are dropped, queued
+    /// and in-flight runs become interrupted (spec §4.8), and retention applies.
+    pub(crate) fn restored(
+        records: Vec<RunRecord>,
+        live_agents: &HashSet<String>,
+        now_ms: u64,
+    ) -> Self {
+        let mut ledger = Self::default();
+        for mut record in records {
+            if !live_agents.contains(&record.agent_id) {
+                continue;
+            }
+            record.recover_after_restart(now_ms);
+            ledger.insert(record);
+        }
+        ledger.prune(now_ms);
+        ledger
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn start(agent_id: &str) -> RunStart {
+        RunStart {
+            agent_id: agent_id.into(),
+            session_id: "direct:test".into(),
+            source: RunSource::Api,
+            source_ref: None,
+            idempotency_key: None,
+            text: "hello".into(),
+            model: "test-model".into(),
+            provider: None,
+            parent_run_id: None,
+        }
+    }
+
+    fn record(agent_id: &str, at_ms: u64) -> RunRecord {
+        RunRecord::running(start(agent_id), at_ms)
+    }
+
+    fn finished(agent_id: &str, at_ms: u64) -> RunRecord {
+        let mut record = record(agent_id, at_ms);
+        record.finish(RunStatus::Completed, None, at_ms);
+        record
+    }
+
+    #[test]
+    fn run_status_and_source_use_snake_case_names() {
+        for (status, name) in [
+            (RunStatus::Queued, "queued"),
+            (RunStatus::Running, "running"),
+            (RunStatus::AwaitingApproval, "awaiting_approval"),
+            (RunStatus::Completed, "completed"),
+            (RunStatus::Failed, "failed"),
+            (RunStatus::Cancelled, "cancelled"),
+            (RunStatus::Interrupted, "interrupted"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(name));
+            assert_eq!(
+                status.is_terminal(),
+                matches!(name, "completed" | "failed" | "cancelled" | "interrupted"),
+                "{name}"
+            );
+            assert_eq!(
+                status.is_in_flight(),
+                matches!(name, "running" | "awaiting_approval"),
+                "{name}"
+            );
+        }
+        for (source, name) in [
+            (RunSource::Web, "web"),
+            (RunSource::Api, "api"),
+            (RunSource::Telegram, "telegram"),
+            (RunSource::Schedule, "schedule"),
+            (RunSource::Job, "job"),
+            (RunSource::Delegation, "delegation"),
+            (RunSource::Peer, "peer"),
+        ] {
+            assert_eq!(serde_json::to_value(source).unwrap(), json!(name));
+        }
+    }
+
+    #[test]
+    fn running_records_use_v4_run_ids_camel_case_and_serde_defaults() {
+        let mut keyed = start("agent-a");
+        keyed.idempotency_key = Some("key-1".into());
+        let record = RunRecord::running(keyed, 42);
+        let value = serde_json::to_value(&record).unwrap();
+
+        let id = value["id"].as_str().unwrap();
+        assert_eq!(
+            uuid::Uuid::parse_str(id.strip_prefix("run_").unwrap())
+                .unwrap()
+                .get_version_num(),
+            4
+        );
+        assert_eq!(value["sessionId"], "direct:test");
+        assert_eq!(value["status"], "running");
+        assert_eq!(value["idempotencyKey"], "key-1");
+        assert_eq!(value["createdAtMs"], 42);
+        assert_eq!(value["startedAtMs"], 42);
+        assert_eq!(value["toolsStarted"], json!([]));
+        assert_eq!(value["mirrored"], false);
+
+        let minimal: RunRecord = serde_json::from_value(json!({
+            "id": "run_legacy",
+            "agentId": "agent-a",
+            "sessionId": "direct:a",
+            "source": "api",
+            "status": "completed",
+            "createdAtMs": 1
+        }))
+        .unwrap();
+        assert!(!minimal.mirrored);
+        assert!(minimal.tools_started.is_empty());
+        assert!(minimal.steps.is_empty());
+        assert_eq!(minimal.usage, TokenUsage::default());
+        assert_eq!(minimal.input, RunInput::default());
+        assert_eq!(minimal.parent_run_id, None);
+    }
+
+    #[test]
+    fn run_input_text_is_truncated_on_a_char_boundary() {
+        let mut long = start("agent-a");
+        long.text = "é".repeat(MAX_RUN_INPUT_TEXT_BYTES);
+
+        let record = RunRecord::running(long, 1);
+
+        assert_eq!(record.input.text.len(), MAX_RUN_INPUT_TEXT_BYTES);
+        assert!(record.input.text.chars().all(|character| character == 'é'));
+    }
+
+    #[test]
+    fn restart_recovery_interrupts_unfinished_runs_and_keeps_their_tools() {
+        let now = 5 * TERMINAL_RUN_RETENTION_MS;
+        let mut running = record("agent-a", now - 10);
+        running.tools_started = vec!["bash".into()];
+        let mut awaiting = record("agent-a", now - 9);
+        awaiting.status = RunStatus::AwaitingApproval;
+        let mut queued = record("agent-a", now - 8);
+        queued.status = RunStatus::Queued;
+        queued.started_at_ms = None;
+        let done = finished("agent-a", now - 7);
+        let orphan = record("agent-gone", now - 6);
+        let live = HashSet::from(["agent-a".to_string()]);
+
+        let ledger = RunLedger::restored(
+            vec![
+                running.clone(),
+                awaiting.clone(),
+                queued.clone(),
+                done.clone(),
+                orphan.clone(),
+            ],
+            &live,
+            now,
+        );
+
+        let interrupted = ledger.get(&running.id).unwrap();
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        assert_eq!(interrupted.error.as_ref().unwrap().code, RESTART_DURING_RUN);
+        assert_eq!(interrupted.tools_started, vec!["bash".to_string()]);
+        assert_eq!(interrupted.finished_at_ms, Some(now));
+        assert_eq!(
+            ledger
+                .get(&awaiting.id)
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
+                .code,
+            RESTART_DURING_RUN
+        );
+        let never_started = ledger.get(&queued.id).unwrap();
+        assert_eq!(never_started.status, RunStatus::Interrupted);
+        assert_eq!(
+            never_started.error.as_ref().unwrap().code,
+            RESTART_BEFORE_START
+        );
+        assert_eq!(ledger.get(&done.id), Some(&done));
+        assert!(
+            ledger.get(&orphan.id).is_none(),
+            "runs of missing agents are dropped"
+        );
+        assert_eq!(ledger.in_flight_count("agent-a"), 0);
+    }
+
+    #[test]
+    fn retention_keeps_in_flight_runs_and_the_newest_terminal_runs_of_the_last_day() {
+        let now = 10 * TERMINAL_RUN_RETENTION_MS;
+        let mut ledger = RunLedger::default();
+        let old_running = record("agent-a", now - 2 * TERMINAL_RUN_RETENTION_MS);
+        ledger.insert(old_running.clone());
+        let stale = finished("agent-a", now - TERMINAL_RUN_RETENTION_MS - 1);
+        ledger.insert(stale.clone());
+        let mut recent = Vec::new();
+        for offset in 0..(MAX_TERMINAL_RUNS_PER_AGENT as u64 + 5) {
+            let run = finished("agent-a", now - offset);
+            recent.push(run.id.clone());
+            ledger.insert(run);
+        }
+        let other = finished("agent-b", now - 10);
+        ledger.insert(other.clone());
+
+        ledger.prune(now);
+
+        assert!(
+            ledger.get(&old_running.id).is_some(),
+            "in-flight runs are never pruned"
+        );
+        assert!(
+            ledger.get(&stale.id).is_none(),
+            "terminal runs older than a day are pruned"
+        );
+        assert!(ledger.get(&other.id).is_some(), "limits apply per agent");
+        let kept = recent.iter().filter(|id| ledger.get(id).is_some()).count();
+        assert_eq!(kept, MAX_TERMINAL_RUNS_PER_AGENT);
+        assert!(ledger.get(&recent[0]).is_some(), "the newest run is kept");
+        assert!(
+            ledger.get(recent.last().unwrap()).is_none(),
+            "the oldest excess run is pruned"
+        );
+    }
+
+    #[test]
+    fn in_flight_queries_ignore_queued_and_terminal_runs() {
+        let mut ledger = RunLedger::default();
+        let mut running = record("agent-a", 1);
+        running.idempotency_key = Some("key-1".into());
+        let mut queued = record("agent-a", 2);
+        queued.status = RunStatus::Queued;
+        queued.idempotency_key = Some("key-2".into());
+        let mut done = finished("agent-a", 3);
+        done.idempotency_key = Some("key-3".into());
+        for run in [running, queued, done] {
+            ledger.insert(run);
+        }
+
+        assert_eq!(ledger.in_flight_count("agent-a"), 1);
+        assert_eq!(ledger.in_flight_count("agent-b"), 0);
+        assert!(ledger.has_in_flight_idempotency_key("agent-a", "key-1"));
+        assert!(!ledger.has_in_flight_idempotency_key("agent-a", "key-2"));
+        assert!(!ledger.has_in_flight_idempotency_key("agent-a", "key-3"));
+        assert!(!ledger.has_in_flight_idempotency_key("agent-b", "key-1"));
+        assert_eq!(ledger.for_agent("agent-a").len(), 3);
+    }
+
+    #[test]
+    fn snapshot_records_are_sorted_and_skip_deleted_agents() {
+        let mut ledger = RunLedger::default();
+        let late = record("agent-a", 20);
+        let early = record("agent-a", 10);
+        let other = record("agent-b", 5);
+        let orphan = record("agent-gone", 1);
+        for run in [late.clone(), early.clone(), other.clone(), orphan] {
+            ledger.insert(run);
+        }
+        let live = HashSet::from(["agent-a".to_string(), "agent-b".to_string()]);
+
+        let saved = ledger.snapshot_records(&live);
+
+        assert_eq!(
+            saved.iter().map(|run| run.id.as_str()).collect::<Vec<_>>(),
+            [early.id.as_str(), late.id.as_str(), other.id.as_str()]
+        );
+    }
+
+    #[test]
+    fn validation_rejects_blank_and_duplicate_ids() {
+        let valid = record("agent-a", 1);
+        assert!(RunLedger::validate(std::slice::from_ref(&valid)).is_ok());
+        assert!(RunLedger::validate(&[valid.clone(), valid]).is_err());
+        let mut blank = record("agent-a", 2);
+        blank.id = " ".into();
+        assert!(RunLedger::validate(&[blank]).is_err());
+        let mut no_session = record("agent-a", 3);
+        no_session.session_id = String::new();
+        assert!(RunLedger::validate(&[no_session]).is_err());
+    }
+}

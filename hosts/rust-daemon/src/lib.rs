@@ -9,6 +9,7 @@ mod memory_embeddings;
 mod memory_store;
 mod model;
 mod routes;
+mod runs;
 mod runtime_model;
 mod schedules;
 mod state;

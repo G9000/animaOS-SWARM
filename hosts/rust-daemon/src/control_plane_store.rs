@@ -90,6 +90,8 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) mail_drafts: Vec<crate::connectors::mail::MailDraft>,
     #[serde(default)]
     pub(crate) workspace: Option<WorkspaceConfig>,
+    #[serde(default)]
+    pub(crate) runs: Vec<crate::runs::RunRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -316,6 +318,7 @@ impl ControlPlaneSnapshot {
             calendar_connectors: vec![],
             calendar_writes: vec![],
             workspace: None,
+            runs: vec![],
         }
     }
 }
@@ -449,6 +452,7 @@ mod tests {
         assert_eq!(payload["inbound"], serde_json::json!([]));
         assert_eq!(payload["outbound"], serde_json::json!([]));
         assert_eq!(payload["schedules"], serde_json::json!([]));
+        assert_eq!(payload["runs"], serde_json::json!([]));
     }
 
     #[test]
@@ -526,5 +530,17 @@ mod tests {
         assert!(snapshot.inbound.is_empty());
         assert!(snapshot.outbound.is_empty());
         assert!(snapshot.schedules.is_empty());
+    }
+
+    #[test]
+    fn version_four_snapshot_loads_with_an_empty_run_ledger() {
+        let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 4,
+            "agents": [],
+            "swarms": []
+        }))
+        .expect("version-four snapshot should deserialize");
+
+        assert!(snapshot.runs.is_empty());
     }
 }

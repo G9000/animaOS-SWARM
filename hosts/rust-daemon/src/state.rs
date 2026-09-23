@@ -1126,6 +1126,67 @@ mod tests {
             settings: Some(AgentSettings::default()),
         }
     }
+
+    #[test]
+    fn run_ledger_is_saved_in_the_snapshot_and_restart_interrupts_unfinished_runs() {
+        use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
+
+        let now = anima_core::primitives::now_millis();
+        let start = |agent_id: &str, session_id: &str| RunStart {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+            source: RunSource::Telegram,
+            source_ref: Some("telegram-a:42".into()),
+            idempotency_key: Some("telegram-a:update:42".into()),
+            text: "hello".into(),
+            model: "deterministic".into(),
+            provider: None,
+            parent_run_id: None,
+        };
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("ledger-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let running = RunRecord::running(start(&agent_id, "telegram:telegram-a"), now);
+        let mut completed = RunRecord::running(start(&agent_id, "direct:ledger"), now);
+        completed.finish(RunStatus::Completed, None, now);
+        let mut queued = RunRecord::running(start(&agent_id, "chat:queued"), now);
+        queued.status = RunStatus::Queued;
+        queued.started_at_ms = None;
+        let orphan = RunRecord::running(start("agent-deleted", "direct:gone"), now);
+        for record in [running.clone(), completed.clone(), queued.clone(), orphan] {
+            source.runs.insert(record);
+        }
+
+        let snapshot = source.control_plane_snapshot();
+        assert_eq!(snapshot.version, 4);
+        assert_eq!(snapshot.runs.len(), 3, "runs of deleted agents are not saved");
+        assert!(snapshot.runs.iter().all(|run| run.agent_id == agent_id));
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("snapshot with a run ledger should restore");
+
+        let interrupted = restored.runs.get(&running.id).unwrap();
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        assert_eq!(
+            interrupted.error.as_ref().map(|error| error.code.as_str()),
+            Some("restart_during_run")
+        );
+        let never_started = restored.runs.get(&queued.id).unwrap();
+        assert_eq!(never_started.status, RunStatus::Interrupted);
+        assert_eq!(
+            never_started.error.as_ref().map(|error| error.code.as_str()),
+            Some("restart_before_start")
+        );
+        assert_eq!(restored.runs.get(&completed.id), Some(&completed));
+        assert_eq!(restored.in_flight_runs(&agent_id), 0);
+    }
 }
 
 const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
@@ -1198,6 +1259,7 @@ pub(crate) struct DaemonState {
     pub(crate) schedules: HashMap<String, ScheduledPromptRecord>,
     pub(crate) jobs: HashMap<String, crate::jobs::AgentJobRecord>,
     pub(crate) goals: HashMap<String, crate::jobs::GoalRecord>,
+    pub(crate) runs: crate::runs::RunLedger,
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
     pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
     calendar_manager: Option<CalendarManager>,
@@ -1347,6 +1409,7 @@ impl DaemonState {
             schedules: HashMap::new(),
             jobs: HashMap::new(),
             goals: HashMap::new(),
+            runs: crate::runs::RunLedger::default(),
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
             calendar_manager: None,
@@ -1492,6 +1555,7 @@ impl DaemonState {
         snapshot.jobs.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.goals = self.goals.values().cloned().collect();
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
+        snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
         snapshot
     }
 
@@ -1586,6 +1650,12 @@ impl DaemonState {
             .map(|write| (write.id.clone(), write))
             .collect();
 
+        self.runs = crate::runs::RunLedger::restored(
+            snapshot.runs,
+            &self.live_agent_ids(),
+            anima_core::primitives::now_millis(),
+        );
+
         Ok((restored_agents, restored_swarms))
     }
 
@@ -1645,6 +1715,7 @@ impl DaemonState {
                 return Err("duplicate job identity or request key in snapshot".into());
             }
         }
+        crate::runs::RunLedger::validate(&snapshot.runs)?;
         let mut swarm_ids = HashSet::new();
         for swarm in &snapshot.swarms {
             let swarm_id = &swarm.state.id;
@@ -2036,6 +2107,19 @@ impl DaemonState {
             }
         }
         count
+    }
+
+    /// Runs of this agent that are running or awaiting approval (spec §4.4 item 5).
+    pub(crate) fn in_flight_runs(&self, agent_id: &str) -> usize {
+        self.runs.in_flight_count(agent_id)
+    }
+
+    fn live_agent_ids(&self) -> HashSet<String> {
+        self.agents
+            .keys()
+            .chain(self.agent_snapshots.keys())
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn swarm_count(&self) -> usize {
