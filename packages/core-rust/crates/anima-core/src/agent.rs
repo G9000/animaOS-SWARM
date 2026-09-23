@@ -118,6 +118,12 @@ pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// Prompt tokens served from a provider cache; included in `prompt_tokens`.
+    #[serde(default)]
+    pub cached_prompt_tokens: u64,
+    /// Reasoning or thinking tokens; included in `completion_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -232,5 +238,28 @@ mod tests {
         assert_eq!(settings.timeout_ms, None);
         assert_eq!(settings.max_retries, None);
         assert!(settings.additional.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod token_usage_tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn usage_saved_before_detail_fields_loads_with_zero_details() {
+        let usage: TokenUsage =
+            serde_json::from_str(r#"{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}"#)
+                .expect("legacy usage deserializes");
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+                cached_prompt_tokens: 0,
+                reasoning_tokens: 0,
+            }
+        );
     }
 }

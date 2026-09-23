@@ -272,3 +272,21 @@ async fn subscription_does_not_follow_redirects() {
         .contains("HTTP 307"));
     task.abort();
 }
+
+#[test]
+fn completed_response_parses_cached_and_reasoning_usage() {
+    let response = json!({
+        "status": "completed",
+        "output": [{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],
+        "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20,
+                  "input_tokens_details": {"cached_tokens": 5},
+                  "output_tokens_details": {"reasoning_tokens": 3}}
+    });
+
+    let parsed = completed_response(&response).expect("completed response parses");
+
+    assert_eq!(parsed.usage.prompt_tokens, 12);
+    assert_eq!(parsed.usage.cached_prompt_tokens, 5);
+    assert_eq!(parsed.usage.reasoning_tokens, 3);
+    assert_eq!(parsed.usage.total_tokens, 20);
+}

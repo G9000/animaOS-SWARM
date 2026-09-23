@@ -1606,6 +1606,7 @@ async fn final_model_turn_emits_live_deltas_and_durable_semantic_events() {
             prompt_tokens: 2,
             completion_tokens: 2,
             total_tokens: 4,
+            ..TokenUsage::default()
         },
         stop_reason: ModelStopReason::End,
     };
@@ -1979,6 +1980,7 @@ async fn model_capability_result_loop_commits_dispatch_before_executor_entry() {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::ToolCall,
             })],
@@ -1993,6 +1995,7 @@ async fn model_capability_result_loop_commits_dispatch_before_executor_entry() {
                     prompt_tokens: 2,
                     completion_tokens: 1,
                     total_tokens: 3,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             })],
@@ -4461,6 +4464,7 @@ async fn exhausted_turn_budget_pauses_durably_before_the_next_model_boundary() {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::ToolCall,
             })],

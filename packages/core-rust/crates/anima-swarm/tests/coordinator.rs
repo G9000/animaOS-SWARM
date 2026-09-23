@@ -441,6 +441,7 @@ fn start_populates_workers_and_dispatch_reuses_the_pool() {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
+                ..TokenUsage::default()
             },
         ),
         (
@@ -449,6 +450,7 @@ fn start_populates_workers_and_dispatch_reuses_the_pool() {
                 prompt_tokens: 4,
                 completion_tokens: 3,
                 total_tokens: 7,
+                ..TokenUsage::default()
             },
         ),
         (
@@ -457,6 +459,7 @@ fn start_populates_workers_and_dispatch_reuses_the_pool() {
                 prompt_tokens: 5,
                 completion_tokens: 4,
                 total_tokens: 9,
+                ..TokenUsage::default()
             },
         ),
     ]));
@@ -1047,6 +1050,7 @@ fn dispatch_is_serial_and_clears_inboxes_between_tasks() {
             prompt_tokens: 1,
             completion_tokens: 1,
             total_tokens: 2,
+            ..TokenUsage::default()
         },
     )]));
     let order = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1193,6 +1197,7 @@ fn stop_waits_for_in_flight_dispatch_before_stopping_agents() {
                 prompt_tokens: 2,
                 completion_tokens: 1,
                 total_tokens: 3,
+                ..TokenUsage::default()
             },
         ),
         (
@@ -1201,6 +1206,7 @@ fn stop_waits_for_in_flight_dispatch_before_stopping_agents() {
                 prompt_tokens: 4,
                 completion_tokens: 2,
                 total_tokens: 6,
+                ..TokenUsage::default()
             },
         ),
     ]));
@@ -1304,6 +1310,7 @@ fn get_state_preserves_results_and_get_message_bus_is_stable() {
                 prompt_tokens: 3,
                 completion_tokens: 3,
                 total_tokens: 6,
+                ..TokenUsage::default()
             },
         ),
         (
@@ -1312,6 +1319,7 @@ fn get_state_preserves_results_and_get_message_bus_is_stable() {
                 prompt_tokens: 4,
                 completion_tokens: 4,
                 total_tokens: 8,
+                ..TokenUsage::default()
             },
         ),
     ]));
@@ -1514,6 +1522,7 @@ fn delayed_usage_poll_cannot_reopen_an_already_exhausted_budget() {
                         prompt_tokens: total,
                         completion_tokens: 0,
                         total_tokens: total,
+                        ..TokenUsage::default()
                     }
                 }),
                 clear_task_state: Arc::new(|| {}),
@@ -1546,6 +1555,7 @@ fn dispatch_injects_runtime_managed_send_and_broadcast_hooks() {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..TokenUsage::default()
             },
         ),
         (
@@ -1554,6 +1564,7 @@ fn dispatch_injects_runtime_managed_send_and_broadcast_hooks() {
                 prompt_tokens: 2,
                 completion_tokens: 2,
                 total_tokens: 4,
+                ..TokenUsage::default()
             },
         ),
     ]));
@@ -1728,6 +1739,7 @@ fn start_rolls_back_workers_created_before_a_later_spawn_failure() {
             prompt_tokens: 2,
             completion_tokens: 2,
             total_tokens: 4,
+            ..TokenUsage::default()
         },
     )]));
     let failing_factory: Arc<CoordinatorAgentFactoryFn> = Arc::new({
@@ -1777,6 +1789,7 @@ fn get_state_refreshes_live_token_usage_for_persistent_workers() {
             prompt_tokens: 1,
             completion_tokens: 2,
             total_tokens: 3,
+            ..TokenUsage::default()
         },
     )]));
     let coordinator = SwarmCoordinator::with_hooks(
@@ -1794,6 +1807,7 @@ fn get_state_refreshes_live_token_usage_for_persistent_workers() {
             prompt_tokens: 5,
             completion_tokens: 6,
             total_tokens: 11,
+            ..TokenUsage::default()
         },
     );
 
@@ -1963,6 +1977,7 @@ fn dispatch_cleanup_prunes_agent_ids_and_invalidates_removed_refs() {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..TokenUsage::default()
             },
         ),
         (
@@ -1971,6 +1986,7 @@ fn dispatch_cleanup_prunes_agent_ids_and_invalidates_removed_refs() {
                 prompt_tokens: 2,
                 completion_tokens: 2,
                 total_tokens: 4,
+                ..TokenUsage::default()
             },
         ),
     ]));
@@ -2035,6 +2051,7 @@ fn stop_prunes_agent_ids_and_invalidates_pooled_refs() {
             prompt_tokens: 1,
             completion_tokens: 1,
             total_tokens: 2,
+            ..TokenUsage::default()
         },
     )]));
     let saved_worker = Arc::new(Mutex::new(None::<CoordinatorAgentRef>));

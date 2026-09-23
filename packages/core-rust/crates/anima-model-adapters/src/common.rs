@@ -184,6 +184,16 @@ pub(super) fn response_usage(value: Option<&Value>) -> TokenUsage {
         prompt_tokens: value_to_u64(usage.get("prompt_tokens")),
         completion_tokens: value_to_u64(usage.get("completion_tokens")),
         total_tokens: value_to_u64(usage.get("total_tokens")),
+        cached_prompt_tokens: value_to_u64(
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens")),
+        ),
+        reasoning_tokens: value_to_u64(
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens")),
+        ),
     }
 }
 

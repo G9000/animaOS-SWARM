@@ -242,10 +242,16 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
     };
 
     let usage = if let Some(usage) = payload.get("usageMetadata") {
+        let prompt = value_to_u64(usage.get("promptTokenCount"))
+            + value_to_u64(usage.get("toolUsePromptTokenCount"));
+        let thoughts = value_to_u64(usage.get("thoughtsTokenCount"));
+        let completion = value_to_u64(usage.get("candidatesTokenCount")) + thoughts;
         TokenUsage {
-            prompt_tokens: value_to_u64(usage.get("promptTokenCount")),
-            completion_tokens: value_to_u64(usage.get("candidatesTokenCount")),
-            total_tokens: value_to_u64(usage.get("totalTokenCount")),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_prompt_tokens: value_to_u64(usage.get("cachedContentTokenCount")),
+            reasoning_tokens: thoughts,
         }
     } else {
         TokenUsage::default()

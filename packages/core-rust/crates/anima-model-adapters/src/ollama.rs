@@ -89,6 +89,7 @@ pub(super) fn parse_ollama_response(payload: &Value) -> Result<ModelGenerateResp
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            ..TokenUsage::default()
         },
         stop_reason,
     })

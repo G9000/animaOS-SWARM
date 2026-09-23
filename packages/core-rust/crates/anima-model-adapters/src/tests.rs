@@ -949,3 +949,184 @@ async fn spawn_server(app: Router) -> String {
     });
     format!("http://{address}")
 }
+
+#[tokio::test]
+async fn openai_stream_requests_usage_and_parses_token_details() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["stream_options"]["include_usage"], true);
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":6,\"total_tokens\":16,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens_details\":{\"reasoning_tokens\":2}}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.usage.prompt_tokens, 10);
+    assert_eq!(response.usage.completion_tokens, 6);
+    assert_eq!(response.usage.total_tokens, 16);
+    assert_eq!(response.usage.cached_prompt_tokens, 4);
+    assert_eq!(response.usage.reasoning_tokens, 2);
+}
+
+#[tokio::test]
+async fn providers_without_documented_stream_usage_option_do_not_receive_it() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert!(body.get("stream_options").is_none());
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("mistral", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("mistral", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.usage.total_tokens, 2);
+}
+
+#[tokio::test]
+async fn openai_generate_parses_cached_and_reasoning_tokens() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({
+                "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":20,"completion_tokens":9,"total_tokens":29,
+                         "prompt_tokens_details":{"cached_tokens":12},
+                         "completion_tokens_details":{"reasoning_tokens":5}}
+            }))
+        }),
+    );
+    let base_url = spawn_server(app).await;
+
+    let response = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))])
+        .generate(&agent_config("openai", false), &request())
+        .await
+        .expect("openai response");
+
+    assert_eq!(response.usage.cached_prompt_tokens, 12);
+    assert_eq!(response.usage.reasoning_tokens, 5);
+    assert_eq!(response.usage.total_tokens, 29);
+}
+
+#[tokio::test]
+async fn anthropic_usage_counts_cache_tokens_as_prompt_tokens() {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            Json(json!({
+                "content":[{"type":"text","text":"ok"}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":5,"cache_read_input_tokens":20,"cache_creation_input_tokens":1,"output_tokens":7}
+            }))
+        }),
+    );
+    let base_url = spawn_server(app).await;
+
+    let response = adapter_with(&[("anthropic", Some("key"), &base_url)])
+        .generate(&agent_config("anthropic", false), &request())
+        .await
+        .expect("anthropic response");
+
+    assert_eq!(response.usage.prompt_tokens, 26);
+    assert_eq!(response.usage.cached_prompt_tokens, 20);
+    assert_eq!(response.usage.completion_tokens, 7);
+    assert_eq!(response.usage.total_tokens, 33);
+}
+
+#[tokio::test]
+async fn anthropic_stream_usage_counts_cache_tokens_as_prompt_tokens() {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":40,\"cache_creation_input_tokens\":2}}}\n\n",
+                    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":6}}\n\n",
+                    "data: {\"type\":\"message_stop\"}\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("anthropic", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("anthropic", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.usage.prompt_tokens, 45);
+    assert_eq!(response.usage.cached_prompt_tokens, 40);
+    assert_eq!(response.usage.completion_tokens, 6);
+    assert_eq!(response.usage.total_tokens, 51);
+}
+
+#[tokio::test]
+async fn google_usage_counts_thinking_tokens_as_completion_tokens() {
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.5-flash:generateContent",
+        post(|| async {
+            Json(json!({
+                "candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],
+                "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":7,
+                                 "cachedContentTokenCount":3,"totalTokenCount":22}
+            }))
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let mut config = agent_config("google", false);
+    config.model = "gemini-2.5-flash".into();
+
+    let response = adapter_with(&[("google", Some("key"), &base_url)])
+        .generate(&config, &request())
+        .await
+        .expect("google response");
+
+    assert_eq!(response.usage.prompt_tokens, 10);
+    assert_eq!(response.usage.completion_tokens, 12);
+    assert_eq!(response.usage.total_tokens, 22);
+    assert_eq!(response.usage.cached_prompt_tokens, 3);
+    assert_eq!(response.usage.reasoning_tokens, 7);
+}

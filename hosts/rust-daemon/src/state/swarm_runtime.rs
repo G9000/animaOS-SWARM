@@ -499,6 +499,7 @@ mod tests {
                     prompt_tokens: 3,
                     completion_tokens: 2,
                     total_tokens: 5,
+                    ..anima_core::TokenUsage::default()
                 },
                 stop_reason: if delegate {
                     anima_core::ModelStopReason::ToolCall
@@ -589,6 +590,7 @@ mod tests {
                         prompt_tokens: 3,
                         completion_tokens: 2,
                         total_tokens: 5,
+                        ..TokenUsage::default()
                     },
                     stop_reason: anima_core::ModelStopReason::End,
                 }))

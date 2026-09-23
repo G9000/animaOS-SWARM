@@ -104,6 +104,8 @@ struct StreamUsage {
     prompt: Option<u64>,
     completion: Option<u64>,
     total: Option<u64>,
+    cached_prompt: Option<u64>,
+    reasoning: Option<u64>,
 }
 
 #[derive(Default)]
@@ -364,12 +366,36 @@ impl StreamUsage {
             usage.get("prompt_tokens"),
             usage.get("completion_tokens"),
             usage.get("total_tokens"),
+        )?;
+        merge_usage_value(
+            &mut self.cached_prompt,
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens")),
+        )?;
+        merge_usage_value(
+            &mut self.reasoning,
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens")),
         )
     }
 
     fn merge_anthropic_start(&mut self, usage: Option<&Value>) -> Result<(), String> {
         let Some(usage) = usage else { return Ok(()) };
-        self.merge(usage.get("input_tokens"), None, None)
+        let cache_read = optional_usage_value(usage.get("cache_read_input_tokens"))?;
+        let cache_write = optional_usage_value(usage.get("cache_creation_input_tokens"))?;
+        if let Some(input) = optional_usage_value(usage.get("input_tokens"))? {
+            let prompt = input
+                .checked_add(cache_read.unwrap_or(0))
+                .and_then(|value| value.checked_add(cache_write.unwrap_or(0)))
+                .ok_or_else(stream_parse_error)?;
+            merge_usage_number(&mut self.prompt, prompt)?;
+        }
+        if let Some(cache_read) = cache_read {
+            merge_usage_number(&mut self.cached_prompt, cache_read)?;
+        }
+        Ok(())
     }
 
     fn merge_anthropic_delta(&mut self, usage: Option<&Value>) -> Result<(), String> {
@@ -402,13 +428,27 @@ impl StreamUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cached_prompt_tokens: self.cached_prompt.unwrap_or(0),
+            reasoning_tokens: self.reasoning.unwrap_or(0),
         })
     }
 }
 
+fn optional_usage_value(value: Option<&Value>) -> Result<Option<u64>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value.as_u64().map(Some).ok_or_else(stream_parse_error),
+    }
+}
+
 fn merge_usage_value(target: &mut Option<u64>, value: Option<&Value>) -> Result<(), String> {
-    let Some(value) = value else { return Ok(()) };
-    let value = value.as_u64().ok_or_else(stream_parse_error)?;
+    match optional_usage_value(value)? {
+        Some(value) => merge_usage_number(target, value),
+        None => Ok(()),
+    }
+}
+
+fn merge_usage_number(target: &mut Option<u64>, value: u64) -> Result<(), String> {
     if target.is_some_and(|current| current != value) {
         return Err(stream_parse_error());
     }

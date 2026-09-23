@@ -14,6 +14,11 @@ use crate::{ProviderAdapterConfig, ProviderCredential};
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
+/// Providers whose chat-completions streaming documents `stream_options.include_usage`.
+fn stream_usage_option_supported(provider_id: &str) -> bool {
+    matches!(provider_id, "openai" | "deepseek" | "vllm")
+}
+
 #[derive(Clone)]
 pub struct ProviderModelAdapter {
     client: Client,
@@ -193,10 +198,14 @@ impl ProviderModelAdapter {
         config: &AgentConfig,
         request: &ModelGenerateRequest,
         sink: &dyn ModelStreamSink,
+        include_usage: bool,
     ) -> Result<(), String> {
         for attempt in 0..2 {
             let mut body = build_openai_compatible_body(config, request)?;
             body["stream"] = serde_json::Value::Bool(true);
+            if include_usage {
+                body["stream_options"] = serde_json::json!({ "include_usage": true });
+            }
             let mut builder = self
                 .client
                 .post(&endpoint)
@@ -320,6 +329,7 @@ impl ModelAdapter for ProviderModelAdapter {
                     config,
                     request,
                     sink,
+                    stream_usage_option_supported(definition.id),
                 )
                 .await
             }

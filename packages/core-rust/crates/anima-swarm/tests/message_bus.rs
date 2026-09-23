@@ -75,6 +75,7 @@ fn swarm_types_keep_ts_shape_fields() {
             prompt_tokens: 5,
             completion_tokens: 7,
             total_tokens: 12,
+            ..TokenUsage::default()
         },
         started_at: Some(100),
         completed_at: Some(112),

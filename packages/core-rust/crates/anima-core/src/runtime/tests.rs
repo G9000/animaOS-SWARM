@@ -91,6 +91,7 @@ impl ModelAdapter for StaticModelAdapter {
                 prompt_tokens: 5,
                 completion_tokens: 7,
                 total_tokens: 12,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::End,
         })
@@ -164,6 +165,7 @@ impl ModelAdapter for ToolCallingModelAdapter {
                     prompt_tokens: 2,
                     completion_tokens: 3,
                     total_tokens: 5,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
                 tool_calls: None,
@@ -192,6 +194,7 @@ impl ModelAdapter for ToolCallingModelAdapter {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::ToolCall,
             tool_calls: Some(vec![ToolCall {
@@ -239,6 +242,7 @@ impl ModelAdapter for RecordingToolCallingModelAdapter {
                     prompt_tokens: 2,
                     completion_tokens: 3,
                     total_tokens: 5,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
                 tool_calls: None,
@@ -267,6 +271,7 @@ impl ModelAdapter for RecordingToolCallingModelAdapter {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::ToolCall,
             tool_calls: Some(vec![ToolCall {
@@ -310,6 +315,7 @@ impl ModelAdapter for MultiToolCallingModelAdapter {
                     prompt_tokens: 4,
                     completion_tokens: 3,
                     total_tokens: 7,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             });
@@ -337,6 +343,7 @@ impl ModelAdapter for MultiToolCallingModelAdapter {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::ToolCall,
         })
@@ -409,6 +416,7 @@ impl ModelAdapter for ContextAwareModelAdapter {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::End,
         })
@@ -442,6 +450,7 @@ impl ModelAdapter for AsyncBoundaryModelAdapter {
                 prompt_tokens: 11,
                 completion_tokens: 13,
                 total_tokens: 24,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::End,
         })
@@ -640,6 +649,7 @@ impl ModelAdapter for RetryAwareModelAdapter {
                 prompt_tokens: 2,
                 completion_tokens: 3,
                 total_tokens: 5,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::End,
         })
