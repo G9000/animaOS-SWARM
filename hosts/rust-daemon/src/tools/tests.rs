@@ -1162,6 +1162,66 @@ fn write_workspace_file_writes_through_symlink_inside_workspace() {
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 
+#[cfg(unix)]
+#[test]
+fn write_workspace_file_rejects_absolute_path_outside_workspace() {
+    let sandbox = create_temp_workspace("write-absolute-outside");
+    let workspace = sandbox.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let outside = sandbox.join("outside.txt");
+    let outside_path = outside.to_str().expect("outside path is utf-8").to_owned();
+
+    let error = write_workspace_file_from_root(&workspace, &outside_path, "leak")
+        .expect_err("absolute path outside the workspace must be rejected");
+
+    assert_eq!(
+        error,
+        format!("write_file path escapes workspace root: {outside_path}")
+    );
+    assert!(!outside.exists());
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_workspace_file_rejects_symlinked_directory_component_pointing_outside() {
+    let sandbox = create_temp_workspace("write-symlinked-dir-component");
+    let workspace = sandbox.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let outside = sandbox.join("outside");
+    fs::create_dir_all(&outside).expect("create outside dir");
+    std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("create symlink");
+
+    let error = write_workspace_file_from_root(&workspace, "link/new/x.txt", "leak")
+        .expect_err("writing through a symlinked directory component must be rejected");
+
+    assert_eq!(error, "write_file path escapes workspace root: link/new/x.txt");
+    assert!(!outside.join("new").exists());
+    assert!(!outside.join("new/x.txt").exists());
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_workspace_file_rejects_dangling_symlink_directory_component() {
+    let sandbox = create_temp_workspace("write-dangling-dir-component");
+    let workspace = sandbox.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let dangling_target = sandbox.join("does-not-exist");
+    std::os::unix::fs::symlink(&dangling_target, workspace.join("link"))
+        .expect("create dangling symlink");
+
+    let error = write_workspace_file_from_root(&workspace, "link/x.txt", "leak")
+        .expect_err("writing through a dangling symlink directory component must be rejected");
+
+    assert_eq!(
+        error,
+        "write_file failed to create directories for link/x.txt: File exists (os error 17)"
+    );
+    assert!(!dangling_target.exists());
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
 #[cfg(windows)]
 #[test]
 fn write_workspace_file_rejects_drive_relative_and_rooted_relative_paths() {
