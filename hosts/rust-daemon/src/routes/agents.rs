@@ -8,6 +8,7 @@ use super::contracts::{
 use super::ApiError;
 use crate::agent_runs::{AgentRunCoordinator, AgentRunPermit, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
+use crate::runs::RunSource;
 use crate::state::UpdateAgentError;
 
 pub(crate) async fn handle_create_agent(
@@ -193,6 +194,8 @@ pub(crate) async fn handle_run_agent(
                 content,
                 room,
                 idempotency_key: None,
+                source: RunSource::Api,
+                source_ref: None,
             },
             permit,
         )
@@ -202,19 +205,23 @@ pub(crate) async fn handle_run_agent(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_create_agent, handle_delete_agent,
-        handle_run_agent as handle_run_agent_with_coordinator, handle_update_agent,
+        handle_create_agent, handle_run_agent as handle_run_agent_with_coordinator,
+        handle_update_agent,
     };
-    use crate::agent_runs::AgentRunCoordinator;
+    use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
     use crate::app::SharedDaemonState;
     use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+    use crate::runs::RunSource;
     use crate::state::DaemonState;
     use anima_core::{
-        AgentConfig, AgentSettings, AgentStatus, Content, ModelAdapter, ModelGenerateRequest,
-        ModelGenerateResponse, ModelStopReason, TokenUsage,
+        AgentConfig, AgentSettings, AgentStatus, Content, DataValue, ModelAdapter,
+        ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::{RwLock, Semaphore};
 
     async fn handle_run_agent(
@@ -236,6 +243,38 @@ mod tests {
 
     struct CapturingModelAdapter {
         configs: Arc<Mutex<Vec<AgentConfig>>>,
+    }
+
+    struct RequestCapturingModelAdapter {
+        requests: Arc<Mutex<Vec<ModelGenerateRequest>>>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for RequestCapturingModelAdapter {
+        fn provider(&self) -> &str {
+            "request-capturing"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.requests
+                .lock()
+                .expect("capture lock should not be poisoned")
+                .push(request.clone());
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: "captured".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::End,
+            })
+        }
     }
 
     #[async_trait]
@@ -497,7 +536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_agent_during_in_flight_run_stays_deleted_and_persisted() {
+    async fn commit_for_an_agent_deleted_mid_run_is_discarded() {
         let store_path = std::env::temp_dir().join(format!(
             "anima-delete-race-{}-{}.json",
             std::process::id(),
@@ -534,14 +573,23 @@ mod tests {
             .expect("run should enter model")
             .forget();
 
-        handle_delete_agent(&agent_id, &state)
+        // Bypasses the route's in-flight guard, like an internal removal path.
+        let persist_request = {
+            let mut guard = state.write().await;
+            guard.remove_agent(&agent_id);
+            guard.control_plane_persist_request()
+        };
+        persist_request
+            .save()
             .await
-            .expect("deleting the checked-out agent should succeed");
+            .expect("deletion should persist");
         release.add_permits(1);
-        run.await
+        let error = run
+            .await
             .expect("run task should join")
-            .expect("the already-started request may finish");
+            .expect_err("a commit for a deleted agent is discarded");
 
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
         {
             let guard = state.read().await;
             assert!(guard.get_agent(&agent_id).is_none());
@@ -552,8 +600,157 @@ mod tests {
             .expect("control-plane snapshot should load")
             .expect("control-plane snapshot should exist");
         assert!(persisted.agents.is_empty());
+        assert!(
+            persisted.runs.is_empty(),
+            "the discarded run belonged to a deleted agent"
+        );
 
         let _ = std::fs::remove_file(store_path);
+    }
+
+    #[tokio::test]
+    async fn run_body_metadata_cannot_choose_the_runtime_retry_key() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            RequestCapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            },
+        ))));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+
+        handle_run_agent(
+            &agent_id,
+            br#"{"text":"keyed by the client","metadata":{"idempotencyKey":"telegram-a:update:42","idempotency_key":"client-key","retryKey":"client-key","retry_key":"client-key","source":"client"}}"#
+                .to_vec(),
+            &state,
+        )
+        .await
+        .expect("run should succeed");
+
+        let requests = requests
+            .lock()
+            .expect("capture lock should not be poisoned");
+        let input = requests[0]
+            .messages
+            .last()
+            .expect("the model receives the run input");
+        let metadata = input
+            .content
+            .metadata
+            .as_ref()
+            .expect("other client metadata is kept");
+        for key in ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"] {
+            assert!(
+                !metadata.contains_key(key),
+                "client metadata `{key}` reached the runtime input"
+            );
+        }
+        assert_eq!(
+            metadata.get("source"),
+            Some(&DataValue::String("client".into()))
+        );
+        assert_eq!(
+            state.read().await.runs.for_agent(&agent_id)[0].idempotency_key,
+            None,
+            "the run records no client-chosen retry key"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_run_for_a_helper_fails_fast_while_its_slot_is_held() {
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let (companion_id, helper_id) = {
+            let mut guard = state.write().await;
+            let mut companion = test_config("companion");
+            companion
+                .settings
+                .as_mut()
+                .expect("test config has settings")
+                .additional
+                .insert("workspaceRole".into(), DataValue::String("lead".into()));
+            let companion_id = guard
+                .create_agent(companion)
+                .expect("companion should be created")
+                .state
+                .id;
+            let mut helper = test_config("helper");
+            helper
+                .settings
+                .as_mut()
+                .expect("test config has settings")
+                .additional = BTreeMap::from([
+                ("workspaceRole".into(), DataValue::String("helper".into())),
+                (
+                    "parentAgentId".into(),
+                    DataValue::String(companion_id.clone()),
+                ),
+            ]);
+            let helper_id = guard
+                .create_agent(helper)
+                .expect("helper should be created")
+                .state
+                .id;
+            (companion_id, helper_id)
+        };
+        let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        // The companion's delegated run holds the helper's slot while it waits
+        // in the model.
+        let delegated = {
+            let coordinator = coordinator.clone();
+            let request = AgentRunRequest {
+                agent_id: helper_id.clone(),
+                content: Content {
+                    text: "delegated task".into(),
+                    ..Content::default()
+                },
+                room: RunRoom::Delegated {
+                    parent_id: companion_id,
+                },
+                idempotency_key: None,
+                source: RunSource::Delegation,
+                source_ref: None,
+            };
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered
+            .acquire()
+            .await
+            .expect("the delegated run should enter the model")
+            .forget();
+
+        let permit = coordinator
+            .try_admit()
+            .expect("a run permit should be free");
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_run_agent_with_coordinator(
+                &helper_id,
+                br#"{"text":"bypass the companion"}"#.to_vec(),
+                &coordinator,
+                permit,
+            ),
+        )
+        .await
+        .expect("an invalid run fails before waiting for the helper's slot")
+        .expect_err("helpers run only through their companion");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message(),
+            "Helpers must run through their owning companion"
+        );
+
+        release.add_permits(1);
+        delegated
+            .await
+            .expect("delegated run should join")
+            .expect("delegated run should finish");
     }
 
     fn pending_adapter() -> (Arc<dyn ModelAdapter>, Arc<Semaphore>, Arc<Semaphore>) {

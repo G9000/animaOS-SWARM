@@ -203,6 +203,16 @@ impl RunRecord {
         self.finished_at_ms = Some(now_ms.max(self.created_at_ms));
     }
 
+    /// Notes a tool the run is starting: first-use order, no duplicates, and at
+    /// most `MAX_RUN_TOOLS_STARTED` names (spec §4.1, §4.8).
+    pub(crate) fn note_tool_started(&mut self, name: &str) {
+        if self.tools_started.len() < MAX_RUN_TOOLS_STARTED
+            && !self.tools_started.iter().any(|known| known == name)
+        {
+            self.tools_started.push(name.to_string());
+        }
+    }
+
     fn recover_after_restart(&mut self, now_ms: u64) {
         let (code, message) = match self.status {
             RunStatus::Queued => (
@@ -488,6 +498,25 @@ mod tests {
 
         assert_eq!(record.input.text.len(), MAX_RUN_INPUT_TEXT_BYTES);
         assert!(record.input.text.chars().all(|character| character == 'é'));
+    }
+
+    #[test]
+    fn noted_tools_keep_first_use_order_without_duplicates_up_to_the_limit() {
+        let mut record = record("agent-a", 1);
+        record.note_tool_started("bash");
+        record.note_tool_started("read_file");
+        record.note_tool_started("bash");
+        assert_eq!(record.tools_started, ["bash", "read_file"]);
+
+        for index in 0..MAX_RUN_TOOLS_STARTED {
+            record.note_tool_started(&format!("tool-{index}"));
+        }
+        assert_eq!(record.tools_started.len(), MAX_RUN_TOOLS_STARTED);
+        assert_eq!(record.tools_started[..2], ["bash", "read_file"]);
+        assert_eq!(
+            record.tools_started.last().map(String::as_str),
+            Some(format!("tool-{}", MAX_RUN_TOOLS_STARTED - 3).as_str())
+        );
     }
 
     #[test]

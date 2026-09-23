@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::oauth_apps::{OAuthAppService, OAuthProvider, ResolvedOAuthApp};
+use crate::runs::RunSource;
 use crate::state::DaemonState;
 
 use self::client::{GoogleCalendarEvent, GoogleCalendarTransport, GoogleTransportError};
@@ -941,7 +942,7 @@ impl CalendarManager {
     fn notify_agent_write_applied(&self, write: &CalendarPendingWriteRecord) {
         let coordinator = self.agent_runs.clone();
         let agent_id = write.agent_id.clone();
-        let write_id = write.id.clone();
+        let reference = format!("calendar-write:{}", write.id);
         let text = format!(
             "Calendar change confirmed and applied: {}. Continue the conversation accordingly.",
             write.summary
@@ -955,7 +956,10 @@ impl CalendarManager {
                         ..Default::default()
                     },
                     room: RunRoom::Generated,
-                    idempotency_key: Some(format!("calendar-write:{write_id}")),
+                    idempotency_key: Some(reference.clone()),
+                    // Daemon-internal follow-ups are recorded like API runs.
+                    source: RunSource::Api,
+                    source_ref: Some(reference),
                 })
                 .await;
         });

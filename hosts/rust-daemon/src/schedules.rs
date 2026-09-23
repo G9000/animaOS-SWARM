@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anima_core::{Content, DataValue, MessageRole, TaskStatus};
+use anima_core::{Content, DataValue, TaskStatus};
 use chrono::{LocalResult, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use crate::app::SharedDaemonState;
 use crate::connectors::runtime::{ConnectorManager, ConnectorRuntimeStatus};
 use crate::connectors::{OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::ApiError;
+use crate::runs::RunSource;
 
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
@@ -579,16 +580,19 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             .last_fired
             .as_ref()
             .map(|item| item.run_idempotency_key.clone()),
+        source: RunSource::Schedule,
+        source_ref: Some(record.id.clone()),
     };
-    let outcome = Arc::new(std::sync::Mutex::new(
+    let recorded = Arc::new(std::sync::Mutex::new(
         None::<(ScheduleSafeOutcome, Option<TelegramOutboundRecord>)>,
     ));
-    let commit_outcome = Arc::clone(&outcome);
+    let commit_recorded = Arc::clone(&recorded);
     let result = inner
         .runs
         .run_with_commit_waiting(
             request,
-            move |state, snapshot, result| {
+            move |state, outcome| {
+                let result = &outcome.result;
                 let status = if result.status == TaskStatus::Error {
                     ScheduleOutcomeStatus::Failed
                 } else if result
@@ -620,28 +624,24 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                             .get(connector_id)
                             .filter(|item| item.is_active() && item.approved_chat.is_some())
                             .ok_or_else(ApiError::not_found)?;
-                        let assistant = snapshot
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|message| {
-                                message.room_id == connector.room_id
-                                    && message.role == MessageRole::Assistant
-                            })
-                            .ok_or_else(|| {
-                                ApiError::bad_request("agent produced no assistant message")
-                            })?;
-                        if !is_silent_checkin_reply(&assistant.content.text) {
+                        let (Some(reply_id), Some(reply)) =
+                            (outcome.reply_message_id.as_ref(), result.data.as_ref())
+                        else {
+                            return Err(ApiError::bad_request(
+                                "agent produced no assistant message",
+                            ));
+                        };
+                        if !is_silent_checkin_reply(&reply.text) {
                             let item = TelegramOutboundRecord {
                                 id: format!(
                                     "telegram:{}:schedule:{}:{}",
-                                    connector_id, schedule_id, assistant.id
+                                    connector_id, schedule_id, reply_id
                                 ),
                                 connector_id: connector_id.clone(),
                                 agent_id: connector.agent_id.clone(),
                                 room_id: connector.room_id.clone(),
-                                assistant_message_id: assistant.id.clone(),
-                                text: assistant.content.text.clone(),
+                                assistant_message_id: reply_id.clone(),
+                                text: reply.text.clone(),
                                 created_at_ms: now,
                                 delivered_at_ms: None,
                                 attempts: 0,
@@ -655,23 +655,17 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                         }
                     }
                 }
-                *commit_outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some((safe, outbound));
+                *commit_recorded.lock().unwrap_or_else(|p| p.into_inner()) = Some((safe, outbound));
                 Ok(())
             },
-            move |state, baseline| {
-                if let Some((_, outbound)) =
-                    outcome.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            move |state| {
+                if let Some((_, Some(outbound))) =
+                    recorded.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
                 {
-                    if let Some(outbound) = outbound {
-                        if state.outbound.get(&outbound.id) == Some(outbound) {
-                            state.outbound.remove(&outbound.id);
-                        }
+                    if state.outbound.get(&outbound.id) == Some(outbound) {
+                        state.outbound.remove(&outbound.id);
                     }
                 }
-                state
-                    .rollback_agent_runtime(baseline)
-                    .map(|_| ())
-                    .map_err(ApiError::service_unavailable)?;
                 if let Some(schedule) = state.schedules.get_mut(&rollback_schedule_id) {
                     schedule.last_safe_outcome = None;
                 }
@@ -923,7 +917,7 @@ mod tests {
         TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata, TelegramConnectorRecord,
     };
     use crate::state::DaemonState;
-    use anima_core::{AgentConfig, AgentSettings};
+    use anima_core::{AgentConfig, AgentSettings, MessageRole};
     use async_trait::async_trait;
     use tokio::sync::{RwLock, Semaphore};
 

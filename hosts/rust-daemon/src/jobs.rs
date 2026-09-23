@@ -2,6 +2,7 @@ use crate::{
     agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom},
     app::SharedDaemonState,
     routes::ApiError,
+    runs::RunSource,
     state::DaemonState,
 };
 use anima_core::{Content, TaskStatus};
@@ -527,9 +528,12 @@ impl JobService {
                     },
                     room: RunRoom::Stable(format!("job:{}", job.id)),
                     idempotency_key: Some(format!("job:{}:attempt:{}", job.id, job.attempt)),
+                    source: RunSource::Job,
+                    source_ref: Some(format!("{}:{}", job.id, job.attempt)),
                 },
                 permit,
-                move |state, _, result| {
+                move |state, outcome| {
+                    let result = &outcome.result;
                     let current = state
                         .jobs
                         .get_mut(&commit_id)
@@ -551,7 +555,7 @@ impl JobService {
                     }
                     Ok(())
                 },
-                move |state, _baseline| {
+                move |state| {
                     state.jobs.insert(rollback_job.id.clone(), rollback_job);
                     Ok(())
                 },

@@ -41,7 +41,7 @@ use crate::model::DeterministicModelAdapter;
 use crate::schedules::{ScheduleTarget, ScheduledPromptRecord};
 use crate::tools::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
-    ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
 
 use self::swarm_relationships::{persist_swarm_message_relationship, swarm_agent_names};
@@ -960,10 +960,8 @@ mod tests {
         room_id: &str,
         message_id: &str,
     ) {
-        state.agents.remove(agent_id);
-        let snapshot = state
-            .agent_snapshots
-            .get_mut(agent_id)
+        let mut snapshot = state
+            .get_agent(agent_id)
             .expect("fixture agent snapshot should exist");
         snapshot.messages.push(Message {
             id: message_id.into(),
@@ -977,6 +975,9 @@ mod tests {
             created_at_ms: 13,
         });
         snapshot.message_count = snapshot.messages.len();
+        state
+            .restore_agent_snapshot(snapshot)
+            .expect("fixture agent snapshot should restore");
     }
 
     fn assistant_message_for_outbound(snapshot: &mut ControlPlaneSnapshot) -> &mut Message {
@@ -1247,7 +1248,6 @@ pub(crate) struct DaemonState {
     control_plane_persist_order: Arc<ControlPlanePersistOrder>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
     pub(crate) agent_snapshots: HashMap<String, AgentRuntimeSnapshot>,
-    deleted_agent_ids: HashSet<String>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
@@ -1397,7 +1397,6 @@ impl DaemonState {
             }),
             agents: HashMap::new(),
             agent_snapshots: HashMap::new(),
-            deleted_agent_ids: HashSet::new(),
             swarms: HashMap::new(),
             swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
@@ -1491,6 +1490,13 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
         gate
+    }
+
+    /// Lets a test make the next persist request overflow the revision counter,
+    /// which panics at a precise point in a caller's critical section.
+    #[cfg(test)]
+    pub(crate) fn set_control_plane_revision_for_test(&mut self, revision: u64) {
+        self.control_plane_revision = revision;
     }
 
     pub(crate) fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
@@ -2360,59 +2366,28 @@ impl DaemonState {
     }
 
     /// Apply a fully validated partial config update to an existing agent and
-    /// refresh its snapshot.
+    /// refresh its snapshot. Runs in flight keep the config they started with;
+    /// the patch applies to later runs.
     pub(crate) fn update_agent(
         &mut self,
         agent_id: &str,
         mut patch: AgentConfigUpdate,
     ) -> Result<AgentRuntimeSnapshot, UpdateAgentError> {
-        if !self.agents.contains_key(agent_id) && !self.agent_snapshots.contains_key(agent_id) {
+        if !self.agents.contains_key(agent_id) {
             return Err(UpdateAgentError::NotFound);
         }
         patch.tools = self
             .resolve_agent_tools(patch.tools)
             .map_err(UpdateAgentError::InvalidTools)?;
-
-        if let Some(runtime) = self.agents.get_mut(agent_id) {
-            runtime.update_config(patch);
-            let snapshot = runtime.snapshot();
-            self.agent_snapshots
-                .insert(agent_id.to_string(), snapshot.clone());
-            return Ok(snapshot);
-        }
-
-        // The runtime can be checked out for an in-flight run; fall back to
-        // patching the snapshot so the change still persists. The run itself
-        // keeps the config it started with.
-        let snapshot = self
-            .agent_snapshots
+        let runtime = self
+            .agents
             .get_mut(agent_id)
             .expect("agent existence was checked before validation");
-        if let Some(name) = patch.name {
-            snapshot.state.name = name.clone();
-            snapshot.state.config.name = name;
-        }
-        if let Some(model) = patch.model {
-            snapshot.state.config.model = model;
-        }
-        if let Some(provider) = patch.provider {
-            snapshot.state.config.provider = if provider.is_empty() {
-                None
-            } else {
-                Some(provider)
-            };
-        }
-        if let Some(system) = patch.system {
-            snapshot.state.config.system = if system.is_empty() {
-                None
-            } else {
-                Some(system)
-            };
-        }
-        if let Some(tools) = patch.tools {
-            snapshot.state.config.tools = Some(tools);
-        }
-        Ok(snapshot.clone())
+        runtime.update_config(patch);
+        let snapshot = runtime.snapshot();
+        self.agent_snapshots
+            .insert(agent_id.to_string(), snapshot.clone());
+        Ok(self.with_derived_status(snapshot))
     }
 
     fn wire_runtime(&self, runtime: &mut AgentRuntime) {
@@ -2472,11 +2447,9 @@ impl DaemonState {
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: &str) {
-        let had_snapshot = self.agent_snapshots.remove(agent_id).is_some();
+        self.agent_snapshots.remove(agent_id);
         if let Some(mut runtime) = self.agents.remove(agent_id) {
             runtime.stop();
-        } else if had_snapshot {
-            self.deleted_agent_ids.insert(agent_id.to_string());
         }
     }
 
@@ -2484,7 +2457,6 @@ impl DaemonState {
         &mut self,
         snapshot: AgentRuntimeSnapshot,
     ) -> Result<(), String> {
-        self.deleted_agent_ids.remove(&snapshot.state.id);
         self.restore_agent_snapshot(snapshot)
     }
 
@@ -2497,88 +2469,6 @@ impl DaemonState {
                     .get(agent_id)
                     .map(|snapshot| snapshot.state.id.clone())
             })
-    }
-
-    pub(crate) fn take_agent_runtime(
-        &mut self,
-        agent_id: &str,
-    ) -> Option<(AgentRuntime, ToolExecutionContext)> {
-        let runtime = self.agents.remove(agent_id)?;
-        let mut snapshot = runtime.snapshot();
-        snapshot.state.status = AgentStatus::Running;
-        self.agent_snapshots.insert(agent_id.to_string(), snapshot);
-        let tool_context = ToolExecutionContext::new(
-            Arc::clone(&self.memory),
-            Arc::clone(&self.memory_embeddings),
-            self.memory_store.clone(),
-            self.tool_registry.clone(),
-            Arc::clone(&self.process_manager),
-            self.workspace.as_ref().map(|w| w.root_path.clone()),
-            self.calendar_manager.clone(),
-        )
-        .with_mail(self.mail_manager.clone());
-        Some((runtime, tool_context))
-    }
-
-    pub(crate) fn restore_agent_runtime(
-        &mut self,
-        mut runtime: AgentRuntime,
-    ) -> (
-        AgentRuntimeSnapshot,
-        String,
-        String,
-        SharedMemoryStore,
-        SharedMemoryEmbeddings,
-        Option<MemoryStoreConfig>,
-    ) {
-        let agent_id = runtime.id().to_string();
-        let was_deleted = self.deleted_agent_ids.remove(&agent_id);
-        if let Some(latest_config) = self
-            .agent_snapshots
-            .get(runtime.id())
-            .map(|snapshot| snapshot.state.config.clone())
-        {
-            runtime.update_config(AgentConfigUpdate {
-                name: Some(latest_config.name),
-                model: Some(latest_config.model),
-                provider: Some(latest_config.provider.unwrap_or_default()),
-                system: Some(latest_config.system.unwrap_or_default()),
-                tools: latest_config.tools,
-            });
-        }
-        let snapshot = runtime.snapshot();
-        let agent_name = runtime.state().name;
-        if !was_deleted {
-            self.agent_snapshots
-                .insert(agent_id.clone(), snapshot.clone());
-            self.agents.insert(agent_id.clone(), runtime);
-        }
-
-        (
-            snapshot,
-            agent_id,
-            agent_name,
-            Arc::clone(&self.memory),
-            Arc::clone(&self.memory_embeddings),
-            self.memory_store.clone(),
-        )
-    }
-
-    /// Restores a pre-run transcript after an undurable final snapshot while
-    /// retaining configuration changes accepted during the in-flight run.
-    /// A concurrently deleted agent is never resurrected.
-    pub(crate) fn rollback_agent_runtime(
-        &mut self,
-        mut previous: AgentRuntimeSnapshot,
-    ) -> Result<bool, String> {
-        let agent_id = previous.state.id.clone();
-        let Some(latest) = self.get_agent(&agent_id) else {
-            return Ok(false);
-        };
-        previous.state.name = latest.state.name;
-        previous.state.config = latest.state.config;
-        self.restore_agent_snapshot(previous)?;
-        Ok(true)
     }
 
     fn validate_swarm_tools(&self, config: &SwarmConfig) -> Result<(), String> {

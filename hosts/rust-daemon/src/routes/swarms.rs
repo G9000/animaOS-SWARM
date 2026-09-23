@@ -98,7 +98,7 @@ pub(crate) async fn handle_run_swarm(
 ) -> Result<SwarmRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let content = request
-        .into_domain()
+        .into_domain_with_client_retry_key()
         .map_err(ApiError::bad_request_static)?;
 
     let state = state.clone();

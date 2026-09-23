@@ -248,6 +248,11 @@ impl ApiError {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

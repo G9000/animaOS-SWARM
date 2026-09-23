@@ -21,6 +21,7 @@ use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
+use crate::runs::RunSource;
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
 use crate::state::DaemonState;
 
@@ -926,13 +927,15 @@ impl ConnectorManager {
             },
             room: RunRoom::Stable(connector.room_id.clone()),
             idempotency_key: Some(idempotency_key),
+            source: RunSource::Telegram,
+            source_ref: Some(connector.id.clone()),
         };
         let run = self
             .runs
             .run_with_commit_admitted_and_rollback(
                 request,
                 permit,
-                move |state, snapshot, result| {
+                move |state, outcome| {
                     let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
                         ApiError::service_unavailable("connector lifecycle changed during run")
                     })?;
@@ -948,18 +951,20 @@ impl ConnectorManager {
                             "connector worker changed during run",
                         ));
                     }
-                    let current = state
+                    let connector_unchanged = state
                         .connectors
                         .get(&commit_connector_id)
-                        .filter(|current| {
+                        .is_some_and(|current| {
                             current.is_active()
                                 && current.agent_id == commit_agent_id
                                 && current.room_id == commit_room_id
                                 && current.approved_chat.as_ref().map(|chat| &chat.id)
                                     == commit_chat_id.as_ref()
-                        })
-                        .ok_or_else(|| ApiError::not_found())?;
-                    if result.status == TaskStatus::Error || commit_chat_id.is_none() {
+                        });
+                    if !connector_unchanged {
+                        return Err(ApiError::not_found());
+                    }
+                    if outcome.result.status == TaskStatus::Error || commit_chat_id.is_none() {
                         return Ok(());
                     }
                     if state
@@ -976,29 +981,21 @@ impl ConnectorManager {
                             "connector outbound capacity is exhausted",
                         ));
                     }
-                    let assistant = snapshot
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|message| {
-                            message.room_id == current.room_id
-                                && message.role == MessageRole::Assistant
-                        })
-                        .cloned()
-                        .ok_or_else(|| {
-                            ApiError::bad_request("agent produced no assistant message")
-                        })?;
-                    let outbound_id = format!(
-                        "telegram:{}:web:{}:outbound",
-                        commit_connector_id, assistant.id
-                    );
+                    let (Some(reply_id), Some(reply)) = (
+                        outcome.reply_message_id.clone(),
+                        outcome.result.data.as_ref(),
+                    ) else {
+                        return Err(ApiError::bad_request("agent produced no assistant message"));
+                    };
+                    let outbound_id =
+                        format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
                     let outbound = TelegramOutboundRecord {
                         id: outbound_id.clone(),
                         connector_id: commit_connector_id.clone(),
                         agent_id: commit_agent_id.clone(),
                         room_id: commit_room_id.clone(),
-                        assistant_message_id: assistant.id,
-                        text: assistant.content.text,
+                        assistant_message_id: reply_id,
+                        text: reply.text.clone(),
                         created_at_ms: now_ms(),
                         delivered_at_ms: None,
                         attempts: 0,
@@ -1018,7 +1015,7 @@ impl ConnectorManager {
                     }
                     Ok(())
                 },
-                move |state, baseline| {
+                move |state| {
                     if let Some(inserted) = rollback_outbound
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1028,10 +1025,7 @@ impl ConnectorManager {
                             state.outbound.remove(&inserted.id);
                         }
                     }
-                    state
-                        .rollback_agent_runtime(baseline)
-                        .map(|_| ())
-                        .map_err(ApiError::service_unavailable)
+                    Ok(())
                 },
             )
             .await
@@ -1224,13 +1218,15 @@ impl ConnectorManager {
             },
             room: RunRoom::Stable(inbound.room_id.clone()),
             idempotency_key: Some(inbound.run_idempotency_key.clone()),
+            source: RunSource::Telegram,
+            source_ref: Some(format!("{}:{}", inbound.connector_id, inbound.update_id)),
         };
 
         let run = self
             .runs
             .run_with_commit_waiting(
                 request,
-                move |state, snapshot, result| {
+                move |state, outcome| {
                     let current = state
                         .inbound
                         .get(&commit_key)
@@ -1242,7 +1238,7 @@ impl ConnectorManager {
                         return Err(ApiError::bad_request("durable inbound changed during run"));
                     }
 
-                    if result.status == TaskStatus::Error {
+                    if outcome.result.status == TaskStatus::Error {
                         let target = state
                             .inbound
                             .get_mut(&commit_key)
@@ -1255,25 +1251,19 @@ impl ConnectorManager {
                         return Ok(());
                     }
 
-                    let assistant = snapshot
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|message| {
-                            message.room_id == commit_room_id
-                                && message.role == MessageRole::Assistant
-                        })
-                        .cloned()
-                        .ok_or_else(|| {
-                            ApiError::bad_request("agent produced no assistant message")
-                        })?;
+                    let (Some(reply_id), Some(reply)) = (
+                        outcome.reply_message_id.clone(),
+                        outcome.result.data.as_ref(),
+                    ) else {
+                        return Err(ApiError::bad_request("agent produced no assistant message"));
+                    };
                     let candidate = TelegramOutboundRecord {
                         id: commit_outbound_id.clone(),
                         connector_id: commit_connector_id.clone(),
                         agent_id: commit_agent_id.clone(),
                         room_id: commit_room_id.clone(),
-                        assistant_message_id: assistant.id,
-                        text: assistant.content.text,
+                        assistant_message_id: reply_id,
+                        text: reply.text.clone(),
                         created_at_ms: now_ms(),
                         delivered_at_ms: None,
                         attempts: 0,
@@ -1316,7 +1306,7 @@ impl ConnectorManager {
                     delta.removed_terminal = removed_terminal;
                     Ok(())
                 },
-                move |state, baseline| {
+                move |state| {
                     let delta = rollback_delta
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1341,10 +1331,7 @@ impl ConnectorManager {
                             .entry(rollback_outbound_id)
                             .or_insert(previous);
                     }
-                    state
-                        .rollback_agent_runtime(baseline)
-                        .map(|_| ())
-                        .map_err(ApiError::service_unavailable)
+                    Ok(())
                 },
             )
             .await;
@@ -2524,6 +2511,7 @@ mod tests {
         InboundProcessingState, TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata,
         TelegramSenderMetadata,
     };
+    use crate::runs::RunSource;
     use crate::state::DaemonState;
 
     #[derive(Default)]
@@ -4990,6 +4978,8 @@ mod tests {
                     },
                     room: RunRoom::Generated,
                     idempotency_key: None,
+                    source: RunSource::Api,
+                    source_ref: None,
                 })
                 .await
         });

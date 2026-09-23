@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::{
-    AgentCommunicationRoute, AgentConfig, AgentConfigUpdate, AgentRuntimeSnapshot, AgentSettings,
+    content_retry_key, AgentCommunicationRoute, AgentConfig, AgentConfigUpdate, AgentSettings,
     AgentState, Content, DataValue, TaskResult,
 };
 use anima_memory::{MemoryType, NewMemory};
@@ -12,6 +12,10 @@ use tracing::warn;
 use crate::app::SharedDaemonState;
 use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
+use crate::runs::{
+    RunChangeSet, RunError, RunOutcome, RunRecord, RunSource, RunStart, RunStatus, COMMIT_FAILED,
+    COMMIT_REJECTED, RUN_ABORTED,
+};
 use crate::state::DaemonState;
 
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
@@ -19,6 +23,7 @@ pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
 const MAX_HELPERS_PER_COMPANION: usize = 4;
 const MAX_HELPER_TOOL_ITERATIONS: usize = 8;
 const MAX_HELPER_RUN_MS: u64 = 120_000;
+const DUPLICATE_IN_FLIGHT_RUN: &str = "A run with this idempotency key is already in progress";
 
 fn helper_parent(agent: &AgentState) -> Option<&str> {
     let settings = agent.config.settings.as_ref()?;
@@ -76,9 +81,9 @@ fn is_workspace_manager(agent: &AgentState) -> bool {
 }
 
 type AgentLockMap = Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>;
-type AgentRunRollback = Box<
-    dyn FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
->;
+/// Undoes a source's own records after a failed commit; the coordinator has
+/// already removed the run's messages, events, and usage.
+type AgentRunRollback = Box<dyn FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static>;
 
 struct AgentLockCleanup {
     agent_id: String,
@@ -111,6 +116,21 @@ pub(crate) enum RunRoom {
     Peer { route: AgentCommunicationRoute },
 }
 
+impl RunRoom {
+    /// The room (session id) this run uses. Generated and delegated rooms get a
+    /// fresh id before the run starts so it can be locked and recorded first.
+    pub(crate) fn resolve(&self, agent_id: &str) -> String {
+        match self {
+            Self::Stable(room_id) => room_id.clone(),
+            Self::Peer { route } => {
+                let participants = route.participants();
+                format!("peer:{}:{}", participants[participants.len() - 2], agent_id)
+            }
+            Self::Generated | Self::Delegated { .. } => anima_core::new_room_id(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentRunRequest {
     pub(crate) agent_id: String,
@@ -120,6 +140,9 @@ pub(crate) struct AgentRunRequest {
     /// Whole-run completion is owned by the durable caller record (for example,
     /// a Telegram inbound item), not an in-memory response cache here.
     pub(crate) idempotency_key: Option<String>,
+    /// Ledger source and reference (spec §4.1).
+    pub(crate) source: RunSource,
+    pub(crate) source_ref: Option<String>,
 }
 
 #[derive(Clone)]
@@ -202,6 +225,8 @@ impl AgentRunCoordinator {
                     },
                     room: RunRoom::Peer { route },
                     idempotency_key: None,
+                    source: RunSource::Peer,
+                    source_ref: None,
                 })
                 .await
         })
@@ -267,6 +292,8 @@ impl AgentRunCoordinator {
                 content: Content { text: format!("Task delegated by workspace manager {} ({}). Return the result and any blockers. Do not delegate further.\n\n{}", caller.name, caller.id, task), attachments: None, metadata: None },
                 room: RunRoom::Delegated { parent_id: caller.id },
                 idempotency_key: None,
+                source: RunSource::Delegation,
+                source_ref: None,
             }).await.map_err(|_| "Specialist unavailable, busy, or outside the manager's tool permissions".to_string())?;
             Ok(serde_json::json!({"agentId": target, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
         })
@@ -339,12 +366,19 @@ impl AgentRunCoordinator {
                     return Err(format!("Could not persist helper creation: {error}"));
                 }
                 drop(transaction);
-                let result = coordinator.run_locked(AgentRunRequest {
+                let request = AgentRunRequest {
                     agent_id: helper.state.id.clone(),
                     content: Content { text: task, ..Content::default() },
                     room: RunRoom::Delegated { parent_id },
                     idempotency_key: None,
-                }, permit, |_, _, _| Ok(()), None).await.map_err(|error| error.message().to_string())?;
+                    source: RunSource::Delegation,
+                    source_ref: None,
+                };
+                let room_id = request.room.resolve(&request.agent_id);
+                let result = coordinator
+                    .run_locked(request, room_id, permit, |_, _| Ok(()), None)
+                    .await
+                    .map_err(|error| error.message().to_string())?;
                 Ok(serde_json::json!({"agentId": helper.state.id, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
             }).await.map_err(|_| "Helper worker stopped unexpectedly".to_string())?
         })
@@ -391,28 +425,22 @@ impl AgentRunCoordinator {
         request: AgentRunRequest,
         permit: AgentRunPermit,
     ) -> Result<AgentRunEnvelope, ApiError> {
-        self.run_with_commit_admitted(request, permit, |_, _, _| Ok(()))
+        self.run_with_commit_admitted(request, permit, |_, _| Ok(()))
             .await
     }
 
-    /// Runs with a state commit captured in the same final control-plane snapshot.
+    /// Runs with a source commit captured in the same final control-plane snapshot.
     ///
     /// A hook that can fail must finish all validation before its first mutation;
-    /// arbitrary `DaemonState` changes cannot be rolled back generically.
-    #[allow(dead_code)] // Used by durable connector inbound processing.
+    /// on failure the coordinator removes only this run's transcript changes.
+    #[allow(dead_code)] // Used by the commit-contract tests.
     pub(crate) async fn run_with_commit<F>(
         &self,
         request: AgentRunRequest,
         commit: F,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
         let permit = self.try_admit()?;
         self.run_with_commit_admitted(request, permit, commit).await
@@ -430,14 +458,8 @@ impl AgentRunCoordinator {
         rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
-        R: FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
         let permit = self
             .run_limiter
@@ -457,13 +479,7 @@ impl AgentRunCoordinator {
         commit: F,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
         self.run_transaction_admitted(request, permit, commit, None)
             .await
@@ -477,14 +493,8 @@ impl AgentRunCoordinator {
         rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
-        R: FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
         self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
             .await
@@ -498,13 +508,7 @@ impl AgentRunCoordinator {
         rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
         let coordinator = self.clone();
         tokio::spawn(async move {
@@ -527,14 +531,10 @@ impl AgentRunCoordinator {
         rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
+        self.prevalidate(&request).await?;
+        let room_id = request.room.resolve(&request.agent_id);
         let agent_lock = self.agent_lock(&request.agent_id);
         let _cleanup = AgentLockCleanup {
             agent_id: request.agent_id.clone(),
@@ -551,145 +551,115 @@ impl AgentRunCoordinator {
         } else {
             agent_lock.lock_owned().await
         };
-        self.run_locked(request, permit, commit, rollback).await
+        self.run_locked(request, room_id, permit, commit, rollback)
+            .await
+    }
+
+    /// The start checks, run before waiting for the agent so an invalid request
+    /// fails fast; `run_locked` repeats them authoritatively under the
+    /// control-plane transaction.
+    async fn prevalidate(&self, request: &AgentRunRequest) -> Result<(), ApiError> {
+        let guard = self.state.read().await;
+        validate_run_request(&guard, &request.agent_id, &request.room)?;
+        if guard.agents.contains_key(&request.agent_id) {
+            Ok(())
+        } else {
+            Err(ApiError::not_found())
+        }
     }
 
     async fn run_locked<F>(
         &self,
-        mut request: AgentRunRequest,
+        request: AgentRunRequest,
+        room_id: String,
         permit: AgentRunPermit,
         commit: F,
         mut rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send,
     {
         let _run_permit = permit.0;
-
-        if let Some(idempotency_key) = request.idempotency_key.take() {
-            request
-                .content
+        let AgentRunRequest {
+            agent_id,
+            mut content,
+            room,
+            idempotency_key,
+            source,
+            source_ref,
+        } = request;
+        if let Some(idempotency_key) = idempotency_key {
+            content
                 .metadata
                 .get_or_insert_with(Default::default)
                 .insert("idempotencyKey".into(), DataValue::String(idempotency_key));
         }
+        let retry_key = content_retry_key(&content).map(str::to_owned);
 
+        // Phase A: record the run as running and publish that durable marker
+        // before any model work (the run-start save that already existed).
         let transaction = self.control_plane_transaction().await;
-        let Some((mut runtime, tool_context, running_persist_request, mut rollback_baseline)) = ({
+        let (mut runtime, tool_context, base, run_id, mut in_flight, running_persist_request) = {
             let mut guard = self.state.write().await;
-            if let Some(parent_id) = guard
-                .get_agent(&request.agent_id)
-                .as_ref()
-                .and_then(|agent| helper_parent(&agent.state))
-            {
-                if !matches!(&request.room, RunRoom::Delegated { parent_id: source } if source == parent_id)
-                {
-                    return Err(ApiError::bad_request_static(
-                        "Helpers must run through their owning companion",
-                    ));
-                }
-                if guard.get_agent(&request.agent_id).is_some_and(|helper| {
-                    helper
-                        .state
-                        .config
-                        .tools
-                        .iter()
-                        .flatten()
-                        .any(|tool| crate::tools::is_process_tool(&tool.name))
-                }) {
-                    return Err(ApiError::bad_request_static(
-                        "Process tools are unavailable to helpers until process cancellation is supported",
-                    ));
+            validate_run_request(&guard, &agent_id, &room)?;
+            if let Some(key) = retry_key.as_deref() {
+                // Retry-keyed tool steps stay replay-safe only while one run owns the key.
+                if guard.runs.has_in_flight_idempotency_key(&agent_id, key) {
+                    return Err(ApiError::conflict(DUPLICATE_IN_FLIGHT_RUN));
                 }
             }
-            if let RunRoom::Peer { route } = &request.room {
-                let target = guard
-                    .get_agent(&request.agent_id)
-                    .ok_or_else(ApiError::not_found)?;
-                for source in route
-                    .participants()
-                    .iter()
-                    .take(route.participants().len() - 1)
-                {
-                    let source = guard.get_agent(source).ok_or_else(ApiError::not_found)?;
-                    if target.state.config.tools.iter().flatten().any(|tool| {
-                        !matches!(
-                            tool.name.as_str(),
-                            "list_workspace_agents"
-                                | "send_message"
-                                | "broadcast_message"
-                                | "delegate_to_agent"
-                                | "spawn_helper"
-                        ) && !source.state.config.allows_tool(&tool.name)
-                    }) {
-                        return Err(ApiError::bad_request_static("Peer request would exceed the sender's tool permissions; ask the owner to contact this agent directly"));
-                    }
-                }
-            }
-            if let RunRoom::Delegated { parent_id } = &request.room {
-                let parent = guard.get_agent(parent_id).ok_or_else(ApiError::not_found)?;
-                let target = guard
-                    .get_agent(&request.agent_id)
-                    .ok_or_else(ApiError::not_found)?;
-                if !is_workspace_manager(&parent.state)
-                    || is_workspace_manager(&target.state)
-                    || parent_id == &request.agent_id
-                    || target.state.config.tools.iter().flatten().any(|tool| {
-                        tool.name != "list_workspace_agents"
-                            && tool.name != "delegate_to_agent"
-                            && tool.name != "spawn_helper"
-                            && !parent.state.config.allows_tool(&tool.name)
-                    })
-                {
-                    return Err(ApiError::bad_request_static(
-                        "Delegation cannot escalate permissions or target a manager",
-                    ));
-                }
-            }
-            let rollback_baseline = if rollback.is_some() {
-                Some(
-                    guard
-                        .get_agent(&request.agent_id)
-                        .ok_or_else(ApiError::not_found)?,
-                )
-            } else {
-                None
+            let Some((runtime, tool_context, base)) = guard.build_run_runtime(&agent_id, &room_id)
+            else {
+                return Err(ApiError::not_found());
             };
-            let taken = guard.take_agent_runtime(&request.agent_id);
-            taken.map(|(runtime, tool_context)| {
-                (
-                    runtime,
-                    tool_context,
-                    guard.control_plane_persist_request(),
-                    rollback_baseline,
-                )
-            })
-        }) else {
-            return Err(ApiError::not_found());
+            let record = RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: room_id.clone(),
+                    source,
+                    source_ref,
+                    idempotency_key: retry_key.clone(),
+                    text: content.text.clone(),
+                    model: runtime.config().model.clone(),
+                    provider: runtime.config().provider.clone(),
+                    parent_run_id: None,
+                },
+                anima_core::primitives::now_millis(),
+            );
+            let run_id = record.id.clone();
+            guard.runs.insert(record);
+            // Armed before anything else can fail, so a panic before the start
+            // save cannot leave a permanently in-flight record.
+            let in_flight = InFlightRunGuard::new(Arc::clone(&self.state), run_id.clone());
+            (
+                runtime,
+                tool_context,
+                base,
+                run_id,
+                in_flight,
+                guard.control_plane_persist_request(),
+            )
         };
-
         if let Err(error) = running_persist_request.save().await {
-            let mut guard = self.state.write().await;
-            guard.restore_agent_runtime(runtime);
+            self.state.write().await.runs.remove(&run_id);
+            in_flight.disarm();
             return Err(ApiError::service_unavailable(error.to_string()));
         }
         drop(transaction);
 
-        let original_config = runtime.state().config;
-        let delegated_parent = match &request.room {
+        // Phase B: per-run configuration applies only to this isolated copy. The
+        // canonical configuration is never rewritten; a PATCH during the run
+        // applies to later runs (spec §4.4 items 1–2).
+        let original_config = runtime.config().clone();
+        let delegated_parent = match &room {
             RunRoom::Delegated { parent_id } => Some(parent_id.clone()),
             _ => None,
         };
-        let peer_route = match &request.room {
+        let peer_route = match &room {
             RunRoom::Peer { route } => route.clone(),
             _ => AgentCommunicationRoute::start(runtime.id()),
         };
-        let peer_sources = match &request.room {
+        let peer_sources = match &room {
             RunRoom::Peer { route } => {
                 route.participants()[..route.participants().len() - 1].to_vec()
             }
@@ -713,7 +683,6 @@ impl AgentRunCoordinator {
             }
         }
         if can_delegate {
-            let registry = crate::tools::ToolRegistry::new();
             for name in ["list_workspace_agents", "delegate_to_agent", "spawn_helper"] {
                 if !tools.iter().any(|tool| tool.name == name) {
                     tools.push(registry.descriptor(name).expect("registered team tool"));
@@ -735,23 +704,12 @@ impl AgentRunCoordinator {
                 ..Default::default()
             });
         }
+        runtime.set_run_id(run_id.clone());
         let tool_context = tool_context
             .with_team(self.clone(), can_delegate)
             .with_delegated_parent(delegated_parent)
             .with_peer_route(peer_route, peer_sources);
-
-        let execution_room = match request.room {
-            RunRoom::Stable(room_id) => Some(room_id),
-            RunRoom::Peer { route } => {
-                let participants = route.participants();
-                Some(format!(
-                    "peer:{}:{}",
-                    participants[participants.len() - 2],
-                    request.agent_id
-                ))
-            }
-            _ => None,
-        };
+        let history = runtime.messages().to_vec();
         let helper_timeout = helper_parent(&runtime.state()).is_some().then(|| {
             original_config
                 .settings
@@ -761,43 +719,30 @@ impl AgentRunCoordinator {
                 .min(MAX_HELPER_RUN_MS)
         });
         let execution = async {
-            match execution_room {
-                None => {
-                    runtime
-                        .run_with_tools(request.content, |agent, user_message, tool_call| {
-                            let tool_context = tool_context.clone();
-                            async move {
-                                tool_context
-                                    .execute_tool(agent, user_message, tool_call)
-                                    .await
+            runtime
+                .run_in_room_with_context_and_tools(
+                    room_id.clone(),
+                    history,
+                    content,
+                    |agent, user_message, tool_call| {
+                        let tool_context = tool_context.clone();
+                        let state = Arc::clone(&self.state);
+                        let run_id = run_id.clone();
+                        async move {
+                            // Noted before the tool can have effects and kept by
+                            // any later save, so a run a restart interrupts still
+                            // reports the tools it started (spec §4.8). The commit
+                            // fills the final list.
+                            if let Some(record) = state.write().await.runs.get_mut(&run_id) {
+                                record.note_tool_started(&tool_call.name);
                             }
-                        })
-                        .await
-                }
-                Some(room_id) => {
-                    let history = runtime
-                        .messages()
-                        .iter()
-                        .filter(|message| message.room_id == room_id)
-                        .cloned()
-                        .collect();
-                    runtime
-                        .run_in_room_with_context_and_tools(
-                            room_id,
-                            history,
-                            request.content,
-                            |agent, user_message, tool_call| {
-                                let tool_context = tool_context.clone();
-                                async move {
-                                    tool_context
-                                        .execute_tool(agent, user_message, tool_call)
-                                        .await
-                                }
-                            },
-                        )
-                        .await
-                }
-            }
+                            tool_context
+                                .execute_tool(agent, user_message, tool_call)
+                                .await
+                        }
+                    },
+                )
+                .await
         };
         let result = if let Some(timeout_ms) = helper_timeout {
             // This is a cooperative execution deadline, not an effect rollback.
@@ -816,50 +761,53 @@ impl AgentRunCoordinator {
             execution.await
         };
 
-        runtime.replace_config(original_config);
-
+        // Phase C: merge exactly this run's changes, let the source commit, then
+        // save; a rejected or undurable commit removes exactly those changes
+        // (spec §4.4 items 3–4).
         let transaction = self.control_plane_transaction().await;
-        let (
-            snapshot,
-            runtime_id,
-            runtime_name,
-            memory,
-            memory_embeddings,
-            memory_store,
-            persist_request,
-        ) = {
+        let (snapshot, change_set, memory, memory_embeddings, memory_store, persist_request) = {
             let mut guard = self.state.write().await;
-            let restored = guard.restore_agent_runtime(runtime);
-            // Hooks may fail, but arbitrary `DaemonState` mutation cannot be
-            // rolled back generically. Callers must perform all fallible
-            // validation before their first mutation and then mutate as one
-            // infallible unit. In particular, connector hooks must prevalidate
-            // the inbound/outbound transition before changing either record.
-            if let Err(error) = commit(&mut guard, &restored.0, &result) {
-                apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
+            let mut change_set = RunChangeSet::new(
+                run_id.clone(),
+                agent_id.clone(),
+                room_id.clone(),
+                runtime.run_delta_since(&base),
+            );
+            let outcome = RunOutcome::new(&change_set, result.clone());
+            if !guard.commit_run(&mut change_set, &outcome) {
+                // The agent was deleted while this run executed (spec §4.4 item 6).
+                return Err(ApiError::not_found());
+            }
+            if let Err(error) = commit(&mut guard, &outcome) {
+                guard.rollback_run(&change_set, RunError::new(COMMIT_REJECTED, error.message()));
+                apply_run_rollback(&mut guard, &mut rollback)?;
                 return Err(error);
             }
+            let snapshot = guard
+                .get_agent(&agent_id)
+                .expect("a committed agent stays registered");
             (
-                restored.0,
-                restored.1,
-                restored.2,
-                restored.3,
-                restored.4,
-                restored.5,
+                snapshot,
+                change_set,
+                guard.memory_handle(),
+                guard.memory_embeddings_handle(),
+                guard.memory_store_config(),
                 guard.control_plane_persist_request(),
             )
         };
         if let Err(error) = persist_request.save().await {
             let mut guard = self.state.write().await;
-            apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
+            guard.rollback_run(&change_set, RunError::new(COMMIT_FAILED, error.to_string()));
+            apply_run_rollback(&mut guard, &mut rollback)?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
         drop(transaction);
+        in_flight.disarm();
 
         persist_task_result_memory(
             &result,
-            &runtime_id,
-            &runtime_name,
+            &snapshot.state.id,
+            &snapshot.state.name,
             memory,
             memory_embeddings,
             memory_store,
@@ -901,15 +849,135 @@ impl AgentRunCoordinator {
 fn apply_run_rollback(
     state: &mut DaemonState,
     rollback: &mut Option<AgentRunRollback>,
-    baseline: &mut Option<AgentRuntimeSnapshot>,
 ) -> Result<(), ApiError> {
-    let Some(rollback) = rollback.take() else {
-        return Ok(());
-    };
-    let baseline = baseline.take().ok_or_else(|| {
-        ApiError::service_unavailable("agent run rollback baseline is unavailable")
-    })?;
-    rollback(state, baseline)
+    match rollback.take() {
+        Some(rollback) => rollback(state),
+        None => Ok(()),
+    }
+}
+
+/// The start checks that applied before M1: helpers only through their
+/// companion and never with process tools; peer requests within the senders'
+/// permissions; delegation only from a manager to a non-manager without
+/// escalation.
+fn validate_run_request(
+    state: &DaemonState,
+    agent_id: &str,
+    room: &RunRoom,
+) -> Result<(), ApiError> {
+    if let Some(parent_id) = state
+        .get_agent(agent_id)
+        .as_ref()
+        .and_then(|agent| helper_parent(&agent.state))
+    {
+        if !matches!(room, RunRoom::Delegated { parent_id: source } if source == parent_id) {
+            return Err(ApiError::bad_request_static(
+                "Helpers must run through their owning companion",
+            ));
+        }
+        if state.get_agent(agent_id).is_some_and(|helper| {
+            helper
+                .state
+                .config
+                .tools
+                .iter()
+                .flatten()
+                .any(|tool| crate::tools::is_process_tool(&tool.name))
+        }) {
+            return Err(ApiError::bad_request_static(
+                "Process tools are unavailable to helpers until process cancellation is supported",
+            ));
+        }
+    }
+    if let RunRoom::Peer { route } = room {
+        let target = state.get_agent(agent_id).ok_or_else(ApiError::not_found)?;
+        for source in route
+            .participants()
+            .iter()
+            .take(route.participants().len() - 1)
+        {
+            let source = state.get_agent(source).ok_or_else(ApiError::not_found)?;
+            if target.state.config.tools.iter().flatten().any(|tool| {
+                !matches!(
+                    tool.name.as_str(),
+                    "list_workspace_agents"
+                        | "send_message"
+                        | "broadcast_message"
+                        | "delegate_to_agent"
+                        | "spawn_helper"
+                ) && !source.state.config.allows_tool(&tool.name)
+            }) {
+                return Err(ApiError::bad_request_static("Peer request would exceed the sender's tool permissions; ask the owner to contact this agent directly"));
+            }
+        }
+    }
+    if let RunRoom::Delegated { parent_id } = room {
+        let parent = state.get_agent(parent_id).ok_or_else(ApiError::not_found)?;
+        let target = state.get_agent(agent_id).ok_or_else(ApiError::not_found)?;
+        if !is_workspace_manager(&parent.state)
+            || is_workspace_manager(&target.state)
+            || parent_id == agent_id
+            || target.state.config.tools.iter().flatten().any(|tool| {
+                tool.name != "list_workspace_agents"
+                    && tool.name != "delegate_to_agent"
+                    && tool.name != "spawn_helper"
+                    && !parent.state.config.allows_tool(&tool.name)
+            })
+        {
+            return Err(ApiError::bad_request_static(
+                "Delegation cannot escalate permissions or target a manager",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Marks a started run failed if its task ends without finishing it (for
+/// example, a panic in a tool), so a crashed run never stays in flight and
+/// never blocks deletion or task edits.
+struct InFlightRunGuard {
+    state: SharedDaemonState,
+    run_id: Option<String>,
+}
+
+impl InFlightRunGuard {
+    fn new(state: SharedDaemonState, run_id: String) -> Self {
+        Self {
+            state,
+            run_id: Some(run_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.run_id = None;
+    }
+}
+
+impl Drop for InFlightRunGuard {
+    fn drop(&mut self) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        handle.spawn(async move {
+            let mut guard = state.write().await;
+            if let Some(record) = guard.runs.get_mut(&run_id) {
+                if !record.status.is_terminal() {
+                    record.finish(
+                        RunStatus::Failed,
+                        Some(RunError::new(
+                            RUN_ABORTED,
+                            "The run stopped unexpectedly before its result was saved",
+                        )),
+                        anima_core::primitives::now_millis(),
+                    );
+                }
+            }
+        });
+    }
 }
 
 async fn persist_task_result_memory(
@@ -972,6 +1040,7 @@ mod tests {
     use super::{AgentRunCoordinator, AgentRunRequest, RunRoom};
     use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
     use crate::routes::ApiError;
+    use crate::runs::{RunLedger, RunRecord, RunSource, RunStart, RunStatus};
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentConfigUpdate, AgentRuntime, AgentSettings, AgentStatus, Content,
@@ -979,7 +1048,8 @@ mod tests {
         ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
-    use std::collections::BTreeMap;
+    use axum::http::StatusCode;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -2301,6 +2371,8 @@ mod tests {
                 },
                 room: RunRoom::Stable("room-telegram".into()),
                 idempotency_key: None,
+                source: RunSource::Api,
+                source_ref: None,
             })
             .await
             .expect("stable room run should succeed");
@@ -2341,6 +2413,8 @@ mod tests {
                 },
                 room: RunRoom::Stable("room-telegram".into()),
                 idempotency_key: Some("connector:update:42".into()),
+                source: RunSource::Api,
+                source_ref: None,
             })
             .await
             .expect("run should succeed");
@@ -2380,7 +2454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_runs_after_runtime_restore_and_before_final_snapshot() {
+    async fn commit_hook_sees_the_merged_run_before_the_final_snapshot() {
         let path = snapshot_path("commit-order");
         let config = ControlPlaneStoreConfig::Json(path.clone());
         let adapter = Arc::new(CapturingModelAdapter {
@@ -2400,23 +2474,35 @@ mod tests {
         let commit_agent_id = agent_id.clone();
 
         coordinator
-            .run_with_commit(
-                request(&agent_id, "commit me"),
-                move |state, snapshot, _| {
-                    assert_eq!(snapshot.state.id, commit_agent_id);
-                    assert!(state.agents.contains_key(&commit_agent_id));
-                    state
-                        .update_agent(
-                            &commit_agent_id,
-                            AgentConfigUpdate {
-                                name: Some("after-commit".into()),
-                                ..AgentConfigUpdate::default()
-                            },
-                        )
-                        .expect("commit mutation should succeed");
-                    Ok(())
-                },
-            )
+            .run_with_commit(request(&agent_id, "commit me"), move |state, outcome| {
+                let agent = state
+                    .get_agent(&commit_agent_id)
+                    .expect("the canonical agent stays registered");
+                let reply = outcome
+                    .reply_message_id
+                    .as_deref()
+                    .expect("a successful run has a reply");
+                assert!(agent.messages.iter().any(|message| {
+                    message.id == reply
+                        && message.role == MessageRole::Assistant
+                        && message.room_id == outcome.session_id
+                }));
+                assert_eq!(outcome.status, RunStatus::Completed);
+                assert_eq!(
+                    state.runs.get(&outcome.run_id).map(|run| run.status),
+                    Some(RunStatus::Completed)
+                );
+                state
+                    .update_agent(
+                        &commit_agent_id,
+                        AgentConfigUpdate {
+                            name: Some("after-commit".into()),
+                            ..AgentConfigUpdate::default()
+                        },
+                    )
+                    .expect("commit mutation should succeed");
+                Ok(())
+            })
             .await
             .expect("run and commit should succeed");
 
@@ -2425,11 +2511,14 @@ mod tests {
             .expect("snapshot should load")
             .expect("snapshot should exist");
         assert_eq!(persisted.agents[0].state.config.name, "after-commit");
+        assert_eq!(persisted.runs.len(), 1);
+        assert_eq!(persisted.runs[0].status, RunStatus::Completed);
+        assert_eq!(persisted.runs[0].source, RunSource::Api);
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
-    async fn failed_commit_leaves_runtime_restored_without_final_snapshot() {
+    async fn rejected_commit_rolls_back_only_the_run_and_keeps_the_running_marker() {
         let path = snapshot_path("commit-failure");
         let config = ControlPlaneStoreConfig::Json(path.clone());
         let adapter = Arc::new(CapturingModelAdapter {
@@ -2447,23 +2536,29 @@ mod tests {
         };
         let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
 
-        let result = coordinator
-            .run_with_commit(request(&agent_id, "fail commit"), |state, snapshot, _| {
-                assert!(state.agents.contains_key(&snapshot.state.id));
+        let error = coordinator
+            .run_with_commit(request(&agent_id, "fail commit"), |state, outcome| {
+                assert!(state.runs.get(&outcome.run_id).is_some());
                 Err(ApiError::bad_request("commit rejected"))
             })
-            .await;
-        assert!(result.is_err());
+            .await
+            .expect_err("a rejected commit fails the run");
+        assert_eq!(error.message(), "commit rejected");
         {
             let guard = state.read().await;
-            assert!(guard.agents.contains_key(&agent_id));
+            let agent = guard
+                .get_agent(&agent_id)
+                .expect("the canonical runtime stays registered");
+            assert!(
+                agent.messages.is_empty(),
+                "the rejected run's messages are removed"
+            );
+            assert_eq!(agent.state.status, AgentStatus::Idle);
+            let run = guard.runs.for_agent(&agent_id)[0].clone();
+            assert_eq!(run.status, RunStatus::Failed);
             assert_eq!(
-                guard
-                    .get_agent(&agent_id)
-                    .expect("runtime should remain visible")
-                    .state
-                    .status,
-                AgentStatus::Completed
+                run.error.map(|error| error.code),
+                Some("commit_rejected".to_string())
             );
         }
         let persisted = load_control_plane_snapshot(&config)
@@ -2471,7 +2566,389 @@ mod tests {
             .expect("snapshot should load")
             .expect("running snapshot should exist");
         assert_eq!(persisted.agents[0].state.status, AgentStatus::Running);
+        assert_eq!(persisted.runs[0].status, RunStatus::Running);
         let _ = std::fs::remove_file(path);
+    }
+
+    struct ConfigGateModelAdapter {
+        names: StdMutex<Vec<String>>,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for ConfigGateModelAdapter {
+        fn provider(&self) -> &str {
+            "config-gate"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.names.lock().unwrap().push(config.name.clone());
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(model_response("done"))
+        }
+    }
+
+    struct PanickingModelAdapter;
+
+    #[async_trait]
+    impl ModelAdapter for PanickingModelAdapter {
+        fn provider(&self) -> &str {
+            "panicking"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            panic!("model adapter crashed");
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_during_a_run_applies_to_later_runs_only() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(ConfigGateModelAdapter {
+            names: StdMutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 2).await;
+        let running = {
+            let coordinator = coordinator.clone();
+            let request = request(&agent_id, "first");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        coordinator
+            .state
+            .write()
+            .await
+            .update_agent(
+                &agent_id,
+                AgentConfigUpdate {
+                    name: Some("renamed".into()),
+                    ..AgentConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        release.add_permits(1);
+        running.await.unwrap().unwrap();
+
+        let config = coordinator
+            .state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .state
+            .config;
+        assert_eq!(config.name, "renamed");
+        assert_eq!(
+            config.system, None,
+            "per-run prompts never reach the canonical config"
+        );
+        assert_eq!(
+            config.tools, None,
+            "per-run tools never reach the canonical config"
+        );
+        release.add_permits(1);
+        coordinator.run(request(&agent_id, "second")).await.unwrap();
+        assert_eq!(
+            adapter.names.lock().unwrap().clone(),
+            ["operator", "renamed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_run_gets_a_ledger_record_with_its_source_room_and_input() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let mut stable = request(&agent_id, "stable room");
+        stable.room = RunRoom::Stable("direct:ledger".into());
+        coordinator.run(stable).await.unwrap();
+        coordinator
+            .run(request(&agent_id, "generated room"))
+            .await
+            .unwrap();
+
+        let guard = coordinator.state.read().await;
+        let runs = guard.runs.for_agent(&agent_id);
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| {
+            run.id.starts_with("run_")
+                && run.status == RunStatus::Completed
+                && run.source == RunSource::Api
+                && run.finished_at_ms.is_some()
+                && !run.mirrored
+        }));
+        let stable = runs
+            .iter()
+            .find(|run| run.input.text == "stable room")
+            .unwrap();
+        assert_eq!(stable.session_id, "direct:ledger");
+        let generated = runs
+            .iter()
+            .find(|run| run.input.text == "generated room")
+            .unwrap();
+        assert!(generated.session_id.starts_with("room-"));
+        let agent = guard.get_agent(&agent_id).unwrap();
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|message| message.room_id == generated.session_id),
+            "a generated room is chosen before the run and used for its messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_in_flight_run_with_the_same_idempotency_key_is_rejected() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            }),
+            2,
+        )
+        .await;
+        coordinator
+            .state
+            .write()
+            .await
+            .runs
+            .insert(RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: "room-other".into(),
+                    source: RunSource::Telegram,
+                    source_ref: None,
+                    idempotency_key: Some("dup-key".into()),
+                    text: "in flight".into(),
+                    model: "gpt-5.4".into(),
+                    provider: None,
+                    parent_run_id: None,
+                },
+                anima_core::primitives::now_millis(),
+            ));
+        let mut duplicate = request(&agent_id, "same logical work");
+        duplicate.idempotency_key = Some("dup-key".into());
+
+        let error = coordinator
+            .run(duplicate)
+            .await
+            .expect_err("one logical unit of work runs once at a time");
+
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error.message(),
+            "A run with this idempotency key is already in progress"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_crashed_run_never_stays_in_flight() {
+        let (coordinator, agent_id) =
+            coordinator_with_agent(Arc::new(PanickingModelAdapter), 2).await;
+
+        let error = coordinator
+            .run(request(&agent_id, "crash"))
+            .await
+            .expect_err("the run task panicked");
+        assert_eq!(error.message(), "agent run worker stopped unexpectedly");
+
+        for _ in 0..100 {
+            if coordinator.state.read().await.in_flight_runs(&agent_id) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let guard = coordinator.state.read().await;
+        assert_eq!(guard.in_flight_runs(&agent_id), 0);
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.error.map(|error| error.code),
+            Some("run_aborted".to_string())
+        );
+        assert_ne!(
+            guard.get_agent(&agent_id).unwrap().state.status,
+            AgentStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_stops_between_its_ledger_insert_and_start_save_never_stays_in_flight() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            }),
+            2,
+        )
+        .await;
+        // The run-start persist request overflows the revision counter, so the
+        // run task panics after recording the run and before its start save.
+        coordinator
+            .state
+            .write()
+            .await
+            .set_control_plane_revision_for_test(u64::MAX);
+
+        let error = coordinator
+            .run(request(&agent_id, "never saved"))
+            .await
+            .expect_err("the run task panicked");
+        assert_eq!(error.message(), "agent run worker stopped unexpectedly");
+
+        for _ in 0..100 {
+            if coordinator.state.read().await.in_flight_runs(&agent_id) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let guard = coordinator.state.read().await;
+        assert_eq!(guard.in_flight_runs(&agent_id), 0);
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.error.map(|error| error.code),
+            Some("run_aborted".to_string())
+        );
+        assert!(requests.lock().unwrap().is_empty(), "the model never ran");
+    }
+
+    struct ToolThenGateModelAdapter {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for ToolThenGateModelAdapter {
+        fn provider(&self) -> &str {
+            "tool-then-gate"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            if !request
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                let mut response = model_response("Calculating");
+                response.stop_reason = ModelStopReason::ToolCall;
+                response.tool_calls = Some(vec![anima_core::ToolCall {
+                    id: "calculate-1".into(),
+                    name: "calculate".into(),
+                    args: BTreeMap::from([(
+                        "expression".into(),
+                        DataValue::String("1 + 2".into()),
+                    )]),
+                }]);
+                return Ok(response);
+            }
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(model_response("The answer is 3"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_interrupted_after_starting_a_tool_keeps_that_tool_across_a_restart() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            ToolThenGateModelAdapter {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        ))));
+        let mut config = test_config("calculator");
+        config.tools = Some(
+            crate::tools::ToolRegistry::new()
+                .resolve_descriptors(["calculate"])
+                .unwrap(),
+        );
+        let agent_id = state.write().await.create_agent(config).unwrap().state.id;
+        let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
+        let running = {
+            let coordinator = coordinator.clone();
+            let request = request(&agent_id, "what is 1 + 2?");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        // Any save taken now carries the tool the run already started, and a
+        // restart then interrupts the run.
+        let snapshot = state.read().await.control_plane_snapshot();
+        let restored = RunLedger::restored(
+            snapshot.runs,
+            &HashSet::from([agent_id.clone()]),
+            anima_core::primitives::now_millis(),
+        );
+        let interrupted = restored.for_agent(&agent_id)[0].clone();
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        assert_eq!(
+            interrupted.error.map(|error| error.code),
+            Some("restart_during_run".to_string())
+        );
+        assert_eq!(interrupted.tools_started, ["calculate"]);
+
+        release.add_permits(1);
+        running.await.unwrap().unwrap();
+        assert_eq!(
+            state.read().await.runs.for_agent(&agent_id)[0].tools_started,
+            ["calculate"],
+            "the commit-time fill agrees"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_save_leaves_no_ledger_record() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            }),
+            2,
+        )
+        .await;
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+
+        let error = coordinator
+            .run(request(&agent_id, "unsaved"))
+            .await
+            .expect_err("the run-start save failed");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let guard = coordinator.state.read().await;
+        assert!(guard.runs.for_agent(&agent_id).is_empty());
+        assert_eq!(guard.in_flight_runs(&agent_id), 0);
+        assert!(requests.lock().unwrap().is_empty(), "the model never ran");
     }
 
     fn request(agent_id: &str, text: &str) -> AgentRunRequest {
@@ -2483,6 +2960,8 @@ mod tests {
             },
             room: RunRoom::Generated,
             idempotency_key: None,
+            source: RunSource::Api,
+            source_ref: None,
         }
     }
 
