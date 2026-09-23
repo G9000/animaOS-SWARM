@@ -367,12 +367,18 @@ impl StreamUsage {
             usage.get("completion_tokens"),
             usage.get("total_tokens"),
         )?;
-        merge_detail_value(
-            &mut self.cached_prompt,
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get("cached_tokens")),
-        )?;
+        // `prompt_tokens_details.cached_tokens` is the OpenAI-shaped field; when it is
+        // absent or null, fall back to DeepSeek's `prompt_cache_hit_tokens`. Conflict
+        // detection (a later chunk disagreeing with an earlier one) still applies via
+        // `merge_detail_value` below, whichever field supplied the value.
+        let cached_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"));
+        let cached_tokens = match cached_tokens {
+            None | Some(Value::Null) => usage.get("prompt_cache_hit_tokens"),
+            present => present,
+        };
+        merge_detail_value(&mut self.cached_prompt, cached_tokens)?;
         merge_detail_value(
             &mut self.reasoning,
             usage

@@ -1044,6 +1044,66 @@ async fn openai_generate_parses_cached_and_reasoning_tokens() {
 }
 
 #[tokio::test]
+async fn deepseek_generate_falls_back_to_prompt_cache_hit_tokens() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            Json(json!({
+                "choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110,
+                         "prompt_cache_hit_tokens":80,"prompt_cache_miss_tokens":20}
+            }))
+        }),
+    );
+    let base_url = spawn_server(app).await;
+
+    let response = adapter_with(&[("deepseek", Some("key"), &format!("{base_url}/v1"))])
+        .generate(&agent_config("deepseek", false), &request())
+        .await
+        .expect("deepseek response");
+
+    assert_eq!(response.usage.prompt_tokens, 100);
+    assert_eq!(response.usage.completion_tokens, 10);
+    assert_eq!(response.usage.total_tokens, 110);
+    assert_eq!(response.usage.cached_prompt_tokens, 80);
+}
+
+#[tokio::test]
+async fn deepseek_stream_falls_back_to_prompt_cache_hit_tokens() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream_options"]["include_usage"], true);
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110,\"prompt_cache_hit_tokens\":80,\"prompt_cache_miss_tokens\":20}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("deepseek", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("deepseek", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    let Some(ModelStreamFrame::Final(response)) = frames.last() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.usage.prompt_tokens, 100);
+    assert_eq!(response.usage.completion_tokens, 10);
+    assert_eq!(response.usage.total_tokens, 110);
+    assert_eq!(response.usage.cached_prompt_tokens, 80);
+}
+
+#[tokio::test]
 async fn anthropic_usage_counts_cache_tokens_as_prompt_tokens() {
     let app = Router::new().route(
         "/v1/messages",
