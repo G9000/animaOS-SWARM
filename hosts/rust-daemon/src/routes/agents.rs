@@ -6,7 +6,7 @@ use super::contracts::{
     MemoriesEnvelope, MemoryResponse, TaskRequest,
 };
 use super::ApiError;
-use crate::agent_runs::{AgentRunCoordinator, AgentRunPermit, AgentRunRequest, RunRoom};
+use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::runs::RunSource;
 use crate::state::UpdateAgentError;
@@ -181,7 +181,6 @@ pub(crate) async fn handle_run_agent(
     agent_id: &str,
     body: Vec<u8>,
     coordinator: &AgentRunCoordinator,
-    permit: AgentRunPermit,
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let room = match request.room_id.as_deref() {
@@ -194,17 +193,14 @@ pub(crate) async fn handle_run_agent(
         .map_err(ApiError::bad_request_static)?;
 
     coordinator
-        .run_admitted(
-            AgentRunRequest {
-                agent_id: agent_id.to_string(),
-                content,
-                room,
-                idempotency_key: None,
-                source: RunSource::Api,
-                source_ref: None,
-            },
-            permit,
-        )
+        .run(AgentRunRequest {
+            agent_id: agent_id.to_string(),
+            content,
+            room,
+            idempotency_key: None,
+            source: RunSource::Api,
+            source_ref: None,
+        })
         .await
 }
 
@@ -236,10 +232,7 @@ mod tests {
         state: &SharedDaemonState,
     ) -> Result<crate::routes::AgentRunEnvelope, crate::routes::ApiError> {
         let coordinator = AgentRunCoordinator::new(Arc::clone(state), Arc::new(Semaphore::new(8)));
-        let permit = coordinator
-            .try_admit()
-            .expect("test coordinator should admit the run");
-        handle_run_agent_with_coordinator(agent_id, body, &coordinator, permit).await
+        handle_run_agent_with_coordinator(agent_id, body, &coordinator).await
     }
 
     struct PendingModelAdapter {
@@ -796,16 +789,12 @@ mod tests {
             .expect("the delegated run should enter the model")
             .forget();
 
-        let permit = coordinator
-            .try_admit()
-            .expect("a run permit should be free");
         let error = tokio::time::timeout(
             Duration::from_secs(1),
             handle_run_agent_with_coordinator(
                 &helper_id,
                 br#"{"text":"bypass the companion"}"#.to_vec(),
                 &coordinator,
-                permit,
             ),
         )
         .await

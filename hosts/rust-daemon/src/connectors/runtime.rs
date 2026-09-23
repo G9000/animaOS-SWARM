@@ -901,10 +901,11 @@ impl ConnectorManager {
         if let Some(replay) = replay {
             return Ok(replay);
         }
-        let permit = self
-            .runs
-            .try_admit()
-            .map_err(|_| ConnectorManagerError::Backpressure)?;
+        // Nothing is reserved here: the run takes the Telegram room, an agent
+        // slot, and then a global permit, in that order (spec §4.3).
+        if !self.runs.has_available_permit() {
+            return Err(ConnectorManagerError::Backpressure);
+        }
         let commit_connector_id = connector.id.clone();
         let commit_agent_id = connector.agent_id.clone();
         let commit_room_id = connector.room_id.clone();
@@ -934,9 +935,8 @@ impl ConnectorManager {
         };
         let run = self
             .runs
-            .run_with_commit_admitted_and_rollback(
+            .run_with_commit_waiting(
                 request,
-                permit,
                 move |state, outcome| {
                     let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
                         ApiError::service_unavailable("connector lifecycle changed during run")
@@ -4921,7 +4921,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serialized_rollback_preserves_a_turn_committed_while_connector_waited() {
+    async fn cross_room_rollback_preserves_a_turn_committed_while_the_connector_ran() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
@@ -4931,8 +4931,7 @@ mod tests {
         daemon.create_agent(test_config()).unwrap();
         let state = Arc::new(RwLock::new(daemon));
         let agent_id = state.read().await.list_agents()[0].state.id.clone();
-        let limiter = Arc::new(Semaphore::new(2));
-        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
         let manager = ConnectorManager::new(
             Arc::clone(&state),
             runs.clone(),
@@ -4942,7 +4941,7 @@ mod tests {
         let connector = manager
             .create(
                 agent_id.clone(),
-                TelegramBotToken::parse("42:serialized-token").unwrap(),
+                TelegramBotToken::parse("42:cross-room-token").unwrap(),
             )
             .await
             .unwrap();
@@ -4971,7 +4970,7 @@ mod tests {
         let original = state.read().await.get_agent(&agent_id).unwrap();
 
         let temporary = std::env::temp_dir().join(format!(
-            "anima-connector-serialized-rollback-{}-{}",
+            "anima-connector-cross-room-rollback-{}-{}",
             std::process::id(),
             super::now_ms()
         ));
@@ -5001,30 +5000,23 @@ mod tests {
         entered
             .acquire()
             .await
-            .expect("intervening turn should hold the per-agent lock")
+            .expect("the intervening turn should enter the model")
             .forget();
-
         let processing_manager = manager.clone();
         let connector_id = connector.id.clone();
         let processing =
             tokio::spawn(
                 async move { processing_manager.process_pending_once(connector_id).await },
             );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while limiter.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("connector should acquire global admission and wait on the agent lock");
-
-        release.add_permits(1);
-        intervening.await.unwrap().unwrap();
         entered
             .acquire()
             .await
-            .expect("connector should enter only after the intervening turn commits")
+            .expect("the connector turn runs concurrently in its own room")
             .forget();
+
+        // The intervening turn waited on the gate first, so it is released first.
+        release.add_permits(1);
+        intervening.await.unwrap().unwrap();
         let committed_intervening = state.read().await.get_agent(&agent_id).unwrap();
         assert_eq!(
             committed_intervening.messages.len(),

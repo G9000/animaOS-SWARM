@@ -14,7 +14,7 @@ use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::{
     RunChangeSet, RunError, RunOutcome, RunRecord, RunSource, RunStart, RunStatus, COMMIT_FAILED,
-    COMMIT_REJECTED, RUN_ABORTED,
+    COMMIT_REJECTED, DEFAULT_MAX_RUNS_PER_AGENT, HELPER_MAX_RUNS, RUN_ABORTED,
 };
 use crate::state::DaemonState;
 
@@ -26,7 +26,11 @@ const MAX_HELPER_RUN_MS: u64 = 120_000;
 const DUPLICATE_IN_FLIGHT_RUN: &str = "A run with this idempotency key is already in progress";
 
 fn helper_parent(agent: &AgentState) -> Option<&str> {
-    let settings = agent.config.settings.as_ref()?;
+    config_helper_parent(&agent.config)
+}
+
+fn config_helper_parent(config: &AgentConfig) -> Option<&str> {
+    let settings = config.settings.as_ref()?;
     if settings.additional.get("workspaceRole") != Some(&DataValue::String("helper".into())) {
         return None;
     }
@@ -34,6 +38,19 @@ fn helper_parent(agent: &AgentState) -> Option<&str> {
         Some(DataValue::String(parent)) => Some(parent.as_str()),
         _ => None,
     }
+}
+
+fn is_helper_config(config: &AgentConfig) -> bool {
+    config
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.additional.get("workspaceRole"))
+        == Some(&DataValue::String("helper".into()))
+}
+
+fn run_worker_stopped(error: tokio::task::JoinError) -> ApiError {
+    warn!(error = %error, "agent run worker stopped unexpectedly");
+    ApiError::service_unavailable("agent run worker stopped unexpectedly")
 }
 
 fn is_coordination_tool(name: &str) -> bool {
@@ -72,38 +89,113 @@ fn helper_config(parent: &AgentState, name: String) -> AgentConfig {
 }
 
 fn is_workspace_manager(agent: &AgentState) -> bool {
-    agent
-        .config
+    is_manager_config(&agent.config)
+}
+
+fn is_manager_config(config: &AgentConfig) -> bool {
+    config
         .settings
         .as_ref()
         .and_then(|settings| settings.additional.get("workspaceRole"))
         == Some(&DataValue::String("lead".into()))
 }
 
-type AgentLockMap = Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>;
 /// Undoes a source's own records after a failed commit; the coordinator has
 /// already removed the run's messages, events, and usage.
 type AgentRunRollback = Box<dyn FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static>;
 
-struct AgentLockCleanup {
-    agent_id: String,
-    agent_lock: Arc<Mutex<()>>,
-    agent_locks: AgentLockMap,
+/// Error returned when the global run limit is exhausted on a fail-fast path.
+pub(crate) const RUN_ADMISSION_SATURATED: &str = "too many concurrent run requests";
+const SPECIALIST_BUSY: &str = "Specialist is busy";
+
+type SessionLockMap = Arc<StdMutex<HashMap<(String, String), Arc<Mutex<()>>>>>;
+type AgentSlotMap = Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>;
+
+/// How a run waits for its room lock and agent slot (spec §4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmitMode {
+    /// Wait in acceptance order (top-level runs).
+    Wait,
+    /// Fail fast with "Specialist is busy" (nested delegated and peer runs).
+    TryNow,
 }
 
-impl Drop for AgentLockCleanup {
+/// How a run takes its global permit once it holds its room and slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermitMode {
+    Wait,
+    TryNow,
+}
+
+/// One room lock of an agent. tokio's mutex serves waiters in FIFO order,
+/// which keeps same-room runs in acceptance order.
+struct SessionLease {
+    key: (String, String),
+    lock: Arc<Mutex<()>>,
+    guard: Option<OwnedMutexGuard<()>>,
+    locks: SessionLockMap,
+}
+
+impl Drop for SessionLease {
     fn drop(&mut self) {
+        self.guard.take();
         let mut locks = self
-            .agent_locks
+            .locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::strong_count(&self.agent_lock) == 2
+        if Arc::strong_count(&self.lock) == 2
             && locks
-                .get(&self.agent_id)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.agent_lock))
+                .get(&self.key)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.lock))
         {
-            locks.remove(&self.agent_id);
+            locks.remove(&self.key);
         }
+    }
+}
+
+/// One of an agent's run slots.
+struct SlotLease {
+    agent_id: String,
+    slots: Arc<Semaphore>,
+    permit: Option<OwnedSemaphorePermit>,
+    registry: AgentSlotMap,
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.permit.take();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.slots) == 2
+            && registry
+                .get(&self.agent_id)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.slots))
+        {
+            registry.remove(&self.agent_id);
+        }
+    }
+}
+
+/// A run's room lock and agent slot, held until the run finishes.
+pub(crate) struct RunReservation {
+    _session: SessionLease,
+    _slot: SlotLease,
+}
+
+/// Everything a run needs to start: its room, reservation, and global permit,
+/// acquired in that order.
+pub(crate) struct RunTicket {
+    room_id: String,
+    _reservation: RunReservation,
+    permit: AgentRunPermit,
+}
+
+impl RunTicket {
+    /// The room this ticket locked; a ticketed run always runs in it.
+    pub(crate) fn room_id(&self) -> &str {
+        &self.room_id
     }
 }
 
@@ -149,7 +241,9 @@ pub(crate) struct AgentRunRequest {
 pub(crate) struct AgentRunCoordinator {
     state: SharedDaemonState,
     run_limiter: Arc<Semaphore>,
-    agent_locks: AgentLockMap,
+    session_locks: SessionLockMap,
+    agent_slots: AgentSlotMap,
+    max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
 }
 
@@ -318,7 +412,7 @@ impl AgentRunCoordinator {
             // between its durable publish and the helper's final state commit.
             tokio::spawn(async move {
                 let transaction = coordinator.control_plane_transaction().await;
-                let (helper, baseline, persist_request, agent_lock, agent_guard, permit) = {
+                let (helper, baseline, persist_request, slot, permit) = {
                     let mut guard = coordinator.state.write().await;
                     let parent = guard.get_agent(&parent_id).ok_or("Companion no longer exists")?;
                     if !is_workspace_manager(&parent.state) {
@@ -327,35 +421,30 @@ impl AgentRunCoordinator {
                     // Reserve shared run capacity before creating any durable agent.
                     let permit = coordinator.try_admit().map_err(|error| error.message().to_string())?;
                     let helpers: Vec<_> = guard.list_agents().into_iter().filter(|agent| helper_parent(&agent.state) == Some(parent_id.as_str())).collect();
+                    // A helper is idle when its single run slot is free; taking that
+                    // slot is the reservation (spec §4.4 item 7). Only the
+                    // non-waiting slot helpers may run under this `state.write()`:
+                    // never call `admit()` here, because its `slot_capacity` takes
+                    // `state.read()` and would deadlock.
                     let available = helpers.iter().find_map(|helper| {
-                        let lock = coordinator.agent_lock(&helper.state.id);
-                        let reservation = lock.clone().try_lock_owned().ok()?;
-                        Some((helper.clone(), lock, reservation))
+                        let slot = coordinator.try_slot_lease(&helper.state.id, HELPER_MAX_RUNS)?;
+                        Some((helper.clone(), slot))
                     });
                     let config = helper_config(&parent.state, name);
-                    let (helper, baseline, lock, reservation) = if let Some((helper, lock, reservation)) = available {
+                    let (helper, baseline, slot) = if let Some((helper, slot)) = available {
                         let baseline = helper.state.config.clone();
                         guard.restore_agent_config(&helper.state.id, config);
-                        (guard.get_agent(&helper.state.id).expect("reserved helper exists"), Some(baseline), lock, reservation)
+                        (guard.get_agent(&helper.state.id).expect("reserved helper exists"), Some(baseline), slot)
                     } else {
                         if helpers.len() >= MAX_HELPERS_PER_COMPANION {
                             return Err("All four helpers are busy; wait for a result before spawning another helper".to_string());
                         }
                         let helper = guard.create_agent(config)?;
-                        let lock = coordinator.agent_lock(&helper.state.id);
-                        let reservation = lock.clone().try_lock_owned().expect("new helper is not running");
-                        (helper, None, lock, reservation)
+                        let slot = coordinator.try_slot_lease(&helper.state.id, HELPER_MAX_RUNS).expect("a new helper has a free slot");
+                        (helper, None, slot)
                     };
-                    (helper, baseline, guard.control_plane_persist_request(), lock, reservation, permit)
+                    (helper, baseline, guard.control_plane_persist_request(), slot, permit)
                 };
-                let _cleanup = AgentLockCleanup {
-                    agent_id: helper.state.id.clone(),
-                    agent_lock,
-                    agent_locks: coordinator.agent_locks.clone(),
-                };
-                // Keep the reservation until after run_locked completes. Selecting an
-                // idle helper and reserving it are one serialized operation.
-                let _agent_guard = agent_guard;
                 if let Err(error) = persist_request.save().await {
                     let mut guard = coordinator.state.write().await;
                     if let Some(config) = baseline {
@@ -375,8 +464,18 @@ impl AgentRunCoordinator {
                     source_ref: None,
                 };
                 let room_id = request.room.resolve(&request.agent_id);
+                // A fresh delegated room is never contended. The permit and slot were
+                // taken above without waiting, so this order cannot deadlock.
+                let session = coordinator
+                    .try_session_lease(&request.agent_id, &room_id)
+                    .expect("a fresh helper room is uncontended");
+                let ticket = RunTicket {
+                    room_id,
+                    _reservation: RunReservation { _session: session, _slot: slot },
+                    permit,
+                };
                 let result = coordinator
-                    .run_locked(request, room_id, permit, |_, _| Ok(()), None)
+                    .run_locked(request, ticket, |_, _| Ok(()), None)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 Ok(serde_json::json!({"agentId": helper.state.id, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
@@ -387,9 +486,18 @@ impl AgentRunCoordinator {
         Self {
             state,
             run_limiter,
-            agent_locks: Arc::new(StdMutex::new(HashMap::new())),
+            session_locks: Arc::new(StdMutex::new(HashMap::new())),
+            agent_slots: Arc::new(StdMutex::new(HashMap::new())),
+            max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Concurrent runs per non-helper agent across different rooms (spec §4.3).
+    #[allow(dead_code)] // Only tests set it until the daemon configuration does.
+    pub(crate) fn with_max_runs_per_agent(mut self, max_runs_per_agent: usize) -> Self {
+        self.max_runs_per_agent = max_runs_per_agent.max(1);
+        self
     }
 
     /// Serializes every in-memory control-plane mutation through its durable
@@ -405,27 +513,25 @@ impl AgentRunCoordinator {
         Arc::clone(&self.control_plane_transactions)
     }
 
-    /// Advisory admission check; the serialized runner remains authoritative.
+    /// Advisory: the agent has no free run slot (spec §4.4 item 7).
     pub(crate) fn is_agent_busy(&self, agent_id: &str) -> bool {
-        self.agent_locks
+        self.agent_slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(agent_id)
-            .is_some_and(|lock| lock.try_lock().is_err())
+            .is_some_and(|slots| slots.available_permits() == 0)
     }
 
-    #[allow(dead_code)] // Used by daemon-owned connector and scheduler workers.
+    /// Advisory, reserves nothing: fail-fast callers check this before doing work.
+    pub(crate) fn has_available_permit(&self) -> bool {
+        self.run_limiter.available_permits() > 0
+    }
+
+    /// Runs without a source commit. Top-level runs wait for their room and an
+    /// agent slot; nested delegated and peer runs fail fast. The global permit
+    /// is never waited for here (fail-fast 503).
     pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
-        let permit = self.try_admit()?;
-        self.run_admitted(request, permit).await
-    }
-
-    pub(crate) async fn run_admitted(
-        &self,
-        request: AgentRunRequest,
-        permit: AgentRunPermit,
-    ) -> Result<AgentRunEnvelope, ApiError> {
-        self.run_with_commit_admitted(request, permit, |_, _| Ok(()))
+        self.run_spawned(request, PermitMode::TryNow, |_, _| Ok(()), None)
             .await
     }
 
@@ -442,11 +548,12 @@ impl AgentRunCoordinator {
     where
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
-        let permit = self.try_admit()?;
-        self.run_with_commit_admitted(request, permit, commit).await
+        self.run_spawned(request, PermitMode::TryNow, commit, None)
+            .await
     }
 
-    /// Runs durable background work after waiting for shared daemon admission.
+    /// Runs durable background work after waiting for its room, an agent slot,
+    /// and shared daemon admission, in that order.
     ///
     /// Interactive callers deliberately fail fast when the daemon is saturated,
     /// but daemon-owned workers must not turn temporary saturation into a durable
@@ -461,34 +568,15 @@ impl AgentRunCoordinator {
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
         R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
-        let permit = self
-            .run_limiter
-            .clone()
-            .acquire_owned()
-            .await
-            .map(AgentRunPermit)
-            .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?;
-        self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
+        self.run_spawned(request, PermitMode::Wait, commit, Some(Box::new(rollback)))
             .await
     }
 
-    pub(crate) async fn run_with_commit_admitted<F>(
+    /// Runs with a ticket the caller acquired up front (see `try_ticket`).
+    pub(crate) async fn run_ticketed_with_commit_and_rollback<F, R>(
         &self,
         request: AgentRunRequest,
-        permit: AgentRunPermit,
-        commit: F,
-    ) -> Result<AgentRunEnvelope, ApiError>
-    where
-        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
-    {
-        self.run_transaction_admitted(request, permit, commit, None)
-            .await
-    }
-
-    pub(crate) async fn run_with_commit_admitted_and_rollback<F, R>(
-        &self,
-        request: AgentRunRequest,
-        permit: AgentRunPermit,
+        ticket: RunTicket,
         commit: F,
         rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
@@ -496,14 +584,25 @@ impl AgentRunCoordinator {
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
         R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
-        self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
-            .await
+        // The run executes in the ticket's room; a stable request room must name it.
+        debug_assert!(
+            !matches!(&request.room, RunRoom::Stable(room) if room.as_str() != ticket.room_id()),
+            "a ticketed run must use the room its ticket locked"
+        );
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            coordinator
+                .run_locked(request, ticket, commit, Some(Box::new(rollback)))
+                .await
+        })
+        .await
+        .map_err(run_worker_stopped)?
     }
 
-    async fn run_transaction_admitted<F>(
+    async fn run_spawned<F>(
         &self,
         request: AgentRunRequest,
-        permit: AgentRunPermit,
+        permit_mode: PermitMode,
         commit: F,
         rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
@@ -511,53 +610,192 @@ impl AgentRunCoordinator {
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
         let coordinator = self.clone();
+        // The run owns its task, so a dropped caller cannot cancel a commit.
         tokio::spawn(async move {
+            // An invalid request fails before waiting for a room, slot, or permit.
+            coordinator.prevalidate(&request).await?;
+            let ticket = coordinator.acquire_ticket(&request, permit_mode).await?;
             coordinator
-                .run_serialized(request, permit, commit, rollback)
+                .run_locked(request, ticket, commit, rollback)
                 .await
         })
         .await
-        .map_err(|error| {
-            warn!(error = %error, "agent run worker stopped unexpectedly");
-            ApiError::service_unavailable("agent run worker stopped unexpectedly")
-        })?
+        .map_err(run_worker_stopped)?
     }
 
-    async fn run_serialized<F>(
+    async fn acquire_ticket(
         &self,
-        request: AgentRunRequest,
-        permit: AgentRunPermit,
-        commit: F,
-        rollback: Option<AgentRunRollback>,
-    ) -> Result<AgentRunEnvelope, ApiError>
-    where
-        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
-    {
-        self.prevalidate(&request).await?;
+        request: &AgentRunRequest,
+        permit_mode: PermitMode,
+    ) -> Result<RunTicket, ApiError> {
         let room_id = request.room.resolve(&request.agent_id);
-        let agent_lock = self.agent_lock(&request.agent_id);
-        let _cleanup = AgentLockCleanup {
-            agent_id: request.agent_id.clone(),
-            agent_lock: Arc::clone(&agent_lock),
-            agent_locks: Arc::clone(&self.agent_locks),
-        };
-        let _agent_guard = if matches!(
+        let mode = if matches!(
             request.room,
             RunRoom::Delegated { .. } | RunRoom::Peer { .. }
         ) {
-            agent_lock
-                .try_lock_owned()
-                .map_err(|_| ApiError::service_unavailable("Specialist is busy"))?
+            AdmitMode::TryNow
         } else {
-            agent_lock.lock_owned().await
+            AdmitMode::Wait
         };
-        self.run_locked(request, room_id, permit, commit, rollback)
-            .await
+        let reservation = self.admit(&request.agent_id, &room_id, mode).await?;
+        let permit = match permit_mode {
+            PermitMode::TryNow => self.try_admit()?,
+            PermitMode::Wait => self
+                .run_limiter
+                .clone()
+                .acquire_owned()
+                .await
+                .map(AgentRunPermit)
+                .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?,
+        };
+        Ok(RunTicket {
+            room_id,
+            _reservation: reservation,
+            permit,
+        })
     }
 
-    /// The start checks, run before waiting for the agent so an invalid request
-    /// fails fast; `run_locked` repeats them authoritatively under the
-    /// control-plane transaction.
+    /// Acquires the room lock, then an agent slot (spec §4.3).
+    ///
+    /// Deadlock hazard: a run keeps its own room lock and slot until it
+    /// finishes, so a tool that awaits `coordinator.run()` for its own agent and
+    /// room in `Wait` mode would wait on itself forever (and one waiting for its
+    /// own agent's slot can, once every slot is held). Nested runs use
+    /// `TryNow`, as delegated and peer runs do.
+    pub(crate) async fn admit(
+        &self,
+        agent_id: &str,
+        room_key: &str,
+        mode: AdmitMode,
+    ) -> Result<RunReservation, ApiError> {
+        let capacity = self.slot_capacity(agent_id).await;
+        let session = match mode {
+            AdmitMode::Wait => self.wait_session_lease(agent_id, room_key).await,
+            AdmitMode::TryNow => self
+                .try_session_lease(agent_id, room_key)
+                .ok_or_else(|| ApiError::service_unavailable(SPECIALIST_BUSY))?,
+        };
+        let slot = match mode {
+            AdmitMode::Wait => self.wait_slot_lease(agent_id, capacity).await?,
+            AdmitMode::TryNow => self
+                .try_slot_lease(agent_id, capacity)
+                .ok_or_else(|| ApiError::service_unavailable(SPECIALIST_BUSY))?,
+        };
+        Ok(RunReservation {
+            _session: session,
+            _slot: slot,
+        })
+    }
+
+    /// Room, slot, and permit, in that order, without waiting for any of them.
+    pub(crate) async fn try_ticket(
+        &self,
+        agent_id: &str,
+        room_id: &str,
+    ) -> Result<RunTicket, ApiError> {
+        let reservation = self.admit(agent_id, room_id, AdmitMode::TryNow).await?;
+        let permit = self.try_admit()?;
+        Ok(RunTicket {
+            room_id: room_id.to_string(),
+            _reservation: reservation,
+            permit,
+        })
+    }
+
+    async fn slot_capacity(&self, agent_id: &str) -> usize {
+        if self
+            .state
+            .read()
+            .await
+            .agents
+            .get(agent_id)
+            .is_some_and(|runtime| is_helper_config(runtime.config()))
+        {
+            HELPER_MAX_RUNS
+        } else {
+            self.max_runs_per_agent
+        }
+    }
+
+    fn session_lock(&self, agent_id: &str, room_id: &str) -> ((String, String), Arc<Mutex<()>>) {
+        let key = (agent_id.to_string(), room_id.to_string());
+        let lock = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        (key, lock)
+    }
+
+    fn try_session_lease(&self, agent_id: &str, room_id: &str) -> Option<SessionLease> {
+        let (key, lock) = self.session_lock(agent_id, room_id);
+        let guard = Arc::clone(&lock).try_lock_owned().ok();
+        let lease = SessionLease {
+            key,
+            lock,
+            guard,
+            locks: Arc::clone(&self.session_locks),
+        };
+        lease.guard.is_some().then_some(lease)
+    }
+
+    async fn wait_session_lease(&self, agent_id: &str, room_id: &str) -> SessionLease {
+        let (key, lock) = self.session_lock(agent_id, room_id);
+        let mut lease = SessionLease {
+            key,
+            lock: Arc::clone(&lock),
+            guard: None,
+            locks: Arc::clone(&self.session_locks),
+        };
+        lease.guard = Some(lock.lock_owned().await);
+        lease
+    }
+
+    fn agent_slot_semaphore(&self, agent_id: &str, capacity: usize) -> Arc<Semaphore> {
+        self.agent_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(agent_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(capacity)))
+            .clone()
+    }
+
+    fn try_slot_lease(&self, agent_id: &str, capacity: usize) -> Option<SlotLease> {
+        let slots = self.agent_slot_semaphore(agent_id, capacity);
+        let permit = Arc::clone(&slots).try_acquire_owned().ok();
+        let lease = SlotLease {
+            agent_id: agent_id.to_string(),
+            slots,
+            permit,
+            registry: Arc::clone(&self.agent_slots),
+        };
+        lease.permit.is_some().then_some(lease)
+    }
+
+    async fn wait_slot_lease(
+        &self,
+        agent_id: &str,
+        capacity: usize,
+    ) -> Result<SlotLease, ApiError> {
+        let slots = self.agent_slot_semaphore(agent_id, capacity);
+        let mut lease = SlotLease {
+            agent_id: agent_id.to_string(),
+            slots: Arc::clone(&slots),
+            permit: None,
+            registry: Arc::clone(&self.agent_slots),
+        };
+        lease.permit =
+            Some(slots.acquire_owned().await.map_err(|_| {
+                ApiError::service_unavailable("agent run admission is unavailable")
+            })?);
+        Ok(lease)
+    }
+
+    /// The start checks, run before waiting for a room lock, slot, or permit so
+    /// an invalid request fails fast; `run_locked` repeats them authoritatively
+    /// under the control-plane transaction.
     async fn prevalidate(&self, request: &AgentRunRequest) -> Result<(), ApiError> {
         let guard = self.state.read().await;
         validate_run_request(&guard, &request.agent_id, &request.room)?;
@@ -571,14 +809,18 @@ impl AgentRunCoordinator {
     async fn run_locked<F>(
         &self,
         request: AgentRunRequest,
-        room_id: String,
-        permit: AgentRunPermit,
+        ticket: RunTicket,
         commit: F,
         mut rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send,
     {
+        let RunTicket {
+            room_id,
+            _reservation,
+            permit,
+        } = ticket;
         let _run_permit = permit.0;
         let AgentRunRequest {
             agent_id,
@@ -820,29 +1062,26 @@ impl AgentRunCoordinator {
         })
     }
 
-    fn agent_lock(&self, agent_id: &str) -> Arc<Mutex<()>> {
-        self.agent_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(agent_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
     pub(crate) fn try_admit(&self) -> Result<AgentRunPermit, ApiError> {
         self.run_limiter
             .clone()
             .try_acquire_owned()
             .map(AgentRunPermit)
-            .map_err(|_| ApiError::service_unavailable("too many concurrent run requests"))
+            .map_err(|_| ApiError::service_unavailable(RUN_ADMISSION_SATURATED))
     }
 
     #[cfg(test)]
-    fn lock_count(&self) -> usize {
-        self.agent_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+    fn lock_counts(&self) -> (usize, usize) {
+        (
+            self.session_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            self.agent_slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+        )
     }
 }
 
@@ -856,48 +1095,50 @@ fn apply_run_rollback(
     }
 }
 
+/// A registered agent's canonical configuration, without copying its
+/// transcript or event log the way `DaemonState::get_agent` does.
+fn agent_config<'a>(state: &'a DaemonState, agent_id: &str) -> Option<&'a AgentConfig> {
+    state.agents.get(agent_id).map(|runtime| runtime.config())
+}
+
 /// The start checks that applied before M1: helpers only through their
 /// companion and never with process tools; peer requests within the senders'
 /// permissions; delegation only from a manager to a non-manager without
-/// escalation.
+/// escalation. They read only configurations, never a transcript copy, so
+/// they stay cheap before admission and under the control-plane transaction.
 fn validate_run_request(
     state: &DaemonState,
     agent_id: &str,
     room: &RunRoom,
 ) -> Result<(), ApiError> {
-    if let Some(parent_id) = state
-        .get_agent(agent_id)
-        .as_ref()
-        .and_then(|agent| helper_parent(&agent.state))
-    {
-        if !matches!(room, RunRoom::Delegated { parent_id: source } if source == parent_id) {
-            return Err(ApiError::bad_request_static(
-                "Helpers must run through their owning companion",
-            ));
-        }
-        if state.get_agent(agent_id).is_some_and(|helper| {
-            helper
-                .state
-                .config
+    if let Some(target) = agent_config(state, agent_id) {
+        if let Some(parent_id) = config_helper_parent(target) {
+            if !matches!(room, RunRoom::Delegated { parent_id: source } if source == parent_id) {
+                return Err(ApiError::bad_request_static(
+                    "Helpers must run through their owning companion",
+                ));
+            }
+            if target
                 .tools
                 .iter()
                 .flatten()
                 .any(|tool| crate::tools::is_process_tool(&tool.name))
-        }) {
-            return Err(ApiError::bad_request_static(
-                "Process tools are unavailable to helpers until process cancellation is supported",
-            ));
+            {
+                return Err(ApiError::bad_request_static(
+                    "Process tools are unavailable to helpers until process cancellation is supported",
+                ));
+            }
         }
     }
     if let RunRoom::Peer { route } = room {
-        let target = state.get_agent(agent_id).ok_or_else(ApiError::not_found)?;
+        let target = agent_config(state, agent_id).ok_or_else(ApiError::not_found)?;
         for source in route
             .participants()
             .iter()
             .take(route.participants().len() - 1)
         {
-            let source = state.get_agent(source).ok_or_else(ApiError::not_found)?;
-            if target.state.config.tools.iter().flatten().any(|tool| {
+            let source = agent_config(state, source).ok_or_else(ApiError::not_found)?;
+            if target.tools.iter().flatten().any(|tool| {
                 !matches!(
                     tool.name.as_str(),
                     "list_workspace_agents"
@@ -905,23 +1146,23 @@ fn validate_run_request(
                         | "broadcast_message"
                         | "delegate_to_agent"
                         | "spawn_helper"
-                ) && !source.state.config.allows_tool(&tool.name)
+                ) && !source.allows_tool(&tool.name)
             }) {
                 return Err(ApiError::bad_request_static("Peer request would exceed the sender's tool permissions; ask the owner to contact this agent directly"));
             }
         }
     }
     if let RunRoom::Delegated { parent_id } = room {
-        let parent = state.get_agent(parent_id).ok_or_else(ApiError::not_found)?;
-        let target = state.get_agent(agent_id).ok_or_else(ApiError::not_found)?;
-        if !is_workspace_manager(&parent.state)
-            || is_workspace_manager(&target.state)
+        let parent = agent_config(state, parent_id).ok_or_else(ApiError::not_found)?;
+        let target = agent_config(state, agent_id).ok_or_else(ApiError::not_found)?;
+        if !is_manager_config(parent)
+            || is_manager_config(target)
             || parent_id == agent_id
-            || target.state.config.tools.iter().flatten().any(|tool| {
+            || target.tools.iter().flatten().any(|tool| {
                 tool.name != "list_workspace_agents"
                     && tool.name != "delegate_to_agent"
                     && tool.name != "spawn_helper"
-                    && !parent.state.config.allows_tool(&tool.name)
+                    && !parent.allows_tool(&tool.name)
             })
         {
             return Err(ApiError::bad_request_static(
@@ -2077,7 +2318,15 @@ mod tests {
             .delegate(&manager, "missing".into(), "missing".into())
             .await
             .is_err());
-        let lock = coordinator.agent_lock(&worker_id).lock_owned().await;
+        let mut held = Vec::new();
+        for room in ["busy-1", "busy-2", "busy-3"] {
+            held.push(
+                coordinator
+                    .admit(&worker_id, room, super::AdmitMode::TryNow)
+                    .await
+                    .expect("worker has a free slot"),
+            );
+        }
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
             coordinator.delegate(&manager, worker_id.clone(), "busy".into())
@@ -2085,7 +2334,7 @@ mod tests {
         .await
         .unwrap()
         .is_err());
-        drop(lock);
+        drop(held);
         assert!(
             !coordinator
                 .parent_allows_tool(&manager.id, "write_file")
@@ -2121,6 +2370,35 @@ mod tests {
 
     struct CapturingModelAdapter {
         requests: Arc<StdMutex<Vec<ModelGenerateRequest>>>,
+    }
+
+    struct OrderedGateModelAdapter {
+        order: StdMutex<Vec<String>>,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for OrderedGateModelAdapter {
+        fn provider(&self) -> &str {
+            "ordered-gate"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let text = request
+                .messages
+                .last()
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            self.order.lock().unwrap().push(text.clone());
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(model_response(&text))
+        }
     }
 
     #[async_trait]
@@ -2171,7 +2449,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_agent_runs_wait_then_both_execute() {
+    async fn same_room_runs_wait_in_acceptance_order() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(OrderedGateModelAdapter {
+            order: StdMutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 4).await;
+        let spawn_run = |text: &str| {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-shared", text);
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+
+        let first = spawn_run("first");
+        entered.acquire().await.unwrap().forget();
+        let second = spawn_run("second");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let third = spawn_run("third");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(adapter.order.lock().unwrap().clone(), ["first"]);
+
+        release.add_permits(1);
+        entered.acquire().await.unwrap().forget();
+        release.add_permits(1);
+        entered.acquire().await.unwrap().forget();
+        release.add_permits(1);
+        for task in [first, second, third] {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(
+            adapter.order.lock().unwrap().clone(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[tokio::test]
+    async fn different_rooms_of_one_agent_run_concurrently_and_both_commit() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let adapter = Arc::new(GateModelAdapter {
@@ -2179,39 +2499,136 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 2).await;
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 4).await;
+        let runs = ["room-a", "room-b"].map(|room| {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, room, room);
+            tokio::spawn(async move { coordinator.run(request).await })
+        });
 
-        let first_coordinator = coordinator.clone();
-        let first_request = request(&agent_id, "first");
-        let first = tokio::spawn(async move { first_coordinator.run(first_request).await });
-        entered
-            .acquire()
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(2))
             .await
-            .expect("first run should enter model")
+            .expect("both rooms enter the model concurrently")
+            .unwrap()
             .forget();
-        let second_coordinator = coordinator.clone();
-        let second_request = request(&agent_id, "second");
-        let second = tokio::spawn(async move { second_coordinator.run(second_request).await });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
+        {
+            let guard = coordinator.state.read().await;
+            assert_eq!(guard.in_flight_runs(&agent_id), 2);
+            assert_eq!(
+                guard.get_agent(&agent_id).unwrap().state.status,
+                AgentStatus::Running
+            );
         }
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        release.add_permits(2);
+        for run in runs {
+            run.await.unwrap().unwrap();
+        }
 
-        release.add_permits(1);
-        entered
-            .acquire()
-            .await
-            .expect("second run should enter after first completes")
-            .forget();
-        release.add_permits(1);
-
-        assert!(first.await.expect("first task should join").is_ok());
-        assert!(second.await.expect("second task should join").is_ok());
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+        let guard = coordinator.state.read().await;
+        let agent = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(agent.state.status, AgentStatus::Completed);
+        for room in ["room-a", "room-b"] {
+            assert_eq!(
+                agent
+                    .messages
+                    .iter()
+                    .filter(|message| message.room_id == room)
+                    .count(),
+                2,
+                "{room} keeps its own turn"
+            );
+        }
+        let runs = guard.runs.for_agent(&agent_id);
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.status == RunStatus::Completed));
     }
 
     #[tokio::test]
-    async fn aborted_caller_does_not_cancel_restore_or_leave_a_stale_agent_lock() {
+    async fn the_per_agent_slot_limit_queues_runs_beyond_it() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 8).await;
+        let coordinator = coordinator.with_max_runs_per_agent(2);
+        let runs = ["room-a", "room-b", "room-c"].map(|room| {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, room, room);
+            tokio::spawn(async move { coordinator.run(request).await })
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(2))
+            .await
+            .expect("two rooms start")
+            .unwrap()
+            .forget();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            2,
+            "the third room waits for a free slot"
+        );
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("the third room starts once a slot frees")
+            .unwrap()
+            .forget();
+        release.add_permits(2);
+        for run in runs {
+            assert!(run.await.unwrap().is_ok());
+        }
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn helper_agents_have_a_single_run_slot() {
+        let (coordinator, worker_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let lead = helper_lead(&coordinator).await;
+        let helper = coordinator
+            .state
+            .write()
+            .await
+            .create_agent(super::helper_config(&lead, "Research".into()))
+            .unwrap()
+            .state;
+
+        let _running = coordinator
+            .admit(&helper.id, "room-1", super::AdmitMode::TryNow)
+            .await
+            .expect("the helper's only slot is free");
+        let busy = coordinator
+            .admit(&helper.id, "room-2", super::AdmitMode::TryNow)
+            .await
+            .err()
+            .expect("a helper runs one task at a time");
+        assert_eq!(busy.message(), "Specialist is busy");
+        assert!(coordinator.is_agent_busy(&helper.id));
+
+        let _first = coordinator
+            .admit(&worker_id, "room-1", super::AdmitMode::TryNow)
+            .await
+            .expect("first worker slot");
+        let _second = coordinator
+            .admit(&worker_id, "room-2", super::AdmitMode::TryNow)
+            .await
+            .expect("other agents keep several slots");
+        assert!(!coordinator.is_agent_busy(&worker_id));
+    }
+
+    #[tokio::test]
+    async fn aborted_caller_does_not_cancel_the_commit_or_leak_locks_and_slots() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let adapter = Arc::new(GateModelAdapter {
@@ -2250,7 +2667,7 @@ mod tests {
         release.add_permits(1);
 
         for _ in 0..100 {
-            if coordinator.lock_count() == 0
+            if coordinator.lock_counts() == (0, 0)
                 && state
                     .read()
                     .await
@@ -2261,7 +2678,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(coordinator.lock_count(), 0);
+        assert_eq!(coordinator.lock_counts(), (0, 0));
         assert!(state.read().await.agents.contains_key(&agent_id));
 
         let retry_coordinator = coordinator.clone();
@@ -2951,6 +3368,128 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty(), "the model never ran");
     }
 
+    #[tokio::test]
+    async fn a_failed_final_save_fails_the_run_and_reverts_only_its_transcript() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        // A turn committed in another room, which the failed runs must keep.
+        release.add_permits(1);
+        coordinator
+            .run(room_request(&agent_id, "room-kept", "kept turn"))
+            .await
+            .expect("an ordinary run commits");
+        entered.acquire().await.unwrap().forget();
+        let committed = coordinator
+            .state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages;
+        assert_eq!(committed.len(), 2);
+
+        // The legacy route's run, then a job's ticketed run; each fails only its
+        // final save.
+        let legacy = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-legacy", "legacy turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        let legacy_error = legacy.await.unwrap().expect_err("the final save failed");
+
+        let source_rollbacks = Arc::new(AtomicUsize::new(0));
+        let ticket = coordinator
+            .try_ticket(&agent_id, "job:job-1")
+            .await
+            .expect("the job's room, a slot, and a permit are free");
+        let job = {
+            let coordinator = coordinator.clone();
+            let source_rollbacks = Arc::clone(&source_rollbacks);
+            let request = AgentRunRequest {
+                idempotency_key: Some("job:job-1:attempt:1".into()),
+                source: RunSource::Job,
+                source_ref: Some("job-1:1".into()),
+                ..room_request(&agent_id, "job:job-1", "job turn")
+            };
+            tokio::spawn(async move {
+                coordinator
+                    .run_ticketed_with_commit_and_rollback(
+                        request,
+                        ticket,
+                        |_, _| Ok(()),
+                        move |_| {
+                            source_rollbacks.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+            })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        let job_error = job.await.unwrap().expect_err("the final save failed");
+
+        for error in [&legacy_error, &job_error] {
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(
+            source_rollbacks.load(Ordering::SeqCst),
+            1,
+            "the job's own rollback ran"
+        );
+        let guard = coordinator.state.read().await;
+        assert_eq!(
+            guard.get_agent(&agent_id).unwrap().messages,
+            committed,
+            "only the failed runs' messages are removed"
+        );
+        for (room, source) in [
+            ("room-legacy", RunSource::Api),
+            ("job:job-1", RunSource::Job),
+        ] {
+            let run = guard
+                .runs
+                .for_agent(&agent_id)
+                .into_iter()
+                .find(|run| run.session_id == room)
+                .expect("the failed run keeps its ledger record");
+            assert_eq!(run.source, source);
+            assert_eq!(run.status, RunStatus::Failed);
+            assert_eq!(
+                run.error.as_ref().map(|error| error.code.as_str()),
+                Some("commit_failed")
+            );
+        }
+        drop(guard);
+        assert_eq!(coordinator.lock_counts(), (0, 0));
+    }
+
+    /// Waits for the run parked in the gate model, makes the next control-plane
+    /// save (its final save) fail, then releases the run.
+    async fn fail_the_next_final_save(
+        coordinator: &AgentRunCoordinator,
+        entered: &Semaphore,
+        release: &Semaphore,
+    ) {
+        entered.acquire().await.unwrap().forget();
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+        release.add_permits(1);
+    }
+
     fn request(agent_id: &str, text: &str) -> AgentRunRequest {
         AgentRunRequest {
             agent_id: agent_id.to_string(),
@@ -2962,6 +3501,13 @@ mod tests {
             idempotency_key: None,
             source: RunSource::Api,
             source_ref: None,
+        }
+    }
+
+    fn room_request(agent_id: &str, room_id: &str, text: &str) -> AgentRunRequest {
+        AgentRunRequest {
+            room: RunRoom::Stable(room_id.into()),
+            ..request(agent_id, text)
         }
     }
 

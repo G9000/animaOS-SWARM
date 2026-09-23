@@ -105,6 +105,24 @@ async fn claim_precedes_model_and_failed_completion_stays_uncertain_without_repl
     assert_eq!(current.attempt, 1);
     assert!(current.result.is_none());
     assert!(state.read().await.get_agent(&agent).is_some());
+    {
+        // The undurable final save failed the run and removed its turn.
+        let guard = state.read().await;
+        let run = guard.runs.for_agent(&agent)[0];
+        assert_eq!(run.source, RunSource::Job);
+        assert_eq!(run.status, crate::runs::RunStatus::Failed);
+        assert_eq!(
+            run.error.as_ref().map(|error| error.code.as_str()),
+            Some("commit_failed")
+        );
+        let job_room = format!("job:{}", job.id);
+        assert!(guard
+            .get_agent(&agent)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id != job_room));
+    }
     state
         .write()
         .await
@@ -115,6 +133,97 @@ async fn claim_precedes_model_and_failed_completion_stays_uncertain_without_repl
         .is_err());
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir(blocked);
+}
+
+struct GatedModel {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+#[async_trait::async_trait]
+impl anima_core::ModelAdapter for GatedModel {
+    fn provider(&self) -> &str {
+        "gated-test"
+    }
+    async fn generate(
+        &self,
+        config: &anima_core::AgentConfig,
+        request: &anima_core::ModelGenerateRequest,
+    ) -> Result<anima_core::ModelGenerateResponse, String> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        anima_core::ModelAdapter::generate(
+            &crate::model::DeterministicModelAdapter,
+            config,
+            request,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn a_chat_run_in_another_room_does_not_hold_back_the_agents_job() {
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let path = std::env::temp_dir().join(format!(
+        "anima-job-cross-room-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let mut state = DaemonState::with_model_adapter(Arc::new(GatedModel {
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    state.set_control_plane_store(Some(ControlPlaneStoreConfig::Json(path.clone())));
+    let agent = state
+        .create_agent(
+            serde_json::from_value(serde_json::json!({"name":"busy","model":"deterministic"}))
+                .unwrap(),
+        )
+        .unwrap()
+        .state
+        .id;
+    let state = Arc::new(RwLock::new(state));
+    let runs = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(4)));
+    let chat = {
+        let runs = runs.clone();
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            runs.run(AgentRunRequest {
+                agent_id: agent,
+                content: Content {
+                    text: "chat turn".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                room: RunRoom::Stable("chat".into()),
+                idempotency_key: None,
+                source: RunSource::Api,
+                source_ref: None,
+            })
+            .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    let service = JobService::new(state.clone(), runs);
+    let job = service
+        .create(&agent, "title", "prompt", "key")
+        .await
+        .unwrap();
+    service.start().await.unwrap();
+    let job_started = tokio::time::timeout(Duration::from_secs(3), entered.acquire()).await;
+    release.add_permits(2);
+    assert!(
+        job_started.is_ok(),
+        "the agent's job starts while its chat run is in another room"
+    );
+    wait_completed(&service, &job.id).await;
+    chat.await.unwrap().unwrap();
+    service.shutdown().await;
+    let _ = std::fs::remove_file(path);
 }
 
 fn setup() -> (JobService, String, std::path::PathBuf) {

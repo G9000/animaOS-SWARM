@@ -471,8 +471,17 @@ impl JobService {
                 {
                     continue;
                 }
-                let Ok(permit) = self.runs.try_admit() else {
+                if !self.runs.has_available_permit() {
                     break;
+                }
+                // Take the room, a slot, and the permit before the durable claim so a
+                // claimed job always starts; none of the three waits.
+                let Ok(ticket) = self
+                    .runs
+                    .try_ticket(&candidate.agent_id, &format!("job:{}", candidate.id))
+                    .await
+                else {
+                    continue;
                 };
                 let id = candidate.id.clone();
                 let claimed = self
@@ -504,7 +513,7 @@ impl JobService {
                 let service = self.clone();
                 let agent = job.agent_id.clone();
                 let task = active.spawn(async move {
-                    service.execute(job, permit).await;
+                    service.execute(job, ticket).await;
                 });
                 task_agents.insert(task.id(), agent);
             }
@@ -512,13 +521,15 @@ impl JobService {
         while active.join_next().await.is_some() {}
     }
 
-    async fn execute(&self, job: AgentJobRecord, permit: crate::agent_runs::AgentRunPermit) {
+    async fn execute(&self, job: AgentJobRecord, ticket: crate::agent_runs::RunTicket) {
         let commit_id = job.id.clone();
         let rollback_job = job.clone();
         let revision = job.revision;
+        // The run's room comes from the ticket that locked it, so the two cannot drift.
+        let room = RunRoom::Stable(ticket.room_id().to_string());
         let run = self
             .runs
-            .run_with_commit_admitted_and_rollback(
+            .run_ticketed_with_commit_and_rollback(
                 AgentRunRequest {
                     agent_id: job.agent_id.clone(),
                     content: Content {
@@ -526,12 +537,12 @@ impl JobService {
                         attachments: None,
                         metadata: None,
                     },
-                    room: RunRoom::Stable(format!("job:{}", job.id)),
+                    room,
                     idempotency_key: Some(format!("job:{}:attempt:{}", job.id, job.attempt)),
                     source: RunSource::Job,
                     source_ref: Some(format!("{}:{}", job.id, job.attempt)),
                 },
-                permit,
+                ticket,
                 move |state, outcome| {
                     let result = &outcome.result;
                     let current = state

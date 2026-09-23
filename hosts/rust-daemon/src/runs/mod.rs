@@ -139,6 +139,12 @@ impl RunOutcome {
     }
 }
 
+/// Concurrent runs of one agent across different rooms unless
+/// `ANIMAOS_RS_MAX_RUNS_PER_AGENT` says otherwise (spec §4.3, §16).
+pub(crate) const DEFAULT_MAX_RUNS_PER_AGENT: usize = 3;
+/// Generated helpers run one task at a time (spec §4.3).
+pub(crate) const HELPER_MAX_RUNS: usize = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;

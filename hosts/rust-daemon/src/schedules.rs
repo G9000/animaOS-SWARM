@@ -113,7 +113,8 @@ struct SchedulerInner {
     state: SharedDaemonState,
     runs: AgentRunCoordinator,
     connectors: ConnectorManager,
-    // A job owns its slot until the detached agent run and durable commit finish.
+    // One live run per automation (spec §4.3); a job owns its entry until the
+    // detached agent run and durable commit finish.
     jobs: Mutex<BTreeMap<String, JoinHandle<()>>>,
 }
 
@@ -396,8 +397,8 @@ impl SchedulerService {
         }
         // Reconcile only jobs with no live owner, including failures after startup.
         // Persistence failure closes admission for this tick; the next tick retries.
-        let active_agents = jobs.keys().cloned().collect();
-        reconcile_interrupted(inner, now, &active_agents).await?;
+        let active_schedules = jobs.keys().cloned().collect();
+        reconcile_interrupted(inner, now, &active_schedules).await?;
         let due_ids = {
             let state = inner.state.read().await;
             let mut ids = state
@@ -406,24 +407,29 @@ impl SchedulerService {
                 .filter(|item| {
                     item.enabled && item.next_due_at_ms <= now && !unresolved_occurrence(item)
                 })
-                .map(|item| (item.next_due_at_ms, item.id.clone(), item.agent_id.clone()))
+                .map(|item| (item.next_due_at_ms, item.id.clone()))
                 .collect::<Vec<_>>();
             ids.sort();
             ids
         };
         let mut claimed = 0;
-        for (_, id, agent_id) in due_ids {
+        for (_, id) in due_ids {
             if jobs.len() >= MAX_ACTIVE_SCHEDULES {
                 break;
             }
-            if jobs.contains_key(&agent_id) {
+            if jobs.contains_key(&id) {
                 continue;
             }
+            // The claim is durable before the run waits for its room, slot, and
+            // permit. Two automations sharing a room (one connector's chat, say)
+            // are both claimed and one may wait on the room lock; a restart in
+            // that window auto-disables the waiting occurrence under the
+            // interrupted-schedule rule. Accepted for M1.
             if let Some(record) = claim_due(inner, &id, now).await? {
                 claimed += 1;
                 let inner = inner.clone();
                 jobs.insert(
-                    agent_id,
+                    id,
                     tokio::spawn(async move {
                         execute_claimed(&inner, record, now).await;
                     }),
@@ -455,7 +461,7 @@ fn unresolved_occurrence(record: &ScheduledPromptRecord) -> bool {
 async fn reconcile_interrupted(
     inner: &Arc<SchedulerInner>,
     now: u64,
-    active_agents: &BTreeSet<String>,
+    active_schedules: &BTreeSet<String>,
 ) -> Result<(), ScheduleError> {
     let _transaction = inner.runs.control_plane_transaction().await;
     let (previous, persist) = {
@@ -464,7 +470,7 @@ async fn reconcile_interrupted(
         for schedule in state
             .schedules
             .values_mut()
-            .filter(|s| !active_agents.contains(&s.agent_id) && unresolved_occurrence(s))
+            .filter(|s| !active_schedules.contains(&s.id) && unresolved_occurrence(s))
         {
             previous.push(schedule.clone());
             schedule.enabled = false;
@@ -1053,41 +1059,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_starts_new_due_agent_while_another_is_running() {
+    async fn scheduler_runs_other_automations_of_a_busy_agent_concurrently() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let daemon = DaemonState::with_model_adapter(Arc::new(GatedModel {
             entered: entered.clone(),
             release: release.clone(),
         }));
-        let (service, state, first, _) = service_with_daemon(daemon);
+        let (mut service, state, first, _) = service_with_daemon(daemon);
+        Arc::get_mut(&mut service.inner).unwrap().runs =
+            AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(8)));
         let second = {
             let mut state = state.write().await;
             let mut config = state.get_agent(&first).unwrap().state.config;
             config.name = "second".into();
             state.create_agent(config).unwrap().state.id
         };
-        due_schedule(&service, &first).await;
+        let running = due_schedule(&service, &first).await;
         service.start().await;
         tokio::time::timeout(Duration::from_secs(3), entered.acquire())
             .await
             .unwrap()
             .unwrap()
             .forget();
-        // A second due occurrence for the busy agent must not monopolize admission.
-        due_schedule(&service, &first).await;
-        let second_record = due_schedule(&service, &second).await;
-        let independent_started =
-            tokio::time::timeout(Duration::from_secs(2), entered.acquire()).await;
+        let running_fired = state.read().await.schedules[&running.id].last_fired.clone();
+
+        // Another automation of the busy agent and one of another agent.
+        let sibling = due_schedule(&service, &first).await;
+        let other = due_schedule(&service, &second).await;
+        let both_started =
+            tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(2)).await;
+        let running_fired_later = state.read().await.schedules[&running.id].last_fired.clone();
         release.add_permits(10);
         service.shutdown().await;
+
         assert!(
-            independent_started.is_ok(),
-            "an unrelated newly due agent must start before the first finishes"
+            both_started.is_ok(),
+            "one run per automation: a busy agent's other automation starts too"
         );
-        assert!(state.read().await.schedules[&second_record.id]
-            .last_safe_outcome
-            .is_some());
+        assert_eq!(
+            running_fired_later, running_fired,
+            "a running automation is never claimed again while it runs"
+        );
+        for id in [&running.id, &sibling.id, &other.id] {
+            assert!(
+                state.read().await.schedules[id].last_safe_outcome.is_some(),
+                "{id} should finish"
+            );
+        }
     }
 
     #[tokio::test]

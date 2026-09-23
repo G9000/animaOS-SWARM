@@ -1296,18 +1296,19 @@ async fn run_agent_entry(
     Path(agent_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
-    let permit = match state.agent_runs.try_admit() {
-        Ok(permit) => permit,
-        Err(error) => return error.into_response(),
-    };
+    // Fail fast before reading the body when the daemon is saturated. Nothing is
+    // reserved here: the run takes its room, an agent slot, and then a global
+    // permit, and fails fast again if the permit is gone by then.
+    if !state.agent_runs.has_available_permit() {
+        return ApiError::service_unavailable(crate::agent_runs::RUN_ADMISSION_SATURATED)
+            .into_response();
+    }
 
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => {
-            match agents::handle_run_agent(&agent_id, body, &state.agent_runs, permit).await {
-                Ok(response) => json_response(StatusCode::OK, &response),
-                Err(error) => error.into_response(),
-            }
-        }
+        Ok(body) => match agents::handle_run_agent(&agent_id, body, &state.agent_runs).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
         Err(response) => response,
     }
 }
