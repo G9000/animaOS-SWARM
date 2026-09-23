@@ -33,7 +33,7 @@ pub(crate) use process::{
 };
 pub(crate) use workspace::{
     canonical_workspace_root, normalized_relative_path, resolve_workspace_write_path,
-    workspace_root_path,
+    workspace_root_path, write_workspace_bytes,
 };
 
 type ToolHandler = fn(

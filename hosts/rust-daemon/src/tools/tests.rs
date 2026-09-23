@@ -25,7 +25,7 @@ use super::{
     },
     utility::{current_time_iso_utc, evaluate_expression},
     web::{parse_exa_results, strip_html_text},
-    workspace_root_path, ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    write_workspace_bytes, workspace_root_path, ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
 use crate::memory_embeddings::MemoryEmbeddingRuntime;
 use anima_core::{
@@ -1048,6 +1048,117 @@ fn write_workspace_file_creates_parent_directories() {
         "hello world"
     );
 
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
+fn write_workspace_file_rejects_parent_components() {
+    for (index, user_path) in [
+        "newdir/../../escaped.txt",
+        "../escaped.txt",
+        "a/b/../../../escaped.txt",
+        "nested/../notes.txt",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sandbox = create_temp_workspace(&format!("write-parent-{index}"));
+        let workspace = sandbox.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+
+        let error = write_workspace_file_from_root(&workspace, user_path, "escaped")
+            .expect_err("parent components must be rejected");
+
+        assert_eq!(
+            error,
+            format!("write_file path must not contain '..': {user_path}")
+        );
+        assert!(!sandbox.join("escaped.txt").exists(), "{user_path}");
+        assert!(!workspace.join("newdir").exists(), "{user_path}");
+        assert!(!workspace.join("a").exists(), "{user_path}");
+        assert!(!workspace.join("nested").exists(), "{user_path}");
+        fs::remove_dir_all(sandbox).expect("remove sandbox");
+    }
+}
+
+#[test]
+fn resolve_workspace_write_path_rejects_parent_components_for_every_writer() {
+    let workspace = create_temp_workspace("write-parent-agency");
+
+    let error = super::resolve_workspace_write_path(&workspace, "../agency", "agency_create")
+        .expect_err("agency output must stay inside the workspace");
+
+    assert_eq!(error, "agency_create path must not contain '..': ../agency");
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[test]
+fn write_workspace_bytes_creates_parents_and_returns_the_target() {
+    let workspace = create_temp_workspace("write-bytes");
+
+    let target = super::write_workspace_bytes(
+        &workspace,
+        "uploads/2026-09-23/data.bin",
+        &[0, 1, 2],
+        "upload",
+    )
+    .expect("write bytes");
+
+    assert!(target.ends_with("uploads/2026-09-23/data.bin"));
+    assert_eq!(fs::read(&target).expect("read bytes"), vec![0, 1, 2]);
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_workspace_file_rejects_dangling_symlink_target() {
+    let sandbox = create_temp_workspace("write-dangling-symlink");
+    let workspace = sandbox.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let outside = sandbox.join("outside.txt");
+    std::os::unix::fs::symlink(&outside, workspace.join("link.txt")).expect("create symlink");
+
+    let error = write_workspace_file_from_root(&workspace, "link.txt", "escaped")
+        .expect_err("dangling symlink must be rejected");
+
+    assert_eq!(error, "write_file path is a dangling symbolic link: link.txt");
+    assert!(!outside.exists());
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_workspace_file_rejects_symlink_to_outside_file() {
+    let sandbox = create_temp_workspace("write-outside-symlink");
+    let workspace = sandbox.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let outside = sandbox.join("outside.txt");
+    fs::write(&outside, "original").expect("write outside file");
+    std::os::unix::fs::symlink(&outside, workspace.join("link.txt")).expect("create symlink");
+
+    let error = write_workspace_file_from_root(&workspace, "link.txt", "escaped")
+        .expect_err("escaping symlink must be rejected");
+
+    assert_eq!(error, "write_file path escapes workspace root: link.txt");
+    assert_eq!(fs::read_to_string(&outside).expect("read outside"), "original");
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
+#[cfg(unix)]
+#[test]
+fn write_workspace_file_writes_through_symlink_inside_workspace() {
+    let workspace = create_temp_workspace("write-inside-symlink");
+    fs::write(workspace.join("real.txt"), "original").expect("write real file");
+    std::os::unix::fs::symlink(workspace.join("real.txt"), workspace.join("link.txt"))
+        .expect("create symlink");
+
+    write_workspace_file_from_root(&workspace, "link.txt", "updated")
+        .expect("internal symlink stays writable");
+
+    assert_eq!(
+        fs::read_to_string(workspace.join("real.txt")).expect("read real file"),
+        "updated"
+    );
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 

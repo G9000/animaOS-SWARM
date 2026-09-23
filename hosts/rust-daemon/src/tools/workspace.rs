@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) fn workspace_root_path(
     tool_name: &str,
@@ -153,10 +153,65 @@ pub(crate) fn resolve_workspace_write_path(
     file_path: &str,
     tool_name: &str,
 ) -> Result<PathBuf, String> {
+    reject_parent_components(file_path, tool_name)?;
     let canonical_root = canonical_workspace_root(workspace_root, tool_name)?;
     let resolved = resolve_input_path(&canonical_root, file_path);
     ensure_write_path_within_workspace(&canonical_root, &resolved, tool_name, file_path)?;
+    ensure_symlink_target_within_workspace(&canonical_root, &resolved, tool_name, file_path)?;
     Ok(resolved)
+}
+
+/// Writes bytes to a workspace path with the same checks as `write_file`,
+/// re-verifying the parent after directories are created.
+pub(crate) fn write_workspace_bytes(
+    workspace_root: &Path,
+    file_path: &str,
+    bytes: &[u8],
+    tool_name: &str,
+) -> Result<PathBuf, String> {
+    let target = resolve_workspace_write_path(workspace_root, file_path, tool_name)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("{tool_name} failed to create directories for {file_path}: {error}")
+        })?;
+        let canonical_root = canonical_workspace_root(workspace_root, tool_name)?;
+        let canonical_parent = parent.canonicalize().map_err(|error| {
+            format!("{tool_name} path could not be resolved: {file_path} ({error})")
+        })?;
+        ensure_path_within_workspace(&canonical_root, &canonical_parent, tool_name, file_path)?;
+    }
+    fs::write(&target, bytes)
+        .map_err(|error| format!("{tool_name} failed to write {file_path}: {error}"))?;
+    Ok(target)
+}
+
+fn reject_parent_components(user_path: &str, tool_name: &str) -> Result<(), String> {
+    if Path::new(user_path)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        Err(format!("{tool_name} path must not contain '..': {user_path}"))
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_symlink_target_within_workspace(
+    workspace_root: &Path,
+    target: &Path,
+    tool_name: &str,
+    user_path: &str,
+) -> Result<(), String> {
+    let Ok(metadata) = fs::symlink_metadata(target) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    let canonical = target
+        .canonicalize()
+        .map_err(|_| format!("{tool_name} path is a dangling symbolic link: {user_path}"))?;
+    ensure_path_within_workspace(workspace_root, &canonical, tool_name, user_path)
 }
 
 fn ensure_write_path_within_workspace(
