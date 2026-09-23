@@ -33,8 +33,8 @@
 
 | Milestone | Detailed plan | Status |
 |---|---|---|
-| M0 Security and groundwork | `2026-09-23-companion-console-m0.md` | planned |
-| M1 Run coordinator | (written before M1) | pending |
+| M0 Security and groundwork | `2026-09-23-companion-console-m0.md` | implemented — Nx gate pending (disk) |
+| M1 Run coordinator | `2026-09-23-companion-console-m1.md` | planned (audited) |
 | M2 Sessions | (written before M2) | pending |
 | M3 Live runs | (written before M3) | pending |
 | M4 Approvals | (written before M4) | pending |
