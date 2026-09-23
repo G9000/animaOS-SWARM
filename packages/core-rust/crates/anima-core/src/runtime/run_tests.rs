@@ -330,8 +330,16 @@ fn step_keys_include_the_run_id_unless_a_durable_retry_key_is_present() {
     assert_eq!(key(Some("run_a"), &keyed), key(None, &keyed));
 }
 
+/// Proves that two isolated copies built from one canonical snapshot, run
+/// concurrently, each persist their own completed tool step and neither
+/// overwrites the other's row in the step log, even though both copies start
+/// from the same step index. It does not pin the run-id key component: here
+/// `message.id`/`message.room_id` already differ per iteration (each mints
+/// fresh ids off the process-wide counters), so the keys would stay distinct
+/// even without `run_id` in the seed. That component is covered by
+/// `step_keys_include_the_run_id_unless_a_durable_retry_key_is_present`.
 #[test]
-fn copies_running_concurrently_record_distinct_tool_steps() {
+fn copies_running_concurrently_persist_separate_tool_steps() {
     let db = Arc::new(InMemoryAdapter::new());
     let mut canonical = AgentRuntime::new(search_config(), Arc::new(SearchOnceModel));
     canonical.init();
