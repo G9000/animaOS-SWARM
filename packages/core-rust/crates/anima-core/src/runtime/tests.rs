@@ -6,6 +6,7 @@ use crate::agent::{
     AgentConfig, AgentConfigUpdate, AgentState, AgentStatus, TokenUsage, ToolDescriptor,
 };
 use crate::components::{Evaluator, EvaluatorResult, Provider, ProviderResult};
+use crate::events::{EngineEvent, EventType};
 use crate::model::{
     ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ToolCall,
 };
@@ -1951,4 +1952,46 @@ fn runtime_writes_steps_to_database_adapter() {
     let last = steps.last().unwrap();
     assert_eq!(last.status, StepStatus::Done);
     assert_eq!(last.step_type, "tool");
+}
+
+#[test]
+fn event_log_retains_newest_events_and_counts_every_event() {
+    let mut runtime = runtime();
+    let before = runtime.snapshot().event_count;
+    let recorded = super::MAX_RETAINED_EVENTS + 100;
+    for _ in 0..recorded {
+        runtime.record_event(EventType::AgentTokens, DataValue::Null);
+    }
+
+    let snapshot = runtime.snapshot();
+
+    assert_eq!(snapshot.events.len(), super::MAX_RETAINED_EVENTS);
+    assert_eq!(runtime.events().len(), super::MAX_RETAINED_EVENTS);
+    assert_eq!(snapshot.event_count, before + recorded);
+    assert_eq!(
+        snapshot.events.last().map(|event| &event.id),
+        runtime.events().last().map(|event| &event.id)
+    );
+}
+
+#[test]
+fn restoring_an_oversized_snapshot_trims_events_and_keeps_the_total() {
+    let mut snapshot = runtime().snapshot();
+    snapshot.events = (0..1_000u64)
+        .map(|index| EngineEvent {
+            id: format!("legacy-{index}"),
+            event_type: EventType::AgentTokens,
+            agent_id: None,
+            timestamp_ms: index,
+            data: DataValue::Null,
+        })
+        .collect();
+    snapshot.event_count = 1_000;
+
+    let restored = AgentRuntime::from_snapshot(snapshot, Arc::new(StaticModelAdapter));
+    let restored_snapshot = restored.snapshot();
+
+    assert_eq!(restored_snapshot.events.len(), super::MAX_RETAINED_EVENTS);
+    assert_eq!(restored_snapshot.events[0].id, "legacy-500");
+    assert_eq!(restored_snapshot.event_count, 1_000);
 }

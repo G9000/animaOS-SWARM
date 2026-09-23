@@ -27,6 +27,10 @@ static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_ROOM_ID: AtomicU64 = AtomicU64::new(0);
 pub const MAX_TOOL_ITERATIONS: usize = 8;
+/// Newest engine events kept in memory and in snapshots; `event_count` keeps the running total.
+pub const MAX_RETAINED_EVENTS: usize = 500;
+/// Extra events tolerated before trimming, so trimming is amortized.
+const EVENT_TRIM_SLACK: usize = 64;
 const MAX_EVALUATOR_RETRIES: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -45,6 +49,7 @@ pub struct AgentRuntime {
     messages: Vec<Message>,
     last_task: Option<TaskResult<Content>>,
     events: Vec<EngineEvent>,
+    event_total: usize,
     event_listener: Option<Arc<dyn Fn(EngineEvent) + Send + Sync>>,
     providers: Vec<Arc<dyn Provider>>,
     evaluators: Vec<Arc<dyn Evaluator>>,
@@ -88,6 +93,7 @@ impl AgentRuntime {
             messages: Vec::new(),
             last_task: None,
             events: Vec::new(),
+            event_total: 0,
             event_listener: None,
             providers: Vec::new(),
             evaluators: Vec::new(),
@@ -115,11 +121,17 @@ impl AgentRuntime {
         snapshot: AgentRuntimeSnapshot,
         model_adapter: Arc<dyn ModelAdapter>,
     ) -> Self {
+        let event_total = snapshot.event_count.max(snapshot.events.len());
+        let mut events = snapshot.events;
+        if events.len() > MAX_RETAINED_EVENTS {
+            events.drain(..events.len() - MAX_RETAINED_EVENTS);
+        }
         Self {
             state: snapshot.state,
             messages: snapshot.messages,
             last_task: snapshot.last_task,
-            events: snapshot.events,
+            events,
+            event_total,
             event_listener: None,
             providers: Vec::new(),
             evaluators: Vec::new(),
@@ -212,8 +224,8 @@ impl AgentRuntime {
             state: self.state(),
             message_count: self.messages.len(),
             messages: self.messages.clone(),
-            event_count: self.events.len(),
-            events: self.events.clone(),
+            event_count: self.event_total,
+            events: self.events().to_vec(),
             last_task: self.last_task.clone(),
             step_count: self.step_counter,
         }
@@ -224,7 +236,8 @@ impl AgentRuntime {
     }
 
     pub fn events(&self) -> &[EngineEvent] {
-        &self.events
+        let start = self.events.len().saturating_sub(MAX_RETAINED_EVENTS);
+        &self.events[start..]
     }
 
     pub fn register_provider(&mut self, provider: Arc<dyn Provider>) {
@@ -760,6 +773,11 @@ impl AgentRuntime {
             data,
         };
         self.events.push(event.clone());
+        self.event_total += 1;
+        if self.events.len() > MAX_RETAINED_EVENTS + EVENT_TRIM_SLACK {
+            let excess = self.events.len() - MAX_RETAINED_EVENTS;
+            self.events.drain(..excess);
+        }
         if let Some(listener) = &self.event_listener {
             listener(event);
         }
