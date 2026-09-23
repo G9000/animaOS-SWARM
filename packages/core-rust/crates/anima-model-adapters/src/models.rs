@@ -1047,17 +1047,59 @@ static MODELS: &[ModelInfo] = &[
     },
 ];
 
+/// Exact-match aliases transcribed from `docs/superpowers/plans/data/2026-09-23-model-table.md`,
+/// including aliases stated only in that file's Notes (for example `grok-build-latest`, which the
+/// Notes state is an alias of `grok-4.5`, not of the similarly-named `grok-build-0.1` row).
+/// `(provider, alias id [lowercase, trimmed], canonical model_prefix)`.
+static MODEL_ALIASES: &[(&str, &str, &str)] = &[
+    // xai
+    ("xai", "grok-4.5-latest", "grok-4.5"),
+    ("xai", "grok-build-latest", "grok-4.5"),
+    ("xai", "grok-4.3-latest", "grok-4.3"),
+    ("xai", "grok-code-fast-1", "grok-build-0.1"),
+    ("xai", "grok-code-fast", "grok-build-0.1"),
+    ("xai", "grok-code-fast-1-0825", "grok-build-0.1"),
+    // mistral
+    ("mistral", "mistral-medium-3", "mistral-medium-3-5"),
+    ("mistral", "mistral-medium-latest", "mistral-medium-3-5"),
+    ("mistral", "mistral-large-latest", "mistral-large-2512"),
+    ("mistral", "mistral-small-latest", "mistral-small-2603"),
+    ("mistral", "ministral-14b-latest", "ministral-14b-2512"),
+    ("mistral", "ministral-8b-latest", "ministral-8b-2512"),
+    ("mistral", "ministral-3b-latest", "ministral-3b-2512"),
+    ("mistral", "codestral-latest", "codestral-2508"),
+    ("mistral", "zai-glm-5", "zai-glm-5-3"),
+    ("mistral", "zai-glm-latest", "zai-glm-5-3"),
+    // deepseek
+    ("deepseek", "deepseek-v4-flash", "deepseek-flash"),
+    ("deepseek", "deepseek-v4-flash-vision-exp", "deepseek-flash"),
+];
+
 pub fn model_table() -> &'static [ModelInfo] {
     MODELS
 }
 
 pub fn model_info(provider: &str, model: &str) -> Option<&'static ModelInfo> {
     let provider = canonical_provider(provider)?;
-    model_info_in(MODELS, provider, model)
+    // The ChatGPT subscription runs OpenAI models under the hood; look up context/vision
+    // metadata under the `openai` rows even though cost estimation (a separate call) still
+    // treats `chatgpt` as a no-per-token subscription.
+    let lookup_provider = if provider == "chatgpt" { "openai" } else { provider };
+    model_info_in(MODELS, lookup_provider, model)
 }
 
 fn model_info_in<'a>(table: &'a [ModelInfo], provider: &str, model: &str) -> Option<&'a ModelInfo> {
     let model = model.trim().to_ascii_lowercase();
+    if let Some(canonical) = MODEL_ALIASES.iter().find_map(|(alias_provider, alias, canonical)| {
+        (*alias_provider == provider && *alias == model).then_some(*canonical)
+    }) {
+        if let Some(info) = table
+            .iter()
+            .find(|info| info.provider == provider && info.model_prefix == canonical)
+        {
+            return Some(info);
+        }
+    }
     table
         .iter()
         .filter(|info| info.provider == provider && model.starts_with(info.model_prefix))
@@ -1310,6 +1352,52 @@ mod tests {
         assert_eq!(
             estimate_cost_micros("openai", "gpt-5.5-cyber", &usage),
             CostEstimate::Priced { micros: 12_500_000 }
+        );
+    }
+
+    #[test]
+    fn every_listed_alias_resolves_to_its_canonical_row() {
+        for (provider, alias, canonical) in MODEL_ALIASES {
+            let row = model_table()
+                .iter()
+                .find(|info| info.provider == *provider && info.model_prefix == *canonical)
+                .unwrap_or_else(|| {
+                    panic!("alias {alias} for {provider} names missing canonical row {canonical}")
+                });
+            let resolved = model_info(provider, alias)
+                .unwrap_or_else(|| panic!("alias {alias} for {provider} did not resolve"));
+            assert_eq!(resolved.model_prefix, row.model_prefix, "alias {alias}");
+            assert_eq!(resolved.provider, row.provider, "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn grok_build_latest_resolves_to_grok_4_5_not_grok_build_0_1() {
+        assert_eq!(
+            model_info("xai", "grok-build-latest").unwrap().model_prefix,
+            "grok-4.5"
+        );
+        assert_eq!(
+            model_info("xai", "grok-build-0.1").unwrap().model_prefix,
+            "grok-build-0.1"
+        );
+    }
+
+    #[test]
+    fn chatgpt_model_info_looks_up_the_openai_row_but_still_prices_as_subscription() {
+        let info = model_info("chatgpt", "gpt-5.5").expect("chatgpt should resolve openai rows");
+        assert_eq!(info.provider, "openai");
+        assert_eq!(info.model_prefix, "gpt-5.5");
+
+        let usage = TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 10,
+            total_tokens: 20,
+            ..TokenUsage::default()
+        };
+        assert_eq!(
+            estimate_cost_micros("chatgpt", "gpt-5.5", &usage),
+            CostEstimate::Subscription
         );
     }
 }
