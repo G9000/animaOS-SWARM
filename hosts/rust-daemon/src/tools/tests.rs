@@ -25,7 +25,8 @@ use super::{
     },
     utility::{current_time_iso_utc, evaluate_expression},
     web::{parse_exa_results, strip_html_text},
-    write_workspace_bytes, workspace_root_path, ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    workspace_root_path, write_workspace_bytes, ToolExecutionContext, ToolRegistry,
+    DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
 use crate::memory_embeddings::MemoryEmbeddingRuntime;
 use anima_core::{
@@ -1164,7 +1165,10 @@ fn write_workspace_file_rejects_dangling_symlink_target() {
     let error = write_workspace_file_from_root(&workspace, "link.txt", "escaped")
         .expect_err("dangling symlink must be rejected");
 
-    assert_eq!(error, "write_file path is a dangling symbolic link: link.txt");
+    assert_eq!(
+        error,
+        "write_file path is a dangling symbolic link: link.txt"
+    );
     assert!(!outside.exists());
     fs::remove_dir_all(sandbox).expect("remove sandbox");
 }
@@ -1183,7 +1187,10 @@ fn write_workspace_file_rejects_symlink_to_outside_file() {
         .expect_err("escaping symlink must be rejected");
 
     assert_eq!(error, "write_file path escapes workspace root: link.txt");
-    assert_eq!(fs::read_to_string(&outside).expect("read outside"), "original");
+    assert_eq!(
+        fs::read_to_string(&outside).expect("read outside"),
+        "original"
+    );
     fs::remove_dir_all(sandbox).expect("remove sandbox");
 }
 
@@ -1238,7 +1245,10 @@ fn write_workspace_file_rejects_symlinked_directory_component_pointing_outside()
     let error = write_workspace_file_from_root(&workspace, "link/new/x.txt", "leak")
         .expect_err("writing through a symlinked directory component must be rejected");
 
-    assert_eq!(error, "write_file path escapes workspace root: link/new/x.txt");
+    assert_eq!(
+        error,
+        "write_file path escapes workspace root: link/new/x.txt"
+    );
     assert!(!outside.join("new").exists());
     assert!(!outside.join("new/x.txt").exists());
     fs::remove_dir_all(sandbox).expect("remove sandbox");

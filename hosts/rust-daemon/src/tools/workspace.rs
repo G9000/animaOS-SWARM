@@ -199,9 +199,9 @@ fn reject_workspace_root_target(
     if !resolved.exists() {
         return Ok(());
     }
-    let canonical = resolved
-        .canonicalize()
-        .map_err(|error| format!("{tool_name} path could not be resolved: {user_path} ({error})"))?;
+    let canonical = resolved.canonicalize().map_err(|error| {
+        format!("{tool_name} path could not be resolved: {user_path} ({error})")
+    })?;
     if canonical == canonical_root {
         return Err(format!(
             "{tool_name} path must name a file or directory inside the workspace: {user_path}"
@@ -214,19 +214,24 @@ fn reject_disallowed_components(user_path: &str, tool_name: &str) -> Result<(), 
     let path = Path::new(user_path);
 
     // Reject any parent directory references anywhere in the path
-    if path.components()
+    if path
+        .components()
         .any(|component| matches!(component, Component::ParentDir))
     {
-        return Err(format!("{tool_name} path must not contain '..': {user_path}"));
+        return Err(format!(
+            "{tool_name} path must not contain '..': {user_path}"
+        ));
     }
 
     // Reject root and drive-prefix components in relative paths
-    if !path.is_absolute() {
-        if path.components()
+    if !path.is_absolute()
+        && path
+            .components()
             .any(|component| matches!(component, Component::RootDir | Component::Prefix(_)))
-        {
-            return Err(format!("{tool_name} path has an unsupported root or drive prefix: {user_path}"));
-        }
+    {
+        return Err(format!(
+            "{tool_name} path has an unsupported root or drive prefix: {user_path}"
+        ));
     }
 
     Ok(())
