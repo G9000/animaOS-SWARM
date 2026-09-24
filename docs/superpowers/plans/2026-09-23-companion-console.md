@@ -35,7 +35,7 @@
 |---|---|---|
 | M0 Security and groundwork | `2026-09-23-companion-console-m0.md` | done (Nx rust-daemon:test 1,082 passed at 4e3eb7d) |
 | M1 Run coordinator | `2026-09-23-companion-console-m1.md` | done (Nx rust-daemon:test 1,141 passed at ef5b6fe) |
-| M2 Sessions | `2026-09-23-companion-console-m2.md` | planned (audit in progress) |
+| M2 Sessions | `2026-09-23-companion-console-m2.md` | in progress (audited) |
 | M3 Live runs | (written before M3) | pending |
 | M4 Approvals | (written before M4) | pending |
 | M5 Skills | (written before M5) | pending |
