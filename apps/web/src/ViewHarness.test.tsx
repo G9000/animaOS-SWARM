@@ -1977,6 +1977,85 @@ it('asks for a daemon update instead of failing sends when sessions are missing'
   expect(runAgent).not.toHaveBeenCalled();
 });
 
+it('keeps an opened page when the open session finishes deleting behind it', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+  );
+  const deletion = deferred<void>();
+  const deleteSession = vi.mocked(daemon.deleteSession);
+  const deleteListed = deleteSession.getMockImplementation()!;
+  deleteSession.mockImplementationOnce(async (agentId, sessionId) => {
+    await deletion.promise;
+    return deleteListed(agentId, sessionId);
+  });
+  window.history.replaceState(null, '', '/#/s/chat%3Aold');
+  render(<ViewHarness />);
+
+  await user.click(await screen.findByRole('button', { name: 'Actions for Old plan' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
+  await user.click(screen.getByRole('button', { name: 'Work', exact: true }));
+  await act(async () => deletion.resolve());
+
+  expect(window.location.hash).toBe('#/work');
+  await user.click(screen.getByRole('button', { name: 'Open companion chat' }));
+  expect(window.location.hash).toBe('#/');
+  expect(
+    await screen.findByRole('heading', { name: 'Say something to Nova' }),
+  ).toBeVisible();
+});
+
+it('keeps the open session while a sidebar search filters it out', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('schedule:daily', {
+      kind: 'checkin',
+      origin: 'schedule',
+      title: 'Daily check-in',
+      capabilities: readOnly,
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  // A search lists only matches, and the record cannot be read on its own now.
+  vi.mocked(daemon.listSessions).mockImplementation(
+    async (_agentId, options = {}) => ({
+      sessions: options.q ? [] : [...routes.sessions],
+      nextCursor: null,
+    }),
+  );
+  vi.mocked(daemon.getSession).mockRejectedValue(
+    Object.assign(new Error('history store is unavailable'), { status: 503 }),
+  );
+  window.history.replaceState(null, '', '/#/s/schedule%3Adaily');
+  render(<ViewHarness />);
+
+  expect(
+    await screen.findByRole('heading', { name: 'Daily check-in' }),
+  ).toBeVisible();
+  await user.type(
+    screen.getByRole('searchbox', { name: 'Search sessions' }),
+    'budget',
+  );
+  await screen.findByText('No sessions match.');
+
+  expect(screen.getByRole('heading', { name: 'Daily check-in' })).toBeVisible();
+  expect(screen.getByRole('note')).toHaveTextContent(
+    'Replying to a check-in is not available yet.',
+  );
+  expect(screen.queryByPlaceholderText('Message Nova…')).not.toBeInTheDocument();
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });

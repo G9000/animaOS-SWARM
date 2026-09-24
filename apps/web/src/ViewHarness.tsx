@@ -253,14 +253,18 @@ export function ViewHarness() {
     ? (sessions.sessions.find((item) => item.id === routeSessionId) ?? null)
     : null;
   const sessionListed = listedSession !== null;
-  // A session outside the loaded list (archived or older) is read on its own.
-  const [fetchedSession, setFetchedSession] = useState<Session | null>(null);
+  // A session outside the loaded list (archived, older, or filtered out by a
+  // search) keeps its last known record and is read again on its own.
+  const [knownSession, setKnownSession] = useState<Session | null>(null);
+  useEffect(() => {
+    if (listedSession) setKnownSession(listedSession);
+  }, [listedSession]);
   useEffect(() => {
     if (!routeSessionId || sessionListed || !agentId) return;
     let active = true;
     void daemon.getSession(agentId, routeSessionId).then(
       (session) => {
-        if (active) setFetchedSession(session);
+        if (active) setKnownSession(session);
       },
       () => undefined,
     );
@@ -270,7 +274,7 @@ export function ViewHarness() {
   }, [agentId, routeSessionId, sessionListed]);
   const activeSession =
     listedSession ??
-    (fetchedSession && fetchedSession.id === routeSessionId ? fetchedSession : null);
+    (knownSession && knownSession.id === routeSessionId ? knownSession : null);
   // The composer waits for the record: a send needs the session's room.
   const sessionLoading = routeSessionId !== null && activeSession === null;
   const [messagesRefresh, setMessagesRefresh] = useState(0);
@@ -933,8 +937,11 @@ export function ViewHarness() {
       setSessionActionError(null);
       sessions.remove(session);
       if (agentId) forgetChat(chatKey(agentId, sessionConversation(session.id)));
-      if (routeSessionId === session.id) {
-        if (route.kind === 'page') lastConversationRef.current = { kind: 'home' };
+      // Judge by the route now: a page or another session may have opened meanwhile.
+      const open = lastConversationRef.current;
+      if (open.kind === 'session' && open.sessionId === session.id) {
+        if (routeRef.current.kind === 'page')
+          lastConversationRef.current = { kind: 'home' };
         else navigate({ kind: 'home' }, { replace: true });
       }
     } catch (caught) {
