@@ -474,6 +474,59 @@ pub(crate) async fn assert_history_store_session_search_conformance(store: &dyn 
         .is_empty());
 }
 
+/// A check-in prompt's scheduler suffix (`schedules::wrap_checkin_prompt`)
+/// carries ordinary words ("scheduled", "reply", "exactly"...) that must not
+/// make the prompt match every search (review fix, M2 fix round 1); a word
+/// from the prompt itself must still match. Fresh agent id per call.
+pub(crate) async fn assert_history_store_checkin_text_conformance(store: &dyn HistoryStore) {
+    let agent = format!("agent-{}", uuid::Uuid::new_v4());
+    let checkin = crate::sessions::test_support::checkin_prompt(
+        &agent,
+        "checkin-1",
+        "schedule:s1",
+        "s1",
+        "Check the widgets inventory",
+        1,
+    );
+    store
+        .upsert_messages(&[HistoryMessage {
+            agent_id: agent.clone(),
+            session_id: "schedule:s1".into(),
+            hidden: false,
+            message: checkin,
+        }])
+        .await
+        .expect("checkin message upsert");
+
+    let agents = [agent.clone()];
+    assert!(
+        store
+            .search_messages(&agents, "scheduled", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a scheduler-suffix-only word must not match a check-in prompt"
+    );
+    assert!(
+        store
+            .search_sessions(&agents, "scheduled", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a scheduler-suffix-only word must not match a check-in prompt (search_sessions)"
+    );
+    assert_eq!(
+        ids(&store.search_messages(&agents, "widgets", 10).await.unwrap()),
+        ["checkin-1"],
+        "a word of the prompt itself must still match"
+    );
+    assert_eq!(
+        ids(&store.search_sessions(&agents, "widgets", 10).await.unwrap()),
+        ["checkin-1"],
+        "a word of the prompt itself must still match (search_sessions)"
+    );
+}
+
 /// A memory store whose every call fails while `failing` is set. Unlike the
 /// memory store it is not ephemeral, so pruning tests can use it.
 pub(crate) struct FlakyHistoryStore {

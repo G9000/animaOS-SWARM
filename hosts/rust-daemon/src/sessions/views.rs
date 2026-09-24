@@ -12,13 +12,14 @@ use base64::Engine as _;
 use tracing::warn;
 
 use super::{
-    hidden_message_ids, is_checkin_message, is_inbound_message, preview_text, schedule_id_of_room,
-    SessionCapabilities, SessionKind, SessionRecord,
+    hidden_message_ids, is_inbound_message, preview_text, schedule_id_of_room, SessionCapabilities,
+    SessionKind, SessionRecord,
 };
 use crate::agent_runs::config_helper_parent;
 use crate::app::SharedDaemonState;
 use crate::history::{
-    search_snippet, search_tokens, text_matches, HistoryStore, MessageOrder, MessagePageQuery,
+    search_snippet, search_tokens, searchable_text, text_matches, HistoryStore, MessageOrder,
+    MessagePageQuery,
 };
 use crate::state::DaemonState;
 
@@ -182,19 +183,10 @@ struct Candidate {
     matched: Option<SessionMatch>,
 }
 
-/// The text a person sees: a check-in prompt without the scheduler's suffix.
-fn display_text(message: &Message) -> &str {
-    if is_checkin_message(message) {
-        crate::schedules::unwrap_checkin_prompt(&message.content.text)
-    } else {
-        &message.content.text
-    }
-}
-
 fn preview_from_newest<'a>(newest_first: impl Iterator<Item = &'a Message>) -> Option<String> {
     newest_first
         .filter(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
-        .find_map(|message| preview_text(display_text(message)))
+        .find_map(|message| preview_text(searchable_text(message)))
 }
 
 fn hot_rooms<'a>(state: &'a DaemonState, agent_id: &str) -> HashMap<&'a str, Vec<&'a Message>> {
@@ -231,10 +223,10 @@ fn candidate(
         visible
             .iter()
             .rev()
-            .find(|message| text_matches(&message.content.text, tokens))
+            .find(|message| text_matches(searchable_text(message), tokens))
             .map(|message| SessionMatch {
                 message_id: Some(message.id.clone()),
-                snippet: search_snippet(&message.content.text, tokens),
+                snippet: search_snippet(searchable_text(message), tokens),
             })
     };
     Candidate {
@@ -337,7 +329,7 @@ async fn store_matches(
             .entry((row.agent_id.clone(), row.session_id.clone()))
             .or_insert_with(|| SessionMatch {
                 message_id: Some(row.message.id.clone()),
-                snippet: search_snippet(&row.message.content.text, tokens),
+                snippet: search_snippet(searchable_text(&row.message), tokens),
             });
     }
     matches

@@ -7,8 +7,8 @@ use std::sync::{Mutex, MutexGuard};
 use async_trait::async_trait;
 
 use super::{
-    search_tokens, text_matches, HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
-    EPHEMERAL_HISTORY_MAX_ROWS,
+    search_tokens, searchable_text, text_matches, HistoryError, HistoryMessage, HistoryStore,
+    MessagePageQuery, EPHEMERAL_HISTORY_MAX_ROWS,
 };
 use crate::runs::RunRecord;
 
@@ -213,7 +213,7 @@ impl HistoryStore for MemoryHistoryStore {
             .filter(|row| {
                 !row.hidden
                     && agent_ids.contains(&row.agent_id)
-                    && text_matches(&row.message.content.text, &tokens)
+                    && text_matches(searchable_text(&row.message), &tokens)
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -237,7 +237,7 @@ impl HistoryStore for MemoryHistoryStore {
         for (_, row) in tables.messages.values() {
             if row.hidden
                 || !agent_ids.contains(&row.agent_id)
-                || !text_matches(&row.message.content.text, &tokens)
+                || !text_matches(searchable_text(&row.message), &tokens)
             {
                 continue;
             }
@@ -284,8 +284,8 @@ impl HistoryStore for MemoryHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{
-        assert_history_store_conformance, assert_history_store_session_search_conformance,
-        history_message,
+        assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_session_search_conformance, history_message,
     };
     use anima_core::MessageRole;
 
@@ -294,6 +294,7 @@ mod tests {
         let store = MemoryHistoryStore::new();
         assert_history_store_conformance(&store).await;
         assert_history_store_session_search_conformance(&store).await;
+        assert_history_store_checkin_text_conformance(&store).await;
     }
 
     #[tokio::test]

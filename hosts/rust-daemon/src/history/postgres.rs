@@ -7,8 +7,8 @@ use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use super::{
-    message_ordinal, role_name, search_tokens, to_i64, HistoryError, HistoryMessage, HistoryStore,
-    MessagePageQuery,
+    message_ordinal, role_name, search_tokens, searchable_text, to_i64, HistoryError,
+    HistoryMessage, HistoryStore, MessagePageQuery,
 };
 use crate::runs::RunRecord;
 
@@ -88,7 +88,11 @@ impl HistoryStore for PostgresHistoryStore {
                 .bind(&row.agent_id)
                 .bind(&row.session_id)
                 .bind(role_name(row.message.role))
-                .bind(&row.message.content.text)
+                // Indexed (the generated `search` tsvector); a check-in
+                // prompt's scheduler suffix is stripped so it can't match
+                // every search (review fix, M2 fix round 1). `record` keeps
+                // the full message.
+                .bind(searchable_text(&row.message))
                 .bind(row.hidden)
                 .bind(to_i64(row.message.created_at_ms)?)
                 .bind(to_i64(message_ordinal(&row.message.id))?)
@@ -326,7 +330,8 @@ impl HistoryStore for PostgresHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{
-        assert_history_store_conformance, assert_history_store_session_search_conformance,
+        assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_session_search_conformance,
     };
 
     #[test]
@@ -343,6 +348,7 @@ mod tests {
         let store = PostgresHistoryStore::new(pool);
         assert_history_store_conformance(&store).await;
         assert_history_store_session_search_conformance(&store).await;
+        assert_history_store_checkin_text_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }

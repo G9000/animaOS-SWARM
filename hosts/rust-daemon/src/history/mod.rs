@@ -204,6 +204,19 @@ fn role_name(role: MessageRole) -> &'static str {
     }
 }
 
+/// The text a search indexes and matches for one message: a check-in
+/// prompt's text without the scheduler's suffix, otherwise the message's own
+/// text. The suffix (`schedules::wrap_checkin_prompt`) carries ordinary
+/// words ("scheduled", "reply", "exactly"...) that must not make a check-in
+/// prompt match every query (review fix, M2 fix round 1).
+pub(crate) fn searchable_text(message: &Message) -> &str {
+    if crate::sessions::is_checkin_message(message) {
+        crate::schedules::unwrap_checkin_prompt(&message.content.text)
+    } else {
+        &message.content.text
+    }
+}
+
 /// Lowercase query words, at most `MAX_SEARCH_TOKENS`.
 pub(crate) fn search_tokens(query: &str) -> Vec<String> {
     query

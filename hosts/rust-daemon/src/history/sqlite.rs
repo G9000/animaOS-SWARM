@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use super::{
-    message_ordinal, role_name, search_tokens, to_i64, HistoryError, HistoryMessage, HistoryStore,
-    MessagePageQuery,
+    message_ordinal, role_name, search_tokens, searchable_text, to_i64, HistoryError,
+    HistoryMessage, HistoryStore, MessagePageQuery,
 };
 use crate::runs::RunRecord;
 
@@ -267,7 +267,10 @@ impl HistoryStore for SqliteHistoryStore {
                     agent_id: row.agent_id.clone(),
                     session_id: row.session_id.clone(),
                     role: role_name(row.message.role),
-                    text: row.message.content.text.clone(),
+                    // Indexed for FTS; a check-in prompt's scheduler suffix
+                    // is stripped so it can't match every search (review
+                    // fix, M2 fix round 1). `record` keeps the full message.
+                    text: searchable_text(&row.message).to_string(),
                     hidden: row.hidden,
                     created_at_ms: to_i64(row.message.created_at_ms)?,
                     ordinal: to_i64(message_ordinal(&row.message.id))?,
@@ -595,8 +598,8 @@ impl HistoryStore for SqliteHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{
-        assert_history_store_conformance, assert_history_store_session_search_conformance,
-        history_message,
+        assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_session_search_conformance, history_message,
     };
     use anima_core::MessageRole;
 
@@ -628,6 +631,7 @@ mod tests {
             .expect("the store opens and creates its directory");
         assert_history_store_conformance(&store).await;
         assert_history_store_session_search_conformance(&store).await;
+        assert_history_store_checkin_text_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }
