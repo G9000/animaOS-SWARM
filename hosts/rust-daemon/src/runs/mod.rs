@@ -10,6 +10,11 @@ pub(crate) use ledger::{
     RUN_ABORTED, RUN_FAILED, TERMINAL_RUN_RETENTION_MS,
 };
 
+use anima_core::{
+    Content, DataValue, MessageRole, RuntimeRunDelta, RuntimeRunUndo, TaskResult, TaskStatus,
+    TokenUsage,
+};
+
 /// The run that started another run (spec §3.2 parent fields, §4.1 `parentRunId`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunLink {
@@ -17,11 +22,6 @@ pub(crate) struct RunLink {
     pub(crate) session_id: String,
     pub(crate) agent_id: String,
 }
-
-use anima_core::{
-    Content, DataValue, MessageRole, RuntimeRunDelta, RuntimeRunUndo, TaskResult, TaskStatus,
-    TokenUsage,
-};
 
 /// Exactly what one run added to its agent, so a commit can merge it and a
 /// rollback can remove it without touching other rooms' turns (spec §4.4).

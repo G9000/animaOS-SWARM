@@ -79,8 +79,9 @@ impl DaemonState {
             .expect("agent existence was checked above");
         change_set.undo = Some(runtime.apply_run_delta(&change_set.delta));
         // Spec §3.2: activity follows the commit, and the owner's own turn is read.
-        // A calendar write's own confirmation follow-up is `api`-sourced like an
-        // owner call, but it is not the owner's own turn (pre-flight audit ruling).
+        // Controller ruling (M2 pre-flight audit): a calendar write's own
+        // confirmation follow-up is `api`-sourced like an owner call, but it
+        // is not the owner's own turn.
         let owner_authored = self.runs.get(&change_set.run_id).is_some_and(|record| {
             matches!(record.source, RunSource::Api | RunSource::Web)
                 && !crate::sessions::is_calendar_write_followup(record.source_ref.as_deref())

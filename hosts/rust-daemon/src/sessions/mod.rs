@@ -400,17 +400,22 @@ pub(crate) struct TitleContext<'a> {
     pub(crate) peer_sender_name: Option<&'a str>,
 }
 
+/// `"{label} · {detail}"`, truncated to the title limit; `fallback` (usually
+/// just `label`) when there is no detail. Shared by every `system`-sourced
+/// title: Telegram, check-in, job, and the calendar write follow-up.
+pub(crate) fn labelled_title(label: &str, detail: Option<String>, fallback: &str) -> String {
+    detail
+        .map(|detail| truncate_chars(&format!("{label} · {detail}"), MAX_SESSION_TITLE_CHARS))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
 /// The initial title of a session by kind (spec §3.2 `titleSource`).
 pub(crate) fn session_title(
     kind: SessionKind,
     origin: SessionOrigin,
     context: &TitleContext<'_>,
 ) -> (String, TitleSource) {
-    let labelled = |label: &str, detail: Option<String>| {
-        detail
-            .map(|detail| truncate_chars(&format!("{label} · {detail}"), MAX_SESSION_TITLE_CHARS))
-            .unwrap_or_else(|| label.to_string())
-    };
+    let labelled = |label: &str, detail: Option<String>| labelled_title(label, detail, label);
     match kind {
         SessionKind::Chat => (
             context
@@ -487,12 +492,22 @@ pub(crate) fn is_owner_web_turn(message: &Message) -> bool {
     message.role == MessageRole::User && metadata_str(message, "source") == Some("telegramThread")
 }
 
+/// The `sourceRef` prefix the calendar connector's own write-confirmation
+/// follow-up uses (`connectors::gcalendar::notify_agent_write_applied`), so
+/// the producer and `is_calendar_write_followup` never drift apart.
+pub(crate) const CALENDAR_WRITE_SOURCE_REF_PREFIX: &str = "calendar-write:";
+
+/// The metadata key that follow-up's run content carries its calendar
+/// summary under, so the session title can use the structured value
+/// directly instead of parsing it back out of the confirmation prose.
+pub(crate) const CALENDAR_SUMMARY_METADATA_KEY: &str = "calendarSummary";
+
 /// The daemon's own confirmation follow-up after a calendar write is applied
-/// (`sourceRef = calendar-write:<id>`, spec §9.4). It runs with `source: api`
-/// like an owner call, but it is not the owner's own turn (pre-flight audit
-/// ruling): its session is titled `system`, not marked owner-read.
+/// (`sourceRef = calendar-write:<id>`). It runs with `source: api` like an
+/// owner call, but it is not the owner's own turn (Controller ruling, M2
+/// pre-flight audit): its session is titled `system`, not marked owner-read.
 pub(crate) fn is_calendar_write_followup(source_ref: Option<&str>) -> bool {
-    source_ref.is_some_and(|source_ref| source_ref.starts_with("calendar-write:"))
+    source_ref.is_some_and(|source_ref| source_ref.starts_with(CALENDAR_WRITE_SOURCE_REF_PREFIX))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -1034,6 +1034,16 @@ impl AgentRunCoordinator {
                 room_id: &room_id,
                 source,
                 source_ref: source_ref.as_deref(),
+                calendar_summary: content
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| {
+                        metadata.get(crate::sessions::CALENDAR_SUMMARY_METADATA_KEY)
+                    })
+                    .and_then(|value| match value {
+                        DataValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    }),
                 delegated_parent: match &room {
                     RunRoom::Delegated { parent_id } => Some(parent_id.as_str()),
                     _ => None,
