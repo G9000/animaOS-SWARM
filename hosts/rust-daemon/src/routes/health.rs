@@ -185,7 +185,11 @@ mod tests {
             ],
         );
         let long_ago = anima_core::primitives::now_millis() - HISTORY_READINESS_GRACE_MS - 1_000;
-        assert!(history.flush_once(&state, long_ago).await.is_err());
+        let transactions = tokio::sync::Mutex::new(());
+        assert!(history
+            .flush_once(&state, &transactions, long_ago)
+            .await
+            .is_err());
 
         let response = handle_readiness(&state, &config).await;
         assert_eq!(response.status, "not_ready");

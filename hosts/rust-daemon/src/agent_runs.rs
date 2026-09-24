@@ -1217,14 +1217,16 @@ impl AgentRunCoordinator {
             apply_run_rollback(&mut guard, &mut rollback)?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
-        drop(transaction);
-        in_flight.disarm();
-        // Only a durable commit reaches the history store (spec §13.1).
+        // Only a durable commit reaches the history store (spec §13.1). It is
+        // queued inside the transaction, so a deletion of its session, which
+        // takes the same transaction, is always queued after it.
         history_outbox.enqueue_committed(
             &agent_id,
             &crate::sessions::session_id_for_room(&room_id),
             &change_set.delta.messages,
         );
+        drop(transaction);
+        in_flight.disarm();
 
         persist_task_result_memory(
             &result,
@@ -4124,6 +4126,88 @@ mod tests {
             history.pending_count(),
             2,
             "a commit whose save failed never reaches the history store"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_during_a_failing_final_save_mirrors_the_rolled_back_run_without_its_messages()
+    {
+        use crate::history::{HistoryService, HistoryStore, MemoryHistoryStore, MessagePageQuery};
+
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        let store = Arc::new(MemoryHistoryStore::new());
+        let history = HistoryService::new(store.clone());
+        coordinator
+            .state
+            .write()
+            .await
+            .set_history(Arc::clone(&history));
+        let run = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-lost", "lost turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        release.add_permits(1);
+        // The commit is merged in memory and its final save is in flight.
+        gate.entered.acquire().await.unwrap().forget();
+
+        let flush = {
+            let history = Arc::clone(&history);
+            let state = Arc::clone(&coordinator.state);
+            let transactions = coordinator.control_plane_transactions();
+            tokio::spawn(async move {
+                history
+                    .flush_once(&state, &transactions, anima_core::primitives::now_millis())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !flush.is_finished(),
+            "a flush waits until the commit is saved or rolled back"
+        );
+        gate.release.add_permits(1);
+        run.await.unwrap().expect_err("the final save failed");
+        let report = flush.await.unwrap().expect("the flush succeeds");
+
+        let record = coordinator.state.read().await.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(record.status, RunStatus::Failed);
+        let stored = store
+            .get_run(&record.id)
+            .await
+            .unwrap()
+            .expect("the rolled-back run is mirrored");
+        assert_eq!(stored.status, RunStatus::Failed);
+        assert_eq!(report.messages, 0);
+        assert!(
+            store
+                .page_messages(&MessagePageQuery {
+                    agent_id: agent_id.clone(),
+                    session_id: "room-lost".into(),
+                    before: None,
+                    limit: 10,
+                    include_hidden: true,
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "no phantom rows for messages the rollback removed"
         );
     }
 }

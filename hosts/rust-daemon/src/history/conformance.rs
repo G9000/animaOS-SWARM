@@ -2,9 +2,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anima_core::{Content, Message, MessageRole};
 use async_trait::async_trait;
+use tokio::sync::Semaphore;
 
 use super::{HistoryError, HistoryMessage, HistoryStore, MemoryHistoryStore, MessagePageQuery};
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
@@ -332,6 +334,15 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
 pub(crate) struct FlakyHistoryStore {
     inner: MemoryHistoryStore,
     failing: AtomicBool,
+    existence_gate: Mutex<Option<StoreGate>>,
+}
+
+/// Holds one store call: the call adds a permit to `entered`, then waits for
+/// one on `release`.
+#[derive(Clone)]
+pub(crate) struct StoreGate {
+    pub(crate) entered: Arc<Semaphore>,
+    pub(crate) release: Arc<Semaphore>,
 }
 
 impl FlakyHistoryStore {
@@ -339,11 +350,26 @@ impl FlakyHistoryStore {
         Self {
             inner: MemoryHistoryStore::new(),
             failing: AtomicBool::new(false),
+            existence_gate: Mutex::new(None),
         }
     }
 
     pub(crate) fn set_failing(&self, failing: bool) {
         self.failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Holds the next `existing_message_ids` call (a reconcile's store round
+    /// trip) at a gate.
+    pub(crate) fn hold_next_existence_check(&self) -> StoreGate {
+        let gate = StoreGate {
+            entered: Arc::new(Semaphore::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        *self
+            .existence_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
+        gate
     }
 
     fn check(&self) -> Result<(), HistoryError> {
@@ -373,6 +399,19 @@ impl HistoryStore for FlakyHistoryStore {
 
     async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {
         self.check()?;
+        let gate = self
+            .existence_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            gate.release
+                .acquire()
+                .await
+                .expect("the store gate stays open")
+                .forget();
+        }
         self.inner.existing_message_ids(ids).await
     }
 

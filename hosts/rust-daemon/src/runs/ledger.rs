@@ -196,11 +196,13 @@ impl RunRecord {
     }
 
     /// Records a terminal status; a later call (for example a rolled-back
-    /// commit) replaces an earlier one.
+    /// commit) replaces an earlier one, so the history store's copy, if any,
+    /// is written again.
     pub(crate) fn finish(&mut self, status: RunStatus, error: Option<RunError>, now_ms: u64) {
         self.status = status;
         self.error = error;
         self.finished_at_ms = Some(now_ms.max(self.created_at_ms));
+        self.mirrored = false;
     }
 
     /// Notes a tool the run is starting: first-use order, no duplicates, and at
@@ -723,6 +725,27 @@ mod tests {
             [newer.id.as_str()]
         );
         assert!(!ledger.get(&running.id).unwrap().mirrored);
+    }
+
+    #[test]
+    fn finishing_a_mirrored_run_again_marks_it_for_rewriting() {
+        let mut ledger = RunLedger::default();
+        let run = mirrored("agent-a", 10);
+        ledger.insert(run.clone());
+
+        // A commit the store already holds is rolled back (spec §4.4 item 4).
+        ledger.get_mut(&run.id).unwrap().finish(
+            RunStatus::Failed,
+            Some(RunError::new(COMMIT_FAILED, "disk full")),
+            11,
+        );
+
+        let record = ledger.get(&run.id).unwrap();
+        assert_eq!(record.status, RunStatus::Failed);
+        assert!(
+            !record.mirrored,
+            "the store's copy is stale, so the run is written again"
+        );
     }
 
     #[test]

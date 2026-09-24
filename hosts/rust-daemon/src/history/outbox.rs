@@ -1,8 +1,10 @@
 //! History outbox (spec §13.1): committed messages and terminal runs reach the
 //! history store within about a second, in batches, idempotently by id, with
-//! retries and backoff. Records stay in the control plane until mirrored.
-//! After a restart or a queue overflow the hot transcript is reconciled
-//! against the store; five minutes of failures become a readiness issue.
+//! retries and backoff. Records stay in the control plane until mirrored, and
+//! only saved state is mirrored: the outbox reads the control plane under the
+//! control-plane transaction. After a restart or a queue overflow the hot
+//! transcript is reconciled against the store; five minutes of failures
+//! become a readiness issue.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +63,8 @@ struct OutboxState {
     /// The queue overflowed and dropped its message copies; the next flush
     /// reads the hot transcript for what is still unmirrored.
     needs_reconcile: bool,
+    /// Counts overflows, so a reconcile that overlapped one runs again.
+    overflows: u64,
     failing_since_ms: Option<u64>,
     consecutive_failures: u32,
     last_error: Option<String>,
@@ -195,6 +199,7 @@ impl HistoryService {
                 .items
                 .retain(|queued| matches!(queued.item, OutboxItem::DeleteSession { .. }));
             outbox.needs_reconcile = true;
+            outbox.overflows += 1;
         }
     }
 
@@ -261,15 +266,18 @@ impl HistoryService {
     }
 
     /// Reconciles when needed, writes queued items in order, then writes
-    /// terminal runs the ledger has not mirrored yet.
+    /// terminal runs the ledger has not mirrored yet. `transactions` is the
+    /// control-plane transaction: the control plane is read only while it is
+    /// held, so a commit whose save may still fail is never mirrored.
     pub(crate) async fn flush_once(
         &self,
         state: &SharedDaemonState,
+        transactions: &Mutex<()>,
         now_ms: u64,
     ) -> Result<FlushReport, HistoryError> {
         let _flushing = self.flushing.lock().await;
         let mut report = FlushReport::default();
-        let result = self.flush_locked(state, &mut report).await;
+        let result = self.flush_locked(state, transactions, &mut report).await;
         self.record_result(&result, now_ms);
         result.map(|()| report)
     }
@@ -277,14 +285,21 @@ impl HistoryService {
     async fn flush_locked(
         &self,
         state: &SharedDaemonState,
+        transactions: &Mutex<()>,
         report: &mut FlushReport,
     ) -> Result<(), HistoryError> {
         if !self.reconciled() || self.outbox().needs_reconcile {
-            report.reconciled = self.reconcile(state).await?;
+            report.reconciled = self.reconcile(state, transactions).await?;
         }
+        self.write_queue(report).await?;
+        self.write_runs(state, transactions, report).await
+    }
+
+    /// Writes queued items in order until the queue is empty.
+    async fn write_queue(&self, report: &mut FlushReport) -> Result<(), HistoryError> {
         loop {
             match self.next_batch() {
-                Batch::Empty => break,
+                Batch::Empty => return Ok(()),
                 Batch::Messages { through, rows } => {
                     self.store.upsert_messages(&rows).await?;
                     self.mark_mirrored(rows.iter().map(|row| row.message.id.as_str()));
@@ -302,23 +317,35 @@ impl HistoryService {
                 }
             }
         }
+    }
+
+    /// Writes terminal runs in batches, read under the control-plane
+    /// transaction; `mark_mirrored` skips any record that changed since.
+    async fn write_runs(
+        &self,
+        state: &SharedDaemonState,
+        transactions: &Mutex<()>,
+        report: &mut FlushReport,
+    ) -> Result<(), HistoryError> {
         loop {
-            let runs = state
-                .read()
-                .await
-                .runs
-                .unmirrored_terminal(HISTORY_RUN_BATCH);
+            let runs = {
+                let _transaction = transactions.lock().await;
+                state
+                    .read()
+                    .await
+                    .runs
+                    .unmirrored_terminal(HISTORY_RUN_BATCH)
+            };
             if runs.is_empty() {
-                break;
+                return Ok(());
             }
             self.store.upsert_runs(&runs).await?;
             let marked = state.write().await.runs.mark_mirrored(&runs);
             report.runs += marked;
             if marked == 0 || runs.len() < HISTORY_RUN_BATCH {
-                break;
+                return Ok(());
             }
         }
-        Ok(())
     }
 
     /// The queue prefix to write next: up to a batch of messages, or one deletion.
@@ -360,11 +387,38 @@ impl HistoryService {
     }
 
     /// Marks hot messages the store already holds as mirrored and queues the
-    /// ones it is missing (spec §13.1 restart rule, §13.3 step 3).
-    async fn reconcile(&self, state: &SharedDaemonState) -> Result<usize, HistoryError> {
-        let hot = hot_messages_by_session(&*state.read().await);
-        let queued = self
-            .outbox()
+    /// ones it is missing (spec §13.1 restart rule, §13.3 step 3). The hot
+    /// transcript is read under the control-plane transaction twice: for the
+    /// ids to check, and after the store round trip for the rows to queue.
+    /// The second read skips messages removed meanwhile (a deleted session)
+    /// and queues before it ends, so a deletion queued later stays behind the
+    /// rows it must remove.
+    ///
+    /// Memory: on a first boot over a large transcript almost every hot
+    /// message is missing, and each one is cloned into the queue at once,
+    /// before capacity is enforced, so the transcript is briefly held twice.
+    async fn reconcile(
+        &self,
+        state: &SharedDaemonState,
+        transactions: &Mutex<()>,
+    ) -> Result<usize, HistoryError> {
+        let (hot_ids, overflows) = {
+            let _transaction = transactions.lock().await;
+            let guard = state.read().await;
+            (hot_message_ids(&guard), self.outbox().overflows)
+        };
+        let mut stored = HashSet::new();
+        for chunk in hot_ids.chunks(HISTORY_FLUSH_BATCH) {
+            stored.extend(self.store.existing_message_ids(chunk).await?);
+        }
+        let checked = hot_ids.into_iter().collect::<HashSet<_>>();
+
+        let _transaction = transactions.lock().await;
+        let guard = state.read().await;
+        let (missing, held) = reconcile_rows(&guard, &checked, &stored);
+        self.mark_mirrored(held.iter().map(String::as_str));
+        let mut outbox = self.outbox();
+        let queued = outbox
             .items
             .iter()
             .filter_map(|queued| match &queued.item {
@@ -372,36 +426,20 @@ impl HistoryService {
                 OutboxItem::DeleteSession { .. } => None,
             })
             .collect::<HashSet<_>>();
-        let mut missing = Vec::new();
-        for (agent_id, session_id, messages) in hot {
-            let hidden = hidden_message_ids(messages.iter());
-            for chunk in messages.chunks(HISTORY_FLUSH_BATCH) {
-                let ids = chunk
-                    .iter()
-                    .map(|message| message.id.clone())
-                    .collect::<Vec<_>>();
-                let existing = self.store.existing_message_ids(&ids).await?;
-                self.mark_mirrored(existing.iter().map(String::as_str));
-                for message in chunk.iter().filter(|message| {
-                    !existing.contains(&message.id) && !queued.contains(&message.id)
-                }) {
-                    missing.push(HistoryMessage {
-                        agent_id: agent_id.clone(),
-                        session_id: session_id.clone(),
-                        hidden: hidden.contains(&message.id),
-                        message: message.clone(),
-                    });
-                }
+        let mut count = 0;
+        for row in missing {
+            if !queued.contains(&row.message.id) {
+                outbox.push(OutboxItem::Message(row));
+                count += 1;
             }
         }
-        let count = missing.len();
-        {
-            let mut outbox = self.outbox();
-            for row in missing {
-                outbox.push(OutboxItem::Message(row));
-            }
+        // An overflow during the store round trip dropped messages the first
+        // read never saw; the next flush reconciles again.
+        if outbox.overflows == overflows {
             outbox.needs_reconcile = false;
         }
+        drop(outbox);
+        drop(guard);
         self.reconciled.store(true, Ordering::Release);
         Ok(count)
     }
@@ -428,22 +466,53 @@ impl HistoryService {
     }
 }
 
-/// Every hot message, grouped by (agent, session) in transcript order.
-fn hot_messages_by_session(state: &DaemonState) -> Vec<(String, String, Vec<Message>)> {
-    let mut sessions = Vec::new();
+/// The id of every hot message.
+fn hot_message_ids(state: &DaemonState) -> Vec<String> {
+    state
+        .agents
+        .values()
+        .flat_map(|runtime| runtime.messages().iter().map(|message| message.id.clone()))
+        .collect()
+}
+
+/// Rows for the `checked` hot messages the store is missing, and the ids of
+/// those it holds; messages no longer hot are skipped.
+fn reconcile_rows(
+    state: &DaemonState,
+    checked: &HashSet<String>,
+    stored: &HashSet<String>,
+) -> (Vec<HistoryMessage>, Vec<String>) {
+    let mut missing = Vec::new();
+    let mut held = Vec::new();
     for (agent_id, runtime) in &state.agents {
-        let mut rooms: HashMap<&str, Vec<Message>> = HashMap::new();
+        let mut rooms: HashMap<&str, Vec<&Message>> = HashMap::new();
         for message in runtime.messages() {
             rooms
                 .entry(message.room_id.as_str())
                 .or_default()
-                .push(message.clone());
+                .push(message);
         }
         for (room_id, messages) in rooms {
-            sessions.push((agent_id.clone(), session_id_for_room(room_id), messages));
+            let session_id = session_id_for_room(room_id);
+            let hidden = hidden_message_ids(messages.iter().copied());
+            for message in messages {
+                if !checked.contains(&message.id) {
+                    continue;
+                }
+                if stored.contains(&message.id) {
+                    held.push(message.id.clone());
+                } else {
+                    missing.push(HistoryMessage {
+                        agent_id: agent_id.clone(),
+                        session_id: session_id.clone(),
+                        hidden: hidden.contains(&message.id),
+                        message: message.clone(),
+                    });
+                }
+            }
         }
     }
-    sessions
+    (missing, held)
 }
 
 struct WorkerHandle {
@@ -455,8 +524,8 @@ struct WorkerHandle {
 #[derive(Clone)]
 pub(crate) struct HistoryWorker {
     state: SharedDaemonState,
-    /// The control-plane transaction; hot-tail pruning (Task 13) takes it.
-    #[allow(dead_code)]
+    /// The control-plane transaction, under which flushes read the control
+    /// plane; hot-tail pruning (Task 13) takes it too.
     transactions: Arc<Mutex<()>>,
     running: Arc<StdMutex<Option<WorkerHandle>>>,
 }
@@ -478,6 +547,7 @@ impl HistoryWorker {
         }
         let (cancel, mut cancelled) = watch::channel(false);
         let state = Arc::clone(&self.state);
+        let transactions = Arc::clone(&self.transactions);
         let join = tokio::spawn(async move {
             loop {
                 let history = state.read().await.history.clone();
@@ -489,7 +559,9 @@ impl HistoryWorker {
                     }
                     () = history.wait_for_work() => {}
                 }
-                let _ = history.flush_once(&state, now_millis()).await;
+                let _ = history
+                    .flush_once(&state, &transactions, now_millis())
+                    .await;
             }
         });
         *running = Some(WorkerHandle { cancel, join });
@@ -503,7 +575,10 @@ impl HistoryWorker {
             let _ = handle.join.await;
         }
         let history = self.state.read().await.history.clone();
-        if let Err(error) = history.flush_once(&self.state, now_millis()).await {
+        if let Err(error) = history
+            .flush_once(&self.state, &self.transactions, now_millis())
+            .await
+        {
             warn!(error = %error, "final history flush failed; records stay in the control plane");
         }
     }
@@ -576,6 +651,7 @@ mod tests {
     async fn committed_turns_and_terminal_runs_reach_the_store_and_runs_are_marked_mirrored() {
         let store = Arc::new(MemoryHistoryStore::new());
         let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
         coordinator
             .run(request(&agent_id, "chat:one", "hello"))
             .await
@@ -587,7 +663,10 @@ mod tests {
             "the committed turn waits in the outbox"
         );
 
-        let report = history.flush_once(&state, now_millis()).await.unwrap();
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
         assert_eq!(
             report,
             FlushReport {
@@ -615,7 +694,10 @@ mod tests {
         stored.mirrored = true;
         assert_eq!(stored, run);
         assert_eq!(
-            history.flush_once(&state, now_millis()).await.unwrap(),
+            history
+                .flush_once(&state, &transactions, now_millis())
+                .await
+                .unwrap(),
             FlushReport::default(),
             "nothing is written twice"
         );
@@ -625,6 +707,7 @@ mod tests {
     async fn a_failing_store_keeps_records_until_it_recovers_and_reports_after_five_minutes() {
         let store = Arc::new(FlakyHistoryStore::new());
         let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
         coordinator
             .run(request(&agent_id, "chat:one", "hello"))
             .await
@@ -633,14 +716,20 @@ mod tests {
         store.set_failing(true);
         let started = 1_000_000;
 
-        assert!(history.flush_once(&state, started).await.is_err());
+        assert!(history
+            .flush_once(&state, &transactions, started)
+            .await
+            .is_err());
         assert_eq!(history.pending_count(), 2);
         assert!(!state.read().await.runs.for_agent(&agent_id)[0].mirrored);
         assert_eq!(
             history.readiness_issue(started + HISTORY_READINESS_GRACE_MS - 1),
             None
         );
-        assert!(history.flush_once(&state, started + 60_000).await.is_err());
+        assert!(history
+            .flush_once(&state, &transactions, started + 60_000)
+            .await
+            .is_err());
         assert_eq!(history.retry_delay(), HISTORY_FLUSH_INTERVAL * 2);
         let issue = history
             .readiness_issue(started + HISTORY_READINESS_GRACE_MS)
@@ -652,7 +741,11 @@ mod tests {
 
         store.set_failing(false);
         let report = history
-            .flush_once(&state, started + HISTORY_READINESS_GRACE_MS + 1)
+            .flush_once(
+                &state,
+                &transactions,
+                started + HISTORY_READINESS_GRACE_MS + 1,
+            )
             .await
             .unwrap();
         assert_eq!((report.messages, report.runs), (2, 1));
@@ -668,6 +761,7 @@ mod tests {
     async fn a_restart_mirrors_hot_messages_the_store_is_missing() {
         let store = Arc::new(MemoryHistoryStore::new());
         let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
         coordinator
             .run(request(&agent_id, "chat:one", "before the crash"))
             .await
@@ -677,7 +771,10 @@ mod tests {
         state.write().await.set_history(Arc::clone(&restarted));
         assert!(!restarted.reconciled());
 
-        let report = restarted.flush_once(&state, now_millis()).await.unwrap();
+        let report = restarted
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
         assert_eq!((report.reconciled, report.messages, report.runs), (2, 2, 1));
         assert!(restarted.reconciled());
         assert_eq!(
@@ -695,12 +792,16 @@ mod tests {
         let store = Arc::new(MemoryHistoryStore::new());
         let (state, coordinator, agent_id) =
             state_with(HistoryService::with_capacity(store.clone(), 3)).await;
+        let transactions = coordinator.control_plane_transactions();
         coordinator
             .run(request(&agent_id, "chat:one", "first"))
             .await
             .unwrap();
         let history = state.read().await.history.clone();
-        history.flush_once(&state, now_millis()).await.unwrap();
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
 
         coordinator
             .run(request(&agent_id, "chat:one", "second"))
@@ -716,7 +817,10 @@ mod tests {
             "four queued messages overflowed three slots"
         );
 
-        let report = history.flush_once(&state, now_millis()).await.unwrap();
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
         assert_eq!((report.reconciled, report.messages), (4, 4));
         assert_eq!(
             store
@@ -735,6 +839,7 @@ mod tests {
         let mut daemon = DaemonState::new();
         daemon.set_history(Arc::clone(&history));
         let state = Arc::new(RwLock::new(daemon));
+        let transactions = Mutex::new(());
         let turn = [
             history_message(
                 "msg-1-1",
@@ -771,7 +876,10 @@ mod tests {
             .message],
         );
 
-        let report = history.flush_once(&state, now_millis()).await.unwrap();
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
 
         assert_eq!((report.messages, report.deletions), (3, 1));
         assert!(store
@@ -797,6 +905,7 @@ mod tests {
         let mut daemon = DaemonState::new();
         daemon.set_history(Arc::clone(&history));
         let state = Arc::new(RwLock::new(daemon));
+        let transactions = Mutex::new(());
         let mut prompt = history_message(
             "msg-1-1",
             "agent-1",
@@ -820,7 +929,10 @@ mod tests {
         )
         .message;
         history.enqueue_committed("agent-1", "schedule:s1", &[prompt, reply]);
-        history.flush_once(&state, now_millis()).await.unwrap();
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
 
         let rows = store
             .page_messages(&page("agent-1", "schedule:s1"))
@@ -828,5 +940,85 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.hidden));
+    }
+
+    #[tokio::test]
+    async fn a_session_deleted_while_a_reconcile_awaits_the_store_stays_deleted() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        coordinator
+            .run(request(&agent_id, "chat:doomed", "delete me"))
+            .await
+            .unwrap();
+        coordinator
+            .run(request(&agent_id, "chat:kept", "keep me"))
+            .await
+            .unwrap();
+        // A restart before any flush: the reconcile finds every message missing.
+        let restarted = HistoryService::new(store.clone());
+        state.write().await.set_history(Arc::clone(&restarted));
+        let gate = store.hold_next_existence_check();
+        let flush = {
+            let restarted = Arc::clone(&restarted);
+            let state = Arc::clone(&state);
+            let transactions = Arc::clone(&transactions);
+            tokio::spawn(async move {
+                restarted
+                    .flush_once(&state, &transactions, now_millis())
+                    .await
+            })
+        };
+        gate.entered.acquire().await.unwrap().forget();
+
+        // The session delete (Task 12): drop the hot messages and finished
+        // runs, save, then queue the history deletion, all in one transaction.
+        {
+            let _transaction = coordinator.control_plane_transaction().await;
+            let persist = {
+                let mut guard = state.write().await;
+                guard
+                    .agents
+                    .get_mut(&agent_id)
+                    .unwrap()
+                    .retain_messages(|message| message.room_id != "chat:doomed");
+                let doomed_runs = guard
+                    .runs
+                    .for_agent(&agent_id)
+                    .into_iter()
+                    .filter(|run| run.session_id == "chat:doomed")
+                    .map(|run| run.id.clone())
+                    .collect::<Vec<_>>();
+                for run_id in doomed_runs {
+                    guard.runs.remove(&run_id);
+                }
+                guard.control_plane_persist_request()
+            };
+            persist.save().await.unwrap();
+            restarted.enqueue_session_deletion(&agent_id, "chat:doomed");
+        }
+        gate.release.add_permits(1);
+        flush.await.unwrap().unwrap();
+        restarted
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .page_messages(&page(&agent_id, "chat:doomed"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the reconcile must not bring the deleted session back"
+        );
+        assert_eq!(
+            store
+                .page_messages(&page(&agent_id, "chat:kept"))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }
