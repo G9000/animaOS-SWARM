@@ -4129,9 +4129,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_flush_during_a_failing_final_save_mirrors_the_rolled_back_run_without_its_messages()
-    {
+    /// Flushes while a run's final save is in flight and then fails: the
+    /// flush waits for the rollback, then mirrors the run as failed and none
+    /// of its messages. `reconciled` flushes once first, so the flush under
+    /// test skips the reconcile and reaches the runs read directly.
+    async fn assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(reconciled: bool) {
         use crate::history::{HistoryService, HistoryStore, MemoryHistoryStore, MessagePageQuery};
 
         let entered = Arc::new(Semaphore::new(0));
@@ -4152,6 +4154,18 @@ mod tests {
             .write()
             .await
             .set_history(Arc::clone(&history));
+        let transactions = coordinator.control_plane_transactions();
+        if reconciled {
+            history
+                .flush_once(
+                    &coordinator.state,
+                    &transactions,
+                    anima_core::primitives::now_millis(),
+                )
+                .await
+                .unwrap();
+            assert!(history.reconciled());
+        }
         let run = {
             let coordinator = coordinator.clone();
             let request = room_request(&agent_id, "room-lost", "lost turn");
@@ -4170,7 +4184,7 @@ mod tests {
         let flush = {
             let history = Arc::clone(&history);
             let state = Arc::clone(&coordinator.state);
-            let transactions = coordinator.control_plane_transactions();
+            let transactions = Arc::clone(&transactions);
             tokio::spawn(async move {
                 history
                     .flush_once(&state, &transactions, anima_core::primitives::now_millis())
@@ -4209,5 +4223,16 @@ mod tests {
                 .is_empty(),
             "no phantom rows for messages the rollback removed"
         );
+    }
+
+    #[tokio::test]
+    async fn a_flush_during_a_failing_final_save_mirrors_the_rolled_back_run_without_its_messages()
+    {
+        assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_first_flush_during_a_failing_final_save_reconciles_only_saved_messages() {
+        assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(false).await;
     }
 }
