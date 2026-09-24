@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
 import type { DaemonWorkspaceState } from '../lib/daemon-api';
 import type { HashPage, HashRoute, Navigate } from '../lib/hash-route';
@@ -135,6 +135,81 @@ function DestinationNavigation({
         SYSTEM_DESTINATIONS.map((item) => destination(item))
       )}
     </nav>
+  );
+}
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/** The sessions list on mobile: a modal drawer that takes focus, keeps Tab
+ *  inside, closes on Escape, and returns focus to its opener. */
+function SessionDrawer({
+  children,
+  onClose,
+  onNewChat,
+}: {
+  children: ReactNode;
+  onClose: () => void;
+  onNewChat: () => void;
+}) {
+  const panel = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const opener =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    panel.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    return () => {
+      if (opener?.isConnected) opener.focus();
+    };
+  }, []);
+  return (
+    <div
+      className="session-drawer"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Sessions"
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          onClose();
+          return;
+        }
+        if (event.key !== 'Tab') return;
+        const focusable = Array.from(
+          panel.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [],
+        );
+        if (focusable.length === 0) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      }}
+    >
+      <div ref={panel} className="session-drawer-panel studio-sidebar">
+        <div className="flex items-center justify-between gap-2 p-3">
+          <button type="button" className={ghostBtnCls} onClick={onNewChat}>
+            New chat
+          </button>
+          <button
+            type="button"
+            className="studio-tool-button"
+            aria-label="Close sessions"
+            onClick={onClose}
+          >
+            ×
+          </button>
+        </div>
+        {children}
+      </div>
+      <div className="session-drawer-backdrop" aria-hidden onClick={onClose} />
+    </div>
   );
 }
 
@@ -422,41 +497,15 @@ export function WorkspaceShell({
               ) : null}
             </div>
             {drawerOpen && !desktopNavigation && sidebar !== null && (
-              <div
-                className="session-drawer"
-                role="dialog"
-                aria-modal="true"
-                aria-label="Sessions"
+              <SessionDrawer
+                onClose={() => setDrawerOpen(false)}
+                onNewChat={() => {
+                  setDrawerOpen(false);
+                  newChat();
+                }}
               >
-                <div className="session-drawer-panel studio-sidebar">
-                  <div className="flex items-center justify-between gap-2 p-3">
-                    <button
-                      type="button"
-                      className={ghostBtnCls}
-                      onClick={() => {
-                        setDrawerOpen(false);
-                        newChat();
-                      }}
-                    >
-                      New chat
-                    </button>
-                    <button
-                      type="button"
-                      className="studio-tool-button"
-                      aria-label="Close sessions"
-                      onClick={() => setDrawerOpen(false)}
-                    >
-                      ×
-                    </button>
-                  </div>
-                  {sidebar}
-                </div>
-                <div
-                  className="session-drawer-backdrop"
-                  aria-hidden
-                  onClick={() => setDrawerOpen(false)}
-                />
-              </div>
+                {sidebar}
+              </SessionDrawer>
             )}
           </main>
         </div>

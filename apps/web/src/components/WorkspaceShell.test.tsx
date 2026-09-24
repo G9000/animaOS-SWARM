@@ -301,6 +301,35 @@ describe('WorkspaceShell', () => {
     expect(screen.queryByRole('dialog', { name: 'Sessions' })).not.toBeInTheDocument();
   });
 
+  it('moves focus into the sessions drawer, keeps it there, and closes on Escape', async () => {
+    mobile();
+    const user = userEvent.setup();
+    render(<Shell sidebar={<input aria-label="Search sessions" />} />);
+    const opener = screen.getByRole('button', { name: 'Open sessions' });
+    await user.click(opener);
+    const drawer = screen.getByRole('dialog', { name: 'Sessions' });
+    const newChat = within(drawer).getByRole('button', { name: 'New chat' });
+    const search = within(drawer).getByRole('textbox', {
+      name: 'Search sessions',
+    });
+    expect(newChat).toHaveFocus();
+    await user.tab();
+    expect(
+      within(drawer).getByRole('button', { name: 'Close sessions' }),
+    ).toHaveFocus();
+    await user.tab();
+    expect(search).toHaveFocus();
+    await user.tab();
+    expect(newChat).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(search).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(
+      screen.queryByRole('dialog', { name: 'Sessions' }),
+    ).not.toBeInTheDocument();
+    expect(opener).toHaveFocus();
+  });
+
   it('shows working helpers as status without introducing another persona', () => {
     const main = agent('agent-main', 'Nova', 1);
     render(
