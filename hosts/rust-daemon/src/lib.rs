@@ -4,6 +4,7 @@ mod components;
 mod connectors;
 mod control_plane_store;
 mod events;
+mod history;
 mod jobs;
 mod memory_embeddings;
 mod memory_store;
