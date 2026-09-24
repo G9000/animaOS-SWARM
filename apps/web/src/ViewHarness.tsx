@@ -240,6 +240,8 @@ export function ViewHarness() {
   const activeSession =
     listedSession ??
     (fetchedSession && fetchedSession.id === routeSessionId ? fetchedSession : null);
+  // The composer waits for the record: a send needs the session's room.
+  const sessionLoading = routeSessionId !== null && activeSession === null;
   const [messagesRefresh, setMessagesRefresh] = useState(0);
   const history = useSessionMessages(
     routeSessionId ? (activeSession?.agentId ?? agentId) : null,
@@ -822,18 +824,15 @@ export function ViewHarness() {
       void startChat(agent.id, text);
       return;
     }
+    // Until its record loads, the session's room and kind are unknown.
+    if (!activeSession) return;
     const key = chatKey(agent.id, sessionConversation(routeSessionId));
-    if (activeSession?.kind === 'telegram') {
+    if (activeSession.kind === 'telegram') {
       if (activeConnector)
         void replyOnTelegram(agent.id, activeConnector.id, text, key);
       return;
     }
-    void runInSession(
-      activeSession?.agentId ?? agent.id,
-      activeSession ?? { id: routeSessionId, roomId: routeSessionId },
-      text,
-      key,
-    );
+    void runInSession(activeSession.agentId, activeSession, text, key);
   };
 
   const newChat = () => navigate({ kind: 'home' });
@@ -966,7 +965,10 @@ export function ViewHarness() {
         draft,
         setDraft,
         sending,
-        disabled: resetting || (activeSession?.activeRuns ?? 0) > 0,
+        disabled:
+          resetting ||
+          sessionLoading ||
+          (activeSession?.activeRuns ?? 0) > 0,
         offline: connection === 'offline',
         onSend: send,
         error: workspaceError,

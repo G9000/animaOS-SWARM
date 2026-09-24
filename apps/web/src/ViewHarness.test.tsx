@@ -1737,6 +1737,46 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
   expect(await screen.findByText('Saturday works')).toBeVisible();
 });
 
+it('keeps the composer disabled until the open session record loads', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  // An archived legacy session is not listed, so its record is read on its own.
+  const record = deferred<Session>();
+  vi.mocked(daemon.getSession).mockReturnValue(record.promise);
+  const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+    agent: snapshot('agent-main', 'Nova', 1),
+    result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
+  });
+  window.history.replaceState(null, '', '/#/s/legacy-room%3Aabc');
+  render(<ViewHarness />);
+
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  expect(input).toBeDisabled();
+  await act(async () => {
+    record.resolve(
+      sessionFixture('legacy-room:abc', {
+        roomId: 'direct:agent-main',
+        title: 'Earlier chat',
+        archived: true,
+      }),
+    );
+  });
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, 'Hello again');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(runAgent).toHaveBeenCalledWith(
+    'agent-main',
+    'Hello again',
+    expect.objectContaining({ clientRequestId: expect.any(String) }),
+    'direct:agent-main',
+  );
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
