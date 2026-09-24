@@ -8,7 +8,10 @@ use sqlx::PgPool;
 use tracing::{info, warn};
 
 use super::{DaemonConfig, PersistenceMode, SharedDaemonState};
-use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+use crate::control_plane_store::{
+    load_control_plane_snapshot, write_pre_upgrade_backup, ControlPlaneStoreConfig,
+    CONTROL_PLANE_STORE_VERSION,
+};
 use crate::history::{
     HistoryService, HistoryStore, MemoryHistoryStore, PostgresHistoryStore, SqliteHistoryStore,
 };
@@ -101,6 +104,19 @@ async fn configure_control_plane_store(
     }
 
     let snapshot = load_control_plane_snapshot(&config).await?;
+    if let Some(loaded) = &snapshot {
+        if loaded.version < CONTROL_PLANE_STORE_VERSION {
+            // Spec §13.3 step 1: back up the untouched snapshot before anything
+            // is written in the new version.
+            let backup = write_pre_upgrade_backup(&config, loaded.version).await?;
+            info!(
+                backup = %backup,
+                from_version = loaded.version,
+                to_version = CONTROL_PLANE_STORE_VERSION,
+                "saved the pre-upgrade control-plane backup"
+            );
+        }
+    }
     let (restored_agents, restored_swarms) = if let Some(snapshot) = snapshot {
         state
             .write()
@@ -528,6 +544,128 @@ mod tests {
         assert!(
             saved.pending_history_deletions.is_empty(),
             "the entry is cleared in a normal save"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn upgrader() -> anima_core::AgentConfig {
+        anima_core::AgentConfig {
+            name: "upgrader".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: None,
+            plugins: None,
+            settings: None,
+        }
+    }
+
+    /// A snapshot file as an older daemon wrote it: no sessions, and the
+    /// given version field (or none).
+    fn older_snapshot_file(version: Option<u32>) -> String {
+        let mut source = crate::state::DaemonState::new();
+        source.create_agent(upgrader()).unwrap();
+        let mut value = serde_json::to_value(source.control_plane_snapshot()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("sessions");
+        match version {
+            Some(version) => {
+                object.insert("version".into(), version.into());
+            }
+            None => {
+                object.remove("version");
+            }
+        }
+        serde_json::to_string_pretty(&value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn upgrading_any_older_snapshot_writes_the_backup_before_saving_version_five() {
+        for version in [None, Some(1), Some(2), Some(3), Some(4)] {
+            let dir = temp_dir("upgrade");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("control-plane.json");
+            let original = older_snapshot_file(version);
+            std::fs::write(&path, &original).unwrap();
+            let state = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+
+            configure_control_plane_store(
+                &state,
+                Some(ControlPlaneStoreConfig::Json(path.clone())),
+            )
+            .await
+            .unwrap();
+
+            let backup = crate::control_plane_store::pre_sessions_backup_path(&path);
+            assert_eq!(
+                std::fs::read_to_string(&backup).unwrap(),
+                original,
+                "{version:?}: the backup is the untouched original"
+            );
+            let saved: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(saved["version"], 5, "{version:?}");
+            assert_eq!(state.read().await.agent_count(), 1);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_current_snapshot_loads_without_a_backup() {
+        let dir = temp_dir("current");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-plane.json");
+        let config = ControlPlaneStoreConfig::Json(path.clone());
+        let fresh = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_store(&fresh, Some(config.clone()))
+            .await
+            .unwrap();
+        assert!(path.exists(), "a fresh start saves a version-5 snapshot");
+
+        let restarted = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_store(&restarted, Some(config))
+            .await
+            .unwrap();
+
+        assert!(!crate::control_plane_store::pre_sessions_backup_path(&path).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // Controller ruling (pre-flight audit): the backup is written only when the
+    // loaded version is below CONTROL_PLANE_STORE_VERSION, so a later version
+    // bump can never clobber it. This simulates a backup already on disk from a
+    // prior upgrade and proves loading a current (v5) snapshot never rewrites it.
+    #[tokio::test]
+    async fn loading_a_current_snapshot_leaves_an_existing_pre_upgrade_backup_untouched() {
+        let dir = temp_dir("current-with-backup");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-plane.json");
+        let config = ControlPlaneStoreConfig::Json(path.clone());
+        let fresh = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_store(&fresh, Some(config.clone()))
+            .await
+            .unwrap();
+        assert!(path.exists(), "a fresh start saves a version-5 snapshot");
+
+        let backup = crate::control_plane_store::pre_sessions_backup_path(&path);
+        let preexisting_backup = "{\"version\":3,\"agents\":[],\"swarms\":[]}";
+        std::fs::write(&backup, preexisting_backup).unwrap();
+
+        let restarted = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_store(&restarted, Some(config))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            preexisting_backup,
+            "loading an already-current snapshot must not rewrite an existing backup"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

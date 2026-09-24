@@ -1163,7 +1163,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 4);
+        assert_eq!(snapshot.version, 5);
         assert_eq!(snapshot.runs.len(), 3, "runs of deleted agents are not saved");
         assert!(snapshot.runs.iter().all(|run| run.agent_id == agent_id));
         let snapshot: ControlPlaneSnapshot =
