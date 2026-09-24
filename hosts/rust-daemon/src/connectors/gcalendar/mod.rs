@@ -960,6 +960,7 @@ impl CalendarManager {
                     // Daemon-internal follow-ups are recorded like API runs.
                     source: RunSource::Api,
                     source_ref: Some(reference),
+                    parent: None,
                 })
                 .await;
         });

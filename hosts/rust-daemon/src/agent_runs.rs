@@ -293,6 +293,9 @@ pub(crate) struct AgentRunRequest {
     /// Ledger source and reference (spec §4.1).
     pub(crate) source: RunSource,
     pub(crate) source_ref: Option<String>,
+    /// The run that started this one (a delegation, helper, or peer request);
+    /// recorded on the ledger and on the helper session (spec §3.2, §4.1).
+    pub(crate) parent: Option<crate::runs::RunLink>,
 }
 
 #[derive(Clone)]
@@ -347,6 +350,7 @@ impl AgentRunCoordinator {
         target: String,
         message: String,
         route: AgentCommunicationRoute,
+        parent: Option<crate::runs::RunLink>,
     ) -> futures::future::BoxFuture<'static, Result<AgentRunEnvelope, ApiError>> {
         let coordinator = self.clone();
         Box::pin(async move {
@@ -380,6 +384,7 @@ impl AgentRunCoordinator {
                     idempotency_key: None,
                     source: RunSource::Peer,
                     source_ref: None,
+                    parent,
                 })
                 .await
         })
@@ -421,6 +426,7 @@ impl AgentRunCoordinator {
         caller: &AgentState,
         target: String,
         task: String,
+        parent: Option<crate::runs::RunLink>,
     ) -> futures::future::BoxFuture<'static, Result<String, String>> {
         let coordinator = self.clone();
         let caller = caller.clone();
@@ -447,6 +453,7 @@ impl AgentRunCoordinator {
                 idempotency_key: None,
                 source: RunSource::Delegation,
                 source_ref: None,
+                parent,
             }).await.map_err(|_| "Specialist unavailable, busy, or outside the manager's tool permissions".to_string())?;
             Ok(serde_json::json!({"agentId": target, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
         })
@@ -457,6 +464,7 @@ impl AgentRunCoordinator {
         parent_id: String,
         name: String,
         task: String,
+        parent_run: Option<crate::runs::RunLink>,
     ) -> futures::future::BoxFuture<'static, Result<String, String>> {
         let coordinator = self.clone();
         Box::pin(async move {
@@ -521,6 +529,7 @@ impl AgentRunCoordinator {
                     idempotency_key: None,
                     source: RunSource::Delegation,
                     source_ref: None,
+                    parent: parent_run,
                 };
                 let room_id = request.room.resolve(&request.agent_id);
                 // A fresh delegated room is never contended. The permit and slot were
@@ -981,6 +990,7 @@ impl AgentRunCoordinator {
             idempotency_key,
             source,
             source_ref,
+            parent,
         } = request;
         if let Some(idempotency_key) = idempotency_key {
             content
@@ -993,7 +1003,16 @@ impl AgentRunCoordinator {
         // Phase A: record the run as running and publish that durable marker
         // before any model work (the run-start save that already existed).
         let transaction = self.control_plane_transaction().await;
-        let (mut runtime, tool_context, base, run_id, mut in_flight, running_persist_request) = {
+        let (
+            mut runtime,
+            tool_context,
+            base,
+            run_id,
+            session_id,
+            session_created,
+            mut in_flight,
+            running_persist_request,
+        ) = {
             let mut guard = self.state.write().await;
             validate_run_request(&guard, &agent_id, &room)?;
             if let Some(key) = retry_key.as_deref() {
@@ -1006,19 +1025,42 @@ impl AgentRunCoordinator {
             else {
                 return Err(ApiError::not_found());
             };
+            // Spec §3: every room is a session; a new record is saved with the
+            // run start below, so no extra save is added.
+            let now_ms = anima_core::primitives::now_millis();
+            let session_id = crate::sessions::session_id_for_room(&room_id);
+            let session_created = guard.ensure_run_session(crate::state::RunSessionRequest {
+                agent_id: &agent_id,
+                room_id: &room_id,
+                source,
+                source_ref: source_ref.as_deref(),
+                delegated_parent: match &room {
+                    RunRoom::Delegated { parent_id } => Some(parent_id.as_str()),
+                    _ => None,
+                },
+                peer_sender: match &room {
+                    RunRoom::Peer { route } => {
+                        route.participants().iter().rev().nth(1).map(String::as_str)
+                    }
+                    _ => None,
+                },
+                parent: parent.as_ref(),
+                first_text: &content.text,
+                now_ms,
+            });
             let record = RunRecord::running(
                 RunStart {
                     agent_id: agent_id.clone(),
-                    session_id: room_id.clone(),
+                    session_id: session_id.clone(),
                     source,
                     source_ref,
                     idempotency_key: retry_key.clone(),
                     text: content.text.clone(),
                     model: runtime.config().model.clone(),
                     provider: runtime.config().provider.clone(),
-                    parent_run_id: None,
+                    parent_run_id: parent.as_ref().map(|link| link.run_id.clone()),
                 },
-                anima_core::primitives::now_millis(),
+                now_ms,
             );
             let run_id = record.id.clone();
             guard.runs.insert(record);
@@ -1030,12 +1072,19 @@ impl AgentRunCoordinator {
                 tool_context,
                 base,
                 run_id,
+                session_id,
+                session_created,
                 in_flight,
                 guard.control_plane_persist_request(),
             )
         };
         if let Err(error) = running_persist_request.save().await {
-            self.state.write().await.runs.remove(&run_id);
+            let mut guard = self.state.write().await;
+            guard.runs.remove(&run_id);
+            if session_created {
+                guard.sessions.remove(&agent_id, &session_id);
+            }
+            drop(guard);
             in_flight.disarm();
             return Err(ApiError::service_unavailable(error.to_string()));
         }
@@ -1115,7 +1164,12 @@ impl AgentRunCoordinator {
             .with_team(self.clone(), can_delegate)
             .with_delegated_parent(delegated_parent)
             .with_peer_route(peer_route, peer_sources)
-            .with_todo_baseline(todo_baseline);
+            .with_todo_baseline(todo_baseline)
+            .with_run_link(Some(crate::runs::RunLink {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
+            }));
         let history = runtime.messages().to_vec();
         let helper_timeout = helper_parent(&runtime.state()).is_some().then(|| {
             original_config
@@ -1220,11 +1274,7 @@ impl AgentRunCoordinator {
         // Only a durable commit reaches the history store (spec §13.1). It is
         // queued inside the transaction, so a deletion of its session, which
         // takes the same transaction, is always queued after it.
-        history_outbox.enqueue_committed(
-            &agent_id,
-            &crate::sessions::session_id_for_room(&room_id),
-            &change_set.delta.messages,
-        );
+        history_outbox.enqueue_committed(&agent_id, &session_id, &change_set.delta.messages);
         drop(transaction);
         in_flight.disarm();
 
@@ -1625,6 +1675,7 @@ mod tests {
                 alice.id.clone(),
                 "Please review my work".into(),
                 anima_core::AgentCommunicationRoute::start(&bob.id),
+                None,
             )
             .await
             .unwrap();
@@ -2108,7 +2159,12 @@ mod tests {
             .await
             .is_err());
         assert!(coordinator
-            .delegate(&lead, helper.state.id, "Bypass start allowance".into())
+            .delegate(
+                &lead,
+                helper.state.id,
+                "Bypass start allowance".into(),
+                None
+            )
             .await
             .unwrap_err()
             .contains("spawn_helper"));
@@ -2500,15 +2556,15 @@ mod tests {
             .unwrap()
             .state;
         assert!(coordinator
-            .delegate(&manager, manager.id.clone(), "self".into())
+            .delegate(&manager, manager.id.clone(), "self".into(), None)
             .await
             .is_err());
         assert!(coordinator
-            .delegate(&worker, manager.id.clone(), "reverse".into())
+            .delegate(&worker, manager.id.clone(), "reverse".into(), None)
             .await
             .is_err());
         assert!(coordinator
-            .delegate(&manager, "missing".into(), "missing".into())
+            .delegate(&manager, "missing".into(), "missing".into(), None)
             .await
             .is_err());
         let mut held = Vec::new();
@@ -2522,7 +2578,7 @@ mod tests {
         }
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
-            coordinator.delegate(&manager, worker_id.clone(), "busy".into())
+            coordinator.delegate(&manager, worker_id.clone(), "busy".into(), None)
         )
         .await
         .unwrap()
@@ -2549,7 +2605,7 @@ mod tests {
             )
             .unwrap();
         assert!(coordinator
-            .delegate(&manager, worker_id, "escalate".into())
+            .delegate(&manager, worker_id, "escalate".into(), None)
             .await
             .is_err());
         assert!(captures.lock().unwrap().is_empty());
@@ -3298,6 +3354,7 @@ mod tests {
                 idempotency_key: None,
                 source: RunSource::Api,
                 source_ref: None,
+                parent: None,
             })
             .await
             .expect("stable room run should succeed");
@@ -3340,6 +3397,7 @@ mod tests {
                 idempotency_key: Some("connector:update:42".into()),
                 source: RunSource::Api,
                 source_ref: None,
+                parent: None,
             })
             .await
             .expect("run should succeed");
@@ -4009,6 +4067,7 @@ mod tests {
             idempotency_key: None,
             source: RunSource::Api,
             source_ref: None,
+            parent: None,
         }
     }
 
@@ -4234,5 +4293,343 @@ mod tests {
     #[tokio::test]
     async fn a_first_flush_during_a_failing_final_save_reconciles_only_saved_messages() {
         assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_run_saves_its_session_with_the_run_start_and_advances_it_at_commit() {
+        use crate::sessions::{SessionKind, SessionOrigin, TitleSource};
+
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        let path = snapshot_path("session-start");
+        let store = ControlPlaneStoreConfig::Json(path.clone());
+        coordinator
+            .state
+            .write()
+            .await
+            .set_control_plane_store(Some(store.clone()));
+        let running = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "chat:plan", "Plan the offsite\nsoon");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+        let started = saved
+            .sessions
+            .iter()
+            .find(|session| session.id == "chat:plan")
+            .expect("the run-start save carries the new session");
+        assert_eq!(
+            (started.kind, started.origin),
+            (SessionKind::Chat, SessionOrigin::Web)
+        );
+        assert_eq!(started.title, "Plan the offsite");
+        assert_eq!(started.title_source, TitleSource::FirstMessage);
+        assert_eq!(saved.runs[0].session_id, "chat:plan");
+
+        release.add_permits(1);
+        running.await.unwrap().unwrap();
+        let guard = coordinator.state.read().await;
+        let session = guard.sessions.get(&agent_id, "chat:plan").unwrap();
+        let messages = guard.get_agent(&agent_id).unwrap().messages;
+        assert_eq!(
+            session.last_activity_at_ms,
+            messages
+                .iter()
+                .map(|message| message.created_at_ms)
+                .max()
+                .unwrap()
+        );
+        assert_eq!(
+            session.last_read_at_ms,
+            Some(messages[0].created_at_ms),
+            "the owner's own message is read; the reply is not"
+        );
+        drop(guard);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_save_leaves_no_session_record() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+
+        coordinator
+            .run(room_request(&agent_id, "chat:unsaved", "unsaved"))
+            .await
+            .expect_err("the run-start save failed");
+
+        assert!(coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:unsaved")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_commit_restores_the_session_it_advanced() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        let failed = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "chat:lost", "lost turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        failed.await.unwrap().expect_err("the final save failed");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&agent_id, "chat:lost")
+            .expect("the session was saved with the run start");
+        assert_eq!(
+            session.last_activity_at_ms, session.created_at_ms,
+            "the rolled-back turn no longer counts as activity"
+        );
+        assert_eq!(session.last_read_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn a_delegated_run_links_its_parent_run_and_session() {
+        use crate::sessions::{SessionKind, SessionOrigin};
+
+        let adapter = Arc::new(TeamModelAdapter {
+            target: StdMutex::new(String::new()),
+            configs: StdMutex::new(vec![]),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let mut manager = test_config("Manager");
+        manager.tools = Some(vec![crate::tools::ToolRegistry::new()
+            .descriptor("send_message")
+            .unwrap()]);
+        manager
+            .settings
+            .as_mut()
+            .unwrap()
+            .additional
+            .insert("workspaceRole".into(), DataValue::String("lead".into()));
+        let manager = state.write().await.create_agent(manager).unwrap().state;
+        let mut worker_config = test_config("Alice");
+        worker_config.tools = manager.config.tools.clone();
+        let worker = state
+            .write()
+            .await
+            .create_agent(worker_config)
+            .unwrap()
+            .state;
+        *adapter.target.lock().unwrap() = worker.id.clone();
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(4)));
+
+        coordinator
+            .run(request(&manager.id, "Ask Alice to draft a plan"))
+            .await
+            .unwrap();
+
+        let guard = state.read().await;
+        let manager_run = guard.runs.for_agent(&manager.id)[0].clone();
+        let worker_run = guard.runs.for_agent(&worker.id)[0].clone();
+        assert_eq!(manager_run.parent_run_id, None);
+        assert_eq!(worker_run.source, RunSource::Delegation);
+        assert_eq!(
+            worker_run.parent_run_id.as_deref(),
+            Some(manager_run.id.as_str())
+        );
+        let helper = guard
+            .sessions
+            .get(&worker.id, &worker_run.session_id)
+            .expect("the delegated room is a session");
+        assert_eq!(
+            (helper.kind, helper.origin),
+            (SessionKind::Helper, SessionOrigin::Delegation)
+        );
+        assert_eq!(
+            helper.parent_run_id.as_deref(),
+            Some(manager_run.id.as_str())
+        );
+        assert_eq!(
+            helper.parent_session_id.as_deref(),
+            Some(manager_run.session_id.as_str())
+        );
+        assert_eq!(helper.parent_agent_id.as_deref(), Some(manager.id.as_str()));
+        assert_eq!(helper.title, "Draft a content plan");
+        let chat = guard
+            .sessions
+            .get(&manager.id, &manager_run.session_id)
+            .expect("the manager's generated room is a session too");
+        assert_eq!(chat.kind, SessionKind::Chat);
+    }
+
+    #[tokio::test]
+    async fn spawned_helpers_record_the_companion_run_that_started_them() {
+        use crate::sessions::{SessionKind, SessionOrigin};
+
+        let (coordinator, _) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            4,
+        )
+        .await;
+        let lead = helper_lead(&coordinator).await;
+        let link = crate::runs::RunLink {
+            run_id: "run_companion".into(),
+            session_id: "chat:plan".into(),
+            agent_id: lead.id.clone(),
+        };
+
+        let text = coordinator
+            .spawn_helper(
+                lead.id.clone(),
+                "Scout".into(),
+                "Find three sources".into(),
+                Some(link),
+            )
+            .await
+            .expect("the helper runs");
+
+        let helper_id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["agentId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let guard = coordinator.state.read().await;
+        let run = guard.runs.for_agent(&helper_id)[0].clone();
+        assert_eq!(run.parent_run_id.as_deref(), Some("run_companion"));
+        let session = guard
+            .sessions
+            .get(&helper_id, &run.session_id)
+            .expect("the helper room is a session");
+        assert_eq!(
+            (session.kind, session.origin),
+            (SessionKind::Helper, SessionOrigin::Delegation)
+        );
+        assert_eq!(session.parent_session_id.as_deref(), Some("chat:plan"));
+        assert_eq!(session.parent_agent_id.as_deref(), Some(lead.id.as_str()));
+        assert_eq!(session.title, "Find three sources");
+    }
+
+    #[tokio::test]
+    async fn a_peer_request_is_a_helper_session_of_the_recipient() {
+        use crate::sessions::{SessionKind, SessionOrigin};
+
+        let (coordinator, sender) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            4,
+        )
+        .await;
+        let recipient = coordinator
+            .state
+            .write()
+            .await
+            .create_agent(test_config("Recipient"))
+            .unwrap()
+            .state
+            .id;
+
+        coordinator
+            .send_peer(
+                sender.clone(),
+                recipient.clone(),
+                "Check this".into(),
+                anima_core::AgentCommunicationRoute::start(sender.clone()),
+                None,
+            )
+            .await
+            .expect("the peer request runs");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&recipient, &format!("peer:{sender}:{recipient}"))
+            .expect("the peer room is a session");
+        assert_eq!(
+            (session.kind, session.origin),
+            (SessionKind::Helper, SessionOrigin::Peer)
+        );
+        assert_eq!(session.parent_agent_id.as_deref(), Some(sender.as_str()));
+        assert_eq!(session.parent_run_id, None);
+        assert_eq!(session.title, "Messages from operator");
+    }
+
+    /// Controller ruling from the pre-flight audit: a calendar write's own
+    /// confirmation follow-up (`RunRoom::Generated`, source `api`, `sourceRef
+    /// = calendar-write:<id>`) creates a session titled `system`, and that
+    /// follow-up is not the owner's own turn, so the session stays unread.
+    #[tokio::test]
+    async fn a_calendar_write_followup_gets_a_system_titled_session_that_is_not_owner_read() {
+        use crate::sessions::TitleSource;
+
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+
+        coordinator
+            .run(AgentRunRequest {
+                agent_id: agent_id.clone(),
+                content: Content {
+                    text: "Calendar change confirmed and applied: Team sync. Continue the conversation accordingly.".into(),
+                    ..Content::default()
+                },
+                room: RunRoom::Generated,
+                idempotency_key: Some("calendar-write:evt-1".into()),
+                source: RunSource::Api,
+                source_ref: Some("calendar-write:evt-1".into()),
+                parent: None,
+            })
+            .await
+            .expect("the calendar follow-up runs");
+
+        let guard = coordinator.state.read().await;
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        let session = guard
+            .sessions
+            .get(&agent_id, &run.session_id)
+            .expect("the calendar follow-up room is a session");
+        assert_eq!(session.title_source, TitleSource::System);
+        assert_eq!(
+            session.last_read_at_ms, None,
+            "a calendar write follow-up is not the owner's own turn"
+        );
     }
 }

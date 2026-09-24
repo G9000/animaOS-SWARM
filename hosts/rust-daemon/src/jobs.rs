@@ -541,6 +541,7 @@ impl JobService {
                     idempotency_key: Some(format!("job:{}:attempt:{}", job.id, job.attempt)),
                     source: RunSource::Job,
                     source_ref: Some(format!("{}:{}", job.id, job.attempt)),
+                    parent: None,
                 },
                 ticket,
                 move |state, outcome| {

@@ -26,7 +26,10 @@ pub(super) fn send_message(
             Ok(target) => target,
             Err(error) => return TaskResult::error(error, 0),
         };
-        match coordinator.send_peer(agent.id, target.id.clone(), message.into(), route).await {
+        match coordinator
+            .send_peer(agent.id, target.id.clone(), message.into(), route, context.run_link.clone())
+            .await
+        {
             Ok(result) => TaskResult::success(Content { text: serde_json::json!({"fromAgentId": target.id, "fromAgentName": target.name, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string(), ..Content::default() }, 0),
             Err(error) => TaskResult::error(format!("Peer request failed: {}", error.message()), 0),
         }
@@ -62,6 +65,7 @@ pub(super) fn broadcast_message(
                     target.clone(),
                     message.clone(),
                     route.clone(),
+                    context.run_link.clone(),
                 )
                 .await
             {
@@ -133,7 +137,10 @@ pub(super) fn delegate_to_agent(
         let (Some(target), Some(task)) = (arg("agent_id"), arg("task")) else {
             return TaskResult::error("agent_id and task are required", 0);
         };
-        match coordinator.delegate(&agent, target, task).await {
+        match coordinator
+            .delegate(&agent, target, task, context.run_link.clone())
+            .await
+        {
             Ok(text) => TaskResult::success(
                 Content {
                     text,
@@ -187,7 +194,10 @@ pub(super) fn spawn_helper(
                 0,
             );
         }
-        match coordinator.spawn_helper(agent.id, name, task).await {
+        match coordinator
+            .spawn_helper(agent.id, name, task, context.run_link.clone())
+            .await
+        {
             Ok(text) => TaskResult::success(
                 Content {
                     text,

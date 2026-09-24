@@ -443,6 +443,7 @@ mod tests {
             idempotency_key: None,
             source: RunSource::Api,
             source_ref: None,
+            parent: None,
         };
 
         // First boot: two mirrored chats, one of them deleted with its history

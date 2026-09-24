@@ -938,6 +938,7 @@ impl ConnectorManager {
             idempotency_key: Some(idempotency_key),
             source: RunSource::Telegram,
             source_ref: Some(connector.id.clone()),
+            parent: None,
         };
         let run = self
             .runs
@@ -1229,6 +1230,7 @@ impl ConnectorManager {
             idempotency_key: Some(inbound.run_idempotency_key.clone()),
             source: RunSource::Telegram,
             source_ref: Some(format!("{}:{}", inbound.connector_id, inbound.update_id)),
+            parent: None,
         };
 
         let run = self
@@ -5001,6 +5003,7 @@ mod tests {
                     idempotency_key: None,
                     source: RunSource::Api,
                     source_ref: None,
+                    parent: None,
                 })
                 .await
         });
@@ -7003,6 +7006,7 @@ mod tests {
                     idempotency_key: None,
                     source: RunSource::Api,
                     source_ref: None,
+                    parent: None,
                 })
                 .await
             })

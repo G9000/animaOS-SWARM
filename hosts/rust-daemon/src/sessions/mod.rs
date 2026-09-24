@@ -487,6 +487,14 @@ pub(crate) fn is_owner_web_turn(message: &Message) -> bool {
     message.role == MessageRole::User && metadata_str(message, "source") == Some("telegramThread")
 }
 
+/// The daemon's own confirmation follow-up after a calendar write is applied
+/// (`sourceRef = calendar-write:<id>`, spec §9.4). It runs with `source: api`
+/// like an owner call, but it is not the owner's own turn (pre-flight audit
+/// ruling): its session is titled `system`, not marked owner-read.
+pub(crate) fn is_calendar_write_followup(source_ref: Option<&str>) -> bool {
+    source_ref.is_some_and(|source_ref| source_ref.starts_with("calendar-write:"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GroupStart {
     Missing,

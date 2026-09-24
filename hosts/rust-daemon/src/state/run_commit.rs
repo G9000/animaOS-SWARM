@@ -3,10 +3,10 @@
 use std::sync::Arc;
 
 use anima_core::primitives::now_millis;
-use anima_core::{AgentRuntime, AgentRuntimeSnapshot, AgentStatus, RuntimeRunBase};
+use anima_core::{AgentRuntime, AgentRuntimeSnapshot, AgentStatus, MessageRole, RuntimeRunBase};
 
 use super::DaemonState;
-use crate::runs::{RunChangeSet, RunError, RunOutcome, RunStatus, AGENT_DELETED};
+use crate::runs::{RunChangeSet, RunError, RunOutcome, RunSource, RunStatus, AGENT_DELETED};
 use crate::tools::ToolExecutionContext;
 
 impl DaemonState {
@@ -78,6 +78,24 @@ impl DaemonState {
             .get_mut(&change_set.agent_id)
             .expect("agent existence was checked above");
         change_set.undo = Some(runtime.apply_run_delta(&change_set.delta));
+        // Spec §3.2: activity follows the commit, and the owner's own turn is read.
+        // A calendar write's own confirmation follow-up is `api`-sourced like an
+        // owner call, but it is not the owner's own turn (pre-flight audit ruling).
+        let owner_authored = self.runs.get(&change_set.run_id).is_some_and(|record| {
+            matches!(record.source, RunSource::Api | RunSource::Web)
+                && !crate::sessions::is_calendar_write_followup(record.source_ref.as_deref())
+        }) || change_set
+            .delta
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .is_some_and(crate::sessions::is_owner_web_turn);
+        change_set.session_undo = self.sessions.record_commit(
+            &change_set.agent_id,
+            &crate::sessions::session_id_for_room(&change_set.session_id),
+            &change_set.delta.messages,
+            owner_authored,
+        );
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
             record.usage = change_set.token_delta.clone();
             record.tools_started = change_set.tools_started();
@@ -98,6 +116,9 @@ impl DaemonState {
         }
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
             record.finish(RunStatus::Failed, Some(error), now_millis());
+        }
+        if let Some(undo) = change_set.session_undo.clone() {
+            self.sessions.revert_commit(undo);
         }
     }
 

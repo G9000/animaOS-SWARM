@@ -198,6 +198,7 @@ async fn a_chat_run_in_another_room_does_not_hold_back_the_agents_job() {
                 idempotency_key: None,
                 source: RunSource::Api,
                 source_ref: None,
+                parent: None,
             })
             .await
         })

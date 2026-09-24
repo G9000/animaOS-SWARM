@@ -10,6 +10,14 @@ pub(crate) use ledger::{
     RUN_ABORTED, RUN_FAILED, TERMINAL_RUN_RETENTION_MS,
 };
 
+/// The run that started another run (spec §3.2 parent fields, §4.1 `parentRunId`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunLink {
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) agent_id: String,
+}
+
 use anima_core::{
     Content, DataValue, MessageRole, RuntimeRunDelta, RuntimeRunUndo, TaskResult, TaskStatus,
     TokenUsage,
@@ -29,6 +37,8 @@ pub(crate) struct RunChangeSet {
     pub(crate) delta: RuntimeRunDelta,
     /// Set by `DaemonState::commit_run`; read by `rollback_run`.
     pub(crate) undo: Option<RuntimeRunUndo>,
+    /// Set by `DaemonState::commit_run`; read by `rollback_run`.
+    pub(crate) session_undo: Option<crate::sessions::SessionCommitUndo>,
 }
 
 impl RunChangeSet {
@@ -52,6 +62,7 @@ impl RunChangeSet {
             session_id,
             delta,
             undo: None,
+            session_undo: None,
         }
     }
 

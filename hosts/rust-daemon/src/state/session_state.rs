@@ -6,7 +6,7 @@ use anima_core::AgentConfigUpdate;
 use tracing::warn;
 
 use super::DaemonState;
-use crate::agent_runs::is_helper_config;
+use crate::agent_runs::{config_helper_parent, is_helper_config};
 use crate::sessions::migration::{
     derive_sessions_for_legacy_rooms, LegacyAgent, LegacySessionContext, ToolGrantSet,
 };
@@ -107,5 +107,98 @@ impl DaemonState {
             }
         }
         changed
+    }
+}
+
+use crate::runs::{RunLink, RunSource};
+use crate::sessions::{
+    connector_id_of_room, derived_title, is_calendar_write_followup, job_id_of_room, kind_for_room,
+    schedule_id_of_room, session_id_for_room, session_title, SessionKind, TitleContext,
+    TitleSource,
+};
+
+/// What `ensure_run_session` needs to know about a starting run.
+pub(crate) struct RunSessionRequest<'a> {
+    pub(crate) agent_id: &'a str,
+    pub(crate) room_id: &'a str,
+    pub(crate) source: RunSource,
+    /// Ledger source reference (spec §4.1); `calendar-write:<id>` marks the
+    /// calendar connector's own confirmation follow-up (pre-flight audit
+    /// ruling), not an owner-authored `api` call.
+    pub(crate) source_ref: Option<&'a str>,
+    /// The delegating agent of a `RunRoom::Delegated` run.
+    pub(crate) delegated_parent: Option<&'a str>,
+    /// The sending agent of a `RunRoom::Peer` run.
+    pub(crate) peer_sender: Option<&'a str>,
+    pub(crate) parent: Option<&'a RunLink>,
+    pub(crate) first_text: &'a str,
+    pub(crate) now_ms: u64,
+}
+
+impl DaemonState {
+    /// Makes sure the run's room has a session record (spec §3); returns
+    /// whether it created one, so a failed run-start save can remove it.
+    pub(crate) fn ensure_run_session(&mut self, request: RunSessionRequest<'_>) -> bool {
+        let session_id = session_id_for_room(request.room_id);
+        if self.sessions.contains(request.agent_id, &session_id) {
+            return false;
+        }
+        let helper_parent = self
+            .agents
+            .get(request.agent_id)
+            .and_then(|runtime| config_helper_parent(runtime.config()))
+            .map(str::to_string);
+        let (kind, origin) = kind_for_room(
+            request.room_id,
+            Some(request.source),
+            helper_parent.is_some(),
+        );
+        let peer_sender_name = request
+            .peer_sender
+            .and_then(|id| self.agents.get(id))
+            .map(|runtime| runtime.config().name.clone());
+        let title_context = TitleContext {
+            first_user_text: Some(request.first_text),
+            schedule_prompt: schedule_id_of_room(request.room_id)
+                .and_then(|id| self.schedules.get(id))
+                .map(|schedule| schedule.prompt.as_str()),
+            job_title: job_id_of_room(request.room_id)
+                .and_then(|id| self.jobs.get(id))
+                .map(|job| job.title.as_str()),
+            bot_username: connector_id_of_room(request.room_id)
+                .and_then(|id| self.connectors.get(id))
+                .and_then(|connector| connector.bot.username.as_deref()),
+            peer_sender_name: peer_sender_name.as_deref(),
+        };
+        let (title, title_source) = if is_calendar_write_followup(request.source_ref) {
+            // Spec ruling: a system follow-up, not the owner's first message.
+            (
+                derived_title(request.first_text).unwrap_or_else(|| "Calendar update".to_string()),
+                TitleSource::System,
+            )
+        } else {
+            session_title(kind, origin, &title_context)
+        };
+        let mut record = SessionRecord::new(
+            request.agent_id,
+            request.room_id,
+            kind,
+            origin,
+            title,
+            title_source,
+            request.now_ms,
+        );
+        if kind == SessionKind::Helper {
+            record.parent_session_id = request.parent.map(|link| link.session_id.clone());
+            record.parent_run_id = request.parent.map(|link| link.run_id.clone());
+            record.parent_agent_id = request
+                .parent
+                .map(|link| link.agent_id.clone())
+                .or_else(|| request.delegated_parent.map(str::to_string))
+                .or_else(|| request.peer_sender.map(str::to_string))
+                .or(helper_parent);
+        }
+        self.sessions.insert(record);
+        true
     }
 }

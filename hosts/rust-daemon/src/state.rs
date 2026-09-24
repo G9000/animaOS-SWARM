@@ -4,6 +4,7 @@ mod swarm_runtime;
 mod swarm_tools;
 mod run_commit;
 mod session_state;
+pub(crate) use self::session_state::RunSessionRequest;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

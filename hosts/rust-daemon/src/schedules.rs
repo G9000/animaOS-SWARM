@@ -588,6 +588,7 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             .map(|item| item.run_idempotency_key.clone()),
         source: RunSource::Schedule,
         source_ref: Some(record.id.clone()),
+        parent: None,
     };
     let recorded = Arc::new(std::sync::Mutex::new(
         None::<(ScheduleSafeOutcome, Option<TelegramOutboundRecord>)>,

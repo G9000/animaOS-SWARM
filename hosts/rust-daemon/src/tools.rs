@@ -62,6 +62,8 @@ pub(crate) struct ToolExecutionContext {
     delegated_parent: Option<String>,
     pub(super) peer_route: Option<anima_core::AgentCommunicationRoute>,
     peer_sources: Vec<String>,
+    /// The run executing these tools, so the runs they start can link to it.
+    pub(super) run_link: Option<crate::runs::RunLink>,
     pub(super) memory: SharedMemoryStore,
     pub(super) memory_embeddings: SharedMemoryEmbeddings,
     pub(super) memory_store: Option<MemoryStoreConfig>,
@@ -93,6 +95,7 @@ impl ToolExecutionContext {
             delegated_parent: None,
             peer_route: None,
             peer_sources: vec![],
+            run_link: None,
             memory,
             memory_embeddings,
             memory_store,
@@ -132,6 +135,11 @@ impl ToolExecutionContext {
     ) -> Self {
         self.peer_route = Some(route);
         self.peer_sources = sources;
+        self
+    }
+
+    pub(crate) fn with_run_link(mut self, link: Option<crate::runs::RunLink>) -> Self {
+        self.run_link = link;
         self
     }
 

@@ -238,6 +238,7 @@ pub(crate) async fn handle_run_agent(
                 idempotency_key: None,
                 source: RunSource::Api,
                 source_ref: None,
+                parent: None,
             },
             waiting,
         )
@@ -820,6 +821,7 @@ mod tests {
                 idempotency_key: None,
                 source: RunSource::Delegation,
                 source_ref: None,
+                parent: None,
             };
             tokio::spawn(async move { coordinator.run(request).await })
         };

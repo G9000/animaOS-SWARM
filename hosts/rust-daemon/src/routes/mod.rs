@@ -1351,6 +1351,7 @@ async fn peer_message_entry(
             input.to_agent_id,
             input.message,
             anima_core::AgentCommunicationRoute::start(sender_id),
+            None,
         )
         .await
     {
