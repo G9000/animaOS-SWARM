@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anima_core::{AgentRuntimeSnapshot, Message};
+use tokio::sync::MutexGuard;
 use tracing::warn;
 
 use super::{hidden_message_ids, session_id_for_room};
@@ -170,18 +171,19 @@ pub(crate) async fn prune_once(
     transactions: &std::sync::Arc<tokio::sync::Mutex<()>>,
     now_ms: u64,
 ) -> Result<usize, String> {
-    let _transaction = transactions.lock().await;
-    prune_in_transaction(state, now_ms).await
+    let transaction = transactions.lock().await;
+    prune_in_transaction(state, &transaction, now_ms).await
 }
 
-/// One pruning pass for a caller that already holds the control-plane
-/// transaction; returns how many messages left the hot tail. Call it only
-/// while holding that transaction, so no commit, deletion, or other save
-/// interleaves with the prune, its save, or its revert. The state lock is
-/// never held across the save; a failed save puts everything back, and a
-/// saved prune forgets the pruned ids in the mirrored set.
+/// One pruning pass under the control-plane transaction, whose held guard
+/// the caller passes in, so no commit, deletion, or other save interleaves
+/// with the prune, its save, or its revert. Returns how many messages left
+/// the hot tail. The state lock is never held across the save; a failed save
+/// puts everything back, and a saved prune forgets the pruned ids in the
+/// mirrored set.
 pub(crate) async fn prune_in_transaction(
     state: &SharedDaemonState,
+    _transaction: &MutexGuard<'_, ()>,
     now_ms: u64,
 ) -> Result<usize, String> {
     let (undo, persist) = {

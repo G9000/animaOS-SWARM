@@ -105,7 +105,7 @@ impl HistoryWorker {
                 }
                 next_prune_at = Instant::now() + prune_interval;
                 let pruned = {
-                    let _transaction = transactions.lock().await;
+                    let transaction = transactions.lock().await;
                     // The flush, or a commit this waited for, may have
                     // outlived the last owner or a shutdown request: a stale
                     // instance must never prune and save its snapshot over a
@@ -113,7 +113,7 @@ impl HistoryWorker {
                     if *stopping.borrow() || owned.has_changed().is_err() {
                         break;
                     }
-                    prune_in_transaction(&state, now_millis()).await
+                    prune_in_transaction(&state, &transaction, now_millis()).await
                 };
                 match pruned {
                     Ok(0) => {}
