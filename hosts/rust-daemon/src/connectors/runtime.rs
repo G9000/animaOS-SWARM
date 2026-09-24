@@ -901,11 +901,17 @@ impl ConnectorManager {
         if let Some(replay) = replay {
             return Ok(replay);
         }
-        // Nothing is reserved here: the run takes the Telegram room, an agent
-        // slot, and then a global permit, in that order (spec §4.3).
+        // Only a unit of the agent's waiting budget is reserved here, without
+        // waiting (spec §16). The run then waits for the Telegram room, an
+        // agent slot, and a global permit, in that order (spec §4.3), and
+        // gives the unit back once it holds the permit.
         if !self.runs.has_available_permit() {
             return Err(ConnectorManagerError::Backpressure);
         }
+        let waiting = self
+            .runs
+            .try_take_waiting_unit(&connector.agent_id)
+            .ok_or(ConnectorManagerError::Backpressure)?;
         let commit_connector_id = connector.id.clone();
         let commit_agent_id = connector.agent_id.clone();
         let commit_room_id = connector.room_id.clone();
@@ -935,8 +941,9 @@ impl ConnectorManager {
         };
         let run = self
             .runs
-            .run_with_commit_waiting(
+            .run_budgeted_with_commit_waiting(
                 request,
+                waiting,
                 move |state, outcome| {
                     let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
                         ApiError::service_unavailable("connector lifecycle changed during run")
@@ -5106,6 +5113,198 @@ mod tests {
 
         assert!(waited);
         assert_eq!(result, Ok(true));
+    }
+
+    /// An owner thread (no paired chat) whose room `blocker` holds without a
+    /// global permit, so the next owner send passes the permit pre-check and
+    /// then waits for that room. Its agent's model calls park on the gate.
+    struct BlockedOwnerThread {
+        manager: ConnectorManager,
+        runs: AgentRunCoordinator,
+        agent_id: String,
+        connector_id: String,
+        blocker: crate::agent_runs::RunReservation,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    async fn owner_thread_with_blocked_room(limiter: Arc<Semaphore>) -> BlockedOwnerThread {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), limiter);
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:owner-waiting").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.stop_worker(&connector.id).await.unwrap();
+        let blocker = runs
+            .admit(
+                &agent_id,
+                &connector.room_id,
+                crate::agent_runs::AdmitMode::TryNow,
+            )
+            .await
+            .expect("the owner thread's room is free");
+        BlockedOwnerThread {
+            manager,
+            runs,
+            agent_id,
+            connector_id: connector.id,
+            blocker,
+            entered,
+            release,
+        }
+    }
+
+    fn spawn_owner_send(
+        manager: &ConnectorManager,
+        agent_id: &str,
+        connector_id: &str,
+        key: &str,
+    ) -> tokio::task::JoinHandle<
+        Result<(crate::routes::AgentRunEnvelope, bool), super::ConnectorManagerError>,
+    > {
+        let manager = manager.clone();
+        let agent_id = agent_id.to_string();
+        let connector_id = connector_id.to_string();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            manager
+                .send_from_owner(agent_id, connector_id, format!("owner turn {key}"), key)
+                .await
+        })
+    }
+
+    /// Once past the permit pre-check an owner send waits for a global
+    /// permit instead of failing (spec §4.3), and holds one unit of its
+    /// agent's waiting budget only while it waits.
+    #[tokio::test]
+    async fn owner_send_waits_for_a_permit_and_holds_a_waiting_unit_only_while_waiting() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let BlockedOwnerThread {
+            manager,
+            runs,
+            agent_id,
+            connector_id,
+            blocker,
+            entered,
+            release,
+        } = owner_thread_with_blocked_room(Arc::clone(&limiter)).await;
+
+        let sending = spawn_owner_send(&manager, &agent_id, &connector_id, "owner-waits");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!sending.is_finished(), "the send waits for its room");
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            1,
+            "a waiting owner send holds one unit"
+        );
+
+        // The only permit is taken, then the room frees: the send now waits
+        // for a permit rather than failing.
+        let elsewhere = limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("the permit is free");
+        drop(blocker);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !sending.is_finished(),
+            "an owner send waits for a permit instead of failing"
+        );
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            1,
+            "still waiting, so it keeps its unit"
+        );
+
+        drop(elsewhere);
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("the send takes the freed permit and enters the model")
+            .unwrap()
+            .forget();
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            0,
+            "a send holding its permit no longer holds a unit"
+        );
+        release.add_permits(1);
+        let (run, delivery_queued) = sending.await.unwrap().expect("the owner send succeeds");
+        assert_eq!(run.result.status, "success");
+        assert!(
+            !delivery_queued,
+            "an unpaired owner thread queues no delivery"
+        );
+        manager.shutdown().await;
+    }
+
+    /// Owner sends share their agent's waiting budget (spec §16): with eight
+    /// sends waiting, the next gets the saturation backpressure at once.
+    #[tokio::test]
+    async fn owner_sends_beyond_the_waiting_budget_get_backpressure_at_once() {
+        use crate::agent_runs::MAX_QUEUED_RUNS_PER_AGENT;
+
+        let BlockedOwnerThread {
+            manager,
+            runs,
+            agent_id,
+            connector_id,
+            blocker,
+            release,
+            ..
+        } = owner_thread_with_blocked_room(Arc::new(Semaphore::new(4))).await;
+        let waiting: Vec<_> = (1..=MAX_QUEUED_RUNS_PER_AGENT)
+            .map(|index| {
+                spawn_owner_send(
+                    &manager,
+                    &agent_id,
+                    &connector_id,
+                    &format!("owner-{index}"),
+                )
+            })
+            .collect();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            spawn_owner_send(&manager, &agent_id, &connector_id, "owner-refused"),
+        )
+        .await
+        .expect("the ninth waiting send is answered at once")
+        .unwrap();
+        assert_eq!(
+            refused.unwrap_err(),
+            super::ConnectorManagerError::Backpressure
+        );
+
+        drop(blocker);
+        release.add_permits(MAX_QUEUED_RUNS_PER_AGENT);
+        for send in waiting {
+            assert!(send.await.unwrap().is_ok(), "every waiting send runs");
+        }
+        assert_eq!(runs.waiting_runs(&agent_id), 0);
+        manager.shutdown().await;
     }
 
     #[tokio::test]

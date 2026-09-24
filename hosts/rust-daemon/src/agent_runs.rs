@@ -111,10 +111,46 @@ type AgentRunRollback = Box<dyn FnOnce(&mut DaemonState) -> Result<(), ApiError>
 
 /// Error returned when the global run limit is exhausted on a fail-fast path.
 pub(crate) const RUN_ADMISSION_SATURATED: &str = "too many concurrent run requests";
+
+/// Runs of one agent that fail-fast callers (the legacy run route and
+/// Telegram owner sends) may have waiting at once for a room lock, an agent
+/// slot, or a global permit (spec §16).
+pub(crate) const MAX_QUEUED_RUNS_PER_AGENT: usize = 8;
+
 const SPECIALIST_BUSY: &str = "Specialist is busy";
 
 type SessionLockMap = Arc<StdMutex<HashMap<(String, String), Arc<Mutex<()>>>>>;
 type AgentSlotMap = Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>;
+/// Units of each agent's waiting budget in use; an agent with none has no entry.
+type WaitingBudgetMap = Arc<StdMutex<HashMap<String, usize>>>;
+
+/// One unit of an agent's waiting budget (`MAX_QUEUED_RUNS_PER_AGENT`).
+///
+/// A fail-fast caller takes it without waiting (`try_take_waiting_unit`)
+/// before its run waits for a room lock and an agent slot. The run drops it
+/// as soon as it holds its global permit; any other exit (an error, a panic,
+/// or the run's task being dropped) drops it too. Nothing ever waits for a
+/// unit, so holding one while waiting for a room lock, slot, or permit cannot
+/// deadlock, and a permit holder never needs one.
+pub(crate) struct WaitingBudgetUnit {
+    agent_id: String,
+    budget: WaitingBudgetMap,
+}
+
+impl Drop for WaitingBudgetUnit {
+    fn drop(&mut self) {
+        let mut budget = self
+            .budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(waiting) = budget.get_mut(&self.agent_id) {
+            *waiting = waiting.saturating_sub(1);
+            if *waiting == 0 {
+                budget.remove(&self.agent_id);
+            }
+        }
+    }
+}
 
 /// How a run waits for its room lock and agent slot (spec §4.3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +301,7 @@ pub(crate) struct AgentRunCoordinator {
     run_limiter: Arc<Semaphore>,
     session_locks: SessionLockMap,
     agent_slots: AgentSlotMap,
+    waiting_budget: WaitingBudgetMap,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
 }
@@ -510,6 +547,7 @@ impl AgentRunCoordinator {
             run_limiter,
             session_locks: Arc::new(StdMutex::new(HashMap::new())),
             agent_slots: Arc::new(StdMutex::new(HashMap::new())),
+            waiting_budget: Arc::new(StdMutex::new(HashMap::new())),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
         }
@@ -555,12 +593,52 @@ impl AgentRunCoordinator {
         self.run_limiter.available_permits() > 0
     }
 
+    /// Takes one unit of the agent's waiting budget without waiting, or
+    /// `None` when `MAX_QUEUED_RUNS_PER_AGENT` of its fail-fast runs are
+    /// already waiting (spec §16). Only the legacy run route and Telegram
+    /// owner sends take units; each answers `None` with its own saturation
+    /// response.
+    pub(crate) fn try_take_waiting_unit(&self, agent_id: &str) -> Option<WaitingBudgetUnit> {
+        let mut budget = self
+            .waiting_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waiting = budget.entry(agent_id.to_string()).or_insert(0);
+        if *waiting >= MAX_QUEUED_RUNS_PER_AGENT {
+            return None;
+        }
+        *waiting += 1;
+        Some(WaitingBudgetUnit {
+            agent_id: agent_id.to_string(),
+            budget: Arc::clone(&self.waiting_budget),
+        })
+    }
+
     /// Runs without a source commit. Top-level runs wait for their room and an
     /// agent slot; nested delegated and peer runs fail fast. The global permit
-    /// is never waited for here (fail-fast 503).
+    /// is never waited for here (fail-fast 503). Fail-fast HTTP callers use
+    /// `run_budgeted`, which bounds that waiting.
     pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
-        self.run_spawned(request, PermitMode::TryNow, |_, _| Ok(()), None)
+        self.run_spawned(request, PermitMode::TryNow, None, |_, _| Ok(()), None)
             .await
+    }
+
+    /// The legacy run route (spec §4.9): `run`, holding `waiting` (a unit of
+    /// the agent's waiting budget) while the run waits for its room and an
+    /// agent slot, until it has its global permit.
+    pub(crate) async fn run_budgeted(
+        &self,
+        request: AgentRunRequest,
+        waiting: WaitingBudgetUnit,
+    ) -> Result<AgentRunEnvelope, ApiError> {
+        self.run_spawned(
+            request,
+            PermitMode::TryNow,
+            Some(waiting),
+            |_, _| Ok(()),
+            None,
+        )
+        .await
     }
 
     /// Runs with a source commit captured in the same final control-plane snapshot.
@@ -576,7 +654,7 @@ impl AgentRunCoordinator {
     where
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
-        self.run_spawned(request, PermitMode::TryNow, commit, None)
+        self.run_spawned(request, PermitMode::TryNow, None, commit, None)
             .await
     }
 
@@ -596,8 +674,37 @@ impl AgentRunCoordinator {
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
         R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
-        self.run_spawned(request, PermitMode::Wait, commit, Some(Box::new(rollback)))
-            .await
+        self.run_spawned(
+            request,
+            PermitMode::Wait,
+            None,
+            commit,
+            Some(Box::new(rollback)),
+        )
+        .await
+    }
+
+    /// Telegram owner sends: `run_with_commit_waiting`, holding `waiting` (a
+    /// unit of the agent's waiting budget) until the run has its global permit.
+    pub(crate) async fn run_budgeted_with_commit_waiting<F, R>(
+        &self,
+        request: AgentRunRequest,
+        waiting: WaitingBudgetUnit,
+        commit: F,
+        rollback: R,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
+    {
+        self.run_spawned(
+            request,
+            PermitMode::Wait,
+            Some(waiting),
+            commit,
+            Some(Box::new(rollback)),
+        )
+        .await
     }
 
     /// Runs with a ticket the caller acquired up front (see `try_ticket`).
@@ -631,6 +738,7 @@ impl AgentRunCoordinator {
         &self,
         request: AgentRunRequest,
         permit_mode: PermitMode,
+        waiting: Option<WaitingBudgetUnit>,
         commit: F,
         rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
@@ -639,10 +747,14 @@ impl AgentRunCoordinator {
     {
         let coordinator = self.clone();
         // The run owns its task, so a dropped caller cannot cancel a commit.
+        // The waiting unit moves into that task too: a run still waiting
+        // after its caller gave up keeps counting against its agent's budget.
         tokio::spawn(async move {
             // An invalid request fails before waiting for a room, slot, or permit.
             coordinator.prevalidate(&request).await?;
-            let ticket = coordinator.acquire_ticket(&request, permit_mode).await?;
+            let ticket = coordinator
+                .acquire_ticket(&request, permit_mode, waiting)
+                .await?;
             coordinator
                 .run_locked(request, ticket, commit, rollback)
                 .await
@@ -651,11 +763,20 @@ impl AgentRunCoordinator {
         .map_err(run_worker_stopped)?
     }
 
+    /// Room, slot, then permit (spec §4.3). `waiting` is released once the
+    /// permit is held, or on any earlier exit.
     async fn acquire_ticket(
         &self,
         request: &AgentRunRequest,
         permit_mode: PermitMode,
+        waiting: Option<WaitingBudgetUnit>,
     ) -> Result<RunTicket, ApiError> {
+        debug_assert!(
+            waiting
+                .as_ref()
+                .is_none_or(|unit| unit.agent_id == request.agent_id),
+            "a waiting unit belongs to the agent whose run holds it"
+        );
         let room_id = request.room.resolve(&request.agent_id);
         let mode = if matches!(
             request.room,
@@ -676,6 +797,9 @@ impl AgentRunCoordinator {
                 .map(AgentRunPermit)
                 .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?,
         };
+        // No longer waiting: the unit goes back to the agent's budget now,
+        // not when the run finishes.
+        drop(waiting);
         Ok(RunTicket {
             room_id,
             _reservation: reservation,
@@ -1109,6 +1233,17 @@ impl AgentRunCoordinator {
             .try_acquire_owned()
             .map(AgentRunPermit)
             .map_err(|_| ApiError::service_unavailable(RUN_ADMISSION_SATURATED))
+    }
+
+    /// Units of the agent's waiting budget in use.
+    #[cfg(test)]
+    pub(crate) fn waiting_runs(&self, agent_id: &str) -> usize {
+        self.waiting_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -2835,6 +2970,61 @@ mod tests {
             coordinator.lock_counts(),
             (0, 0),
             "racing slot-lease drops on one key must not leak a stale registry entry"
+        );
+    }
+
+    /// The waiting budget is per agent and try-only, and a unit comes back on
+    /// every exit of the task holding it, including cancellation and panic.
+    #[tokio::test]
+    async fn waiting_budget_is_per_agent_try_only_and_released_on_every_exit() {
+        let coordinator = AgentRunCoordinator::new(
+            Arc::new(RwLock::new(DaemonState::new())),
+            Arc::new(Semaphore::new(1)),
+        );
+        let mut units: Vec<_> = (0..super::MAX_QUEUED_RUNS_PER_AGENT)
+            .map(|_| {
+                coordinator
+                    .try_take_waiting_unit("agent-x")
+                    .expect("within the budget")
+            })
+            .collect();
+        assert!(
+            coordinator.try_take_waiting_unit("agent-x").is_none(),
+            "a ninth waiter is refused without waiting"
+        );
+        let other = coordinator
+            .try_take_waiting_unit("agent-y")
+            .expect("each agent has its own budget");
+
+        let cancelled = {
+            let unit = units.pop().unwrap();
+            tokio::spawn(async move {
+                let _unit = unit;
+                std::future::pending::<()>().await;
+            })
+        };
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let panicked = {
+            let unit = units.pop().unwrap();
+            tokio::spawn(async move {
+                let _unit = unit;
+                panic!("simulated panic in a task holding a waiting unit");
+            })
+        };
+        assert!(panicked.await.unwrap_err().is_panic());
+        assert_eq!(
+            coordinator.waiting_runs("agent-x"),
+            super::MAX_QUEUED_RUNS_PER_AGENT - 2
+        );
+        let refill = coordinator
+            .try_take_waiting_unit("agent-x")
+            .expect("a released unit can be taken again");
+
+        drop((units, refill, other));
+        assert!(
+            coordinator.waiting_budget.lock().unwrap().is_empty(),
+            "an agent with no waiting runs keeps no budget entry"
         );
     }
 

@@ -1291,7 +1291,7 @@ async fn update_agent_entry(
         (status = 400, description = "Invalid request", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 409, description = "A run with this idempotency key is already in progress", body = ErrorBody),
-        (status = 503, description = "Too many concurrent runs", body = ErrorBody)
+        (status = 503, description = "Too many concurrent runs, or too many runs already waiting for this agent", body = ErrorBody)
     )
 )]
 async fn run_agent_entry(
@@ -1300,8 +1300,9 @@ async fn run_agent_entry(
     request: AxumRequest,
 ) -> AxumResponse {
     // Fail fast before reading the body when the daemon is saturated. Nothing is
-    // reserved here: the run takes its room, an agent slot, and then a global
-    // permit, and fails fast again if the permit is gone by then.
+    // reserved here. Once the body parses, the run takes a unit of its agent's
+    // waiting budget (503 when that is exhausted), its room, an agent slot, and
+    // then a global permit, and fails fast again if the permit is gone by then.
     if !state.agent_runs.has_available_permit() {
         return ApiError::service_unavailable(crate::agent_runs::RUN_ADMISSION_SATURATED)
             .into_response();
@@ -3345,6 +3346,217 @@ mod tests {
 
         let first = first.await.expect("first join succeeds");
         assert_eq!(first.status(), StatusCode::OK);
+    }
+
+    /// Records each run's input text in model-call order; every call parks
+    /// until the test releases it.
+    struct OrderedGateModelAdapter {
+        order: StdMutex<Vec<String>>,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for OrderedGateModelAdapter {
+        fn provider(&self) -> &str {
+            "ordered-gate"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let text = request
+                .messages
+                .last()
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            self.order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(text);
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "release gate closed".to_string())?
+                .forget();
+            Ok(model_response(config))
+        }
+    }
+
+    fn legacy_run_request(agent_id: &str, room_id: &str, text: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/agents/{agent_id}/run"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "text": text, "roomId": room_id }).to_string(),
+            ))
+            .expect("run request builds")
+    }
+
+    async fn error_message(response: axum::response::Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("error body is JSON")["error"]
+            .as_str()
+            .expect("error body has a message")
+            .to_string()
+    }
+
+    /// A legacy run waiting for a busy room or agent slot holds no global
+    /// permit, so its waiting is bounded per agent instead (spec §4.9, §16):
+    /// with one run parked in room R, eight more requests for R wait in
+    /// acceptance order and the next one is refused at once.
+    #[tokio::test]
+    async fn legacy_run_route_accepts_eight_waiters_per_agent_then_fails_fast() {
+        use crate::agent_runs::MAX_QUEUED_RUNS_PER_AGENT;
+
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(OrderedGateModelAdapter {
+            order: StdMutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        // Enough global permits that only the room and the waiting budget
+        // decide admission.
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        let app = custom_router(Arc::clone(&state), runs.clone(), DaemonConfig::default());
+        let send = |text: String| {
+            let app = app.clone();
+            let request = legacy_run_request(&agent_id, "room-r", &text);
+            tokio::spawn(async move { app.oneshot(request).await.expect("app responds") })
+        };
+
+        let parked = send("parked".into());
+        entered
+            .acquire()
+            .await
+            .expect("the parked run enters the model")
+            .forget();
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            0,
+            "a run holding its global permit is no longer waiting"
+        );
+
+        let mut waiters = Vec::new();
+        for index in 1..=MAX_QUEUED_RUNS_PER_AGENT {
+            waiters.push(send(format!("waiter-{index}")));
+            // Let this waiter queue on room R before the next one arrives.
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let refused = tokio::time::timeout(Duration::from_secs(1), send("refused".into()))
+            .await
+            .expect("the ninth waiting request is answered at once")
+            .expect("request task joins");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error_message(refused).await,
+            "too many concurrent run requests"
+        );
+        assert_eq!(runs.waiting_runs(&agent_id), MAX_QUEUED_RUNS_PER_AGENT);
+
+        release.add_permits(MAX_QUEUED_RUNS_PER_AGENT + 1);
+        assert_eq!(parked.await.unwrap().status(), StatusCode::OK);
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap().status(), StatusCode::OK);
+        }
+        let expected: Vec<String> = std::iter::once("parked".to_string())
+            .chain((1..=MAX_QUEUED_RUNS_PER_AGENT).map(|index| format!("waiter-{index}")))
+            .collect();
+        assert_eq!(
+            *adapter.order.lock().unwrap(),
+            expected,
+            "the waiters run in acceptance order"
+        );
+        assert_eq!(runs.waiting_runs(&agent_id), 0);
+    }
+
+    /// A legacy run that waited behind its room still fails fast at the
+    /// global permit (spec §4.3, §4.9) and gives its waiting unit back.
+    #[tokio::test]
+    async fn legacy_run_that_waited_for_its_room_fails_fast_without_a_free_permit() {
+        use crate::agent_runs::AdmitMode;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            CountingModelAdapter {
+                calls: Arc::clone(&calls),
+            },
+        ))));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let limiter = Arc::new(Semaphore::new(1));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let app = custom_router(Arc::clone(&state), runs.clone(), DaemonConfig::default());
+
+        // Hold room R (and a slot) without a permit, so the request below
+        // passes the permit pre-check and then waits purely on the room lock.
+        let blocker = runs
+            .admit(&agent_id, "room-r", AdmitMode::TryNow)
+            .await
+            .expect("room R is free");
+        let queued = {
+            let app = app.clone();
+            let request = legacy_run_request(&agent_id, "room-r", "queued");
+            tokio::spawn(async move { app.oneshot(request).await.expect("app responds") })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!queued.is_finished(), "the request waits for room R");
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            1,
+            "the waiting request holds one unit of its agent's waiting budget"
+        );
+
+        // The only permit is taken while the request waits, so none is left
+        // once it holds its room.
+        let _elsewhere = limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("the permit is free");
+        drop(blocker);
+        let response = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("the run fails fast at the permit stage")
+            .expect("request task joins");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error_message(response).await,
+            "too many concurrent run requests"
+        );
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            0,
+            "the refused run gives its unit back"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the run never started");
+        assert!(state.read().await.runs.for_agent(&agent_id).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

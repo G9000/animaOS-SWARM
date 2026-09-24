@@ -6,7 +6,7 @@ use super::contracts::{
     MemoriesEnvelope, MemoryResponse, TaskRequest,
 };
 use super::ApiError;
-use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
+use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom, RUN_ADMISSION_SATURATED};
 use crate::app::SharedDaemonState;
 use crate::runs::RunSource;
 use crate::state::UpdateAgentError;
@@ -203,16 +203,24 @@ pub(crate) async fn handle_run_agent(
     let content = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
+    // Waiting for a busy room or agent slot is bounded per agent (spec §16);
+    // beyond that the route keeps its fail-fast saturation (spec §4.9).
+    let waiting = coordinator
+        .try_take_waiting_unit(agent_id)
+        .ok_or_else(|| ApiError::service_unavailable(RUN_ADMISSION_SATURATED))?;
 
     coordinator
-        .run(AgentRunRequest {
-            agent_id: agent_id.to_string(),
-            content,
-            room,
-            idempotency_key: None,
-            source: RunSource::Api,
-            source_ref: None,
-        })
+        .run_budgeted(
+            AgentRunRequest {
+                agent_id: agent_id.to_string(),
+                content,
+                room,
+                idempotency_key: None,
+                source: RunSource::Api,
+                source_ref: None,
+            },
+            waiting,
+        )
         .await
 }
 
