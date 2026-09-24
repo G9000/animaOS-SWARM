@@ -1901,6 +1901,53 @@ it('keeps drafts in memory when session storage refuses them', async () => {
   );
 });
 
+it('creates one session for the first send and moves text typed meanwhile into it', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  const creating = deferred<void>();
+  const createSession = vi.mocked(daemon.createSession);
+  const createListed = createSession.getMockImplementation()!;
+  createSession.mockImplementationOnce(async (agentId) => {
+    await creating.promise;
+    return createListed(agentId);
+  });
+  const runAgent = vi
+    .spyOn(daemon, 'runAgent')
+    .mockImplementation(async (id, text, _metadata, roomId) => {
+      // The daemon titles a new chat from its first message.
+      setSessionFields(roomId ?? '', { title: text });
+      return {
+        agent: snapshot(id, 'Nova', 1),
+        result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
+      };
+    });
+  render(<ViewHarness />);
+  await openChat();
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await user.type(input, 'First question');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.type(input, 'A follow-up{Enter}');
+
+  await act(async () => creating.resolve());
+  await waitFor(() => expect(window.location.hash).toBe('#/s/chat%3Anew-1'));
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue('A follow-up');
+  expect(createSession).toHaveBeenCalledTimes(1);
+  expect(runAgent).toHaveBeenCalledTimes(1);
+  expect(runAgent).toHaveBeenCalledWith(
+    'agent-main',
+    'First question',
+    expect.objectContaining({ clientRequestId: expect.any(String) }),
+    'chat:new-1',
+  );
+  await screen.findByRole('button', { name: 'First question' });
+  await user.click(screen.getByRole('button', { name: 'New chat' }));
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue('');
+});
+
 it('keeps a page open when the first send creates its session, then returns to that session', async () => {
   const user = userEvent.setup();
   let current = snapshot('agent-main', 'Nova', 1);
