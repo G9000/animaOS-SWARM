@@ -321,6 +321,20 @@ async fn listing_agents_as_summaries_omits_their_messages() {
         2,
         "an unrecognized view falls back to the full response"
     );
+    // Fix round 1 (M2 review): a malformed query string is not a rejection
+    // either -- this route used to ignore the URI entirely.
+    let malformed = json(
+        app.clone()
+            .oneshot(get("/api/agents?%zz=1", OWNER_ORIGIN))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        malformed["agents"][0]["messages"].as_array().unwrap().len(),
+        2,
+        "a malformed query string falls back to the full response, not a rejection"
+    );
 }
 
 #[test]

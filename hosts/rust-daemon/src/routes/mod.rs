@@ -1155,22 +1155,23 @@ async fn generate_profile_entry(
 
 /// Controller ruling 1 (M2 pre-flight audit): an unrecognized `view` value is
 /// ignored (the full response), preserving prior behaviour; only
-/// `view=summary` changes the shape. A malformed query string is still 400.
+/// `view=summary` changes the shape. Fix round 1 (M2 review): a malformed
+/// query string is treated the same as no `view` (the full response) -- this
+/// route used to ignore the URI entirely, and a query it cannot parse is not
+/// a reason to reject the request now.
 #[utoipa::path(
     get,
     path = "/api/agents",
     tag = "agents",
     params(("view" = Option<String>, Query, description = "summary returns AgentSummariesEnvelope: the agents without their messages")),
     responses(
-        (status = 200, description = "List agents (AgentSummariesEnvelope with view=summary)", body = AgentsEnvelope),
-        (status = 400, description = "Malformed query", body = ErrorBody)
+        (status = 200, description = "List agents (AgentSummariesEnvelope with view=summary)", body = AgentsEnvelope)
     )
 )]
 async fn list_agents_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
-    let view = match request_query(&uri) {
-        Ok(query) => query.get("view").filter(|view| !view.is_empty()).cloned(),
-        Err(()) => return ApiError::bad_request_static("malformed query").into_response(),
-    };
+    let view = request_query(&uri)
+        .ok()
+        .and_then(|query| query.get("view").filter(|view| !view.is_empty()).cloned());
     if view.as_deref() == Some("summary") {
         return json_response(
             StatusCode::OK,
