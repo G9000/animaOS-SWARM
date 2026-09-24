@@ -115,17 +115,25 @@ impl DaemonState {
         Some(undo)
     }
 
-    /// Puts back what `prune_hot_tail` removed after its save failed.
+    /// Puts back what `prune_hot_tail` removed after its save failed. An
+    /// agent that cannot be restored keeps its pruned hot tail (the history
+    /// store holds those messages), so its records keep `messagePruned`: a
+    /// later save must never write a delivered record whose reply is gone
+    /// without the mark, or that snapshot would fail validation at boot.
     pub(crate) fn revert_prune(&mut self, undo: PruneUndo) {
+        let mut still_pruned = HashSet::new();
         for snapshot in undo.agents {
             let agent_id = snapshot.state.id.clone();
             if let Err(error) = self.restore_removed_agent(snapshot) {
                 warn!(agent_id = %agent_id, error = %error, "could not restore an agent's hot tail after a failed prune");
+                still_pruned.insert(agent_id);
             }
         }
         for id in undo.marked_outbound {
             if let Some(record) = self.outbound.get_mut(&id) {
-                record.message_pruned = false;
+                if !still_pruned.contains(&record.agent_id) {
+                    record.message_pruned = false;
+                }
             }
         }
     }
@@ -642,5 +650,41 @@ mod tests {
             HOT_TAIL_MESSAGES
         );
         assert_eq!(guard.agent_summaries()[0].message_count, HOT_TAIL_MESSAGES);
+    }
+
+    #[tokio::test]
+    async fn a_revert_that_cannot_restore_an_agent_keeps_its_records_marked() {
+        let (state, agent) =
+            mirrored_state(|agent| room(agent, "telegram:telegram-a", "t", 202)).await;
+        let mut guard = state.write().await;
+        let mut record = outbound(
+            &agent,
+            "delivered",
+            "t001",
+            OutboundDeliveryState::Delivered,
+        );
+        record.room_id = "telegram:telegram-a".into();
+        guard.outbound.insert("delivered".into(), record);
+        let mut undo = guard.prune_hot_tail(NOW_MS).expect("t000 and t001 leave");
+        // A snapshot the daemon can no longer restore (for example a tool
+        // that is no longer registered).
+        undo.agents[0].state.config.tools = Some(vec![anima_core::ToolDescriptor {
+            name: "no_such_tool".into(),
+            description: "gone".into(),
+            parameters_schema: Default::default(),
+            examples: None,
+        }]);
+
+        guard.revert_prune(undo);
+
+        assert_eq!(
+            guard.get_agent(&agent).unwrap().messages.len(),
+            HOT_TAIL_MESSAGES,
+            "the agent keeps its pruned hot tail"
+        );
+        assert!(
+            guard.outbound["delivered"].message_pruned,
+            "its reply is still gone, so the next save must keep the mark"
+        );
     }
 }
