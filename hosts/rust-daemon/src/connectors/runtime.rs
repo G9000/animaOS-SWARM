@@ -7031,10 +7031,7 @@ mod tests {
         assert_eq!(manager.worker_count().await, 1);
 
         release.add_permits(1);
-        running
-            .await
-            .unwrap()
-            .expect("the run commits normally");
+        running.await.unwrap().expect("the run commits normally");
         manager
             .delete_agent(agent_id.clone())
             .await

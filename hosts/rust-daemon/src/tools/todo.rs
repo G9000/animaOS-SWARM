@@ -562,11 +562,18 @@ mod agent_tests {
         assert_eq!(conflict.status, TaskStatus::Error);
         let message = conflict.error.unwrap();
         assert!(
-            message.starts_with("Tasks changed since this run last saw them, so nothing was saved."),
+            message
+                .starts_with("Tasks changed since this run last saw them, so nothing was saved."),
             "{message}"
         );
-        assert!(message.contains("[ ] 1. [pending] From room B"), "{message}");
-        assert!(message.ends_with("call todo_write again with the complete list."), "{message}");
+        assert!(
+            message.contains("[ ] 1. [pending] From room B"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("call todo_write again with the complete list."),
+            "{message}"
+        );
         assert_eq!(
             read_agent_todos(Some(&root), "agent-cas").unwrap().tasks[0].content,
             "From room B"
@@ -584,7 +591,13 @@ mod agent_tests {
             merged.data.unwrap().text,
             "Todos updated (0 completed, 0 in progress, 2 pending). Proceed with current tasks."
         );
-        assert_eq!(read_agent_todos(Some(&root), "agent-cas").unwrap().tasks.len(), 2);
+        assert_eq!(
+            read_agent_todos(Some(&root), "agent-cas")
+                .unwrap()
+                .tasks
+                .len(),
+            2
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
