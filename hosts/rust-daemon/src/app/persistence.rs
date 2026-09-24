@@ -669,4 +669,46 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // Review finding (fix round 1, Important): the backup write's `?` in
+    // `configure_control_plane_store` is the only thing standing between a
+    // failed backup and an unprotected upgrade. Force the write to fail
+    // deterministically (no permission tricks): put a directory where the
+    // backup file needs to go, so `AtomicFile`'s rename onto that path fails.
+    #[tokio::test]
+    async fn a_failed_backup_write_refuses_boot_and_leaves_the_snapshot_untouched() {
+        let dir = temp_dir("backup-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-plane.json");
+        let original = older_snapshot_file(Some(4));
+        std::fs::write(&path, &original).unwrap();
+
+        let backup_path = crate::control_plane_store::pre_sessions_backup_path(&path);
+        std::fs::create_dir_all(&backup_path).unwrap();
+
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_store(&state, Some(ControlPlaneStoreConfig::Json(path.clone())))
+            .await
+            .expect_err("a backup write that cannot replace a directory must refuse boot");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "the original snapshot must be untouched when the backup fails"
+        );
+        let residue = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".atomicwrite")
+            });
+        assert!(
+            !residue,
+            "the atomic writer's temp file must not survive a failed rename"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

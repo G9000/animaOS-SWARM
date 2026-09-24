@@ -230,7 +230,7 @@ async fn backup_postgres_snapshot(pool: &PgPool, version: u32) -> io::Result<Str
     sqlx::query(
         r#"
         INSERT INTO host_snapshots (key, version, payload, updated_at)
-        SELECT $1, version, payload, now() FROM host_snapshots WHERE key = $2
+        SELECT $1::text, version, payload, now() FROM host_snapshots WHERE key = $2
         ON CONFLICT (key)
         DO UPDATE SET
             version = EXCLUDED.version,
