@@ -14,6 +14,17 @@ export interface CompanionSessionFilters {
   query: string;
 }
 
+/** The SDK's `DaemonTooOldError`, by its stable code: the daemon has no
+ *  sessions routes yet (spec §13.4). */
+function isDaemonTooOld(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    error.code === 'daemon_too_old'
+  );
+}
+
 /** The companion's sessions plus its helpers' (spec §3.3 `includeHelpers`). */
 export function useCompanionSessions(
   agentId: string | null,
@@ -22,6 +33,7 @@ export function useCompanionSessions(
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [daemonTooOld, setDaemonTooOld] = useState(false);
   const generation = useRef(0);
   const query = filters.query.trim();
   const { archived } = filters;
@@ -30,6 +42,7 @@ export function useCompanionSessions(
     generation.current += 1;
     setSessions([]);
     setError(null);
+    setDaemonTooOld(false);
   }, [agentId]);
 
   const refresh = useCallback(async () => {
@@ -46,9 +59,12 @@ export function useCompanionSessions(
       if (request !== generation.current) return;
       setSessions(page.sessions);
       setError(null);
+      setDaemonTooOld(false);
     } catch (caught) {
       if (request !== generation.current) return;
       setError(caught instanceof Error ? caught.message : String(caught));
+      // Only a successful list clears it; a dropped connection proves nothing.
+      if (isDaemonTooOld(caught)) setDaemonTooOld(true);
     } finally {
       if (request === generation.current) setLoading(false);
     }
@@ -85,5 +101,5 @@ export function useCompanionSessions(
     );
   }, []);
 
-  return { sessions, loading, error, refresh, upsert, remove };
+  return { sessions, loading, error, daemonTooOld, refresh, upsert, remove };
 }

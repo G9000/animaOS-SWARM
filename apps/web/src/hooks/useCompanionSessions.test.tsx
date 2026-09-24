@@ -1,5 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { DaemonTooOldError } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
 import { sessionFixture } from '../test/sessions';
@@ -96,5 +97,16 @@ describe('useCompanionSessions', () => {
     expect(result.current.sessions.map((session) => session.id)).toEqual([
       'chat:2',
     ]);
+  });
+
+  it('flags a daemon that predates the sessions routes', async () => {
+    vi.spyOn(daemon, 'listSessions').mockRejectedValue(
+      new DaemonTooOldError('agent-main'),
+    );
+    const { result } = renderHook(() =>
+      useCompanionSessions('agent-main', { archived: false, query: '' }),
+    );
+
+    await waitFor(() => expect(result.current.daemonTooOld).toBe(true));
   });
 });

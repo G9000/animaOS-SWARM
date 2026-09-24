@@ -245,6 +245,8 @@ export function ViewHarness() {
     archived: showArchived,
     query: sessionQuery,
   });
+  // A daemon without the sessions routes cannot take a send (spec §13.4).
+  const daemonTooOld = sessions.daemonTooOld;
   const routeSessionId =
     conversationRoute.kind === 'session' ? conversationRoute.sessionId : null;
   const listedSession = routeSessionId
@@ -867,7 +869,12 @@ export function ViewHarness() {
   };
 
   const send = () => {
-    if (!agent || connection !== 'online' || resetInFlightRef.current !== null)
+    if (
+      !agent ||
+      connection !== 'online' ||
+      resetInFlightRef.current !== null ||
+      daemonTooOld
+    )
       return;
     const text = draft.trim();
     if (!text) return;
@@ -992,7 +999,7 @@ export function ViewHarness() {
       onQueryChange={setSessionQuery}
       showArchived={showArchived}
       onShowArchivedChange={setShowArchived}
-      error={sessionActionError ?? sessions.error}
+      error={sessionActionError ?? (daemonTooOld ? null : sessions.error)}
       onOpen={openSession}
       onRename={renameSession}
       onArchive={archiveSession}
@@ -1009,7 +1016,7 @@ export function ViewHarness() {
       hasOlder={history.hasOlder}
       loadingOlder={history.loadingOlder}
       onLoadOlder={() => void history.loadOlder()}
-      missing={routeSessionId !== null && history.missing}
+      missing={routeSessionId !== null && history.missing && !daemonTooOld}
       telegramAvailable={activeConnector !== null}
       scrollerRef={scrollerRef}
       onSuggestion={setDraft}
@@ -1020,6 +1027,7 @@ export function ViewHarness() {
         disabled:
           resetting ||
           sessionLoading ||
+          daemonTooOld ||
           (activeSession?.activeRuns ?? 0) > 0,
         offline: connection === 'offline',
         onSend: send,
@@ -1059,6 +1067,19 @@ export function ViewHarness() {
             <p role="status" className="px-4 pt-3 text-xs text-ink-3">
               {legacyMigrationError}
             </p>
+          ) : null}
+          {daemonTooOld ? (
+            <div
+              role="alert"
+              className="mx-4 mt-3 rounded-xl border border-danger/25 bg-danger/[0.08] px-3.5 py-2.5 text-xs leading-relaxed"
+            >
+              <p className="font-semibold text-danger">Update the daemon</p>
+              <p className="text-ink-2">
+                This console keeps chats as sessions, which this anima-daemon
+                does not support yet. Update and restart the daemon, then
+                reload this page.
+              </p>
+            </div>
           ) : null}
           {routeSessionId && history.error ? (
             <p role="alert" className="px-4 pt-3 text-xs text-danger">

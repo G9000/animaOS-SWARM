@@ -8,7 +8,11 @@ import {
 } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Session, SessionMessage } from '@animaOS-SWARM/sdk';
+import {
+  DaemonTooOldError,
+  type Session,
+  type SessionMessage,
+} from '@animaOS-SWARM/sdk';
 
 import { toolNamesForProfile } from './lib/agent-access';
 import {
@@ -1949,6 +1953,28 @@ it('keeps a page open when the first send creates its session, then returns to t
   await user.click(screen.getByRole('button', { name: 'Open companion chat' }));
   expect(window.location.hash).toBe('#/s/chat%3Anew-1');
   expect(await screen.findByText('Launch plan ready')).toBeVisible();
+});
+
+it('asks for a daemon update instead of failing sends when sessions are missing', async () => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.mocked(daemon.listSessions).mockRejectedValue(
+    new DaemonTooOldError('agent-main'),
+  );
+  const runAgent = vi.spyOn(daemon, 'runAgent');
+  render(<ViewHarness />);
+
+  expect(await screen.findByText('Update the daemon')).toBeVisible();
+  const input = screen.getByPlaceholderText('Message Nova…');
+  expect(input).toBeDisabled();
+  fireEvent.change(input, { target: { value: 'Hello' } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+  expect(daemon.createSession).not.toHaveBeenCalled();
+  expect(runAgent).not.toHaveBeenCalled();
 });
 
 it('replies to a Telegram session through its connector', async () => {
