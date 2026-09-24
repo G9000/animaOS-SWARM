@@ -32,9 +32,10 @@ pub(crate) const MAX_MESSAGE_PAGE: usize = 200;
 /// The longest accepted search query, in characters.
 pub(crate) const MAX_SEARCH_QUERY_CHARS: usize = 200;
 /// Sessions one search returns at most (Controller ruling, M2 pre-flight
-/// audit): the store groups by session before this limit applies, so it caps
-/// sessions, not the rows the store scans to find them.
-const SEARCH_ROW_LIMIT: usize = 500;
+/// audit): `HistoryStore::search_sessions` groups by session before this
+/// limit applies, so it caps sessions, not the rows the store scans to find
+/// them (renamed from `SEARCH_ROW_LIMIT`, fix round 1, M2 review).
+const SEARCH_SESSION_LIMIT: usize = 500;
 /// History rows read for a preview when the hot tail has none.
 const PREVIEW_ROW_LIMIT: usize = 20;
 
@@ -314,7 +315,7 @@ async fn store_matches(
         return HashMap::new();
     }
     let rows = match store
-        .search_sessions(&agent_ids, query, SEARCH_ROW_LIMIT)
+        .search_sessions(&agent_ids, query, SEARCH_SESSION_LIMIT)
         .await
     {
         Ok(rows) => rows,
@@ -933,7 +934,7 @@ mod tests {
     async fn search_still_finds_a_session_whose_only_match_is_older_than_the_row_limit_elsewhere() {
         // Controller ruling 2 (M2 pre-flight audit): session search ranks
         // sessions by their newest matching message, so a session whose only
-        // match is older than SEARCH_ROW_LIMIT matches elsewhere still shows.
+        // match is older than SEARCH_SESSION_LIMIT matches elsewhere still shows.
         let mut daemon = DaemonState::new();
         let agent = daemon
             .create_agent(agent_config("companion"))
@@ -950,7 +951,7 @@ mod tests {
         daemon
             .sessions
             .insert(session(&agent, "chat:quiet", SessionKind::Chat, "Quiet", 1));
-        let busy_rows = (0..=SEARCH_ROW_LIMIT as u64)
+        let busy_rows = (0..=SEARCH_SESSION_LIMIT as u64)
             .map(|n| {
                 history_message(
                     &format!("busy-{n}"),
@@ -997,7 +998,7 @@ mod tests {
         assert_eq!(
             page.sessions.iter().map(|view| view.record.id.as_str()).collect::<Vec<_>>(),
             ["chat:busy", "chat:quiet"],
-            "a session with more than SEARCH_ROW_LIMIT matches must not crowd out an older session's only match"
+            "a session with more than SEARCH_SESSION_LIMIT matches must not crowd out an older session's only match"
         );
     }
 
