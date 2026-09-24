@@ -1167,7 +1167,7 @@ async fn generate_profile_entry(
     tag = "agents",
     params(("view" = Option<String>, Query, description = "summary returns AgentSummariesEnvelope: the agents without their messages")),
     responses(
-        (status = 200, description = "List agents (AgentSummariesEnvelope with view=summary). messages hold the hot tail: each session's newest 200 messages plus anything from the last 24 hours; page older ones with GET /api/agents/{agent_id}/sessions/{session_id}/messages", body = AgentsEnvelope)
+        (status = 200, description = "List agents (AgentSummariesEnvelope with view=summary). messages and messageCount cover only the hot tail: each session's newest 200 visible messages (silent check-in turns among them stay) plus anything from the last 24 hours. The session routes cover the full history; page it with GET /api/agents/{agent_id}/sessions/{session_id}/messages", body = AgentsEnvelope)
     )
 )]
 async fn list_agents_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
@@ -1215,7 +1215,7 @@ async fn create_agent_entry(State(state): State<AppState>, request: AxumRequest)
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent identifier")),
     responses(
-        (status = 200, description = "Agent snapshot. messages hold the hot tail: each session's newest 200 messages plus anything from the last 24 hours; page older ones with GET /api/agents/{agent_id}/sessions/{session_id}/messages", body = AgentEnvelope),
+        (status = 200, description = "Agent snapshot. messages and messageCount cover only the hot tail: each session's newest 200 visible messages (silent check-in turns among them stay) plus anything from the last 24 hours. The session routes cover the full history; page it with GET /api/agents/{agent_id}/sessions/{session_id}/messages", body = AgentEnvelope),
         (status = 404, description = "Not found", body = ErrorBody)
     )
 )]

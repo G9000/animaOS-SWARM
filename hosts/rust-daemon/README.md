@@ -139,9 +139,9 @@ application endpoints. The summary below matches the live router in
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/agents` | List all registered agent snapshots. `?view=summary` returns them without `messages`. |
+| `GET` | `/api/agents` | List all registered agent snapshots; `messages` and `messageCount` cover only the hot tail (see Sessions). `?view=summary` returns them without `messages`. |
 | `POST` | `/api/agents` | Create an agent. Body: `AgentConfig` JSON. Returns `201` with the created snapshot. |
-| `GET` | `/api/agents/{agent_id}` | Get one agent snapshot. |
+| `GET` | `/api/agents/{agent_id}` | Get one agent snapshot; `messages` and `messageCount` cover only the hot tail (see Sessions). |
 | `DELETE` | `/api/agents/{agent_id}` | Remove an agent runtime and return a deleted flag. |
 | `POST` | `/api/agents/{agent_id}/run` | Run the agent with `{"text":"..."}`. Blocks until completion and returns the updated snapshot plus task result. |
 | `GET` | `/api/agents/{agent_id}/memories/recent` | Get recent memories for the agent. Optional `?limit=N`. |
@@ -160,7 +160,7 @@ Every session route requires local-owner authorization, and reads answer `Cache-
 | `GET` | `/api/agents/{agent_id}/sessions/{session_id}/messages` | Messages oldest to newest: `?before=<messageId>&limit=50&includeHidden=false`. Returns `{ messages, nextBefore }`. |
 | `GET` | `/api/agents/{agent_id}/sessions/{session_id}/export` | The full transcript as `text/markdown`, including messages kept only in the history store, with silent check-in turns marked rather than hidden. |
 
-Every committed message is mirrored to the history store (`ANIMAOS_RS_HISTORY_SQLITE_FILE`, the Postgres history tables, or bounded in-memory tables in ephemeral mode). Every 10 minutes the daemon prunes mirrored messages that are neither among their session's newest 200 nor from the last 24 hours from the control plane (never in ephemeral mode, never while a run in the session is active or a Telegram delivery still needs the message). `GET /api/agents` and `GET /api/agents/{agent_id}` then carry only this hot tail; the session messages and export routes still return the full history.
+Every committed message is mirrored to the history store (`ANIMAOS_RS_HISTORY_SQLITE_FILE`, the Postgres history tables, or bounded in-memory tables in ephemeral mode). Every 10 minutes the daemon prunes mirrored messages from the control plane down to a hot tail: each session's newest 200 visible messages (silent check-in turns among them stay too) plus anything from the last 24 hours. It never prunes in ephemeral mode, while a run in the session is active, or while a Telegram delivery still needs the message. `GET /api/agents` and `GET /api/agents/{agent_id}` then cover only this hot tail: their `messages` and `messageCount` (also with `?view=summary`) count hot messages, not the full history. The session routes still cover the full history: a session's `messageCount`, its message pages, and its export.
 
 ### Agencies
 
