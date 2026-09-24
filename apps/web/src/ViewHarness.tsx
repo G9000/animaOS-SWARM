@@ -6,31 +6,77 @@ import {
   useRef,
   useState,
 } from 'react';
+import type { Session } from '@animaOS-SWARM/sdk';
 
-import { ActivityView } from './components/ActivityView';
-import { Composer, MessageList } from './components/ChatScreen';
 import { AlertIcon } from './components/icons';
 import { CompanionSetup } from './components/onboarding/CompanionSetup';
 import { SettingsPanel } from './components/SettingsPanel';
 import { ConnectorsView } from './components/ConnectorsView';
+import { SessionSidebar } from './components/sessions/SessionSidebar';
+import { SessionView } from './components/sessions/SessionView';
 import { TelegramSettings } from './components/TelegramSettings';
-import { TelegramThread } from './components/TelegramThread';
 import { WorkspaceShell } from './components/WorkspaceShell';
 import { useAgentIntegrations } from './hooks/useAgentIntegrations';
+import { useCompanionSessions } from './hooks/useCompanionSessions';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
+import { useSessionMessages } from './hooks/useSessionMessages';
 import { clearCheckins, importLegacyCheckins } from './lib/checkins';
 import {
   daemon,
   toAgentDetail,
+  toChatMessage,
   type AgentUpdateInput,
   type DaemonSnapshot,
 } from './lib/daemon-api';
 import { selectMainAgent } from './lib/agent-access';
+import { useHashRoute, type HashRoute } from './lib/hash-route';
+import { exportFileName, sessionKey } from './lib/session-groups';
+import {
+  createTelegramIdempotencyKey,
+  safeIntegrationError,
+} from './lib/telegram';
 
 interface AgentOperation {
   generation: number;
   lifecycleGeneration: number;
   targetAgentId: string;
+}
+
+type ChatState = {
+  draft: string;
+  failedDrafts: { requestId: string; text: string }[];
+  sending: boolean;
+  error: string | null;
+};
+
+const EMPTY_CHAT: ChatState = {
+  draft: '',
+  failedDrafts: [],
+  sending: false,
+  error: null,
+};
+const HOME_CONVERSATION = 'home';
+
+/** Chat state is kept per agent and conversation (`home` or `session:<id>`). */
+function chatKey(agentId: string, conversation: string): string {
+  return `${agentId}\u0000${conversation}`;
+}
+
+function sessionConversation(sessionId: string): string {
+  return `session:${sessionId}`;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function saveTextFile(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function ConnectingState() {
@@ -117,60 +163,111 @@ export function ViewHarness() {
   const mainAgent = selectMainAgent(agents);
   // Helpers are implementation details, never a second top-level persona.
   const agent = mainAgent;
+  const agentId = agent?.id ?? null;
   const availableAgentIdsRef = useRef(new Set<string>());
   availableAgentIdsRef.current = new Set(agents.map((item) => item.id));
+  const [route, navigate] = useHashRoute();
+  // A page hides the conversation but keeps it: the last chat or session stays loaded.
+  const lastConversationRef = useRef<HashRoute>({ kind: 'home' });
+  if (route.kind !== 'page') lastConversationRef.current = route;
+  const conversationRoute = lastConversationRef.current;
 
-  type ChatState = {
-    draft: string;
-    failedDrafts: { requestId: string; text: string }[];
-    sending: boolean;
-    error: string | null;
-  };
+  const [sessionQuery, setSessionQuery] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
+  const [sessionActionError, setSessionActionError] = useState<string | null>(
+    null,
+  );
+  const sessions = useCompanionSessions(agentId, {
+    archived: showArchived,
+    query: sessionQuery,
+  });
+  const routeSessionId =
+    conversationRoute.kind === 'session' ? conversationRoute.sessionId : null;
+  const listedSession = routeSessionId
+    ? (sessions.sessions.find((item) => item.id === routeSessionId) ?? null)
+    : null;
+  const sessionListed = listedSession !== null;
+  // A session outside the loaded list (archived or older) is read on its own.
+  const [fetchedSession, setFetchedSession] = useState<Session | null>(null);
+  useEffect(() => {
+    if (!routeSessionId || sessionListed || !agentId) return;
+    let active = true;
+    void daemon.getSession(agentId, routeSessionId).then(
+      (session) => {
+        if (active) setFetchedSession(session);
+      },
+      () => undefined,
+    );
+    return () => {
+      active = false;
+    };
+  }, [agentId, routeSessionId, sessionListed]);
+  const activeSession =
+    listedSession ??
+    (fetchedSession && fetchedSession.id === routeSessionId ? fetchedSession : null);
+  const [messagesRefresh, setMessagesRefresh] = useState(0);
+  const history = useSessionMessages(
+    routeSessionId ? (activeSession?.agentId ?? agentId) : null,
+    routeSessionId,
+    messagesRefresh,
+  );
+  const chatMessages = useMemo(
+    () => history.messages.map(toChatMessage),
+    [history.messages],
+  );
+
+  const conversation = routeSessionId
+    ? sessionConversation(routeSessionId)
+    : HOME_CONVERSATION;
+  const activeChatKey = agentId ? chatKey(agentId, conversation) : null;
   const [chats, setChats] = useState<Record<string, ChatState>>({});
-  const emptyChat: ChatState = {
-    draft: '',
-    failedDrafts: [],
-    sending: false,
-    error: null,
-  };
-  const chat = chats[agent?.id ?? ''] ?? emptyChat;
+  const chat = (activeChatKey ? chats[activeChatKey] : undefined) ?? EMPTY_CHAT;
   const { draft, failedDrafts, sending, error: workspaceError } = chat;
   const failedDraft = failedDrafts[0]?.text ?? null;
-  const updateChat = (
-    id: string,
-    patch: Partial<ChatState> | ((value: ChatState) => Partial<ChatState>),
-  ) => {
-    setChats((current) => {
-      const value = current[id] ?? emptyChat;
-      return {
-        ...current,
-        [id]: {
-          ...value,
-          ...(typeof patch === 'function' ? patch(value) : patch),
-        },
-      };
-    });
-  };
-  const setDraft = (value: string | ((current: string) => string)) => {
-    if (agent)
-      updateChat(agent.id, (current) => ({
-        draft: typeof value === 'function' ? value(current.draft) : value,
-      }));
-  };
+  const updateChat = useCallback(
+    (
+      key: string,
+      patch: Partial<ChatState> | ((value: ChatState) => Partial<ChatState>),
+    ) => {
+      setChats((current) => {
+        const value = current[key] ?? EMPTY_CHAT;
+        return {
+          ...current,
+          [key]: {
+            ...value,
+            ...(typeof patch === 'function' ? patch(value) : patch),
+          },
+        };
+      });
+    },
+    [],
+  );
+  const setDraft = useCallback(
+    (value: string | ((current: string) => string)) => {
+      if (activeChatKey)
+        updateChat(activeChatKey, (current) => ({
+          draft: typeof value === 'function' ? value(current.draft) : value,
+        }));
+    },
+    [activeChatKey, updateChat],
+  );
   const setFailedDrafts = (
     value: (current: ChatState['failedDrafts']) => ChatState['failedDrafts'],
   ) => {
-    if (agent)
-      updateChat(agent.id, (current) => ({
+    if (activeChatKey)
+      updateChat(activeChatKey, (current) => ({
         failedDrafts: value(current.failedDrafts),
       }));
   };
   const setWorkspaceError = (error: string | null) => {
-    if (agent) updateChat(agent.id, { error });
+    if (activeChatKey) updateChat(activeChatKey, { error });
   };
   const pendingSendsRef = useRef(new Set<string>());
   const uncertainSendsRef = useRef(
-    new Map<string, { agentId: string; text: string; waiting: boolean }>(),
+    new Map<
+      string,
+      { agentId: string; key: string; text: string; waiting: boolean }
+    >(),
   );
   useEffect(() => {
     for (const [requestId, pending] of uncertainSendsRef.current) {
@@ -178,30 +275,39 @@ export function ViewHarness() {
         (item) => item.state.id === pending.agentId,
       );
       if (!snapshot) continue;
-      const delivered = snapshot.messages.some(
-        (message) =>
-          message.role === 'user' &&
-          message.content.metadata?.clientRequestId === requestId,
-      );
+      // A committed user message means its blocking run finished (M2 runs
+      // commit their messages together).
+      const delivered =
+        snapshot.messages.some(
+          (message) =>
+            message.role === 'user' &&
+            message.content.metadata?.clientRequestId === requestId,
+        ) ||
+        history.messages.some(
+          (message) =>
+            message.role === 'user' &&
+            message.metadata.clientRequestId === requestId,
+        );
       const running = snapshot.state.status === 'running';
       if (!delivered && (!pending.waiting || running)) continue;
-      if (pending.waiting && running) continue;
       if (delivered) uncertainSendsRef.current.delete(requestId);
       else
         uncertainSendsRef.current.set(requestId, {
           ...pending,
           waiting: false,
         });
-      if (pending.waiting) pendingSendsRef.current.delete(pending.agentId);
-      updateChat(pending.agentId, (current) => {
+      if (pending.waiting) pendingSendsRef.current.delete(pending.key);
+      updateChat(pending.key, (current) => {
         const index = delivered
           ? current.failedDrafts.findIndex(
-              (draft) => draft.requestId === requestId,
+              (item) => item.requestId === requestId,
             )
           : -1;
-        const failedDrafts = current.failedDrafts.filter((_, i) => i !== index);
+        const remaining = current.failedDrafts.filter(
+          (_, position) => position !== index,
+        );
         return {
-          failedDrafts,
+          failedDrafts: remaining,
           sending: pending.waiting ? false : current.sending,
           error:
             current.sending && !pending.waiting
@@ -209,14 +315,15 @@ export function ViewHarness() {
               : delivered
                 ? snapshot.state.status === 'failed'
                   ? 'The agent run failed. Check the conversation for details.'
-                  : failedDrafts.length
+                  : remaining.length
                     ? current.error
                     : null
                 : 'The daemon has not confirmed this message. Check the conversation before restoring it.',
         };
       });
+      if (delivered) setMessagesRefresh((value) => value + 1);
     }
-  }, [agentSnapshots]);
+  }, [agentSnapshots, history.messages, updateChat]);
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null,
   );
@@ -224,11 +331,6 @@ export function ViewHarness() {
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [resetting, setResetting] = useState(false);
-  const [ciPrompt, setCiPrompt] = useState('');
-  const [ciIntervalMin, setCiIntervalMin] = useState(30);
-  const [ciTarget, setCiTarget] = useState<'workspace' | 'telegram'>(
-    'workspace',
-  );
   const [legacyMigrationError, setLegacyMigrationError] = useState<
     string | null
   >(null);
@@ -242,12 +344,18 @@ export function ViewHarness() {
   const currentAgentIdRef = useRef<string | null>(null);
   const previousSelectedMainIdRef = useRef<string | null>(null);
 
-  const agentId = agent?.id ?? null;
   const integrations = useAgentIntegrations(agentId);
   const telegramConnector = integrations.connectors[0] ?? null;
+  const activeConnector =
+    activeSession?.kind === 'telegram'
+      ? (integrations.connectors.find(
+          (item) => item.roomId === activeSession.roomId,
+        ) ?? null)
+      : null;
   useLayoutEffect(() => {
     if (previousSelectedMainIdRef.current === agentId) return;
 
+    const previousAgentId = previousSelectedMainIdRef.current;
     previousSelectedMainIdRef.current = agentId;
     agentLifecycleGenerationRef.current += 1;
     agentOperationGenerationRef.current += 1;
@@ -257,16 +365,16 @@ export function ViewHarness() {
     settingsTriggerRef.current = null;
     savingSettingsRef.current = false;
 
-    setCiPrompt('');
-    setCiIntervalMin(30);
-    setCiTarget('workspace');
     setLegacyMigrationError(null);
+    setSessionActionError(null);
     setSettingsSaveError(null);
     setResetError(null);
     setShowSettings(false);
     setSavingSettings(false);
     setResetting(false);
-  }, [agentId]);
+    // Another companion has other sessions: start from a new chat.
+    if (previousAgentId !== null) navigate({ kind: 'home' }, { replace: true });
+  }, [agentId, navigate]);
 
   const beginAgentOperation = useCallback(
     (targetAgentId: string): AgentOperation => ({
@@ -342,30 +450,24 @@ export function ViewHarness() {
     };
   }, [agentId]);
 
+  // Opening an unread session marks it read up to its newest message.
+  const markedReadRef = useRef(new Map<string, number>());
+  const refreshSessions = sessions.refresh;
   useEffect(() => {
-    if (telegramConnector) void integrations.loadMessages(telegramConnector.id);
-  }, [telegramConnector?.id]);
-
-  const addCheckin = async () => {
-    const text = ciPrompt.trim();
-    if (!text || !agentId) return;
-    const added = await integrations.createSchedule({
-      prompt: text,
-      trigger: {
-        type: 'interval',
-        intervalMs: Math.max(1, ciIntervalMin) * 60_000,
-      },
-      target:
-        ciTarget === 'telegram' && telegramConnector
-          ? { type: 'connector', connectorId: telegramConnector.id }
-          : { type: 'workspace' },
-    });
-    if (added) setCiPrompt('');
-  };
-
-  const removeCheckin = (id: string) => {
-    void integrations.removeSchedule(id);
-  };
+    if (!activeSession?.unread || history.messages.length === 0) return;
+    const newest = history.messages[history.messages.length - 1].createdAtMs;
+    const key = sessionKey(activeSession);
+    if ((markedReadRef.current.get(key) ?? 0) >= newest) return;
+    markedReadRef.current.set(key, newest);
+    void daemon
+      .updateSession(activeSession.agentId, activeSession.id, {
+        lastReadAtMs: newest,
+      })
+      .then(
+        () => refreshSessions(),
+        () => markedReadRef.current.delete(key),
+      );
+  }, [activeSession, history.messages, refreshSessions]);
 
   const changeWorkspaceAvatar = useCallback(
     async (file: File) => {
@@ -417,9 +519,7 @@ export function ViewHarness() {
       return adopted;
     } catch (caught) {
       if (isCurrentAgentOperation(operation)) {
-        setSettingsSaveError(
-          caught instanceof Error ? caught.message : String(caught),
-        );
+        setSettingsSaveError(errorMessage(caught));
       }
       return false;
     } finally {
@@ -450,9 +550,7 @@ export function ViewHarness() {
         await daemon.deleteAgent(targetAgentId);
       } catch (caught) {
         if (isCurrentResetOperation(operation)) {
-          setResetError(
-            caught instanceof Error ? caught.message : String(caught),
-          );
+          setResetError(errorMessage(caught));
         }
         return;
       }
@@ -478,24 +576,29 @@ export function ViewHarness() {
     }
   };
 
-  const sendToAgent = async (
+  const refreshConversation = () => {
+    setMessagesRefresh((value) => value + 1);
+    void sessions.refresh();
+  };
+
+  /** One blocking run in a session's room (spec §4.9). */
+  const runInSession = async (
     targetId: string,
-    content: string,
+    roomId: string,
+    text: string,
+    key: string,
     preserveDraft = false,
   ) => {
-    const text = content.trim();
     if (
-      !text ||
       !availableAgentIdsRef.current.has(targetId) ||
       connection !== 'online' ||
-      pendingSendsRef.current.has(targetId) ||
-      agents.find((item) => item.id === targetId)?.status === 'Running' ||
+      pendingSendsRef.current.has(key) ||
       resetInFlightRef.current !== null
     )
       return;
     const clientRequestId = crypto.randomUUID();
-    pendingSendsRef.current.add(targetId);
-    updateChat(targetId, {
+    pendingSendsRef.current.add(key);
+    updateChat(key, {
       sending: true,
       error: null,
       ...(preserveDraft ? {} : { draft: '' }),
@@ -505,7 +608,7 @@ export function ViewHarness() {
         targetId,
         text,
         { clientRequestId },
-        `direct:${targetId}`,
+        roomId,
       );
       if (
         availableAgentIdsRef.current.has(targetId) &&
@@ -513,40 +616,183 @@ export function ViewHarness() {
       ) {
         acceptAgentSnapshot(updatedAgent);
         if (result.status === 'error')
-          updateChat(targetId, { error: result.error ?? 'run failed' });
+          updateChat(key, { error: result.error ?? 'run failed' });
       }
     } catch (caught) {
       if (availableAgentIdsRef.current.has(targetId)) {
         const timedOut =
-          caught instanceof Error &&
-          'status' in caught &&
-          caught.status === 408;
+          caught instanceof Error && 'status' in caught && caught.status === 408;
         uncertainSendsRef.current.set(clientRequestId, {
           agentId: targetId,
+          key,
           text,
           waiting: timedOut,
         });
-        updateChat(targetId, (current) => ({
+        updateChat(key, (current) => ({
           failedDrafts: [
             ...current.failedDrafts,
             { requestId: clientRequestId, text },
           ],
           error: timedOut
             ? 'The response timed out. Checking the daemon for completion—do not resend yet.'
-            : caught instanceof Error
-              ? caught.message
-              : String(caught),
+            : errorMessage(caught),
         }));
         if (timedOut) void refreshAgents();
       }
     } finally {
       if (!uncertainSendsRef.current.get(clientRequestId)?.waiting) {
-        pendingSendsRef.current.delete(targetId);
-        updateChat(targetId, { sending: false });
+        pendingSendsRef.current.delete(key);
+        updateChat(key, { sending: false });
       }
+      refreshConversation();
     }
   };
-  const send = () => (agent ? sendToAgent(agent.id, draft) : Promise.resolve());
+
+  /** A new chat becomes a session with its first message (spec §3.3). */
+  const startChat = async (targetId: string, text: string) => {
+    const homeKey = chatKey(targetId, HOME_CONVERSATION);
+    if (pendingSendsRef.current.has(homeKey)) return;
+    pendingSendsRef.current.add(homeKey);
+    updateChat(homeKey, { sending: true, error: null, draft: '' });
+    let session: Session;
+    try {
+      session = await daemon.createSession(targetId);
+    } catch (caught) {
+      pendingSendsRef.current.delete(homeKey);
+      updateChat(homeKey, (current) => ({
+        sending: false,
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: crypto.randomUUID(), text },
+        ],
+        error: errorMessage(caught),
+      }));
+      return;
+    }
+    pendingSendsRef.current.delete(homeKey);
+    if (currentAgentIdRef.current !== targetId) {
+      updateChat(homeKey, { sending: false });
+      return;
+    }
+    const target = chatKey(targetId, sessionConversation(session.id));
+    // Text typed while the chat was created moves with it.
+    setChats((current) => {
+      const home = current[homeKey] ?? EMPTY_CHAT;
+      return {
+        ...current,
+        [homeKey]: { ...home, draft: '', sending: false },
+        [target]: { ...(current[target] ?? EMPTY_CHAT), draft: home.draft },
+      };
+    });
+    sessions.upsert(session);
+    navigate({ kind: 'session', sessionId: session.id }, { replace: true });
+    await runInSession(targetId, session.roomId, text, target, true);
+  };
+
+  /** An owner turn in a Telegram session goes out through its connector. */
+  const replyOnTelegram = async (
+    targetId: string,
+    connectorId: string,
+    text: string,
+    key: string,
+  ) => {
+    if (pendingSendsRef.current.has(key)) return;
+    pendingSendsRef.current.add(key);
+    updateChat(key, { sending: true, error: null, draft: '' });
+    try {
+      const response = await daemon.sendConnectorMessage(
+        targetId,
+        connectorId,
+        text,
+        createTelegramIdempotencyKey(),
+      );
+      if (response.result.status === 'error')
+        updateChat(key, { error: response.result.error ?? 'run failed' });
+    } catch (caught) {
+      updateChat(key, (current) => ({
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: crypto.randomUUID(), text },
+        ],
+        error: safeIntegrationError(caught),
+      }));
+    } finally {
+      pendingSendsRef.current.delete(key);
+      updateChat(key, { sending: false });
+      refreshConversation();
+    }
+  };
+
+  const send = () => {
+    if (!agent || connection !== 'online' || resetInFlightRef.current !== null)
+      return;
+    const text = draft.trim();
+    if (!text) return;
+    if (!routeSessionId) {
+      void startChat(agent.id, text);
+      return;
+    }
+    const key = chatKey(agent.id, sessionConversation(routeSessionId));
+    if (activeSession?.kind === 'telegram') {
+      if (activeConnector)
+        void replyOnTelegram(agent.id, activeConnector.id, text, key);
+      return;
+    }
+    void runInSession(
+      activeSession?.agentId ?? agent.id,
+      activeSession?.roomId ?? routeSessionId,
+      text,
+      key,
+    );
+  };
+
+  const newChat = () => navigate({ kind: 'home' });
+  const openSession = (session: Session) =>
+    navigate({ kind: 'session', sessionId: session.id });
+  const renameSession = async (session: Session, title: string) => {
+    try {
+      await daemon.updateSession(session.agentId, session.id, { title });
+      setSessionActionError(null);
+      await sessions.refresh();
+      return true;
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+      return false;
+    }
+  };
+  const archiveSession = async (session: Session, archived: boolean) => {
+    try {
+      await daemon.updateSession(session.agentId, session.id, { archived });
+      setSessionActionError(null);
+      await sessions.refresh();
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+    }
+  };
+  const exportSession = async (session: Session) => {
+    try {
+      saveTextFile(
+        exportFileName(session.title),
+        await daemon.exportSession(session.agentId, session.id),
+      );
+      setSessionActionError(null);
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+    }
+  };
+  const deleteSession = async (session: Session) => {
+    try {
+      await daemon.deleteSession(session.agentId, session.id);
+      setSessionActionError(null);
+      sessions.remove(session);
+      if (routeSessionId === session.id) {
+        if (route.kind === 'page') lastConversationRef.current = { kind: 'home' };
+        else navigate({ kind: 'home' }, { replace: true });
+      }
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+    }
+  };
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {
     return <ConnectingState />;
@@ -597,6 +843,82 @@ export function ViewHarness() {
     />
   ) : null;
 
+  const sidebar = (
+    <SessionSidebar
+      sessions={sessions.sessions}
+      activeKey={activeSession ? sessionKey(activeSession) : null}
+      query={sessionQuery}
+      onQueryChange={setSessionQuery}
+      showArchived={showArchived}
+      onShowArchivedChange={setShowArchived}
+      error={sessionActionError ?? sessions.error}
+      onOpen={openSession}
+      onRename={renameSession}
+      onArchive={archiveSession}
+      onExport={exportSession}
+      onDelete={deleteSession}
+    />
+  );
+
+  const sessionView = (
+    <SessionView
+      agent={agent}
+      session={activeSession}
+      messages={routeSessionId ? chatMessages : []}
+      hasOlder={history.hasOlder}
+      loadingOlder={history.loadingOlder}
+      onLoadOlder={() => void history.loadOlder()}
+      missing={routeSessionId !== null && history.missing}
+      telegramAvailable={activeConnector !== null}
+      scrollerRef={scrollerRef}
+      onSuggestion={setDraft}
+      composer={{
+        draft,
+        setDraft,
+        sending,
+        disabled: resetting || (activeSession?.activeRuns ?? 0) > 0,
+        offline: connection === 'offline',
+        onSend: send,
+        error: workspaceError,
+        onDismissError: () => setWorkspaceError(null),
+        recovery:
+          failedDraft && !sending
+            ? {
+                count: failedDrafts.length,
+                text: failedDraft,
+                restore: () => {
+                  setDraft((current) =>
+                    current.trim()
+                      ? `${current}\n\n${failedDraft}`
+                      : failedDraft,
+                  );
+                  setFailedDrafts((current) => current.slice(1));
+                },
+                dismiss: () => setFailedDrafts((current) => current.slice(1)),
+              }
+            : undefined,
+      }}
+      onNewChat={newChat}
+      onOpenWork={() => navigate({ kind: 'page', page: 'work' })}
+      onRename={(title) =>
+        activeSession ? renameSession(activeSession, title) : Promise.resolve(false)
+      }
+      onToggleArchived={() => {
+        if (activeSession) void archiveSession(activeSession, !activeSession.archived);
+      }}
+      onExport={() => {
+        if (activeSession) void exportSession(activeSession);
+      }}
+      notice={
+        legacyMigrationError ? (
+          <p role="status" className="px-4 pt-3 text-xs text-ink-3">
+            {legacyMigrationError}
+          </p>
+        ) : null
+      }
+    />
+  );
+
   return (
     <>
       <div
@@ -609,6 +931,9 @@ export function ViewHarness() {
           mainAgent={mainAgent ?? agent}
           agents={agents}
           connection={connection}
+          route={route}
+          navigate={navigate}
+          onNewChat={newChat}
           onOpenSettings={openSettings}
           onChangeWorkspaceAvatar={changeWorkspaceAvatar}
           onPickPrompt={(prompt) =>
@@ -635,153 +960,8 @@ export function ViewHarness() {
             />
           }
           workspaceState={workspace}
-          workspace={
-            <section
-              className="flex h-full min-h-0 flex-col"
-              aria-label="Workspace"
-            >
-              {agent.messages.some((message) =>
-                message.roomId?.startsWith('peer:'),
-              ) && (
-                <details className="shrink-0 border-b border-line px-4 py-2 text-xs text-ink-2">
-                  <summary className="cursor-pointer">Delegated work</summary>
-                  <div
-                    className="mt-2 max-h-48 overflow-y-auto space-y-3"
-                    aria-label="Delegated work"
-                  >
-                    {agent.messages
-                      .filter((message) => message.roomId?.startsWith('peer:'))
-                      .map((message) => {
-                        const ownCommunication = message.content.metadata
-                          ?.communication as
-                          | { fromAgentId?: string; toAgentId?: string }
-                          | undefined;
-                        const incomingCommunication = agent.messages.find(
-                          (item) =>
-                            item.roomId === message.roomId &&
-                            item.role === 'User' &&
-                            item.content.metadata?.communication,
-                        )?.content.metadata?.communication as
-                          | { fromAgentId?: string; toAgentId?: string }
-                          | undefined;
-                        const communication =
-                          ownCommunication ??
-                          (message.role === 'Assistant' ||
-                          message.role === 'Tool'
-                            ? {
-                                fromAgentId: incomingCommunication?.toAgentId,
-                                toAgentId: incomingCommunication?.fromAgentId,
-                              }
-                            : incomingCommunication);
-                        const from =
-                          agents.find(
-                            (item) => item.id === communication?.fromAgentId,
-                          )?.name ??
-                          communication?.fromAgentId ??
-                          agent.name;
-                        const to =
-                          agents.find(
-                            (item) => item.id === communication?.toAgentId,
-                          )?.name ??
-                          communication?.toAgentId ??
-                          'helper';
-                        return (
-                          <article key={message.id}>
-                            <p className="font-medium">
-                              {from} to {to}
-                            </p>
-                            <p className="whitespace-pre-wrap break-words">
-                              {message.content.text}
-                            </p>
-                          </article>
-                        );
-                      })}
-                  </div>
-                </details>
-              )}
-              <MessageList
-                agent={{
-                  ...agent,
-                  messages: agent.messages.filter(
-                    (message) =>
-                      !message.roomId?.startsWith('peer:') &&
-                      (
-                        message.content.metadata?.communication as
-                          | { kind?: string }
-                          | undefined
-                      )?.kind !== 'peer',
-                  ),
-                }}
-                sending={sending || agent.status === 'Running'}
-                scrollerRef={scrollerRef}
-                onSuggestion={setDraft}
-              />
-              <Composer
-                agentName={agent.name}
-                draft={draft}
-                setDraft={setDraft}
-                sending={sending}
-                disabled={resetting || agent.status === 'Running'}
-                offline={connection === 'offline'}
-                onSend={send}
-                error={workspaceError}
-                onDismissError={() => setWorkspaceError(null)}
-                recovery={
-                  failedDraft && !sending
-                    ? {
-                        count: failedDrafts.length,
-                        text: failedDraft,
-                        restore: () => {
-                          setDraft((current) =>
-                            current.trim()
-                              ? `${current}\n\n${failedDraft}`
-                              : failedDraft,
-                          );
-                          setFailedDrafts((current) => current.slice(1));
-                        },
-                        dismiss: () =>
-                          setFailedDrafts((current) => current.slice(1)),
-                      }
-                    : undefined
-                }
-              />
-            </section>
-          }
-          activity={
-            <ActivityView
-              agent={agent}
-              checkins={integrations.schedules}
-              prompt={ciPrompt}
-              setPrompt={setCiPrompt}
-              intervalMin={ciIntervalMin}
-              setIntervalMin={setCiIntervalMin}
-              addCheckin={addCheckin}
-              removeCheckin={removeCheckin}
-              error={integrations.scheduleError ?? legacyMigrationError}
-              target={ciTarget}
-              setTarget={setCiTarget}
-              telegramAvailable={telegramConnector?.approvedChat != null}
-              busy={integrations.scheduleBusy}
-            />
-          }
-          telegram={
-            telegramConnector ? (
-              <TelegramThread
-                agentName={agent.name}
-                messages={integrations.messages}
-                hasOlder={integrations.nextBefore !== null}
-                busy={integrations.connectorBusy}
-                error={integrations.connectorError}
-                deliveryQueued={integrations.deliveryQueued}
-                loadOlder={() =>
-                  integrations.loadMessages(telegramConnector.id, true)
-                }
-                send={(text) =>
-                  integrations.sendTelegramMessage(telegramConnector.id, text)
-                }
-              />
-            ) : null
-          }
+          sidebar={sidebar}
+          conversation={sessionView}
         />
       </div>
       {settingsPanel}

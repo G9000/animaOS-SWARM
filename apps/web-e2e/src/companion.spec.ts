@@ -10,6 +10,14 @@ async function fixture(page: Page, empty = false) {
   const helper = { ...agent, state: { ...agent.state, id: 'helper', name: 'Research helper', config: { ...agent.state.config, settings: { additional: { workspaceRole: 'helper' } } } } };
   let agents = empty ? [] : [agent, helper];
   let sent = 0;
+  const chatSession = {
+    id: 'chat:e2e', agentId: 'companion', roomId: 'chat:e2e', kind: 'chat', origin: 'web',
+    title: 'Help me plan my day', titleSource: 'first_message', createdAtMs: 2, lastActivityAtMs: 3,
+    lastReadAtMs: null, archived: false, parentSessionId: null, parentRunId: null, parentAgentId: null,
+    summary: null, contextTrimmed: null, messageCount: 0, preview: null, activeRuns: 0, pendingApprovals: 0,
+    unread: false, capabilities: { send: true, steer: true, stop: true, rename: true, archive: true, delete: true, compact: true, export: true },
+  };
+  let created = false;
   await page.route('**/api/**', async route => {
     const path = new URL(route.request().url()).pathname;
     let body: unknown = {};
@@ -20,13 +28,19 @@ async function fixture(page: Page, empty = false) {
       expect(route.request().postDataJSON()).not.toHaveProperty('workers');
       agents = [agent]; body = { agent };
     } else if (path === '/api/agents') body = { agents };
+    else if (path === '/api/agents/companion/sessions') {
+      if (route.request().method() === 'POST') { created = true; body = { session: chatSession }; }
+      else body = { sessions: created ? [chatSession] : [], nextCursor: null };
+    } else if (/^\/api\/agents\/companion\/sessions\/[^/]+\/messages$/.test(path)) {
+      body = { messages: (agent.messages as { id: string; role: string; content: { text: string }; createdAtMs: number }[]).map(m => ({ id: m.id, role: m.role, text: m.content.text, attachments: [], metadata: {}, createdAtMs: m.createdAtMs })), nextBefore: null };
+    } else if (/^\/api\/agents\/companion\/sessions\/[^/]+$/.test(path)) body = { session: chatSession };
     else if (path.endsWith('/run')) {
       sent += 1;
       expect(path).toBe('/api/agents/companion/run');
       const text = route.request().postDataJSON().text;
       agent.messages = [
-        { id: 'u1', role: 'user', agentId: 'companion', roomId: 'direct:companion', content: { text }, createdAtMs: 2 },
-        { id: 'a1', role: 'assistant', agentId: 'companion', roomId: 'direct:companion', content: { text: 'Let’s make a little room in your day. What matters most today?' }, createdAtMs: 3 },
+        { id: 'u1', role: 'user', agentId: 'companion', roomId: route.request().postDataJSON().roomId, content: { text }, createdAtMs: 2 },
+        { id: 'a1', role: 'assistant', agentId: 'companion', roomId: route.request().postDataJSON().roomId, content: { text: 'Let’s make a little room in your day. What matters most today?' }, createdAtMs: 3 },
       ];
       agent.messageCount = 2;
       body = { agent, result: { status: 'success', durationMs: 1, data: {} } };
@@ -52,8 +66,8 @@ for (const viewport of [{ name: 'desktop', width: 1440, height: 960 }, { name: '
     await page.screenshot({ path: testInfo.outputPath(`${viewport.name}-welcome.png`), fullPage: true });
     const input = page.getByPlaceholder('Message Anima…');
     await input.fill('Help me plan my day');
-    await page.getByRole('button', { name: 'Activity', exact: true }).click();
-    await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await page.getByRole('button', { name: 'Work', exact: true }).click();
+    await page.getByRole('button', { name: 'Open companion chat' }).click();
     await expect(input).toHaveValue('Help me plan my day');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(page.getByText('Let’s make a little room in your day. What matters most today?')).toBeVisible();

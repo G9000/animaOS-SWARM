@@ -341,6 +341,8 @@ export const daemon = {
     setupClient.goals.jobs(id, options),
   listSessions: (agentId: string, options: SessionListOptions = {}) =>
     setupClient.sessions.list(agentId, options),
+  getSession: (agentId: string, sessionId: string) =>
+    setupClient.sessions.get(agentId, sessionId),
   createSession: (agentId: string, input: { title?: string } = {}): Promise<Session> =>
     setupClient.sessions.create(agentId, input),
   updateSession: (agentId: string, sessionId: string, patch: SessionUpdateInput) =>

@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { DaemonConnection } from '../hooks/useDaemonBootstrap';
 import type { DaemonWorkspaceState } from '../lib/daemon-api';
+import type { HashPage, HashRoute, Navigate } from '../lib/hash-route';
 import type { AgentDetail } from '../lib/types';
 import { AgentPresence } from './AgentPresence';
 import { WorkspaceHub } from './WorkspaceHub';
@@ -11,27 +12,39 @@ import { PROMPT_LIBRARY } from '../lib/prompt-library';
 import { GearIcon, PulseIcon, SendIcon, SparkIcon } from './icons';
 import { ghostBtnCls } from './ui-bits';
 
-export type WorkspaceDestination =
-  | 'workspace'
-  | 'hub'
-  | 'files'
-  | 'connectors'
-  | 'telegram'
-  | 'activity'
-  | 'capabilities';
+/** Pages this release renders; the other hash pages open the conversation
+ *  until their milestones build them. */
+export const AVAILABLE_PAGES = [
+  'work',
+  'files',
+  'connectors',
+  'capabilities',
+] as const satisfies readonly HashPage[];
+export type AvailablePage = (typeof AVAILABLE_PAGES)[number];
 
-const DESTINATIONS: Array<{
-  id: WorkspaceDestination;
+interface Destination {
+  page: AvailablePage;
   label: string;
   icon: ReactNode;
-}> = [
-  { id: 'workspace', label: 'Chat', icon: <SendIcon size={16} /> },
-  { id: 'hub', label: 'Work', icon: <SparkIcon size={16} /> },
-  { id: 'files', label: 'Files', icon: <PulseIcon size={16} /> },
-  { id: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
-  { id: 'activity', label: 'Activity', icon: <PulseIcon size={16} /> },
-  { id: 'capabilities', label: 'Capabilities', icon: <SparkIcon size={16} /> },
+}
+
+const PRIMARY_DESTINATIONS: Destination[] = [
+  { page: 'work', label: 'Work', icon: <SparkIcon size={16} /> },
+  { page: 'files', label: 'Files', icon: <PulseIcon size={16} /> },
+  { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
 ];
+const SYSTEM_DESTINATIONS: Destination[] = [
+  { page: 'capabilities', label: 'Capabilities', icon: <SparkIcon size={16} /> },
+];
+const DESTINATIONS = [...PRIMARY_DESTINATIONS, ...SYSTEM_DESTINATIONS];
+
+export function availablePage(route: HashRoute): AvailablePage | null {
+  return route.kind === 'page' &&
+    (AVAILABLE_PAGES as readonly HashPage[]).includes(route.page)
+    ? (route.page as AvailablePage)
+    : null;
+}
+
 const ignoreWorkspaceAvatarChange = async () => undefined;
 const DESKTOP_NAVIGATION_QUERY = '(min-width: 768px)';
 
@@ -53,28 +66,34 @@ function useDesktopNavigation() {
 }
 
 function DestinationNavigation({
-  destination,
-  setDestination,
+  page,
+  navigate,
   placement,
-  hasTelegram,
+  onOpenChats,
 }: {
-  destination: WorkspaceDestination;
-  setDestination: (destination: WorkspaceDestination) => void;
+  page: AvailablePage | null;
+  navigate: Navigate;
   placement: 'sidebar' | 'bottom-dock';
-  hasTelegram: boolean;
+  onOpenChats: () => void;
 }) {
   const sidebar = placement === 'sidebar';
-  const destinations = hasTelegram
-    ? [
-        DESTINATIONS[0],
-        {
-          id: 'telegram' as const,
-          label: 'Telegram',
-          icon: <SendIcon size={16} />,
-        },
-        ...DESTINATIONS.slice(1),
-      ]
-    : DESTINATIONS;
+  const [systemOpen, setSystemOpen] = useState(false);
+  const systemExpanded =
+    systemOpen || SYSTEM_DESTINATIONS.some((item) => item.page === page);
+  const itemClass = `studio-nav-item inline-flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${sidebar ? 'w-full justify-start text-left' : 'min-w-16 shrink-0 flex-col gap-1 text-[10px]'}`;
+  const destination = (item: Destination) => (
+    <button
+      key={item.page}
+      type="button"
+      onClick={() => navigate({ kind: 'page', page: item.page })}
+      aria-current={page === item.page ? 'page' : undefined}
+      aria-label={item.label}
+      className={itemClass}
+    >
+      {item.icon}
+      <span>{item.label}</span>
+    </button>
+  );
   return (
     <nav
       aria-label="Workspace navigation"
@@ -82,23 +101,39 @@ function DestinationNavigation({
       data-placement={placement}
       className={
         sidebar
-          ? 'studio-navigation flex min-h-0 flex-1 flex-col gap-1 p-3'
+          ? 'studio-navigation flex shrink-0 flex-col gap-1 p-3'
           : 'safe-bottom-dock glass-strong absolute inset-x-3 z-30 flex items-center gap-1 overflow-x-auto rounded-2xl p-1.5'
       }
     >
-      {destinations.map((item) => (
+      {!sidebar && (
         <button
-          key={item.id}
           type="button"
-          onClick={() => setDestination(item.id)}
-          aria-current={destination === item.id ? 'page' : undefined}
-          aria-label={item.label}
-          className={`studio-nav-item inline-flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition ${sidebar ? 'w-full justify-start text-left' : 'min-w-16 shrink-0 flex-col gap-1 text-[10px]'}`}
+          onClick={onOpenChats}
+          aria-current={page === null ? 'page' : undefined}
+          aria-label="Chats"
+          className={itemClass}
         >
-          {item.icon}
-          <span>{item.label}</span>
+          <SendIcon size={16} />
+          <span>Chats</span>
         </button>
-      ))}
+      )}
+      {PRIMARY_DESTINATIONS.map((item) => destination(item))}
+      {sidebar ? (
+        <>
+          <button
+            type="button"
+            className={itemClass}
+            aria-expanded={systemExpanded}
+            onClick={() => setSystemOpen((open) => !open)}
+          >
+            <GearIcon size={16} />
+            <span>System</span>
+          </button>
+          {systemExpanded && SYSTEM_DESTINATIONS.map((item) => destination(item))}
+        </>
+      ) : (
+        SYSTEM_DESTINATIONS.map((item) => destination(item))
+      )}
     </nav>
   );
 }
@@ -107,31 +142,40 @@ export function WorkspaceShell({
   mainAgent,
   agents,
   connection,
-  workspace,
-  activity,
-  telegram = null,
+  route,
+  navigate,
+  conversation,
+  sidebar = null,
   connectors = null,
   workspaceState = null,
   onOpenSettings,
   onChangeWorkspaceAvatar = ignoreWorkspaceAvatarChange,
   onPickPrompt,
+  onNewChat,
 }: {
   mainAgent: AgentDetail;
   agents: readonly AgentDetail[];
   connection: Exclude<DaemonConnection, 'unknown'>;
-  workspace: ReactNode;
-  activity: ReactNode;
-  telegram?: ReactNode | null;
+  route: HashRoute;
+  navigate: Navigate;
+  /** The chat or session view; kept mounted so drafts and scroll survive page visits. */
+  conversation: ReactNode;
+  /** The sessions list for the desktop sidebar and the mobile drawer. */
+  sidebar?: ReactNode | null;
   connectors?: ReactNode | null;
   workspaceState?: DaemonWorkspaceState | null;
   onOpenSettings: () => void;
   onChangeWorkspaceAvatar?: (file: File) => Promise<void>;
   onPickPrompt?: (prompt: string) => void;
+  onNewChat?: () => void;
 }) {
-  const [destination, setDestination] =
-    useState<WorkspaceDestination>('workspace');
+  const page = availablePage(route);
+  const [lastConversation, setLastConversation] = useState<HashRoute>(
+    route.kind === 'session' ? route : { kind: 'home' },
+  );
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const desktopNavigation = useDesktopNavigation();
   const companyName = workspaceState?.configured
     ? (workspaceState.workspace?.companyName ?? null)
@@ -142,6 +186,13 @@ export function WorkspaceShell({
   const workingHelpers = agents.filter(
     (agent) => agent.id !== mainAgent.id && agent.status === 'Running',
   ).length;
+  const newChat = onNewChat ?? (() => navigate({ kind: 'home' }));
+  const openConversation = () => navigate(lastConversation);
+
+  useEffect(() => {
+    if (route.kind === 'session' || route.kind === 'home') setLastConversation(route);
+    setDrawerOpen(false);
+  }, [route]);
 
   useEffect(() => {
     const shortcut = (event: KeyboardEvent) => {
@@ -158,23 +209,21 @@ export function WorkspaceShell({
     window.addEventListener('keydown', shortcut);
     return () => window.removeEventListener('keydown', shortcut);
   }, []);
-  useEffect(() => {
-    if (destination === 'telegram' && telegram === null)
-      setDestination('workspace');
-  }, [destination, telegram]);
 
   const commands: StudioCommand[] = [
-    ...[
-      ...DESTINATIONS,
-      ...(telegram !== null
-        ? [{ id: 'telegram' as const, label: 'Telegram' }]
-        : []),
-    ].map((item) => ({
-      id: item.id,
+    {
+      id: 'new-chat',
+      title: 'New chat',
+      description: 'Start a fresh conversation',
+      group: 'Navigate',
+      run: newChat,
+    },
+    ...DESTINATIONS.map((item) => ({
+      id: item.page,
       title: `Go to ${item.label}`,
       description: `Open ${item.label.toLowerCase()}`,
       group: 'Navigate',
-      run: () => setDestination(item.id),
+      run: () => navigate({ kind: 'page', page: item.page }),
     })),
     {
       id: 'settings',
@@ -201,7 +250,7 @@ export function WorkspaceShell({
           description: prompt.description,
           group: prompt.category,
           run: () => {
-            setDestination('workspace');
+            if (page !== null) openConversation();
             onPickPrompt(prompt.prompt);
             requestAnimationFrame(() =>
               document
@@ -248,12 +297,22 @@ export function WorkspaceShell({
                 hasAvatar={hasAvatar}
                 onChangeWorkspaceAvatar={onChangeWorkspaceAvatar}
               />
+              <div className="shrink-0 px-3 pt-3">
+                <button
+                  type="button"
+                  className={`${ghostBtnCls} w-full justify-center`}
+                  onClick={newChat}
+                >
+                  New chat
+                </button>
+              </div>
               <DestinationNavigation
-                destination={destination}
-                setDestination={setDestination}
+                page={page}
+                navigate={navigate}
                 placement="sidebar"
-                hasTelegram={telegram !== null}
+                onOpenChats={openConversation}
               />
+              {sidebar}
               <div className="companion-status" role="status">
                 <p>
                   {connection === 'offline'
@@ -286,16 +345,24 @@ export function WorkspaceShell({
           )}
           <main className="studio-main spatial-canvas workspace-mobile-safe relative min-h-0 min-w-0 flex-1">
             <div className="studio-topbar">
+              {!desktopNavigation && sidebar !== null && (
+                <button
+                  type="button"
+                  className="studio-tool-button"
+                  aria-label="Open sessions"
+                  aria-expanded={drawerOpen}
+                  onClick={() => setDrawerOpen(true)}
+                >
+                  ☰
+                </button>
+              )}
               <div className="studio-breadcrumb">
                 <strong>
-                  {destination === 'workspace'
-                    ? mainAgent.name
-                    : destination === 'telegram'
-                      ? 'Telegram'
-                      : DESTINATIONS.find((item) => item.id === destination)
-                          ?.label}
+                  {page
+                    ? DESTINATIONS.find((item) => item.page === page)?.label
+                    : mainAgent.name}
                 </strong>
-                {destination === 'workspace' && (
+                {page === null && (
                   <span className="companion-model">{mainAgent.model}</span>
                 )}
               </div>
@@ -306,12 +373,12 @@ export function WorkspaceShell({
                 {connection === 'online' ? 'Connected' : 'Offline'}
               </span>
               <div className="studio-topbar-actions">
-                {destination !== 'workspace' && (
+                {page !== null && (
                   <button
                     type="button"
                     className="studio-tool-button"
                     aria-label="Open companion chat"
-                    onClick={() => setDestination('workspace')}
+                    onClick={openConversation}
                   >
                     Back to chat
                   </button>
@@ -331,9 +398,7 @@ export function WorkspaceShell({
                     type="button"
                     className="studio-tool-button"
                     onClick={() => setFocusMode((value) => !value)}
-                    aria-label={
-                      focusMode ? 'Exit focus mode' : 'Enter focus mode'
-                    }
+                    aria-label={focusMode ? 'Exit focus mode' : 'Enter focus mode'}
                     aria-pressed={focusMode}
                   >
                     {focusMode ? '↙' : '⛶'}
@@ -342,35 +407,65 @@ export function WorkspaceShell({
               </div>
             </div>
             <div className="studio-view">
-              {/* Keep chat mounted so drafts, scroll position, and tool approvals survive navigation. */}
-              <div
-                className="companion-chat-panel"
-                hidden={destination !== 'workspace'}
-              >
-                {workspace}
+              {/* Keep the conversation mounted so drafts and scroll survive page visits. */}
+              <div className="companion-chat-panel" hidden={page !== null}>
+                {conversation}
               </div>
-              {destination === 'telegram' ? (
-                telegram
-              ) : destination === 'connectors' ? (
+              {page === 'connectors' ? (
                 connectors
-              ) : destination === 'activity' ? (
-                activity
-              ) : destination === 'files' ? (
+              ) : page === 'files' ? (
                 <WorkspaceFiles online={connection === 'online'} />
-              ) : destination === 'capabilities' ? (
+              ) : page === 'capabilities' ? (
                 <WorkspaceCapabilities online={connection === 'online'} />
-              ) : destination === 'hub' ? (
+              ) : page === 'work' ? (
                 <WorkspaceHub agents={[mainAgent]} initialSection="Tasks" />
               ) : null}
             </div>
+            {drawerOpen && !desktopNavigation && sidebar !== null && (
+              <div
+                className="session-drawer"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Sessions"
+              >
+                <div className="session-drawer-panel studio-sidebar">
+                  <div className="flex items-center justify-between gap-2 p-3">
+                    <button
+                      type="button"
+                      className={ghostBtnCls}
+                      onClick={() => {
+                        setDrawerOpen(false);
+                        newChat();
+                      }}
+                    >
+                      New chat
+                    </button>
+                    <button
+                      type="button"
+                      className="studio-tool-button"
+                      aria-label="Close sessions"
+                      onClick={() => setDrawerOpen(false)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                  {sidebar}
+                </div>
+                <div
+                  className="session-drawer-backdrop"
+                  aria-hidden
+                  onClick={() => setDrawerOpen(false)}
+                />
+              </div>
+            )}
           </main>
         </div>
         {!desktopNavigation && (
           <DestinationNavigation
-            destination={destination}
-            setDestination={setDestination}
+            page={page}
+            navigate={navigate}
             placement="bottom-dock"
-            hasTelegram={telegram !== null}
+            onOpenChats={openConversation}
           />
         )}
       </div>

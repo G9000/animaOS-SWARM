@@ -134,6 +134,32 @@ async function installApiFixture(
       });
       return;
     }
+    const sessionsMatch = path.match(/^\/agents\/([^/]+)\/sessions(?:\/([^/]+)(\/messages)?)?$/);
+    if (sessionsMatch) {
+      const owner = state.agents.find((agent) => agent.state.id === sessionsMatch[1]);
+      const rooms = [...new Set((owner?.messages ?? []).map((message) => message.roomId))];
+      const session = (roomId: string) => ({
+        id: roomId, agentId: sessionsMatch[1], roomId, kind: 'chat', origin: 'web', title: 'Earlier chat',
+        titleSource: 'first_message', createdAtMs: 1, lastActivityAtMs: 2, lastReadAtMs: 2, archived: false,
+        parentSessionId: null, parentRunId: null, parentAgentId: null, summary: null, contextTrimmed: null,
+        messageCount: 1, preview: null, activeRuns: 0, pendingApprovals: 0, unread: false,
+        capabilities: { send: true, steer: true, stop: true, rename: true, archive: true, delete: true, compact: true, export: true },
+      });
+      const sessionId = sessionsMatch[2] ? decodeURIComponent(sessionsMatch[2]) : null;
+      if (sessionId && sessionsMatch[3]) {
+        await fulfillJson(route, {
+          messages: (owner?.messages ?? [])
+            .filter((message) => message.roomId === sessionId)
+            .map((message) => ({ id: message.id, role: message.role, text: message.content.text, attachments: [], metadata: message.content.metadata ?? {}, createdAtMs: message.createdAtMs })),
+          nextBefore: null,
+        });
+      } else if (sessionId) {
+        await fulfillJson(route, { session: session(sessionId) });
+      } else {
+        await fulfillJson(route, { sessions: rooms.map(session), nextCursor: null });
+      }
+      return;
+    }
     if (path.includes('/connectors')) {
       await fulfillJson(route, { connectors: [] });
       return;
@@ -312,7 +338,7 @@ test('failed settings save preserves draft, conversation and original identity',
     agents: [main],
     failFirstPatch: true,
   });
-  await page.goto('/');
+  await page.goto('/#/s/direct%3Amain');
   await expect(page.getByText('Existing conversation')).toBeVisible();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   const settings = page.getByRole('dialog', { name: 'Agent settings' });
@@ -387,7 +413,7 @@ test('mobile chat keeps a bounded navigation dock and reports disconnection', as
   });
   await expect(navigation).toHaveAttribute('data-placement', 'bottom-dock');
   await expect(
-    navigation.getByRole('button', { name: 'Chat', exact: true }),
+    navigation.getByRole('button', { name: 'Chats', exact: true }),
   ).toBeVisible();
   const box = await navigation.boundingBox();
   expect(box!.y).toBeGreaterThan(700);

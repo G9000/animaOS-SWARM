@@ -1,6 +1,10 @@
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { useState, type ReactNode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { daemon } from '../lib/daemon-api';
+import type { HashRoute } from '../lib/hash-route';
 import type { AgentDetail } from '../lib/types';
 import { WorkspaceShell } from './WorkspaceShell';
 
@@ -16,25 +20,49 @@ const companion: AgentDetail = {
   token_usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
 };
 
+function Shell({
+  agents = [companion],
+  connection = 'online',
+  conversation,
+}: {
+  agents?: AgentDetail[];
+  connection?: 'online' | 'offline';
+  conversation: ReactNode;
+}) {
+  const [route, setRoute] = useState<HashRoute>({ kind: 'home' });
+  return (
+    <WorkspaceShell
+      mainAgent={companion}
+      agents={agents}
+      connection={connection}
+      route={route}
+      navigate={(next) => setRoute(next)}
+      conversation={conversation}
+      onOpenSettings={vi.fn()}
+    />
+  );
+}
+
+beforeEach(() => {
+  vi.spyOn(daemon, 'agentJobs').mockResolvedValue([]);
+  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({ tasks: [], revision: '1' });
+  vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe('single companion experience', () => {
   it('opens the conversation immediately without swarm management or agent switching', () => {
     render(
-      <WorkspaceShell
-        mainAgent={companion}
-        agents={[
-          companion,
-          { ...companion, id: 'helper', name: 'Research helper' },
-        ]}
-        connection="online"
-        workspace={<div>My conversation</div>}
-        activity={<div>Activity content</div>}
-        onOpenSettings={vi.fn()}
+      <Shell
+        agents={[companion, { ...companion, id: 'helper', name: 'Research helper' }]}
+        conversation={<div>My conversation</div>}
       />,
     );
     expect(screen.getByText('My conversation')).toBeVisible();
-    expect(
-      screen.getByRole('button', { name: 'Chat', exact: true }),
-    ).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('button', { name: 'New chat' })).toBeVisible();
     for (const name of ['Team', 'Operations', 'Overview']) {
       expect(
         screen.queryByRole('button', { name, exact: true }),
@@ -55,41 +83,24 @@ describe('single companion experience', () => {
 
   it('keeps the conversation mounted when checking another page', async () => {
     render(
-      <WorkspaceShell
-        mainAgent={companion}
-        agents={[companion]}
-        connection="online"
-        workspace={
+      <Shell
+        conversation={
           <input aria-label="Unsaved draft" defaultValue="Remember this" />
         }
-        activity={<div>Activity content</div>}
-        onOpenSettings={vi.fn()}
       />,
     );
     const input = screen.getByLabelText('Unsaved draft');
-    await userEvent.click(
-      screen.getByRole('button', { name: 'Activity', exact: true }),
-    );
-    expect(screen.getByText('Activity content')).toBeVisible();
+    await userEvent.click(screen.getByRole('button', { name: 'Work', exact: true }));
     expect(input).not.toBeVisible();
     await userEvent.click(
-      screen.getByRole('button', { name: 'Chat', exact: true }),
+      screen.getByRole('button', { name: 'Open companion chat' }),
     );
     expect(screen.getByLabelText('Unsaved draft')).toBe(input);
     expect(input).toHaveValue('Remember this');
   });
 
   it('describes disconnection without promising work is still running', () => {
-    render(
-      <WorkspaceShell
-        mainAgent={companion}
-        agents={[companion]}
-        connection="offline"
-        workspace={<div>My conversation</div>}
-        activity={null}
-        onOpenSettings={vi.fn()}
-      />,
-    );
+    render(<Shell connection="offline" conversation={<div>My conversation</div>} />);
     expect(screen.getByText('Offline')).toBeVisible();
     expect(screen.getByText('Cannot reach your companion')).toBeVisible();
   });
