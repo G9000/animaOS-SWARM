@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use anima_core::{AgentConfig, AgentRuntimeSnapshot, DataValue, Message, MessageRole};
 
 use super::{
-    connector_id_of_room, delegating_agent_id, is_checkin_message, job_id_of_room, kind_for_room,
-    peer_sender_of_room, schedule_id_of_room, schedule_room_id, session_id_for_room, session_title,
-    SessionKind, SessionRecord, SessionRegistry, TitleContext,
+    connector_id_of_room, delegating_agent_id, hidden_message_ids, is_checkin_message,
+    job_id_of_room, kind_for_room, peer_sender_of_room, schedule_id_of_room, schedule_room_id,
+    session_id_for_room, session_title, SessionKind, SessionRecord, SessionRegistry, TitleContext,
 };
 use crate::connectors::TelegramConnectorRecord;
 use crate::jobs::AgentJobRecord;
@@ -35,11 +35,18 @@ pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[];
 
 /// Legacy check-ins ran in a fresh `room-*` room per tick. Those rooms become
 /// the automation's `schedule:<id>` session, and so do their ledger runs;
-/// nothing else references them. Returns how many messages moved.
+/// nothing else references them. A run a restart interrupted or a rollback
+/// undid may have committed no message to key off, so a schedule-sourced run
+/// whose session id still looks like a per-tick room is also relabelled from
+/// its own `sourceRef`, whether or not its room holds any message. Callers
+/// only run this against a snapshot older than the current store version — a
+/// room a live run just created this boot must be left alone, or its
+/// already-mirrored history would be stranded under the old id. Returns how
+/// many messages moved and how many runs were relabelled.
 pub(crate) fn relabel_legacy_checkin_rooms(
     agents: &mut [AgentRuntimeSnapshot],
     runs: &mut [RunRecord],
-) -> usize {
+) -> (usize, usize) {
     let mut moved = 0;
     let mut relabelled: HashMap<(String, String), String> = HashMap::new();
     for agent in agents.iter_mut() {
@@ -65,12 +72,23 @@ pub(crate) fn relabel_legacy_checkin_rooms(
             relabelled.insert((agent.state.id.clone(), old), new);
         }
     }
+    let mut runs_relabelled = 0;
     for run in runs.iter_mut() {
         if let Some(room) = relabelled.get(&(run.agent_id.clone(), run.session_id.clone())) {
             run.session_id = room.clone();
+            runs_relabelled += 1;
+        } else if run.source == RunSource::Schedule && run.session_id.starts_with("room-") {
+            let source_ref = run
+                .source_ref
+                .as_deref()
+                .filter(|schedule_id| !schedule_id.trim().is_empty());
+            if let Some(schedule_id) = source_ref {
+                run.session_id = schedule_room_id(schedule_id);
+                runs_relabelled += 1;
+            }
         }
     }
-    moved
+    (moved, runs_relabelled)
 }
 
 fn checkin_schedule_id(message: &Message) -> Option<&str> {
@@ -125,6 +143,11 @@ pub(crate) fn derive_sessions_for_legacy_rooms(
         let mut rooms: Vec<(&str, Vec<&Message>)> = Vec::new();
         let mut index: HashMap<&str, usize> = HashMap::new();
         for message in agent.messages {
+            // An empty or whitespace-only room id would derive an invalid
+            // session and refuse the next boot's validation; skip it.
+            if message.room_id.trim().is_empty() {
+                continue;
+            }
             let slot = *index.entry(message.room_id.as_str()).or_insert_with(|| {
                 rooms.push((message.room_id.as_str(), Vec::new()));
                 rooms.len() - 1
@@ -182,8 +205,19 @@ fn legacy_session(
         .first()
         .map(|message| message.created_at_ms)
         .unwrap_or(0);
-    let last_at = messages
+    // last_read_at_ms covers every message, visible or not, so upgraded
+    // history is never unread. last_activity_at_ms follows the live rule and
+    // counts only visible messages, so a room upgraded straight from a
+    // silent check-in pair does not jump to the top of the sidebar.
+    let last_read_at = messages
         .iter()
+        .map(|message| message.created_at_ms)
+        .max()
+        .unwrap_or(first_at);
+    let hidden = hidden_message_ids(messages.iter().copied());
+    let last_activity_at = messages
+        .iter()
+        .filter(|message| !hidden.contains(&message.id))
         .map(|message| message.created_at_ms)
         .max()
         .unwrap_or(first_at);
@@ -196,8 +230,8 @@ fn legacy_session(
         title_source,
         first_at,
     );
-    record.last_activity_at_ms = last_at;
-    record.last_read_at_ms = Some(last_at);
+    record.last_activity_at_ms = last_activity_at;
+    record.last_read_at_ms = Some(last_read_at);
     if kind == SessionKind::Helper {
         record.parent_agent_id = helper_parent
             .or(delegated_by)
@@ -350,9 +384,13 @@ mod tests {
             run_in(&agent_id, "room-300-3"),
         ];
 
-        let moved = relabel_legacy_checkin_rooms(&mut agents, &mut runs);
+        let (moved, runs_relabelled) = relabel_legacy_checkin_rooms(&mut agents, &mut runs);
 
         assert_eq!(moved, 4);
+        assert_eq!(
+            runs_relabelled, 1,
+            "only the room-100-1 run had a message-based relabel; room-300-3 was never a check-in"
+        );
         let rooms = agents[0]
             .messages
             .iter()
@@ -373,9 +411,244 @@ mod tests {
         assert_eq!(runs[1].session_id, "room-300-3");
         assert_eq!(
             relabel_legacy_checkin_rooms(&mut agents, &mut runs),
-            0,
+            (0, 0),
             "relabeling is idempotent"
         );
+    }
+
+    #[test]
+    fn a_mixed_checkin_and_chat_room_moves_whole() {
+        let wrapped = crate::schedules::wrap_checkin_prompt("Review open tasks");
+        let messages = vec![
+            message(
+                "m1",
+                "room-1-1",
+                MessageRole::User,
+                "Unrelated chat",
+                &[],
+                10,
+            ),
+            message("m2", "room-1-1", MessageRole::Assistant, "Sure", &[], 11),
+            message(
+                "c1",
+                "room-1-1",
+                MessageRole::User,
+                &wrapped,
+                &[("kind", "checkin"), ("id", "schedule-1")],
+                20,
+            ),
+            message(
+                "c2",
+                "room-1-1",
+                MessageRole::Assistant,
+                "CHECKIN_OK",
+                &[],
+                21,
+            ),
+        ];
+        let mut agents = vec![agent_snapshot("companion", messages)];
+        let mut runs: Vec<RunRecord> = Vec::new();
+
+        let (moved, _) = relabel_legacy_checkin_rooms(&mut agents, &mut runs);
+
+        assert_eq!(
+            moved, 4,
+            "every message in the room moves, not only the check-in pair"
+        );
+        assert!(agents[0]
+            .messages
+            .iter()
+            .all(|message| message.room_id == "schedule:schedule-1"));
+    }
+
+    #[test]
+    fn ticks_of_different_schedules_go_to_their_own_rooms() {
+        let wrapped = crate::schedules::wrap_checkin_prompt("Review open tasks");
+        let messages = vec![
+            message(
+                "a1",
+                "room-1-1",
+                MessageRole::User,
+                &wrapped,
+                &[("kind", "checkin"), ("id", "schedule-1")],
+                10,
+            ),
+            message(
+                "a2",
+                "room-1-1",
+                MessageRole::Assistant,
+                "CHECKIN_OK",
+                &[],
+                11,
+            ),
+            message(
+                "b1",
+                "room-2-1",
+                MessageRole::User,
+                &wrapped,
+                &[("kind", "checkin"), ("id", "schedule-2")],
+                20,
+            ),
+            message(
+                "b2",
+                "room-2-1",
+                MessageRole::Assistant,
+                "CHECKIN_OK",
+                &[],
+                21,
+            ),
+        ];
+        let mut agents = vec![agent_snapshot("companion", messages)];
+        let mut runs: Vec<RunRecord> = Vec::new();
+
+        let (moved, _) = relabel_legacy_checkin_rooms(&mut agents, &mut runs);
+
+        assert_eq!(moved, 4);
+        let rooms = agents[0]
+            .messages
+            .iter()
+            .map(|message| message.room_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rooms,
+            [
+                "schedule:schedule-1",
+                "schedule:schedule-1",
+                "schedule:schedule-2",
+                "schedule:schedule-2",
+            ],
+            "each tick's room follows its own schedule id, never another one's"
+        );
+    }
+
+    #[test]
+    fn another_agents_run_with_the_same_room_id_stays_untouched() {
+        let wrapped = crate::schedules::wrap_checkin_prompt("Review open tasks");
+        let messages = vec![
+            message(
+                "c1",
+                "room-1-1",
+                MessageRole::User,
+                &wrapped,
+                &[("kind", "checkin"), ("id", "schedule-1")],
+                10,
+            ),
+            message(
+                "c2",
+                "room-1-1",
+                MessageRole::Assistant,
+                "CHECKIN_OK",
+                &[],
+                11,
+            ),
+        ];
+        let mut agents = vec![agent_snapshot("companion", messages)];
+        let mut runs = vec![run_in("some-other-agent", "room-1-1")];
+
+        relabel_legacy_checkin_rooms(&mut agents, &mut runs);
+
+        assert_eq!(
+            runs[0].session_id, "room-1-1",
+            "a different agent's run with the same room string is untouched"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_schedule_run_with_no_messages_still_relabels_from_its_source_ref() {
+        let mut agents = vec![agent_snapshot("companion", Vec::new())];
+        let agent_id = agents[0].state.id.clone();
+        let mut run = RunRecord::running(
+            RunStart {
+                agent_id: agent_id.clone(),
+                session_id: "room-9-1".into(),
+                source: RunSource::Schedule,
+                source_ref: Some("schedule-9".into()),
+                idempotency_key: None,
+                text: "tick".into(),
+                model: "deterministic".into(),
+                provider: None,
+                parent_run_id: None,
+            },
+            10,
+        );
+        run.finish(RunStatus::Interrupted, None, 11);
+        let mut runs = vec![run];
+
+        let (moved, runs_relabelled) = relabel_legacy_checkin_rooms(&mut agents, &mut runs);
+
+        assert_eq!(moved, 0, "the room never got any messages");
+        assert_eq!(runs_relabelled, 1);
+        assert_eq!(runs[0].session_id, "schedule:schedule-9");
+    }
+
+    #[test]
+    fn relabel_only_runs_on_a_snapshot_older_than_the_current_version() {
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(config("companion", &[]))
+            .unwrap()
+            .state
+            .id;
+        let wrapped = crate::schedules::wrap_checkin_prompt("Review open tasks");
+        let checkin_messages = || -> Vec<Message> {
+            vec![
+                message(
+                    "c1",
+                    "room-1-1",
+                    MessageRole::User,
+                    &wrapped,
+                    &[("kind", "checkin"), ("id", "schedule-1")],
+                    10,
+                ),
+                message(
+                    "c2",
+                    "room-1-1",
+                    MessageRole::Assistant,
+                    "CHECKIN_OK",
+                    &[],
+                    11,
+                ),
+            ]
+            .into_iter()
+            .map(|mut message| {
+                message.agent_id = agent_id.clone();
+                message
+            })
+            .collect()
+        };
+
+        // A run just created this boot's tagged room-* room; a current-version
+        // snapshot must leave it alone (its history may already be mirrored
+        // under the old id).
+        let mut current = source.control_plane_snapshot();
+        current.agents[0].messages = checkin_messages();
+        current.agents[0].message_count = 2;
+        let mut restored_current = DaemonState::new();
+        restored_current
+            .restore_control_plane_snapshot(current)
+            .unwrap();
+        assert!(restored_current
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id == "room-1-1"));
+
+        // The same data under an older version still relabels.
+        let mut older = source.control_plane_snapshot();
+        older.version = 4;
+        older.agents[0].messages = checkin_messages();
+        older.agents[0].message_count = 2;
+        let mut restored_older = DaemonState::new();
+        restored_older
+            .restore_control_plane_snapshot(older)
+            .unwrap();
+        assert!(restored_older
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id == "schedule:schedule-1"));
     }
 
     #[test]
@@ -635,6 +908,103 @@ mod tests {
     }
 
     #[test]
+    fn a_derived_checkin_session_with_a_trailing_silent_pair_keeps_the_visible_activity_time() {
+        let wrapped = crate::schedules::wrap_checkin_prompt("Review open tasks");
+        let messages = vec![
+            message(
+                "c1",
+                "schedule:schedule-1",
+                MessageRole::User,
+                &wrapped,
+                &[("kind", "checkin"), ("id", "schedule-1")],
+                10,
+            ),
+            message(
+                "s1",
+                "schedule:schedule-1",
+                MessageRole::Assistant,
+                "You have two overdue tasks",
+                &[],
+                11,
+            ),
+            message(
+                "c2",
+                "schedule:schedule-1",
+                MessageRole::User,
+                &wrapped,
+                &[("kind", "checkin"), ("id", "schedule-1")],
+                20,
+            ),
+            message(
+                "s2",
+                "schedule:schedule-1",
+                MessageRole::Assistant,
+                "CHECKIN_OK",
+                &[],
+                21,
+            ),
+        ];
+        let agent_config = config("companion", &[]);
+        let agents = [LegacyAgent {
+            agent_id: "companion-1",
+            config: &agent_config,
+            messages: &messages,
+        }];
+        let context = LegacySessionContext {
+            schedules: &HashMap::new(),
+            jobs: &HashMap::new(),
+            connectors: &HashMap::new(),
+            agent_names: &HashMap::new(),
+        };
+
+        let derived =
+            derive_sessions_for_legacy_rooms(&SessionRegistry::default(), &agents, &context);
+
+        assert_eq!(derived.len(), 1);
+        let session = &derived[0];
+        assert_eq!(
+            session.last_activity_at_ms, 11,
+            "the trailing silent check-in pair at 20/21 is hidden from activity, same as the live rule"
+        );
+        assert_eq!(
+            session.last_read_at_ms,
+            Some(21),
+            "read state still covers every message, visible or not"
+        );
+    }
+
+    #[test]
+    fn messages_with_a_blank_room_id_are_skipped_when_deriving_sessions() {
+        let agent_config = config("companion", &[]);
+        let messages = vec![
+            message("m1", "", MessageRole::User, "stray", &[], 10),
+            message("m2", "   ", MessageRole::User, "also stray", &[], 20),
+            message("m3", "chat:x", MessageRole::User, "real chat", &[], 30),
+        ];
+        let agents = [LegacyAgent {
+            agent_id: "companion-1",
+            config: &agent_config,
+            messages: &messages,
+        }];
+        let context = LegacySessionContext {
+            schedules: &HashMap::new(),
+            jobs: &HashMap::new(),
+            connectors: &HashMap::new(),
+            agent_names: &HashMap::new(),
+        };
+
+        let derived =
+            derive_sessions_for_legacy_rooms(&SessionRegistry::default(), &agents, &context);
+
+        assert_eq!(
+            derived.len(),
+            1,
+            "a blank or whitespace-only room id never derives a session"
+        );
+        assert_eq!(derived[0].id, "chat:x");
+    }
+
+    #[test]
     fn restoring_an_older_snapshot_gives_every_room_a_session_exactly_once() {
         let mut source = DaemonState::new();
         let agent_id = source
@@ -799,6 +1169,71 @@ mod tests {
             .control_plane_snapshot()
             .tool_grants_applied
             .contains(&"test-grant".to_string()));
+    }
+
+    #[test]
+    fn a_helper_role_agent_without_a_recorded_parent_id_gets_no_grants() {
+        // The grant gate must use the same "helper" predicate as the rest of
+        // the daemon (workspaceRole alone), not config_helper_parent's
+        // stricter one, which also requires a recorded parentAgentId.
+        const GRANTS: &[ToolGrantSet] = &[ToolGrantSet {
+            id: "orphan-helper-grant",
+            read_class: &["todo_read"],
+            write_class: &[],
+        }];
+        let registry = crate::tools::ToolRegistry::new();
+        let mut orphan_helper = config("orphan helper", &[("workspaceRole", "helper")]);
+        orphan_helper.tools = Some(registry.resolve_descriptors(["read_file"]).unwrap());
+        let mut state = DaemonState::new();
+        let orphan_helper_id = state.create_agent(orphan_helper).unwrap().state.id;
+
+        let changed = state.apply_pending_tool_grants(GRANTS);
+
+        assert!(
+            changed.is_empty(),
+            "workspaceRole alone marks a helper, even without a recorded parentAgentId"
+        );
+        let tools = state
+            .get_agent(&orphan_helper_id)
+            .unwrap()
+            .state
+            .config
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert_eq!(tools, ["read_file"]);
+    }
+
+    #[test]
+    fn tool_grants_applied_survives_a_save_and_restore_round_trip() {
+        const GRANTS: &[ToolGrantSet] = &[ToolGrantSet {
+            id: "round-trip-grant",
+            read_class: &["todo_read"],
+            write_class: &[],
+        }];
+        let registry = crate::tools::ToolRegistry::new();
+        let mut reader = config("reader", &[]);
+        reader.tools = Some(registry.resolve_descriptors(["read_file"]).unwrap());
+        let mut source = DaemonState::new();
+        let agent_id = source.create_agent(reader).unwrap().state.id;
+
+        let granted = source.apply_pending_tool_grants(GRANTS);
+        assert_eq!(granted, vec![agent_id.clone()]);
+        let snapshot = source.control_plane_snapshot();
+        assert!(snapshot
+            .tool_grants_applied
+            .contains(&"round-trip-grant".to_string()));
+
+        let mut restored = DaemonState::new();
+        restored.restore_control_plane_snapshot(snapshot).unwrap();
+
+        assert!(restored.tool_grants_applied.contains("round-trip-grant"));
+        assert!(
+            restored.apply_pending_tool_grants(GRANTS).is_empty(),
+            "a grant set already applied before the restart never re-applies"
+        );
     }
 
     #[test]

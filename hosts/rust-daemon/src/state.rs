@@ -21,7 +21,7 @@ use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::components::{default_evaluators, default_providers};
 use crate::connectors::gcalendar::{
@@ -1724,12 +1724,21 @@ impl DaemonState {
     ) -> Result<(usize, usize), String> {
         self.validate_control_plane_snapshot(&snapshot)?;
         // Spec §13.3 step 2: legacy per-tick check-in rooms become their
-        // automation's session, and ledger session ids follow the room mapping.
-        crate::sessions::migration::relabel_legacy_checkin_rooms(
-            &mut snapshot.agents,
-            &mut snapshot.runs,
-        );
-        crate::sessions::migration::map_ledger_session_ids(&mut snapshot.runs);
+        // automation's session. Only a snapshot older than this store version
+        // can still hold a pre-M2 room-* check-in; relabeling a room a live
+        // run created this boot would strand its already-mirrored history
+        // under the old id, so a current snapshot is left alone.
+        let (relabelled_messages, relabelled_runs) =
+            if snapshot.version < crate::control_plane_store::CONTROL_PLANE_STORE_VERSION {
+                crate::sessions::migration::relabel_legacy_checkin_rooms(
+                    &mut snapshot.agents,
+                    &mut snapshot.runs,
+                )
+            } else {
+                (0, 0)
+            };
+        // Ledger session ids follow the room mapping; always idempotent.
+        let mapped_runs = crate::sessions::migration::map_ledger_session_ids(&mut snapshot.runs);
         self.workspace = snapshot.workspace.clone();
         let mut restored_agents = 0;
         let mut restored_swarms = 0;
@@ -1820,7 +1829,9 @@ impl DaemonState {
             snapshot.sessions,
             &self.live_agent_ids(),
         );
-        for record in self.derive_legacy_sessions() {
+        let derived_sessions = self.derive_legacy_sessions();
+        let derived_session_count = derived_sessions.len();
+        for record in derived_sessions {
             self.sessions.insert(record);
         }
         self.tool_grants_applied = snapshot.tool_grants_applied.into_iter().collect();
@@ -1830,6 +1841,21 @@ impl DaemonState {
             &self.live_agent_ids(),
             anima_core::primitives::now_millis(),
         );
+
+        if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
+            info!(
+                relabelled_messages,
+                relabelled_runs,
+                mapped_runs,
+                "upgraded legacy check-in rooms and ledger session ids"
+            );
+        }
+        if derived_session_count > 0 {
+            info!(
+                derived_session_count,
+                "derived sessions for legacy rooms without one"
+            );
+        }
 
         Ok((restored_agents, restored_swarms))
     }
