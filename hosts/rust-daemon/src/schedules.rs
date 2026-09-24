@@ -654,6 +654,7 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                                 delivered_at_ms: None,
                                 attempts: 0,
                                 delivery_state: OutboundDeliveryState::Pending,
+                                message_pruned: false,
                             };
                             state
                                 .outbound

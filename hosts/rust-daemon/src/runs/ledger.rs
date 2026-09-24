@@ -287,6 +287,15 @@ impl RunLedger {
             .count()
     }
 
+    /// `(agentId, sessionId)` of every run that is queued, running, or awaiting approval.
+    pub(crate) fn active_sessions(&self) -> HashSet<(String, String)> {
+        self.records
+            .values()
+            .filter(|record| !record.status.is_terminal())
+            .map(|record| (record.agent_id.clone(), record.session_id.clone()))
+            .collect()
+    }
+
     /// Removes a deleted session's terminal runs and returns them, so a failed
     /// save can put them back.
     pub(crate) fn remove_terminal_for_session(

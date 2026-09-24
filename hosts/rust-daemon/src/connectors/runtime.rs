@@ -1011,6 +1011,7 @@ impl ConnectorManager {
                         delivered_at_ms: None,
                         attempts: 0,
                         delivery_state: OutboundDeliveryState::Pending,
+                        message_pruned: false,
                     };
                     if let Some(existing) = state.outbound.get(&outbound_id) {
                         if existing != &outbound {
@@ -1280,6 +1281,7 @@ impl ConnectorManager {
                         delivered_at_ms: None,
                         attempts: 0,
                         delivery_state: OutboundDeliveryState::Pending,
+                        message_pruned: false,
                     };
                     if let Some(existing) = state.outbound.get(&commit_outbound_id) {
                         if existing.connector_id != candidate.connector_id
@@ -3568,6 +3570,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 0,
                     delivery_state: crate::connectors::OutboundDeliveryState::Pending,
+                    message_pruned: false,
                 },
             );
         }
@@ -5414,6 +5417,7 @@ mod tests {
                         delivered_at_ms: Some(1),
                         attempts: 1,
                         delivery_state: crate::connectors::OutboundDeliveryState::Delivered,
+                        message_pruned: false,
                     },
                 );
             }
@@ -5587,6 +5591,7 @@ mod tests {
                         delivered_at_ms: None,
                         attempts: 1,
                         delivery_state: crate::connectors::OutboundDeliveryState::Failed,
+                        message_pruned: false,
                     },
                 );
             }
@@ -5684,6 +5689,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 1,
                     delivery_state: crate::connectors::OutboundDeliveryState::Failed,
+                    message_pruned: false,
                 },
             );
         }
@@ -6254,6 +6260,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 0,
                     delivery_state: crate::connectors::OutboundDeliveryState::Pending,
+                    message_pruned: false,
                 },
             );
         }
@@ -6967,6 +6974,7 @@ mod tests {
                         delivered_at_ms,
                         attempts: 1,
                         delivery_state,
+                        message_pruned: false,
                     },
                 );
             }
@@ -7033,6 +7041,7 @@ mod tests {
                     delivered_at_ms,
                     attempts: 1,
                     delivery_state: state,
+                    message_pruned: false,
                 },
             );
         }
@@ -7067,6 +7076,7 @@ mod tests {
                         delivered_at_ms: Some(now - 1_000 + index),
                         attempts: 1,
                         delivery_state: OutboundDeliveryState::Delivered,
+                        message_pruned: false,
                     },
                 );
             }
@@ -7089,6 +7099,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 1,
                     delivery_state: state,
+                    message_pruned: false,
                 },
             );
         }

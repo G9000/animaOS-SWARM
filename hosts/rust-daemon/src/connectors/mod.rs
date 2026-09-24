@@ -123,6 +123,10 @@ pub(crate) struct TelegramOutboundRecord {
     #[serde(default)]
     pub(crate) attempts: u32,
     pub(crate) delivery_state: OutboundDeliveryState,
+    /// The assistant message left the control plane's hot tail after this
+    /// record was delivered (spec §13.2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) message_pruned: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

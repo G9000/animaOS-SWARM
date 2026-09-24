@@ -160,6 +160,8 @@ Every session route requires local-owner authorization, and reads answer `Cache-
 | `GET` | `/api/agents/{agent_id}/sessions/{session_id}/messages` | Messages oldest to newest: `?before=<messageId>&limit=50&includeHidden=false`. Returns `{ messages, nextBefore }`. |
 | `GET` | `/api/agents/{agent_id}/sessions/{session_id}/export` | The full transcript as `text/markdown`, including messages kept only in the history store, with silent check-in turns marked rather than hidden. |
 
+Every committed message is mirrored to the history store (`ANIMAOS_RS_HISTORY_SQLITE_FILE`, the Postgres history tables, or bounded in-memory tables in ephemeral mode). Every 10 minutes the daemon prunes mirrored messages that are neither among their session's newest 200 nor from the last 24 hours from the control plane (never in ephemeral mode, never while a run in the session is active or a Telegram delivery still needs the message). `GET /api/agents` and `GET /api/agents/{agent_id}` then carry only this hot tail; the session messages and export routes still return the full history.
+
 ### Agencies
 
 | Method | Path | Description |

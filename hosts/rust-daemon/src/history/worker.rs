@@ -1,15 +1,18 @@
-//! The history worker: the loop that flushes the outbox while a router owns
-//! it, and the owner token that keeps it running.
+//! The history worker: the loop that flushes the outbox and prunes the hot
+//! tail while a router owns it, and the owner token that keeps it running.
 
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use anima_core::primitives::now_millis;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{error, warn};
+use tokio::time::Instant;
+use tracing::{error, info, warn};
 
 use super::lock;
 use crate::app::SharedDaemonState;
+use crate::sessions::pruning::{prune_in_transaction, PRUNE_INTERVAL_MS};
 
 struct WorkerHandle {
     stop: watch::Sender<bool>,
@@ -34,16 +37,18 @@ impl HistoryWorkerOwner {
     }
 }
 
-/// Runs the outbox flush loop; Task 13 adds hot-tail pruning to it. The loop
-/// ends on `shutdown`, after one final flush, or once every
+/// Runs the outbox flush loop and, every ten minutes, hot-tail pruning. The
+/// loop ends on `shutdown`, after one final flush, or once every
 /// `HistoryWorkerOwner` it was started with is dropped. Worker handles never
 /// keep it running.
 #[derive(Clone)]
 pub(crate) struct HistoryWorker {
     state: SharedDaemonState,
     /// The control-plane transaction, under which flushes read the control
-    /// plane; hot-tail pruning (Task 13) takes it too.
+    /// plane and every prune runs.
     transactions: Arc<Mutex<()>>,
+    /// How often the loop prunes the hot tail.
+    prune_interval: Duration,
     running: Arc<StdMutex<Option<WorkerHandle>>>,
 }
 
@@ -52,12 +57,21 @@ impl HistoryWorker {
         Self {
             state,
             transactions,
+            prune_interval: Duration::from_millis(PRUNE_INTERVAL_MS),
             running: Arc::new(StdMutex::new(None)),
         }
     }
 
-    /// Starts the flush loop, which runs while `owner` or a clone of it
-    /// lives. Needs a Tokio runtime; a second call is a no-op.
+    /// A shorter pruning interval, so a test need not wait ten minutes.
+    #[cfg(test)]
+    pub(crate) fn with_prune_interval(mut self, prune_interval: Duration) -> Self {
+        self.prune_interval = prune_interval;
+        self
+    }
+
+    /// Starts the loop, which flushes and, once its pruning interval is due,
+    /// prunes while `owner` or a clone of it lives. Needs a Tokio runtime; a
+    /// second call is a no-op.
     pub(crate) fn start(&self, owner: &HistoryWorkerOwner) {
         let mut running = lock(&self.running);
         if running.is_some() {
@@ -70,8 +84,10 @@ impl HistoryWorker {
         let mut owned = owner.alive.subscribe();
         let state = Arc::clone(&self.state);
         let transactions = Arc::clone(&self.transactions);
+        let prune_interval = self.prune_interval;
         let join = tokio::spawn(async move {
             let _keep_open = keep_open;
+            let mut next_prune_at = Instant::now() + prune_interval;
             loop {
                 let history = state.read().await.history.clone();
                 tokio::select! {
@@ -84,6 +100,33 @@ impl HistoryWorker {
                 let _ = history
                     .flush_once(&state, &transactions, now_millis())
                     .await;
+                if Instant::now() < next_prune_at {
+                    continue;
+                }
+                next_prune_at = Instant::now() + prune_interval;
+                let pruned = {
+                    let _transaction = transactions.lock().await;
+                    // The flush, or a commit this waited for, may have
+                    // outlived the last owner or a shutdown request: a stale
+                    // instance must never prune and save its snapshot over a
+                    // newer one.
+                    if *stopping.borrow() || owned.has_changed().is_err() {
+                        break;
+                    }
+                    prune_in_transaction(&state, now_millis()).await
+                };
+                match pruned {
+                    Ok(0) => {}
+                    Ok(pruned) => {
+                        info!(
+                            pruned,
+                            "moved old mirrored messages out of the control plane"
+                        );
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "hot-tail pruning could not save; the messages stay in the control plane");
+                    }
+                }
             }
         });
         *running = Some(WorkerHandle { stop, join });
@@ -124,9 +167,10 @@ mod tests {
     use super::*;
     use crate::history::conformance::{history_message, FlakyHistoryStore};
     use crate::history::{HistoryService, HistoryStore, MessagePageQuery, HISTORY_FLUSH_INTERVAL};
+    use crate::sessions::pruning::HOT_TAIL_MESSAGES;
+    use crate::sessions::test_support::{agent_config, message, seed_messages};
     use crate::state::DaemonState;
     use anima_core::MessageRole;
-    use std::time::Duration;
     use tokio::sync::RwLock;
 
     fn page(agent_id: &str, session_id: &str) -> MessagePageQuery {
@@ -212,6 +256,114 @@ mod tests {
                 .len(),
             1,
             "shutdown still flushes once more"
+        );
+    }
+
+    /// An agent with one more old message in `chat:a` than the hot tail keeps,
+    /// none of them mirrored yet, and a worker that prunes on every pass.
+    fn state_with_an_old_chat(store: Arc<FlakyHistoryStore>) -> (SharedDaemonState, String) {
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(store));
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        let messages = (0..=HOT_TAIL_MESSAGES)
+            .map(|index| {
+                let role = if index % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                };
+                message(
+                    &agent,
+                    &format!("m{index:03}"),
+                    "chat:a",
+                    role,
+                    "old",
+                    1_000 + index as u64,
+                )
+            })
+            .collect();
+        seed_messages(&mut daemon, &agent, messages);
+        (Arc::new(RwLock::new(daemon)), agent)
+    }
+
+    async fn hot_ids(state: &SharedDaemonState, agent_id: &str) -> Vec<String> {
+        state.read().await.agents[agent_id]
+            .messages()
+            .iter()
+            .map(|message| message.id.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_loop_prunes_the_hot_tail_on_its_interval_while_an_owner_lives() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, agent) = state_with_an_old_chat(Arc::clone(&store));
+        let worker = HistoryWorker::new(Arc::clone(&state), Arc::new(Mutex::new(())))
+            .with_prune_interval(Duration::ZERO);
+        let owner = HistoryWorkerOwner::new();
+        worker.start(&owner);
+
+        // The first pass reconciles (mirroring every message), then prunes.
+        let deadline = tokio::time::Instant::now() + 5 * HISTORY_FLUSH_INTERVAL;
+        while hot_ids(&state, &agent).await.len() > HOT_TAIL_MESSAGES {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop prunes once its interval is due"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(hot_ids(&state, &agent).await[0], "m001");
+        assert!(
+            store
+                .get_message(&agent, "chat:a", "m000")
+                .await
+                .unwrap()
+                .is_some(),
+            "the pruned message stays in the history store"
+        );
+        assert!(!worker.has_stopped());
+        drop(owner);
+        worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_flush_that_outlives_the_last_owner_is_not_followed_by_a_prune() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, agent) = state_with_an_old_chat(Arc::clone(&store));
+        let worker = HistoryWorker::new(Arc::clone(&state), Arc::new(Mutex::new(())))
+            .with_prune_interval(Duration::ZERO);
+        let owner = HistoryWorkerOwner::new();
+        // Hold the first pass inside its reconcile's store round trip.
+        let gate = store.hold_next_existence_check();
+        worker.start(&owner);
+        gate.entered.acquire().await.unwrap().forget();
+
+        // The last owner goes (a stale app instance) while that flush runs.
+        drop(owner);
+        gate.release.add_permits(1);
+        let deadline = tokio::time::Instant::now() + 5 * HISTORY_FLUSH_INTERVAL;
+        while !worker.has_stopped() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop ends once its owners are gone"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(
+            hot_ids(&state, &agent).await.len(),
+            HOT_TAIL_MESSAGES + 1,
+            "a stale instance must not prune and save its snapshot"
+        );
+        let history = state.read().await.history.clone();
+        assert!(
+            history.is_mirrored("m000"),
+            "the flush in progress finished"
         );
     }
 }

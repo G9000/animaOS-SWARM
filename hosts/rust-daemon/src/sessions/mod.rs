@@ -4,6 +4,7 @@
 //! their room on the record.
 
 pub(crate) mod migration;
+pub(crate) mod pruning;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod views;

@@ -1069,6 +1069,7 @@ mod tests {
             delivered_at_ms: None,
             attempts: 1,
             delivery_state: OutboundDeliveryState::Pending,
+            message_pruned: false,
         }
     }
 
@@ -1263,6 +1264,35 @@ mod tests {
         assert!(state.restore_control_plane_snapshot(snapshot).is_err());
         assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
         assert_eq!(state.sessions.len(), 0);
+    }
+
+    #[test]
+    fn a_pruned_assistant_message_is_accepted_only_for_delivered_records() {
+        let (snapshot, _) = valid_connector_snapshot();
+
+        let mut delivered = snapshot.clone();
+        delivered.outbound[0].delivery_state = OutboundDeliveryState::Delivered;
+        delivered.outbound[0].delivered_at_ms = Some(14);
+        delivered.outbound[0].assistant_message_id = "pruned-message".into();
+        delivered.outbound[0].message_pruned = true;
+        DaemonState::new()
+            .restore_control_plane_snapshot(delivered)
+            .expect("a delivered record may outlive its pruned message");
+
+        for delivery_state in [
+            OutboundDeliveryState::Pending,
+            OutboundDeliveryState::Failed,
+        ] {
+            let mut undelivered = snapshot.clone();
+            undelivered.outbound[0].delivery_state = delivery_state;
+            undelivered.outbound[0].message_pruned = true;
+            assert_eq!(
+                DaemonState::new()
+                    .restore_control_plane_snapshot(undelivered)
+                    .unwrap_err(),
+                "outbound delivery 'outbound-1' is marked messagePruned but was not delivered"
+            );
+        }
     }
 
     #[test]
@@ -2089,6 +2119,12 @@ impl DaemonState {
                     record.id
                 ));
             }
+            if record.message_pruned && record.delivery_state != OutboundDeliveryState::Delivered {
+                return Err(format!(
+                    "outbound delivery '{}' is marked messagePruned but was not delivered",
+                    record.id
+                ));
+            }
             if let Some(agent) = persisted_agents.get(&record.agent_id) {
                 let assistant_message_exists = agent.messages.iter().any(|message| {
                     message.id == record.assistant_message_id
@@ -2096,7 +2132,7 @@ impl DaemonState {
                         && message.room_id == connector.room_id
                         && message.role == MessageRole::Assistant
                 });
-                if !assistant_message_exists {
+                if !assistant_message_exists && !record.message_pruned {
                     return Err(format!(
                         "outbound delivery '{}' references a missing, non-assistant, or wrong-room assistant message '{}'",
                         record.id, record.assistant_message_id
