@@ -46,6 +46,12 @@ impl Evaluator for ReflectionMemoryEvaluator {
         message: &Message,
         response: &Content,
     ) -> Result<EvaluatorResult, String> {
+        // A silent check-in is plumbing, not conversation (spec §9.2).
+        if crate::sessions::is_checkin_message(message)
+            && crate::schedules::is_silent_checkin_reply(&response.text)
+        {
+            return Ok(EvaluatorResult::default());
+        }
         if response.text.trim().is_empty() {
             return Ok(EvaluatorResult::default());
         }
@@ -775,5 +781,74 @@ mod tests {
         }
         assert!(extract_explicit_user_memory("My brand is Ardenta").is_some());
         assert!(extract_explicit_user_memory("Remember that my brand is Ardenta").is_some());
+    }
+
+    #[tokio::test]
+    async fn silent_checkins_store_no_reflection() {
+        let memory = Arc::new(AsyncRwLock::new(MemoryManager::new()));
+        let evaluator = ReflectionMemoryEvaluator {
+            memory: memory.clone(),
+            memory_embeddings: Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::disabled())),
+            memory_store: None,
+        };
+        let runtime = AgentRuntime::new(
+            AgentConfig {
+                name: "operator".into(),
+                model: "gpt-5.4".into(),
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                provider: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            },
+            Arc::new(DeterministicModelAdapter),
+        );
+        let message = Message {
+            id: "msg-1".into(),
+            agent_id: runtime.id().to_string(),
+            room_id: "schedule:schedule-1".into(),
+            content: Content {
+                text: "Check status".into(),
+                attachments: None,
+                metadata: Some(BTreeMap::from([(
+                    "kind".to_string(),
+                    DataValue::String("checkin".into()),
+                )])),
+            },
+            role: MessageRole::User,
+            created_at_ms: 0,
+        };
+        let silent = Content {
+            text: " CHECKIN_OK ".into(),
+            attachments: None,
+            metadata: None,
+        };
+
+        let result = evaluator
+            .evaluate(&runtime, &message, &silent)
+            .await
+            .unwrap();
+
+        assert_eq!(result.metadata, None);
+        assert_eq!(memory.read().await.size(), 0);
+        let spoken = Content {
+            text: "Two tasks are overdue".into(),
+            attachments: None,
+            metadata: None,
+        };
+        evaluator
+            .evaluate(&runtime, &message, &spoken)
+            .await
+            .unwrap();
+        assert!(
+            memory.read().await.size() >= 1,
+            "a spoken check-in still reflects"
+        );
     }
 }

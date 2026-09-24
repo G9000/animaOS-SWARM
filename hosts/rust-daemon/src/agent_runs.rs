@@ -999,6 +999,7 @@ impl AgentRunCoordinator {
                 .insert("idempotencyKey".into(), DataValue::String(idempotency_key));
         }
         let retry_key = content_retry_key(&content).map(str::to_owned);
+        let checkin_input = crate::schedules::is_checkin_content(&content);
 
         // Phase A: record the run as running and publish that durable marker
         // before any model work (the run-start save that already existed).
@@ -1288,15 +1289,24 @@ impl AgentRunCoordinator {
         drop(transaction);
         in_flight.disarm();
 
-        persist_task_result_memory(
-            &result,
-            &snapshot.state.id,
-            &snapshot.state.name,
-            memory,
-            memory_embeddings,
-            memory_store,
-        )
-        .await;
+        // A silent check-in stores no task-result memory; otherwise silent
+        // check-ins crowd real memories out of the recent-memory context (spec §9.2).
+        let silent_checkin = checkin_input
+            && result
+                .data
+                .as_ref()
+                .is_some_and(|reply| crate::schedules::is_silent_checkin_reply(&reply.text));
+        if !silent_checkin {
+            persist_task_result_memory(
+                &result,
+                &snapshot.state.id,
+                &snapshot.state.name,
+                memory,
+                memory_embeddings,
+                memory_store,
+            )
+            .await;
+        }
 
         Ok(AgentRunEnvelope {
             agent: AgentRuntimeSnapshotResponse::from(&snapshot),
@@ -4974,5 +4984,64 @@ mod tests {
             Some(alice_run.id.as_str())
         );
         assert_eq!(session.parent_agent_id.as_deref(), Some(alice.id.as_str()));
+    }
+
+    struct CheckinModel;
+
+    #[async_trait]
+    impl ModelAdapter for CheckinModel {
+        fn provider(&self) -> &str {
+            "checkin"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let input = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            Ok(model_response(if input.contains("quiet") {
+                "CHECKIN_OK"
+            } else {
+                "Two tasks are overdue"
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_checkin_stores_no_task_result_memory_or_reflection() {
+        let (coordinator, agent_id) = coordinator_with_agent(Arc::new(CheckinModel), 4).await;
+        let checkin = |text: &str| AgentRunRequest {
+            content: Content {
+                text: crate::schedules::wrap_checkin_prompt(text),
+                attachments: None,
+                metadata: Some(BTreeMap::from([
+                    ("kind".to_string(), DataValue::String("checkin".into())),
+                    ("id".to_string(), DataValue::String("schedule-1".into())),
+                ])),
+            },
+            source: RunSource::Schedule,
+            ..room_request(&agent_id, "schedule:schedule-1", "unused")
+        };
+        let memory = coordinator.state.read().await.memory_handle();
+
+        coordinator.run(checkin("quiet check")).await.unwrap();
+        assert_eq!(
+            memory.read().await.size(),
+            0,
+            "a silent check-in leaves no memory"
+        );
+
+        coordinator.run(checkin("loud check")).await.unwrap();
+        assert!(
+            memory.read().await.size() >= 1,
+            "a check-in that spoke is remembered as before"
+        );
     }
 }

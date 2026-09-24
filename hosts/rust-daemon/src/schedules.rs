@@ -538,7 +538,8 @@ async fn claim_due(
 
 async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRecord, now: u64) {
     let room = match &record.target {
-        ScheduleTarget::Workspace => RunRoom::Generated,
+        // Spec §9.2: a workspace automation runs in its own `schedule:<id>` session.
+        ScheduleTarget::Workspace => RunRoom::Stable(crate::sessions::schedule_room_id(&record.id)),
         ScheduleTarget::Connector { connector_id } => {
             let connector = {
                 let state = inner.state.read().await;
@@ -829,6 +830,13 @@ pub(crate) fn unwrap_checkin_prompt(text: &str) -> &str {
         .map(str::trim_end)
         .unwrap_or(text)
         .trim()
+}
+/// Input the scheduler tagged as a check-in prompt.
+pub(crate) fn is_checkin_content(content: &Content) -> bool {
+    matches!(
+        content.metadata.as_ref().and_then(|metadata| metadata.get("kind")),
+        Some(DataValue::String(kind)) if kind == "checkin"
+    )
 }
 pub(crate) fn is_silent_checkin_reply(reply: &str) -> bool {
     reply.trim() == CHECKIN_SENTINEL
@@ -1412,7 +1420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_workspace_schedule_claims_before_running_and_tags_the_generated_room() {
+    async fn due_workspace_schedule_runs_in_its_stable_schedule_room() {
         let (service, state, agent_id, manager) = service();
         let (record, _) = service
             .create(
@@ -1428,15 +1436,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.tick_at(2).await.unwrap(), 1);
+        assert_eq!(
+            service.tick_at(1_002).await.unwrap(),
+            1,
+            "the next occurrence fires too"
+        );
         let guard = state.read().await;
         let schedule = &guard.schedules[&record.id];
-        assert_eq!(schedule.next_due_at_ms, 1_002);
-        assert_eq!(schedule.last_fired.as_ref().unwrap().fired_at_ms, 2);
+        assert_eq!(schedule.next_due_at_ms, 2_002);
+        assert_eq!(schedule.last_fired.as_ref().unwrap().fired_at_ms, 1_002);
         assert_eq!(
             schedule.last_safe_outcome.as_ref().unwrap().status,
             ScheduleOutcomeStatus::Spoke
         );
+        let room = crate::sessions::schedule_room_id(&record.id);
         let snapshot = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(snapshot.messages.len(), 4);
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| message.room_id == room),
+            "both occurrences share the automation's room"
+        );
         let input = snapshot
             .messages
             .iter()
@@ -1448,8 +1470,14 @@ mod tests {
         );
         assert_eq!(
             input.content.metadata.as_ref().unwrap().get("id"),
-            Some(&DataValue::String(record.id))
+            Some(&DataValue::String(record.id.clone()))
         );
+        let session = guard
+            .sessions
+            .get(&agent_id, &room)
+            .expect("the automation's room is a check-in session");
+        assert_eq!(session.kind, crate::sessions::SessionKind::Checkin);
+        assert_eq!(session.title, "Check-in · Check status");
         drop(guard);
         manager.shutdown().await;
     }
