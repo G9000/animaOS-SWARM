@@ -113,8 +113,14 @@ fn isolated_copy_carries_only_its_room_and_no_events() {
 
     assert_eq!(copy.messages.len(), 2);
     assert_eq!(copy.message_count, 2);
-    assert!(copy.messages.iter().all(|message| message.room_id == "room-b"));
-    assert!(copy.events.is_empty(), "a run copy never carries the event log");
+    assert!(copy
+        .messages
+        .iter()
+        .all(|message| message.room_id == "room-b"));
+    assert!(
+        copy.events.is_empty(),
+        "a run copy never carries the event log"
+    );
     assert_eq!(copy.event_count, full.event_count);
     assert_eq!(copy.step_count, full.step_count);
     assert_eq!(copy.state, full.state);
@@ -139,7 +145,10 @@ fn applying_a_delta_merges_exactly_one_run_and_reverting_restores_the_record() {
             .iter()
             .map(|message| (message.role, message.room_id.as_str()))
             .collect::<Vec<_>>(),
-        [(MessageRole::User, "room-b"), (MessageRole::Assistant, "room-b")]
+        [
+            (MessageRole::User, "room-b"),
+            (MessageRole::Assistant, "room-b")
+        ]
     );
     assert_eq!(delta.token_usage, usage());
     assert_eq!(delta.status, AgentStatus::Completed);
@@ -154,8 +163,14 @@ fn applying_a_delta_merges_exactly_one_run_and_reverting_restores_the_record() {
 
     let undo = canonical.apply_run_delta(&delta);
     let applied = canonical.snapshot();
-    assert_eq!(&applied.messages[..before.messages.len()], &before.messages[..]);
-    assert_eq!(&applied.messages[before.messages.len()..], &delta.messages[..]);
+    assert_eq!(
+        &applied.messages[..before.messages.len()],
+        &before.messages[..]
+    );
+    assert_eq!(
+        &applied.messages[before.messages.len()..],
+        &delta.messages[..]
+    );
     assert_eq!(
         applied.state.token_usage.total_tokens,
         before.state.token_usage.total_tokens + 12
@@ -196,7 +211,10 @@ fn copies_from_one_base_merge_independently_and_revert_by_id() {
     let merged = canonical.snapshot();
     assert_eq!(merged.messages, second_delta.messages);
     assert_eq!(merged.state.token_usage, usage());
-    assert_eq!(merged.event_count, before.event_count + second_delta.event_total);
+    assert_eq!(
+        merged.event_count,
+        before.event_count + second_delta.event_total
+    );
     assert_eq!(
         merged.last_task, second_delta.last_task,
         "reverting an earlier run keeps a later run's result"
@@ -343,13 +361,14 @@ fn copies_running_concurrently_persist_separate_tool_steps() {
     let db = Arc::new(InMemoryAdapter::new());
     let mut canonical = AgentRuntime::new(search_config(), Arc::new(SearchOnceModel));
     canonical.init();
-    let tool = |_: AgentState, _: Message, _: ToolCall| async move {
-        TaskResult::success(text("hit"), 1)
-    };
+    let tool =
+        |_: AgentState, _: Message, _: ToolCall| async move { TaskResult::success(text("hit"), 1) };
     let mut steps_per_run = Vec::new();
     for run_id in ["run_a", "run_b"] {
-        let mut copy =
-            AgentRuntime::from_snapshot(canonical.run_snapshot(Vec::new()), Arc::new(SearchOnceModel));
+        let mut copy = AgentRuntime::from_snapshot(
+            canonical.run_snapshot(Vec::new()),
+            Arc::new(SearchOnceModel),
+        );
         copy.set_database(db.clone());
         copy.set_run_id(run_id);
         assert_eq!(copy.run_id(), Some(run_id));

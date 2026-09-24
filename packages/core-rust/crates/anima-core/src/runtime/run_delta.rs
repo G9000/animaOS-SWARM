@@ -189,5 +189,7 @@ fn subtract_usage(total: &mut TokenUsage, delta: &TokenUsage) {
     total.cached_prompt_tokens = total
         .cached_prompt_tokens
         .saturating_sub(delta.cached_prompt_tokens);
-    total.reasoning_tokens = total.reasoning_tokens.saturating_sub(delta.reasoning_tokens);
+    total.reasoning_tokens = total
+        .reasoning_tokens
+        .saturating_sub(delta.reasoning_tokens);
 }

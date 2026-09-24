@@ -39,7 +39,11 @@ impl RunChangeSet {
         delta: RuntimeRunDelta,
     ) -> Self {
         Self {
-            message_ids: delta.messages.iter().map(|message| message.id.clone()).collect(),
+            message_ids: delta
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect(),
             event_ids: delta.events.iter().map(|event| event.id.clone()).collect(),
             token_delta: delta.token_usage.clone(),
             step_delta: delta.step_count,
@@ -181,7 +185,11 @@ mod tests {
     fn outcome_reports_the_final_reply_only_when_the_run_succeeded() {
         let calls = BTreeMap::from([(
             "toolCalls".to_string(),
-            DataValue::Array(vec![tool_call("bash"), tool_call("bash"), tool_call("read_file")]),
+            DataValue::Array(vec![
+                tool_call("bash"),
+                tool_call("bash"),
+                tool_call("read_file"),
+            ]),
         )]);
         let change_set = RunChangeSet::new(
             "run_1".into(),
