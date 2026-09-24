@@ -17,7 +17,7 @@ pub(crate) use sqlite::SqliteHistoryStore;
 
 use std::collections::{HashMap, HashSet};
 
-use anima_core::Message;
+use anima_core::{Message, MessageRole};
 use async_trait::async_trait;
 
 use crate::runs::RunRecord;
@@ -167,6 +167,21 @@ pub(crate) trait HistoryStore: Send + Sync {
 
     /// Removes a session's messages, runs, and attachment records.
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError>;
+}
+
+/// Converts a millisecond timestamp or counter to a store's signed column type.
+fn to_i64(value: u64) -> Result<i64, HistoryError> {
+    i64::try_from(value).map_err(|_| HistoryError::new("a timestamp or counter is out of range"))
+}
+
+/// The row value a store writes for a message's role.
+fn role_name(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::System => "system",
+        MessageRole::Tool => "tool",
+    }
 }
 
 /// Lowercase query words, at most `MAX_SEARCH_TOKENS`.

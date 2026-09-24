@@ -3,12 +3,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anima_core::MessageRole;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 
 use super::{
-    message_ordinal, search_tokens, HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
+    message_ordinal, role_name, search_tokens, to_i64, HistoryError, HistoryMessage, HistoryStore,
+    MessagePageQuery,
 };
 use crate::runs::RunRecord;
 
@@ -59,19 +59,6 @@ pub(crate) fn prefix_tsquery(tokens: &[String]) -> String {
         .map(|token| format!("{token}:*"))
         .collect::<Vec<_>>()
         .join(" & ")
-}
-
-fn to_i64(value: u64) -> Result<i64, HistoryError> {
-    i64::try_from(value).map_err(|_| HistoryError::new("a timestamp or counter is out of range"))
-}
-
-fn role_name(role: MessageRole) -> &'static str {
-    match role {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::System => "system",
-        MessageRole::Tool => "tool",
-    }
 }
 
 fn decode_row(row: &sqlx::postgres::PgRow) -> Result<HistoryMessage, HistoryError> {

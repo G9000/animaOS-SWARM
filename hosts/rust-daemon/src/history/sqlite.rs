@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use super::{
-    message_ordinal, search_tokens, HistoryError, HistoryMessage, HistoryStore, MessagePageQuery,
+    message_ordinal, role_name, search_tokens, to_i64, HistoryError, HistoryMessage, HistoryStore,
+    MessagePageQuery,
 };
 use crate::runs::RunRecord;
 
@@ -197,19 +198,6 @@ fn open_connection(path: &Path) -> Result<Connection, HistoryError> {
         }
     }
     Ok(connection)
-}
-
-fn to_i64(value: u64) -> Result<i64, HistoryError> {
-    i64::try_from(value).map_err(|_| HistoryError::new("a timestamp or counter is out of range"))
-}
-
-fn role_name(role: MessageRole) -> &'static str {
-    match role {
-        MessageRole::User => "user",
-        MessageRole::Assistant => "assistant",
-        MessageRole::System => "system",
-        MessageRole::Tool => "tool",
-    }
 }
 
 fn placeholders(first: usize, count: usize) -> String {
