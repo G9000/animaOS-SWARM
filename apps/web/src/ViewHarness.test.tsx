@@ -2103,6 +2103,29 @@ it('keeps the open session while a sidebar search filters it out', async () => {
   expect(screen.queryByPlaceholderText('Message Nova…')).not.toBeInTheDocument();
 });
 
+it('shows a failed session action in the sidebar instead of rejecting', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+  );
+  vi.mocked(daemon.updateSession).mockRejectedValue(new Error('archive refused'));
+  render(<ViewHarness />);
+
+  await user.click(await screen.findByRole('button', { name: 'Actions for Old plan' }));
+  await user.click(screen.getByRole('menuitem', { name: 'Archive' }));
+
+  expect(
+    await within(screen.getByRole('navigation', { name: 'Sessions' })).findByRole(
+      'alert',
+    ),
+  ).toHaveTextContent('archive refused');
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
