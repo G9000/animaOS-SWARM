@@ -1494,6 +1494,13 @@ git commit -m "feat(daemon): add session records, room mapping, titles, and the 
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Add `legacy-room:` to `RESERVED_ROOM_PREFIXES` in `hosts/rust-daemon/src/routes/agents.rs`, so a client `roomId` can never alias a mapped `legacy-room:<hash>` session id. Test: `POST /api/agents/{id}/run` with `roomId: "legacy-room:abc"` returns the existing reserved-prefix 400.
+2. A session's `lastActivityAtMs` advances only for visible messages: silent check-in pairs (`CHECKIN_OK` exchanges) do not move a heartbeat session to the top of the list. Test.
+
+---
+
 ### Task 3: History store contract and the bounded in-memory store
 
 **Files:**
@@ -3450,6 +3457,12 @@ git commit -m "feat(daemon): add the Postgres history store and its migration"
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Document in `hosts/rust-daemon/README.md` (Postgres persistence) that the history tables require Postgres 12+, and that rolling back to a pre-M2 daemon in Postgres mode also requires `DELETE FROM _sqlx_migrations WHERE version = 20260923000000;` (optionally dropping the `history_*` tables) besides restoring `control_plane.backup.<version>`, because sqlx refuses to start when an applied migration is missing (`VersionMissing`).
+
+---
+
 ### Task 6: History outbox, worker, readiness, and wiring
 
 **Files:**
@@ -4818,6 +4831,17 @@ git commit -m "feat(daemon): mirror committed turns and finished runs through th
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Mirror only durable state: `flush_once` reads `unmirrored_terminal` runs and `reconcile` takes its hot snapshot while holding the control-plane transaction mutex (`HistoryWorker.transactions`); `rollback_run` sets the record's `mirrored = false` (in `RunRecord::finish` or explicitly) so a rolled-back run is re-mirrored with its final status. Test: a flush that mirrors a completed run followed by a failed final save leaves the store row rewritten as `failed` after the next flush, with no phantom message rows.
+2. Reconcile cannot resurrect deleted sessions: after its store round-trip, `reconcile` recomputes `missing` against the current hot state under `state.read()` and enqueues while still holding that read guard. Test: a `DeleteSession` enqueued while a reconcile is between its snapshot and its push leaves the deleted session with no rows after flushing.
+3. Durable deletions: the control-plane snapshot gains `pendingHistoryDeletions` (`#[serde(default)]`, empty when absent), written in the same save as a session deletion (Task 12) or an agent deletion; boot replays pending deletions before `reconcile`; each entry is cleared in a normal save after the store's delete succeeds. Tests: a deletion survives a restart before the flush; a replayed deletion removes the rows.
+4. Keep the worker alive in every router: store the `HistoryWorker` handle (or its cancel sender) in `AppState` or `DaemonState` so `router_with_runtime`, `app_with_state`, and `app_with_configured_persistence` keep flushing and pruning; the loop stops only on an explicit shutdown signal, never because a sender was dropped. Test: an `app_with_state` router mirrors a committed message within the flush interval.
+5. Open or probe the history store before `configure_control_plane_store` writes anything, so a missing, corrupt, or unwritable history file refuses boot before the snapshot is upgraded and a pre-M2 daemon can still start on the untouched file. Test: an unwritable history path fails startup and leaves the control-plane file byte-identical.
+6. Add a code comment at `reconcile` noting its first-boot memory cost (it clones hot messages into the outbox before capacity enforcement).
+
+---
+
 ### Task 7: Snapshot version 5 with the pre-upgrade backup
 
 **Files:**
@@ -5117,6 +5141,10 @@ Expected: PASS; the Postgres backup test is reported as ignored.
 git add hosts/rust-daemon/src/control_plane_store.rs hosts/rust-daemon/src/app/persistence.rs hosts/rust-daemon/src/state.rs
 git commit -m "feat(daemon): bump the control plane to version 5 behind a pre-upgrade backup"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Write the JSON backup `<file>.pre-sessions.bak` (and the Postgres `control_plane.backup.<version>` row) only when the loaded version is below 5, so a later version bump can never overwrite it (unversioned files still count as version 1). Test: loading an already-v5 snapshot writes no backup and leaves an existing `.pre-sessions.bak` untouched.
 
 ---
 
@@ -6493,6 +6521,10 @@ git add hosts/rust-daemon/src/runs/mod.rs hosts/rust-daemon/src/state/session_st
 git commit -m "feat(daemon): give every run's room a session and link helper runs to their parent"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Calendar follow-up runs (`RunRoom::Generated`, source `api`, `sourceRef = calendar-write:<id>`) create sessions with `titleSource: system` and are not marked owner-read.
+
 ---
 
 ### Task 10: Stable check-in rooms and the silent check-in memory skip
@@ -6786,6 +6818,12 @@ git commit -m "feat(daemon): run workspace check-ins in their session and skip m
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Interim context guard (controller ruling): when building a run's history for a `schedule:` room, exclude silent check-in pairs (the same hidden-message rule the session views use) and keep only the newest 10 turns, where a turn starts at a user message and an assistant tool-call message is never separated from its tool results. Other rooms are unchanged in M2; M3's context selection replaces this. Tests: a schedule room with 30 prior ticks (half silent) gives the model at most 10 visible turns and no `CHECKIN_OK` pairs; a tool-call turn is kept whole.
+
+---
+
 ### Task 11: Session read routes and `GET /api/agents?view=summary`
 
 **Files:**
@@ -8776,6 +8814,13 @@ git commit -m "feat(daemon): add owner-only session list, detail, and message ro
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. `GET /api/agents` ignores unknown `view` values (default full response) instead of returning 400, preserving existing route behavior (spec §13.4); only `view=summary` changes the shape. Test. (Supersedes the earlier acceptance of 400.)
+2. Session search ranks sessions by their newest matching message per session (a per-session grouping in SQLite and Postgres, and the equivalent in memory), so a session whose only matches are older than the newest 500 matching rows still appears. Test with more than 500 matches in one session and one older match in another.
+
+---
+
 ### Task 12: Session mutation routes and Markdown export
 
 **Files:**
@@ -9795,6 +9840,14 @@ git commit -m "feat(daemon): create, rename, archive, delete, and export session
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. `POST /api/agents/{id}/sessions` returns 409 for helper agents (they can only run through their companion).
+2. Session deletion and agent deletion (`ConnectorManager::delete_agent`) record their history deletions through Task 6's durable `pendingHistoryDeletions` (a per-agent deletion for agent delete).
+3. Markdown export includes silent check-in turns, marked `(silent check-in)`, because spec §3.3 promises the full transcript.
+
+---
+
 ### Task 13: Hot-tail pruning and `messagePruned`
 
 **Files:**
@@ -10287,6 +10340,13 @@ git commit -m "feat(daemon): prune mirrored messages from the control plane's ho
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The newest-200 hot-tail rank counts visible messages only (silent check-in pairs do not consume the window).
+2. Remove the stale `agent_snapshots` duplication (M1 carry-forward): `list_agents`, `get_agent`, `team_roster`, `peer_ids`, and `resolve_peer` read the canonical runtimes; `agent_snapshots` keeps entries only for agents without a loaded runtime (verify every user; delete the map if none remain), so `retain_messages` (delete and prune) actually frees memory. Test: after pruning, `list_agents()` returns only the hot tail.
+
+---
+
 ### Task 14: SDK sessions client
 
 **Files:**
@@ -10771,6 +10831,13 @@ git commit -m "feat(sdk): add the sessions client and agent summaries"
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. End the task by running `bun x nx run @animaOS-SWARM/sdk:build` so later direct `vitest` runs in apps/web resolve the new sessions client from `packages/sdk/dist`.
+2. The SDK maps a 404 from the sessions routes to a typed daemon-too-old error so the web can show "Update the daemon" (spec §13.4). Test.
+
+---
+
 ### Task 15: Web hash routing and session data hooks
 
 **Files:**
@@ -11833,6 +11900,13 @@ git commit -m "feat(web): add hash routes, session grouping, and session data ho
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Before running web tests directly, make sure the SDK dist is current (`bun x nx run @animaOS-SWARM/sdk:build`), or run them through `bun x nx test @animaOS-SWARM/web`.
+2. `mergeNewest`: when the newest page's first message is not already in the list (a gap), reset `nextBefore` from the page or reload the session so no permanent gap remains. Test.
+
+---
+
 ### Task 16: Sessions sidebar and session view components
 
 **Files:**
@@ -13208,6 +13282,12 @@ git commit -m "feat(web): add the sessions sidebar and session view components"
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Row and header menus close on Escape and return focus to their trigger. Test.
+
+---
+
 ### Task 17: Route-driven shell and session-based chat
 
 **Files:**
@@ -16127,6 +16207,20 @@ git commit -m "feat(web): route the console by session with a sessions sidebar a
 ```
 
 ---
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Resolve uncertain or timed-out sends from the open session (its `activeRuns` or a re-fetched session plus the session's messages), not agent-wide status, and keep polling while the session has active runs. Tests: a check-in running in another session does not lock an unrelated timed-out send; a send still queued for its room is not declared unconfirmed.
+2. Disable the composer while `routeSessionId && !activeSession` (the session record is still loading).
+3. Keep Telegram-target check-in creation: add a Workspace/Telegram target selector (Telegram only when a chat is approved) to the Work › Schedules create form, mirroring the removed CheckinsView. Test.
+4. Show `useSessionMessages().error` in the session view (for example a 503 when loading older pages).
+5. Persist drafts per session in `sessionStorage` (wrapped in try/catch; failures fall back to memory), per spec §15.5.
+6. The sessions drawer traps focus, sets initial focus, and closes on Escape.
+7. `startChat` skips navigation when `route.kind === 'page'` and updates `lastConversationRef` instead.
+8. When the sessions routes report the daemon is too old (Task 14's error), show "Update the daemon" instead of failing sends.
+9. Correct this task's test-change count to its actual list (11 changed, 3 new).
+
+---
+
 ### Task 18: M2 verification
 
 **Files:**
@@ -16171,6 +16265,11 @@ If the Rust gate ran only through the fallback, use `implemented — Nx gate pen
 git add docs/superpowers/plans/2026-09-23-companion-console.md
 git commit -m "docs: mark the M2 sessions milestone complete"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Fix the grep expectation: `TelegramOutboundRecord {` also matches two function signatures; assert the 14 `message_pruned: false` literals instead of a 15-line count.
+2. Run the three edited Playwright specs (web-e2e) locally if Playwright browsers and the simulated-API setup are available (CI runs `e2e-ci` on every push); otherwise record the deferral in the ledger instead of claiming them.
 
 ---
 
