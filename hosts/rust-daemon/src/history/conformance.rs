@@ -532,6 +532,10 @@ pub(crate) async fn assert_history_store_checkin_text_conformance(store: &dyn Hi
 pub(crate) struct FlakyHistoryStore {
     inner: MemoryHistoryStore,
     failing: AtomicBool,
+    /// Fails only `page_messages`, independent of `failing`: lets a test put
+    /// `get_message` (or the hot tail) through a `before` lookup and then
+    /// fail just the page read that follows it.
+    page_messages_failing: AtomicBool,
     panic_on_write: AtomicBool,
     existence_gate: Mutex<Option<StoreGate>>,
 }
@@ -549,6 +553,7 @@ impl FlakyHistoryStore {
         Self {
             inner: MemoryHistoryStore::new(),
             failing: AtomicBool::new(false),
+            page_messages_failing: AtomicBool::new(false),
             panic_on_write: AtomicBool::new(false),
             existence_gate: Mutex::new(None),
         }
@@ -556,6 +561,11 @@ impl FlakyHistoryStore {
 
     pub(crate) fn set_failing(&self, failing: bool) {
         self.failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Fails only `page_messages` calls, leaving every other method healthy.
+    pub(crate) fn set_page_messages_failing(&self, failing: bool) {
+        self.page_messages_failing.store(failing, Ordering::SeqCst);
     }
 
     /// Makes the next `upsert_messages` call panic.
@@ -645,6 +655,9 @@ impl HistoryStore for FlakyHistoryStore {
         query: &MessagePageQuery,
     ) -> Result<Vec<HistoryMessage>, HistoryError> {
         self.check()?;
+        if self.page_messages_failing.load(Ordering::SeqCst) {
+            return Err(HistoryError::new("injected page_messages failure"));
+        }
         self.inner.page_messages(query).await
     }
 

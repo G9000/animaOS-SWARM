@@ -337,7 +337,7 @@ async fn store_matches(
 }
 
 async fn stored_preview(store: &dyn HistoryStore, record: &SessionRecord) -> Option<String> {
-    let rows = store
+    let rows = match store
         .page_messages(&MessagePageQuery {
             agent_id: record.agent_id.clone(),
             session_id: record.id.clone(),
@@ -346,7 +346,13 @@ async fn stored_preview(store: &dyn HistoryStore, record: &SessionRecord) -> Opt
             include_hidden: false,
         })
         .await
-        .ok()?;
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(error = %error, "a stored preview could not read the history store; showing no preview");
+            return None;
+        }
+    };
     preview_from_newest(rows.iter().map(|row| &row.message))
 }
 
@@ -508,18 +514,27 @@ pub(crate) async fn session_messages(
         (hot, guard.history.store())
     };
     let hidden_ids = hidden_message_ids(hot.iter());
+    // Whether `before` needed the store to resolve (it named a message no
+    // longer in the hot tail): if the page read that follows then fails, the
+    // client asked for something only the store can answer, so it gets 503
+    // rather than a page that quietly omits what it could not check (review
+    // fix, M2 fix round 1).
+    let mut before_from_store = false;
     let before = match request.before.as_deref() {
         None => None,
         Some(before_id) => match hot.iter().find(|message| message.id == before_id) {
             Some(message) => Some(MessageOrder::of(message)),
-            None => match store.get_message(agent_id, session_id, before_id).await {
-                Ok(Some(row)) => Some(row.order()),
-                Ok(None) => return Err(MessagePageError::BeforeNotFound),
-                Err(error) => {
-                    warn!(error = %error, "a message page could not read the history store");
-                    return Err(MessagePageError::Unavailable);
+            None => {
+                before_from_store = true;
+                match store.get_message(agent_id, session_id, before_id).await {
+                    Ok(Some(row)) => Some(row.order()),
+                    Ok(None) => return Err(MessagePageError::BeforeNotFound),
+                    Err(error) => {
+                        warn!(error = %error, "a message page could not read the history store");
+                        return Err(MessagePageError::Unavailable);
+                    }
                 }
-            },
+            }
         },
     };
     let hot_ids = hot
@@ -546,6 +561,7 @@ pub(crate) async fn session_messages(
         limit: request.limit + 1,
         include_hidden: request.include_hidden,
     };
+    let mut store_unavailable = false;
     match store.page_messages(&query).await {
         Ok(rows) => page.extend(
             rows.into_iter()
@@ -556,7 +572,12 @@ pub(crate) async fn session_messages(
                 }),
         ),
         Err(error) => {
+            if before_from_store {
+                warn!(error = %error, "a message page could not read the history store after resolving `before` there");
+                return Err(MessagePageError::Unavailable);
+            }
             warn!(error = %error, "a message page could not read the history store; showing the hot tail");
+            store_unavailable = true;
         }
     }
     page.sort_by(|left, right| {
@@ -567,6 +588,17 @@ pub(crate) async fn session_messages(
     page.reverse();
     let next_before = if has_more {
         page.first().map(|entry| entry.message.id.clone())
+    } else if store_unavailable && !store.is_ephemeral() {
+        // The store could not say whether older messages exist. A store that
+        // never prunes the hot tail (`is_ephemeral`) is exempt: the hot tail
+        // already provably reaches the session's start. Otherwise, offer a
+        // cursor instead of `null` (which would claim this is the whole
+        // history), or -- if even the hot tail is exhausted -- answer 503
+        // outright rather than silently agreeing there is nothing more.
+        match page.first() {
+            Some(entry) => Some(entry.message.id.clone()),
+            None => return Err(MessagePageError::Unavailable),
+        }
     } else {
         None
     };
@@ -1103,6 +1135,169 @@ mod tests {
         assert_eq!(
             session_messages(&state, &agent, "chat:missing", &first_page(false)).await,
             Err(MessagePageError::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_before_resolved_only_from_the_store_pages_correctly() {
+        // Fix round 1, item 1: `get_message`'s `Ok(Some(..))` branch, with a
+        // healthy store throughout.
+        let mut daemon = DaemonState::new();
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        daemon
+            .sessions
+            .insert(session(&agent, "chat:plans", SessionKind::Chat, "Plans", 1));
+        // m1 and m2 exist only in the store; m3 is the lone hot message.
+        daemon
+            .history
+            .store()
+            .upsert_messages(&[
+                history_message("m1", &agent, "chat:plans", MessageRole::User, "one", 1),
+                history_message("m2", &agent, "chat:plans", MessageRole::Assistant, "two", 2),
+            ])
+            .await
+            .unwrap();
+        seed_messages(
+            &mut daemon,
+            &agent,
+            vec![message(
+                &agent,
+                "m3",
+                "chat:plans",
+                MessageRole::User,
+                "three",
+                3,
+            )],
+        );
+        let state = Arc::new(RwLock::new(daemon));
+
+        let page = session_messages(
+            &state,
+            &agent,
+            "chat:plans",
+            &MessagePageRequest {
+                before: Some("m2".into()),
+                limit: 10,
+                include_hidden: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ids(&page),
+            ["m1"],
+            "m2 was resolved via the store and paged from there"
+        );
+        assert_eq!(page.next_before, None);
+    }
+
+    #[tokio::test]
+    async fn a_before_resolved_from_the_store_with_a_failing_page_read_answers_unavailable() {
+        // Fix round 1, item 1: `before` found only in the store (`get_message`
+        // succeeds), but the page read that follows it then fails -> 503, not
+        // a 200 with an empty page and a `null` cursor.
+        let flaky = Arc::new(FlakyHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(flaky.clone()));
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        daemon
+            .sessions
+            .insert(session(&agent, "chat:plans", SessionKind::Chat, "Plans", 1));
+        flaky
+            .upsert_messages(&[
+                history_message("m1", &agent, "chat:plans", MessageRole::User, "one", 1),
+                history_message("m2", &agent, "chat:plans", MessageRole::Assistant, "two", 2),
+            ])
+            .await
+            .unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+
+        flaky.set_page_messages_failing(true);
+        assert_eq!(
+            session_messages(
+                &state,
+                &agent,
+                "chat:plans",
+                &MessagePageRequest {
+                    before: Some("m2".into()),
+                    limit: 10,
+                    include_hidden: false,
+                },
+            )
+            .await,
+            Err(MessagePageError::Unavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degraded_page_offers_a_cursor_that_surfaces_unavailable_on_the_next_request() {
+        // Fix round 1, item 1: a degraded page must not claim `nextBefore:
+        // null` (the whole history) when the store could not say whether
+        // older messages exist. It offers a cursor instead, and once the hot
+        // tail is exhausted the next request answers 503.
+        let flaky = Arc::new(FlakyHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(flaky.clone()));
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        daemon
+            .sessions
+            .insert(session(&agent, "chat:solo", SessionKind::Chat, "Solo", 1));
+        seed_messages(
+            &mut daemon,
+            &agent,
+            vec![
+                message(&agent, "h1", "chat:solo", MessageRole::User, "one", 1),
+                message(&agent, "h2", "chat:solo", MessageRole::Assistant, "two", 2),
+            ],
+        );
+        let state = Arc::new(RwLock::new(daemon));
+        flaky.set_failing(true);
+
+        let first = session_messages(
+            &state,
+            &agent,
+            "chat:solo",
+            &MessagePageRequest {
+                before: None,
+                limit: 5,
+                include_hidden: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ids(&first), ["h1", "h2"]);
+        assert_eq!(
+            first.next_before.as_deref(),
+            Some("h1"),
+            "a degraded page must not claim there is nothing more"
+        );
+
+        assert_eq!(
+            session_messages(
+                &state,
+                &agent,
+                "chat:solo",
+                &MessagePageRequest {
+                    before: first.next_before.clone(),
+                    limit: 5,
+                    include_hidden: false,
+                },
+            )
+            .await,
+            Err(MessagePageError::Unavailable),
+            "the hot tail is exhausted and the store still cannot say what comes before it"
         );
     }
 
