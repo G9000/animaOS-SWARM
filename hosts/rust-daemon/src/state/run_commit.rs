@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use anima_core::primitives::now_millis;
 use anima_core::{
-    AgentRuntime, AgentRuntimeSnapshot, AgentStatus, Message, MessageRole, RuntimeRunBase,
+    AgentRuntime, AgentRuntimeSnapshot, AgentState, AgentStatus, Message, MessageRole,
+    RuntimeRunBase,
 };
 
 use super::DaemonState;
@@ -146,10 +147,16 @@ impl DaemonState {
         &self,
         mut snapshot: AgentRuntimeSnapshot,
     ) -> AgentRuntimeSnapshot {
-        if self.in_flight_runs(&snapshot.state.id) > 0 {
-            snapshot.state.status = AgentStatus::Running;
-        }
+        snapshot.state = self.with_derived_state(snapshot.state);
         snapshot
+    }
+
+    /// `with_derived_status` for an agent's state alone.
+    pub(super) fn with_derived_state(&self, mut state: AgentState) -> AgentState {
+        if self.in_flight_runs(&state.id) > 0 {
+            state.status = AgentStatus::Running;
+        }
+        state
     }
 }
 
@@ -430,6 +437,35 @@ mod tests {
             state.get_agent(&agent_id).unwrap().state.status,
             AgentStatus::Idle
         );
+    }
+
+    #[test]
+    fn agent_states_match_the_listed_agents_without_cloning_transcripts() {
+        let (mut state, busy) = state_with_agent();
+        let mut config = state.get_agent(&busy).unwrap().state.config;
+        config.name = "second".into();
+        let idle = state.create_agent(config).unwrap().state.id;
+        start_run(&mut state, &busy, "room-a");
+
+        let states = state.agent_states();
+
+        assert_eq!(
+            states,
+            state
+                .list_agents()
+                .into_iter()
+                .map(|snapshot| snapshot.state)
+                .collect::<Vec<_>>(),
+            "the same agents, order, and derived status as list_agents"
+        );
+        let status = |id: &str| {
+            states
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.status)
+        };
+        assert_eq!(status(&busy), Some(AgentStatus::Running));
+        assert_eq!(status(&idle), Some(AgentStatus::Idle));
     }
 
     #[test]

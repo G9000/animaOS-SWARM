@@ -328,12 +328,12 @@ impl AgentRunCoordinator {
     ) -> Result<AgentState, String> {
         let guard = self.state.read().await;
         let matches: Vec<_> = guard
-            .list_agents()
+            .agent_states()
             .into_iter()
-            .filter(|snapshot| {
+            .filter(|agent| {
                 id.map_or_else(
-                    || name.is_some_and(|name| snapshot.state.name == name),
-                    |id| snapshot.state.id == id,
+                    || name.is_some_and(|name| agent.name == name),
+                    |id| agent.id == id,
                 )
             })
             .collect();
@@ -342,16 +342,16 @@ impl AgentRunCoordinator {
                 "Peer not found or name is ambiguous; use an agent ID from the roster".into(),
             );
         }
-        Ok(matches.into_iter().next().unwrap().state)
+        Ok(matches.into_iter().next().unwrap())
     }
 
     pub(crate) async fn peer_ids(&self) -> Vec<String> {
         self.state
             .read()
             .await
-            .list_agents()
+            .agent_states()
             .into_iter()
-            .map(|snapshot| snapshot.state.id)
+            .map(|agent| agent.id)
             .collect()
     }
 
@@ -415,8 +415,7 @@ impl AgentRunCoordinator {
     }
     pub(crate) async fn team_roster(&self) -> String {
         let guard = self.state.read().await;
-        let agents: Vec<_> = guard.list_agents().iter().map(|snapshot| {
-            let agent = &snapshot.state;
+        let agents: Vec<_> = guard.agent_states().iter().map(|agent| {
             serde_json::json!({"id": agent.id, "name": agent.name, "role": if is_workspace_manager(agent) { "workspace_manager" } else if helper_parent(agent).is_some() { "helper" } else { "specialist" }, "parentAgentId": helper_parent(agent), "description": agent.config.bio, "status": agent.status.as_str()})
         }).collect();
         serde_json::json!({"totalAgents": agents.len(), "agents": agents}).to_string()
@@ -3386,9 +3385,8 @@ mod tests {
             seeded.message_count = seeded.messages.len();
             guard.agents.insert(
                 agent_id.clone(),
-                AgentRuntime::from_snapshot(seeded.clone(), adapter.clone()),
+                AgentRuntime::from_snapshot(seeded, adapter.clone()),
             );
-            guard.agent_snapshots.insert(agent_id.clone(), seeded);
             agent_id
         };
         let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(2)));

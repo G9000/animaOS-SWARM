@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use anima_core::{
-    AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentStatus,
+    AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentState, AgentStatus,
     DatabaseAdapter, MessageRole, ModelAdapter, ToolDescriptor,
 };
 use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
@@ -1387,7 +1387,6 @@ pub(crate) struct DaemonState {
     control_plane_revision: u64,
     control_plane_persist_order: Arc<ControlPlanePersistOrder>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
-    pub(crate) agent_snapshots: HashMap<String, AgentRuntimeSnapshot>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
@@ -1543,7 +1542,6 @@ impl DaemonState {
                 test_save_gate: StdMutex::new(None),
             }),
             agents: HashMap::new(),
-            agent_snapshots: HashMap::new(),
             swarms: HashMap::new(),
             swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
@@ -1906,12 +1904,7 @@ impl DaemonState {
         for agent in &snapshot.agents {
             persisted_agents.insert(agent.state.id.clone(), agent.clone());
         }
-        let mut agent_ids = self
-            .agent_snapshots
-            .keys()
-            .chain(self.agents.keys())
-            .cloned()
-            .collect::<HashSet<_>>();
+        let mut agent_ids = self.agents.keys().cloned().collect::<HashSet<_>>();
         let mut snapshot_agent_ids = HashSet::new();
         for agent in &snapshot.agents {
             let agent_id = &agent.state.id;
@@ -2342,13 +2335,7 @@ impl DaemonState {
     }
 
     pub(crate) fn agent_count(&self) -> usize {
-        let mut count = self.agent_snapshots.len();
-        for agent_id in self.agents.keys() {
-            if !self.agent_snapshots.contains_key(agent_id) {
-                count += 1;
-            }
-        }
-        count
+        self.agents.len()
     }
 
     /// Runs of this agent that are running or awaiting approval (spec §4.4 item 5).
@@ -2363,11 +2350,7 @@ impl DaemonState {
     }
 
     fn live_agent_ids(&self) -> HashSet<String> {
-        self.agents
-            .keys()
-            .chain(self.agent_snapshots.keys())
-            .cloned()
-            .collect()
+        self.agents.keys().cloned().collect()
     }
 
     pub(crate) fn swarm_count(&self) -> usize {
@@ -2590,19 +2573,13 @@ impl DaemonState {
         runtime.init();
         let agent_id = runtime.id().to_string();
         let snapshot = runtime.snapshot();
-        self.agent_snapshots
-            .insert(agent_id.clone(), snapshot.clone());
         self.agents.insert(agent_id, runtime);
         Ok(snapshot)
     }
 
     pub(crate) fn restore_agent_config(&mut self, agent_id: &str, config: AgentConfig) {
         if let Some(runtime) = self.agents.get_mut(agent_id) {
-            runtime.replace_config(config.clone());
-        }
-        if let Some(snapshot) = self.agent_snapshots.get_mut(agent_id) {
-            snapshot.state.name = config.name.clone();
-            snapshot.state.config = config;
+            runtime.replace_config(config);
         }
     }
 
@@ -2626,8 +2603,6 @@ impl DaemonState {
             .expect("agent existence was checked before validation");
         runtime.update_config(patch);
         let snapshot = runtime.snapshot();
-        self.agent_snapshots
-            .insert(agent_id.to_string(), snapshot.clone());
         Ok(self.with_derived_status(snapshot))
     }
 
@@ -2652,23 +2627,18 @@ impl DaemonState {
         if runtime.state().status == AgentStatus::Running {
             runtime.mark_failed("daemon restarted before task completed", 0);
         }
-
-        let restored_snapshot = runtime.snapshot();
-        self.agent_snapshots
-            .insert(agent_id.clone(), restored_snapshot);
         self.agents.insert(agent_id, runtime);
         Ok(())
     }
 
+    /// Every agent's snapshot, read from its canonical runtime (Controller
+    /// ruling 2, M2 pre-flight audit: no second copy of any transcript is
+    /// kept, so pruning and session deletion free what they remove).
     pub(crate) fn list_agents(&self) -> Vec<AgentRuntimeSnapshot> {
-        let mut snapshots = self.agent_snapshots.clone();
-        for (agent_id, runtime) in &self.agents {
-            snapshots.insert(agent_id.clone(), runtime.snapshot());
-        }
-
-        let mut snapshots: Vec<_> = snapshots
-            .into_values()
-            .map(|snapshot| self.with_derived_status(snapshot))
+        let mut snapshots: Vec<_> = self
+            .agents
+            .values()
+            .map(|runtime| self.with_derived_status(runtime.snapshot()))
             .collect();
         snapshots.sort_by(|left, right| {
             left.state
@@ -2679,16 +2649,30 @@ impl DaemonState {
         snapshots
     }
 
+    /// Every agent's state, ordered like `list_agents`, without cloning any
+    /// transcript or events: the team roster and peer lookups read this on
+    /// every run.
+    pub(crate) fn agent_states(&self) -> Vec<AgentState> {
+        let mut states: Vec<_> = self
+            .agents
+            .values()
+            .map(|runtime| self.with_derived_state(runtime.state()))
+            .collect();
+        states.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        states
+    }
+
     pub(crate) fn get_agent(&self, agent_id: &str) -> Option<AgentRuntimeSnapshot> {
         self.agents
             .get(agent_id)
-            .map(AgentRuntime::snapshot)
-            .or_else(|| self.agent_snapshots.get(agent_id).cloned())
-            .map(|snapshot| self.with_derived_status(snapshot))
+            .map(|runtime| self.with_derived_status(runtime.snapshot()))
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: &str) {
-        self.agent_snapshots.remove(agent_id);
         if let Some(mut runtime) = self.agents.remove(agent_id) {
             runtime.stop();
         }
@@ -2705,11 +2689,6 @@ impl DaemonState {
         self.agents
             .get(agent_id)
             .map(|runtime| runtime.id().to_string())
-            .or_else(|| {
-                self.agent_snapshots
-                    .get(agent_id)
-                    .map(|snapshot| snapshot.state.id.clone())
-            })
     }
 
     fn validate_swarm_tools(&self, config: &SwarmConfig) -> Result<(), String> {

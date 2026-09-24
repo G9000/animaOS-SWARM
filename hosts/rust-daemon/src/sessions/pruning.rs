@@ -597,4 +597,50 @@ mod tests {
             record
         );
     }
+
+    #[tokio::test]
+    async fn after_pruning_list_agents_and_every_agent_read_carry_only_the_hot_tail() {
+        // Controller ruling 2 (M2 pre-flight audit): agent reads come from
+        // the canonical runtimes, so a restored agent's boot-time transcript
+        // is neither kept nor listed beside its pruned hot tail.
+        let mut source = DaemonState::new();
+        let agent = source
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        seed_messages(&mut source, &agent, room(&agent, "chat:a", "a", 201));
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(Arc::new(FlakyHistoryStore::new())));
+        daemon
+            .restore_control_plane_snapshot(source.control_plane_snapshot())
+            .unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let history = state.read().await.history.clone();
+        history
+            .flush_once(&state, &Mutex::new(()), NOW_MS)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prune_once(&state, &Arc::new(Mutex::new(())), NOW_MS).await,
+            Ok(1)
+        );
+
+        let guard = state.read().await;
+        let listed = guard.list_agents();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].message_count, HOT_TAIL_MESSAGES);
+        assert_eq!(listed[0].messages.len(), HOT_TAIL_MESSAGES);
+        assert_eq!(listed[0].messages[0].id, "a001");
+        assert_eq!(
+            guard.get_agent(&agent).unwrap().messages.len(),
+            HOT_TAIL_MESSAGES
+        );
+        assert_eq!(
+            guard.control_plane_snapshot().agents[0].messages.len(),
+            HOT_TAIL_MESSAGES
+        );
+        assert_eq!(guard.agent_summaries()[0].message_count, HOT_TAIL_MESSAGES);
+    }
 }
