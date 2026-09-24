@@ -15,7 +15,7 @@ import { ConnectorsView } from './components/ConnectorsView';
 import { SessionSidebar } from './components/sessions/SessionSidebar';
 import { SessionView } from './components/sessions/SessionView';
 import { TelegramSettings } from './components/TelegramSettings';
-import { WorkspaceShell } from './components/WorkspaceShell';
+import { WorkspaceShell, availablePage } from './components/WorkspaceShell';
 import { useAgentIntegrations } from './hooks/useAgentIntegrations';
 import { useCompanionSessions } from './hooks/useCompanionSessions';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
@@ -866,9 +866,15 @@ export function ViewHarness() {
     });
     sessions.upsert(session);
     const created: HashRoute = { kind: 'session', sessionId: session.id };
-    // A page opened meanwhile stays open; the new session waits behind it.
-    if (routeRef.current.kind === 'page') lastConversationRef.current = created;
-    else navigate(created, { replace: true });
+    // Follow the new chat only while it is still the conversation on screen
+    // or behind a page: a session opened meanwhile keeps the owner, a page
+    // that hides the chat stays open with the session behind it, and a page
+    // that shows the chat moves to the session so a reload finds it.
+    if (lastConversationRef.current.kind === 'home') {
+      if (availablePage(routeRef.current) !== null)
+        lastConversationRef.current = created;
+      else navigate(created, { replace: true });
+    }
     await runInSession(targetId, session, text, target, true);
   };
 

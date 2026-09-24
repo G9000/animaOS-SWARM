@@ -2002,6 +2002,79 @@ it('creates one session for the first send and moves text typed meanwhile into i
   expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue('');
 });
 
+it('stays in a session opened while the first send was creating its chat', async () => {
+  const user = userEvent.setup();
+  const current = withMessage(
+    snapshot('agent-main', 'Nova', 1),
+    'Earlier answer',
+    'room-7',
+  );
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [current] });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  messagesFromSnapshot(() => current);
+  const creating = deferred<void>();
+  const createSession = vi.mocked(daemon.createSession);
+  const createListed = createSession.getMockImplementation()!;
+  createSession.mockImplementationOnce(async (agentId) => {
+    await creating.promise;
+    return createListed(agentId);
+  });
+  const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+    agent: current,
+    result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
+  });
+  render(<ViewHarness />);
+  await openChat();
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Plan the launch',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.click(await screen.findByRole('button', { name: 'Weekend plans' }));
+
+  await act(async () => creating.resolve());
+  await waitFor(() =>
+    expect(runAgent).toHaveBeenCalledWith(
+      'agent-main',
+      'Plan the launch',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'chat:new-1',
+    ),
+  );
+  expect(window.location.hash).toBe('#/s/room-7');
+  expect(screen.getByText('Earlier answer')).toBeVisible();
+});
+
+it('opens the new session on a page that still shows the conversation', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+    agent: snapshot('agent-main', 'Nova', 1),
+    result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
+  });
+  // Approvals arrives in a later release; until then it shows the chat.
+  window.history.replaceState(null, '', '/#/approvals');
+  render(<ViewHarness />);
+
+  await user.type(await screen.findByPlaceholderText('Message Nova…'), 'Hello');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  // A reload of the page must find the session, not a new chat.
+  await waitFor(() => expect(window.location.hash).toBe('#/s/chat%3Anew-1'));
+});
+
 it('keeps a page open when the first send creates its session, then returns to that session', async () => {
   const user = userEvent.setup();
   let current = snapshot('agent-main', 'Nova', 1);
