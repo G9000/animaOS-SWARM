@@ -247,6 +247,8 @@ export function ViewHarness() {
   });
   // A daemon without the sessions routes cannot take a send (spec §13.4).
   const daemonTooOld = sessions.daemonTooOld;
+  const listedSessionsRef = useRef(sessions.sessions);
+  listedSessionsRef.current = sessions.sessions;
   const routeSessionId =
     conversationRoute.kind === 'session' ? conversationRoute.sessionId : null;
   const listedSession = routeSessionId
@@ -389,6 +391,16 @@ export function ViewHarness() {
       timers.clear();
     };
   }, []);
+  /** A fresh record replaces the listed or known copy, so its active runs
+   *  stop holding the composer before the next list poll. */
+  const adoptSessionRecord = (session: Session) => {
+    const key = sessionKey(session);
+    if (listedSessionsRef.current.some((item) => sessionKey(item) === key))
+      sessions.upsert(session);
+    setKnownSession((current) =>
+      current && sessionKey(current) === key ? session : current,
+    );
+  };
   /** Reads a timed-out send's session and then its messages, again while the
    *  session has active runs. Reading the session first means a page read
    *  after it reports none already holds what those runs committed. */
@@ -396,6 +408,7 @@ export function ViewHarness() {
     const pending = uncertainSendsRef.current.get(requestId);
     if (!pending?.waiting || !mountedRef.current) return;
     let check: SendCheck | null = null;
+    let record: Session | null = null;
     try {
       const session = await daemon.getSession(
         pending.agentId,
@@ -406,6 +419,7 @@ export function ViewHarness() {
         pending.sessionId,
         { limit: REQUEST_CHECK_PAGE },
       );
+      record = session;
       check = {
         activeRuns: session.activeRuns,
         delivered: page.messages.some((message) =>
@@ -424,7 +438,10 @@ export function ViewHarness() {
     if (check) {
       sendChecksRef.current.set(requestId, check);
       setSendCheckRevision((value) => value + 1);
-      if (check.delivered || check.activeRuns === 0) return;
+      if (check.delivered || check.activeRuns === 0) {
+        if (record) adoptSessionRecord(record);
+        return;
+      }
     }
     const timer = window.setTimeout(() => {
       checkTimersRef.current.delete(timer);

@@ -1643,6 +1643,9 @@ it('does not declare a send unconfirmed while it waits behind another run in its
   expect(
     screen.queryByRole('button', { name: 'Restore message' }),
   ).not.toBeInTheDocument();
+  // The record read when the send settled replaces the listed one at once.
+  expect(input).toBeEnabled();
+  expect(screen.queryByText('Nova is thinking')).not.toBeInTheDocument();
   expect(run).toHaveBeenCalledTimes(1);
 });
 
