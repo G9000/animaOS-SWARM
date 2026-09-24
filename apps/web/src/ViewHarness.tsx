@@ -1002,11 +1002,18 @@ export function ViewHarness() {
         if (activeSession) void exportSession(activeSession);
       }}
       notice={
-        legacyMigrationError ? (
-          <p role="status" className="px-4 pt-3 text-xs text-ink-3">
-            {legacyMigrationError}
-          </p>
-        ) : null
+        <>
+          {legacyMigrationError ? (
+            <p role="status" className="px-4 pt-3 text-xs text-ink-3">
+              {legacyMigrationError}
+            </p>
+          ) : null}
+          {routeSessionId && history.error ? (
+            <p role="alert" className="px-4 pt-3 text-xs text-danger">
+              Messages could not be loaded: {history.error}
+            </p>
+          ) : null}
+        </>
       }
     />
   );

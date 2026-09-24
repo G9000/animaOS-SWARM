@@ -1777,6 +1777,51 @@ it('keeps the composer disabled until the open session record loads', async () =
   );
 });
 
+it('shows why older messages could not be loaded', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('chat:long', {
+      title: 'Long history',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  vi.mocked(daemon.sessionMessages).mockImplementation(
+    async (_agentId, _sessionId, options = {}) => {
+      if (options.before)
+        throw Object.assign(new Error('history store is unavailable'), {
+          status: 503,
+        });
+      return {
+        messages: [
+          {
+            id: 'm2',
+            role: 'assistant',
+            text: 'Latest answer',
+            attachments: [],
+            metadata: {},
+            createdAtMs: 2,
+          },
+        ],
+        nextBefore: 'm2',
+      };
+    },
+  );
+  window.history.replaceState(null, '', '/#/s/chat%3Along');
+  render(<ViewHarness />);
+
+  await screen.findByText('Latest answer');
+  await user.click(screen.getByRole('button', { name: 'Load older messages' }));
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Messages could not be loaded: history store is unavailable',
+  );
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
