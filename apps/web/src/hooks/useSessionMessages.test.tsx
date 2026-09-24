@@ -445,6 +445,8 @@ describe('useSessionMessages', () => {
     expect(result.current.error).toBe('history store is unavailable');
     rerender({ sessionId: 'chat:2' });
     expect(result.current.error).toBeNull();
+    await waitFor(() => expect(result.current.hasOlder).toBe(true));
+    expect(result.current.error).toBeNull();
   });
 
   it('clears a newest-page error once a later poll succeeds', async () => {
