@@ -34,7 +34,7 @@ fn helper_parent(agent: &AgentState) -> Option<&str> {
     config_helper_parent(&agent.config)
 }
 
-fn config_helper_parent(config: &AgentConfig) -> Option<&str> {
+pub(crate) fn config_helper_parent(config: &AgentConfig) -> Option<&str> {
     let settings = config.settings.as_ref()?;
     if settings.additional.get("workspaceRole") != Some(&DataValue::String("helper".into())) {
         return None;

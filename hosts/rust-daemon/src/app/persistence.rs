@@ -129,6 +129,14 @@ async fn configure_control_plane_store(
 
     {
         let mut guard = state.write().await;
+        // Spec §13.3 step 5: tools added since these agents were created.
+        let granted = guard.apply_pending_tool_grants(crate::sessions::migration::TOOL_GRANTS);
+        if !granted.is_empty() {
+            info!(
+                agents = granted.len(),
+                "granted newly added tools to existing agents"
+            );
+        }
         guard.set_control_plane_store(Some(config.clone()));
         guard.control_plane_persist_request()
     }

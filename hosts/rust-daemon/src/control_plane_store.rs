@@ -100,6 +100,9 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) runs: Vec<crate::runs::RunRecord>,
     #[serde(default)]
     pub(crate) sessions: Vec<crate::sessions::SessionRecord>,
+    /// Tool grant sets already applied (spec §13.3 step 5).
+    #[serde(default)]
+    pub(crate) tool_grants_applied: Vec<String>,
     #[serde(default)]
     pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
 }
@@ -395,6 +398,7 @@ impl ControlPlaneSnapshot {
             workspace: None,
             runs: vec![],
             sessions: vec![],
+            tool_grants_applied: vec![],
             pending_history_deletions: vec![],
         }
     }

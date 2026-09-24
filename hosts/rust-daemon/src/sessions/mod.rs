@@ -3,6 +3,8 @@
 //! valid session id; those map to a stable `legacy-room:<hash>` id and keep
 //! their room on the record.
 
+pub(crate) mod migration;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anima_core::{DataValue, Message, MessageRole};

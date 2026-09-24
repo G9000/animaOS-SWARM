@@ -3,6 +3,7 @@ mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
 mod run_commit;
+mod session_state;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1371,6 +1372,7 @@ pub(crate) struct DaemonState {
     pub(crate) runs: crate::runs::RunLedger,
     pub(crate) sessions: crate::sessions::SessionRegistry,
     pub(crate) history: crate::history::SharedHistory,
+    pub(crate) tool_grants_applied: std::collections::BTreeSet<String>,
     /// Saved history deletions the store has not applied yet (spec §3.3).
     pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
@@ -1524,6 +1526,7 @@ impl DaemonState {
             runs: crate::runs::RunLedger::default(),
             sessions: crate::sessions::SessionRegistry::default(),
             history: crate::history::HistoryService::ephemeral(),
+            tool_grants_applied: std::collections::BTreeSet::new(),
             pending_history_deletions: Vec::new(),
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
@@ -1710,15 +1713,23 @@ impl DaemonState {
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
         snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
+        snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();
         snapshot.pending_history_deletions = self.pending_history_deletions.clone();
         snapshot
     }
 
     pub(crate) fn restore_control_plane_snapshot(
         &mut self,
-        snapshot: ControlPlaneSnapshot,
+        mut snapshot: ControlPlaneSnapshot,
     ) -> Result<(usize, usize), String> {
         self.validate_control_plane_snapshot(&snapshot)?;
+        // Spec §13.3 step 2: legacy per-tick check-in rooms become their
+        // automation's session, and ledger session ids follow the room mapping.
+        crate::sessions::migration::relabel_legacy_checkin_rooms(
+            &mut snapshot.agents,
+            &mut snapshot.runs,
+        );
+        crate::sessions::migration::map_ledger_session_ids(&mut snapshot.runs);
         self.workspace = snapshot.workspace.clone();
         let mut restored_agents = 0;
         let mut restored_swarms = 0;
@@ -1809,6 +1820,10 @@ impl DaemonState {
             snapshot.sessions,
             &self.live_agent_ids(),
         );
+        for record in self.derive_legacy_sessions() {
+            self.sessions.insert(record);
+        }
+        self.tool_grants_applied = snapshot.tool_grants_applied.into_iter().collect();
         self.pending_history_deletions = snapshot.pending_history_deletions;
         self.runs = crate::runs::RunLedger::restored(
             snapshot.runs,
