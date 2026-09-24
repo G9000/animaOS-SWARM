@@ -1343,14 +1343,28 @@ mod tests {
             .run(request(&survivor, "chat:one", "unrelated"))
             .await
             .unwrap();
+        let run_ids = state
+            .read()
+            .await
+            .runs
+            .for_agent(&agent_id)
+            .into_iter()
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(run_ids.len(), 2);
 
-        // The agent delete (Task 12): remove the agent and record its history
-        // deletion in one save, then queue the deletion.
+        // The agent delete (Task 12): remove the agent and its terminal runs,
+        // and record its history deletion, in one save, then queue the
+        // deletion. Unlike Task 6, the runs leave the ledger immediately
+        // instead of lingering until a restart (Controller ruling 2, M2
+        // pre-flight audit): `unmirrored_terminal` skips agents that no
+        // longer exist, so they would otherwise never be mirrored or pruned.
         {
             let _transaction = coordinator.control_plane_transaction().await;
             let persist = {
                 let mut guard = state.write().await;
                 guard.remove_agent(&agent_id);
+                guard.runs.remove_terminal_for_agent(&agent_id);
                 guard.record_history_deletion(HistoryDeletion::agent(&agent_id));
                 guard.control_plane_persist_request()
             };
@@ -1373,20 +1387,15 @@ mod tests {
                 "{session}"
             );
         }
-        let runs = state
-            .read()
-            .await
-            .runs
-            .for_agent(&agent_id)
-            .into_iter()
-            .map(|run| run.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(runs.len(), 2, "the ledger keeps them until a restart");
-        for run_id in runs {
+        assert!(
+            state.read().await.runs.for_agent(&agent_id).is_empty(),
+            "the deleted agent's runs are dropped from the ledger in the same save as the agent"
+        );
+        for run_id in run_ids {
             assert_eq!(
                 store.get_run(&run_id).await.unwrap(),
                 None,
-                "a deleted agent's runs are not mirrored again"
+                "a deleted agent's runs are not mirrored"
             );
         }
         assert_eq!(

@@ -20,6 +20,7 @@ use super::{
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
+use crate::history::HistoryDeletion;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::RunSource;
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
@@ -1569,7 +1570,12 @@ impl ConnectorManager {
                 manager.restore_agent_delete_configuration(&previous).await?;
                 return Err(ConnectorManagerError::AgentBusy);
             }
-            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, persist) = {
+            // Recorded in the same save as the removal below (Controller
+            // ruling 2, M2 pre-flight audit; Task 6's durable-deletion
+            // protocol): a crash right after a successful save still replays
+            // this deletion on restart.
+            let deletion = HistoryDeletion::agent(&agent_id);
+            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, previous_runs, persist) = {
                 let mut state = manager.state.write().await;
                 let agent_snapshot = state.get_agent(&agent_id);
                 let previous_connectors = previous
@@ -1614,6 +1620,13 @@ impl ConnectorManager {
                 }
                 state.schedules.retain(|_, schedule| schedule.agent_id != agent_id);
                 state.remove_agent(&agent_id);
+                // Without this, the deleted agent's terminal runs would stay
+                // in the ledger until a restart: `unmirrored_terminal` skips
+                // agents that no longer exist, so they would never be
+                // mirrored and never pruned (Controller ruling 2, M2
+                // pre-flight audit, carried forward from Task 6).
+                let previous_runs = state.runs.remove_terminal_for_agent(&agent_id);
+                state.record_history_deletion(deletion.clone());
                 let persist = state.control_plane_persist_request();
                 (
                     agent_snapshot,
@@ -1621,6 +1634,7 @@ impl ConnectorManager {
                     previous_inbound,
                     previous_outbound,
                     previous_schedules,
+                    previous_runs,
                     persist,
                 )
             };
@@ -1634,6 +1648,10 @@ impl ConnectorManager {
                     state.inbound = previous_inbound;
                     state.outbound = previous_outbound;
                     state.schedules = previous_schedules;
+                    for run in previous_runs {
+                        state.runs.insert(run);
+                    }
+                    state.clear_history_deletion(&deletion);
                     if let Some(agent_snapshot) = agent_snapshot {
                         state
                             .restore_removed_agent(agent_snapshot)
@@ -1644,6 +1662,9 @@ impl ConnectorManager {
                 drop(_transaction);
                 return Err(ConnectorManagerError::Persistence);
             }
+            // Durable now: the history rows may go (spec §3.3).
+            let history = manager.state.read().await.history.clone();
+            history.enqueue_agent_deletion(&agent_id);
             for (connector, _, _) in &previous {
                 manager.statuses.lock().await.remove(&connector.id);
             }
@@ -6525,6 +6546,17 @@ mod tests {
         manager.delete_agent(agent_id.clone()).await.unwrap();
         assert!(!state.read().await.connectors[&connector.id].is_active());
         assert!(state.read().await.get_agent(&agent_id).is_none());
+        // Controller ruling 2 (M2 pre-flight audit): the deletion is recorded
+        // durably in the same save as the agent's removal.
+        assert!(
+            state
+                .read()
+                .await
+                .pending_history_deletions
+                .iter()
+                .any(|deletion| deletion.agent_id == agent_id && deletion.session_id.is_none()),
+            "the agent's history deletion is recorded in the saved snapshot"
+        );
         manager.shutdown().await;
     }
 
@@ -6567,6 +6599,12 @@ mod tests {
             "42:agent-delete-token"
         );
         assert_eq!(manager.worker_count().await, 1);
+        // Controller ruling 2 (M2 pre-flight audit): a failed save leaves no
+        // pending history deletion behind, matching the restored agent.
+        assert!(
+            state.read().await.pending_history_deletions.is_empty(),
+            "a failed save leaves no pending entry"
+        );
         manager.shutdown().await;
         std::fs::remove_dir_all(invalid_path).unwrap();
     }
