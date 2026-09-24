@@ -231,6 +231,9 @@ export function AgentProactiveView({
   const [schedules, setSchedules] = useState<DaemonSchedule[] | null>(null);
   // Check-ins can be delivered to Telegram only once a chat is approved.
   const [telegram, setTelegram] = useState<TelegramConnector | null>(null);
+  const [connectors, setConnectors] = useState<'loading' | 'loaded' | 'failed'>(
+    'loading',
+  );
   const [target, setTarget] = useState<'workspace' | 'telegram'>('workspace');
   const [prompt, setPrompt] = useState('');
   const [minutes, setMinutes] = useState(60);
@@ -240,25 +243,33 @@ export function AgentProactiveView({
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    void Promise.allSettled([
-      daemon.listSchedules(agentId),
-      daemon.listConnectors(agentId),
-    ]).then(([scheduleResult, connectorResult]) => {
-      if (cancelled) return;
-      if (scheduleResult.status === 'fulfilled') {
-        setSchedules(scheduleResult.value.schedules);
-      } else {
-        const reason = scheduleResult.reason;
-        setError(reason instanceof Error ? reason.message : String(reason));
-      }
-      setTelegram(
-        connectorResult.status === 'fulfilled'
-          ? (connectorResult.value.connectors.find(
-              (connector) => connector.approvedChat !== null,
-            ) ?? null)
-          : null,
-      );
-    });
+    daemon.listSchedules(agentId).then(
+      (result) => {
+        if (!cancelled) setSchedules(result.schedules);
+      },
+      (reason: unknown) => {
+        if (!cancelled)
+          setError(reason instanceof Error ? reason.message : String(reason));
+      },
+    );
+    // Connectors load on their own, so a slow or failed read never holds up
+    // the schedules; Telegram stays unavailable until one succeeds.
+    daemon.listConnectors(agentId).then(
+      (result) => {
+        if (cancelled) return;
+        setTelegram(
+          result.connectors.find(
+            (connector) => connector.approvedChat !== null,
+          ) ?? null,
+        );
+        setConnectors('loaded');
+      },
+      () => {
+        if (cancelled) return;
+        setTelegram(null);
+        setConnectors('failed');
+      },
+    );
     return () => {
       cancelled = true;
     };
@@ -436,7 +447,11 @@ export function AgentProactiveView({
           Deliver to
           <select
             aria-label="Deliver to"
-            aria-describedby={telegram === null ? telegramHintId : undefined}
+            aria-describedby={
+              telegram === null && connectors !== 'loading'
+                ? telegramHintId
+                : undefined
+            }
             className="field w-auto"
             value={target}
             disabled={busy}
@@ -450,11 +465,16 @@ export function AgentProactiveView({
             </option>
           </select>
         </label>
-        {telegram === null && (
+        {connectors === 'failed' ? (
+          <p id={telegramHintId} className="text-xs text-danger">
+            Connectors could not be loaded, so Telegram delivery is
+            unavailable. Refresh schedules to try again.
+          </p>
+        ) : connectors === 'loaded' && telegram === null ? (
           <p id={telegramHintId} className="text-xs text-ink-3">
             Approve a Telegram chat in Connectors to deliver check-ins there.
           </p>
-        )}
+        ) : null}
         <p className="text-xs text-ink-3">
           {target === 'telegram'
             ? 'Updates are sent to your approved Telegram chat.'

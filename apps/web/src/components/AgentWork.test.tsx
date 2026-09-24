@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
@@ -83,6 +83,29 @@ it('keeps Telegram delivery off until a chat is approved, then creates a Telegra
     target: { type: 'connector', connectorId: 'tg-1' },
     enabled: true,
   });
+});
+
+it('shows schedules without waiting for connectors and says when they cannot be loaded', async () => {
+  vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
+  let failConnectors!: (reason: unknown) => void;
+  vi.spyOn(daemon, 'listConnectors').mockReturnValue(
+    new Promise((_, reject) => {
+      failConnectors = reject;
+    }),
+  );
+  render(<AgentProactiveView agentId="agent-main" name="Nova" />);
+
+  expect(
+    await screen.findByText('Proactive work is off. No schedules configured for Nova.'),
+  ).toBeVisible();
+  expect(screen.getByRole('option', { name: 'Telegram' })).toBeDisabled();
+
+  await act(async () => failConnectors(new Error('connectors unavailable')));
+  expect(screen.getByRole('combobox', { name: 'Deliver to' })).toHaveAccessibleDescription(
+    'Connectors could not be loaded, so Telegram delivery is unavailable. Refresh schedules to try again.',
+  );
+  expect(screen.getByRole('option', { name: 'Telegram' })).toBeDisabled();
+  expect(screen.queryByText(/Approve a Telegram chat/)).not.toBeInTheDocument();
 });
 
 it('creates workspace check-ins by default', async () => {
