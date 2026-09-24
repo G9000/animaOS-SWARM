@@ -61,6 +61,38 @@ describe('session groups', () => {
     ).toEqual(['chat:today', 'room-9']);
   });
 
+  it('shows a helper whose parent is itself a helper as a top-level node', () => {
+    const main = sessionFixture('chat:main', {
+      lastActivityAtMs: NOW.getTime() - HOUR,
+    });
+    const helper = sessionFixture('room-1', {
+      agentId: 'helper-1',
+      kind: 'helper',
+      parentAgentId: 'agent-main',
+      parentSessionId: 'chat:main',
+      lastActivityAtMs: NOW.getTime() - HOUR,
+    });
+    const helperOfHelper = sessionFixture('room-2', {
+      agentId: 'helper-2',
+      kind: 'helper',
+      parentAgentId: 'helper-1',
+      parentSessionId: 'room-1',
+      lastActivityAtMs: NOW.getTime() - HOUR,
+    });
+
+    const groups = groupSessions([main, helper, helperOfHelper], NOW);
+
+    expect(
+      groups[0].nodes.map((node) => [
+        node.session.id,
+        node.helpers.map((item) => item.id),
+      ]),
+    ).toEqual([
+      ['chat:main', ['room-1']],
+      ['room-2', []],
+    ]);
+  });
+
   it('lists only the kinds present, in sidebar order', () => {
     expect(
       presentKinds([

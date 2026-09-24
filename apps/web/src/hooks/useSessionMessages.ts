@@ -8,26 +8,35 @@ export const SESSION_MESSAGE_PAGE = 50;
 /** The open session re-reads its newest page this often until M3's stream. */
 export const SESSION_MESSAGES_POLL_MS = 3_000;
 
-/** The newest page replaces the tail; older loaded messages stay. */
+/**
+ * The newest page always replaces the tail from its first message onward.
+ * When that message is not found in `current` at all (a gap — the hot tail
+ * rolled past messages this client never saw, from a long disconnect or a
+ * burst of more than a page between polls), there is no reliable splice
+ * point, so the newest page replaces the whole list outright instead of
+ * guessing which older messages are still contiguous with it. Splicing by
+ * comparing `createdAtMs` (the earlier approach) could re-admit a skipped
+ * range out of order once `loadOlder` later fetched it, and could drop a
+ * message that shared its exact millisecond with the page's first message
+ * (controller ruling on ruling 2, M2 pre-flight audit fix round 1).
+ */
 export function mergeNewest(
   current: readonly SessionMessage[],
   page: readonly SessionMessage[],
 ): SessionMessage[] {
   if (page.length === 0) return [];
   const start = current.findIndex((message) => message.id === page[0].id);
-  const older =
-    start >= 0
-      ? current.slice(0, start)
-      : current.filter((message) => message.createdAtMs < page[0].createdAtMs);
-  return [...older, ...page];
+  if (start < 0) return [...page];
+  return [...current.slice(0, start), ...page];
 }
 
 /**
  * True when `page`'s first message is not already among `current` (and
  * `current` is non-empty) — the hot tail rolled past messages this client
  * never saw. Ruling 2 (M2 pre-flight audit): a poll that opens such a gap
- * must not leave `nextBefore` frozen, or the missing range becomes
- * permanently unreachable through "load older".
+ * must reset `nextBefore` from the fresh page — `mergeNewest` also replaces
+ * `current` outright in this case (see above) — or scrolling back could
+ * never reach the gap because `hasOlder` stayed frozen at `false`.
  */
 function opensGap(
   current: readonly SessionMessage[],
@@ -61,7 +70,15 @@ export function useSessionMessages(
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [missing, setMissing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Invalidates every in-flight request (both `refresh` and `loadOlder`)
+  // when the hook resets for a different agent/session.
   const generation = useRef(0);
+  // Invalidates only stale `refresh` calls, so an overlapping `refresh` (a
+  // poll racing a `refreshKey`-triggered reload) can't apply a response that
+  // is older than one already applied — without touching `loadOlder`, which
+  // must keep running even while a `refresh` is in flight (Important 2,
+  // fix round 1: `refresh` had no reentrancy guard of its own before this).
+  const refreshGeneration = useRef(0);
   const loadedOlder = useRef(false);
   const loadingOlderRef = useRef(false);
   const missingRef = useRef(false);
@@ -85,12 +102,17 @@ export function useSessionMessages(
 
   const refresh = useCallback(async () => {
     if (!agentId || !sessionId) return;
-    const request = generation.current;
+    const sessionEpoch = generation.current;
+    const request = ++refreshGeneration.current;
     try {
       const page = await daemon.sessionMessages(agentId, sessionId, {
         limit: SESSION_MESSAGE_PAGE,
       });
-      if (request !== generation.current) return;
+      if (
+        sessionEpoch !== generation.current ||
+        request !== refreshGeneration.current
+      )
+        return;
       const previous = messagesRef.current;
       const merged = mergeNewest(previous, page.messages);
       messagesRef.current = merged;
@@ -105,7 +127,11 @@ export function useSessionMessages(
       setMissing(false);
       setError(null);
     } catch (caught) {
-      if (request !== generation.current) return;
+      if (
+        sessionEpoch !== generation.current ||
+        request !== refreshGeneration.current
+      )
+        return;
       if (httpStatus(caught) === 404) {
         missingRef.current = true;
         setMissing(true);

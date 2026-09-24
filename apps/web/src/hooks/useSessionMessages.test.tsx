@@ -1,4 +1,4 @@
-import type { SessionMessage } from '@animaOS-SWARM/sdk';
+import type { SessionMessage, SessionMessagePage } from '@animaOS-SWARM/sdk';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -102,13 +102,7 @@ describe('useSessionMessages', () => {
     await waitFor(() => expect(ids()).toEqual(['m1', 'm2', 'm3']));
   });
 
-  it('reopens hasOlder when a poll gap would otherwise strand history', async () => {
-    // Controller ruling 2 (M2 pre-flight audit): once older history has been
-    // loaded, a normal poll must not move `nextBefore` (it would discard the
-    // client's paging progress). But if the hot tail later rolls so far that
-    // the newest page no longer connects to what is loaded (a gap — messages
-    // arrived faster than the poll), freezing `nextBefore` would leave that
-    // gap permanently unreachable. Such a poll must reopen `hasOlder` instead.
+  it('replaces the list and reopens hasOlder when a poll gap disconnects from it', async () => {
     const pages = vi
       .spyOn(daemon, 'sessionMessages')
       .mockImplementation(async (_agentId, _sessionId, options = {}) =>
@@ -154,6 +148,47 @@ describe('useSessionMessages', () => {
       await result.current.refresh();
     });
 
+    // Controller ruling on ruling 2: a gap replaces the list outright rather
+    // than splicing older messages back in (which risked misordering once
+    // `loadOlder` later re-fetched the skipped range — see the next test).
+    expect(result.current.messages.map((item) => item.id)).toEqual(['m20', 'm21']);
+    expect(result.current.hasOlder).toBe(true);
+    expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', { limit: 50 });
+  });
+
+  it('keeps strict chronological order with no duplicates or drops after loadOlder fills a gap', async () => {
+    let newest = [message('m5', 5), message('m6', 6)];
+    let newestCursor: string | null = 'm5';
+    const pages = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockImplementation(async (_agentId, _sessionId, options = {}) => {
+        if (options.before === 'm5')
+          return {
+            messages: [
+              message('m1', 1),
+              message('m2', 2),
+              message('m3', 3),
+              message('m4', 4),
+            ],
+            nextBefore: null,
+          };
+        if (options.before === 'm20')
+          return {
+            messages: [message('m17', 17), message('m18', 18), message('m19', 19)],
+            nextBefore: null,
+          };
+        return { messages: newest, nextBefore: newestCursor };
+      });
+    const { result } = renderHook(() =>
+      useSessionMessages('agent-main', 'chat:1'),
+    );
+
+    await waitFor(() =>
+      expect(result.current.messages.map((item) => item.id)).toEqual(['m5', 'm6']),
+    );
+    await act(async () => {
+      await result.current.loadOlder();
+    });
     expect(result.current.messages.map((item) => item.id)).toEqual([
       'm1',
       'm2',
@@ -161,11 +196,75 @@ describe('useSessionMessages', () => {
       'm4',
       'm5',
       'm6',
-      'm20',
-      'm21',
     ]);
+
+    // A gap: the hot tail rolled past m7..m19 between polls.
+    newest = [message('m20', 20), message('m21', 21)];
+    newestCursor = 'm20';
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.messages.map((item) => item.id)).toEqual(['m20', 'm21']);
     expect(result.current.hasOlder).toBe(true);
     expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', { limit: 50 });
+
+    // Scrolling back from the new frontier re-fetches the skipped range and
+    // must merge it in, in order, with no duplicate or dropped ids.
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+
+    const ids = result.current.messages.map((item) => item.id);
+    expect(ids).toEqual(['m17', 'm18', 'm19', 'm20', 'm21']);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(result.current.messages.map((item) => item.createdAtMs)).toEqual([
+      17, 18, 19, 20, 21,
+    ]);
+  });
+
+  it('keeps the newer refresh in place when an older one resolves last', async () => {
+    const polls = capturePolls();
+    let resolveFirst: ((page: SessionMessagePage) => void) | undefined;
+    let resolveSecond: ((page: SessionMessagePage) => void) | undefined;
+    let calls = 0;
+    vi.spyOn(daemon, 'sessionMessages').mockImplementation(
+      () =>
+        new Promise<SessionMessagePage>((resolve) => {
+          calls += 1;
+          if (calls === 1) resolveFirst = resolve;
+          else resolveSecond = resolve;
+        }),
+    );
+    const { result } = renderHook(() =>
+      useSessionMessages('agent-main', 'chat:1'),
+    );
+    await waitFor(() => expect(resolveFirst).toBeDefined());
+
+    // A second, overlapping refresh (e.g. a `refreshKey` reload) starts
+    // before the first (e.g. a routine poll) has resolved.
+    act(() => {
+      void result.current.refresh();
+    });
+    await waitFor(() => expect(resolveSecond).toBeDefined());
+
+    // The newer call resolves first…
+    await act(async () => {
+      resolveSecond?.({
+        messages: [message('m1', 1), message('m2', 2)],
+        nextBefore: null,
+      });
+    });
+    await waitFor(() =>
+      expect(result.current.messages.map((item) => item.id)).toEqual(['m1', 'm2']),
+    );
+
+    // …then the older call resolves last, with a smaller/stale page — it
+    // must be discarded outright, not roll the newer result back.
+    await act(async () => {
+      resolveFirst?.({ messages: [message('m1', 1)], nextBefore: null });
+    });
+    await waitFor(() => expect(polls.length).toBeGreaterThan(0));
+    expect(result.current.messages.map((item) => item.id)).toEqual(['m1', 'm2']);
   });
 
   it('reports a deleted session and stops polling it', async () => {
@@ -192,12 +291,23 @@ describe('useSessionMessages', () => {
     expect(mergeNewest([message('m1', 1)], [])).toEqual([]);
   });
 
-  it('merges a page that does not connect, keeping everything older (a gap)', () => {
+  it('replaces the list outright when a page does not connect (a gap)', () => {
     expect(
       mergeNewest(
         [message('m1', 1), message('m2', 2)],
         [message('m20', 20), message('m21', 21)],
       ).map((item) => item.id),
-    ).toEqual(['m1', 'm2', 'm20', 'm21']);
+    ).toEqual(['m20', 'm21']);
+  });
+
+  it('does not drop a same-millisecond message (ties resolve by id, not time)', () => {
+    const a = message('m1', 100);
+    const b = message('m2', 100);
+    const c = message('m3', 100);
+    expect(mergeNewest([a, b], [b, c]).map((item) => item.id)).toEqual([
+      'm1',
+      'm2',
+      'm3',
+    ]);
   });
 });
