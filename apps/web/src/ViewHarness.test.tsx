@@ -20,6 +20,7 @@ import {
   type DaemonProvider,
   type DaemonSnapshot,
 } from './lib/daemon-api';
+import { SESSION_MESSAGES_POLL_MS } from './hooks/useSessionMessages';
 import { sessionFixture } from './test/sessions';
 import { ViewHarness } from './ViewHarness';
 
@@ -186,6 +187,21 @@ function messagesFromSnapshot(snapshotOf: () => DaemonSnapshot) {
 
 function mockProviders() {
   vi.spyOn(daemon, 'listProviders').mockResolvedValue({ providers });
+}
+
+/** Fake timers that keep pace with real time, so user-event and findBy work
+ *  as usual, while `elapse` runs the polls that are due at once. */
+function fakeClock() {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  return userEvent.setup({
+    advanceTimers: (ms) => vi.advanceTimersByTime(ms),
+  });
+}
+
+async function elapse(ms: number) {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(ms);
+  });
 }
 
 it('opens the main companion without automatically executing a prepared assignment', async () => {
@@ -1461,7 +1477,7 @@ it('does not mistake an older identical message for the timed-out request', asyn
 });
 
 it('keeps a timed-out running request locked until the daemon confirms its completion', async () => {
-  const user = userEvent.setup();
+  const user = fakeClock();
   let current = snapshot('agent-main', 'Nova', 1);
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
@@ -1503,7 +1519,8 @@ it('keeps a timed-out running request locked until the daemon confirms its compl
     createdAtMs: 2,
   });
   setSessionFields('chat:new-1', { activeRuns: 0 });
-  await screen.findByText('Long work completed', {}, { timeout: 5000 });
+  await elapse(SESSION_MESSAGES_POLL_MS);
+  await screen.findByText('Long work completed');
   await waitFor(() =>
     expect(
       screen.queryByText(/Checking the daemon for completion/),
@@ -1513,7 +1530,7 @@ it('keeps a timed-out running request locked until the daemon confirms its compl
   expect(
     screen.queryByRole('button', { name: 'Restore message' }),
   ).not.toBeInTheDocument();
-}, 10000);
+});
 
 it('does not keep a timed-out send locked while a check-in runs in another session', async () => {
   const user = userEvent.setup();
@@ -1554,7 +1571,7 @@ it('does not keep a timed-out send locked while a check-in runs in another sessi
 });
 
 it('does not declare a send unconfirmed while it waits behind another run in its room', async () => {
-  const user = userEvent.setup();
+  const user = fakeClock();
   // The agent reads idle between runs; only the session knows its room is busy.
   let current = snapshot('agent-main', 'Nova', 1);
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
@@ -1581,17 +1598,16 @@ it('does not declare a send unconfirmed while it waits behind another run in its
     });
   window.history.replaceState(null, '', '/#/s/room-7');
   render(<ViewHarness />);
-  await user.type(
-    await screen.findByPlaceholderText('Message Nova…'),
-    'Queued thought',
-  );
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, 'Queued thought');
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
   await screen.findByText(/Checking the daemon for completion/);
   // The session is read again because its room is still busy.
-  await waitFor(() => expect(sessionReads('room-7')).toBeGreaterThanOrEqual(2), {
-    timeout: 5000,
-  });
+  const reads = sessionReads('room-7');
+  await elapse(SESSION_MESSAGES_POLL_MS);
+  expect(sessionReads('room-7')).toBeGreaterThan(reads);
   expect(screen.queryByText(/has not confirmed/)).not.toBeInTheDocument();
   expect(
     screen.queryByRole('button', { name: 'Restore message' }),
@@ -1617,9 +1633,8 @@ it('does not declare a send unconfirmed while it waits behind another run in its
     },
   );
   setSessionFields('room-7', { activeRuns: 0 });
-  expect(
-    await screen.findByText('Answered after the queue', {}, { timeout: 5000 }),
-  ).toBeVisible();
+  await elapse(SESSION_MESSAGES_POLL_MS);
+  expect(await screen.findByText('Answered after the queue')).toBeVisible();
   await waitFor(() =>
     expect(
       screen.queryByText(/Checking the daemon for completion/),
@@ -1629,7 +1644,7 @@ it('does not declare a send unconfirmed while it waits behind another run in its
     screen.queryByRole('button', { name: 'Restore message' }),
   ).not.toBeInTheDocument();
   expect(run).toHaveBeenCalledTimes(1);
-}, 15000);
+});
 
 it('does not clear a newer recovery entry when an older identical send is confirmed', async () => {
   const user = userEvent.setup();
