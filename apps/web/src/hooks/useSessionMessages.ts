@@ -69,7 +69,11 @@ export function useSessionMessages(
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [missing, setMissing] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // A newest-page error clears with the next good poll; an older-page error
+  // stays until older messages load or the session changes, so a failed
+  // Load older is not hidden by the poll that follows it.
+  const [newestError, setNewestError] = useState<string | null>(null);
+  const [olderError, setOlderError] = useState<string | null>(null);
   // Invalidates every in-flight request (both `refresh` and `loadOlder`)
   // when the hook resets for a different agent/session.
   const generation = useRef(0);
@@ -97,7 +101,8 @@ export function useSessionMessages(
     setNextBefore(null);
     setLoadingOlder(false);
     setMissing(false);
-    setError(null);
+    setNewestError(null);
+    setOlderError(null);
   }, [agentId, sessionId]);
 
   const refresh = useCallback(async () => {
@@ -125,7 +130,7 @@ export function useSessionMessages(
       }
       missingRef.current = false;
       setMissing(false);
-      setError(null);
+      setNewestError(null);
     } catch (caught) {
       if (
         sessionEpoch !== generation.current ||
@@ -136,7 +141,7 @@ export function useSessionMessages(
         missingRef.current = true;
         setMissing(true);
       } else {
-        setError(errorText(caught));
+        setNewestError(errorText(caught));
       }
     }
   }, [agentId, sessionId]);
@@ -170,8 +175,9 @@ export function useSessionMessages(
       messagesRef.current = merged;
       setMessages(merged);
       setNextBefore(page.nextBefore);
+      setOlderError(null);
     } catch (caught) {
-      if (request === generation.current) setError(errorText(caught));
+      if (request === generation.current) setOlderError(errorText(caught));
     } finally {
       if (request === generation.current) {
         loadingOlderRef.current = false;
@@ -204,7 +210,7 @@ export function useSessionMessages(
     loadingOlder,
     loadOlder,
     missing,
-    error,
+    error: newestError ?? olderError,
     refresh,
   };
 }

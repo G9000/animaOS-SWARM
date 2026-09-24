@@ -400,6 +400,72 @@ describe('useSessionMessages', () => {
     expect(result.current.loadingOlder).toBe(false);
   });
 
+  it('keeps an older-page error through polls until older messages load or the session changes', async () => {
+    const polls = capturePolls();
+    let olderFails = true;
+    vi.spyOn(daemon, 'sessionMessages').mockImplementation(
+      async (_agentId, _sessionId, options = {}) => {
+        if (!options.before)
+          return { messages: [message('m3', 3)], nextBefore: 'm3' };
+        if (olderFails)
+          throw Object.assign(new Error('history store is unavailable'), {
+            status: 503,
+          });
+        return { messages: [message('m2', 2)], nextBefore: 'm2' };
+      },
+    );
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useSessionMessages('agent-main', sessionId),
+      { initialProps: { sessionId: 'chat:1' } },
+    );
+    await waitFor(() => expect(result.current.hasOlder).toBe(true));
+
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+    expect(result.current.error).toBe('history store is unavailable');
+    // A successful newest-page poll does not clear it.
+    await waitFor(() => expect(polls.length).toBeGreaterThan(0));
+    await act(async () => {
+      polls[polls.length - 1]();
+    });
+    expect(result.current.error).toBe('history store is unavailable');
+
+    olderFails = false;
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+    expect(result.current.error).toBeNull();
+    expect(result.current.messages.map((item) => item.id)).toEqual(['m2', 'm3']);
+
+    olderFails = true;
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+    expect(result.current.error).toBe('history store is unavailable');
+    rerender({ sessionId: 'chat:2' });
+    expect(result.current.error).toBeNull();
+  });
+
+  it('clears a newest-page error once a later poll succeeds', async () => {
+    const polls = capturePolls();
+    const pages = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockRejectedValueOnce(new Error('daemon unavailable'))
+      .mockResolvedValue({ messages: [message('m1', 1)], nextBefore: null });
+    const { result } = renderHook(() =>
+      useSessionMessages('agent-main', 'chat:1'),
+    );
+
+    await waitFor(() => expect(result.current.error).toBe('daemon unavailable'));
+    await waitFor(() => expect(polls.length).toBeGreaterThan(0));
+    await act(async () => {
+      polls[polls.length - 1]();
+    });
+    await waitFor(() => expect(result.current.error).toBeNull());
+    expect(pages).toHaveBeenCalledTimes(2);
+  });
+
   it('reports a deleted session and stops polling it', async () => {
     const polls = capturePolls();
     const pages = vi
