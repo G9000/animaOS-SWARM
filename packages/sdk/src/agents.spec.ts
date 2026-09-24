@@ -76,6 +76,18 @@ describe('agent transport', () => {
     expect(requests[0].url).toBe('/api/agents/agent%2Fa%20b');
     expect(requests[0].init?.method).toBe('DELETE');
   });
+
+  it('lists agent summaries without transcripts', async () => {
+    const summary = {
+      state: { id: 'agent/a b' },
+      messageCount: 3,
+      eventCount: 1,
+      lastTask: null,
+    };
+    const { agents, requests } = transport({ agents: [summary] });
+    expect(await agents.listSummaries()).toEqual([summary]);
+    expect(requests[0].url).toBe('/api/agents?view=summary');
+  });
 });
 
 it('uploads binary avatars and encodes agent IDs for removal', async () => {

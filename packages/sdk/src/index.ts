@@ -24,6 +24,24 @@ export type {
   WorkspaceFileResponse,
 } from './workspace.js';
 export { ConnectorsClient } from './connectors.js';
+export { DaemonTooOldError, SessionsClient } from './sessions.js';
+export type {
+  Session,
+  SessionCapabilities,
+  SessionContextTrimmed,
+  SessionKind,
+  SessionListOptions,
+  SessionMatch,
+  SessionMessage,
+  SessionMessageAttachment,
+  SessionMessageOptions,
+  SessionMessagePage,
+  SessionOrigin,
+  SessionPage,
+  SessionSummary,
+  SessionTitleSource,
+  SessionUpdateInput,
+} from './sessions.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {
@@ -58,6 +76,7 @@ export type {
   AgentRunOptions,
   AgentRunResponse,
   AgentSnapshot,
+  AgentSummary,
   AgentToolInput,
   AgentUpdateInput,
 } from './agents.js';

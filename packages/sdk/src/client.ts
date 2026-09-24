@@ -6,6 +6,7 @@ import { ChatGptClient } from './chatgpt.js';
 import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
+import { SessionsClient } from './sessions.js';
 import type { DaemonCapabilities } from './capabilities.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
@@ -69,6 +70,7 @@ export class DaemonClient {
   readonly connectors: ConnectorsClient;
   readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
+  readonly sessions: SessionsClient;
 
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
@@ -90,6 +92,7 @@ export class DaemonClient {
     this.connectors = new ConnectorsClient(this);
     this.memories = new MemoriesClient(this);
     this.swarms = new SwarmsClient(this);
+    this.sessions = new SessionsClient(this);
   }
 
   async health(): Promise<DaemonHealth> {
@@ -128,6 +131,21 @@ export class DaemonClient {
     }
 
     return payload as T;
+  }
+
+  /** A text response such as Markdown; failures throw like `requestJson`. */
+  async requestText(path: string, init: RequestInit = {}): Promise<string> {
+    const response = await this.fetchWithConnectionErrors(path, {
+      ...init,
+      headers: {
+        accept: 'text/markdown, text/plain;q=0.9, */*;q=0.1',
+        ...headersToObject(init.headers),
+      },
+    });
+    if (!response.ok) {
+      throw new DaemonHttpError(response.status, await readResponseBody(response));
+    }
+    return response.text();
   }
 
   async *subscribe<T = unknown>(
