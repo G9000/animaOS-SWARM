@@ -683,7 +683,8 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
     use crate::connectors::telegram::TelegramClient;
 
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+        .with_max_runs_per_agent(config.max_runs_per_agent);
     let connector_manager = ConnectorManager::new(
         Arc::clone(&state),
         agent_runs.clone(),
@@ -1288,7 +1289,9 @@ async fn update_agent_entry(
     responses(
         (status = 200, description = "Task result", body = AgentRunEnvelope),
         (status = 400, description = "Invalid request", body = ErrorBody),
-        (status = 404, description = "Not found", body = ErrorBody)
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "A run with this idempotency key is already in progress", body = ErrorBody),
+        (status = 503, description = "Too many concurrent runs", body = ErrorBody)
     )
 )]
 async fn run_agent_entry(

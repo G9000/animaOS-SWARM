@@ -494,10 +494,14 @@ impl AgentRunCoordinator {
     }
 
     /// Concurrent runs per non-helper agent across different rooms (spec §4.3).
-    #[allow(dead_code)] // Only tests set it until the daemon configuration does.
     pub(crate) fn with_max_runs_per_agent(mut self, max_runs_per_agent: usize) -> Self {
         self.max_runs_per_agent = max_runs_per_agent.max(1);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_runs_per_agent(&self) -> usize {
+        self.max_runs_per_agent
     }
 
     /// Serializes every in-memory control-plane mutation through its durable

@@ -70,6 +70,9 @@ pub struct DaemonConfig {
     pub run_request_timeout: Duration,
     pub persistence_mode: PersistenceMode,
     pub max_concurrent_runs: usize,
+    /// Concurrent runs of one agent across different conversation rooms
+    /// (`ANIMAOS_RS_MAX_RUNS_PER_AGENT`); generated helpers are fixed at 1.
+    pub max_runs_per_agent: usize,
     pub max_background_processes: usize,
     /// Postgres connection pool size when `persistence_mode` is `Postgres`.
     /// Should comfortably exceed `max_concurrent_runs` to leave headroom for
@@ -89,6 +92,7 @@ impl Default for DaemonConfig {
             run_request_timeout: Duration::from_secs(600),
             persistence_mode: PersistenceMode::Memory,
             max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
+            max_runs_per_agent: crate::runs::DEFAULT_MAX_RUNS_PER_AGENT,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
             db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
             event_buffer: DEFAULT_EVENT_BUFFER,
@@ -237,7 +241,8 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
     let oauth_apps =
         crate::connectors::oauth_apps::OAuthAppService::new_for_origin(public_origin.as_deref())?;
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+        .with_max_runs_per_agent(config.max_runs_per_agent);
     let transport = TelegramClient::new()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     let connectors = ConnectorManager::new(
@@ -290,7 +295,8 @@ fn deterministic_daemon_runtime_with_mail_transport(
     mail_transport: Arc<dyn crate::connectors::mail::client::MailTransport>,
 ) -> DaemonRuntime {
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+        .with_max_runs_per_agent(config.max_runs_per_agent);
     let connectors = ConnectorManager::new(
         Arc::clone(&state),
         agent_runs.clone(),
@@ -586,5 +592,21 @@ mod tests {
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn per_agent_run_limit_defaults_to_three_and_reaches_the_coordinator() {
+        assert_eq!(DaemonConfig::default().max_runs_per_agent, 3);
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+
+        let runtime = deterministic_daemon_runtime(
+            state,
+            &DaemonConfig {
+                max_runs_per_agent: 2,
+                ..DaemonConfig::default()
+            },
+        );
+
+        assert_eq!(runtime.agent_runs.max_runs_per_agent(), 2);
     }
 }

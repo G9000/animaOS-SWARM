@@ -14,6 +14,10 @@ use crate::state::UpdateAgentError;
 pub(crate) const AGENT_BUSY_MESSAGE: &str =
     "Agent has a run in progress; wait for it to finish before deleting it";
 
+/// Rooms owned by connectors, automations, jobs, and agent-to-agent requests;
+/// the generic run route may not write into them (spec §3.1).
+const RESERVED_ROOM_PREFIXES: [&str; 4] = ["telegram:", "schedule:", "job:", "peer:"];
+
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
     state: &SharedDaemonState,
@@ -184,7 +188,15 @@ pub(crate) async fn handle_run_agent(
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let room = match request.room_id.as_deref() {
-        Some(id) if id.trim().is_empty() || id.len() > 256 || id.starts_with("peer:") => return Err(ApiError::bad_request_static("roomId must be non-empty, at most 256 bytes, and outside the reserved peer namespace")),
+        Some(id)
+            if id.trim().is_empty()
+                || id.len() > 256
+                || RESERVED_ROOM_PREFIXES
+                    .iter()
+                    .any(|prefix| id.starts_with(prefix)) =>
+        {
+            return Err(ApiError::bad_request_static("roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, and peer: namespaces"));
+        }
         Some(id) => RunRoom::Stable(id.to_string()),
         None => RunRoom::Generated,
     };
@@ -842,5 +854,52 @@ mod tests {
             plugins: None,
             settings: Some(AgentSettings::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn run_route_rejects_reserved_room_prefixes() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+
+        for room in [
+            "telegram:connector-1",
+            "schedule:schedule-1",
+            "job:job-1",
+            "peer:alice:bob",
+        ] {
+            let body = serde_json::json!({"text": "hello", "roomId": room})
+                .to_string()
+                .into_bytes();
+            let error = handle_run_agent(&agent_id, body, &state)
+                .await
+                .expect_err(room);
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{room}");
+            assert_eq!(
+                error.message(),
+                "roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, and peer: namespaces"
+            );
+        }
+        let accepted = handle_run_agent(
+            &agent_id,
+            br#"{"text":"hello","roomId":"direct:operator"}"#.to_vec(),
+            &state,
+        )
+        .await
+        .expect("ordinary rooms stay available");
+        assert_eq!(accepted.result.status, "success");
+        assert!(state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id == "direct:operator"));
     }
 }

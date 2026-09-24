@@ -32,6 +32,10 @@ async fn main() -> io::Result<()> {
             "ANIMAOS_RS_MAX_CONCURRENT_RUNS",
             default_config.max_concurrent_runs,
         )?,
+        max_runs_per_agent: parse_env_usize(
+            "ANIMAOS_RS_MAX_RUNS_PER_AGENT",
+            default_config.max_runs_per_agent,
+        )?,
         max_background_processes: parse_env_usize(
             "ANIMAOS_RS_MAX_BACKGROUND_PROCESSES",
             default_config.max_background_processes,
@@ -51,6 +55,7 @@ async fn main() -> io::Result<()> {
         run_timeout_secs = config.run_request_timeout.as_secs(),
         persistence_mode = config.persistence_mode.as_str(),
         max_concurrent_runs = config.max_concurrent_runs,
+        max_runs_per_agent = config.max_runs_per_agent,
         max_background_processes = config.max_background_processes,
         runtime_memory_store = runtime_memory_store_label(),
         control_plane_durability = control_plane_store_label(),
