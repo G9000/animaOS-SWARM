@@ -146,6 +146,19 @@ function mockSessionRoutes(): SessionRoutes {
   return state;
 }
 
+/** Changes a mocked session's derived fields, such as its active runs. */
+function setSessionFields(sessionId: string, patch: Partial<Session>) {
+  routes.sessions = routes.sessions.map((item) =>
+    item.id === sessionId ? { ...item, ...patch } : item,
+  );
+}
+
+function sessionReads(sessionId: string): number {
+  return vi
+    .mocked(daemon.getSession)
+    .mock.calls.filter(([, id]) => id === sessionId).length;
+}
+
 /** Session messages read from an agent snapshot's room, like the daemon route. */
 function messagesFromSnapshot(snapshotOf: () => DaemonSnapshot) {
   vi.spyOn(daemon, 'sessionMessages').mockImplementation(
@@ -1454,9 +1467,11 @@ it('keeps a timed-out running request locked until the daemon confirms its compl
   let requestMetadata: Record<string, unknown> | undefined;
   const run = vi
     .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (_id, _text, metadata) => {
+    .mockImplementation(async (_id, _text, metadata, roomId) => {
       requestMetadata = metadata;
       current = { ...current, state: { ...current.state, status: 'running' } };
+      // The run keeps going in its session after the request times out.
+      setSessionFields(roomId ?? '', { activeRuns: 1 });
       throw Object.assign(new Error('timeout'), { status: 408 });
     });
   render(<ViewHarness />);
@@ -1482,6 +1497,7 @@ it('keeps a timed-out running request locked until the daemon confirms its compl
     content: { text: 'Long work', metadata: requestMetadata },
     createdAtMs: 2,
   });
+  setSessionFields('chat:new-1', { activeRuns: 0 });
   await screen.findByText('Long work completed', {}, { timeout: 5000 });
   await waitFor(() =>
     expect(
@@ -1493,6 +1509,122 @@ it('keeps a timed-out running request locked until the daemon confirms its compl
     screen.queryByRole('button', { name: 'Restore message' }),
   ).not.toBeInTheDocument();
 }, 10000);
+
+it('does not keep a timed-out send locked while a check-in runs in another session', async () => {
+  const user = userEvent.setup();
+  // The check-in's run makes the agent as a whole report running.
+  const busy = snapshot('agent-main', 'Nova', 1);
+  busy.state.status = 'running';
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [busy] });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('schedule:daily', {
+      kind: 'checkin',
+      origin: 'schedule',
+      title: 'Daily check-in',
+      activeRuns: 1,
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  const run = vi
+    .spyOn(daemon, 'runAgent')
+    .mockRejectedValue(Object.assign(new Error('timeout'), { status: 408 }));
+  render(<ViewHarness />);
+  await openChat();
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Plan my week',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  ).toBeVisible();
+  expect(screen.getByText(/has not confirmed this message/)).toBeVisible();
+  expect(
+    screen.queryByText(/Checking the daemon for completion/),
+  ).not.toBeInTheDocument();
+  expect(run).toHaveBeenCalledTimes(1);
+});
+
+it('does not declare a send unconfirmed while it waits behind another run in its room', async () => {
+  const user = userEvent.setup();
+  // The agent reads idle between runs; only the session knows its room is busy.
+  let current = snapshot('agent-main', 'Nova', 1);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
+    agents: [current],
+  }));
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  messagesFromSnapshot(() => current);
+  let requestMetadata: Record<string, unknown> | undefined;
+  const run = vi
+    .spyOn(daemon, 'runAgent')
+    .mockImplementation(async (_id, _text, metadata) => {
+      requestMetadata = metadata;
+      // Another run in this room went first; this request is queued behind it.
+      setSessionFields('room-7', { activeRuns: 1 });
+      throw Object.assign(new Error('timeout'), { status: 408 });
+    });
+  window.history.replaceState(null, '', '/#/s/room-7');
+  render(<ViewHarness />);
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Queued thought',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  await screen.findByText(/Checking the daemon for completion/);
+  // The session is read again because its room is still busy.
+  await waitFor(() => expect(sessionReads('room-7')).toBeGreaterThanOrEqual(2), {
+    timeout: 5000,
+  });
+  expect(screen.queryByText(/has not confirmed/)).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+
+  current = structuredClone(current);
+  current.messages.push(
+    {
+      id: 'queued-request',
+      agentId: 'agent-main',
+      roomId: 'room-7',
+      role: 'user',
+      content: { text: 'Queued thought', metadata: requestMetadata },
+      createdAtMs: 5,
+    },
+    {
+      id: 'queued-reply',
+      agentId: 'agent-main',
+      roomId: 'room-7',
+      role: 'assistant',
+      content: { text: 'Answered after the queue' },
+      createdAtMs: 6,
+    },
+  );
+  setSessionFields('room-7', { activeRuns: 0 });
+  expect(
+    await screen.findByText('Answered after the queue', {}, { timeout: 5000 }),
+  ).toBeVisible();
+  await waitFor(() =>
+    expect(
+      screen.queryByText(/Checking the daemon for completion/),
+    ).not.toBeInTheDocument(),
+  );
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+  expect(run).toHaveBeenCalledTimes(1);
+}, 15000);
 
 it('does not clear a newer recovery entry when an older identical send is confirmed', async () => {
   const user = userEvent.setup();

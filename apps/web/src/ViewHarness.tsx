@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import type { Session } from '@animaOS-SWARM/sdk';
+import type { Session, SessionMessage } from '@animaOS-SWARM/sdk';
 
 import { AlertIcon } from './components/icons';
 import { CompanionSetup } from './components/onboarding/CompanionSetup';
@@ -19,7 +19,10 @@ import { WorkspaceShell } from './components/WorkspaceShell';
 import { useAgentIntegrations } from './hooks/useAgentIntegrations';
 import { useCompanionSessions } from './hooks/useCompanionSessions';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
-import { useSessionMessages } from './hooks/useSessionMessages';
+import {
+  SESSION_MESSAGES_POLL_MS,
+  useSessionMessages,
+} from './hooks/useSessionMessages';
 import { clearCheckins, importLegacyCheckins } from './lib/checkins';
 import {
   daemon,
@@ -56,6 +59,38 @@ const EMPTY_CHAT: ChatState = {
   error: null,
 };
 const HOME_CONVERSATION = 'home';
+/** The daemon's largest message page, so a busy session still shows the request. */
+const REQUEST_CHECK_PAGE = 200;
+
+/** A send whose outcome is unknown: its request failed in transit or timed out. */
+interface UncertainSend {
+  agentId: string;
+  sessionId: string;
+  key: string;
+  text: string;
+  /** Timed out: the run may still be queued or running, so the chat stays locked. */
+  waiting: boolean;
+}
+
+/** What the send's session said when it was last read again. */
+interface SendCheck {
+  activeRuns: number;
+  delivered: boolean;
+}
+
+/** A committed user message with this request ID means its blocking run
+ *  finished (M2 runs commit their messages together). */
+function carriesRequest(message: SessionMessage, requestId: string): boolean {
+  return (
+    message.role === 'user' && message.metadata.clientRequestId === requestId
+  );
+}
+
+function httpStatus(error: unknown): unknown {
+  return typeof error === 'object' && error !== null && 'status' in error
+    ? error.status
+    : undefined;
+}
 
 /** Chat state is kept per agent and conversation (`home` or `session:<id>`). */
 function chatKey(agentId: string, conversation: string): string {
@@ -263,33 +298,86 @@ export function ViewHarness() {
     if (activeChatKey) updateChat(activeChatKey, { error });
   };
   const pendingSendsRef = useRef(new Set<string>());
-  const uncertainSendsRef = useRef(
-    new Map<
-      string,
-      { agentId: string; key: string; text: string; waiting: boolean }
-    >(),
-  );
+  const uncertainSendsRef = useRef(new Map<string, UncertainSend>());
+  // A timed-out send is settled from its own session, never from the agent's
+  // status: that also reads "running" for a check-in or Telegram turn in
+  // another session, and it can read idle while this request is still
+  // queued behind another run in its room (not yet in the run ledger).
+  const sendChecksRef = useRef(new Map<string, SendCheck>());
+  const [sendCheckRevision, setSendCheckRevision] = useState(0);
+  const mountedRef = useRef(true);
+  const checkTimersRef = useRef(new Set<number>());
+  useEffect(() => {
+    mountedRef.current = true;
+    const timers = checkTimersRef.current;
+    return () => {
+      mountedRef.current = false;
+      for (const timer of timers) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+  /** Reads a timed-out send's session and then its messages, again while the
+   *  session has active runs. Reading the session first means a page read
+   *  after it reports none already holds what those runs committed. */
+  const checkUncertainSend = async (requestId: string) => {
+    const pending = uncertainSendsRef.current.get(requestId);
+    if (!pending?.waiting || !mountedRef.current) return;
+    let check: SendCheck | null = null;
+    try {
+      const session = await daemon.getSession(
+        pending.agentId,
+        pending.sessionId,
+      );
+      const page = await daemon.sessionMessages(
+        pending.agentId,
+        pending.sessionId,
+        { limit: REQUEST_CHECK_PAGE },
+      );
+      check = {
+        activeRuns: session.activeRuns,
+        delivered: page.messages.some((message) =>
+          carriesRequest(message, requestId),
+        ),
+      };
+    } catch (caught) {
+      // A deleted session has nothing left to wait for; other failures retry.
+      if (httpStatus(caught) === 404) check = { activeRuns: 0, delivered: false };
+    }
+    if (
+      !mountedRef.current ||
+      uncertainSendsRef.current.get(requestId) !== pending
+    )
+      return;
+    if (check) {
+      sendChecksRef.current.set(requestId, check);
+      setSendCheckRevision((value) => value + 1);
+      if (check.delivered || check.activeRuns === 0) return;
+    }
+    const timer = window.setTimeout(() => {
+      checkTimersRef.current.delete(timer);
+      void checkUncertainSend(requestId);
+    }, SESSION_MESSAGES_POLL_MS);
+    checkTimersRef.current.add(timer);
+  };
   useEffect(() => {
     for (const [requestId, pending] of uncertainSendsRef.current) {
       const snapshot = agentSnapshots.find(
         (item) => item.state.id === pending.agentId,
       );
       if (!snapshot) continue;
-      // A committed user message means its blocking run finished (M2 runs
-      // commit their messages together).
+      const check = sendChecksRef.current.get(requestId);
       const delivered =
+        check?.delivered === true ||
         snapshot.messages.some(
           (message) =>
             message.role === 'user' &&
             message.content.metadata?.clientRequestId === requestId,
         ) ||
-        history.messages.some(
-          (message) =>
-            message.role === 'user' &&
-            message.metadata.clientRequestId === requestId,
-        );
-      const running = snapshot.state.status === 'running';
-      if (!delivered && (!pending.waiting || running)) continue;
+        history.messages.some((message) => carriesRequest(message, requestId));
+      // A timed-out send stays locked until its session has no active runs.
+      if (!delivered && (!pending.waiting || !check || check.activeRuns > 0))
+        continue;
+      sendChecksRef.current.delete(requestId);
       if (delivered) uncertainSendsRef.current.delete(requestId);
       else
         uncertainSendsRef.current.set(requestId, {
@@ -313,17 +401,15 @@ export function ViewHarness() {
             current.sending && !pending.waiting
               ? current.error
               : delivered
-                ? snapshot.state.status === 'failed'
-                  ? 'The agent run failed. Check the conversation for details.'
-                  : remaining.length
-                    ? current.error
-                    : null
+                ? remaining.length
+                  ? current.error
+                  : null
                 : 'The daemon has not confirmed this message. Check the conversation before restoring it.',
         };
       });
       if (delivered) setMessagesRefresh((value) => value + 1);
     }
-  }, [agentSnapshots, history.messages, updateChat]);
+  }, [agentSnapshots, history.messages, sendCheckRevision, updateChat]);
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null,
   );
@@ -584,7 +670,7 @@ export function ViewHarness() {
   /** One blocking run in a session's room (spec §4.9). */
   const runInSession = async (
     targetId: string,
-    roomId: string,
+    session: Pick<Session, 'id' | 'roomId'>,
     text: string,
     key: string,
     preserveDraft = false,
@@ -608,7 +694,7 @@ export function ViewHarness() {
         targetId,
         text,
         { clientRequestId },
-        roomId,
+        session.roomId,
       );
       if (
         availableAgentIdsRef.current.has(targetId) &&
@@ -624,6 +710,7 @@ export function ViewHarness() {
           caught instanceof Error && 'status' in caught && caught.status === 408;
         uncertainSendsRef.current.set(clientRequestId, {
           agentId: targetId,
+          sessionId: session.id,
           key,
           text,
           waiting: timedOut,
@@ -637,7 +724,10 @@ export function ViewHarness() {
             ? 'The response timed out. Checking the daemon for completion—do not resend yet.'
             : errorMessage(caught),
         }));
-        if (timedOut) void refreshAgents();
+        if (timedOut) {
+          void refreshAgents();
+          void checkUncertainSend(clientRequestId);
+        }
       }
     } finally {
       if (!uncertainSendsRef.current.get(clientRequestId)?.waiting) {
@@ -686,7 +776,7 @@ export function ViewHarness() {
     });
     sessions.upsert(session);
     navigate({ kind: 'session', sessionId: session.id }, { replace: true });
-    await runInSession(targetId, session.roomId, text, target, true);
+    await runInSession(targetId, session, text, target, true);
   };
 
   /** An owner turn in a Telegram session goes out through its connector. */
@@ -740,7 +830,7 @@ export function ViewHarness() {
     }
     void runInSession(
       activeSession?.agentId ?? agent.id,
-      activeSession?.roomId ?? routeSessionId,
+      activeSession ?? { id: routeSessionId, roomId: routeSessionId },
       text,
       key,
     );
