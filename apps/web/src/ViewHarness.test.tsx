@@ -1797,6 +1797,42 @@ it('keeps the composer disabled until the open session record loads', async () =
   );
 });
 
+it('retries an unlisted session record that fails to load and says why', async () => {
+  fakeClock();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  // An archived legacy session is not listed, so its record is read on its own.
+  vi.mocked(daemon.getSession)
+    .mockRejectedValueOnce(
+      Object.assign(new Error('daemon unavailable'), { status: 503 }),
+    )
+    .mockResolvedValue(
+      sessionFixture('legacy-room:abc', {
+        roomId: 'direct:agent-main',
+        title: 'Earlier chat',
+        archived: true,
+      }),
+    );
+  window.history.replaceState(null, '', '/#/s/legacy-room%3Aabc');
+  render(<ViewHarness />);
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    'Session details could not be loaded: daemon unavailable',
+  );
+  const input = screen.getByPlaceholderText('Message Nova…');
+  expect(input).toBeDisabled();
+
+  await elapse(SESSION_MESSAGES_POLL_MS);
+  await waitFor(() => expect(input).toBeEnabled());
+  expect(
+    screen.queryByText(/Session details could not be loaded/),
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole('heading', { name: 'Earlier chat' })).toBeVisible();
+});
+
 it('shows why older messages could not be loaded', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });

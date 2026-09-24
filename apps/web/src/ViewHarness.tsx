@@ -256,20 +256,37 @@ export function ViewHarness() {
   // A session outside the loaded list (archived, older, or filtered out by a
   // search) keeps its last known record and is read again on its own.
   const [knownSession, setKnownSession] = useState<Session | null>(null);
+  const [sessionReadError, setSessionReadError] = useState<string | null>(
+    null,
+  );
   useEffect(() => {
     if (listedSession) setKnownSession(listedSession);
   }, [listedSession]);
   useEffect(() => {
+    setSessionReadError(null);
     if (!routeSessionId || sessionListed || !agentId) return;
     let active = true;
-    void daemon.getSession(agentId, routeSessionId).then(
-      (session) => {
-        if (active) setKnownSession(session);
-      },
-      () => undefined,
-    );
+    let timer: number | undefined;
+    // A failed read is retried on the messages' cadence while the route
+    // points here; a missing session shows as deleted through its messages.
+    const read = () => {
+      daemon.getSession(agentId, routeSessionId).then(
+        (session) => {
+          if (!active) return;
+          setKnownSession(session);
+          setSessionReadError(null);
+        },
+        (caught) => {
+          if (!active || httpStatus(caught) === 404) return;
+          setSessionReadError(errorMessage(caught));
+          timer = window.setTimeout(read, SESSION_MESSAGES_POLL_MS);
+        },
+      );
+    };
+    read();
     return () => {
       active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [agentId, routeSessionId, sessionListed]);
   const activeSession =
@@ -1087,6 +1104,12 @@ export function ViewHarness() {
                 reload this page.
               </p>
             </div>
+          ) : null}
+          {sessionLoading && sessionReadError ? (
+            <p role="alert" className="px-4 pt-3 text-xs text-danger">
+              Session details could not be loaded: {sessionReadError}.
+              Retrying…
+            </p>
           ) : null}
           {routeSessionId && history.error ? (
             <p role="alert" className="px-4 pt-3 text-xs text-danger">
