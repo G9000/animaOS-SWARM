@@ -3,11 +3,18 @@
 use std::sync::Arc;
 
 use anima_core::primitives::now_millis;
-use anima_core::{AgentRuntime, AgentRuntimeSnapshot, AgentStatus, MessageRole, RuntimeRunBase};
+use anima_core::{
+    AgentRuntime, AgentRuntimeSnapshot, AgentStatus, Message, MessageRole, RuntimeRunBase,
+};
 
 use super::DaemonState;
 use crate::runs::{RunChangeSet, RunError, RunOutcome, RunSource, RunStatus, AGENT_DELETED};
 use crate::tools::ToolExecutionContext;
+
+/// Interim `schedule:` room context cap (controller ruling, M2 pre-flight
+/// audit finding 5): the newest whole turns a run's history keeps once
+/// silent check-in pairs are dropped. M3's context selection replaces this.
+const SCHEDULE_ROOM_CONTEXT_TURNS: usize = 10;
 
 impl DaemonState {
     /// A tool context wired to this daemon's memory, workspace, and connectors.
@@ -36,12 +43,23 @@ impl DaemonState {
         room_id: &str,
     ) -> Option<(AgentRuntime, ToolExecutionContext, RuntimeRunBase)> {
         let canonical = self.agents.get(agent_id)?;
-        let history = canonical
+        let mut history: Vec<Message> = canonical
             .messages()
             .iter()
             .filter(|message| message.room_id == room_id)
             .cloned()
             .collect();
+        // Interim context guard (controller ruling, M2 pre-flight audit
+        // finding 5): a `schedule:` room's history drops silent check-in
+        // pairs (the same rule `crate::sessions::hidden_message_ids` gives
+        // session views) and keeps only the newest whole turns. `run_base`
+        // below reads this trimmed copy's own length, so run deltas and
+        // commits still see exactly what this run appends; the canonical
+        // transcript above is only read, never written. Other rooms are
+        // unchanged in M2; M3's context selection replaces this for every room.
+        if crate::sessions::schedule_id_of_room(room_id).is_some() {
+            history = recent_turns(history);
+        }
         let mut runtime = AgentRuntime::from_snapshot(
             canonical.run_snapshot(history),
             Arc::clone(&self.model_adapter),
@@ -135,13 +153,39 @@ impl DaemonState {
     }
 }
 
+/// `history` with silent check-in pairs excluded and only the newest
+/// [`SCHEDULE_ROOM_CONTEXT_TURNS`] whole turns kept. A turn starts at a user
+/// message; every following assistant and tool message stays with it up to
+/// (not including) the next user message, so a tool-call turn is never split
+/// from its results.
+fn recent_turns(history: Vec<Message>) -> Vec<Message> {
+    let hidden = crate::sessions::hidden_message_ids(history.iter());
+    let visible: Vec<Message> = history
+        .into_iter()
+        .filter(|message| !hidden.contains(&message.id))
+        .collect();
+    let turn_starts: Vec<usize> = visible
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == MessageRole::User)
+        .map(|(index, _)| index)
+        .collect();
+    if turn_starts.len() <= SCHEDULE_ROOM_CONTEXT_TURNS {
+        return visible;
+    }
+    let cutoff = turn_starts[turn_starts.len() - SCHEDULE_ROOM_CONTEXT_TURNS];
+    visible[cutoff..].to_vec()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
 
     use anima_core::{
-        AgentConfig, AgentSettings, AgentStatus, Content, MessageRole, ModelAdapter,
-        ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, TokenUsage,
+        AgentConfig, AgentSettings, AgentStatus, Content, DataValue, Message, MessageRole,
+        ModelAdapter, ModelGenerateRequest, ModelGenerateResponse, ModelStopReason,
+        RuntimeRunDelta, TokenUsage,
     };
     use async_trait::async_trait;
 
@@ -404,5 +448,209 @@ mod tests {
             "restart handling of an interrupted agent is unchanged"
         );
         assert_eq!(restored.in_flight_runs(&agent_id), 0);
+    }
+
+    fn history_message(
+        agent_id: &str,
+        room_id: &str,
+        id: &str,
+        role: MessageRole,
+        text: &str,
+        checkin: bool,
+    ) -> Message {
+        Message {
+            id: id.to_string(),
+            agent_id: agent_id.to_string(),
+            room_id: room_id.to_string(),
+            content: Content {
+                text: text.to_string(),
+                attachments: None,
+                metadata: checkin.then(|| {
+                    BTreeMap::from([("kind".to_string(), DataValue::String("checkin".into()))])
+                }),
+            },
+            role,
+            created_at_ms: 1,
+        }
+    }
+
+    /// Appends messages straight to the agent's canonical transcript, bypassing
+    /// the run machinery: `build_run_runtime` only reads `self.agents`, so its
+    /// interim `schedule:` room guard needs a long history to trim, not a real run.
+    fn seed_history(state: &mut DaemonState, agent_id: &str, messages: Vec<Message>) {
+        state
+            .agents
+            .get_mut(agent_id)
+            .expect("agent exists")
+            .apply_run_delta(&RuntimeRunDelta {
+                messages,
+                events: Vec::new(),
+                event_total: 0,
+                token_usage: TokenUsage::default(),
+                step_count: 0,
+                last_task: None,
+                status: AgentStatus::Idle,
+            });
+    }
+
+    /// Ruling test 1/2 (M2 pre-flight audit, finding 5): a `schedule:` room
+    /// with 30 prior ticks, half silent, gives the model at most 10 visible
+    /// turns and no `CHECKIN_OK` pairs.
+    #[test]
+    fn schedule_room_context_hides_silent_checkins_and_keeps_the_newest_ten_turns() {
+        let (mut state, agent_id) = state_with_agent();
+        let room = crate::sessions::schedule_room_id("schedule-1");
+        let mut messages = Vec::new();
+        for tick in 0..30u32 {
+            let silent = tick % 2 == 0;
+            let reply_text = if silent {
+                "CHECKIN_OK".to_string()
+            } else {
+                format!("Reply {tick}")
+            };
+            messages.push(history_message(
+                &agent_id,
+                &room,
+                &format!("user-{tick}"),
+                MessageRole::User,
+                "Check status",
+                true,
+            ));
+            messages.push(history_message(
+                &agent_id,
+                &room,
+                &format!("assistant-{tick}"),
+                MessageRole::Assistant,
+                &reply_text,
+                false,
+            ));
+        }
+        seed_history(&mut state, &agent_id, messages);
+
+        let (runtime, _tools, _base) = state.build_run_runtime(&agent_id, &room).unwrap();
+
+        let expected: HashSet<String> = (11..30)
+            .step_by(2)
+            .flat_map(|tick| [format!("user-{tick}"), format!("assistant-{tick}")])
+            .collect();
+        let actual: HashSet<String> = runtime.messages().iter().map(|m| m.id.clone()).collect();
+        assert_eq!(
+            actual, expected,
+            "the newest 10 spoken turns remain; every silent check-in pair is dropped"
+        );
+        assert_eq!(
+            runtime
+                .messages()
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            10,
+            "at most 10 visible turns reach the model"
+        );
+        assert!(
+            runtime
+                .messages()
+                .iter()
+                .all(|message| message.content.text.trim() != "CHECKIN_OK"),
+            "no CHECKIN_OK pair leaks into the model's context"
+        );
+    }
+
+    /// Ruling test 2/2: a tool-call turn is kept whole even when it sits at
+    /// the newest-10-turns cutoff boundary.
+    #[test]
+    fn schedule_room_context_keeps_a_tool_call_turn_whole() {
+        let (mut state, agent_id) = state_with_agent();
+        let room = crate::sessions::schedule_room_id("schedule-2");
+        let mut messages = vec![
+            history_message(&agent_id, &room, "user-0", MessageRole::User, "old", false),
+            history_message(
+                &agent_id,
+                &room,
+                "assistant-0",
+                MessageRole::Assistant,
+                "old reply",
+                false,
+            ),
+            history_message(
+                &agent_id,
+                &room,
+                "user-1",
+                MessageRole::User,
+                "run the tool",
+                false,
+            ),
+            history_message(
+                &agent_id,
+                &room,
+                "assistant-1-call",
+                MessageRole::Assistant,
+                "using a tool",
+                false,
+            ),
+            history_message(
+                &agent_id,
+                &room,
+                "tool-1-result",
+                MessageRole::Tool,
+                "tool output",
+                false,
+            ),
+            history_message(
+                &agent_id,
+                &room,
+                "assistant-1-final",
+                MessageRole::Assistant,
+                "done",
+                false,
+            ),
+        ];
+        for tick in 2..11u32 {
+            messages.push(history_message(
+                &agent_id,
+                &room,
+                &format!("user-{tick}"),
+                MessageRole::User,
+                "tick",
+                false,
+            ));
+            messages.push(history_message(
+                &agent_id,
+                &room,
+                &format!("assistant-{tick}"),
+                MessageRole::Assistant,
+                "reply",
+                false,
+            ));
+        }
+        seed_history(&mut state, &agent_id, messages);
+
+        let (runtime, _tools, _base) = state.build_run_runtime(&agent_id, &room).unwrap();
+
+        let ids: Vec<&str> = runtime.messages().iter().map(|m| m.id.as_str()).collect();
+        assert!(
+            !ids.contains(&"user-0") && !ids.contains(&"assistant-0"),
+            "the oldest turn is trimmed away"
+        );
+        for id in [
+            "user-1",
+            "assistant-1-call",
+            "tool-1-result",
+            "assistant-1-final",
+        ] {
+            assert!(
+                ids.contains(&id),
+                "the tool-call turn at the cutoff stays whole: missing {id}"
+            );
+        }
+        assert_eq!(
+            runtime
+                .messages()
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            10,
+            "10 turns remain: the tool-call turn plus 9 simple ticks"
+        );
     }
 }
