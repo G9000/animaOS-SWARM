@@ -141,21 +141,25 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
     let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
-    // Embedded and test routers flush history as well when a runtime is present.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        runtime.history.start();
-    }
     // Construction-time state is uncontended, so this always succeeds in
     // practice; calendar tools simply report "unconfigured" otherwise.
     if let Ok(mut guard) = state.try_write() {
         guard.set_calendar_manager(Some(runtime.calendar.clone()));
     }
-    router_with_runtime(
+    let history = runtime.history.clone();
+    let router = router_with_runtime(
         state,
         config,
         runtime,
         routes::configured_bind_is_loopback(),
-    )
+    );
+    // Embedded and test routers mirror history too when a runtime is present.
+    // The worker starts after construction, which must find the state
+    // uncontended.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        history.start();
+    }
+    router
 }
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
@@ -179,8 +183,10 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     })?;
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
-    runtime.history.start();
-    Ok(router_with_runtime(state, config, runtime, false))
+    let history = runtime.history.clone();
+    let router = router_with_runtime(state, config, runtime, false);
+    history.start();
+    Ok(router)
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
@@ -219,12 +225,12 @@ pub(crate) async fn serve_with_state(
     })?;
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
-    runtime.history.start();
     let connectors = runtime.connectors.clone();
     let scheduler = runtime.scheduler.clone();
     let jobs = runtime.jobs.clone();
     let history = runtime.history.clone();
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
+    history.start();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -611,6 +617,94 @@ mod tests {
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Waits until the store holds every id, failing after `within`.
+    async fn wait_until_mirrored(
+        store: &dyn crate::history::HistoryStore,
+        ids: &[String],
+        within: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        while store.existing_message_ids(ids).await.unwrap().len() < ids.len() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{ids:?} were not mirrored within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn app_with_state_routers_keep_mirroring_committed_messages() {
+        use crate::history::{HistoryService, MemoryHistoryStore, HISTORY_FLUSH_INTERVAL};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::util::ServiceExt;
+
+        let store = Arc::new(MemoryHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(store.clone()));
+        let agent_id = daemon
+            .create_agent(anima_core::AgentConfig {
+                name: "historian".to_string(),
+                model: "deterministic".to_string(),
+                provider: None,
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            })
+            .unwrap()
+            .state
+            .id;
+        let state = Arc::new(RwLock::new(daemon));
+        let router = app_with_state(Arc::clone(&state), DaemonConfig::default());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let committed = state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 2);
+        wait_until_mirrored(&*store, &committed, HISTORY_FLUSH_INTERVAL).await;
+
+        // Only an explicit shutdown stops the loop, not dropped handles.
+        drop(router);
+        let later = crate::history::conformance::history_message(
+            "msg-9-9",
+            &agent_id,
+            "chat:later",
+            anima_core::MessageRole::User,
+            "still mirrored",
+            9,
+        );
+        let history = state.read().await.history.clone();
+        history.enqueue_committed(&agent_id, "chat:later", &[later.message]);
+        wait_until_mirrored(&*store, &["msg-9-9".to_string()], HISTORY_FLUSH_INTERVAL).await;
     }
 
     #[tokio::test]

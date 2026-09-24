@@ -24,12 +24,11 @@ pub(crate) async fn configure_persistence(
     let postgres_pool = configure_database(state, config).await?;
     let memory_store = memory_store_from_env(postgres_pool.as_ref())?;
     let control_plane_store = control_plane_store_from_env(postgres_pool.as_ref())?;
+    let history_sqlite = non_empty_env_path(HISTORY_SQLITE_FILE_ENV)?;
 
     let default_embedding_store = configure_memory_store(state, memory_store).await?;
     configure_memory_embeddings(state, default_embedding_store).await?;
-    configure_control_plane_store(state, control_plane_store.clone()).await?;
-    configure_history_store(state, control_plane_store.as_ref()).await?;
-    Ok(())
+    configure_control_plane_and_history(state, control_plane_store, history_sqlite).await
 }
 
 async fn configure_database(
@@ -133,12 +132,16 @@ async fn configure_control_plane_store(
 /// The SQLite history file (spec §13.1); defaults beside the control plane.
 pub(crate) const HISTORY_SQLITE_FILE_ENV: &str = "ANIMAOS_RS_HISTORY_SQLITE_FILE";
 
-async fn configure_history_store(
+/// Opens the history store before the control plane is loaded or saved: a
+/// history file that cannot be opened refuses boot while the snapshot is still
+/// untouched, so an older daemon can start on it (spec §16).
+async fn configure_control_plane_and_history(
     state: &SharedDaemonState,
-    control_plane: Option<&ControlPlaneStoreConfig>,
+    control_plane: Option<ControlPlaneStoreConfig>,
+    history_sqlite: Option<PathBuf>,
 ) -> io::Result<()> {
-    let store =
-        history_store_for(control_plane, non_empty_env_path(HISTORY_SQLITE_FILE_ENV)?).await?;
+    let store = history_store_for(control_plane.as_ref(), history_sqlite).await?;
+    configure_control_plane_store(state, control_plane).await?;
     let label = store.label();
     state.write().await.set_history(HistoryService::new(store));
     info!(history_store = label, "runtime history store configured");
@@ -352,6 +355,40 @@ mod tests {
                 .unwrap()
                 .label(),
             "postgres"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_history_file_that_cannot_open_refuses_boot_before_the_snapshot_is_touched() {
+        let dir = temp_dir("unopenable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let control_file = dir.join("control-plane.json");
+        let original = r#"{"version":4,"agents":[],"swarms":[]}"#;
+        std::fs::write(&control_file, original).unwrap();
+        // A regular file where the history file's directory should be.
+        let not_a_directory = dir.join("not-a-directory");
+        std::fs::write(&not_a_directory, "").unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+
+        let error = configure_control_plane_and_history(
+            &state,
+            Some(ControlPlaneStoreConfig::Json(control_file.clone())),
+            Some(not_a_directory.join("history.sqlite")),
+        )
+        .await
+        .expect_err("an unopenable history store refuses boot");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("failed to open the history store"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&control_file).unwrap(),
+            original,
+            "an older daemon can still start on the untouched snapshot"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

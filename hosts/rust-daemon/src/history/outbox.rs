@@ -516,11 +516,12 @@ fn reconcile_rows(
 }
 
 struct WorkerHandle {
-    cancel: watch::Sender<bool>,
+    stop: watch::Sender<bool>,
     join: JoinHandle<()>,
 }
 
-/// Runs the outbox flush loop; Task 13 adds hot-tail pruning to it.
+/// Runs the outbox flush loop; Task 13 adds hot-tail pruning to it. Only
+/// `shutdown` stops the loop: routers that drop every handle keep mirroring.
 #[derive(Clone)]
 pub(crate) struct HistoryWorker {
     state: SharedDaemonState,
@@ -545,18 +546,18 @@ impl HistoryWorker {
         if running.is_some() {
             return;
         }
-        let (cancel, mut cancelled) = watch::channel(false);
+        let (stop, mut stopping) = watch::channel(false);
+        // The loop holds a sender itself, so the channel never closes under it.
+        let keep_open = stop.clone();
         let state = Arc::clone(&self.state);
         let transactions = Arc::clone(&self.transactions);
         let join = tokio::spawn(async move {
+            let _keep_open = keep_open;
             loop {
                 let history = state.read().await.history.clone();
                 tokio::select! {
-                    changed = cancelled.changed() => {
-                        if changed.is_err() || *cancelled.borrow() {
-                            break;
-                        }
-                    }
+                    biased;
+                    _ = stopping.wait_for(|stop| *stop) => break,
                     () = history.wait_for_work() => {}
                 }
                 let _ = history
@@ -564,14 +565,14 @@ impl HistoryWorker {
                     .await;
             }
         });
-        *running = Some(WorkerHandle { cancel, join });
+        *running = Some(WorkerHandle { stop, join });
     }
 
     /// Stops the loop and makes one final flush attempt.
     pub(crate) async fn shutdown(&self) {
         let handle = lock(&self.running).take();
         if let Some(handle) = handle {
-            let _ = handle.cancel.send(true);
+            let _ = handle.stop.send(true);
             let _ = handle.join.await;
         }
         let history = self.state.read().await.history.clone();
