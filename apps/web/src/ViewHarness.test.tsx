@@ -2230,6 +2230,28 @@ it('keeps the open session while a sidebar search filters it out', async () => {
   expect(screen.queryByPlaceholderText('Message Nova…')).not.toBeInTheDocument();
 });
 
+it('shows a failed header action in the session view', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+  );
+  vi.mocked(daemon.updateSession).mockRejectedValue(new Error('archive refused'));
+  window.history.replaceState(null, '', '/#/s/chat%3Aold');
+  render(<ViewHarness />);
+
+  // On mobile the sidebar sits in a closed drawer, so the view says it too.
+  const view = await screen.findByRole('region', { name: 'Old plan' });
+  await user.click(within(view).getByRole('button', { name: 'Archive' }));
+  expect(await within(view).findByRole('alert')).toHaveTextContent(
+    'archive refused',
+  );
+});
+
 it('shows a failed session action in the sidebar instead of rejecting', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });

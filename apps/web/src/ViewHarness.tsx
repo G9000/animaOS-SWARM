@@ -1128,6 +1128,11 @@ export function ViewHarness() {
               </p>
             </div>
           ) : null}
+          {sessionActionError ? (
+            <p role="alert" className="px-4 pt-3 text-xs text-danger">
+              {sessionActionError}
+            </p>
+          ) : null}
           {sessionLoading && sessionReadError ? (
             <p role="alert" className="px-4 pt-3 text-xs text-danger">
               Session details could not be loaded: {sessionReadError}.
