@@ -222,6 +222,39 @@ impl HistoryStore for MemoryHistoryStore {
         Ok(rows)
     }
 
+    async fn search_sessions(
+        &self,
+        agent_ids: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryMessage>, HistoryError> {
+        let tokens = search_tokens(query);
+        if tokens.is_empty() || agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tables = self.tables();
+        let mut newest: HashMap<(String, String), HistoryMessage> = HashMap::new();
+        for (_, row) in tables.messages.values() {
+            if row.hidden
+                || !agent_ids.contains(&row.agent_id)
+                || !text_matches(&row.message.content.text, &tokens)
+            {
+                continue;
+            }
+            let key = (row.agent_id.clone(), row.session_id.clone());
+            match newest.get(&key) {
+                Some(existing) if existing.order() >= row.order() => {}
+                _ => {
+                    newest.insert(key, row.clone());
+                }
+            }
+        }
+        let mut rows = newest.into_values().collect::<Vec<_>>();
+        rows.sort_by(|left, right| right.order().cmp(&left.order()));
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         let mut guard = self.tables();
         let tables = &mut *guard;
@@ -250,12 +283,17 @@ impl HistoryStore for MemoryHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::conformance::{assert_history_store_conformance, history_message};
+    use crate::history::conformance::{
+        assert_history_store_conformance, assert_history_store_session_search_conformance,
+        history_message,
+    };
     use anima_core::MessageRole;
 
     #[tokio::test]
     async fn memory_store_meets_the_conformance_suite() {
-        assert_history_store_conformance(&MemoryHistoryStore::new()).await;
+        let store = MemoryHistoryStore::new();
+        assert_history_store_conformance(&store).await;
+        assert_history_store_session_search_conformance(&store).await;
     }
 
     #[tokio::test]

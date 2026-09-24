@@ -509,6 +509,54 @@ impl HistoryStore for SqliteHistoryStore {
         .await
     }
 
+    async fn search_sessions(
+        &self,
+        agent_ids: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryMessage>, HistoryError> {
+        let tokens = search_tokens(query);
+        if tokens.is_empty() || agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts = tokens
+            .iter()
+            .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut values = vec![fts];
+        values.extend(agent_ids.iter().cloned());
+        self.run(move |connection| {
+            // The newest matching row per (agent, session), then the newest
+            // `limit` sessions (Controller ruling, M2 pre-flight audit): the
+            // row-number partition groups before the session limit applies.
+            let sql = format!(
+                "SELECT agent_id, session_id, hidden, record FROM (
+                     SELECT messages.agent_id AS agent_id, messages.session_id AS session_id,
+                            messages.hidden AS hidden, messages.record AS record,
+                            messages.created_at_ms AS created_at_ms, messages.ordinal AS ordinal,
+                            messages.id AS id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY messages.agent_id, messages.session_id
+                                ORDER BY messages.created_at_ms DESC, messages.ordinal DESC, messages.id DESC
+                            ) AS rn
+                     FROM messages_fts JOIN messages ON messages.rowid = messages_fts.rowid
+                     WHERE messages_fts MATCH ?1 AND messages.hidden = 0 AND messages.agent_id IN ({})
+                 ) ranked
+                 WHERE rn = 1
+                 ORDER BY created_at_ms DESC, ordinal DESC, id DESC
+                 LIMIT {limit}",
+                placeholders(2, values.len() - 1)
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement
+                .query_map(params_from_iter(values.iter()), raw_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            decode(rows)
+        })
+        .await
+    }
+
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         let (agent_id, session_id) = (agent_id.to_string(), session_id.to_string());
         self.run(move |connection| {
@@ -546,7 +594,10 @@ impl HistoryStore for SqliteHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::conformance::{assert_history_store_conformance, history_message};
+    use crate::history::conformance::{
+        assert_history_store_conformance, assert_history_store_session_search_conformance,
+        history_message,
+    };
     use anima_core::MessageRole;
 
     struct TempHistory(PathBuf);
@@ -576,6 +627,7 @@ mod tests {
             .await
             .expect("the store opens and creates its directory");
         assert_history_store_conformance(&store).await;
+        assert_history_store_session_search_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }

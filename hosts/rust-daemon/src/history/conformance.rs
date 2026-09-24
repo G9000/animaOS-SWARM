@@ -386,6 +386,92 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
         .expect("deleting an agent twice is harmless");
 }
 
+/// Session search (Controller ruling 2, M2 pre-flight audit): sessions are
+/// ranked by their newest matching message, so a session whose only match is
+/// older than another session's flood of matches is still returned. Agent id
+/// and timestamps are unique per call, so a shared Postgres database can run
+/// it repeatedly.
+pub(crate) async fn assert_history_store_session_search_conformance(store: &dyn HistoryStore) {
+    let agent = format!("agent-{}", uuid::Uuid::new_v4());
+    let base = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as u64 * 1_000;
+    let at = |offset: u64| base + offset;
+    let id = |offset: u64, ordinal: u64| format!("msg-{}-{ordinal}", base + offset);
+
+    // "chat:busy" gets more matches than the session limit below; its newest
+    // is at offset 130. "chat:quiet" has a single, older match that a
+    // row-limited search (the pre-ruling behaviour) would crowd out.
+    let mut rows = (0u64..4)
+        .map(|n| {
+            history_message(
+                &id(100 + n * 10, 20 + n),
+                &agent,
+                "chat:busy",
+                MessageRole::User,
+                "deploy the build",
+                at(100 + n * 10),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.push(history_message(
+        &id(10, 30),
+        &agent,
+        "chat:quiet",
+        MessageRole::User,
+        "deploy notes",
+        at(10),
+    ));
+    let mut hidden = history_message(
+        &id(500, 40),
+        &agent,
+        "chat:busy",
+        MessageRole::Assistant,
+        "deploy hidden",
+        at(500),
+    );
+    hidden.hidden = true;
+    rows.push(hidden);
+    store
+        .upsert_messages(&rows)
+        .await
+        .expect("session-search messages upsert");
+
+    let newest_busy = id(130, 23);
+    let quiet = id(10, 30);
+    let agents = [agent.clone()];
+    let found = store.search_sessions(&agents, "deploy", 3).await.unwrap();
+    assert_eq!(
+        found
+            .iter()
+            .map(|row| (row.session_id.as_str(), row.message.id.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("chat:busy", newest_busy.as_str()),
+            ("chat:quiet", quiet.as_str())
+        ],
+        "a session with more than the limit's worth of matches must not crowd out an older session's match"
+    );
+    assert!(
+        found.iter().all(|row| !row.hidden),
+        "hidden messages never match"
+    );
+
+    assert_eq!(
+        ids(&store.search_sessions(&agents, "deploy", 1).await.unwrap()),
+        [newest_busy],
+        "the limit caps the number of sessions, newest session first"
+    );
+    assert!(store
+        .search_sessions(&[], "deploy", 3)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .search_sessions(&agents, "!!", 3)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// A memory store whose every call fails while `failing` is set. Unlike the
 /// memory store it is not ephemeral, so pruning tests can use it.
 pub(crate) struct FlakyHistoryStore {
@@ -526,6 +612,16 @@ impl HistoryStore for FlakyHistoryStore {
     ) -> Result<Vec<HistoryMessage>, HistoryError> {
         self.check()?;
         self.inner.search_messages(agent_ids, query, limit).await
+    }
+
+    async fn search_sessions(
+        &self,
+        agent_ids: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryMessage>, HistoryError> {
+        self.check()?;
+        self.inner.search_sessions(agent_ids, query, limit).await
     }
 
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {

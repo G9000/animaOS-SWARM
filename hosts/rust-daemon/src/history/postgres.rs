@@ -262,6 +262,37 @@ impl HistoryStore for PostgresHistoryStore {
         rows.iter().map(decode_row).collect()
     }
 
+    async fn search_sessions(
+        &self,
+        agent_ids: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryMessage>, HistoryError> {
+        let tokens = search_tokens(query);
+        if tokens.is_empty() || agent_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `DISTINCT ON` picks the newest row per (agent, session) before the
+        // session limit applies (Controller ruling, M2 pre-flight audit).
+        let rows = sqlx::query(
+            "SELECT agent_id, session_id, hidden, record FROM (
+                 SELECT DISTINCT ON (agent_id, session_id)
+                        agent_id, session_id, hidden, record, created_at_ms, ordinal, id
+                 FROM history_messages
+                 WHERE search @@ to_tsquery('simple', $1) AND NOT hidden AND agent_id = ANY($2)
+                 ORDER BY agent_id, session_id, created_at_ms DESC, ordinal DESC, id DESC
+             ) ranked
+             ORDER BY created_at_ms DESC, ordinal DESC, id DESC
+             LIMIT $3",
+        )
+        .bind(prefix_tsquery(&tokens))
+        .bind(agent_ids.to_vec())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(decode_row).collect()
+    }
+
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
         for table in ["history_messages", "history_runs", "history_attachments"] {
@@ -294,7 +325,9 @@ impl HistoryStore for PostgresHistoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::history::conformance::assert_history_store_conformance;
+    use crate::history::conformance::{
+        assert_history_store_conformance, assert_history_store_session_search_conformance,
+    };
 
     #[test]
     fn prefix_queries_join_every_word() {
@@ -309,6 +342,7 @@ mod tests {
     async fn postgres_store_meets_the_conformance_suite(pool: PgPool) {
         let store = PostgresHistoryStore::new(pool);
         assert_history_store_conformance(&store).await;
+        assert_history_store_session_search_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }

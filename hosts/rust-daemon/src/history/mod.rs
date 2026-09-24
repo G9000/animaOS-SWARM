@@ -168,6 +168,19 @@ pub(crate) trait HistoryStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<HistoryMessage>, HistoryError>;
 
+    /// The newest visible matching message per (agent, session) of these
+    /// agents, newest session first, at most `limit` sessions (Controller
+    /// ruling, M2 pre-flight audit): unlike [`Self::search_messages`], the
+    /// session limit is applied after grouping, so a session whose only
+    /// match is older than another session's flood of matches is still
+    /// returned.
+    async fn search_sessions(
+        &self,
+        agent_ids: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryMessage>, HistoryError>;
+
     /// Removes a session's messages, runs, and attachment records.
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError>;
 
