@@ -24,6 +24,11 @@ const MAX_HELPERS_PER_COMPANION: usize = 4;
 const MAX_HELPER_TOOL_ITERATIONS: usize = 8;
 const MAX_HELPER_RUN_MS: u64 = 120_000;
 const DUPLICATE_IN_FLIGHT_RUN: &str = "A run with this idempotency key is already in progress";
+/// Helpers have no chat of their own (spec §3.1); they only run through the
+/// companion that delegates to them. Shared with `routes::sessions::
+/// create_session`'s `409` (fix round 1, M2 review: was duplicated).
+pub(crate) const HELPER_MUST_RUN_THROUGH_COMPANION: &str =
+    "Helpers must run through their owning companion";
 
 /// Upper bound accepted for `ANIMAOS_RS_MAX_RUNS_PER_AGENT` and for
 /// `with_max_runs_per_agent`; keeps `tokio::sync::Semaphore::new` from ever
@@ -1403,7 +1408,7 @@ fn validate_run_request(
         if let Some(parent_id) = config_helper_parent(target) {
             if !matches!(room, RunRoom::Delegated { parent_id: source } if source == parent_id) {
                 return Err(ApiError::bad_request_static(
-                    "Helpers must run through their owning companion",
+                    HELPER_MUST_RUN_THROUGH_COMPANION,
                 ));
             }
             if target

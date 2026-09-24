@@ -616,9 +616,10 @@ pub(crate) fn automation_exists(state: &DaemonState, record: &SessionRecord) -> 
         && schedule_id_of_room(record.room_id()).is_some_and(|id| state.schedules.contains_key(id))
 }
 
-/// Every visible message of a session oldest first, including messages only
-/// the history store still holds and silent check-in turns (spec §3.3
-/// export: the full transcript, not the default view).
+/// The full transcript of a session oldest first: every message, including
+/// ones only the history store still holds and silent check-in turns, which
+/// `transcript_markdown` marks rather than hides (spec §3.3 export: the full
+/// transcript, not the default view's visible-only messages).
 pub(crate) async fn full_transcript(
     state: &SharedDaemonState,
     agent_id: &str,

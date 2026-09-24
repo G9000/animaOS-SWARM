@@ -158,7 +158,7 @@ Every session route requires local-owner authorization, and reads answer `Cache-
 | `PATCH` | `/api/agents/{agent_id}/sessions/{session_id}` | Rename, archive, or mark read: `{ "title"?, "archived"?, "lastReadAtMs"? }`. |
 | `DELETE` | `/api/agents/{agent_id}/sessions/{session_id}` | Delete a session its kind allows; `409` while a run in it is active. Memories are kept. |
 | `GET` | `/api/agents/{agent_id}/sessions/{session_id}/messages` | Messages oldest to newest: `?before=<messageId>&limit=50&includeHidden=false`. Returns `{ messages, nextBefore }`. |
-| `GET` | `/api/agents/{agent_id}/sessions/{session_id}/export` | The visible transcript as `text/markdown`, including messages kept only in the history store and silent check-in turns. |
+| `GET` | `/api/agents/{agent_id}/sessions/{session_id}/export` | The full transcript as `text/markdown`, including messages kept only in the history store, with silent check-in turns marked rather than hidden. |
 
 ### Agencies
 

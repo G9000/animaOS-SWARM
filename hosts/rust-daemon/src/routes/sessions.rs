@@ -15,6 +15,7 @@ use super::contracts::{
 use super::http::{json_response, read_limited_body, request_query};
 use super::jobs::{authorize, body, no_store};
 use super::{parse_json_body, ApiError, AppState};
+use crate::agent_runs::HELPER_MUST_RUN_THROUGH_COMPANION;
 use crate::history::HistoryDeletion;
 use crate::sessions::views::{
     self, MessagePageError, MessagePageRequest, SessionCursor, SessionListQuery,
@@ -28,9 +29,6 @@ use crate::sessions::{
 
 const TOO_MANY_NEW_CHATS: &str = "Too many new chats; try again in a minute";
 const SESSION_RUN_IN_PROGRESS: &str = "A run in this session is still in progress";
-/// Helpers have no chat of their own (spec §3.1); they only run through the
-/// companion that delegates to them.
-const HELPER_SESSION_CONFLICT: &str = "Helpers must run through their owning companion";
 
 type QueryParams = HashMap<String, String>;
 
@@ -284,7 +282,7 @@ pub(super) async fn create_session(
             // Controller ruling 1 (M2 pre-flight audit): helpers run only
             // through the companion that delegates to them.
             Some(runtime) if crate::agent_runs::is_helper_config(runtime.config()) => {
-                return rejected(ApiError::conflict(HELPER_SESSION_CONFLICT));
+                return rejected(ApiError::conflict(HELPER_MUST_RUN_THROUGH_COMPANION));
             }
             Some(_) => {}
         }
@@ -450,6 +448,17 @@ pub(super) async fn delete_session(
     let deletion = HistoryDeletion::session(&agent_id, &session_id);
     let (previous_agent, record, removed_runs, removed_ids, persist) = {
         let mut guard = state.daemon.write().await;
+        // Re-checked under the transaction, not just in the fast-path check
+        // above (fix round 1, M2 review): a concurrent change -- for example
+        // a check-in's schedule being deleted and then restored -- must not
+        // let a delete proceed, or be refused, on stale capabilities.
+        let Some(record) = guard.sessions.get(&agent_id, &session_id) else {
+            return rejected(ApiError::not_found());
+        };
+        let schedule_exists = views::automation_exists(&guard, record);
+        if !record.capabilities(schedule_exists).delete {
+            return rejected(ApiError::conflict("This session cannot be deleted"));
+        }
         if guard.runs.active_count_for_session(&agent_id, &session_id) > 0 {
             return rejected(ApiError::conflict(SESSION_RUN_IN_PROGRESS));
         }
@@ -507,7 +516,7 @@ pub(super) async fn delete_session(
 #[utoipa::path(get, path = "/api/agents/{agent_id}/sessions/{session_id}/export", tag = "sessions",
     params(("agent_id" = String, Path), ("session_id" = String, Path, description = "Percent-encoded session id")),
     responses(
-        (status = 200, description = "The visible transcript, including messages kept only in the history store", body = String, content_type = "text/markdown"),
+        (status = 200, description = "The full transcript, including messages kept only in the history store, with silent check-in turns marked rather than hidden", body = String, content_type = "text/markdown"),
         (status = 403, description = "Local owner required", body = ErrorBody),
         (status = 404, description = "Agent or session not found", body = ErrorBody),
         (status = 503, description = "The history store cannot be read", body = ErrorBody)

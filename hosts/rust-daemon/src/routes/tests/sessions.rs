@@ -7,6 +7,62 @@ use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
 
 const OWNER_ORIGIN: &str = "http://localhost:4200";
 
+/// A model adapter that blocks in `generate` until released, signaling entry
+/// first -- lets a test hold a run's room lock open (same pattern as
+/// `routes::agents::tests::PendingModelAdapter`, not reusable across those
+/// two test modules).
+struct PendingModelAdapter {
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl ModelAdapter for PendingModelAdapter {
+    fn provider(&self) -> &str {
+        "pending"
+    }
+
+    async fn generate(
+        &self,
+        config: &AgentConfig,
+        _request: &ModelGenerateRequest,
+    ) -> Result<ModelGenerateResponse, String> {
+        self.entered.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("release semaphore should remain open")
+            .forget();
+        Ok(ModelGenerateResponse {
+            content: Content {
+                text: format!("{} handled task: pending", config.name),
+                attachments: None,
+                metadata: None,
+            },
+            tool_calls: None,
+            usage: TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                ..TokenUsage::default()
+            },
+            stop_reason: ModelStopReason::End,
+        })
+    }
+}
+
+fn pending_adapter() -> (Arc<dyn ModelAdapter>, Arc<Semaphore>, Arc<Semaphore>) {
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    (
+        Arc::new(PendingModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }),
+        entered,
+        release,
+    )
+}
+
 fn get(uri: &str, origin: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
@@ -367,6 +423,19 @@ fn send(method: &str, uri: &str, origin: &str, body: serde_json::Value) -> Reque
         .unwrap()
 }
 
+/// A path a JSON control-plane save cannot write to: a directory where the
+/// store expects a file (same trick as `connectors::runtime::tests::
+/// invalid_snapshot_directory`, not reusable across those two test modules).
+fn invalid_snapshot_directory(label: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "anima-session-route-{label}-invalid-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
 #[tokio::test]
 async fn session_mutations_and_export_require_the_owner() {
     let (app, _, agent) = app_with_session().await;
@@ -531,6 +600,48 @@ async fn creating_a_chat_saves_it_returns_201_and_is_rate_limited() {
 }
 
 #[tokio::test]
+async fn a_failed_save_leaves_no_new_chat_behind() {
+    // Minor 4 (fix round 1, M2 review): create's rollback was untested.
+    use crate::control_plane_store::ControlPlaneStoreConfig;
+
+    let (app, state, agent) = app_with_session().await;
+    let invalid_path = invalid_snapshot_directory("session-create");
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(ControlPlaneStoreConfig::Json(invalid_path.clone())));
+
+    let response = app
+        .clone()
+        .oneshot(send(
+            "POST",
+            &format!("/api/agents/{agent}/sessions"),
+            OWNER_ORIGIN,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+
+    let ids = state
+        .read()
+        .await
+        .sessions
+        .records()
+        .filter(|record| record.agent_id == agent)
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        ["chat:plans"],
+        "the failed create's session was rolled back"
+    );
+
+    std::fs::remove_dir_all(invalid_path).unwrap();
+}
+
+#[tokio::test]
 async fn patching_renames_archives_and_marks_a_session_read() {
     let (app, state, agent) = app_with_session().await;
     state.write().await.sessions.insert(SessionRecord::new(
@@ -628,7 +739,55 @@ async fn patching_renames_archives_and_marks_a_session_read() {
 }
 
 #[tokio::test]
+async fn a_failed_save_restores_the_previous_record_on_patch() {
+    // Minor 4 (fix round 1, M2 review): PATCH's rollback was untested.
+    use crate::control_plane_store::ControlPlaneStoreConfig;
+
+    let (app, state, agent) = app_with_session().await;
+    let invalid_path = invalid_snapshot_directory("session-patch");
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(ControlPlaneStoreConfig::Json(invalid_path.clone())));
+
+    let response = app
+        .clone()
+        .oneshot(send(
+            "PATCH",
+            &format!("/api/agents/{agent}/sessions/chat%3Aplans"),
+            OWNER_ORIGIN,
+            serde_json::json!({"title": "Renamed", "archived": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+
+    let record = state
+        .read()
+        .await
+        .sessions
+        .get(&agent, "chat:plans")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        record.title, "Plans",
+        "the previous record is restored, not the failed rename"
+    );
+    assert_eq!(record.title_source, TitleSource::FirstMessage);
+    assert!(!record.archived, "the failed archive did not stick either");
+
+    std::fs::remove_dir_all(invalid_path).unwrap();
+}
+
+#[tokio::test]
 async fn deleting_a_chat_removes_its_record_messages_and_history_rows() {
+    // Important 2's success case (fix round 1, M2 review): a real JSON
+    // control-plane store, so the *saved* snapshot -- not just in-memory
+    // state -- is asserted to hold the session's `HistoryDeletion` and none
+    // of its runs.
+    use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+
     let (app, state, agent) = app_with_session().await;
     seed_messages(
         &mut *state.write().await,
@@ -642,12 +801,61 @@ async fn deleting_a_chat_removes_its_record_messages_and_history_rows() {
             3,
         )],
     );
+    let run_id = {
+        let mut guard = state.write().await;
+        let mut run = crate::runs::RunRecord::running(
+            crate::runs::RunStart {
+                agent_id: agent.clone(),
+                session_id: "chat:plans".into(),
+                source: crate::runs::RunSource::Api,
+                source_ref: None,
+                idempotency_key: None,
+                text: "done already".into(),
+                model: "gpt-5.4".into(),
+                provider: None,
+                parent_run_id: None,
+            },
+            1,
+        );
+        run.finish(crate::runs::RunStatus::Completed, None, 1);
+        let id = run.id.clone();
+        guard.runs.insert(run);
+        id
+    };
     let history = state.read().await.history.clone();
     history
         .flush_once(&state, &tokio::sync::Mutex::new(()), 10)
         .await
         .unwrap();
+    // Minor 7 (fix round 1, M2 review): confirm `chat:plans`'s rows are
+    // really mirrored before deleting, not just that they are absent
+    // afterward (which would also be true if they had never been mirrored).
+    let mirrored_before_delete = history
+        .store()
+        .page_messages(&crate::history::MessagePageQuery {
+            agent_id: agent.clone(),
+            session_id: "chat:plans".into(),
+            before: None,
+            limit: 10,
+            include_hidden: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        mirrored_before_delete.len(),
+        2,
+        "chat:plans's messages are mirrored before the delete"
+    );
     let session = format!("/api/agents/{agent}/sessions/chat%3Aplans");
+    let path = std::env::temp_dir().join(format!(
+        "anima-session-delete-durable-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let store = ControlPlaneStoreConfig::Json(path.clone());
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(store.clone()));
 
     let response = app
         .clone()
@@ -674,7 +882,23 @@ async fn deleting_a_chat_removes_its_record_messages_and_history_rows() {
             .map(|message| message.room_id)
             .collect::<Vec<_>>();
         assert_eq!(rooms, ["chat:keep"], "other rooms keep their messages");
+        assert!(
+            guard.runs.get(&run_id).is_none(),
+            "the session's terminal run leaves the ledger"
+        );
     }
+    let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+    assert!(
+        saved.pending_history_deletions.iter().any(|deletion| {
+            deletion.agent_id == agent && deletion.session_id.as_deref() == Some("chat:plans")
+        }),
+        "the saved snapshot records the session's deletion"
+    );
+    assert!(
+        saved.runs.iter().all(|run| run.session_id != "chat:plans"),
+        "the saved snapshot holds none of the session's runs"
+    );
+
     history
         .flush_once(&state, &tokio::sync::Mutex::new(()), 11)
         .await
@@ -691,12 +915,98 @@ async fn deleting_a_chat_removes_its_record_messages_and_history_rows() {
         .await
         .unwrap();
     assert!(rows.is_empty(), "the history rows are deleted too");
+    assert_eq!(
+        history.store().get_run(&run_id).await.unwrap(),
+        None,
+        "the deleted session's run is never mirrored"
+    );
+    assert!(state.read().await.pending_history_deletions.is_empty());
     let response = app
         .clone()
         .oneshot(get(&session, OWNER_ORIGIN))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_failed_delete_save_restores_the_record_messages_and_runs() {
+    // Important 2 (fix round 1, M2 review): the durable protocol and its
+    // rollback were untested. If `clear_history_deletion` regressed, nothing
+    // here would fail and a restart would replay a deletion of a session
+    // that is, in fact, still there -- data loss.
+    use crate::control_plane_store::ControlPlaneStoreConfig;
+
+    let (app, state, agent) = app_with_session().await;
+    let run_id = {
+        let mut guard = state.write().await;
+        let mut run = crate::runs::RunRecord::running(
+            crate::runs::RunStart {
+                agent_id: agent.clone(),
+                session_id: "chat:plans".into(),
+                source: crate::runs::RunSource::Api,
+                source_ref: None,
+                idempotency_key: None,
+                text: "done already".into(),
+                model: "gpt-5.4".into(),
+                provider: None,
+                parent_run_id: None,
+            },
+            1,
+        );
+        run.finish(crate::runs::RunStatus::Completed, None, 1);
+        let id = run.id.clone();
+        guard.runs.insert(run);
+        id
+    };
+    let invalid_path = invalid_snapshot_directory("session-delete");
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(ControlPlaneStoreConfig::Json(invalid_path.clone())));
+
+    let response = app
+        .clone()
+        .oneshot(send(
+            "DELETE",
+            &format!("/api/agents/{agent}/sessions/chat%3Aplans"),
+            OWNER_ORIGIN,
+            serde_json::Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+
+    let guard = state.read().await;
+    assert!(
+        guard.sessions.get(&agent, "chat:plans").is_some(),
+        "the record is restored"
+    );
+    let message_ids = guard
+        .get_agent(&agent)
+        .unwrap()
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        message_ids,
+        ["m1", "m2"],
+        "the room's hot messages are restored"
+    );
+    assert!(
+        guard.runs.get(&run_id).is_some(),
+        "the session's terminal run is restored"
+    );
+    assert!(
+        guard.pending_history_deletions.is_empty(),
+        "a failed save leaves no pending entry"
+    );
+    drop(guard);
+
+    std::fs::remove_dir_all(invalid_path).unwrap();
 }
 
 #[tokio::test]
@@ -755,6 +1065,97 @@ async fn deleting_is_refused_by_kind_and_while_a_run_is_active() {
         .sessions
         .get(&agent, "chat:plans")
         .is_some());
+}
+
+#[tokio::test]
+async fn deleting_a_session_whose_room_a_run_holds_is_refused_then_succeeds() {
+    // Minor 2 (fix round 1, M2 review): `try_reserve_room`'s refusal branch
+    // was never exercised -- the test above only inserts a `RunRecord`
+    // directly, without ever taking the room's real lock, so it only reaches
+    // the ledger recheck, not `try_reserve_room` itself.
+    let (adapter, entered, release) = pending_adapter();
+    let mut daemon = DaemonState::with_model_adapter(adapter);
+    let agent = daemon
+        .create_agent(test_config("companion"))
+        .unwrap()
+        .state
+        .id;
+    daemon.sessions.insert(SessionRecord::new(
+        &agent,
+        "chat:held",
+        SessionKind::Chat,
+        SessionOrigin::Web,
+        "Held".into(),
+        TitleSource::FirstMessage,
+        1,
+    ));
+    let state = Arc::new(RwLock::new(daemon));
+    let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+    let app = custom_router(Arc::clone(&state), runs.clone(), DaemonConfig::default());
+
+    let held = {
+        let runs = runs.clone();
+        let agent_id = agent.clone();
+        tokio::spawn(async move {
+            runs.run(crate::agent_runs::AgentRunRequest {
+                agent_id,
+                content: Content {
+                    text: "hold the room".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                room: crate::agent_runs::RunRoom::Stable("chat:held".into()),
+                idempotency_key: None,
+                source: crate::runs::RunSource::Web,
+                source_ref: None,
+                parent: None,
+            })
+            .await
+        })
+    };
+    entered.acquire().await.unwrap().forget();
+
+    assert!(
+        runs.try_reserve_room(&agent, "chat:held").is_none(),
+        "the room's lock is held by the in-flight run"
+    );
+    let session = format!("/api/agents/{agent}/sessions/chat%3Aheld");
+    let response = app
+        .clone()
+        .oneshot(send(
+            "DELETE",
+            &session,
+            OWNER_ORIGIN,
+            serde_json::Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        json(response).await["error"],
+        "A run in this session is still in progress"
+    );
+
+    release.add_permits(1);
+    held.await
+        .expect("the held run should join")
+        .expect("the held run should finish");
+
+    let response = app
+        .oneshot(send(
+            "DELETE",
+            &session,
+            OWNER_ORIGIN,
+            serde_json::Value::Null,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the room is free once the run finishes"
+    );
 }
 
 #[tokio::test]
@@ -821,6 +1222,49 @@ async fn exporting_a_session_returns_its_full_markdown_transcript() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn exporting_a_session_with_an_unreadable_store_answers_service_unavailable() {
+    // Minor 3 (fix round 1, M2 review): the export's 503 string was unasserted.
+    use crate::history::conformance::FlakyHistoryStore;
+    use crate::history::HistoryService;
+
+    let flaky = Arc::new(FlakyHistoryStore::new());
+    let mut daemon = DaemonState::new();
+    daemon.set_history(HistoryService::new(flaky.clone()));
+    let agent = daemon
+        .create_agent(test_config("companion"))
+        .unwrap()
+        .state
+        .id;
+    daemon.sessions.insert(SessionRecord::new(
+        &agent,
+        "chat:plans",
+        SessionKind::Chat,
+        SessionOrigin::Web,
+        "Plans".into(),
+        TitleSource::FirstMessage,
+        1,
+    ));
+    let state = Arc::new(RwLock::new(daemon));
+    let app = router(state, DaemonConfig::default());
+    flaky.set_failing(true);
+
+    let response = app
+        .oneshot(get(
+            &format!("/api/agents/{agent}/sessions/chat%3Aplans/export"),
+            OWNER_ORIGIN,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        json(response).await["error"],
+        "history store is unavailable"
+    );
 }
 
 #[test]
