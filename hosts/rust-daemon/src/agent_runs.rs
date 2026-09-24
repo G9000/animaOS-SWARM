@@ -45,7 +45,7 @@ pub(crate) fn config_helper_parent(config: &AgentConfig) -> Option<&str> {
     }
 }
 
-fn is_helper_config(config: &AgentConfig) -> bool {
+pub(crate) fn is_helper_config(config: &AgentConfig) -> bool {
     config
         .settings
         .as_ref()

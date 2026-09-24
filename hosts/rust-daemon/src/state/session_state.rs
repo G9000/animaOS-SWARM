@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 
 use anima_core::AgentConfigUpdate;
+use tracing::warn;
 
 use super::DaemonState;
-use crate::agent_runs::config_helper_parent;
+use crate::agent_runs::is_helper_config;
 use crate::sessions::migration::{
     derive_sessions_for_legacy_rooms, LegacyAgent, LegacySessionContext, ToolGrantSet,
 };
@@ -50,7 +51,7 @@ impl DaemonState {
             }
             for (agent_id, runtime) in self.agents.iter_mut() {
                 let config = runtime.config();
-                if config_helper_parent(config).is_some() {
+                if is_helper_config(config) {
                     continue;
                 }
                 let Some(current) = config.tools.as_ref() else {
@@ -77,10 +78,18 @@ impl DaemonState {
                 if !added {
                     continue;
                 }
-                let tools = self
-                    .tool_registry
-                    .resolve_descriptors(names)
-                    .expect("only registered tools are granted");
+                let tools = match self.tool_registry.resolve_descriptors(names) {
+                    Ok(tools) => tools,
+                    Err(error) => {
+                        warn!(
+                            agent_id = %agent_id,
+                            grant_id = grant.id,
+                            error = %error,
+                            "skipping tool grant: a previously granted tool is no longer registered"
+                        );
+                        continue;
+                    }
+                };
                 runtime.update_config(AgentConfigUpdate {
                     tools: Some(tools),
                     ..AgentConfigUpdate::default()
