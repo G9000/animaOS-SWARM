@@ -4400,6 +4400,57 @@ mod tests {
             .is_none());
     }
 
+    /// Pins the `if session_created` guard at `agent_runs.rs`'s run-start
+    /// failure branch: a second run's failed start save in a room that
+    /// already has a session must leave that pre-existing record untouched.
+    #[tokio::test]
+    async fn a_failed_start_save_does_not_remove_a_session_it_did_not_create() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+
+        coordinator
+            .run(room_request(&agent_id, "chat:reused", "first turn"))
+            .await
+            .expect("the first run commits and creates the session");
+        let original = coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:reused")
+            .cloned()
+            .expect("the session exists after the first run");
+
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+        coordinator
+            .run(room_request(&agent_id, "chat:reused", "second turn"))
+            .await
+            .expect_err("the second run's start save failed");
+
+        let after = coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:reused")
+            .cloned()
+            .expect("a session this run did not create must survive its failed start save");
+        assert_eq!(
+            after, original,
+            "a failed start save must not touch a session it found rather than created"
+        );
+    }
+
     #[tokio::test]
     async fn a_rolled_back_commit_restores_the_session_it_advanced() {
         let entered = Arc::new(Semaphore::new(0));
@@ -4498,6 +4549,10 @@ mod tests {
         );
         assert_eq!(helper.parent_agent_id.as_deref(), Some(manager.id.as_str()));
         assert_eq!(helper.title, "Draft a content plan");
+        assert_eq!(
+            helper.last_read_at_ms, None,
+            "a delegated run is not the owner's own turn"
+        );
         let chat = guard
             .sessions
             .get(&manager.id, &manager_run.session_id)
@@ -4596,16 +4651,19 @@ mod tests {
         assert_eq!(session.parent_agent_id.as_deref(), Some(sender.as_str()));
         assert_eq!(session.parent_run_id, None);
         assert_eq!(session.title, "Messages from operator");
+        assert_eq!(
+            session.last_read_at_ms, None,
+            "a peer request is not the owner's own turn"
+        );
     }
 
-    /// Controller ruling from the pre-flight audit: a calendar write's own
-    /// confirmation follow-up (`RunRoom::Generated`, source `api`, `sourceRef
-    /// = calendar-write:<id>`) creates a session titled `system`, and that
-    /// follow-up is not the owner's own turn, so the session stays unread.
+    /// The `is_owner_web_turn` branch of `commit_run`'s `owner_authored`
+    /// (`run_commit.rs`): a Telegram owner turn sent from the web console
+    /// runs with `source: telegram`, not `api`/`web`, but its message
+    /// metadata marks it as the owner's own turn (mirrors
+    /// `connectors::runtime::send_from_owner_owned`).
     #[tokio::test]
-    async fn a_calendar_write_followup_gets_a_system_titled_session_that_is_not_owner_read() {
-        use crate::sessions::TitleSource;
-
+    async fn a_telegram_owner_turn_sent_from_the_web_marks_the_session_read() {
         let (coordinator, agent_id) = coordinator_with_agent(
             Arc::new(CapturingModelAdapter {
                 requests: Arc::new(StdMutex::new(Vec::new())),
@@ -4618,13 +4676,108 @@ mod tests {
             .run(AgentRunRequest {
                 agent_id: agent_id.clone(),
                 content: Content {
-                    text: "Calendar change confirmed and applied: Team sync. Continue the conversation accordingly.".into(),
+                    text: "sent from the web console".into(),
+                    metadata: Some(BTreeMap::from([
+                        ("source".into(), DataValue::String("telegramThread".into())),
+                        ("connectorId".into(), DataValue::String("conn-1".into())),
+                    ])),
+                    attachments: None,
+                },
+                room: RunRoom::Stable("telegram:conn-1".into()),
+                idempotency_key: None,
+                source: RunSource::Telegram,
+                source_ref: Some("conn-1".into()),
+                parent: None,
+            })
+            .await
+            .expect("the owner's web-sent telegram turn runs");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&agent_id, "telegram:conn-1")
+            .expect("the telegram room is a session");
+        let messages = guard.get_agent(&agent_id).unwrap().messages;
+        assert_eq!(
+            session.last_read_at_ms,
+            Some(messages[0].created_at_ms),
+            "a telegram-thread turn sent from the web is the owner's own turn even though the run's source is telegram, not api or web"
+        );
+    }
+
+    /// A schedule-triggered run's source is neither `api` nor `web`, and its
+    /// check-in prompt carries no `telegramThread` metadata, so it is not the
+    /// owner's own turn either.
+    #[tokio::test]
+    async fn a_schedule_triggered_run_does_not_mark_its_session_owner_read() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+
+        coordinator
+            .run(AgentRunRequest {
+                agent_id: agent_id.clone(),
+                content: Content {
+                    text: "checkin: how is it going?".into(),
                     ..Content::default()
                 },
+                room: RunRoom::Stable("schedule:sched-1".into()),
+                idempotency_key: None,
+                source: RunSource::Schedule,
+                source_ref: Some("sched-1".into()),
+                parent: None,
+            })
+            .await
+            .expect("the scheduled run commits");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&agent_id, "schedule:sched-1")
+            .expect("the schedule room is a session");
+        assert_eq!(
+            session.last_read_at_ms, None,
+            "a scheduled check-in is not the owner's own turn"
+        );
+    }
+
+    /// Controller ruling (M2 pre-flight audit): a calendar write's own
+    /// confirmation follow-up (`RunRoom::Generated`, source `api`, `sourceRef
+    /// = calendar-write:<id>`) creates a session titled `system` from the
+    /// write's own summary, and that follow-up is not the owner's own turn,
+    /// so the session stays unread.
+    #[tokio::test]
+    async fn a_calendar_write_followup_gets_a_system_titled_session_that_is_not_owner_read() {
+        use crate::sessions::TitleSource;
+
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let reference = format!("{}evt-1", crate::sessions::CALENDAR_WRITE_SOURCE_REF_PREFIX);
+
+        coordinator
+            .run(AgentRunRequest {
+                agent_id: agent_id.clone(),
+                content: Content {
+                    text: "Calendar change confirmed and applied: Team sync. Continue the conversation accordingly.".into(),
+                    metadata: Some(BTreeMap::from([(
+                        crate::sessions::CALENDAR_SUMMARY_METADATA_KEY.into(),
+                        DataValue::String("Team sync".into()),
+                    )])),
+                    attachments: None,
+                },
                 room: RunRoom::Generated,
-                idempotency_key: Some("calendar-write:evt-1".into()),
+                idempotency_key: Some(reference.clone()),
                 source: RunSource::Api,
-                source_ref: Some("calendar-write:evt-1".into()),
+                source_ref: Some(reference),
                 parent: None,
             })
             .await
@@ -4636,10 +4789,190 @@ mod tests {
             .sessions
             .get(&agent_id, &run.session_id)
             .expect("the calendar follow-up room is a session");
+        assert_eq!(session.title, "Calendar · Team sync");
         assert_eq!(session.title_source, TitleSource::System);
         assert_eq!(
             session.last_read_at_ms, None,
             "a calendar write follow-up is not the owner's own turn"
         );
+    }
+
+    /// A room id that is not a valid session id (spec §3.1) still runs; the
+    /// ledger record, the session record, and the history outbox all key off
+    /// the same `legacy-room:<hash>` id instead of the raw room.
+    #[tokio::test]
+    async fn an_invalid_room_id_maps_the_ledger_session_and_outbox_to_the_same_legacy_id() {
+        use crate::history::{HistoryService, HistoryStore, MemoryHistoryStore, MessagePageQuery};
+
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let store = Arc::new(MemoryHistoryStore::new());
+        let history = HistoryService::new(store.clone());
+        coordinator
+            .state
+            .write()
+            .await
+            .set_history(Arc::clone(&history));
+        let transactions = coordinator.control_plane_transactions();
+        let raw_room = "weird room/1";
+        let legacy_id = crate::sessions::session_id_for_room(raw_room);
+        assert_ne!(
+            legacy_id, raw_room,
+            "the raw room id is not a valid session id"
+        );
+
+        coordinator
+            .run(room_request(
+                &agent_id,
+                raw_room,
+                "hello from a legacy room",
+            ))
+            .await
+            .expect("an invalid room id still runs, mapped through its legacy hash");
+
+        let guard = coordinator.state.read().await;
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(
+            run.session_id, legacy_id,
+            "the ledger record uses the legacy session id"
+        );
+        let session = guard
+            .sessions
+            .get(&agent_id, &legacy_id)
+            .expect("the session is keyed by the legacy id");
+        assert_eq!(
+            session.room_id(),
+            raw_room,
+            "the session still remembers the real transcript room"
+        );
+        drop(guard);
+
+        history
+            .flush_once(
+                &coordinator.state,
+                &transactions,
+                anima_core::primitives::now_millis(),
+            )
+            .await
+            .expect("the flush succeeds");
+        let page = store
+            .page_messages(&MessagePageQuery {
+                agent_id: agent_id.clone(),
+                session_id: legacy_id,
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .expect("the store can be queried");
+        assert!(
+            !page.is_empty(),
+            "the outbox queued the turn under the legacy session id"
+        );
+    }
+
+    /// `tools/team.rs::spawn_helper` passes `context.run_link.clone()`
+    /// through to `AgentRunCoordinator::spawn_helper`; this drives it through
+    /// the actual tool call (unlike `spawned_helpers_record_the_companion_run_that_started_them`,
+    /// which calls the coordinator method directly), so the helper session's
+    /// parent fields must match the companion's own run and session, not
+    /// just its `parentAgentId` config fallback.
+    #[tokio::test]
+    async fn spawn_helper_through_the_tool_path_links_the_helper_session_to_the_companion_run() {
+        let adapter = Arc::new(HelperModelAdapter {
+            configs: StdMutex::new(vec![]),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(3)));
+        let lead = helper_lead(&coordinator).await;
+
+        coordinator
+            .run(request(&lead.id, "Ask a helper to check facts"))
+            .await
+            .expect("the companion's run, including its spawn_helper tool call, commits");
+
+        let guard = state.read().await;
+        let lead_run = guard.runs.for_agent(&lead.id)[0].clone();
+        let helper = guard
+            .list_agents()
+            .into_iter()
+            .find(|agent| agent.state.id != lead.id)
+            .expect("a helper was created");
+        let helper_run = guard.runs.for_agent(&helper.state.id)[0].clone();
+        assert_eq!(
+            helper_run.parent_run_id.as_deref(),
+            Some(lead_run.id.as_str()),
+            "the run-link passed through the spawn_helper tool call"
+        );
+        let session = guard
+            .sessions
+            .get(&helper.state.id, &helper_run.session_id)
+            .expect("the helper room is a session");
+        assert_eq!(session.parent_run_id.as_deref(), Some(lead_run.id.as_str()));
+        assert_eq!(
+            session.parent_session_id.as_deref(),
+            Some(lead_run.session_id.as_str())
+        );
+        assert_eq!(session.parent_agent_id.as_deref(), Some(lead.id.as_str()));
+    }
+
+    /// `tools/team.rs::send_message` also passes `context.run_link.clone()`
+    /// through; this existing end-to-end test already drives a `send_message`
+    /// tool call (Alice asking Bob for a review), so the assertion is cheap
+    /// to add here rather than duplicating the whole fixture.
+    #[tokio::test]
+    async fn send_message_through_the_tool_path_links_the_peer_session_to_the_calling_run() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            PeerModelAdapter,
+        ))));
+        let alice = state
+            .write()
+            .await
+            .create_agent(test_config("Alice"))
+            .unwrap()
+            .state;
+        state
+            .write()
+            .await
+            .create_agent(test_config("Bob"))
+            .unwrap();
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(4)));
+        let mut direct = request(&alice.id, "Ask Bob for a review");
+        direct.room = RunRoom::Stable(format!("direct:{}", alice.id));
+
+        coordinator
+            .run(direct)
+            .await
+            .expect("alice's run, including its send_message tool call, commits");
+
+        let guard = state.read().await;
+        let alice_run = guard.runs.for_agent(&alice.id)[0].clone();
+        let bob = guard
+            .list_agents()
+            .into_iter()
+            .find(|agent| agent.state.name == "Bob")
+            .expect("bob exists");
+        let bob_run = guard.runs.for_agent(&bob.state.id)[0].clone();
+        assert_eq!(
+            bob_run.parent_run_id.as_deref(),
+            Some(alice_run.id.as_str()),
+            "the run-link passed through the send_message tool call"
+        );
+        let session = guard
+            .sessions
+            .get(&bob.state.id, &bob_run.session_id)
+            .expect("the peer room is a session");
+        assert_eq!(
+            session.parent_run_id.as_deref(),
+            Some(alice_run.id.as_str())
+        );
+        assert_eq!(session.parent_agent_id.as_deref(), Some(alice.id.as_str()));
     }
 }
