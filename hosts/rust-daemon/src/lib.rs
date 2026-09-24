@@ -12,6 +12,7 @@ mod routes;
 mod runs;
 mod runtime_model;
 mod schedules;
+mod sessions;
 mod state;
 mod tools;
 

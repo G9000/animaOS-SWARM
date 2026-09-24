@@ -1189,6 +1189,79 @@ mod tests {
         assert_eq!(restored.runs.get(&completed.id), Some(&completed));
         assert_eq!(restored.in_flight_runs(&agent_id), 0);
     }
+
+    #[test]
+    fn session_records_are_saved_for_live_agents_and_restored() {
+        use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("session-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let chat = SessionRecord::new(
+            &agent_id,
+            "chat:one",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Plans".into(),
+            TitleSource::Owner,
+            10,
+        );
+        let orphan = SessionRecord::new(
+            "agent-deleted",
+            "chat:two",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Gone".into(),
+            TitleSource::Owner,
+            11,
+        );
+        source.sessions.insert(chat.clone());
+        source.sessions.insert(orphan);
+
+        let snapshot = source.control_plane_snapshot();
+        assert_eq!(snapshot.sessions, vec![chat.clone()], "sessions of deleted agents are not saved");
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("sessions should restore");
+        assert_eq!(restored.sessions.get(&agent_id, "chat:one"), Some(&chat));
+        assert_eq!(restored.sessions.len(), 1);
+    }
+
+    #[test]
+    fn restore_rejects_an_invalid_session_record_without_mutation() {
+        use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("session-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let mut snapshot = source.control_plane_snapshot();
+        let mut record = SessionRecord::new(
+            &agent_id,
+            "chat:one",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Plans".into(),
+            TitleSource::Owner,
+            10,
+        );
+        record.id = "bad id".into();
+        snapshot.sessions.push(record);
+
+        let mut state = DaemonState::new();
+        assert!(state.restore_control_plane_snapshot(snapshot).is_err());
+        assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
+        assert_eq!(state.sessions.len(), 0);
+    }
 }
 
 const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
@@ -1261,6 +1334,7 @@ pub(crate) struct DaemonState {
     pub(crate) jobs: HashMap<String, crate::jobs::AgentJobRecord>,
     pub(crate) goals: HashMap<String, crate::jobs::GoalRecord>,
     pub(crate) runs: crate::runs::RunLedger,
+    pub(crate) sessions: crate::sessions::SessionRegistry,
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
     pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
     calendar_manager: Option<CalendarManager>,
@@ -1410,6 +1484,7 @@ impl DaemonState {
             jobs: HashMap::new(),
             goals: HashMap::new(),
             runs: crate::runs::RunLedger::default(),
+            sessions: crate::sessions::SessionRegistry::default(),
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
             calendar_manager: None,
@@ -1563,6 +1638,7 @@ impl DaemonState {
         snapshot.goals = self.goals.values().cloned().collect();
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
+        snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
         snapshot
     }
 
@@ -1657,6 +1733,10 @@ impl DaemonState {
             .map(|write| (write.id.clone(), write))
             .collect();
 
+        self.sessions = crate::sessions::SessionRegistry::restored(
+            snapshot.sessions,
+            &self.live_agent_ids(),
+        );
         self.runs = crate::runs::RunLedger::restored(
             snapshot.runs,
             &self.live_agent_ids(),
@@ -1723,6 +1803,7 @@ impl DaemonState {
             }
         }
         crate::runs::RunLedger::validate(&snapshot.runs)?;
+        crate::sessions::SessionRegistry::validate(&snapshot.sessions)?;
         let mut swarm_ids = HashSet::new();
         for swarm in &snapshot.swarms {
             let swarm_id = &swarm.state.id;

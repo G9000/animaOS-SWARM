@@ -822,6 +822,13 @@ pub(crate) fn legacy_next_due_at_ms(
 pub(crate) fn wrap_checkin_prompt(prompt: &str) -> String {
     format!("{}\n\n{}", prompt.trim(), CHECKIN_SUFFIX)
 }
+/// The owner's prompt inside a wrapped check-in input.
+pub(crate) fn unwrap_checkin_prompt(text: &str) -> &str {
+    text.strip_suffix(CHECKIN_SUFFIX)
+        .map(str::trim_end)
+        .unwrap_or(text)
+        .trim()
+}
 pub(crate) fn is_silent_checkin_reply(reply: &str) -> bool {
     reply.trim() == CHECKIN_SENTINEL
 }

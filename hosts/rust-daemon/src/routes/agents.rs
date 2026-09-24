@@ -14,9 +14,17 @@ use crate::state::UpdateAgentError;
 pub(crate) const AGENT_BUSY_MESSAGE: &str =
     "Agent has a run in progress; wait for it to finish before deleting it";
 
-/// Rooms owned by connectors, automations, jobs, and agent-to-agent requests;
-/// the generic run route may not write into them (spec §3.1).
-const RESERVED_ROOM_PREFIXES: [&str; 4] = ["telegram:", "schedule:", "job:", "peer:"];
+/// Rooms owned by connectors, automations, jobs, agent-to-agent requests, and
+/// mapped legacy sessions; the generic run route may not write into them, so
+/// a client `roomId` can never alias a mapped `legacy-room:<hash>` session id
+/// (spec §3.1).
+const RESERVED_ROOM_PREFIXES: [&str; 5] = [
+    "telegram:",
+    "schedule:",
+    "job:",
+    "peer:",
+    crate::sessions::LEGACY_ROOM_SESSION_PREFIX,
+];
 
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
@@ -880,6 +888,7 @@ mod tests {
             "schedule:schedule-1",
             "job:job-1",
             "peer:alice:bob",
+            "legacy-room:abc",
         ] {
             let body = serde_json::json!({"text": "hello", "roomId": room})
                 .to_string()

@@ -92,6 +92,8 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) workspace: Option<WorkspaceConfig>,
     #[serde(default)]
     pub(crate) runs: Vec<crate::runs::RunRecord>,
+    #[serde(default)]
+    pub(crate) sessions: Vec<crate::sessions::SessionRecord>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -319,6 +321,7 @@ impl ControlPlaneSnapshot {
             calendar_writes: vec![],
             workspace: None,
             runs: vec![],
+            sessions: vec![],
         }
     }
 }
@@ -453,6 +456,7 @@ mod tests {
         assert_eq!(payload["outbound"], serde_json::json!([]));
         assert_eq!(payload["schedules"], serde_json::json!([]));
         assert_eq!(payload["runs"], serde_json::json!([]));
+        assert_eq!(payload["sessions"], serde_json::json!([]));
     }
 
     #[test]
