@@ -5,10 +5,13 @@
 #[cfg(test)]
 pub(crate) mod conformance;
 mod memory;
+mod postgres;
 mod sqlite;
 
 #[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
 pub(crate) use memory::MemoryHistoryStore;
+#[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
+pub(crate) use postgres::PostgresHistoryStore;
 #[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
 pub(crate) use sqlite::SqliteHistoryStore;
 
