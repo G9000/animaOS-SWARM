@@ -335,14 +335,19 @@ impl RunLedger {
         }
     }
 
-    /// Terminal runs of live agents the history store does not hold yet,
-    /// oldest finished first.
+    /// Terminal runs of live agents the history store does not hold yet, the
+    /// `limit` oldest finished first. Only the returned records are cloned.
     pub(crate) fn unmirrored_terminal(
         &self,
         live_agents: &HashSet<String>,
         limit: usize,
     ) -> Vec<RunRecord> {
-        let mut records = self
+        let oldest_first = |left: &&RunRecord, right: &&RunRecord| {
+            left.finished_at_ms
+                .cmp(&right.finished_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        };
+        let mut pending = self
             .records
             .values()
             .filter(|record| {
@@ -350,15 +355,13 @@ impl RunLedger {
                     && !record.mirrored
                     && live_agents.contains(&record.agent_id)
             })
-            .cloned()
             .collect::<Vec<_>>();
-        records.sort_by(|left, right| {
-            left.finished_at_ms
-                .cmp(&right.finished_at_ms)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        records.truncate(limit);
-        records
+        if pending.len() > limit {
+            pending.select_nth_unstable_by(limit, oldest_first);
+            pending.truncate(limit);
+        }
+        pending.sort_unstable_by(oldest_first);
+        pending.into_iter().cloned().collect()
     }
 
     /// Marks written runs mirrored, but only where the ledger still holds
@@ -719,7 +722,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             [older.id.as_str(), newer.id.as_str()]
         );
-        assert_eq!(ledger.unmirrored_terminal(&live, 1).len(), 1);
+        assert_eq!(
+            ledger
+                .unmirrored_terminal(&live, 1)
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            [older.id.as_str()],
+            "a limited batch holds the oldest runs"
+        );
+        assert!(ledger.unmirrored_terminal(&live, 0).is_empty());
 
         // `newer` changes after it was read (a rolled-back commit, say).
         ledger.get_mut(&newer.id).unwrap().finish(
