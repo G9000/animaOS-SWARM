@@ -229,6 +229,8 @@ export function ViewHarness() {
   const availableAgentIdsRef = useRef(new Set<string>());
   availableAgentIdsRef.current = new Set(agents.map((item) => item.id));
   const [route, navigate] = useHashRoute();
+  const routeRef = useRef(route);
+  routeRef.current = route;
   // A page hides the conversation but keeps it: the last chat or session stays loaded.
   const lastConversationRef = useRef<HashRoute>({ kind: 'home' });
   if (route.kind !== 'page') lastConversationRef.current = route;
@@ -823,7 +825,10 @@ export function ViewHarness() {
       };
     });
     sessions.upsert(session);
-    navigate({ kind: 'session', sessionId: session.id }, { replace: true });
+    const created: HashRoute = { kind: 'session', sessionId: session.id };
+    // A page opened meanwhile stays open; the new session waits behind it.
+    if (routeRef.current.kind === 'page') lastConversationRef.current = created;
+    else navigate(created, { replace: true });
     await runInSession(targetId, session, text, target, true);
   };
 
@@ -1108,6 +1113,7 @@ export function ViewHarness() {
           workspaceState={workspace}
           sidebar={sidebar}
           conversation={sessionView}
+          conversationRoute={conversationRoute}
         />
       </div>
       {settingsPanel}

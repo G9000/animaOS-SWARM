@@ -220,6 +220,7 @@ export function WorkspaceShell({
   route,
   navigate,
   conversation,
+  conversationRoute,
   sidebar = null,
   connectors = null,
   workspaceState = null,
@@ -235,6 +236,8 @@ export function WorkspaceShell({
   navigate: Navigate;
   /** The chat or session view; kept mounted so drafts and scroll survive page visits. */
   conversation: ReactNode;
+  /** The chat or session a page returns to; defaults to the last one visited. */
+  conversationRoute?: HashRoute;
   /** The sessions list for the desktop sidebar and the mobile drawer. */
   sidebar?: ReactNode | null;
   connectors?: ReactNode | null;
@@ -245,9 +248,10 @@ export function WorkspaceShell({
   onNewChat?: () => void;
 }) {
   const page = availablePage(route);
-  const [lastConversation, setLastConversation] = useState<HashRoute>(
+  const [visitedConversation, setVisitedConversation] = useState<HashRoute>(
     route.kind === 'session' ? route : { kind: 'home' },
   );
+  const lastConversation = conversationRoute ?? visitedConversation;
   const [commandsOpen, setCommandsOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -265,7 +269,8 @@ export function WorkspaceShell({
   const openConversation = () => navigate(lastConversation);
 
   useEffect(() => {
-    if (route.kind === 'session' || route.kind === 'home') setLastConversation(route);
+    if (route.kind === 'session' || route.kind === 'home')
+      setVisitedConversation(route);
     setDrawerOpen(false);
   }, [route]);
 

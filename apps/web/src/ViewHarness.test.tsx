@@ -1897,6 +1897,60 @@ it('keeps drafts in memory when session storage refuses them', async () => {
   );
 });
 
+it('keeps a page open when the first send creates its session, then returns to that session', async () => {
+  const user = userEvent.setup();
+  let current = snapshot('agent-main', 'Nova', 1);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
+    agents: [current],
+  }));
+  mockProviders();
+  messagesFromSnapshot(() => current);
+  const creating = deferred<void>();
+  const createSession = vi.mocked(daemon.createSession);
+  const createListed = createSession.getMockImplementation()!;
+  createSession.mockImplementationOnce(async (agentId) => {
+    await creating.promise;
+    return createListed(agentId);
+  });
+  const runAgent = vi
+    .spyOn(daemon, 'runAgent')
+    .mockImplementation(async (id, _text, _metadata, roomId) => {
+      current = withMessage(snapshot(id, 'Nova', 1), 'Launch plan ready', roomId);
+      return {
+        agent: current,
+        result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
+      };
+    });
+  render(<ViewHarness />);
+  await openChat();
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Plan the launch',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.click(screen.getByRole('button', { name: 'Work', exact: true }));
+
+  await act(async () => creating.resolve());
+  await waitFor(() =>
+    expect(runAgent).toHaveBeenCalledWith(
+      'agent-main',
+      'Plan the launch',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'chat:new-1',
+    ),
+  );
+  expect(window.location.hash).toBe('#/work');
+  expect(screen.getByRole('button', { name: 'Work', exact: true })).toHaveAttribute(
+    'aria-current',
+    'page',
+  );
+
+  await user.click(screen.getByRole('button', { name: 'Open companion chat' }));
+  expect(window.location.hash).toBe('#/s/chat%3Anew-1');
+  expect(await screen.findByText('Launch plan ready')).toBeVisible();
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
