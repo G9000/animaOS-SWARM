@@ -26,6 +26,15 @@ const RESERVED_ROOM_PREFIXES: [&str; 5] = [
     crate::sessions::LEGACY_ROOM_SESSION_PREFIX,
 ];
 
+/// `RESERVED_ROOM_PREFIXES` spelled out for the rejection message below, so
+/// the wording can't drift out of sync with the list it describes.
+fn reserved_room_prefix_list() -> String {
+    let (last, rest) = RESERVED_ROOM_PREFIXES
+        .split_last()
+        .expect("RESERVED_ROOM_PREFIXES is non-empty");
+    format!("{}, and {last}", rest.join(", "))
+}
+
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
     state: &SharedDaemonState,
@@ -203,7 +212,10 @@ pub(crate) async fn handle_run_agent(
                     .iter()
                     .any(|prefix| id.starts_with(prefix)) =>
         {
-            return Err(ApiError::bad_request_static("roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, and peer: namespaces"));
+            return Err(ApiError::bad_request(format!(
+                "roomId must be non-empty, at most 256 bytes, and outside the reserved {} namespaces",
+                reserved_room_prefix_list()
+            )));
         }
         Some(id) => RunRoom::Stable(id.to_string()),
         None => RunRoom::Generated,
@@ -899,7 +911,7 @@ mod tests {
             assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{room}");
             assert_eq!(
                 error.message(),
-                "roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, and peer: namespaces"
+                "roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, peer:, and legacy-room: namespaces"
             );
         }
         let accepted = handle_run_agent(
