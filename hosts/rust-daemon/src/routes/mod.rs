@@ -3558,8 +3558,12 @@ mod tests {
         assert!(state.read().await.runs.for_agent(&agent_id).is_empty());
     }
 
+    /// The route reserves nothing before the body parses: a malformed body
+    /// gets 400 before its run takes a waiting unit, a room, a slot, or a
+    /// global permit, so with one global permit the next valid run still
+    /// runs.
     #[tokio::test(flavor = "multi_thread")]
-    async fn malformed_run_body_releases_early_admission_permit() {
+    async fn malformed_run_body_is_rejected_before_admission() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             SlowModelAdapter {
                 delay: Duration::ZERO,
