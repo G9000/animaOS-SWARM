@@ -45,11 +45,22 @@ interface AgentOperation {
   targetAgentId: string;
 }
 
+interface FailedDraft {
+  requestId: string;
+  text: string;
+  /** A failed Telegram reply keeps its key, so resending it is joined, not doubled. */
+  idempotencyKey?: string;
+}
+
 type ChatState = {
   draft: string;
-  failedDrafts: { requestId: string; text: string }[];
+  failedDrafts: FailedDraft[];
   sending: boolean;
   error: string | null;
+  /** A restored Telegram reply; sent again unchanged, it reuses its key. */
+  resend: { text: string; idempotencyKey: string } | null;
+  /** The last Telegram reply was accepted and waits for delivery. */
+  deliveryQueued: boolean;
 };
 
 const EMPTY_CHAT: ChatState = {
@@ -57,6 +68,8 @@ const EMPTY_CHAT: ChatState = {
   failedDrafts: [],
   sending: false,
   error: null,
+  resend: null,
+  deliveryQueued: false,
 };
 const HOME_CONVERSATION = 'home';
 /** The daemon's largest message page, so a busy session still shows the request. */
@@ -891,24 +904,35 @@ export function ViewHarness() {
     connectorId: string,
     text: string,
     key: string,
+    idempotencyKey: string,
   ) => {
     if (pendingSendsRef.current.has(key)) return;
     pendingSendsRef.current.add(key);
-    updateChat(key, { sending: true, error: null, draft: '' });
+    updateChat(key, {
+      sending: true,
+      error: null,
+      draft: '',
+      resend: null,
+      deliveryQueued: false,
+    });
     try {
       const response = await daemon.sendConnectorMessage(
         targetId,
         connectorId,
         text,
-        createTelegramIdempotencyKey(),
+        idempotencyKey,
       );
-      if (response.result.status === 'error')
-        updateChat(key, { error: response.result.error ?? 'run failed' });
+      updateChat(key, {
+        deliveryQueued: response.deliveryQueued,
+        ...(response.result.status === 'error'
+          ? { error: response.result.error ?? 'run failed' }
+          : {}),
+      });
     } catch (caught) {
       updateChat(key, (current) => ({
         failedDrafts: [
           ...current.failedDrafts,
-          { requestId: crypto.randomUUID(), text },
+          { requestId: crypto.randomUUID(), text, idempotencyKey },
         ],
         error: safeIntegrationError(caught),
       }));
@@ -937,8 +961,17 @@ export function ViewHarness() {
     if (!activeSession) return;
     const key = chatKey(agent.id, sessionConversation(routeSessionId));
     if (activeSession.kind === 'telegram') {
+      // A restored reply sent unchanged keeps its key; anything else is new.
       if (activeConnector)
-        void replyOnTelegram(agent.id, activeConnector.id, text, key);
+        void replyOnTelegram(
+          agent.id,
+          activeConnector.id,
+          text,
+          key,
+          chat.resend?.text === text
+            ? chat.resend.idempotencyKey
+            : createTelegramIdempotencyKey(),
+        );
       return;
     }
     void runInSession(activeSession.agentId, activeSession, text, key);
@@ -1093,12 +1126,23 @@ export function ViewHarness() {
                 count: failedDrafts.length,
                 text: failedDraft,
                 restore: () => {
-                  setDraft((current) =>
-                    current.trim()
-                      ? `${current}\n\n${failedDraft}`
-                      : failedDraft,
-                  );
-                  setFailedDrafts((current) => current.slice(1));
+                  if (!activeChatKey) return;
+                  updateChat(activeChatKey, (current) => {
+                    const [first, ...rest] = current.failedDrafts;
+                    if (!first) return {};
+                    return {
+                      draft: current.draft.trim()
+                        ? `${current.draft}\n\n${first.text}`
+                        : first.text,
+                      failedDrafts: rest,
+                      resend: first.idempotencyKey
+                        ? {
+                            text: first.text,
+                            idempotencyKey: first.idempotencyKey,
+                          }
+                        : current.resend,
+                    };
+                  });
                 },
                 dismiss: () => setFailedDrafts((current) => current.slice(1)),
               }
@@ -1134,6 +1178,14 @@ export function ViewHarness() {
                 reload this page.
               </p>
             </div>
+          ) : null}
+          {chat.deliveryQueued ? (
+            <p
+              role="status"
+              className="px-4 pt-3 text-center font-mono text-[10px] text-mint"
+            >
+              Queued for Telegram delivery
+            </p>
           ) : null}
           {sessionActionError ? (
             <p role="alert" className="px-4 pt-3 text-xs text-danger">

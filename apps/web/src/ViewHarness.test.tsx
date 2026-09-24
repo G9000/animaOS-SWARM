@@ -2376,6 +2376,92 @@ it('replies to a Telegram session through its connector', async () => {
   expect(runAgent).not.toHaveBeenCalled();
 });
 
+/** A Telegram session with its ready connector, opened in the harness. */
+async function openTelegramSession() {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  vi.spyOn(daemon, 'listConnectors').mockResolvedValue({
+    connectors: [
+      {
+        id: 'tg-1',
+        agentId: 'agent-main',
+        roomId: 'telegram:tg-1',
+        type: 'telegram',
+        bot: { id: '1', username: 'nova_bot', displayName: 'Nova' },
+        approvedChat: { id: '42', kind: 'private', title: null, username: 'owner' },
+        pendingPairing: null,
+        status: 'ready',
+        enabled: true,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      },
+    ],
+  });
+  routes.sessions.push(
+    sessionFixture('telegram:tg-1', {
+      kind: 'telegram',
+      origin: 'telegram',
+      title: 'Telegram · @nova_bot',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  window.history.replaceState(null, '', '/#/s/telegram%3Atg-1');
+  render(<ViewHarness />);
+  const input = await screen.findByPlaceholderText('Reply on Telegram…');
+  await waitFor(() => expect(input).toBeEnabled());
+  return input;
+}
+
+it('reports a Telegram reply that is queued for delivery', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'sendConnectorMessage').mockResolvedValue({
+    messages: [],
+    result: { status: 'success', durationMs: 1 },
+    deliveryQueued: true,
+  });
+  const input = await openTelegramSession();
+  await user.type(input, 'On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(await screen.findByText('Queued for Telegram delivery')).toBeVisible();
+});
+
+it('resends a restored Telegram reply with its key and gives a new reply a new key', async () => {
+  const user = userEvent.setup();
+  const reply = vi
+    .spyOn(daemon, 'sendConnectorMessage')
+    .mockRejectedValueOnce(
+      Object.assign(new Error('daemon request failed (408)'), { status: 408 }),
+    )
+    .mockResolvedValue({
+      messages: [],
+      result: { status: 'success', durationMs: 1 },
+      deliveryQueued: false,
+    });
+  const input = await openTelegramSession();
+  await user.type(input, 'On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.click(await screen.findByRole('button', { name: 'Restore message' }));
+  expect(input).toHaveValue('On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  // The daemon joins a retry that reuses the key instead of sending twice.
+  await waitFor(() => expect(reply).toHaveBeenCalledTimes(2));
+  const [, , , firstKey] = reply.mock.calls[0];
+  expect(reply.mock.calls[1]).toEqual(['agent-main', 'tg-1', 'On my way', firstKey]);
+
+  await user.type(input, 'Running late');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(reply).toHaveBeenCalledTimes(3));
+  const [, , text, newKey] = reply.mock.calls[2];
+  expect(text).toBe('Running late');
+  expect(newKey).toMatch(/^telegram-/);
+  expect(newKey).not.toBe(firstKey);
+});
+
 it('returns to a new chat when the open session is deleted from the sidebar', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
