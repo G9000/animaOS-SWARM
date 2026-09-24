@@ -17,6 +17,11 @@ import {
   type AgentJobReviewInput,
   type GoalInput,
   type GoalStatus,
+  type Session,
+  type SessionListOptions,
+  type SessionMessage,
+  type SessionMessageOptions,
+  type SessionUpdateInput,
 } from '@animaOS-SWARM/sdk';
 
 const setupClient = createDaemonClient({
@@ -334,6 +339,21 @@ export const daemon = {
   ) => setupClient.goals.setStatus(id, input),
   goalJobs: (id: string, options: { signal?: AbortSignal } = {}) =>
     setupClient.goals.jobs(id, options),
+  listSessions: (agentId: string, options: SessionListOptions = {}) =>
+    setupClient.sessions.list(agentId, options),
+  createSession: (agentId: string, input: { title?: string } = {}): Promise<Session> =>
+    setupClient.sessions.create(agentId, input),
+  updateSession: (agentId: string, sessionId: string, patch: SessionUpdateInput) =>
+    setupClient.sessions.update(agentId, sessionId, patch),
+  deleteSession: (agentId: string, sessionId: string) =>
+    setupClient.sessions.remove(agentId, sessionId),
+  sessionMessages: (
+    agentId: string,
+    sessionId: string,
+    options: SessionMessageOptions = {},
+  ) => setupClient.sessions.messages(agentId, sessionId, options),
+  exportSession: (agentId: string, sessionId: string) =>
+    setupClient.sessions.exportMarkdown(agentId, sessionId),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),
   retryAgentJob: (id: string, jobId: string, input: AgentJobRetryInput) =>
@@ -649,5 +669,28 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
         content: { text: m.content.text, metadata: m.content.metadata },
         created_at_ms: m.createdAtMs,
       })),
+  };
+}
+
+const SESSION_ROLES = {
+  user: 'User',
+  assistant: 'Assistant',
+  system: 'System',
+  tool: 'Tool',
+} as const satisfies Record<SessionMessage['role'], ChatMessage['role']>;
+const CHECKIN_SUFFIX = /\n\n\(This is a scheduled check-in\.[\s\S]*\)\s*$/;
+
+/** A session-route message as the chat components render it. A check-in
+ *  prompt becomes a system line without the scheduler's instructions. */
+export function toChatMessage(message: SessionMessage): ChatMessage {
+  const checkin = message.role === 'user' && message.metadata.kind === 'checkin';
+  return {
+    id: message.id,
+    role: checkin ? 'System' : SESSION_ROLES[message.role],
+    content: {
+      text: checkin ? message.text.replace(CHECKIN_SUFFIX, '') : message.text,
+      metadata: message.metadata,
+    },
+    created_at_ms: message.createdAtMs,
   };
 }
