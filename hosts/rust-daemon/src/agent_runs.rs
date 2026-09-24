@@ -25,6 +25,11 @@ const MAX_HELPER_TOOL_ITERATIONS: usize = 8;
 const MAX_HELPER_RUN_MS: u64 = 120_000;
 const DUPLICATE_IN_FLIGHT_RUN: &str = "A run with this idempotency key is already in progress";
 
+/// Upper bound accepted for `ANIMAOS_RS_MAX_RUNS_PER_AGENT` and for
+/// `with_max_runs_per_agent`; keeps `tokio::sync::Semaphore::new` from ever
+/// being asked to build an unreasonably large agent-slot semaphore.
+pub(crate) const MAX_RUNS_PER_AGENT_LIMIT: usize = 64;
+
 fn helper_parent(agent: &AgentState) -> Option<&str> {
     config_helper_parent(&agent.config)
 }
@@ -131,7 +136,7 @@ enum PermitMode {
 /// which keeps same-room runs in acceptance order.
 struct SessionLease {
     key: (String, String),
-    lock: Arc<Mutex<()>>,
+    lock: Option<Arc<Mutex<()>>>,
     guard: Option<OwnedMutexGuard<()>>,
     locks: SessionLockMap,
 }
@@ -143,12 +148,23 @@ impl Drop for SessionLease {
             .locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::strong_count(&self.lock) == 2
-            && locks
-                .get(&self.key)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.lock))
-        {
-            locks.remove(&self.key);
+        // Take this lease's own reference out of the `Option` (still alive,
+        // just moved into `lock`) and let it drop at the end of this `if
+        // let` block, still *inside* the critical section, before deciding
+        // whether to remove the registry entry. `== 2` means only the
+        // registry's copy and this local `lock` remain, i.e. no other lease
+        // is alive. Leaving this lease's reference to drop only implicitly,
+        // after `drop()` returns, would race another lease's own check here:
+        // both could see the pre-decrement count and neither would remove
+        // the entry, leaking it (spec: room/slot lease cleanup).
+        if let Some(lock) = self.lock.take() {
+            if Arc::strong_count(&lock) == 2
+                && locks
+                    .get(&self.key)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &lock))
+            {
+                locks.remove(&self.key);
+            }
         }
     }
 }
@@ -156,7 +172,7 @@ impl Drop for SessionLease {
 /// One of an agent's run slots.
 struct SlotLease {
     agent_id: String,
-    slots: Arc<Semaphore>,
+    slots: Option<Arc<Semaphore>>,
     permit: Option<OwnedSemaphorePermit>,
     registry: AgentSlotMap,
 }
@@ -168,12 +184,18 @@ impl Drop for SlotLease {
             .registry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::strong_count(&self.slots) == 2
-            && registry
-                .get(&self.agent_id)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.slots))
-        {
-            registry.remove(&self.agent_id);
+        // See `SessionLease::drop`: this lease's own reference must drop
+        // inside the critical section (at the end of this `if let` block),
+        // not be left to the automatic field-drop after this function
+        // returns.
+        if let Some(slots) = self.slots.take() {
+            if Arc::strong_count(&slots) == 2
+                && registry
+                    .get(&self.agent_id)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &slots))
+            {
+                registry.remove(&self.agent_id);
+            }
         }
     }
 }
@@ -494,8 +516,10 @@ impl AgentRunCoordinator {
     }
 
     /// Concurrent runs per non-helper agent across different rooms (spec §4.3).
+    /// Clamped to `1..=MAX_RUNS_PER_AGENT_LIMIT` so a misconfigured value can
+    /// never make `Semaphore::new` build an unreasonably large semaphore.
     pub(crate) fn with_max_runs_per_agent(mut self, max_runs_per_agent: usize) -> Self {
-        self.max_runs_per_agent = max_runs_per_agent.max(1);
+        self.max_runs_per_agent = max_runs_per_agent.clamp(1, MAX_RUNS_PER_AGENT_LIMIT);
         self
     }
 
@@ -738,7 +762,7 @@ impl AgentRunCoordinator {
         let guard = Arc::clone(&lock).try_lock_owned().ok();
         let lease = SessionLease {
             key,
-            lock,
+            lock: Some(lock),
             guard,
             locks: Arc::clone(&self.session_locks),
         };
@@ -749,7 +773,7 @@ impl AgentRunCoordinator {
         let (key, lock) = self.session_lock(agent_id, room_id);
         let mut lease = SessionLease {
             key,
-            lock: Arc::clone(&lock),
+            lock: Some(Arc::clone(&lock)),
             guard: None,
             locks: Arc::clone(&self.session_locks),
         };
@@ -771,7 +795,7 @@ impl AgentRunCoordinator {
         let permit = Arc::clone(&slots).try_acquire_owned().ok();
         let lease = SlotLease {
             agent_id: agent_id.to_string(),
-            slots,
+            slots: Some(slots),
             permit,
             registry: Arc::clone(&self.agent_slots),
         };
@@ -786,7 +810,7 @@ impl AgentRunCoordinator {
         let slots = self.agent_slot_semaphore(agent_id, capacity);
         let mut lease = SlotLease {
             agent_id: agent_id.to_string(),
-            slots: Arc::clone(&slots),
+            slots: Some(Arc::clone(&slots)),
             permit: None,
             registry: Arc::clone(&self.agent_slots),
         };
@@ -2548,6 +2572,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn with_max_runs_per_agent_clamps_to_one_and_sixty_four() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(1)));
+
+        assert_eq!(
+            coordinator
+                .clone()
+                .with_max_runs_per_agent(0)
+                .max_runs_per_agent(),
+            1,
+            "0 (and any non-positive request) clamps up to 1 so the semaphore is never empty"
+        );
+        assert_eq!(
+            coordinator
+                .clone()
+                .with_max_runs_per_agent(super::MAX_RUNS_PER_AGENT_LIMIT)
+                .max_runs_per_agent(),
+            super::MAX_RUNS_PER_AGENT_LIMIT,
+            "the limit itself is accepted unchanged"
+        );
+        assert_eq!(
+            coordinator
+                .clone()
+                .with_max_runs_per_agent(1_000_000)
+                .max_runs_per_agent(),
+            super::MAX_RUNS_PER_AGENT_LIMIT,
+            "an oversized request clamps down to the limit so Semaphore::new can never panic"
+        );
+    }
+
+    #[tokio::test]
     async fn the_per_agent_slot_limit_queues_runs_beyond_it() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
@@ -2695,6 +2750,235 @@ mod tests {
             .forget();
         release.add_permits(1);
         assert!(retry.await.expect("retry should join").is_ok());
+    }
+
+    /// Runs `threads` copies of `make_and_drop_lease` in lockstep for
+    /// `rounds` rounds: every round, all threads rendezvous on `start` before
+    /// building and immediately dropping a lease, so every round's drops
+    /// truly race each other rather than merely interleaving loosely.
+    fn stress_concurrent_drops(
+        threads: usize,
+        rounds: usize,
+        make_and_drop_lease: impl Fn() + Send + Sync + 'static,
+    ) {
+        let make_and_drop_lease = Arc::new(make_and_drop_lease);
+        let start = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let make_and_drop_lease = Arc::clone(&make_and_drop_lease);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    for _ in 0..rounds {
+                        start.wait();
+                        make_and_drop_lease();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("racer thread should not panic");
+        }
+    }
+
+    #[test]
+    fn concurrent_lease_drops_on_one_key_leave_no_stale_registry_entry() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(1)));
+
+        // Many leases on the SAME (agent, room) key, dropped by many threads
+        // at once, over and over: a failed try-acquire racing the holder's
+        // own release is one instance of this, but any two leases whose
+        // drops overlap can hit it. `SessionLease::drop`/`SlotLease::drop`
+        // must decide removal atomically with releasing their own reference,
+        // or a race here leaks the registry entry forever (nothing else ever
+        // revisits a key once every lease on it has dropped).
+        let session_coordinator = coordinator.clone();
+        stress_concurrent_drops(32, 4000, move || {
+            let (key, lock) = session_coordinator.session_lock("racer-agent", "racer-room");
+            drop(super::SessionLease {
+                key,
+                lock: Some(lock),
+                guard: None,
+                locks: Arc::clone(&session_coordinator.session_locks),
+            });
+        });
+        assert_eq!(
+            coordinator.lock_counts(),
+            (0, 0),
+            "racing session-lease drops on one key must not leak a stale registry entry"
+        );
+
+        let slot_coordinator = coordinator.clone();
+        stress_concurrent_drops(32, 4000, move || {
+            let slots = slot_coordinator.agent_slot_semaphore("racer-agent", 1);
+            drop(super::SlotLease {
+                agent_id: "racer-agent".to_string(),
+                slots: Some(slots),
+                permit: None,
+                registry: Arc::clone(&slot_coordinator.agent_slots),
+            });
+        });
+        assert_eq!(
+            coordinator.lock_counts(),
+            (0, 0),
+            "racing slot-lease drops on one key must not leak a stale registry entry"
+        );
+    }
+
+    /// No path may hold a global permit while it waits for a room lock or an
+    /// agent slot: room and slot are acquired first, and only then the
+    /// global permit (spec §4.3). A run queued behind another run in the
+    /// *same* room must not starve a run in a *different* room of the same
+    /// agent out of the global permit while it waits.
+    #[tokio::test]
+    async fn a_run_queued_for_a_room_lock_does_not_hold_the_global_permit() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        // Only 2 global permits: if a room-locked waiter held one, a third
+        // room's run would have none left to take.
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 2).await;
+
+        let run_a = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-r", "a");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered
+            .acquire()
+            .await
+            .expect("run A enters the model and holds the global permit")
+            .forget();
+
+        // Run B queues behind A on room R's lock; it must not reach (let
+        // alone hold) the global permit while it waits.
+        let run_b = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-r", "b");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            1,
+            "run B is queued behind A on the room lock, not in the model"
+        );
+
+        // Room R2 of the SAME agent still gets the free global permit even
+        // though B is queued and A has not released.
+        let run_c = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-r2", "c");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("a different room of the same agent still gets the free global permit")
+            .unwrap()
+            .forget();
+
+        release.add_permits(2);
+        assert!(run_a.await.unwrap().is_ok());
+        assert!(run_c.await.unwrap().is_ok());
+
+        entered
+            .acquire()
+            .await
+            .expect("B now runs once A's room lock frees")
+            .forget();
+        release.add_permits(1);
+        assert!(run_b.await.unwrap().is_ok());
+
+        assert_eq!(coordinator.lock_counts(), (0, 0));
+    }
+
+    /// The run owns its task once spawned (see `run_spawned`): a caller
+    /// dropped while still waiting for a room lock or slot must not cancel
+    /// the run itself, any more than a caller dropped while the run is
+    /// already in the model does (see
+    /// `aborted_caller_does_not_cancel_the_commit_or_leak_locks_and_slots`).
+    #[tokio::test]
+    async fn dropped_caller_does_not_cancel_a_run_still_queued_for_a_room_lock() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 4).await;
+
+        // Hold the room (and a slot) directly, with no model involved, so the
+        // queued run below is blocked purely on the room lock.
+        let blocker = coordinator
+            .admit(&agent_id, "room-queued", super::AdmitMode::TryNow)
+            .await
+            .expect("the room and a slot are free");
+
+        let caller = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-queued", "queued");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            0,
+            "the run is queued on the room lock, not in the model yet"
+        );
+
+        // Drop (abort) the caller while its run is still queued for the room.
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller should be aborted")
+                .is_cancelled(),
+            "aborting the waiter should not abort the owned run"
+        );
+
+        // Only now does the blocker release the room; the queued run must
+        // still be there to take it, then reach and finish in the model.
+        drop(blocker);
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("the queued run still enters the model once the blocker releases")
+            .unwrap()
+            .forget();
+        release.add_permits(1);
+
+        for _ in 0..100 {
+            if coordinator.lock_counts() == (0, 0)
+                && coordinator
+                    .state
+                    .read()
+                    .await
+                    .get_agent(&agent_id)
+                    .is_some_and(|snapshot| snapshot.state.status == AgentStatus::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(coordinator.lock_counts(), (0, 0));
+        let guard = coordinator.state.read().await;
+        let agent = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(agent.state.status, AgentStatus::Completed);
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|message| message.room_id == "room-queued"),
+            "the queued run committed its turn"
+        );
     }
 
     #[tokio::test]
