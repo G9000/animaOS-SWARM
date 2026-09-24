@@ -625,7 +625,6 @@ export function ViewHarness() {
           );
         } else if (result.imported > 0) {
           setLegacyMigrationError(null);
-          void integrations.refresh();
         }
       })
       .catch(() => {
