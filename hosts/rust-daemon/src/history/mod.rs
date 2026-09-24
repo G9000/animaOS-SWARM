@@ -5,9 +5,12 @@
 #[cfg(test)]
 pub(crate) mod conformance;
 mod memory;
+mod sqlite;
 
 #[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
 pub(crate) use memory::MemoryHistoryStore;
+#[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
+pub(crate) use sqlite::SqliteHistoryStore;
 
 use std::collections::{HashMap, HashSet};
 
