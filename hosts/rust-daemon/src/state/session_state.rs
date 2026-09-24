@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use anima_core::AgentConfigUpdate;
+use anima_core::{AgentConfigUpdate, AgentRuntimeSnapshot};
 use tracing::warn;
 
 use super::DaemonState;
@@ -205,5 +205,39 @@ impl DaemonState {
         }
         self.sessions.insert(record);
         true
+    }
+
+    /// Agents without their transcripts or events, ordered like `list_agents`
+    /// (`GET /api/agents?view=summary`, spec §3.3).
+    pub(crate) fn agent_summaries(&self) -> Vec<AgentRuntimeSnapshot> {
+        let mut summaries = self
+            .agent_snapshots
+            .iter()
+            .filter(|(agent_id, _)| !self.agents.contains_key(*agent_id))
+            .map(|(_, snapshot)| AgentRuntimeSnapshot {
+                state: snapshot.state.clone(),
+                message_count: snapshot.message_count,
+                messages: Vec::new(),
+                event_count: snapshot.event_count,
+                events: Vec::new(),
+                last_task: snapshot.last_task.clone(),
+                step_count: snapshot.step_count,
+            })
+            .collect::<Vec<_>>();
+        summaries.extend(self.agents.values().map(|runtime| AgentRuntimeSnapshot {
+            message_count: runtime.messages().len(),
+            ..runtime.run_snapshot(Vec::new())
+        }));
+        let mut summaries = summaries
+            .into_iter()
+            .map(|summary| self.with_derived_status(summary))
+            .collect::<Vec<_>>();
+        summaries.sort_by(|left, right| {
+            left.state
+                .created_at_ms
+                .cmp(&right.state.created_at_ms)
+                .then_with(|| left.state.id.cmp(&right.state.id))
+        });
+        summaries
     }
 }

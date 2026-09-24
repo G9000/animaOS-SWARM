@@ -4,6 +4,9 @@
 //! their room on the record.
 
 pub(crate) mod migration;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub(crate) mod views;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

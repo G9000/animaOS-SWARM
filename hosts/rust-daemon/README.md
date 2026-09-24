@@ -139,7 +139,7 @@ application endpoints. The summary below matches the live router in
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/agents` | List all registered agent snapshots. |
+| `GET` | `/api/agents` | List all registered agent snapshots. `?view=summary` returns them without `messages`. |
 | `POST` | `/api/agents` | Create an agent. Body: `AgentConfig` JSON. Returns `201` with the created snapshot. |
 | `GET` | `/api/agents/{agent_id}` | Get one agent snapshot. |
 | `DELETE` | `/api/agents/{agent_id}` | Remove an agent runtime and return a deleted flag. |

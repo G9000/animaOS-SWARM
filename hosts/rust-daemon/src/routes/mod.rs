@@ -16,6 +16,7 @@ mod memories;
 mod oauth_apps;
 mod profile;
 mod schedules;
+mod sessions;
 mod swarms;
 mod workspace;
 mod workspace_agent_yaml;
@@ -162,7 +163,9 @@ use crate::runtime_model::provider_summaries;
         schedules::update_schedule,
         schedules::delete_schedule,
         schedules::import_legacy_schedules,
+        sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
     ),
+    components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
         (name = "health", description = "Daemon health endpoints"),
         (name = "agencies", description = "Agency generation and team drafting"),
@@ -173,6 +176,7 @@ use crate::runtime_model::provider_summaries;
         (name = "connectors", description = "Agent-scoped connector administration"),
         (name = "connector-thread", description = "Dedicated connector-room messages"),
         (name = "schedules", description = "Daemon-backed scheduled prompts"),
+        (name = "sessions", description = "Agent sessions and their transcripts"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -442,6 +446,9 @@ fn router_with_services_with_policies(
         .route("/api/agents/{agent_id}/jobs/{job_id}/retry", axum::routing::post(jobs::retry_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/approve", axum::routing::post(jobs::approve_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/review", axum::routing::post(jobs::review_job))
+        .route("/api/agents/{agent_id}/sessions", get(sessions::list_sessions))
+        .route("/api/agents/{agent_id}/sessions/{session_id}", get(sessions::get_session))
+        .route("/api/agents/{agent_id}/sessions/{session_id}/messages", get(sessions::list_session_messages))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -1146,13 +1153,30 @@ async fn generate_profile_entry(
     }
 }
 
+/// Controller ruling 1 (M2 pre-flight audit): an unrecognized `view` value is
+/// ignored (the full response), preserving prior behaviour; only
+/// `view=summary` changes the shape. A malformed query string is still 400.
 #[utoipa::path(
     get,
     path = "/api/agents",
     tag = "agents",
-    responses((status = 200, description = "List agents", body = AgentsEnvelope))
+    params(("view" = Option<String>, Query, description = "summary returns AgentSummariesEnvelope: the agents without their messages")),
+    responses(
+        (status = 200, description = "List agents (AgentSummariesEnvelope with view=summary)", body = AgentsEnvelope),
+        (status = 400, description = "Malformed query", body = ErrorBody)
+    )
 )]
-async fn list_agents_entry(State(state): State<AppState>) -> AxumResponse {
+async fn list_agents_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
+    let view = match request_query(&uri) {
+        Ok(query) => query.get("view").filter(|view| !view.is_empty()).cloned(),
+        Err(()) => return ApiError::bad_request_static("malformed query").into_response(),
+    };
+    if view.as_deref() == Some("summary") {
+        return json_response(
+            StatusCode::OK,
+            &agents::handle_list_agent_summaries(&state.daemon).await,
+        );
+    }
     match agents::handle_list_agents(&state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
@@ -1803,6 +1827,7 @@ mod tests {
     mod goals;
     mod capabilities;
     mod swarm_reliability;
+    mod sessions;
 
     use super::{router, router_with_services, router_with_services_with_policies};
     use crate::agent_runs::AgentRunCoordinator;

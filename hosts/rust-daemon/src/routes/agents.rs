@@ -2,8 +2,8 @@ use anima_memory::RecentMemoryOptions;
 
 use super::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
-    AgentRuntimeSnapshotResponse, AgentUpdateRequest, AgentsEnvelope, DeleteResponse,
-    MemoriesEnvelope, MemoryResponse, TaskRequest,
+    AgentRuntimeSnapshotResponse, AgentSummariesEnvelope, AgentSummaryResponse, AgentUpdateRequest,
+    AgentsEnvelope, DeleteResponse, MemoriesEnvelope, MemoryResponse, TaskRequest,
 };
 use super::ApiError;
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom, RUN_ADMISSION_SATURATED};
@@ -75,6 +75,15 @@ pub(crate) async fn handle_list_agents(
             .map(AgentRuntimeSnapshotResponse::from)
             .collect(),
     })
+}
+
+pub(crate) async fn handle_list_agent_summaries(
+    state: &SharedDaemonState,
+) -> AgentSummariesEnvelope {
+    let summaries = state.read().await.agent_summaries();
+    AgentSummariesEnvelope {
+        agents: summaries.iter().map(AgentSummaryResponse::from).collect(),
+    }
 }
 
 pub(crate) async fn handle_get_agent(

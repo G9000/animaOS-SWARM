@@ -111,6 +111,32 @@ pub(crate) struct AgentsEnvelope {
     pub(crate) agents: Vec<AgentRuntimeSnapshotResponse>,
 }
 
+/// An agent without its transcript (`GET /api/agents?view=summary`).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentSummaryResponse {
+    pub(crate) state: AgentStateResponse,
+    pub(crate) message_count: usize,
+    pub(crate) event_count: usize,
+    pub(crate) last_task: Option<TaskResultResponse>,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub(crate) struct AgentSummariesEnvelope {
+    pub(crate) agents: Vec<AgentSummaryResponse>,
+}
+
+impl From<&AgentRuntimeSnapshot> for AgentSummaryResponse {
+    fn from(value: &AgentRuntimeSnapshot) -> Self {
+        Self {
+            state: AgentStateResponse::from(&value.state),
+            message_count: value.message_count,
+            event_count: value.event_count,
+            last_task: value.last_task.as_ref().map(TaskResultResponse::from),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, ToSchema)]
 pub(crate) struct AgentRunEnvelope {
     pub(crate) agent: AgentRuntimeSnapshotResponse,

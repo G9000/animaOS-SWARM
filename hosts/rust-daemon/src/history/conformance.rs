@@ -397,9 +397,11 @@ pub(crate) async fn assert_history_store_session_search_conformance(store: &dyn 
     let at = |offset: u64| base + offset;
     let id = |offset: u64, ordinal: u64| format!("msg-{}-{ordinal}", base + offset);
 
-    // "chat:busy" gets more matches than the session limit below; its newest
-    // is at offset 130. "chat:quiet" has a single, older match that a
-    // row-limited search (the pre-ruling behaviour) would crowd out.
+    // "chat:busy" gets 4 matches, more than the `limit: 3` passed below, so a
+    // row-limited search (the pre-ruling behaviour: take the newest `limit`
+    // *rows*, then group) would fill its whole budget with "chat:busy" rows
+    // alone. "chat:quiet" has a single, older match that must still surface
+    // once results are grouped into sessions before the limit is applied.
     let mut rows = (0u64..4)
         .map(|n| {
             history_message(

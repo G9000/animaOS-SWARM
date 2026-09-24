@@ -275,6 +275,18 @@ impl RunLedger {
             .count()
     }
 
+    /// Runs of this session that are queued, running, or awaiting approval.
+    pub(crate) fn active_count_for_session(&self, agent_id: &str, session_id: &str) -> usize {
+        self.records
+            .values()
+            .filter(|record| {
+                record.agent_id == agent_id
+                    && record.session_id == session_id
+                    && !record.status.is_terminal()
+            })
+            .count()
+    }
+
     pub(crate) fn has_in_flight_idempotency_key(&self, agent_id: &str, key: &str) -> bool {
         self.records.values().any(|record| {
             record.agent_id == agent_id
@@ -831,5 +843,23 @@ mod tests {
         let mut no_session = record("agent-a", 3);
         no_session.session_id = String::new();
         assert!(RunLedger::validate(&[no_session]).is_err());
+    }
+
+    #[test]
+    fn active_runs_are_counted_per_session() {
+        let mut ledger = RunLedger::default();
+        let running = record("agent-a", 1);
+        let mut queued = record("agent-a", 2);
+        queued.status = RunStatus::Queued;
+        let done = finished("agent-a", 3);
+        let mut elsewhere = record("agent-a", 4);
+        elsewhere.session_id = "chat:other".into();
+        for run in [running, queued, done, elsewhere] {
+            ledger.insert(run);
+        }
+
+        assert_eq!(ledger.active_count_for_session("agent-a", "direct:test"), 2);
+        assert_eq!(ledger.active_count_for_session("agent-a", "chat:other"), 1);
+        assert_eq!(ledger.active_count_for_session("agent-b", "direct:test"), 0);
     }
 }
