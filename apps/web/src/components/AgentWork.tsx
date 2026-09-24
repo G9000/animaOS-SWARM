@@ -1,6 +1,10 @@
 import { useEffect, useState } from 'react';
 import type { AgentTask, AgentTasks } from '@animaOS-SWARM/sdk';
-import { daemon, type DaemonSchedule } from '../lib/daemon-api';
+import {
+  daemon,
+  type DaemonSchedule,
+  type TelegramConnector,
+} from '../lib/daemon-api';
 import { primaryBtnCls } from './ui-bits';
 
 export function AgentTasksView({
@@ -225,6 +229,9 @@ export function AgentProactiveView({
   onBusyChange?: (busy: boolean) => void;
 }) {
   const [schedules, setSchedules] = useState<DaemonSchedule[] | null>(null);
+  // Check-ins can be delivered to Telegram only once a chat is approved.
+  const [telegram, setTelegram] = useState<TelegramConnector | null>(null);
+  const [target, setTarget] = useState<'workspace' | 'telegram'>('workspace');
   const [prompt, setPrompt] = useState('');
   const [minutes, setMinutes] = useState(60);
   const [busy, setBusy] = useState(false);
@@ -233,18 +240,30 @@ export function AgentProactiveView({
   useEffect(() => {
     let cancelled = false;
     setError(null);
-    daemon
-      .listSchedules(agentId)
-      .then((result) => {
-        if (!cancelled) setSchedules(result.schedules);
-      })
-      .catch((e) => {
-        if (!cancelled) setError(String(e.message ?? e));
-      });
+    void Promise.allSettled([
+      daemon.listSchedules(agentId),
+      daemon.listConnectors(agentId),
+    ]).then(([scheduleResult, connectorResult]) => {
+      if (cancelled) return;
+      if (scheduleResult.status === 'fulfilled') {
+        setSchedules(scheduleResult.value.schedules);
+      } else {
+        const reason = scheduleResult.reason;
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
+      setTelegram(
+        connectorResult.status === 'fulfilled'
+          ? (connectorResult.value.connectors.find(
+              (connector) => connector.approvedChat !== null,
+            ) ?? null)
+          : null,
+      );
+    });
     return () => {
       cancelled = true;
     };
   }, [agentId, reload]);
+  const telegramUnavailable = target === 'telegram' && telegram === null;
   const mutate = async (action: () => Promise<unknown>, created = false) => {
     if (busy) return;
     setBusy(true);
@@ -352,14 +371,22 @@ export function AgentProactiveView({
         className="space-y-4 border-t border-line pt-5"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!prompt.trim() || !Number.isInteger(minutes) || minutes < 1)
+          if (
+            !prompt.trim() ||
+            !Number.isInteger(minutes) ||
+            minutes < 1 ||
+            telegramUnavailable
+          )
             return;
           void mutate(
             () =>
               daemon.createSchedule(agentId, {
                 prompt: prompt.trim(),
                 trigger: { type: 'interval', intervalMs: minutes * 60000 },
-                target: { type: 'workspace' },
+                target:
+                  target === 'telegram' && telegram
+                    ? { type: 'connector', connectorId: telegram.id }
+                    : { type: 'workspace' },
                 enabled: true,
               }),
             true,
@@ -404,14 +431,42 @@ export function AgentProactiveView({
           />{' '}
           minutes
         </label>
+        <label className="flex flex-wrap items-center gap-3 text-sm">
+          Deliver to
+          <select
+            aria-label="Deliver to"
+            className="field w-auto"
+            value={target}
+            disabled={busy}
+            onChange={(event) =>
+              setTarget(event.target.value as 'workspace' | 'telegram')
+            }
+          >
+            <option value="workspace">Workspace</option>
+            <option value="telegram" disabled={telegram === null}>
+              Telegram
+            </option>
+          </select>
+        </label>
+        {telegram === null && (
+          <p className="text-xs text-ink-3">
+            Approve a Telegram chat in Connectors to deliver check-ins there.
+          </p>
+        )}
         <p className="text-xs text-ink-3">
-          Updates appear in this agent’s workspace conversation. Scheduled runs
-          use your configured model.
+          {target === 'telegram'
+            ? 'Updates are sent to your approved Telegram chat.'
+            : 'Updates appear in this agent’s workspace conversation.'}{' '}
+          Scheduled runs use your configured model.
         </p>
         <button
           className={`${primaryBtnCls} w-full`}
           disabled={
-            busy || !prompt.trim() || !Number.isInteger(minutes) || minutes < 1
+            busy ||
+            !prompt.trim() ||
+            !Number.isInteger(minutes) ||
+            minutes < 1 ||
+            telegramUnavailable
           }
         >
           {busy ? 'Saving…' : 'Enable schedule'}
