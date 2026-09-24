@@ -164,6 +164,7 @@ use crate::runtime_model::provider_summaries;
         schedules::delete_schedule,
         schedules::import_legacy_schedules,
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
+        sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -446,9 +447,10 @@ fn router_with_services_with_policies(
         .route("/api/agents/{agent_id}/jobs/{job_id}/retry", axum::routing::post(jobs::retry_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/approve", axum::routing::post(jobs::approve_job))
         .route("/api/agents/{agent_id}/jobs/{job_id}/review", axum::routing::post(jobs::review_job))
-        .route("/api/agents/{agent_id}/sessions", get(sessions::list_sessions))
-        .route("/api/agents/{agent_id}/sessions/{session_id}", get(sessions::get_session))
+        .route("/api/agents/{agent_id}/sessions", get(sessions::list_sessions).post(sessions::create_session))
+        .route("/api/agents/{agent_id}/sessions/{session_id}", get(sessions::get_session).patch(sessions::update_session).delete(sessions::delete_session))
         .route("/api/agents/{agent_id}/sessions/{session_id}/messages", get(sessions::list_session_messages))
+        .route("/api/agents/{agent_id}/sessions/{session_id}/export", get(sessions::export_session))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",

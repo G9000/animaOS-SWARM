@@ -257,6 +257,12 @@ impl RunTicket {
     }
 }
 
+/// A room held by a non-run operation (session deletion); runs for the room
+/// wait until it is dropped.
+pub(crate) struct RoomReservation {
+    _lease: SessionLease,
+}
+
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) enum RunRoom {
@@ -595,6 +601,25 @@ impl AgentRunCoordinator {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(agent_id)
             .is_some_and(|slots| slots.available_permits() == 0)
+    }
+
+    /// Takes the room's run lock without waiting. `None` while a run holds or
+    /// waits for it (spec §3.3: deleting a session with a run is 409).
+    pub(crate) fn try_reserve_room(
+        &self,
+        agent_id: &str,
+        room_id: &str,
+    ) -> Option<RoomReservation> {
+        let in_use = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&(agent_id.to_string(), room_id.to_string()));
+        if in_use {
+            return None;
+        }
+        self.try_session_lease(agent_id, room_id)
+            .map(|lease| RoomReservation { _lease: lease })
     }
 
     /// Advisory, reserves nothing: fail-fast callers check this before doing work.

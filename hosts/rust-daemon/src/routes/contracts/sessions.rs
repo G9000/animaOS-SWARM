@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use anima_core::{AttachmentType, MessageRole};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 
@@ -261,4 +261,24 @@ impl From<&MessagePage> for SessionMessagesEnvelope {
             next_before: page.next_before.clone(),
         }
     }
+}
+
+/// `POST /api/agents/{id}/sessions`; an empty body means `{}`.
+#[derive(Clone, Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionCreateRequest {
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+}
+
+/// `PATCH /api/agents/{id}/sessions/{sid}`; at least one field.
+#[derive(Clone, Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SessionUpdateRequest {
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) archived: Option<bool>,
+    #[serde(default)]
+    pub(crate) last_read_at_ms: Option<u64>,
 }

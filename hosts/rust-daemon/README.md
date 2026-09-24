@@ -146,6 +146,20 @@ application endpoints. The summary below matches the live router in
 | `POST` | `/api/agents/{agent_id}/run` | Run the agent with `{"text":"..."}`. Blocks until completion and returns the updated snapshot plus task result. |
 | `GET` | `/api/agents/{agent_id}/memories/recent` | Get recent memories for the agent. Optional `?limit=N`. |
 
+### Sessions
+
+Every session route requires local-owner authorization, and reads answer `Cache-Control: no-store`.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/agents/{agent_id}/sessions` | Sessions, newest activity first. Optional `?kind=`, `?archived=`, `?q=`, `?cursor=`, `?limit=` (1–200, default 50), and `?includeHelpers=` (default `true`). Returns `{ sessions, nextCursor }`. |
+| `POST` | `/api/agents/{agent_id}/sessions` | Create a chat. Body `{ "title"?: string }`. Returns `201` with `{ session }`; `409` for a helper agent; `429` beyond 60 per minute per agent. |
+| `GET` | `/api/agents/{agent_id}/sessions/{session_id}` | One session with `messageCount`, `preview`, `activeRuns`, `unread`, and `capabilities`. |
+| `PATCH` | `/api/agents/{agent_id}/sessions/{session_id}` | Rename, archive, or mark read: `{ "title"?, "archived"?, "lastReadAtMs"? }`. |
+| `DELETE` | `/api/agents/{agent_id}/sessions/{session_id}` | Delete a session its kind allows; `409` while a run in it is active. Memories are kept. |
+| `GET` | `/api/agents/{agent_id}/sessions/{session_id}/messages` | Messages oldest to newest: `?before=<messageId>&limit=50&includeHidden=false`. Returns `{ messages, nextBefore }`. |
+| `GET` | `/api/agents/{agent_id}/sessions/{session_id}/export` | The visible transcript as `text/markdown`, including messages kept only in the history store and silent check-in turns. |
+
 ### Agencies
 
 | Method | Path | Description |

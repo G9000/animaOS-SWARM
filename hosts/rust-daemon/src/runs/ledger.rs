@@ -287,6 +287,45 @@ impl RunLedger {
             .count()
     }
 
+    /// Removes a deleted session's terminal runs and returns them, so a failed
+    /// save can put them back.
+    pub(crate) fn remove_terminal_for_session(
+        &mut self,
+        agent_id: &str,
+        session_id: &str,
+    ) -> Vec<RunRecord> {
+        let ids = self
+            .records
+            .values()
+            .filter(|record| {
+                record.agent_id == agent_id
+                    && record.session_id == session_id
+                    && record.status.is_terminal()
+            })
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.records.remove(&id))
+            .collect()
+    }
+
+    /// Removes a deleted agent's terminal runs and returns them, so a failed
+    /// save can put them back. Without this, a deleted agent's terminal runs
+    /// would stay in the ledger until a restart: `unmirrored_terminal` skips
+    /// agents that no longer exist, so they would never be mirrored and never
+    /// pruned (Controller ruling 2, M2 pre-flight audit).
+    pub(crate) fn remove_terminal_for_agent(&mut self, agent_id: &str) -> Vec<RunRecord> {
+        let ids = self
+            .records
+            .values()
+            .filter(|record| record.agent_id == agent_id && record.status.is_terminal())
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.records.remove(&id))
+            .collect()
+    }
+
     pub(crate) fn has_in_flight_idempotency_key(&self, agent_id: &str, key: &str) -> bool {
         self.records.values().any(|record| {
             record.agent_id == agent_id
@@ -861,5 +900,72 @@ mod tests {
         assert_eq!(ledger.active_count_for_session("agent-a", "direct:test"), 2);
         assert_eq!(ledger.active_count_for_session("agent-a", "chat:other"), 1);
         assert_eq!(ledger.active_count_for_session("agent-b", "direct:test"), 0);
+    }
+
+    #[test]
+    fn a_deleted_session_takes_only_its_terminal_runs() {
+        let mut ledger = RunLedger::default();
+        let running = record("agent-a", 1);
+        let running_id = running.id.clone();
+        let done = finished("agent-a", 2);
+        let done_id = done.id.clone();
+        let mut elsewhere = finished("agent-a", 3);
+        elsewhere.session_id = "chat:other".into();
+        for run in [running, done, elsewhere] {
+            ledger.insert(run);
+        }
+
+        let removed = ledger.remove_terminal_for_session("agent-a", "direct:test");
+
+        assert_eq!(
+            removed
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            [done_id.as_str()]
+        );
+        assert!(ledger.get(&running_id).is_some());
+        assert_eq!(ledger.for_agent("agent-a").len(), 2);
+    }
+
+    #[test]
+    fn a_deleted_agent_takes_only_its_terminal_runs() {
+        let mut ledger = RunLedger::default();
+        let running = record("agent-a", 1);
+        let running_id = running.id.clone();
+        let mut done = finished("agent-a", 2);
+        done.session_id = "chat:one".into();
+        let done_id = done.id.clone();
+        let mut done_elsewhere = finished("agent-a", 3);
+        done_elsewhere.session_id = "chat:two".into();
+        let done_elsewhere_id = done_elsewhere.id.clone();
+        let other_agent = finished("agent-b", 4);
+        let other_agent_id = other_agent.id.clone();
+        for run in [running, done, done_elsewhere, other_agent] {
+            ledger.insert(run);
+        }
+
+        let mut removed = ledger
+            .remove_terminal_for_agent("agent-a")
+            .iter()
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        removed.sort();
+        let mut expected = [done_id, done_elsewhere_id];
+        expected.sort();
+
+        assert_eq!(removed, expected);
+        assert!(
+            ledger.get(&running_id).is_some(),
+            "an in-flight run is never removed"
+        );
+        assert!(
+            ledger.get(&other_agent_id).is_some(),
+            "other agents are untouched"
+        );
+        assert!(ledger
+            .for_agent("agent-a")
+            .iter()
+            .all(|run| run.id == running_id));
     }
 }

@@ -12,14 +12,14 @@ use base64::Engine as _;
 use tracing::warn;
 
 use super::{
-    hidden_message_ids, is_inbound_message, preview_text, schedule_id_of_room, SessionCapabilities,
-    SessionKind, SessionRecord,
+    hidden_message_ids, is_checkin_message, is_inbound_message, preview_text, schedule_id_of_room,
+    SessionCapabilities, SessionKind, SessionRecord,
 };
 use crate::agent_runs::config_helper_parent;
 use crate::app::SharedDaemonState;
 use crate::history::{
-    search_snippet, search_tokens, searchable_text, text_matches, HistoryStore, MessageOrder,
-    MessagePageQuery,
+    search_snippet, search_tokens, searchable_text, text_matches, HistoryMessage, HistoryStore,
+    MessageOrder, MessagePageQuery,
 };
 use crate::state::DaemonState;
 
@@ -38,6 +38,8 @@ pub(crate) const MAX_SEARCH_QUERY_CHARS: usize = 200;
 const SEARCH_SESSION_LIMIT: usize = 500;
 /// History rows read for a preview when the hot tail has none.
 const PREVIEW_ROW_LIMIT: usize = 20;
+/// History rows read per page while assembling a full export.
+const EXPORT_PAGE_ROWS: usize = 500;
 
 /// The filters of `GET /api/agents/{id}/sessions`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,8 +218,7 @@ fn candidate(
         .filter(|message| !hidden_ids.contains(&message.id))
         .collect::<Vec<_>>();
     let read_through = record.last_read_at_ms.unwrap_or(0);
-    let schedule_exists = record.kind == SessionKind::Checkin
-        && schedule_id_of_room(record.room_id()).is_some_and(|id| state.schedules.contains_key(id));
+    let schedule_exists = automation_exists(state, record);
     let matched = if tokens.is_empty() {
         None
     } else {
@@ -606,6 +607,147 @@ pub(crate) async fn session_messages(
         messages: page,
         next_before,
     })
+}
+
+/// Whether a check-in session's automation still exists; its session can be
+/// deleted only once it is gone (spec §3.2).
+pub(crate) fn automation_exists(state: &DaemonState, record: &SessionRecord) -> bool {
+    record.kind == SessionKind::Checkin
+        && schedule_id_of_room(record.room_id()).is_some_and(|id| state.schedules.contains_key(id))
+}
+
+/// Every visible message of a session oldest first, including messages only
+/// the history store still holds and silent check-in turns (spec §3.3
+/// export: the full transcript, not the default view).
+pub(crate) async fn full_transcript(
+    state: &SharedDaemonState,
+    agent_id: &str,
+    session_id: &str,
+) -> Result<(SessionRecord, String, Vec<Message>), MessagePageError> {
+    let (record, agent_name, hot, store) = {
+        let guard = state.read().await;
+        let runtime = guard
+            .agents
+            .get(agent_id)
+            .ok_or(MessagePageError::NotFound)?;
+        let record = guard
+            .sessions
+            .get(agent_id, session_id)
+            .ok_or(MessagePageError::NotFound)?
+            .clone();
+        let hot = runtime
+            .messages()
+            .iter()
+            .filter(|message| message.room_id == record.room_id())
+            .cloned()
+            .collect::<Vec<_>>();
+        (
+            record,
+            runtime.config().name.clone(),
+            hot,
+            guard.history.store(),
+        )
+    };
+    let hot_ids = hot
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<HashSet<_>>();
+    let mut messages = hot;
+    let mut before = None;
+    loop {
+        let query = MessagePageQuery {
+            agent_id: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            before: before.clone(),
+            limit: EXPORT_PAGE_ROWS,
+            include_hidden: true,
+        };
+        let rows = store.page_messages(&query).await.map_err(|error| {
+            warn!(error = %error, "a session export could not read the history store");
+            MessagePageError::Unavailable
+        })?;
+        let full_page = rows.len() == EXPORT_PAGE_ROWS;
+        before = rows.last().map(HistoryMessage::order);
+        messages.extend(
+            rows.into_iter()
+                .filter(|row| !hot_ids.contains(&row.message.id))
+                .map(|row| row.message),
+        );
+        if !full_page {
+            break;
+        }
+    }
+    messages.sort_by_key(MessageOrder::of);
+    Ok((record, agent_name, messages))
+}
+
+fn format_time(created_at_ms: u64) -> String {
+    i64::try_from(created_at_ms)
+        .ok()
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|at| at.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_default()
+}
+
+/// The Markdown export of a session (spec §3.3): every message, oldest
+/// first, with silent check-in turns kept and marked (Controller ruling 3,
+/// M2 pre-flight audit: export promises the full transcript).
+pub(crate) fn transcript_markdown(
+    record: &SessionRecord,
+    agent_name: &str,
+    messages: &[Message],
+) -> String {
+    let hidden_ids = hidden_message_ids(messages.iter());
+    let mut markdown = format!("# {}\n\n", record.title);
+    markdown.push_str(&format!(
+        "- Agent: {agent_name}\n- Session: `{}` ({})\n- Messages: {}\n",
+        record.id,
+        record.kind.as_str(),
+        messages.len()
+    ));
+    for message in messages {
+        let speaker = match message.role {
+            MessageRole::User if is_checkin_message(message) => "Check-in",
+            MessageRole::User if is_inbound_message(message) => "Telegram",
+            MessageRole::User if record.kind == SessionKind::Helper => "Request",
+            MessageRole::User => "You",
+            MessageRole::Assistant => agent_name,
+            MessageRole::Tool => "Tool",
+            MessageRole::System => "System",
+        };
+        let marker = if hidden_ids.contains(&message.id) {
+            " (silent check-in)"
+        } else {
+            ""
+        };
+        markdown.push_str(&format!(
+            "\n---\n\n**{speaker}** · {}{marker}\n\n{}\n",
+            format_time(message.created_at_ms),
+            searchable_text(message).trim_end()
+        ));
+    }
+    markdown
+}
+
+/// A download file name from a title: lowercase letters, digits, and dashes.
+pub(crate) fn export_file_stem(title: &str) -> String {
+    let mut stem = String::new();
+    for character in title.chars() {
+        if stem.len() >= 60 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            stem.push(character.to_ascii_lowercase());
+        } else if !stem.is_empty() && !stem.ends_with('-') {
+            stem.push('-');
+        }
+    }
+    let stem = stem.trim_end_matches('-');
+    if stem.is_empty() {
+        "session".to_string()
+    } else {
+        stem.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1534,5 +1676,77 @@ mod tests {
             "counts fall back to the visible hot messages"
         );
         assert_eq!(view.preview.as_deref(), Some("Two tasks are overdue"));
+    }
+
+    #[tokio::test]
+    async fn the_markdown_export_includes_silent_checkins_and_labels_speakers() {
+        // Controller ruling 3 (M2 pre-flight audit): the export promises the
+        // full transcript (spec §3.3), so silent check-in turns are included
+        // and marked, unlike the default session view which hides them.
+        let mut daemon = DaemonState::new();
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        daemon.sessions.insert(session(
+            &agent,
+            "schedule:s1",
+            SessionKind::Checkin,
+            "Check-in · Check status",
+            1,
+        ));
+        seed_messages(
+            &mut daemon,
+            &agent,
+            vec![
+                checkin_prompt(&agent, "c1", "schedule:s1", "s1", "Check status", 60_000),
+                message(
+                    &agent,
+                    "c2",
+                    "schedule:s1",
+                    MessageRole::Assistant,
+                    "CHECKIN_OK",
+                    60_001,
+                ),
+                checkin_prompt(&agent, "c3", "schedule:s1", "s1", "Check status", 120_000),
+                message(
+                    &agent,
+                    "c4",
+                    "schedule:s1",
+                    MessageRole::Assistant,
+                    "Two tasks are overdue",
+                    120_001,
+                ),
+            ],
+        );
+        let state = Arc::new(RwLock::new(daemon));
+
+        let (record, agent_name, messages) = full_transcript(&state, &agent, "schedule:s1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["c1", "c2", "c3", "c4"]
+        );
+        assert_eq!(
+            transcript_markdown(&record, &agent_name, &messages),
+            "# Check-in · Check status\n\n- Agent: companion\n- Session: `schedule:s1` (checkin)\n- Messages: 4\n\n---\n\n**Check-in** · 1970-01-01 00:01 UTC (silent check-in)\n\nCheck status\n\n---\n\n**companion** · 1970-01-01 00:01 UTC (silent check-in)\n\nCHECKIN_OK\n\n---\n\n**Check-in** · 1970-01-01 00:02 UTC\n\nCheck status\n\n---\n\n**companion** · 1970-01-01 00:02 UTC\n\nTwo tasks are overdue\n"
+        );
+        assert_eq!(
+            export_file_stem("Check-in · Check status"),
+            "check-in-check-status"
+        );
+        assert_eq!(export_file_stem("···"), "session");
+        assert_eq!(
+            full_transcript(&state, &agent, "chat:missing")
+                .await
+                .unwrap_err(),
+            MessagePageError::NotFound
+        );
     }
 }

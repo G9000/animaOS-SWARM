@@ -1373,6 +1373,8 @@ pub(crate) struct DaemonState {
     pub(crate) runs: crate::runs::RunLedger,
     pub(crate) sessions: crate::sessions::SessionRegistry,
     pub(crate) history: crate::history::SharedHistory,
+    /// Session creations per agent per minute (spec §14); not persisted.
+    pub(crate) session_limiter: crate::sessions::SessionCreateLimiter,
     pub(crate) tool_grants_applied: std::collections::BTreeSet<String>,
     /// Saved history deletions the store has not applied yet (spec §3.3).
     pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
@@ -1527,6 +1529,7 @@ impl DaemonState {
             runs: crate::runs::RunLedger::default(),
             sessions: crate::sessions::SessionRegistry::default(),
             history: crate::history::HistoryService::ephemeral(),
+            session_limiter: crate::sessions::SessionCreateLimiter::default(),
             tool_grants_applied: std::collections::BTreeSet::new(),
             pending_history_deletions: Vec::new(),
             calendar_connectors: HashMap::new(),
