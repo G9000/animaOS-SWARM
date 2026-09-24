@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anima_core::MessageRole;
 use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
@@ -531,6 +530,7 @@ impl HistoryStore for SqliteHistoryStore {
 mod tests {
     use super::*;
     use crate::history::conformance::{assert_history_store_conformance, history_message};
+    use anima_core::MessageRole;
 
     struct TempHistory(PathBuf);
 
