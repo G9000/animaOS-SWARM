@@ -233,6 +233,39 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
         [id(160, 14)]
     );
 
+    // A fresh agent id keeps this block from perturbing any count or page
+    // asserted above.
+    let word_boundary_agent = format!("agent-{}", uuid::Uuid::new_v4());
+    store
+        .upsert_messages(&[
+            history_message(
+                &id(170, 15),
+                &word_boundary_agent,
+                "chat:a",
+                MessageRole::User,
+                "underdeployment fixed",
+                at(170),
+            ),
+            history_message(
+                &id(180, 16),
+                &word_boundary_agent,
+                "chat:a",
+                MessageRole::User,
+                "re-deploy tomorrow",
+                at(180),
+            ),
+        ])
+        .await
+        .expect("word-boundary messages upsert");
+    assert_eq!(
+        ids(&store
+            .search_messages(&[word_boundary_agent.clone()], "deploy", 10)
+            .await
+            .unwrap()),
+        [id(180, 16)],
+        "a mid-word occurrence must not match a word-prefix search"
+    );
+
     let known = store
         .existing_message_ids(&[id(100, 9), format!("missing-{base}")])
         .await

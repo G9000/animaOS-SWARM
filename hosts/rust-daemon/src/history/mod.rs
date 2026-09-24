@@ -173,13 +173,24 @@ pub(crate) fn search_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether every token occurs in `text`, ignoring case.
+/// Whether every token is a case-insensitive prefix of some word in `text`,
+/// where words are split the same way `search_tokens` splits a query.
 pub(crate) fn text_matches(text: &str, tokens: &[String]) -> bool {
-    let lowered = text.to_lowercase();
-    !tokens.is_empty() && tokens.iter().all(|token| lowered.contains(token.as_str()))
+    if tokens.is_empty() {
+        return false;
+    }
+    let words = text
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+    tokens
+        .iter()
+        .all(|token| words.iter().any(|word| word.starts_with(token.as_str())))
 }
 
-/// A single-line excerpt around the first matching token.
+/// A single-line excerpt around the first matching token. Prefers a match
+/// that starts a word over one buried inside another word.
 pub(crate) fn search_snippet(text: &str, tokens: &[String]) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let chars = collapsed.chars().collect::<Vec<_>>();
@@ -187,18 +198,25 @@ pub(crate) fn search_snippet(text: &str, tokens: &[String]) -> String {
         .iter()
         .map(|character| character.to_lowercase().next().unwrap_or(*character))
         .collect::<Vec<_>>();
-    let position = tokens
+    let starts_word = |index: usize| index == 0 || !lowered[index - 1].is_alphanumeric();
+    let occurrences = |token: &String| {
+        let needle = token.chars().collect::<Vec<_>>();
+        if needle.is_empty() || needle.len() > lowered.len() {
+            return Vec::new();
+        }
+        lowered
+            .windows(needle.len())
+            .enumerate()
+            .filter_map(|(index, window)| (window == needle.as_slice()).then_some(index))
+            .collect::<Vec<_>>()
+    };
+    let all_positions = tokens.iter().flat_map(occurrences).collect::<Vec<_>>();
+    let position = all_positions
         .iter()
-        .filter_map(|token| {
-            let needle = token.chars().collect::<Vec<_>>();
-            if needle.is_empty() || needle.len() > lowered.len() {
-                return None;
-            }
-            lowered
-                .windows(needle.len())
-                .position(|window| window == needle.as_slice())
-        })
+        .copied()
+        .filter(|&index| starts_word(index))
         .min()
+        .or_else(|| all_positions.iter().copied().min())
         .unwrap_or(0);
     let start = position.saturating_sub(MAX_SNIPPET_CHARS / 3);
     let end = (start + MAX_SNIPPET_CHARS).min(chars.len());
@@ -254,6 +272,11 @@ mod tests {
         assert!(text_matches("We deployed the Build.", &tokens));
         assert!(!text_matches("We deployed it.", &tokens));
         assert!(!text_matches("anything", &[]));
+        assert!(
+            !text_matches("underdeployment", &search_tokens("deploy")),
+            "a mid-word occurrence is not a word prefix"
+        );
+        assert!(text_matches("Re-deploy tonight", &search_tokens("deploy")));
     }
 
     #[test]
@@ -274,5 +297,15 @@ mod tests {
             search_snippet("no match here", &search_tokens("zebra")),
             "no match here"
         );
+    }
+
+    #[test]
+    fn snippet_prefers_a_word_start_match_over_an_earlier_mid_word_occurrence() {
+        // "deploy" occurs mid-word in "underdeploy" near the start, and again
+        // as a whole word after more than MAX_SNIPPET_CHARS filler.
+        let text = format!("underdeploy {}real deploy here", "filler ".repeat(40));
+        let snippet = search_snippet(&text, &search_tokens("deploy"));
+        assert!(snippet.contains("real deploy here"), "{snippet}");
+        assert!(!snippet.contains("underdeploy"), "{snippet}");
     }
 }
