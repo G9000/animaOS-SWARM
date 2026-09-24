@@ -1290,7 +1290,6 @@ async fn update_agent_entry(
         (status = 200, description = "Task result", body = AgentRunEnvelope),
         (status = 400, description = "Invalid request", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
-        (status = 409, description = "A run with this idempotency key is already in progress", body = ErrorBody),
         (status = 503, description = "Too many concurrent runs, or too many runs already waiting for this agent", body = ErrorBody)
     )
 )]
