@@ -1314,98 +1314,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_agent_deletion_removes_its_rows_and_keeps_its_runs_out_of_the_store() {
-        let store = Arc::new(MemoryHistoryStore::new());
-        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
-        let transactions = coordinator.control_plane_transactions();
-        let survivor = state
-            .write()
-            .await
-            .create_agent(config("survivor"))
-            .unwrap()
-            .state
-            .id;
-        coordinator
-            .run(request(&agent_id, "chat:one", "mirrored"))
-            .await
-            .unwrap();
-        let history = state.read().await.history.clone();
-        history
-            .flush_once(&state, &transactions, now_millis())
-            .await
-            .unwrap();
-        coordinator
-            .run(request(&agent_id, "chat:two", "still queued"))
-            .await
-            .unwrap();
-        coordinator
-            .run(request(&survivor, "chat:one", "unrelated"))
-            .await
-            .unwrap();
-        let run_ids = state
-            .read()
-            .await
-            .runs
-            .for_agent(&agent_id)
-            .into_iter()
-            .map(|run| run.id.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(run_ids.len(), 2);
-
-        // The agent delete (Task 12): remove the agent and its terminal runs,
-        // and record its history deletion, in one save, then queue the
-        // deletion. Unlike Task 6, the runs leave the ledger immediately
-        // instead of lingering until a restart (Controller ruling 2, M2
-        // pre-flight audit): `unmirrored_terminal` skips agents that no
-        // longer exist, so they would otherwise never be mirrored or pruned.
-        {
-            let _transaction = coordinator.control_plane_transaction().await;
-            let persist = {
-                let mut guard = state.write().await;
-                guard.remove_agent(&agent_id);
-                guard.runs.remove_terminal_for_agent(&agent_id);
-                guard.record_history_deletion(HistoryDeletion::agent(&agent_id));
-                guard.control_plane_persist_request()
-            };
-            persist.save().await.unwrap();
-            history.enqueue_agent_deletion(&agent_id);
-        }
-        let report = history
-            .flush_once(&state, &transactions, now_millis())
-            .await
-            .unwrap();
-
-        assert_eq!(report.deletions, 1);
-        for session in ["chat:one", "chat:two"] {
-            assert!(
-                store
-                    .page_messages(&page(&agent_id, session))
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "{session}"
-            );
-        }
-        assert!(
-            state.read().await.runs.for_agent(&agent_id).is_empty(),
-            "the deleted agent's runs are dropped from the ledger in the same save as the agent"
-        );
-        for run_id in run_ids {
-            assert_eq!(
-                store.get_run(&run_id).await.unwrap(),
-                None,
-                "a deleted agent's runs are not mirrored"
-            );
-        }
-        assert_eq!(
-            store
-                .page_messages(&page(&survivor, "chat:one"))
-                .await
-                .unwrap()
-                .len(),
-            2
-        );
-        assert!(state.read().await.pending_history_deletions.is_empty());
-    }
+    // The hand-simulated agent-delete test that used to live here (Task 12) is
+    // gone (fix round 1, M2 review): it never called `ConnectorManager::
+    // delete_agent`, so it could not catch a regression in that method itself.
+    // `connectors::runtime::tests::
+    // deleting_an_agent_through_the_manager_is_durable_and_a_flush_clears_its_rows`
+    // covers the same ground (store rows removed, runs not re-mirrored, an
+    // unrelated agent's rows untouched, the pending entry cleared) through the
+    // real method, plus a real JSON control-plane store and session-registry
+    // cleanup this test never checked.
 }

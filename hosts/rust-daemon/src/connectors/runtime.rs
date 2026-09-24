@@ -1575,7 +1575,7 @@ impl ConnectorManager {
             // protocol): a crash right after a successful save still replays
             // this deletion on restart.
             let deletion = HistoryDeletion::agent(&agent_id);
-            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, previous_runs, persist) = {
+            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, previous_runs, previous_sessions, persist) = {
                 let mut state = manager.state.write().await;
                 let agent_snapshot = state.get_agent(&agent_id);
                 let previous_connectors = previous
@@ -1626,6 +1626,9 @@ impl ConnectorManager {
                 // mirrored and never pruned (Controller ruling 2, M2
                 // pre-flight audit, carried forward from Task 6).
                 let previous_runs = state.runs.remove_terminal_for_agent(&agent_id);
+                // Without this, a deleted agent's session records stay in the
+                // registry until a restart (fix round 1, M2 review).
+                let previous_sessions = state.sessions.remove_for_agent(&agent_id);
                 state.record_history_deletion(deletion.clone());
                 let persist = state.control_plane_persist_request();
                 (
@@ -1635,6 +1638,7 @@ impl ConnectorManager {
                     previous_outbound,
                     previous_schedules,
                     previous_runs,
+                    previous_sessions,
                     persist,
                 )
             };
@@ -1650,6 +1654,9 @@ impl ConnectorManager {
                     state.schedules = previous_schedules;
                     for run in previous_runs {
                         state.runs.insert(run);
+                    }
+                    for session in previous_sessions {
+                        state.sessions.insert(session);
                     }
                     state.clear_history_deletion(&deletion);
                     if let Some(agent_snapshot) = agent_snapshot {
@@ -6607,6 +6614,209 @@ mod tests {
         );
         manager.shutdown().await;
         std::fs::remove_dir_all(invalid_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_through_the_manager_is_durable_and_a_flush_clears_its_rows() {
+        // Fix round 1 (M2 review): the two tests above never exercise a real
+        // control-plane store or a flush, so deleting `remove_terminal_for_agent`
+        // or `enqueue_agent_deletion`, or reordering `record_history_deletion`
+        // after the persist request is built, would leave every test green.
+        // This test goes through `ConnectorManager::delete_agent` itself, with a
+        // real JSON store, a mirrored message, a terminal run, and a session
+        // record, then flushes with the coordinator's own transaction mutex.
+        use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+        use crate::history::MessagePageQuery;
+        use crate::runs::{RunRecord, RunSource as RunLedgerSource, RunStart, RunStatus};
+        use crate::sessions::test_support::{message, seed_messages};
+        use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+        use anima_core::MessageRole;
+
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let survivor_id = state
+            .write()
+            .await
+            .create_agent(AgentConfig {
+                name: "survivor".into(),
+                ..test_config()
+            })
+            .unwrap()
+            .state
+            .id;
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let transactions = runs.control_plane_transactions();
+
+        state.write().await.sessions.insert(SessionRecord::new(
+            &agent_id,
+            "chat:one",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Plans".into(),
+            TitleSource::FirstMessage,
+            1,
+        ));
+        seed_messages(
+            &mut *state.write().await,
+            &agent_id,
+            vec![message(
+                &agent_id,
+                "m1",
+                "chat:one",
+                MessageRole::User,
+                "hello",
+                1,
+            )],
+        );
+        seed_messages(
+            &mut *state.write().await,
+            &survivor_id,
+            vec![message(
+                &survivor_id,
+                "s1",
+                "chat:one",
+                MessageRole::User,
+                "unrelated",
+                1,
+            )],
+        );
+        let history = state.read().await.history.clone();
+        history.flush_once(&state, &transactions, 1).await.unwrap();
+        let mirrored = history
+            .store()
+            .page_messages(&MessagePageQuery {
+                agent_id: agent_id.clone(),
+                session_id: "chat:one".into(),
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mirrored.len(), 1, "the message is mirrored before deleting");
+
+        let run_id = {
+            let mut guard = state.write().await;
+            let mut run = RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: "chat:one".into(),
+                    source: RunLedgerSource::Api,
+                    source_ref: None,
+                    idempotency_key: None,
+                    text: "hi".into(),
+                    model: "gpt-5.4".into(),
+                    provider: None,
+                    parent_run_id: None,
+                },
+                1,
+            );
+            run.finish(RunStatus::Completed, None, 1);
+            let id = run.id.clone();
+            guard.runs.insert(run);
+            id
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "anima-agent-delete-durable-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ControlPlaneStoreConfig::Json(path.clone());
+        state
+            .write()
+            .await
+            .set_control_plane_store(Some(store.clone()));
+
+        manager.delete_agent(agent_id.clone()).await.unwrap();
+
+        // The saved snapshot (not just in-memory state) holds the deletion and
+        // excludes the agent's runs and session records.
+        let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+        assert!(
+            saved
+                .pending_history_deletions
+                .iter()
+                .any(|deletion| deletion.agent_id == agent_id && deletion.session_id.is_none()),
+            "the saved snapshot records the deletion"
+        );
+        assert!(
+            saved.runs.iter().all(|run| run.agent_id != agent_id),
+            "the saved snapshot holds none of the agent's runs"
+        );
+        assert!(
+            saved
+                .sessions
+                .iter()
+                .all(|session| session.agent_id != agent_id),
+            "the saved snapshot holds none of the agent's sessions"
+        );
+        assert!(
+            state
+                .read()
+                .await
+                .sessions
+                .get(&agent_id, "chat:one")
+                .is_none(),
+            "the agent's session records leave the registry immediately, not just the snapshot"
+        );
+        // Neither the saved snapshot nor a flush would fail to exclude a
+        // lingering run of a deleted agent -- both independently filter to
+        // live agents already -- so this is the only assertion that would
+        // catch a regressed (skipped) `remove_terminal_for_agent` call.
+        assert!(
+            state.read().await.runs.get(&run_id).is_none(),
+            "the agent's terminal run leaves the ledger immediately, not just the snapshot"
+        );
+
+        let report = history.flush_once(&state, &transactions, 2).await.unwrap();
+        assert_eq!(report.deletions, 1);
+
+        let after = history
+            .store()
+            .page_messages(&MessagePageQuery {
+                agent_id: agent_id.clone(),
+                session_id: "chat:one".into(),
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "the flush removes the agent's rows");
+        assert_eq!(
+            history.store().get_run(&run_id).await.unwrap(),
+            None,
+            "the flush never mirrors the deleted agent's run"
+        );
+        assert!(
+            state.read().await.pending_history_deletions.is_empty(),
+            "the flush clears the pending entry once applied"
+        );
+        let survivor_rows = history
+            .store()
+            .page_messages(&MessagePageQuery {
+                agent_id: survivor_id.clone(),
+                session_id: "chat:one".into(),
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            survivor_rows.len(),
+            1,
+            "an unrelated agent's rows are untouched"
+        );
+
+        manager.shutdown().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]

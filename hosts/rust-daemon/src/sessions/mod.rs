@@ -613,6 +613,22 @@ impl SessionRegistry {
         self.records.remove(&Self::key(agent_id, session_id))
     }
 
+    /// Removes every session record of a deleted agent and returns them, so a
+    /// failed save can put them back. Without this, a deleted agent's session
+    /// records stay in the registry until a restart (`restored` is what drops
+    /// sessions of missing agents today) — fix round 1, M2 review.
+    pub(crate) fn remove_for_agent(&mut self, agent_id: &str) -> Vec<SessionRecord> {
+        let keys = self
+            .records
+            .keys()
+            .filter(|(record_agent_id, _)| record_agent_id == agent_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| self.records.remove(&key))
+            .collect()
+    }
+
     pub(crate) fn records(&self) -> impl Iterator<Item = &SessionRecord> {
         self.records.values()
     }
