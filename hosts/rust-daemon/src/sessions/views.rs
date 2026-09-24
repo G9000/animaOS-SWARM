@@ -802,6 +802,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_falls_back_to_the_store_when_the_hot_tail_has_none() {
+        let mut daemon = DaemonState::new();
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        daemon
+            .sessions
+            .insert(session(&agent, "chat:plans", SessionKind::Chat, "Plans", 1));
+        // No hot messages at all for this room: the hot tail has no preview.
+        daemon
+            .history
+            .store()
+            .upsert_messages(&[history_message(
+                "s1",
+                &agent,
+                "chat:plans",
+                MessageRole::Assistant,
+                "Only the store has this",
+                1,
+            )])
+            .await
+            .unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+
+        let view = session_view(&state, &agent, "chat:plans").await.unwrap();
+        assert_eq!(view.preview.as_deref(), Some("Only the store has this"));
+    }
+
+    #[tokio::test]
+    async fn a_telegram_inbound_message_marks_a_session_unread_only_when_newer_than_last_read() {
+        let mut daemon = DaemonState::new();
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        let mut unread = session(&agent, "telegram:bot", SessionKind::Telegram, "Telegram", 1);
+        unread.last_activity_at_ms = 30;
+        unread.last_read_at_ms = Some(20);
+        daemon.sessions.insert(unread);
+        let mut read = session(
+            &agent,
+            "telegram:other",
+            SessionKind::Telegram,
+            "Telegram",
+            1,
+        );
+        read.last_activity_at_ms = 10;
+        read.last_read_at_ms = Some(20);
+        daemon.sessions.insert(read);
+        let inbound = |id: &str, room: &str, at: u64| {
+            let mut message = message(&agent, id, room, MessageRole::User, "Hey there", at);
+            message.content.metadata = Some(std::collections::BTreeMap::from([(
+                "source".to_string(),
+                anima_core::DataValue::String("telegram".into()),
+            )]));
+            message
+        };
+        seed_messages(
+            &mut daemon,
+            &agent,
+            vec![
+                inbound("t1", "telegram:bot", 30),
+                inbound("t2", "telegram:other", 10),
+            ],
+        );
+        let state = Arc::new(RwLock::new(daemon));
+
+        let newer = session_view(&state, &agent, "telegram:bot").await.unwrap();
+        assert!(
+            newer.unread,
+            "an inbound message newer than lastReadAtMs marks the session unread"
+        );
+        let older = session_view(&state, &agent, "telegram:other")
+            .await
+            .unwrap();
+        assert!(
+            !older.unread,
+            "an inbound message no newer than lastReadAtMs leaves the session read"
+        );
+    }
+
+    #[tokio::test]
     async fn lists_include_helper_sessions_of_the_agent_unless_excluded() {
         let mut daemon = DaemonState::new();
         let companion = daemon
@@ -1031,6 +1116,61 @@ mod tests {
             page.sessions.iter().map(|view| view.record.id.as_str()).collect::<Vec<_>>(),
             ["chat:busy", "chat:quiet"],
             "a session with more than SEARCH_SESSION_LIMIT matches must not crowd out an older session's only match"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_search_still_returns_hot_tail_matches() {
+        let flaky = Arc::new(FlakyHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(flaky.clone()));
+        let agent = daemon
+            .create_agent(agent_config("companion"))
+            .unwrap()
+            .state
+            .id;
+        daemon
+            .sessions
+            .insert(session(&agent, "chat:plans", SessionKind::Chat, "Plans", 1));
+        seed_messages(
+            &mut daemon,
+            &agent,
+            vec![message(
+                &agent,
+                "h1",
+                "chat:plans",
+                MessageRole::User,
+                "Buy widgets",
+                1,
+            )],
+        );
+        let state = Arc::new(RwLock::new(daemon));
+        flaky.set_failing(true);
+
+        let page = list_sessions(
+            &state,
+            &agent,
+            &SessionListQuery {
+                q: Some("widgets".into()),
+                ..SessionListQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.sessions
+                .iter()
+                .map(|view| view.record.id.as_str())
+                .collect::<Vec<_>>(),
+            ["chat:plans"],
+            "a hot-tail match must survive an unreadable history store"
+        );
+        assert_eq!(
+            page.sessions[0]
+                .matched
+                .as_ref()
+                .and_then(|found| found.message_id.as_deref()),
+            Some("h1")
         );
     }
 

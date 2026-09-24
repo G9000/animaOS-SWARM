@@ -184,6 +184,11 @@ async fn session_routes_list_one_session_and_page_its_messages() {
             "cursor is invalid",
         ),
         (
+            format!("/api/agents/{agent}/sessions?q={}", "a".repeat(201)),
+            StatusCode::BAD_REQUEST,
+            "q must be at most 200 characters",
+        ),
+        (
             format!("/api/agents/{agent}/sessions/chat%3Aplans/messages?before=nope"),
             StatusCode::BAD_REQUEST,
             "before message was not found",
