@@ -5,6 +5,7 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
 } from 'react';
 import { ConversationTools } from './ConversationTools';
 import { CopyMessage } from './CopyMessage';
@@ -178,16 +179,31 @@ export const MessageList = memo(function MessageList({
   sending,
   scrollerRef,
   onSuggestion,
+  hasOlder = false,
+  loadingOlder = false,
+  onLoadOlder,
+  emptyState,
 }: {
   agent: AgentDetail;
   sending: boolean;
   scrollerRef: React.RefObject<HTMLDivElement | null>;
   onSuggestion: (text: string) => void;
+  /** Older history exists: show a control and load it on scroll to the top. */
+  hasOlder?: boolean;
+  loadingOlder?: boolean;
+  onLoadOlder?: () => void;
+  /** Replaces the welcome screen for sessions that are not new chats. */
+  emptyState?: ReactNode;
 }) {
   const [awayFromBottom, setAwayFromBottom] = useState(false);
   const [highlight, setHighlight] = useState<string | null>(null);
   const atBottom = useRef(true);
   const messageElements = useRef(new Map<string, HTMLDivElement>());
+  const firstMessageId = agent.messages[0]?.id;
+  const anchor = useRef<{ firstId: string | undefined; height: number }>({
+    firstId: firstMessageId,
+    height: 0,
+  });
   const jumpToMessage = useCallback((id: string) => {
     atBottom.current = false;
     setAwayFromBottom(true);
@@ -205,6 +221,20 @@ export const MessageList = memo(function MessageList({
       if (element) element.scrollTop = element.scrollHeight;
     }
   }, [agent.messages, sending, scrollerRef]);
+  // Keep the reading position when older messages are prepended.
+  useLayoutEffect(() => {
+    const element = scrollerRef.current;
+    if (!element) return;
+    const previous = anchor.current;
+    if (
+      previous.firstId !== undefined &&
+      previous.firstId !== firstMessageId &&
+      !atBottom.current
+    ) {
+      element.scrollTop += element.scrollHeight - previous.height;
+    }
+    anchor.current = { firstId: firstMessageId, height: element.scrollHeight };
+  }, [firstMessageId, agent.messages, scrollerRef]);
 
   return (
     <>
@@ -226,12 +256,27 @@ export const MessageList = memo(function MessageList({
               element.scrollHeight - element.scrollTop - element.clientHeight <
               80;
             setAwayFromBottom(!atBottom.current);
+            if (element.scrollTop < 40 && hasOlder && !loadingOlder) {
+              onLoadOlder?.();
+            }
           }}
         >
           {agent.messages.length === 0 && !sending ? (
-            <EmptyState agentName={agent.name} onPick={onSuggestion} />
+            (emptyState ?? (
+              <EmptyState agentName={agent.name} onPick={onSuggestion} />
+            ))
           ) : (
             <div className="studio-messages mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6 sm:px-6">
+              {hasOlder && onLoadOlder && (
+                <button
+                  type="button"
+                  className="studio-tool-button session-load-older"
+                  onClick={onLoadOlder}
+                  disabled={loadingOlder}
+                >
+                  {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
+                </button>
+              )}
               {agent.messages.map((m) => (
                 <div
                   key={m.id}
@@ -266,6 +311,7 @@ export const MessageList = memo(function MessageList({
 /* ── Composer ── */
 export function Composer({
   agentName,
+  label,
   draft,
   setDraft,
   sending,
@@ -277,6 +323,8 @@ export function Composer({
   recovery,
 }: {
   agentName: string;
+  /** The textarea's name and placeholder; defaults to "Message <agent>". */
+  label?: string;
   draft: string;
   setDraft: (v: string) => void;
   sending: boolean;
@@ -293,6 +341,7 @@ export function Composer({
   };
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const inputLabel = label ?? `Message ${agentName}`;
 
   useEffect(() => {
     const el = taRef.current;
@@ -364,8 +413,8 @@ export function Composer({
               }
             }}
             rows={1}
-            aria-label={`Message ${agentName}`}
-            placeholder={`Message ${agentName}…`}
+            aria-label={inputLabel}
+            placeholder={`${inputLabel}…`}
             className="max-h-48 flex-1 resize-none bg-transparent px-3 py-2 text-sm leading-relaxed text-ink placeholder-ink-3 outline-none"
           />
           <button
