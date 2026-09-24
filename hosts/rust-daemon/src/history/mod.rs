@@ -8,20 +8,22 @@ mod memory;
 mod outbox;
 mod postgres;
 mod sqlite;
+mod worker;
 
 pub(crate) use memory::MemoryHistoryStore;
-pub(crate) use outbox::{
-    HistoryDeletion, HistoryService, HistoryWorker, HistoryWorkerOwner, SharedHistory,
-};
+pub(crate) use outbox::{HistoryService, SharedHistory};
 #[cfg(test)]
 pub(crate) use outbox::{HISTORY_FLUSH_INTERVAL, HISTORY_READINESS_GRACE_MS};
 pub(crate) use postgres::PostgresHistoryStore;
 pub(crate) use sqlite::SqliteHistoryStore;
+pub(crate) use worker::{HistoryWorker, HistoryWorkerOwner};
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex as StdMutex, MutexGuard};
 
 use anima_core::{Message, MessageRole};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::runs::RunRecord;
 
@@ -85,6 +87,40 @@ pub(crate) struct MessagePageQuery {
     pub(crate) before: Option<MessageOrder>,
     pub(crate) limit: usize,
     pub(crate) include_hidden: bool,
+}
+
+/// A history deletion the control plane has saved and the store may not have
+/// applied yet: one session, or without `session_id` the whole agent. The
+/// control plane keeps these as `pendingHistoryDeletions`, so a restart
+/// replays them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HistoryDeletion {
+    pub(crate) agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+}
+
+impl HistoryDeletion {
+    pub(crate) fn session(agent_id: &str, session_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            session_id: Some(session_id.to_string()),
+        }
+    }
+
+    pub(crate) fn agent(agent_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            session_id: None,
+        }
+    }
+}
+
+fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
