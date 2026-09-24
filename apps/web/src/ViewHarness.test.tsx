@@ -2275,6 +2275,54 @@ it('shows a failed session action in the sidebar instead of rejecting', async ()
   ).toHaveTextContent('archive refused');
 });
 
+it('marks a session read only once it is back on screen', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      unread: true,
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  const page = deferred<Awaited<ReturnType<typeof daemon.sessionMessages>>>();
+  vi.mocked(daemon.sessionMessages).mockReturnValueOnce(page.promise);
+  window.history.replaceState(null, '', '/#/s/room-7');
+  render(<ViewHarness />);
+
+  await screen.findByRole('button', { name: 'Weekend plans, unread' });
+  await user.click(screen.getByRole('button', { name: 'Work', exact: true }));
+  await act(async () =>
+    page.resolve({
+      messages: [
+        {
+          id: 'm1',
+          role: 'assistant',
+          text: 'Saturday works',
+          attachments: [],
+          metadata: {},
+          createdAtMs: 2,
+        },
+      ],
+      nextBefore: null,
+    }),
+  );
+  expect(await screen.findByText('Saturday works')).not.toBeVisible();
+  expect(daemon.updateSession).not.toHaveBeenCalled();
+
+  await user.click(screen.getByRole('button', { name: 'Open companion chat' }));
+  await waitFor(() =>
+    expect(daemon.updateSession).toHaveBeenCalledWith('agent-main', 'room-7', {
+      lastReadAtMs: 2,
+    }),
+  );
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });

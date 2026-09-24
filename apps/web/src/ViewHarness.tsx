@@ -626,11 +626,18 @@ export function ViewHarness() {
     };
   }, [agentId]);
 
-  // Opening an unread session marks it read up to its newest message.
+  // Opening an unread session marks it read up to its newest message, but
+  // not while a page hides it.
   const markedReadRef = useRef(new Map<string, number>());
   const refreshSessions = sessions.refresh;
+  const conversationHidden = availablePage(route) !== null;
   useEffect(() => {
-    if (!activeSession?.unread || history.messages.length === 0) return;
+    if (
+      conversationHidden ||
+      !activeSession?.unread ||
+      history.messages.length === 0
+    )
+      return;
     const newest = history.messages[history.messages.length - 1].createdAtMs;
     const key = sessionKey(activeSession);
     if ((markedReadRef.current.get(key) ?? 0) >= newest) return;
@@ -643,7 +650,7 @@ export function ViewHarness() {
         () => refreshSessions(),
         () => markedReadRef.current.delete(key),
       );
-  }, [activeSession, history.messages, refreshSessions]);
+  }, [activeSession, conversationHidden, history.messages, refreshSessions]);
 
   const changeWorkspaceAvatar = useCallback(
     async (file: File) => {
