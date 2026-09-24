@@ -166,7 +166,9 @@ impl AgentRuntime {
     /// Removes the transcript messages `keep` rejects and returns them in
     /// transcript order. Hosts use this to drop messages they keep elsewhere
     /// (for example ones mirrored to a history store) or a deleted room.
-    /// Counters, events, usage, status, and the last task are untouched.
+    /// Counters, events, usage, status, and the last task are untouched. The
+    /// transcript keeps no spare room for what it removed: its buffer shrinks
+    /// to the messages kept, so pruning a long transcript frees that memory.
     pub fn retain_messages(&mut self, mut keep: impl FnMut(&Message) -> bool) -> Vec<Message> {
         let mut removed = Vec::new();
         let mut kept = Vec::with_capacity(self.messages.len());
@@ -177,6 +179,7 @@ impl AgentRuntime {
                 removed.push(message);
             }
         }
+        kept.shrink_to_fit();
         self.messages = kept;
         removed
     }

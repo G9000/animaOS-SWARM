@@ -446,3 +446,37 @@ fn retain_messages_removes_only_rejected_messages_and_keeps_counters() {
         "keeping everything removes nothing"
     );
 }
+
+#[test]
+fn retain_messages_leaves_no_room_for_the_removed_messages() {
+    let mut canonical = canonical();
+    let status = canonical.state().status;
+    canonical.apply_run_delta(&super::RuntimeRunDelta {
+        messages: (0..1_000)
+            .map(|index| Message {
+                id: format!("msg-{index}"),
+                agent_id: "agent-1".into(),
+                room_id: if index < 990 { "room-old" } else { "room-kept" }.into(),
+                content: text("hello"),
+                role: MessageRole::User,
+                created_at_ms: index,
+            })
+            .collect(),
+        events: Vec::new(),
+        event_total: 0,
+        token_usage: TokenUsage::default(),
+        step_count: 0,
+        last_task: None,
+        status,
+    });
+
+    let removed = canonical.retain_messages(|message| message.room_id == "room-kept");
+
+    assert_eq!(removed.len(), 990);
+    assert_eq!(canonical.messages().len(), 10);
+    assert!(
+        canonical.messages.capacity() <= 2 * canonical.messages.len(),
+        "the transcript keeps room for {} messages after keeping 10",
+        canonical.messages.capacity()
+    );
+}
