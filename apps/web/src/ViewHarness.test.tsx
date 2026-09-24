@@ -376,6 +376,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   localStorage.clear();
+  sessionStorage.clear();
   window.history.replaceState(null, '', '/');
   vi.restoreAllMocks();
 });
@@ -1819,6 +1820,80 @@ it('shows why older messages could not be loaded', async () => {
 
   expect(await screen.findByRole('alert')).toHaveTextContent(
     'Messages could not be loaded: history store is unavailable',
+  );
+});
+
+it('keeps each conversation draft across a reload', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  window.history.replaceState(null, '', '/#/s/room-7');
+  const first = render(<ViewHarness />);
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, 'Half-written thought');
+  first.unmount();
+
+  render(<ViewHarness />);
+  expect(await screen.findByPlaceholderText('Message Nova…')).toHaveValue(
+    'Half-written thought',
+  );
+  await user.click(screen.getByRole('button', { name: 'New chat' }));
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue('');
+});
+
+it('keeps drafts in memory when session storage refuses them', async () => {
+  const user = userEvent.setup();
+  const setItem = Storage.prototype.setItem;
+  vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+    this: Storage,
+    key: string,
+    value: string,
+  ) {
+    if (this === window.sessionStorage)
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    setItem.call(this, key, value);
+  });
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  render(<ViewHarness />);
+
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Keep this thought',
+  );
+  await user.click(screen.getByRole('button', { name: 'Work', exact: true }));
+  await user.click(screen.getByRole('button', { name: 'Open companion chat' }));
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(
+    'Keep this thought',
+  );
+  await user.click(await screen.findByRole('button', { name: 'Weekend plans' }));
+  await waitFor(() =>
+    expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(''),
+  );
+  await user.click(screen.getByRole('button', { name: 'New chat' }));
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(
+    'Keep this thought',
   );
 });
 

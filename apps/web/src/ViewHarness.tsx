@@ -101,6 +101,33 @@ function sessionConversation(sessionId: string): string {
   return `session:${sessionId}`;
 }
 
+// Drafts are saved per agent and conversation in session storage (spec
+// §15.5), so a reload keeps them. Without storage they live in memory only.
+function draftStorageKey(key: string): string {
+  return `animaos.draft.${key.replace('\u0000', '/')}`;
+}
+
+function loadDraft(key: string): string {
+  try {
+    return window.sessionStorage.getItem(draftStorageKey(key)) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function storeDraft(key: string, draft: string) {
+  try {
+    if (draft) window.sessionStorage.setItem(draftStorageKey(key), draft);
+    else window.sessionStorage.removeItem(draftStorageKey(key));
+  } catch {
+    // Storage is full or blocked: the draft stays in memory for this page.
+  }
+}
+
+function chatState(chats: Record<string, ChatState>, key: string): ChatState {
+  return chats[key] ?? { ...EMPTY_CHAT, draft: loadDraft(key) };
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -258,16 +285,35 @@ export function ViewHarness() {
     : HOME_CONVERSATION;
   const activeChatKey = agentId ? chatKey(agentId, conversation) : null;
   const [chats, setChats] = useState<Record<string, ChatState>>({});
-  const chat = (activeChatKey ? chats[activeChatKey] : undefined) ?? EMPTY_CHAT;
+  const chat = activeChatKey ? chatState(chats, activeChatKey) : EMPTY_CHAT;
   const { draft, failedDrafts, sending, error: workspaceError } = chat;
   const failedDraft = failedDrafts[0]?.text ?? null;
+  const storedDraftsRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    for (const [key, value] of Object.entries(chats)) {
+      if (storedDraftsRef.current.get(key) === value.draft) continue;
+      storedDraftsRef.current.set(key, value.draft);
+      storeDraft(key, value.draft);
+    }
+  }, [chats]);
+  /** A deleted session's chat state and saved draft go with it. */
+  const forgetChat = (key: string) => {
+    storedDraftsRef.current.delete(key);
+    storeDraft(key, '');
+    setChats((current) => {
+      if (!(key in current)) return current;
+      const rest = { ...current };
+      delete rest[key];
+      return rest;
+    });
+  };
   const updateChat = useCallback(
     (
       key: string,
       patch: Partial<ChatState> | ((value: ChatState) => Partial<ChatState>),
     ) => {
       setChats((current) => {
-        const value = current[key] ?? EMPTY_CHAT;
+        const value = chatState(current, key);
         return {
           ...current,
           [key]: {
@@ -769,11 +815,11 @@ export function ViewHarness() {
     const target = chatKey(targetId, sessionConversation(session.id));
     // Text typed while the chat was created moves with it.
     setChats((current) => {
-      const home = current[homeKey] ?? EMPTY_CHAT;
+      const home = chatState(current, homeKey);
       return {
         ...current,
         [homeKey]: { ...home, draft: '', sending: false },
-        [target]: { ...(current[target] ?? EMPTY_CHAT), draft: home.draft },
+        [target]: { ...chatState(current, target), draft: home.draft },
       };
     });
     sessions.upsert(session);
@@ -874,6 +920,7 @@ export function ViewHarness() {
       await daemon.deleteSession(session.agentId, session.id);
       setSessionActionError(null);
       sessions.remove(session);
+      if (agentId) forgetChat(chatKey(agentId, sessionConversation(session.id)));
       if (routeSessionId === session.id) {
         if (route.kind === 'page') lastConversationRef.current = { kind: 'home' };
         else navigate({ kind: 'home' }, { replace: true });
