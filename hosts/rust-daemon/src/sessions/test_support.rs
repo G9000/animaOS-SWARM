@@ -72,6 +72,14 @@ pub(crate) fn checkin_prompt(
     checkin
 }
 
+/// Awaits `future`, failing the test after five seconds instead of hanging
+/// the test binary when a regression never reaches a gated call.
+pub(crate) async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(std::time::Duration::from_secs(5), future)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
 /// Appends `messages` to the agent's canonical transcript, as a commit would.
 pub(crate) fn seed_messages(state: &mut DaemonState, agent_id: &str, messages: Vec<Message>) {
     let runtime = state

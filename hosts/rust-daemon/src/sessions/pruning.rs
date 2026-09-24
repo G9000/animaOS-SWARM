@@ -214,7 +214,9 @@ mod tests {
     use crate::history::conformance::FlakyHistoryStore;
     use crate::history::HistoryService;
     use crate::runs::{RunRecord, RunSource, RunStart};
-    use crate::sessions::test_support::{agent_config, checkin_prompt, message, seed_messages};
+    use crate::sessions::test_support::{
+        agent_config, checkin_prompt, message, seed_messages, within,
+    };
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
     const NOW_MS: u64 = 10 * DAY_MS;
@@ -520,7 +522,10 @@ mod tests {
             .await
             .install_test_control_plane_save_gate(false);
         drop(held);
-        gate.entered.acquire().await.unwrap().forget();
+        within("the prune to reach its save", gate.entered.acquire())
+            .await
+            .unwrap()
+            .forget();
         {
             let guard = state
                 .try_read()
@@ -528,7 +533,7 @@ mod tests {
             assert_eq!(guard.get_agent(&agent).unwrap().messages.len(), 200);
         }
         gate.release.add_permits(1);
-        assert_eq!(prune.await.unwrap(), Ok(1));
+        assert_eq!(within("the prune to finish", prune).await.unwrap(), Ok(1));
     }
 
     #[tokio::test]

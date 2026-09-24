@@ -166,9 +166,12 @@ impl HistoryWorker {
 mod tests {
     use super::*;
     use crate::history::conformance::{history_message, FlakyHistoryStore};
-    use crate::history::{HistoryService, HistoryStore, MessagePageQuery, HISTORY_FLUSH_INTERVAL};
-    use crate::sessions::pruning::HOT_TAIL_MESSAGES;
-    use crate::sessions::test_support::{agent_config, message, seed_messages};
+    use crate::history::{
+        HistoryService, HistoryStore, MessagePageQuery, HISTORY_FLUSH_INTERVAL,
+        HISTORY_READINESS_GRACE_MS,
+    };
+    use crate::sessions::pruning::{prune_once, HOT_TAIL_MESSAGES};
+    use crate::sessions::test_support::{agent_config, message, seed_messages, within};
     use crate::state::DaemonState;
     use anima_core::MessageRole;
     use tokio::sync::RwLock;
@@ -328,7 +331,7 @@ mod tests {
         );
         assert!(!worker.has_stopped());
         drop(owner);
-        worker.shutdown().await;
+        within("the worker to shut down", worker.shutdown()).await;
     }
 
     #[tokio::test]
@@ -341,7 +344,13 @@ mod tests {
         // Hold the first pass inside its reconcile's store round trip.
         let gate = store.hold_next_existence_check();
         worker.start(&owner);
-        gate.entered.acquire().await.unwrap().forget();
+        within(
+            "the first flush to reach its reconcile's store call",
+            gate.entered.acquire(),
+        )
+        .await
+        .unwrap()
+        .forget();
 
         // The last owner goes (a stale app instance) while that flush runs.
         drop(owner);
@@ -364,6 +373,112 @@ mod tests {
         assert!(
             history.is_mirrored("m000"),
             "the flush in progress finished"
+        );
+    }
+
+    /// Waits, failing after a few flush intervals, until `condition` holds.
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + 5 * HISTORY_FLUSH_INTERVAL;
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loop_prunes_nothing_after_a_flush_until_its_interval_is_due() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, agent) = state_with_an_old_chat(Arc::clone(&store));
+        let transactions = Arc::new(Mutex::new(()));
+        // The production interval: ten minutes.
+        let worker = HistoryWorker::new(Arc::clone(&state), Arc::clone(&transactions));
+        let owner = HistoryWorkerOwner::new();
+        worker.start(&owner);
+
+        // The first pass reconciles and mirrors every message, which makes
+        // `m000` prunable; `m200`, the newest, is never pruned, so it stays
+        // mirrored either way. Two more passes follow while the test waits.
+        let history = state.read().await.history.clone();
+        wait_until("the first pass to mirror the chat", || {
+            history.is_mirrored("m200")
+        })
+        .await;
+        tokio::time::sleep(2 * HISTORY_FLUSH_INTERVAL).await;
+
+        assert_eq!(
+            hot_ids(&state, &agent).await.len(),
+            HOT_TAIL_MESSAGES + 1,
+            "no flush is followed by a prune before the interval is due"
+        );
+        assert!(!worker.has_stopped());
+        assert_eq!(
+            prune_once(&state, &transactions, now_millis()).await,
+            Ok(1),
+            "a prune was possible all along"
+        );
+        drop(owner);
+        within("the worker to shut down", worker.shutdown()).await;
+    }
+
+    #[tokio::test]
+    async fn a_prune_that_waited_for_the_transaction_rechecks_its_owner_under_it() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, agent) = state_with_an_old_chat(Arc::clone(&store));
+        let transactions = Arc::new(Mutex::new(()));
+        let history = state.read().await.history.clone();
+        within(
+            "a flush that mirrors the chat",
+            history.flush_once(&state, &transactions, now_millis()),
+        )
+        .await
+        .unwrap();
+        // The loop's flush now fails at its first write, before it ever takes
+        // the transaction, so the loop's first wait for the transaction is
+        // its prune tick's.
+        store.set_failing(true);
+        history.enqueue_committed(
+            &agent,
+            "chat:probe",
+            &[message(
+                &agent,
+                "probe",
+                "chat:probe",
+                MessageRole::User,
+                "probe",
+                now_millis(),
+            )],
+        );
+        let held = transactions.lock().await;
+        let worker = HistoryWorker::new(Arc::clone(&state), Arc::clone(&transactions))
+            .with_prune_interval(Duration::ZERO);
+        let owner = HistoryWorkerOwner::new();
+        worker.start(&owner);
+        wait_until("the loop's failed flush", || {
+            history
+                .readiness_issue(now_millis() + HISTORY_READINESS_GRACE_MS)
+                .is_some()
+        })
+        .await;
+        // Past its flush, the loop reaches the prune tick and waits there.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The last owner goes while the prune waits for the transaction.
+        drop(owner);
+        drop(held);
+        wait_until("the loop to end", || worker.has_stopped()).await;
+
+        assert_eq!(
+            hot_ids(&state, &agent).await.len(),
+            HOT_TAIL_MESSAGES + 1,
+            "the owner check runs under the transaction, after the wait"
+        );
+        assert_eq!(
+            prune_once(&state, &transactions, now_millis()).await,
+            Ok(1),
+            "a prune was possible all along"
         );
     }
 }
