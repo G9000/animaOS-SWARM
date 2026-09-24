@@ -62,9 +62,9 @@ it('keeps Telegram delivery off until a chat is approved, then creates a Telegra
   const target = screen.getByRole('combobox', { name: 'Deliver to' });
   expect(target).toHaveValue('workspace');
   expect(screen.getByRole('option', { name: 'Telegram' })).toBeDisabled();
-  expect(
-    screen.getByText('Approve a Telegram chat in Connectors to deliver check-ins there.'),
-  ).toBeVisible();
+  expect(target).toHaveAccessibleDescription(
+    'Approve a Telegram chat in Connectors to deliver check-ins there.',
+  );
 
   await user.click(screen.getByRole('button', { name: 'Refresh schedules' }));
   await waitFor(() =>

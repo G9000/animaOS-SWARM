@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import type { AgentTask, AgentTasks } from '@animaOS-SWARM/sdk';
 import {
   daemon,
@@ -264,6 +264,7 @@ export function AgentProactiveView({
     };
   }, [agentId, reload]);
   const telegramUnavailable = target === 'telegram' && telegram === null;
+  const telegramHintId = useId();
   const mutate = async (action: () => Promise<unknown>, created = false) => {
     if (busy) return;
     setBusy(true);
@@ -435,6 +436,7 @@ export function AgentProactiveView({
           Deliver to
           <select
             aria-label="Deliver to"
+            aria-describedby={telegram === null ? telegramHintId : undefined}
             className="field w-auto"
             value={target}
             disabled={busy}
@@ -449,7 +451,7 @@ export function AgentProactiveView({
           </select>
         </label>
         {telegram === null && (
-          <p className="text-xs text-ink-3">
+          <p id={telegramHintId} className="text-xs text-ink-3">
             Approve a Telegram chat in Connectors to deliver check-ins there.
           </p>
         )}
