@@ -5,7 +5,10 @@ use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use super::workspace::{canonical_workspace_root, workspace_root_path};
+use super::workspace::{
+    canonical_workspace_root, ensure_path_within_workspace, resolve_workspace_write_path,
+    workspace_root_path, write_workspace_bytes,
+};
 use super::{ctx_workspace_root, ToolExecutionContext};
 
 const TODO_DIRECTORY_NAME: &str = ".animaos-swarm";
@@ -155,20 +158,17 @@ pub(super) fn write_todo_list_from_root(
     todos: &[TodoItem],
 ) -> Result<String, String> {
     let warnings = validate_todo_items(todos)?;
-    let todo_file = todo_file_path_from_root(workspace_root, "todo_write")?;
-    if let Some(parent) = todo_file.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "todo_write failed to create todo directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-
     let serialized = serde_json::to_string_pretty(todos)
         .map_err(|error| format!("todo_write failed to serialize todos: {error}"))?;
-    fs::write(&todo_file, serialized)
-        .map_err(|error| format!("todo_write failed to persist todo list: {error}"))?;
+    // Spec §14: every workspace writer must use the hardened write path (rejects
+    // `..`, root/drive prefixes, the workspace root itself, and dangling or
+    // escaping symlinks anywhere in `.animaos-swarm/todos.json`).
+    write_workspace_bytes(
+        workspace_root,
+        &format!("{TODO_DIRECTORY_NAME}/{TODO_FILE_NAME}"),
+        serialized.as_bytes(),
+        "todo_write",
+    )?;
 
     let completed = todos
         .iter()
@@ -330,14 +330,18 @@ pub(crate) struct AgentTodos {
 
 static AGENT_TODO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Workspace-relative path of one agent's task file. Hex-encoding `id` byte by
+/// byte keeps it a single path component (never `..` or a separator), so only
+/// the fixed `.animaos-swarm/agent-tasks` prefix can introduce a symlink escape.
+fn agent_todo_relative_path(id: &str) -> String {
+    let filename: String = id.bytes().map(|byte| format!("{byte:02x}")).collect();
+    format!("{TODO_DIRECTORY_NAME}/agent-tasks/{filename}.json")
+}
+
 fn agent_todo_path(root: Option<&Path>, id: &str) -> Result<PathBuf, String> {
     let root = workspace_root_path("agent tasks", root)?;
     let canonical = canonical_workspace_root(&root, "agent tasks")?;
-    let filename: String = id.bytes().map(|byte| format!("{byte:02x}")).collect();
-    Ok(canonical
-        .join(TODO_DIRECTORY_NAME)
-        .join("agent-tasks")
-        .join(format!("{filename}.json")))
+    Ok(canonical.join(agent_todo_relative_path(id)))
 }
 
 fn agent_todos_at(path: &Path) -> Result<AgentTodos, String> {
@@ -376,13 +380,31 @@ pub(crate) fn write_agent_todos(
     let _lock = AGENT_TODO_LOCK
         .lock()
         .map_err(|_| "Task store unavailable")?;
-    let path = agent_todo_path(root, id)?;
+    // Spec §14: every workspace writer must use the hardened write path. This
+    // atomic write can't go through `write_workspace_bytes` directly (that helper
+    // truncates in place), so its two checks are replicated by hand: resolve and
+    // validate the target up front, then re-verify the canonical parent stays
+    // inside the workspace after `create_dir_all` (mirrors `write_workspace_bytes`).
+    let workspace_root = workspace_root_path("agent tasks", root)?;
+    let relative_path = agent_todo_relative_path(id);
+    let path = resolve_workspace_write_path(&workspace_root, &relative_path, "agent tasks")?;
     if let Some(expected) = expected_revision {
         if agent_todos_at(&path)?.revision != expected {
             return Err("Tasks changed. Refresh before saving again.".into());
         }
     }
-    fs::create_dir_all(path.parent().expect("task parent")).map_err(|e| e.to_string())?;
+    let parent = path.parent().expect("task parent");
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let canonical_root = canonical_workspace_root(&workspace_root, "agent tasks")?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!("agent tasks path could not be resolved: {relative_path} ({error})")
+    })?;
+    ensure_path_within_workspace(
+        &canonical_root,
+        &canonical_parent,
+        "agent tasks",
+        &relative_path,
+    )?;
     let bytes = serde_json::to_vec_pretty(tasks).map_err(|e| e.to_string())?;
     atomicwrites::AtomicFile::new(&path, atomicwrites::AllowOverwrite)
         .write(|file| file.write_all(&bytes))
@@ -609,5 +631,36 @@ mod agent_tests {
 
         assert_eq!(written.status, TaskStatus::Success);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_agent_todos_rejects_symlinked_animaos_swarm_directory_pointing_outside() {
+        let sandbox = temp_root("agent-todo-symlink-sandbox");
+        let workspace = sandbox.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let outside = sandbox.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join(".animaos-swarm")).unwrap();
+
+        let task = TodoItem {
+            content: "Leak".into(),
+            status: "pending".into(),
+            active_form: "Leaking".into(),
+        };
+        let error = write_agent_todos(Some(&workspace), "agent-x", &[task], None)
+            .expect_err("symlinked .animaos-swarm directory must be rejected");
+        assert_eq!(
+            error,
+            format!(
+                "agent tasks path escapes workspace root: .animaos-swarm/agent-tasks/{}.json",
+                "agent-x"
+                    .bytes()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        );
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        fs::remove_dir_all(sandbox).unwrap();
     }
 }

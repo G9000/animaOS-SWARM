@@ -1487,6 +1487,68 @@ fn todo_write_warns_when_multiple_items_are_in_progress() {
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 
+#[cfg(unix)]
+#[test]
+fn todo_write_rejects_symlinked_animaos_swarm_directory_pointing_outside() {
+    let sandbox = create_temp_workspace("todo-symlinked-dir");
+    let workspace = sandbox.join("workspace");
+    fs::create_dir_all(&workspace).expect("create workspace");
+    let outside = sandbox.join("outside");
+    fs::create_dir_all(&outside).expect("create outside dir");
+    std::os::unix::fs::symlink(&outside, workspace.join(".animaos-swarm")).expect("create symlink");
+
+    let todos = vec![TodoItem {
+        content: "Leak".into(),
+        status: "pending".into(),
+        active_form: "Leaking".into(),
+    }];
+
+    let error = write_todo_list_from_root(&workspace, &todos)
+        .expect_err("symlinked .animaos-swarm directory must be rejected");
+
+    assert_eq!(
+        error,
+        "todo_write path escapes workspace root: .animaos-swarm/todos.json"
+    );
+    assert!(!outside.join("todos.json").exists());
+    assert!(fs::read_dir(&outside)
+        .expect("read outside dir")
+        .next()
+        .is_none());
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
+#[cfg(unix)]
+#[test]
+fn todo_write_rejects_symlinked_todos_json_pointing_outside() {
+    let sandbox = create_temp_workspace("todo-symlinked-file");
+    let workspace = sandbox.join("workspace");
+    let todo_dir = workspace.join(".animaos-swarm");
+    fs::create_dir_all(&todo_dir).expect("create todo directory");
+    let outside = sandbox.join("outside.json");
+    fs::write(&outside, "original").expect("write outside file");
+    std::os::unix::fs::symlink(&outside, todo_dir.join("todos.json")).expect("create symlink");
+
+    let todos = vec![TodoItem {
+        content: "Leak".into(),
+        status: "pending".into(),
+        active_form: "Leaking".into(),
+    }];
+
+    let error = write_todo_list_from_root(&workspace, &todos)
+        .expect_err("symlinked todos.json must be rejected");
+
+    assert_eq!(
+        error,
+        "todo_write path escapes workspace root: .animaos-swarm/todos.json"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside).expect("read outside file"),
+        "original"
+    );
+    fs::remove_dir_all(sandbox).expect("remove sandbox");
+}
+
 #[test]
 fn configured_workspace_root_overrides_env_var() {
     let configured = PathBuf::from("C:\\configured\\root");
