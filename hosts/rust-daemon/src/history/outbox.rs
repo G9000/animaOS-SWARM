@@ -17,7 +17,7 @@ use anima_core::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::{HistoryError, HistoryMessage, HistoryStore, MemoryHistoryStore};
 use crate::app::SharedDaemonState;
@@ -695,7 +695,12 @@ impl HistoryWorker {
         let handle = lock(&self.running).take();
         if let Some(handle) = handle {
             let _ = handle.stop.send(true);
-            let _ = handle.join.await;
+            if let Err(error) = handle.join.await {
+                error!(
+                    error = %error,
+                    "history worker loop ended abnormally; records stay in the control plane"
+                );
+            }
         }
         let history = self.state.read().await.history.clone();
         if let Err(error) = history
@@ -1142,6 +1147,82 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_logs_a_loop_that_panicked_and_still_flushes_once_more() {
+        #[derive(Clone, Default)]
+        struct Captured(Arc<StdMutex<Vec<u8>>>);
+
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                lock(&self.0).extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let store = Arc::new(FlakyHistoryStore::new());
+        let history = HistoryService::new(store.clone());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(Arc::clone(&history));
+        let state = Arc::new(RwLock::new(daemon));
+        let worker = HistoryWorker::new(Arc::clone(&state), Arc::new(Mutex::new(())));
+        let owner = HistoryWorkerOwner::new();
+        store.panic_on_next_write();
+        worker.start(&owner);
+        history.enqueue_committed(
+            "agent-1",
+            "chat:one",
+            &[history_message(
+                "msg-1-1",
+                "agent-1",
+                "chat:one",
+                MessageRole::User,
+                "hello",
+                1,
+            )
+            .message],
+        );
+        let deadline = tokio::time::Instant::now() + HISTORY_FLUSH_INTERVAL;
+        while !worker.has_stopped() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the store's panic ends the loop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer({
+                let captured = captured.clone();
+                move || captured.clone()
+            })
+            .finish();
+        {
+            let _default = tracing::subscriber::set_default(subscriber);
+            worker.shutdown().await;
+        }
+        let logged = String::from_utf8(lock(&captured.0).clone()).unwrap();
+
+        assert!(
+            logged.contains("ERROR") && logged.contains("history worker loop ended abnormally"),
+            "{logged}"
+        );
+        assert_eq!(
+            store
+                .page_messages(&page("agent-1", "chat:one"))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "shutdown still flushes once more"
         );
     }
 

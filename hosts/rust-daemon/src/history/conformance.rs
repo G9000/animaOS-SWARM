@@ -391,6 +391,7 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
 pub(crate) struct FlakyHistoryStore {
     inner: MemoryHistoryStore,
     failing: AtomicBool,
+    panic_on_write: AtomicBool,
     existence_gate: Mutex<Option<StoreGate>>,
 }
 
@@ -407,12 +408,18 @@ impl FlakyHistoryStore {
         Self {
             inner: MemoryHistoryStore::new(),
             failing: AtomicBool::new(false),
+            panic_on_write: AtomicBool::new(false),
             existence_gate: Mutex::new(None),
         }
     }
 
     pub(crate) fn set_failing(&self, failing: bool) {
         self.failing.store(failing, Ordering::SeqCst);
+    }
+
+    /// Makes the next `upsert_messages` call panic.
+    pub(crate) fn panic_on_next_write(&self) {
+        self.panic_on_write.store(true, Ordering::SeqCst);
     }
 
     /// Holds the next `existing_message_ids` call (a reconcile's store round
@@ -446,6 +453,9 @@ impl HistoryStore for FlakyHistoryStore {
 
     async fn upsert_messages(&self, messages: &[HistoryMessage]) -> Result<(), HistoryError> {
         self.check()?;
+        if self.panic_on_write.swap(false, Ordering::SeqCst) {
+            panic!("injected history store panic");
+        }
         self.inner.upsert_messages(messages).await
     }
 
