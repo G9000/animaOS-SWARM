@@ -1335,6 +1335,7 @@ pub(crate) struct DaemonState {
     pub(crate) goals: HashMap<String, crate::jobs::GoalRecord>,
     pub(crate) runs: crate::runs::RunLedger,
     pub(crate) sessions: crate::sessions::SessionRegistry,
+    pub(crate) history: crate::history::SharedHistory,
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
     pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
     calendar_manager: Option<CalendarManager>,
@@ -1485,6 +1486,7 @@ impl DaemonState {
             goals: HashMap::new(),
             runs: crate::runs::RunLedger::default(),
             sessions: crate::sessions::SessionRegistry::default(),
+            history: crate::history::HistoryService::ephemeral(),
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
             calendar_manager: None,
@@ -1523,6 +1525,10 @@ impl DaemonState {
 
     pub(crate) fn set_memory_store(&mut self, memory_store: Option<MemoryStoreConfig>) {
         self.memory_store = memory_store;
+    }
+
+    pub(crate) fn set_history(&mut self, history: crate::history::SharedHistory) {
+        self.history = history;
     }
 
     pub(crate) fn set_control_plane_store(

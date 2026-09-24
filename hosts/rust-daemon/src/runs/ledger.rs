@@ -145,7 +145,7 @@ pub(crate) struct RunRecord {
     pub(crate) provider: Option<String>,
     #[serde(default)]
     pub(crate) parent_run_id: Option<String>,
-    /// Set once the history store holds this record (M2); always false in M1.
+    /// Set once the history store holds this terminal record (spec §4.1).
     #[serde(default)]
     pub(crate) mirrored: bool,
 }
@@ -297,12 +297,13 @@ impl RunLedger {
         records
     }
 
-    /// Keeps every non-terminal run plus, per agent, terminal runs from the last
-    /// 24 hours up to 50 (spec §4.1). M2 adds "and only once mirrored".
+    /// Keeps every non-terminal run plus, per agent, the terminal runs from the
+    /// last 24 hours up to 50; a terminal run leaves only once the history
+    /// store holds it (spec §4.1).
     pub(crate) fn prune(&mut self, now_ms: u64) {
         let cutoff = now_ms.saturating_sub(TERMINAL_RUN_RETENTION_MS);
         let expired: Vec<String> = {
-            let mut terminal: HashMap<&str, Vec<(u64, &str)>> = HashMap::new();
+            let mut terminal: HashMap<&str, Vec<(u64, &str, bool)>> = HashMap::new();
             for record in self
                 .records
                 .values()
@@ -311,13 +312,16 @@ impl RunLedger {
                 terminal.entry(record.agent_id.as_str()).or_default().push((
                     record.finished_at_ms.unwrap_or(record.created_at_ms),
                     record.id.as_str(),
+                    record.mirrored,
                 ));
             }
             let mut expired = Vec::new();
             for runs in terminal.values_mut() {
-                runs.sort_unstable_by(|left, right| right.cmp(left));
-                for (index, (finished_at_ms, run_id)) in runs.iter().enumerate() {
-                    if index >= MAX_TERMINAL_RUNS_PER_AGENT || *finished_at_ms < cutoff {
+                runs.sort_unstable_by(|left, right| (right.0, right.1).cmp(&(left.0, left.1)));
+                for (index, (finished_at_ms, run_id, mirrored)) in runs.iter().enumerate() {
+                    if *mirrored
+                        && (index >= MAX_TERMINAL_RUNS_PER_AGENT || *finished_at_ms < cutoff)
+                    {
                         expired.push((*run_id).to_string());
                     }
                 }
@@ -327,6 +331,38 @@ impl RunLedger {
         for run_id in expired {
             self.records.remove(&run_id);
         }
+    }
+
+    /// Terminal runs the history store does not hold yet, oldest finished first.
+    pub(crate) fn unmirrored_terminal(&self, limit: usize) -> Vec<RunRecord> {
+        let mut records = self
+            .records
+            .values()
+            .filter(|record| record.status.is_terminal() && !record.mirrored)
+            .cloned()
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            left.finished_at_ms
+                .cmp(&right.finished_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        records.truncate(limit);
+        records
+    }
+
+    /// Marks written runs mirrored, but only where the ledger still holds
+    /// exactly what was written; a record changed meanwhile is written again.
+    pub(crate) fn mark_mirrored(&mut self, written: &[RunRecord]) -> usize {
+        let mut marked = 0;
+        for run in written {
+            if let Some(current) = self.records.get_mut(&run.id) {
+                if !current.mirrored && *current == *run {
+                    current.mirrored = true;
+                    marked += 1;
+                }
+            }
+        }
+        marked
     }
 
     /// Records to save, sorted, without runs of agents that no longer exist.
@@ -411,6 +447,12 @@ mod tests {
     fn finished(agent_id: &str, at_ms: u64) -> RunRecord {
         let mut record = record(agent_id, at_ms);
         record.finish(RunStatus::Completed, None, at_ms);
+        record
+    }
+
+    fn mirrored(agent_id: &str, at_ms: u64) -> RunRecord {
+        let mut record = finished(agent_id, at_ms);
+        record.mirrored = true;
         record
     }
 
@@ -575,20 +617,20 @@ mod tests {
     }
 
     #[test]
-    fn retention_keeps_in_flight_runs_and_the_newest_terminal_runs_of_the_last_day() {
+    fn retention_keeps_in_flight_runs_and_the_newest_mirrored_terminal_runs_of_the_last_day() {
         let now = 10 * TERMINAL_RUN_RETENTION_MS;
         let mut ledger = RunLedger::default();
         let old_running = record("agent-a", now - 2 * TERMINAL_RUN_RETENTION_MS);
         ledger.insert(old_running.clone());
-        let stale = finished("agent-a", now - TERMINAL_RUN_RETENTION_MS - 1);
+        let stale = mirrored("agent-a", now - TERMINAL_RUN_RETENTION_MS - 1);
         ledger.insert(stale.clone());
         let mut recent = Vec::new();
         for offset in 0..(MAX_TERMINAL_RUNS_PER_AGENT as u64 + 5) {
-            let run = finished("agent-a", now - offset);
+            let run = mirrored("agent-a", now - offset);
             recent.push(run.id.clone());
             ledger.insert(run);
         }
-        let other = finished("agent-b", now - 10);
+        let other = mirrored("agent-b", now - 10);
         ledger.insert(other.clone());
 
         ledger.prune(now);
@@ -609,6 +651,78 @@ mod tests {
             ledger.get(recent.last().unwrap()).is_none(),
             "the oldest excess run is pruned"
         );
+    }
+
+    #[test]
+    fn terminal_runs_leave_the_control_plane_only_once_mirrored() {
+        let now = 10 * TERMINAL_RUN_RETENTION_MS;
+        let mut ledger = RunLedger::default();
+        let stale = finished("agent-a", now - 2 * TERMINAL_RUN_RETENTION_MS);
+        ledger.insert(stale.clone());
+        let mut excess = Vec::new();
+        for offset in 0..(MAX_TERMINAL_RUNS_PER_AGENT as u64 + 3) {
+            let run = finished("agent-a", now - offset);
+            excess.push(run.id.clone());
+            ledger.insert(run);
+        }
+
+        ledger.prune(now);
+        assert!(
+            ledger.get(&stale.id).is_some(),
+            "an old run waits for the history store"
+        );
+        assert!(
+            excess.iter().all(|id| ledger.get(id).is_some()),
+            "so do runs beyond the count limit"
+        );
+
+        ledger.get_mut(&stale.id).unwrap().mirrored = true;
+        ledger.prune(now);
+        assert!(ledger.get(&stale.id).is_none());
+    }
+
+    #[test]
+    fn unmirrored_terminal_runs_are_listed_oldest_first_and_only_unchanged_records_are_marked() {
+        let mut ledger = RunLedger::default();
+        let running = record("agent-a", 1);
+        let newer = finished("agent-a", 30);
+        let older = finished("agent-a", 20);
+        let already = mirrored("agent-a", 10);
+        for run in [running.clone(), newer.clone(), older.clone(), already] {
+            ledger.insert(run);
+        }
+
+        let pending = ledger.unmirrored_terminal(10);
+        assert_eq!(
+            pending
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            [older.id.as_str(), newer.id.as_str()]
+        );
+        assert_eq!(ledger.unmirrored_terminal(1).len(), 1);
+
+        // `newer` changes after it was read (a rolled-back commit, say).
+        ledger.get_mut(&newer.id).unwrap().finish(
+            RunStatus::Failed,
+            Some(RunError::new(COMMIT_FAILED, "disk full")),
+            31,
+        );
+        assert_eq!(ledger.mark_mirrored(&pending), 1);
+        assert!(ledger.get(&older.id).unwrap().mirrored);
+        assert!(
+            !ledger.get(&newer.id).unwrap().mirrored,
+            "a changed record is written again"
+        );
+        assert_eq!(
+            ledger
+                .unmirrored_terminal(10)
+                .iter()
+                .map(|run| run.id.as_str())
+                .collect::<Vec<_>>(),
+            [newer.id.as_str()]
+        );
+        assert!(!ledger.get(&running.id).unwrap().mirrored);
     }
 
     #[test]

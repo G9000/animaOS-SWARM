@@ -1172,7 +1172,15 @@ impl AgentRunCoordinator {
         // save; a rejected or undurable commit removes exactly those changes
         // (spec §4.4 items 3–4).
         let transaction = self.control_plane_transaction().await;
-        let (snapshot, change_set, memory, memory_embeddings, memory_store, persist_request) = {
+        let (
+            snapshot,
+            change_set,
+            memory,
+            memory_embeddings,
+            memory_store,
+            history_outbox,
+            persist_request,
+        ) = {
             let mut guard = self.state.write().await;
             let mut change_set = RunChangeSet::new(
                 run_id.clone(),
@@ -1199,6 +1207,7 @@ impl AgentRunCoordinator {
                 guard.memory_handle(),
                 guard.memory_embeddings_handle(),
                 guard.memory_store_config(),
+                guard.history.clone(),
                 guard.control_plane_persist_request(),
             )
         };
@@ -1210,6 +1219,12 @@ impl AgentRunCoordinator {
         }
         drop(transaction);
         in_flight.disarm();
+        // Only a durable commit reaches the history store (spec §13.1).
+        history_outbox.enqueue_committed(
+            &agent_id,
+            &crate::sessions::session_id_for_room(&room_id),
+            &change_set.delta.messages,
+        );
 
         persist_task_result_memory(
             &result,
@@ -4073,5 +4088,42 @@ mod tests {
                 .expect("clock should be after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[tokio::test]
+    async fn only_durable_commits_reach_the_history_outbox() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        release.add_permits(1);
+        coordinator
+            .run(room_request(&agent_id, "room-kept", "kept turn"))
+            .await
+            .expect("an ordinary run commits");
+        entered.acquire().await.unwrap().forget();
+        let history = coordinator.state.read().await.history.clone();
+        assert_eq!(history.pending_count(), 2, "the committed turn is queued");
+
+        let failed = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-lost", "lost turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        failed.await.unwrap().expect_err("the final save failed");
+
+        assert_eq!(
+            history.pending_count(),
+            2,
+            "a commit whose save failed never reaches the history store"
+        );
     }
 }

@@ -42,6 +42,7 @@ struct DaemonRuntime {
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     jobs: JobService,
+    history: crate::history::HistoryWorker,
 }
 
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
@@ -140,6 +141,10 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
     let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+    // Embedded and test routers flush history as well when a runtime is present.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        runtime.history.start();
+    }
     // Construction-time state is uncontended, so this always succeeds in
     // practice; calendar tools simply report "unconfigured" otherwise.
     if let Ok(mut guard) = state.try_write() {
@@ -174,6 +179,7 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     })?;
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
+    runtime.history.start();
     Ok(router_with_runtime(state, config, runtime, false))
 }
 
@@ -213,9 +219,11 @@ pub(crate) async fn serve_with_state(
     })?;
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
+    runtime.history.start();
     let connectors = runtime.connectors.clone();
     let scheduler = runtime.scheduler.clone();
     let jobs = runtime.jobs.clone();
+    let history = runtime.history.clone();
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -223,6 +231,7 @@ pub(crate) async fn serve_with_state(
             jobs.shutdown().await;
             scheduler.shutdown().await;
             connectors.shutdown().await;
+            history.shutdown().await;
         })
         .await
 }
@@ -268,6 +277,10 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         oauth_apps.clone(),
     );
     let jobs = JobService::new(Arc::clone(&state), agent_runs.clone());
+    let history = crate::history::HistoryWorker::new(
+        Arc::clone(&state),
+        agent_runs.control_plane_transactions(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     Ok(DaemonRuntime {
         run_limiter,
@@ -278,6 +291,7 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         oauth_apps,
         scheduler,
         jobs,
+        history,
     })
 }
 
@@ -319,6 +333,10 @@ fn deterministic_daemon_runtime_with_mail_transport(
         oauth_apps.clone(),
     );
     let jobs = JobService::new(Arc::clone(&state), agent_runs.clone());
+    let history = crate::history::HistoryWorker::new(
+        Arc::clone(&state),
+        agent_runs.control_plane_transactions(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     DaemonRuntime {
         run_limiter,
@@ -329,6 +347,7 @@ fn deterministic_daemon_runtime_with_mail_transport(
         oauth_apps,
         scheduler,
         jobs,
+        history,
     }
 }
 

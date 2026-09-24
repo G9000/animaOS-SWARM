@@ -5,14 +5,15 @@
 #[cfg(test)]
 pub(crate) mod conformance;
 mod memory;
+mod outbox;
 mod postgres;
 mod sqlite;
 
-#[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
 pub(crate) use memory::MemoryHistoryStore;
-#[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
+#[cfg(test)]
+pub(crate) use outbox::HISTORY_READINESS_GRACE_MS;
+pub(crate) use outbox::{HistoryService, HistoryWorker, SharedHistory};
 pub(crate) use postgres::PostgresHistoryStore;
-#[allow(unused_imports)] // Tasks 4-6 add stores that consume this.
 pub(crate) use sqlite::SqliteHistoryStore;
 
 use std::collections::{HashMap, HashSet};

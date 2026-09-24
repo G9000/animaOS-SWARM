@@ -1,10 +1,12 @@
 //! Behaviour every history store shares (memory, SQLite, Postgres).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anima_core::{Content, Message, MessageRole};
+use async_trait::async_trait;
 
-use super::{HistoryMessage, HistoryStore, MessagePageQuery};
+use super::{HistoryError, HistoryMessage, HistoryStore, MemoryHistoryStore, MessagePageQuery};
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
 
 pub(crate) fn history_message(
@@ -323,4 +325,105 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
         .delete_session(&agent, "chat:a")
         .await
         .expect("deleting twice is harmless");
+}
+
+/// A memory store whose every call fails while `failing` is set. Unlike the
+/// memory store it is not ephemeral, so pruning tests can use it.
+pub(crate) struct FlakyHistoryStore {
+    inner: MemoryHistoryStore,
+    failing: AtomicBool,
+}
+
+impl FlakyHistoryStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: MemoryHistoryStore::new(),
+            failing: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn set_failing(&self, failing: bool) {
+        self.failing.store(failing, Ordering::SeqCst);
+    }
+
+    fn check(&self) -> Result<(), HistoryError> {
+        if self.failing.load(Ordering::SeqCst) {
+            Err(HistoryError::new("injected history store failure"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[async_trait]
+impl HistoryStore for FlakyHistoryStore {
+    fn label(&self) -> &'static str {
+        "flaky"
+    }
+
+    async fn upsert_messages(&self, messages: &[HistoryMessage]) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.upsert_messages(messages).await
+    }
+
+    async fn upsert_runs(&self, runs: &[RunRecord]) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.upsert_runs(runs).await
+    }
+
+    async fn existing_message_ids(&self, ids: &[String]) -> Result<HashSet<String>, HistoryError> {
+        self.check()?;
+        self.inner.existing_message_ids(ids).await
+    }
+
+    async fn get_message(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Option<HistoryMessage>, HistoryError> {
+        self.check()?;
+        self.inner
+            .get_message(agent_id, session_id, message_id)
+            .await
+    }
+
+    async fn get_run(&self, run_id: &str) -> Result<Option<RunRecord>, HistoryError> {
+        self.check()?;
+        self.inner.get_run(run_id).await
+    }
+
+    async fn page_messages(
+        &self,
+        query: &MessagePageQuery,
+    ) -> Result<Vec<HistoryMessage>, HistoryError> {
+        self.check()?;
+        self.inner.page_messages(query).await
+    }
+
+    async fn visible_message_counts(
+        &self,
+        agent_id: &str,
+        session_ids: &[String],
+    ) -> Result<HashMap<String, usize>, HistoryError> {
+        self.check()?;
+        self.inner
+            .visible_message_counts(agent_id, session_ids)
+            .await
+    }
+
+    async fn search_messages(
+        &self,
+        agent_ids: &[String],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<HistoryMessage>, HistoryError> {
+        self.check()?;
+        self.inner.search_messages(agent_ids, query, limit).await
+    }
+
+    async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.delete_session(agent_id, session_id).await
+    }
 }

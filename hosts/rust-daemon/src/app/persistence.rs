@@ -1,5 +1,5 @@
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anima_memory::{MemoryManager, RecentMemoryOptions};
@@ -9,6 +9,9 @@ use tracing::{info, warn};
 
 use super::{DaemonConfig, PersistenceMode, SharedDaemonState};
 use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+use crate::history::{
+    HistoryService, HistoryStore, MemoryHistoryStore, PostgresHistoryStore, SqliteHistoryStore,
+};
 use crate::memory_embeddings::MemoryEmbeddingRuntime;
 use crate::memory_store::{load_memory_snapshot, MemoryStoreConfig};
 use crate::postgres::SqlxPostgresAdapter;
@@ -24,7 +27,8 @@ pub(crate) async fn configure_persistence(
 
     let default_embedding_store = configure_memory_store(state, memory_store).await?;
     configure_memory_embeddings(state, default_embedding_store).await?;
-    configure_control_plane_store(state, control_plane_store).await?;
+    configure_control_plane_store(state, control_plane_store.clone()).await?;
+    configure_history_store(state, control_plane_store.as_ref()).await?;
     Ok(())
 }
 
@@ -124,6 +128,55 @@ async fn configure_control_plane_store(
         "runtime control plane store configured"
     );
     Ok(())
+}
+
+/// The SQLite history file (spec §13.1); defaults beside the control plane.
+pub(crate) const HISTORY_SQLITE_FILE_ENV: &str = "ANIMAOS_RS_HISTORY_SQLITE_FILE";
+
+async fn configure_history_store(
+    state: &SharedDaemonState,
+    control_plane: Option<&ControlPlaneStoreConfig>,
+) -> io::Result<()> {
+    let store =
+        history_store_for(control_plane, non_empty_env_path(HISTORY_SQLITE_FILE_ENV)?).await?;
+    let label = store.label();
+    state.write().await.set_history(HistoryService::new(store));
+    info!(history_store = label, "runtime history store configured");
+    Ok(())
+}
+
+/// The history store that goes with the control-plane store: SQLite beside a
+/// JSON control plane (or at the explicit path), Postgres tables in Postgres
+/// mode, and bounded memory tables in ephemeral mode.
+pub(crate) async fn history_store_for(
+    control_plane: Option<&ControlPlaneStoreConfig>,
+    sqlite_override: Option<PathBuf>,
+) -> io::Result<Arc<dyn HistoryStore>> {
+    let sqlite_path = match (control_plane, sqlite_override) {
+        (None, Some(_)) => {
+            warn!("ANIMAOS_RS_HISTORY_SQLITE_FILE is ignored without a durable control plane; history stays in memory");
+            return Ok(Arc::new(MemoryHistoryStore::new()));
+        }
+        (None, None) => return Ok(Arc::new(MemoryHistoryStore::new())),
+        (Some(_), Some(path)) => path,
+        (Some(ControlPlaneStoreConfig::Json(file)), None) => default_history_sqlite_path(file),
+        (Some(ControlPlaneStoreConfig::Postgres(pool)), None) => {
+            return Ok(Arc::new(PostgresHistoryStore::new(pool.clone())))
+        }
+    };
+    let store = SqliteHistoryStore::open(sqlite_path)
+        .await
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to open the history store: {error}"),
+            )
+        })?;
+    Ok(Arc::new(store))
+}
+
+pub(crate) fn default_history_sqlite_path(control_plane_file: &Path) -> PathBuf {
+    control_plane_file.with_file_name("history.sqlite")
 }
 
 async fn configure_memory_store(
@@ -242,4 +295,64 @@ fn non_empty_env_path(name: &'static str) -> io::Result<Option<PathBuf>> {
         ));
     }
     Ok(Some(PathBuf::from(value)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "anima-persistence-{label}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn the_default_history_file_sits_beside_the_control_plane_file() {
+        assert_eq!(
+            default_history_sqlite_path(Path::new("/data/control-plane.json")),
+            PathBuf::from("/data/history.sqlite")
+        );
+        assert_eq!(
+            default_history_sqlite_path(Path::new("control-plane.json")),
+            PathBuf::from("history.sqlite")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_history_store_follows_the_control_plane_store() {
+        let dir = temp_dir("history");
+        let control = ControlPlaneStoreConfig::Json(dir.join("control-plane.json"));
+
+        let beside = history_store_for(Some(&control), None).await.unwrap();
+        assert_eq!(beside.label(), "sqlite");
+        assert!(dir.join("history.sqlite").exists());
+        let custom = dir.join("custom").join("history.db");
+        let chosen = history_store_for(Some(&control), Some(custom.clone()))
+            .await
+            .unwrap();
+        assert_eq!(chosen.label(), "sqlite");
+        assert!(custom.exists());
+        let ephemeral = history_store_for(None, Some(custom)).await.unwrap();
+        assert!(
+            ephemeral.is_ephemeral(),
+            "without a durable control plane history stays in memory"
+        );
+        assert_eq!(
+            history_store_for(None, None).await.unwrap().label(),
+            "memory"
+        );
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://anima@127.0.0.1:1/anima")
+            .unwrap();
+        assert_eq!(
+            history_store_for(Some(&ControlPlaneStoreConfig::Postgres(pool)), None)
+                .await
+                .unwrap()
+                .label(),
+            "postgres"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
