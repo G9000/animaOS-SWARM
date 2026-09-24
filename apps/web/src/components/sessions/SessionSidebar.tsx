@@ -100,7 +100,11 @@ function SessionRow({
             autoFocus
             onChange={(event) => setTitle(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') cancelRename();
+              if (event.key === 'Escape') {
+                // Handled here: an enclosing drawer stays open.
+                event.preventDefault();
+                cancelRename();
+              }
             }}
           />
           <button type="submit" className="studio-tool-button">

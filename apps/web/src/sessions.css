@@ -171,7 +171,7 @@
   font-size: 13px;
 }
 .session-drawer {
-  position: absolute;
+  position: fixed;
   inset: 0;
   z-index: 40;
   display: flex;
@@ -181,6 +181,11 @@
   width: min(320px, 86vw);
   flex-direction: column;
   border-right: 1px solid var(--color-line);
+  background: #17171b;
+  padding: var(--safe-area-top) 0 var(--safe-area-bottom) var(--safe-area-left);
+}
+.session-drawer-panel:focus {
+  outline: none;
 }
 .session-drawer-backdrop {
   flex: 1;

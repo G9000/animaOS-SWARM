@@ -7,6 +7,8 @@ import { toolNamesForProfile } from '../lib/agent-access';
 import { daemon } from '../lib/daemon-api';
 import type { HashRoute } from '../lib/hash-route';
 import type { AgentDetail } from '../lib/types';
+import { sessionFixture } from '../test/sessions';
+import { SessionSidebar } from './sessions/SessionSidebar';
 import { WorkspaceShell } from './WorkspaceShell';
 
 function agent(
@@ -328,6 +330,80 @@ describe('WorkspaceShell', () => {
       screen.queryByRole('dialog', { name: 'Sessions' }),
     ).not.toBeInTheDocument();
     expect(opener).toHaveFocus();
+  });
+
+  it('keeps the sessions drawer modal after a row action and lets row controls handle their own Escape', async () => {
+    mobile();
+    const user = userEvent.setup();
+    const onArchive = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Shell
+        sidebar={
+          <SessionSidebar
+            sessions={[
+              sessionFixture('chat:trip', {
+                title: 'Trip ideas',
+                lastActivityAtMs: Date.now(),
+              }),
+            ]}
+            activeKey={null}
+            query=""
+            onQueryChange={vi.fn()}
+            showArchived={false}
+            onShowArchivedChange={vi.fn()}
+            onOpen={vi.fn()}
+            onRename={vi.fn().mockResolvedValue(true)}
+            onArchive={onArchive}
+            onExport={vi.fn().mockResolvedValue(undefined)}
+            onDelete={vi.fn().mockResolvedValue(undefined)}
+          />
+        }
+      />,
+    );
+    const opener = screen.getByRole('button', { name: 'Open sessions' });
+    await user.click(opener);
+    const drawer = screen.getByRole('dialog', { name: 'Sessions' });
+    // Everything behind the drawer is out of reach while it is open.
+    expect(opener.closest('[inert]')).not.toBeNull();
+    expect(screen.queryByRole('banner')).not.toBeInTheDocument();
+
+    // Archive closes its menu, which removes the focused item.
+    await user.click(
+      within(drawer).getByRole('button', { name: 'Actions for Trip ideas' }),
+    );
+    await user.click(within(drawer).getByRole('menuitem', { name: 'Archive' }));
+    expect(onArchive).toHaveBeenCalledOnce();
+    expect(drawer).toContainElement(document.activeElement as HTMLElement);
+    await user.tab();
+    expect(drawer).toContainElement(document.activeElement as HTMLElement);
+    await user.keyboard('{Escape}');
+    expect(
+      screen.queryByRole('dialog', { name: 'Sessions' }),
+    ).not.toBeInTheDocument();
+    expect(opener).toHaveFocus();
+    expect(opener.closest('[inert]')).toBeNull();
+
+    // Escape in a row menu or the rename field closes only that.
+    await user.click(opener);
+    const reopened = screen.getByRole('dialog', { name: 'Sessions' });
+    await user.click(
+      within(reopened).getByRole('button', { name: 'Actions for Trip ideas' }),
+    );
+    await user.keyboard('{Escape}');
+    expect(within(reopened).queryByRole('menu')).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Sessions' })).toBe(reopened);
+    await user.click(
+      within(reopened).getByRole('button', { name: 'Actions for Trip ideas' }),
+    );
+    await user.click(within(reopened).getByRole('menuitem', { name: 'Rename' }));
+    expect(
+      within(reopened).getByRole('textbox', { name: 'Rename Trip ideas' }),
+    ).toHaveFocus();
+    await user.keyboard('{Escape}');
+    expect(
+      within(reopened).queryByRole('textbox', { name: 'Rename Trip ideas' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('dialog', { name: 'Sessions' })).toBe(reopened);
   });
 
   it('shows working helpers as status without introducing another persona', () => {

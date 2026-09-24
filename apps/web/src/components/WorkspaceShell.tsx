@@ -141,8 +141,9 @@ function DestinationNavigation({
 const FOCUSABLE =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
-/** The sessions list on mobile: a modal drawer that takes focus, keeps Tab
- *  inside, closes on Escape, and returns focus to its opener. */
+/** The sessions list on mobile: a modal drawer rendered outside the inert
+ *  shell. It takes focus, keeps Tab inside, and closes on Escape; the shell
+ *  returns focus to the Open sessions button. */
 function SessionDrawer({
   children,
   onClose,
@@ -153,14 +154,57 @@ function SessionDrawer({
   onNewChat: () => void;
 }) {
   const panel = useRef<HTMLDivElement>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
-    const opener =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : null;
-    panel.current?.querySelector<HTMLElement>(FOCUSABLE)?.focus();
+    const element = panel.current;
+    if (!element) return;
+    (element.querySelector<HTMLElement>(FOCUSABLE) ?? element).focus();
+    // A control that unmounts while focused, such as a row menu item after
+    // Archive, drops focus to the body; bring it back into the panel.
+    const observer = new MutationObserver(() => {
+      const active = document.activeElement;
+      if (!active || active === document.body) element.focus();
+    });
+    observer.observe(element, { childList: true, subtree: true });
+    // Keys are handled at the document so they work wherever focus is. A
+    // control that handles its own Escape (a row menu or the rename field)
+    // closes only itself.
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close.current();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(
+        element.querySelectorAll<HTMLElement>(FOCUSABLE),
+      );
+      if (focusable.length === 0) {
+        event.preventDefault();
+        element.focus();
+        return;
+      }
+      const index = focusable.indexOf(document.activeElement as HTMLElement);
+      const next =
+        index === -1
+          ? event.shiftKey
+            ? focusable.length - 1
+            : 0
+          : event.shiftKey && index === 0
+            ? focusable.length - 1
+            : !event.shiftKey && index === focusable.length - 1
+              ? 0
+              : null;
+      if (next === null) return;
+      event.preventDefault();
+      focusable[next].focus();
+    };
+    document.addEventListener('keydown', onKeyDown);
     return () => {
-      if (opener?.isConnected) opener.focus();
+      observer.disconnect();
+      document.removeEventListener('keydown', onKeyDown);
     };
   }, []);
   return (
@@ -169,30 +213,12 @@ function SessionDrawer({
       role="dialog"
       aria-modal="true"
       aria-label="Sessions"
-      onKeyDown={(event) => {
-        if (event.key === 'Escape') {
-          event.preventDefault();
-          event.stopPropagation();
-          onClose();
-          return;
-        }
-        if (event.key !== 'Tab') return;
-        const focusable = Array.from(
-          panel.current?.querySelectorAll<HTMLElement>(FOCUSABLE) ?? [],
-        );
-        if (focusable.length === 0) return;
-        const first = focusable[0];
-        const last = focusable[focusable.length - 1];
-        if (event.shiftKey && document.activeElement === first) {
-          event.preventDefault();
-          last.focus();
-        } else if (!event.shiftKey && document.activeElement === last) {
-          event.preventDefault();
-          first.focus();
-        }
-      }}
     >
-      <div ref={panel} className="session-drawer-panel studio-sidebar">
+      <div
+        ref={panel}
+        tabIndex={-1}
+        className="session-drawer-panel studio-sidebar"
+      >
         <div className="flex items-center justify-between gap-2 p-3">
           <button type="button" className={ghostBtnCls} onClick={onNewChat}>
             New chat
@@ -256,6 +282,14 @@ export function WorkspaceShell({
   const [focusMode, setFocusMode] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const desktopNavigation = useDesktopNavigation();
+  const drawerShown = drawerOpen && !desktopNavigation && sidebar !== null;
+  const sessionsButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerWasShown = useRef(false);
+  useEffect(() => {
+    if (drawerWasShown.current && !drawerShown)
+      sessionsButtonRef.current?.focus();
+    drawerWasShown.current = drawerShown;
+  }, [drawerShown]);
   const companyName = workspaceState?.configured
     ? (workspaceState.workspace?.companyName ?? null)
     : null;
@@ -346,8 +380,8 @@ export function WorkspaceShell({
     <>
       <div
         className={`studio-shell companion-shell relative z-[1] flex min-h-0 flex-1 flex-col ${focusMode ? 'is-focused' : ''}`}
-        inert={commandsOpen || undefined}
-        aria-hidden={commandsOpen || undefined}
+        inert={commandsOpen || drawerShown || undefined}
+        aria-hidden={commandsOpen || drawerShown || undefined}
       >
         {!desktopNavigation && (
           <AgentPresence
@@ -427,6 +461,7 @@ export function WorkspaceShell({
             <div className="studio-topbar">
               {!desktopNavigation && sidebar !== null && (
                 <button
+                  ref={sessionsButtonRef}
                   type="button"
                   className="studio-tool-button"
                   aria-label="Open sessions"
@@ -501,17 +536,6 @@ export function WorkspaceShell({
                 <WorkspaceHub agents={[mainAgent]} initialSection="Tasks" />
               ) : null}
             </div>
-            {drawerOpen && !desktopNavigation && sidebar !== null && (
-              <SessionDrawer
-                onClose={() => setDrawerOpen(false)}
-                onNewChat={() => {
-                  setDrawerOpen(false);
-                  newChat();
-                }}
-              >
-                {sidebar}
-              </SessionDrawer>
-            )}
           </main>
         </div>
         {!desktopNavigation && (
@@ -523,6 +547,17 @@ export function WorkspaceShell({
           />
         )}
       </div>
+      {drawerShown && (
+        <SessionDrawer
+          onClose={() => setDrawerOpen(false)}
+          onNewChat={() => {
+            setDrawerOpen(false);
+            newChat();
+          }}
+        >
+          {sidebar}
+        </SessionDrawer>
+      )}
       {commandsOpen && (
         <CommandMenu commands={commands} close={() => setCommandsOpen(false)} />
       )}
