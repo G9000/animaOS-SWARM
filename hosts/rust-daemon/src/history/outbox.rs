@@ -609,8 +609,28 @@ struct WorkerHandle {
     join: JoinHandle<()>,
 }
 
-/// Runs the outbox flush loop; Task 13 adds hot-tail pruning to it. Only
-/// `shutdown` stops the loop: routers that drop every handle keep mirroring.
+/// Keeps a started history loop running. The router that owns the worker
+/// holds one in its app state; once every clone is dropped the loop stops
+/// without writing anything more. `HistoryWorker::shutdown` is the way to
+/// stop it with a final flush.
+#[derive(Clone)]
+pub(crate) struct HistoryWorkerOwner {
+    /// Never sent on: the loop waits for this channel to close.
+    alive: watch::Sender<()>,
+}
+
+impl HistoryWorkerOwner {
+    pub(crate) fn new() -> Self {
+        Self {
+            alive: watch::channel(()).0,
+        }
+    }
+}
+
+/// Runs the outbox flush loop; Task 13 adds hot-tail pruning to it. The loop
+/// ends on `shutdown`, after one final flush, or once every
+/// `HistoryWorkerOwner` it was started with is dropped. Worker handles never
+/// keep it running.
 #[derive(Clone)]
 pub(crate) struct HistoryWorker {
     state: SharedDaemonState,
@@ -629,15 +649,18 @@ impl HistoryWorker {
         }
     }
 
-    /// Starts the flush loop. Needs a Tokio runtime; a second call is a no-op.
-    pub(crate) fn start(&self) {
+    /// Starts the flush loop, which runs while `owner` or a clone of it
+    /// lives. Needs a Tokio runtime; a second call is a no-op.
+    pub(crate) fn start(&self, owner: &HistoryWorkerOwner) {
         let mut running = lock(&self.running);
         if running.is_some() {
             return;
         }
         let (stop, mut stopping) = watch::channel(false);
-        // The loop holds a sender itself, so the channel never closes under it.
+        // The loop holds a stop sender itself, so dropping every handle leaves
+        // the stop channel open: only `shutdown` stops it that way.
         let keep_open = stop.clone();
+        let mut owned = owner.alive.subscribe();
         let state = Arc::clone(&self.state);
         let transactions = Arc::clone(&self.transactions);
         let join = tokio::spawn(async move {
@@ -647,6 +670,8 @@ impl HistoryWorker {
                 tokio::select! {
                     biased;
                     _ = stopping.wait_for(|stop| *stop) => break,
+                    // Returns once the last owner is dropped.
+                    _ = owned.changed() => break,
                     () = history.wait_for_work() => {}
                 }
                 let _ = history
@@ -655,6 +680,14 @@ impl HistoryWorker {
             }
         });
         *running = Some(WorkerHandle { stop, join });
+    }
+
+    /// Whether the loop was started and has ended.
+    #[cfg(test)]
+    pub(crate) fn has_stopped(&self) -> bool {
+        lock(&self.running)
+            .as_ref()
+            .is_some_and(|handle| handle.join.is_finished())
     }
 
     /// Stops the loop and makes one final flush attempt.

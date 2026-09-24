@@ -191,6 +191,8 @@ struct AppState {
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
     local_owner: self::http::LocalOwnerPolicy,
+    /// Keeps the history worker's loop running while this router lives.
+    _history_owner: crate::history::HistoryWorkerOwner,
 }
 
 impl AppState {
@@ -342,6 +344,7 @@ pub(crate) fn router_with_services(
         oauth_apps,
         scheduler,
         jobs,
+        crate::history::HistoryWorkerOwner::new(),
         bind_is_loopback,
     )
 }
@@ -357,6 +360,7 @@ pub(crate) fn router_with_all_services(
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
+    history_owner: crate::history::HistoryWorkerOwner,
     bind_is_loopback: bool,
 ) -> Router {
     router_with_services_with_policies(
@@ -370,6 +374,7 @@ pub(crate) fn router_with_all_services(
         oauth_apps,
         scheduler,
         jobs,
+        history_owner,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
     )
@@ -386,6 +391,7 @@ fn router_with_services_with_policies(
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
+    history_owner: crate::history::HistoryWorkerOwner,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
@@ -405,6 +411,7 @@ fn router_with_services_with_policies(
         scheduler,
         jobs,
         local_owner,
+        _history_owner: history_owner,
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -2664,6 +2671,7 @@ mod tests {
             oauth_apps,
             scheduler,
             jobs,
+            crate::history::HistoryWorkerOwner::new(),
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),
         );

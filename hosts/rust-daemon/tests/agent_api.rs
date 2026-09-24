@@ -195,6 +195,7 @@ async fn control_plane_store_recovers_agents_and_swarms_after_restart() {
     )
     .await;
     let swarm_id = extract_json_string_field(&create_swarm_response, "id");
+    drop(first_app);
 
     let second_app = app_with_configured_persistence(DaemonConfig::default())
         .await

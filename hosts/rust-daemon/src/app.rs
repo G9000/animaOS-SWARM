@@ -141,25 +141,26 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
     let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+    app_with_runtime(state, config, runtime)
+}
+
+/// The router `app_with_state` builds, over a prepared runtime.
+fn app_with_runtime(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    runtime: DaemonRuntime,
+) -> Router {
     // Construction-time state is uncontended, so this always succeeds in
     // practice; calendar tools simply report "unconfigured" otherwise.
     if let Ok(mut guard) = state.try_write() {
         guard.set_calendar_manager(Some(runtime.calendar.clone()));
     }
-    let history = runtime.history.clone();
-    let router = router_with_runtime(
+    router_with_runtime(
         state,
         config,
         runtime,
         routes::configured_bind_is_loopback(),
-    );
-    // Embedded and test routers mirror history too when a runtime is present.
-    // The worker starts only once the router is built: construction relies on
-    // `try_write` finding the state uncontended.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        history.start();
-    }
-    router
+    )
 }
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
@@ -183,10 +184,7 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
     })?;
     runtime.connectors.start_restored().await;
     runtime.scheduler.start().await;
-    let history = runtime.history.clone();
-    let router = router_with_runtime(state, config, runtime, false);
-    history.start();
-    Ok(router)
+    Ok(router_with_runtime(state, config, runtime, false))
 }
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
@@ -230,7 +228,6 @@ pub(crate) async fn serve_with_state(
     let jobs = runtime.jobs.clone();
     let history = runtime.history.clone();
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
-    history.start();
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
@@ -357,13 +354,19 @@ fn deterministic_daemon_runtime_with_mail_transport(
     }
 }
 
+/// Builds the router and starts the history loop it owns, when a Tokio
+/// runtime is present. The loop runs while the router or one of its clones
+/// lives, or until `HistoryWorker::shutdown`. It starts after construction,
+/// which relies on `try_write` finding the state uncontended.
 fn router_with_runtime(
     state: SharedDaemonState,
     config: DaemonConfig,
     runtime: DaemonRuntime,
     bind_is_loopback: bool,
 ) -> Router {
-    routes::router_with_all_services(
+    let history = runtime.history;
+    let history_owner = crate::history::HistoryWorkerOwner::new();
+    let router = routes::router_with_all_services(
         state,
         config,
         runtime.run_limiter,
@@ -374,8 +377,13 @@ fn router_with_runtime(
         runtime.oauth_apps,
         runtime.scheduler,
         runtime.jobs,
+        history_owner.clone(),
         bind_is_loopback,
-    )
+    );
+    if tokio::runtime::Handle::try_current().is_ok() {
+        history.start(&history_owner);
+    }
+    router
 }
 
 /// Deterministic Telegram boundary paired with the deterministic model in the
@@ -691,20 +699,63 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(committed.len(), 2);
         wait_until_mirrored(&*store, &committed, HISTORY_FLUSH_INTERVAL).await;
-
-        // Only an explicit shutdown stops the loop, not dropped handles.
         drop(router);
-        let later = crate::history::conformance::history_message(
-            "msg-9-9",
-            &agent_id,
-            "chat:later",
-            anima_core::MessageRole::User,
-            "still mirrored",
-            9,
-        );
+    }
+
+    #[tokio::test]
+    async fn dropping_an_app_with_state_router_stops_its_history_loop() {
+        use crate::history::{
+            HistoryService, HistoryStore, MemoryHistoryStore, HISTORY_FLUSH_INTERVAL,
+        };
+
+        let store = Arc::new(MemoryHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(store.clone()));
+        let state = Arc::new(RwLock::new(daemon));
+        let config = DaemonConfig::default();
+        let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+        // A handle does not keep the loop running; the router does.
+        let worker = runtime.history.clone();
+        let router = app_with_runtime(Arc::clone(&state), config, runtime);
+
+        let message = |id: &str| {
+            crate::history::conformance::history_message(
+                id,
+                "agent-1",
+                "chat:one",
+                anima_core::MessageRole::User,
+                "hello",
+                1,
+            )
+            .message
+        };
         let history = state.read().await.history.clone();
-        history.enqueue_committed(&agent_id, "chat:later", &[later.message]);
-        wait_until_mirrored(&*store, &["msg-9-9".to_string()], HISTORY_FLUSH_INTERVAL).await;
+        history.enqueue_committed("agent-1", "chat:one", &[message("msg-1-1")]);
+        wait_until_mirrored(&*store, &["msg-1-1".to_string()], HISTORY_FLUSH_INTERVAL).await;
+        assert!(
+            !worker.has_stopped(),
+            "the loop runs while its router lives"
+        );
+
+        drop(router);
+        let deadline = tokio::time::Instant::now() + HISTORY_FLUSH_INTERVAL;
+        while !worker.has_stopped() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop keeps running after its router is gone"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        history.enqueue_committed("agent-1", "chat:one", &[message("msg-2-2")]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            store
+                .existing_message_ids(&["msg-2-2".to_string()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a stopped loop writes nothing more"
+        );
     }
 
     #[tokio::test]

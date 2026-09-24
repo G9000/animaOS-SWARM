@@ -10,7 +10,9 @@ mod postgres;
 mod sqlite;
 
 pub(crate) use memory::MemoryHistoryStore;
-pub(crate) use outbox::{HistoryDeletion, HistoryService, HistoryWorker, SharedHistory};
+pub(crate) use outbox::{
+    HistoryDeletion, HistoryService, HistoryWorker, HistoryWorkerOwner, SharedHistory,
+};
 #[cfg(test)]
 pub(crate) use outbox::{HISTORY_FLUSH_INTERVAL, HISTORY_READINESS_GRACE_MS};
 pub(crate) use postgres::PostgresHistoryStore;
