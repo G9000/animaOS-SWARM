@@ -2,9 +2,10 @@
 //! history store within about a second, in batches, idempotently by id, with
 //! retries and backoff. Records stay in the control plane until mirrored, and
 //! only saved state is mirrored: the outbox reads the control plane under the
-//! control-plane transaction. After a restart or a queue overflow the hot
-//! transcript is reconciled against the store; five minutes of failures
-//! become a readiness issue.
+//! control-plane transaction. Deletions stay saved in the control plane
+//! (`pendingHistoryDeletions`) until the store applies them. After a restart
+//! or a queue overflow the hot transcript is reconciled against the store;
+//! five minutes of failures become a readiness issue.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +14,7 @@ use std::time::Duration;
 
 use anima_core::primitives::now_millis;
 use anima_core::Message;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tracing::warn;
@@ -41,13 +43,38 @@ fn lock<T>(mutex: &StdMutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// A history deletion the control plane has saved and the store may not have
+/// applied yet: one session, or without `session_id` the whole agent. The
+/// control plane keeps these as `pendingHistoryDeletions`, so a restart
+/// replays them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HistoryDeletion {
+    pub(crate) agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<String>,
+}
+
+impl HistoryDeletion {
+    pub(crate) fn session(agent_id: &str, session_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            session_id: Some(session_id.to_string()),
+        }
+    }
+
+    pub(crate) fn agent(agent_id: &str) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            session_id: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum OutboxItem {
     Message(HistoryMessage),
-    DeleteSession {
-        agent_id: String,
-        session_id: String,
-    },
+    Delete(HistoryDeletion),
 }
 
 #[derive(Debug)]
@@ -88,8 +115,7 @@ enum Batch {
     },
     Deletion {
         through: u64,
-        agent_id: String,
-        session_id: String,
+        deletion: HistoryDeletion,
     },
 }
 
@@ -158,7 +184,8 @@ impl HistoryService {
     }
 
     /// Queues one durable commit's messages. Call only after the control-plane
-    /// save that made them durable succeeded.
+    /// save that made them durable succeeded, and before that save's
+    /// transaction ends, so a later deletion of the session queues after them.
     pub(crate) fn enqueue_committed(&self, agent_id: &str, session_id: &str, messages: &[Message]) {
         if messages.is_empty() {
             return;
@@ -179,15 +206,41 @@ impl HistoryService {
         self.wake.notify_one();
     }
 
-    /// Queues the removal of a deleted session's rows, after its deletion was saved.
+    /// Queues the removal of a deleted session's rows. Record the deletion in
+    /// the same control-plane save as the session's removal
+    /// (`DaemonState::record_history_deletion`), and queue it once that save
+    /// succeeded, inside the same control-plane transaction.
     pub(crate) fn enqueue_session_deletion(&self, agent_id: &str, session_id: &str) {
+        self.enqueue_deletion(HistoryDeletion::session(agent_id, session_id));
+    }
+
+    /// Queues the removal of every row of a deleted agent; recorded and
+    /// queued like a session deletion.
+    pub(crate) fn enqueue_agent_deletion(&self, agent_id: &str) {
+        self.enqueue_deletion(HistoryDeletion::agent(agent_id));
+    }
+
+    fn enqueue_deletion(&self, deletion: HistoryDeletion) {
         {
             let mut outbox = self.outbox();
-            outbox.push(OutboxItem::DeleteSession {
-                agent_id: agent_id.to_string(),
-                session_id: session_id.to_string(),
-            });
+            outbox.push(OutboxItem::Delete(deletion));
             self.enforce_capacity(&mut outbox);
+        }
+        self.wake.notify_one();
+    }
+
+    /// Queues the saved deletions of a restored control plane (the restart
+    /// rule); the next flush applies them before it reconciles.
+    /// `DaemonState::set_history` calls this for a new service.
+    pub(crate) fn replay_deletions(&self, deletions: &[HistoryDeletion]) {
+        if deletions.is_empty() {
+            return;
+        }
+        {
+            let mut outbox = self.outbox();
+            for deletion in deletions {
+                outbox.push(OutboxItem::Delete(deletion.clone()));
+            }
         }
         self.wake.notify_one();
     }
@@ -197,7 +250,7 @@ impl HistoryService {
             // The hot transcript still holds every message; deletions must survive.
             outbox
                 .items
-                .retain(|queued| matches!(queued.item, OutboxItem::DeleteSession { .. }));
+                .retain(|queued| matches!(queued.item, OutboxItem::Delete(_)));
             outbox.needs_reconcile = true;
             outbox.overflows += 1;
         }
@@ -268,7 +321,9 @@ impl HistoryService {
     /// Reconciles when needed, writes queued items in order, then writes
     /// terminal runs the ledger has not mirrored yet. `transactions` is the
     /// control-plane transaction: the control plane is read only while it is
-    /// held, so a commit whose save may still fail is never mirrored.
+    /// held, so a commit whose save may still fail is never mirrored. The
+    /// flush takes it itself (clearing an applied deletion saves under it), so
+    /// never call this while holding it.
     pub(crate) async fn flush_once(
         &self,
         state: &SharedDaemonState,
@@ -289,14 +344,23 @@ impl HistoryService {
         report: &mut FlushReport,
     ) -> Result<(), HistoryError> {
         if !self.reconciled() || self.outbox().needs_reconcile {
+            // Queued deletions first, including the ones replayed at startup:
+            // the reconcile must not count rows they are about to remove.
+            self.write_queue(state, transactions, report).await?;
             report.reconciled = self.reconcile(state, transactions).await?;
         }
-        self.write_queue(report).await?;
+        self.write_queue(state, transactions, report).await?;
         self.write_runs(state, transactions, report).await
     }
 
-    /// Writes queued items in order until the queue is empty.
-    async fn write_queue(&self, report: &mut FlushReport) -> Result<(), HistoryError> {
+    /// Writes queued items in order until the queue is empty. Each applied
+    /// deletion's saved entry is cleared before the next item is written.
+    async fn write_queue(
+        &self,
+        state: &SharedDaemonState,
+        transactions: &Mutex<()>,
+        report: &mut FlushReport,
+    ) -> Result<(), HistoryError> {
         loop {
             match self.next_batch() {
                 Batch::Empty => return Ok(()),
@@ -306,21 +370,26 @@ impl HistoryService {
                     self.complete_through(through);
                     report.messages += rows.len();
                 }
-                Batch::Deletion {
-                    through,
-                    agent_id,
-                    session_id,
-                } => {
-                    self.store.delete_session(&agent_id, &session_id).await?;
+                Batch::Deletion { through, deletion } => {
+                    match &deletion.session_id {
+                        Some(session_id) => {
+                            self.store
+                                .delete_session(&deletion.agent_id, session_id)
+                                .await?
+                        }
+                        None => self.store.delete_agent(&deletion.agent_id).await?,
+                    }
                     self.complete_through(through);
                     report.deletions += 1;
+                    clear_saved_deletion(state, transactions, &deletion).await;
                 }
             }
         }
     }
 
     /// Writes terminal runs in batches, read under the control-plane
-    /// transaction; `mark_mirrored` skips any record that changed since.
+    /// transaction; `mark_mirrored` skips any record that changed since. Runs
+    /// of deleted agents are never saved, so they are never mirrored either.
     async fn write_runs(
         &self,
         state: &SharedDaemonState,
@@ -333,8 +402,7 @@ impl HistoryService {
                 state
                     .read()
                     .await
-                    .runs
-                    .unmirrored_terminal(HISTORY_RUN_BATCH)
+                    .unmirrored_terminal_runs(HISTORY_RUN_BATCH)
             };
             if runs.is_empty() {
                 return Ok(());
@@ -354,15 +422,10 @@ impl HistoryService {
         let Some(first) = outbox.items.front() else {
             return Batch::Empty;
         };
-        if let OutboxItem::DeleteSession {
-            agent_id,
-            session_id,
-        } = &first.item
-        {
+        if let OutboxItem::Delete(deletion) = &first.item {
             return Batch::Deletion {
                 through: first.seq,
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
+                deletion: deletion.clone(),
             };
         }
         let mut rows = Vec::new();
@@ -373,7 +436,7 @@ impl HistoryService {
                     rows.push(row.clone());
                     through = queued.seq;
                 }
-                OutboxItem::DeleteSession { .. } => break,
+                OutboxItem::Delete(_) => break,
             }
         }
         Batch::Messages { through, rows }
@@ -423,7 +486,7 @@ impl HistoryService {
             .iter()
             .filter_map(|queued| match &queued.item {
                 OutboxItem::Message(row) => Some(row.message.id.clone()),
-                OutboxItem::DeleteSession { .. } => None,
+                OutboxItem::Delete(_) => None,
             })
             .collect::<HashSet<_>>();
         let mut count = 0;
@@ -463,6 +526,32 @@ impl HistoryService {
                 );
             }
         }
+    }
+}
+
+/// Drops the saved entry of a deletion the store applied, in a normal save.
+/// A failed save only delays that: the entry is already gone from memory, so
+/// the next successful save drops it, and a restart before then repeats an
+/// idempotent delete.
+async fn clear_saved_deletion(
+    state: &SharedDaemonState,
+    transactions: &Mutex<()>,
+    deletion: &HistoryDeletion,
+) {
+    let _transaction = transactions.lock().await;
+    let persist = {
+        let mut guard = state.write().await;
+        if !guard.clear_history_deletion(deletion) {
+            return;
+        }
+        guard.control_plane_persist_request()
+    };
+    if let Err(error) = persist.save().await {
+        warn!(
+            error = %error,
+            agent_id = %deletion.agent_id,
+            "could not save a finished history deletion; a restart repeats it"
+        );
     }
 }
 
@@ -1021,5 +1110,178 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn saved_deletions_replay_before_the_reconcile_and_clear_once_applied() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        // A deleted chat's id was reused and the new chat mirrored, then the
+        // daemon stopped before the deletion's entry was cleared.
+        coordinator
+            .run(request(&agent_id, "chat:reused", "a new chat"))
+            .await
+            .unwrap();
+        let history = state.read().await.history.clone();
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        state
+            .write()
+            .await
+            .record_history_deletion(HistoryDeletion::session(&agent_id, "chat:reused"));
+        // A deleted agent's rows the store still holds.
+        store
+            .upsert_messages(&[history_message(
+                "msg-7-7",
+                "agent-gone",
+                "chat:old",
+                MessageRole::User,
+                "from a deleted agent",
+                7,
+            )])
+            .await
+            .unwrap();
+        state
+            .write()
+            .await
+            .record_history_deletion(HistoryDeletion::agent("agent-gone"));
+
+        let restarted = HistoryService::new(store.clone());
+        state.write().await.set_history(Arc::clone(&restarted));
+        assert_eq!(
+            restarted.pending_count(),
+            2,
+            "the saved deletions are queued"
+        );
+        store.set_failing(true);
+        assert!(restarted
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .is_err());
+        assert_eq!(
+            state.read().await.pending_history_deletions.len(),
+            2,
+            "an unapplied deletion stays saved"
+        );
+
+        store.set_failing(false);
+        let report = restarted
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        assert_eq!(
+            (report.deletions, report.reconciled, report.messages),
+            (2, 2, 2)
+        );
+        assert_eq!(
+            store
+                .page_messages(&page(&agent_id, "chat:reused"))
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "the reconcile after the replay mirrors the hot chat again"
+        );
+        assert!(
+            store
+                .page_messages(&page("agent-gone", "chat:old"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a replayed agent deletion removes every row of the agent"
+        );
+        assert!(
+            state.read().await.pending_history_deletions.is_empty(),
+            "cleared once the store applied it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_agent_deletion_removes_its_rows_and_keeps_its_runs_out_of_the_store() {
+        let store = Arc::new(MemoryHistoryStore::new());
+        let (state, coordinator, agent_id) = state_with(HistoryService::new(store.clone())).await;
+        let transactions = coordinator.control_plane_transactions();
+        let survivor = state
+            .write()
+            .await
+            .create_agent(config("survivor"))
+            .unwrap()
+            .state
+            .id;
+        coordinator
+            .run(request(&agent_id, "chat:one", "mirrored"))
+            .await
+            .unwrap();
+        let history = state.read().await.history.clone();
+        history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+        coordinator
+            .run(request(&agent_id, "chat:two", "still queued"))
+            .await
+            .unwrap();
+        coordinator
+            .run(request(&survivor, "chat:one", "unrelated"))
+            .await
+            .unwrap();
+
+        // The agent delete (Task 12): remove the agent and record its history
+        // deletion in one save, then queue the deletion.
+        {
+            let _transaction = coordinator.control_plane_transaction().await;
+            let persist = {
+                let mut guard = state.write().await;
+                guard.remove_agent(&agent_id);
+                guard.record_history_deletion(HistoryDeletion::agent(&agent_id));
+                guard.control_plane_persist_request()
+            };
+            persist.save().await.unwrap();
+            history.enqueue_agent_deletion(&agent_id);
+        }
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!(report.deletions, 1);
+        for session in ["chat:one", "chat:two"] {
+            assert!(
+                store
+                    .page_messages(&page(&agent_id, session))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "{session}"
+            );
+        }
+        let runs = state
+            .read()
+            .await
+            .runs
+            .for_agent(&agent_id)
+            .into_iter()
+            .map(|run| run.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(runs.len(), 2, "the ledger keeps them until a restart");
+        for run_id in runs {
+            assert_eq!(
+                store.get_run(&run_id).await.unwrap(),
+                None,
+                "a deleted agent's runs are not mirrored again"
+            );
+        }
+        assert_eq!(
+            store
+                .page_messages(&page(&survivor, "chat:one"))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(state.read().await.pending_history_deletions.is_empty());
     }
 }

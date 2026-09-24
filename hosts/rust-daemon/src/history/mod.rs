@@ -10,7 +10,7 @@ mod postgres;
 mod sqlite;
 
 pub(crate) use memory::MemoryHistoryStore;
-pub(crate) use outbox::{HistoryService, HistoryWorker, SharedHistory};
+pub(crate) use outbox::{HistoryDeletion, HistoryService, HistoryWorker, SharedHistory};
 #[cfg(test)]
 pub(crate) use outbox::{HISTORY_FLUSH_INTERVAL, HISTORY_READINESS_GRACE_MS};
 pub(crate) use postgres::PostgresHistoryStore;
@@ -168,6 +168,10 @@ pub(crate) trait HistoryStore: Send + Sync {
 
     /// Removes a session's messages, runs, and attachment records.
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError>;
+
+    /// Removes an agent's messages, runs, and attachment records in every
+    /// session; usage rows stay (spec §3.3).
+    async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError>;
 }
 
 /// Converts a millisecond timestamp or counter to a store's signed column type.

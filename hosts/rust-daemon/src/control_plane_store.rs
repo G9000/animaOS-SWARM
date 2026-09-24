@@ -94,6 +94,8 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) runs: Vec<crate::runs::RunRecord>,
     #[serde(default)]
     pub(crate) sessions: Vec<crate::sessions::SessionRecord>,
+    #[serde(default)]
+    pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -322,6 +324,7 @@ impl ControlPlaneSnapshot {
             workspace: None,
             runs: vec![],
             sessions: vec![],
+            pending_history_deletions: vec![],
         }
     }
 }
@@ -457,6 +460,7 @@ mod tests {
         assert_eq!(payload["schedules"], serde_json::json!([]));
         assert_eq!(payload["runs"], serde_json::json!([]));
         assert_eq!(payload["sessions"], serde_json::json!([]));
+        assert_eq!(payload["pendingHistoryDeletions"], serde_json::json!([]));
     }
 
     #[test]
@@ -546,5 +550,6 @@ mod tests {
         .expect("version-four snapshot should deserialize");
 
         assert!(snapshot.runs.is_empty());
+        assert!(snapshot.pending_history_deletions.is_empty());
     }
 }

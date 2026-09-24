@@ -392,4 +392,143 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[tokio::test]
+    async fn a_saved_history_deletion_survives_a_restart_and_is_replayed_at_boot() {
+        use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
+        use crate::history::{HistoryDeletion, MessagePageQuery};
+        use crate::runs::RunSource;
+        use anima_core::primitives::now_millis;
+
+        let dir = temp_dir("deletion-restart");
+        let control = ControlPlaneStoreConfig::Json(dir.join("control-plane.json"));
+        let page = |agent_id: &str, session_id: &str| MessagePageQuery {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+            before: None,
+            limit: 10,
+            include_hidden: true,
+        };
+        let turn = |agent_id: &str, room: &str| AgentRunRequest {
+            agent_id: agent_id.into(),
+            content: anima_core::Content {
+                text: "remember this".into(),
+                ..anima_core::Content::default()
+            },
+            room: RunRoom::Stable(room.into()),
+            idempotency_key: None,
+            source: RunSource::Api,
+            source_ref: None,
+        };
+
+        // First boot: two mirrored chats, one of them deleted with its history
+        // deletion saved, and the daemon stops before the store applies it.
+        let first = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_and_history(&first, Some(control.clone()), None)
+            .await
+            .unwrap();
+        let agent_id = first
+            .write()
+            .await
+            .create_agent(anima_core::AgentConfig {
+                name: "historian".into(),
+                model: "deterministic".into(),
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                provider: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            })
+            .unwrap()
+            .state
+            .id;
+        let coordinator =
+            AgentRunCoordinator::new(Arc::clone(&first), Arc::new(tokio::sync::Semaphore::new(1)));
+        for room in ["chat:doomed", "chat:kept"] {
+            coordinator.run(turn(&agent_id, room)).await.unwrap();
+        }
+        let history = first.read().await.history.clone();
+        history
+            .flush_once(
+                &first,
+                &coordinator.control_plane_transactions(),
+                now_millis(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .store()
+                .page_messages(&page(&agent_id, "chat:doomed"))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        {
+            let _transaction = coordinator.control_plane_transaction().await;
+            let persist = {
+                let mut guard = first.write().await;
+                guard
+                    .agents
+                    .get_mut(&agent_id)
+                    .unwrap()
+                    .retain_messages(|message| message.room_id != "chat:doomed");
+                guard.record_history_deletion(HistoryDeletion::session(&agent_id, "chat:doomed"));
+                guard.control_plane_persist_request()
+            };
+            persist.save().await.unwrap();
+        }
+        drop((coordinator, history, first));
+
+        // Second boot over the same files replays the deletion.
+        let second = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+        configure_control_plane_and_history(&second, Some(control.clone()), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.read().await.pending_history_deletions.len(),
+            1,
+            "the deletion was saved with the session's removal"
+        );
+        let history = second.read().await.history.clone();
+        let report = history
+            .flush_once(&second, &tokio::sync::Mutex::new(()), now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!(report.deletions, 1);
+        let store = history.store();
+        assert!(
+            store
+                .page_messages(&page(&agent_id, "chat:doomed"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the replayed deletion removed the rows"
+        );
+        assert_eq!(
+            store
+                .page_messages(&page(&agent_id, "chat:kept"))
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let saved = load_control_plane_snapshot(&control)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved.pending_history_deletions.is_empty(),
+            "the entry is cleared in a normal save"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

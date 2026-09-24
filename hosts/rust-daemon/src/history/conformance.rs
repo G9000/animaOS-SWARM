@@ -313,7 +313,10 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
         [id(150, 13)]
     );
     assert_eq!(store.get_run(&run.id).await.unwrap(), None);
-    assert_eq!(store.get_run(&kept_run.id).await.unwrap(), Some(kept_run));
+    assert_eq!(
+        store.get_run(&kept_run.id).await.unwrap(),
+        Some(kept_run.clone())
+    );
     assert_eq!(
         store
             .page_messages(&page(&other, "chat:a", None, 10, false))
@@ -327,6 +330,60 @@ pub(crate) async fn assert_history_store_conformance(store: &dyn HistoryStore) {
         .delete_session(&agent, "chat:a")
         .await
         .expect("deleting twice is harmless");
+
+    // Deleting an agent removes the rows of every one of its sessions.
+    let doomed = format!("agent-{}", uuid::Uuid::new_v4());
+    store
+        .upsert_messages(&[
+            history_message(
+                &id(400, 17),
+                &doomed,
+                "chat:a",
+                MessageRole::User,
+                "farewell",
+                at(400),
+            ),
+            history_message(
+                &id(410, 18),
+                &doomed,
+                "chat:b",
+                MessageRole::User,
+                "farewell again",
+                at(410),
+            ),
+        ])
+        .await
+        .expect("the doomed agent's messages upsert");
+    let doomed_run = terminal_run(&doomed, "chat:b");
+    store
+        .upsert_runs(std::slice::from_ref(&doomed_run))
+        .await
+        .unwrap();
+    store.delete_agent(&doomed).await.unwrap();
+    assert!(store
+        .existing_message_ids(&[id(400, 17), id(410, 18)])
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.get_run(&doomed_run.id).await.unwrap(), None);
+    assert_eq!(
+        store
+            .page_messages(&page(&agent, "chat:b", None, 10, false))
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "another agent's rows survive"
+    );
+    assert_eq!(
+        store.get_run(&kept_run.id).await.unwrap(),
+        Some(kept_run),
+        "another agent's runs survive"
+    );
+    store
+        .delete_agent(&doomed)
+        .await
+        .expect("deleting an agent twice is harmless");
 }
 
 /// A memory store whose every call fails while `failing` is set. Unlike the
@@ -464,5 +521,10 @@ impl HistoryStore for FlakyHistoryStore {
     async fn delete_session(&self, agent_id: &str, session_id: &str) -> Result<(), HistoryError> {
         self.check()?;
         self.inner.delete_session(agent_id, session_id).await
+    }
+
+    async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError> {
+        self.check()?;
+        self.inner.delete_agent(agent_id).await
     }
 }

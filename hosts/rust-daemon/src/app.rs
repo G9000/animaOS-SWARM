@@ -154,8 +154,8 @@ pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> 
         routes::configured_bind_is_loopback(),
     );
     // Embedded and test routers mirror history too when a runtime is present.
-    // The worker starts after construction, which must find the state
-    // uncontended.
+    // The worker starts only once the router is built: construction relies on
+    // `try_write` finding the state uncontended.
     if tokio::runtime::Handle::try_current().is_ok() {
         history.start();
     }

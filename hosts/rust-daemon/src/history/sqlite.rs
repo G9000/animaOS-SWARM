@@ -524,6 +524,23 @@ impl HistoryStore for SqliteHistoryStore {
         })
         .await
     }
+
+    async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError> {
+        let agent_id = agent_id.to_string();
+        self.run(move |connection| {
+            let transaction = connection.transaction()?;
+            // Usage rows stay (spec §3.3).
+            for table in ["messages", "runs", "attachments"] {
+                transaction.execute(
+                    &format!("DELETE FROM {table} WHERE agent_id = ?1"),
+                    params![agent_id],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -600,6 +617,57 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_keeps_its_usage_rows() {
+        let temp = TempHistory::new("delete-agent");
+        let store = SqliteHistoryStore::open(temp.0.clone()).await.unwrap();
+        store
+            .upsert_messages(&[history_message(
+                "msg-5-1",
+                "agent-1",
+                "chat:a",
+                MessageRole::User,
+                "goodbye",
+                5,
+            )])
+            .await
+            .unwrap();
+        let connection = Connection::open(&temp.0).unwrap();
+        connection
+            .execute(
+                "INSERT INTO usage (id, agent_id, session_id, run_id, created_at_ms, record)
+                 VALUES ('usage-1', 'agent-1', 'chat:a', NULL, 5, '{}')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attachments (id, agent_id, session_id, created_at_ms, record)
+                 VALUES ('attachment-1', 'agent-1', 'chat:a', 5, '{}')",
+                [],
+            )
+            .unwrap();
+
+        store.delete_agent("agent-1").await.unwrap();
+
+        let rows = |table: &str| -> i64 {
+            connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = 'agent-1'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(rows("messages"), 0);
+        assert_eq!(rows("attachments"), 0);
+        assert_eq!(
+            rows("usage"),
+            1,
+            "usage rows outlive a deletion (spec §3.3)"
+        );
     }
 
     #[tokio::test]

@@ -1262,6 +1262,41 @@ mod tests {
         assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
         assert_eq!(state.sessions.len(), 0);
     }
+
+    #[test]
+    fn pending_history_deletions_are_saved_and_restored() {
+        use crate::history::HistoryDeletion;
+
+        let mut source = DaemonState::new();
+        source.record_history_deletion(HistoryDeletion::session("agent-1", "chat:one"));
+        source.record_history_deletion(HistoryDeletion::agent("agent-gone"));
+
+        let payload = serde_json::to_value(source.control_plane_snapshot()).unwrap();
+        assert_eq!(
+            payload["pendingHistoryDeletions"],
+            serde_json::json!([
+                {"agentId": "agent-1", "sessionId": "chat:one"},
+                {"agentId": "agent-gone"}
+            ]),
+            "kept even for agents that no longer exist"
+        );
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(serde_json::from_value(payload).unwrap())
+            .expect("pending deletions restore");
+        assert_eq!(
+            restored.pending_history_deletions,
+            [
+                HistoryDeletion::session("agent-1", "chat:one"),
+                HistoryDeletion::agent("agent-gone")
+            ]
+        );
+        assert!(restored.clear_history_deletion(&HistoryDeletion::agent("agent-gone")));
+        assert!(
+            !restored.clear_history_deletion(&HistoryDeletion::agent("agent-gone")),
+            "each recorded deletion clears once"
+        );
+    }
 }
 
 const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
@@ -1336,6 +1371,8 @@ pub(crate) struct DaemonState {
     pub(crate) runs: crate::runs::RunLedger,
     pub(crate) sessions: crate::sessions::SessionRegistry,
     pub(crate) history: crate::history::SharedHistory,
+    /// Saved history deletions the store has not applied yet (spec §3.3).
+    pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
     pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
     calendar_manager: Option<CalendarManager>,
@@ -1487,6 +1524,7 @@ impl DaemonState {
             runs: crate::runs::RunLedger::default(),
             sessions: crate::sessions::SessionRegistry::default(),
             history: crate::history::HistoryService::ephemeral(),
+            pending_history_deletions: Vec::new(),
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
             calendar_manager: None,
@@ -1527,8 +1565,35 @@ impl DaemonState {
         self.memory_store = memory_store;
     }
 
+    /// Installs a history service; it first replays the saved deletions the
+    /// store may not have applied (the restart rule).
     pub(crate) fn set_history(&mut self, history: crate::history::SharedHistory) {
+        history.replay_deletions(&self.pending_history_deletions);
         self.history = history;
+    }
+
+    /// Records a history deletion for the next control-plane save: call it in
+    /// the same save as the session or agent removal, clear it again if that
+    /// save fails, and queue it on `history` once the save succeeded.
+    pub(crate) fn record_history_deletion(&mut self, deletion: crate::history::HistoryDeletion) {
+        self.pending_history_deletions.push(deletion);
+    }
+
+    /// Drops one saved entry for `deletion`, once the store applied it or when
+    /// the deletion's own save failed. False when none was saved.
+    pub(crate) fn clear_history_deletion(
+        &mut self,
+        deletion: &crate::history::HistoryDeletion,
+    ) -> bool {
+        let Some(index) = self
+            .pending_history_deletions
+            .iter()
+            .position(|pending| pending == deletion)
+        else {
+            return false;
+        };
+        self.pending_history_deletions.remove(index);
+        true
     }
 
     pub(crate) fn set_control_plane_store(
@@ -1645,6 +1710,7 @@ impl DaemonState {
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
         snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
+        snapshot.pending_history_deletions = self.pending_history_deletions.clone();
         snapshot
     }
 
@@ -1743,6 +1809,7 @@ impl DaemonState {
             snapshot.sessions,
             &self.live_agent_ids(),
         );
+        self.pending_history_deletions = snapshot.pending_history_deletions;
         self.runs = crate::runs::RunLedger::restored(
             snapshot.runs,
             &self.live_agent_ids(),
@@ -2206,6 +2273,12 @@ impl DaemonState {
     /// Runs of this agent that are running or awaiting approval (spec §4.4 item 5).
     pub(crate) fn in_flight_runs(&self, agent_id: &str) -> usize {
         self.runs.in_flight_count(agent_id)
+    }
+
+    /// Terminal runs the snapshot holds that the history store does not yet,
+    /// oldest finished first; runs of deleted agents are left out.
+    pub(crate) fn unmirrored_terminal_runs(&self, limit: usize) -> Vec<crate::runs::RunRecord> {
+        self.runs.unmirrored_terminal(&self.live_agent_ids(), limit)
     }
 
     fn live_agent_ids(&self) -> HashSet<String> {

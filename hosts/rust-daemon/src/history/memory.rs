@@ -233,6 +233,18 @@ impl HistoryStore for MemoryHistoryStore {
         });
         Ok(())
     }
+
+    async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError> {
+        let mut guard = self.tables();
+        let tables = &mut *guard;
+        remove_where(&mut tables.messages, &mut tables.message_seqs, |row| {
+            row.agent_id == agent_id
+        });
+        remove_where(&mut tables.runs, &mut tables.run_seqs, |run| {
+            run.agent_id == agent_id
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]

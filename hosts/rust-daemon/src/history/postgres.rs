@@ -276,6 +276,19 @@ impl HistoryStore for PostgresHistoryStore {
         transaction.commit().await?;
         Ok(())
     }
+
+    async fn delete_agent(&self, agent_id: &str) -> Result<(), HistoryError> {
+        let mut transaction = self.pool.begin().await?;
+        // Usage rows stay (spec §3.3).
+        for table in ["history_messages", "history_runs", "history_attachments"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE agent_id = $1"))
+                .bind(agent_id)
+                .execute(&mut *transaction)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

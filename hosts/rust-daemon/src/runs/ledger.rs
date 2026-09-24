@@ -335,12 +335,21 @@ impl RunLedger {
         }
     }
 
-    /// Terminal runs the history store does not hold yet, oldest finished first.
-    pub(crate) fn unmirrored_terminal(&self, limit: usize) -> Vec<RunRecord> {
+    /// Terminal runs of live agents the history store does not hold yet,
+    /// oldest finished first.
+    pub(crate) fn unmirrored_terminal(
+        &self,
+        live_agents: &HashSet<String>,
+        limit: usize,
+    ) -> Vec<RunRecord> {
         let mut records = self
             .records
             .values()
-            .filter(|record| record.status.is_terminal() && !record.mirrored)
+            .filter(|record| {
+                record.status.is_terminal()
+                    && !record.mirrored
+                    && live_agents.contains(&record.agent_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         records.sort_by(|left, right| {
@@ -690,11 +699,19 @@ mod tests {
         let newer = finished("agent-a", 30);
         let older = finished("agent-a", 20);
         let already = mirrored("agent-a", 10);
-        for run in [running.clone(), newer.clone(), older.clone(), already] {
+        let orphan = finished("agent-gone", 5);
+        for run in [
+            running.clone(),
+            newer.clone(),
+            older.clone(),
+            already,
+            orphan,
+        ] {
             ledger.insert(run);
         }
+        let live = HashSet::from(["agent-a".to_string()]);
 
-        let pending = ledger.unmirrored_terminal(10);
+        let pending = ledger.unmirrored_terminal(&live, 10);
         assert_eq!(
             pending
                 .iter()
@@ -702,7 +719,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [older.id.as_str(), newer.id.as_str()]
         );
-        assert_eq!(ledger.unmirrored_terminal(1).len(), 1);
+        assert_eq!(ledger.unmirrored_terminal(&live, 1).len(), 1);
 
         // `newer` changes after it was read (a rolled-back commit, say).
         ledger.get_mut(&newer.id).unwrap().finish(
@@ -718,7 +735,7 @@ mod tests {
         );
         assert_eq!(
             ledger
-                .unmirrored_terminal(10)
+                .unmirrored_terminal(&live, 10)
                 .iter()
                 .map(|run| run.id.as_str())
                 .collect::<Vec<_>>(),
