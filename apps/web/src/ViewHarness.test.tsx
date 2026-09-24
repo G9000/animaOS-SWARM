@@ -2323,6 +2323,126 @@ it('marks a session read only once it is back on screen', async () => {
   );
 });
 
+it.each([
+  {
+    action: 'rename',
+    fail: () =>
+      vi.mocked(daemon.updateSession).mockRejectedValue(new Error('rename refused')),
+    run: async (user: ReturnType<typeof userEvent.setup>) => {
+      await user.click(screen.getByRole('menuitem', { name: 'Rename' }));
+      const field = screen.getByRole('textbox', { name: 'Rename Old plan' });
+      await user.clear(field);
+      await user.type(field, 'New plan');
+      await user.click(screen.getByRole('button', { name: 'Save' }));
+    },
+    message: 'rename refused',
+    // The rename stays open with the typed title, ready to retry.
+    kept: () =>
+      expect(screen.getByRole('textbox', { name: 'Rename Old plan' })).toHaveValue(
+        'New plan',
+      ),
+  },
+  {
+    action: 'export',
+    fail: () =>
+      vi.spyOn(daemon, 'exportSession').mockRejectedValue(new Error('export refused')),
+    run: async (user: ReturnType<typeof userEvent.setup>) => {
+      await user.click(screen.getByRole('menuitem', { name: 'Export Markdown' }));
+    },
+    message: 'export refused',
+    kept: () =>
+      expect(screen.getByRole('button', { name: 'Old plan' })).toBeInTheDocument(),
+  },
+  {
+    action: 'delete',
+    fail: () =>
+      vi.mocked(daemon.deleteSession).mockRejectedValue(new Error('delete refused')),
+    run: async (user: ReturnType<typeof userEvent.setup>) => {
+      await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+      await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
+    },
+    message: 'delete refused',
+    kept: () =>
+      expect(screen.getByRole('button', { name: 'Old plan' })).toBeInTheDocument(),
+  },
+])(
+  'shows a failed sidebar $action instead of rejecting',
+  async ({ fail, run, message, kept }) => {
+    const user = userEvent.setup();
+    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+    vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+      agents: [snapshot('agent-main', 'Nova', 1)],
+    });
+    mockProviders();
+    routes.sessions.push(
+      sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+    );
+    fail();
+    render(<ViewHarness />);
+
+    await user.click(
+      await screen.findByRole('button', { name: 'Actions for Old plan' }),
+    );
+    await run(user);
+
+    const sidebar = screen.getByRole('navigation', { name: 'Sessions' });
+    expect(await within(sidebar).findByRole('alert')).toHaveTextContent(message);
+    kept();
+  },
+);
+
+it('keeps each session’s own messages and draft when switching between them', async () => {
+  const user = userEvent.setup();
+  const current = snapshot('agent-main', 'Nova', 1);
+  current.messages = [
+    {
+      id: 'a1',
+      agentId: 'agent-main',
+      roomId: 'chat:a',
+      role: 'assistant',
+      content: { text: 'Answer in A' },
+      createdAtMs: 2,
+    },
+    {
+      id: 'b1',
+      agentId: 'agent-main',
+      roomId: 'chat:b',
+      role: 'assistant',
+      content: { text: 'Answer in B' },
+      createdAtMs: 3,
+    },
+  ];
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [current] });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('chat:a', { title: 'Plan A', lastActivityAtMs: Date.now() }),
+    sessionFixture('chat:b', { title: 'Plan B', lastActivityAtMs: Date.now() - 1 }),
+  );
+  messagesFromSnapshot(() => current);
+  render(<ViewHarness />);
+  const composer = () => screen.getByPlaceholderText('Message Nova…');
+
+  await user.click(await screen.findByRole('button', { name: 'Plan A' }));
+  expect(await screen.findByText('Answer in A')).toBeVisible();
+  await waitFor(() => expect(composer()).toBeEnabled());
+  await user.type(composer(), 'Draft for A');
+
+  await user.click(screen.getByRole('button', { name: 'Plan B' }));
+  expect(await screen.findByText('Answer in B')).toBeVisible();
+  expect(screen.queryByText('Answer in A')).not.toBeInTheDocument();
+  expect(composer()).toHaveValue('');
+  await user.type(composer(), 'Draft for B');
+
+  await user.click(screen.getByRole('button', { name: 'Plan A' }));
+  expect(await screen.findByText('Answer in A')).toBeVisible();
+  expect(screen.queryByText('Answer in B')).not.toBeInTheDocument();
+  expect(composer()).toHaveValue('Draft for A');
+  await user.click(screen.getByRole('button', { name: 'Plan B' }));
+  expect(await screen.findByText('Answer in B')).toBeVisible();
+  expect(composer()).toHaveValue('Draft for B');
+});
+
 it('replies to a Telegram session through its connector', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
