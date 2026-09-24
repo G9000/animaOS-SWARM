@@ -975,10 +975,23 @@ impl AgentRunCoordinator {
             });
         }
         runtime.set_run_id(run_id.clone());
+        // `todo_write` may only replace the task list this run started from
+        // (spec §4.4 item 8); another room's update surfaces as a conflict.
+        let todo_baseline = if runtime.config().allows_tool("todo_write") {
+            crate::tools::todo::read_agent_todos(
+                crate::tools::ctx_workspace_root(&tool_context),
+                &agent_id,
+            )
+            .ok()
+            .map(|todos| todos.revision)
+        } else {
+            None
+        };
         let tool_context = tool_context
             .with_team(self.clone(), can_delegate)
             .with_delegated_parent(delegated_parent)
-            .with_peer_route(peer_route, peer_sources);
+            .with_peer_route(peer_route, peer_sources)
+            .with_todo_baseline(todo_baseline);
         let history = runtime.messages().to_vec();
         let helper_timeout = helper_parent(&runtime.state()).is_some().then(|| {
             original_config

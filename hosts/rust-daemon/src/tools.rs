@@ -70,6 +70,9 @@ pub(crate) struct ToolExecutionContext {
     pub(super) workspace_root: Option<PathBuf>,
     pub(super) calendar: Option<CalendarManager>,
     pub(super) mail: Option<MailManager>,
+    /// Task-list revision this run last saw; `todo_write` only replaces the
+    /// list it saw (spec §4.4 item 8). Shared by clones within one run.
+    pub(super) todo_revision: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ToolExecutionContext {
@@ -98,6 +101,7 @@ impl ToolExecutionContext {
             workspace_root,
             calendar,
             mail: None,
+            todo_revision: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -128,6 +132,12 @@ impl ToolExecutionContext {
     ) -> Self {
         self.peer_route = Some(route);
         self.peer_sources = sources;
+        self
+    }
+
+    /// Starts this run's compare-and-swap baseline for `todo_write`.
+    pub(crate) fn with_todo_baseline(mut self, revision: Option<String>) -> Self {
+        self.todo_revision = Arc::new(std::sync::Mutex::new(revision));
         self
     }
 

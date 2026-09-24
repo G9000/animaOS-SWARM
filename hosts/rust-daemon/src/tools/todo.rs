@@ -19,6 +19,8 @@ pub(crate) struct TodoItem {
     pub(crate) active_form: String,
 }
 
+const TASKS_CHANGED_PREFIX: &str = "Tasks changed.";
+
 pub(super) fn execute_todo_write(
     context: ToolExecutionContext,
     agent: AgentState,
@@ -41,20 +43,51 @@ pub(super) fn execute_todo_write(
             None => return TaskResult::error("todo_write todos is required", 0),
         };
 
-        match write_agent_todos(ctx_workspace_root(&context), &agent.id, &todos, None)
-            .map(|_| format!("Todos updated ({} completed, {} in progress, {} pending). Proceed with current tasks.",
-                todos.iter().filter(|task| task.status == "completed").count(),
-                todos.iter().filter(|task| task.status == "in_progress").count(),
-                todos.iter().filter(|task| task.status == "pending").count()))
-        {
-            Ok(message) => TaskResult::success(
-                Content {
-                    text: message,
-                    attachments: None,
-                    metadata: None,
-                },
-                0,
-            ),
+        let root = ctx_workspace_root(&context);
+        let expected = context
+            .todo_revision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match write_agent_todos(root, &agent.id, &todos, expected.as_deref()) {
+            Ok(saved) => {
+                *context
+                    .todo_revision
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(saved.revision);
+                TaskResult::success(
+                    Content {
+                        text: format!(
+                            "Todos updated ({} completed, {} in progress, {} pending). Proceed with current tasks.",
+                            todos.iter().filter(|task| task.status == "completed").count(),
+                            todos.iter().filter(|task| task.status == "in_progress").count(),
+                            todos.iter().filter(|task| task.status == "pending").count()
+                        ),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    0,
+                )
+            }
+            // Another room updated the list since this run saw it: save nothing,
+            // show the latest list, and let a merged retry succeed.
+            Err(error) if error.starts_with(TASKS_CHANGED_PREFIX) => {
+                match read_agent_todos(root, &agent.id) {
+                    Ok(latest) => {
+                        let message = format!(
+                            "Tasks changed since this run last saw them, so nothing was saved. The latest tasks are:\n{}\nMerge your changes into this list and call todo_write again with the complete list.",
+                            render_agent_todos(&latest.tasks)
+                        );
+                        *context
+                            .todo_revision
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(latest.revision);
+                        TaskResult::error(message, 0)
+                    }
+                    Err(read_error) => TaskResult::error(read_error, 0),
+                }
+            }
             Err(error) => TaskResult::error(error, 0),
         }
     })
@@ -67,42 +100,49 @@ pub(super) fn execute_todo_read(
     _tool_call: ToolCall,
 ) -> BoxFuture<'static, TaskResult<Content>> {
     Box::pin(async move {
-        match read_agent_todos(ctx_workspace_root(&context), &agent.id).map(|snapshot| {
-            if snapshot.tasks.is_empty() {
-                "No todos set.".to_string()
-            } else {
-                snapshot
-                    .tasks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, task)| {
-                        format!(
-                            "{} {}. [{}] {}",
-                            match task.status.as_str() {
-                                "completed" => "[x]",
-                                "in_progress" => "[>]",
-                                _ => "[ ]",
-                            },
-                            index + 1,
-                            task.status,
-                            task.content
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+        match read_agent_todos(ctx_workspace_root(&context), &agent.id) {
+            Ok(snapshot) => {
+                *context
+                    .todo_revision
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(snapshot.revision.clone());
+                TaskResult::success(
+                    Content {
+                        text: render_agent_todos(&snapshot.tasks),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    0,
+                )
             }
-        }) {
-            Ok(message) => TaskResult::success(
-                Content {
-                    text: message,
-                    attachments: None,
-                    metadata: None,
-                },
-                0,
-            ),
             Err(error) => TaskResult::error(error, 0),
         }
     })
+}
+
+fn render_agent_todos(tasks: &[TodoItem]) -> String {
+    if tasks.is_empty() {
+        return "No todos set.".to_string();
+    }
+    tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            format!(
+                "{} {}. [{}] {}",
+                match task.status.as_str() {
+                    "completed" => "[x]",
+                    "in_progress" => "[>]",
+                    _ => "[ ]",
+                },
+                index + 1,
+                task.status,
+                task.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_todo_list(configured_root: Option<&Path>, todos: &[TodoItem]) -> Result<String, String> {
@@ -387,6 +427,187 @@ mod agent_tests {
         assert!(agent_todo_path(Some(&root), "../escape")
             .unwrap()
             .starts_with(root.canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    use anima_core::TaskStatus;
+    use std::sync::Arc;
+
+    fn todo_agent(id: &str) -> AgentState {
+        AgentState {
+            id: id.into(),
+            name: "todo-agent".into(),
+            status: anima_core::AgentStatus::Idle,
+            config: anima_core::AgentConfig {
+                name: "todo-agent".into(),
+                model: "test".into(),
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                provider: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            },
+            created_at_ms: 1,
+            token_usage: anima_core::TokenUsage::default(),
+        }
+    }
+
+    fn todo_context(root: &Path) -> ToolExecutionContext {
+        ToolExecutionContext::new(
+            Arc::new(tokio::sync::RwLock::new(anima_memory::MemoryManager::new())),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::memory_embeddings::MemoryEmbeddingRuntime::disabled(),
+            )),
+            None,
+            crate::tools::ToolRegistry::new(),
+            crate::tools::new_shared_process_manager_with_limit(1),
+            Some(root.to_path_buf()),
+            None,
+        )
+    }
+
+    fn user_message() -> Message {
+        Message {
+            id: "todo-message".into(),
+            agent_id: "agent-cas".into(),
+            room_id: "room-a".into(),
+            content: Content::default(),
+            role: anima_core::MessageRole::User,
+            created_at_ms: 1,
+        }
+    }
+
+    fn write_call(items: &[&str]) -> ToolCall {
+        ToolCall {
+            id: "todo-write".into(),
+            name: "todo_write".into(),
+            args: std::collections::BTreeMap::from([(
+                "todos".to_string(),
+                DataValue::Array(
+                    items
+                        .iter()
+                        .map(|content| {
+                            DataValue::Object(std::collections::BTreeMap::from([
+                                ("content".to_string(), DataValue::String((*content).into())),
+                                ("status".to_string(), DataValue::String("pending".into())),
+                                (
+                                    "activeForm".to_string(),
+                                    DataValue::String(format!("Doing {content}")),
+                                ),
+                            ]))
+                        })
+                        .collect(),
+                ),
+            )]),
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn todo_write_is_compare_and_swap_across_concurrent_runs() {
+        let root = temp_root("agent-todo-cas");
+        let baseline = read_agent_todos(Some(&root), "agent-cas").unwrap().revision;
+        let first = todo_context(&root).with_todo_baseline(Some(baseline.clone()));
+        let second = todo_context(&root).with_todo_baseline(Some(baseline));
+
+        let saved = execute_todo_write(
+            second,
+            todo_agent("agent-cas"),
+            user_message(),
+            write_call(&["From room B"]),
+        )
+        .await;
+        assert_eq!(saved.status, TaskStatus::Success);
+
+        let conflict = execute_todo_write(
+            first.clone(),
+            todo_agent("agent-cas"),
+            user_message(),
+            write_call(&["From room A"]),
+        )
+        .await;
+        assert_eq!(conflict.status, TaskStatus::Error);
+        let message = conflict.error.unwrap();
+        assert!(
+            message.starts_with("Tasks changed since this run last saw them, so nothing was saved."),
+            "{message}"
+        );
+        assert!(message.contains("[ ] 1. [pending] From room B"), "{message}");
+        assert!(message.ends_with("call todo_write again with the complete list."), "{message}");
+        assert_eq!(
+            read_agent_todos(Some(&root), "agent-cas").unwrap().tasks[0].content,
+            "From room B"
+        );
+
+        let merged = execute_todo_write(
+            first,
+            todo_agent("agent-cas"),
+            user_message(),
+            write_call(&["From room B", "From room A"]),
+        )
+        .await;
+        assert_eq!(merged.status, TaskStatus::Success);
+        assert_eq!(
+            merged.data.unwrap().text,
+            "Todos updated (0 completed, 0 in progress, 2 pending). Proceed with current tasks."
+        );
+        assert_eq!(read_agent_todos(Some(&root), "agent-cas").unwrap().tasks.len(), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_read_refreshes_the_revision_a_run_writes_against() {
+        let root = temp_root("agent-todo-read");
+        let context = todo_context(&root).with_todo_baseline(Some("stale-revision".into()));
+
+        let read = execute_todo_read(
+            context.clone(),
+            todo_agent("agent-read"),
+            user_message(),
+            ToolCall {
+                id: "todo-read".into(),
+                name: "todo_read".into(),
+                args: std::collections::BTreeMap::new(),
+            },
+        )
+        .await;
+        assert_eq!(read.data.unwrap().text, "No todos set.");
+
+        let written = execute_todo_write(
+            context,
+            todo_agent("agent-read"),
+            user_message(),
+            write_call(&["Plan"]),
+        )
+        .await;
+        assert_eq!(written.status, TaskStatus::Success);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_write_without_a_baseline_replaces_the_list() {
+        let root = temp_root("agent-todo-blind");
+
+        let written = execute_todo_write(
+            todo_context(&root),
+            todo_agent("agent-blind"),
+            user_message(),
+            write_call(&["Plan"]),
+        )
+        .await;
+
+        assert_eq!(written.status, TaskStatus::Success);
         fs::remove_dir_all(root).unwrap();
     }
 }
