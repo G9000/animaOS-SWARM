@@ -162,6 +162,24 @@ impl AgentRuntime {
             self.state.status = undo.status;
         }
     }
+
+    /// Removes the transcript messages `keep` rejects and returns them in
+    /// transcript order. Hosts use this to drop messages they keep elsewhere
+    /// (for example ones mirrored to a history store) or a deleted room.
+    /// Counters, events, usage, status, and the last task are untouched.
+    pub fn retain_messages(&mut self, mut keep: impl FnMut(&Message) -> bool) -> Vec<Message> {
+        let mut removed = Vec::new();
+        let mut kept = Vec::with_capacity(self.messages.len());
+        for message in self.messages.drain(..) {
+            if keep(&message) {
+                kept.push(message);
+            } else {
+                removed.push(message);
+            }
+        }
+        self.messages = kept;
+        removed
+    }
 }
 
 fn usage_since(after: &TokenUsage, before: &TokenUsage) -> TokenUsage {

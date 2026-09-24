@@ -417,3 +417,32 @@ fn content_retry_key_reads_the_supported_metadata_names() {
     assert_eq!(super::content_retry_key(&blank), None);
     assert_eq!(super::content_retry_key(&Content::default()), None);
 }
+
+#[test]
+fn retain_messages_removes_only_rejected_messages_and_keeps_counters() {
+    let mut canonical = canonical();
+    run_in(&mut canonical, "room-a", "first");
+    run_in(&mut canonical, "room-b", "second");
+    let before = canonical.snapshot();
+
+    let removed = canonical.retain_messages(|message| message.room_id != "room-a");
+
+    assert_eq!(removed.len(), 2);
+    assert!(removed.iter().all(|message| message.room_id == "room-a"));
+    assert_eq!(removed[0].role, MessageRole::User);
+    assert_eq!(removed[1].role, MessageRole::Assistant);
+    let after = canonical.snapshot();
+    assert_eq!(after.messages.len(), 2);
+    assert!(after.messages.iter().all(|message| message.room_id == "room-b"));
+    assert_eq!(after.message_count, 2);
+    assert_eq!(after.event_count, before.event_count);
+    assert_eq!(after.events, before.events);
+    assert_eq!(after.step_count, before.step_count);
+    assert_eq!(after.state.token_usage, before.state.token_usage);
+    assert_eq!(after.state.status, before.state.status);
+    assert_eq!(after.last_task, before.last_task);
+    assert!(
+        canonical.retain_messages(|_| true).is_empty(),
+        "keeping everything removes nothing"
+    );
+}
