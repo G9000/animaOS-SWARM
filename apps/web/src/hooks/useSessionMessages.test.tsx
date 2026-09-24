@@ -267,6 +267,139 @@ describe('useSessionMessages', () => {
     expect(result.current.messages.map((item) => item.id)).toEqual(['m1', 'm2']);
   });
 
+  it('drops an older page that no longer attaches to the list after a gap replaces it', async () => {
+    let resolveOlder: ((page: SessionMessagePage) => void) | undefined;
+    const pages = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockImplementation(async (_agentId, _sessionId, options = {}) => {
+        if (options.before === 'm20') {
+          return new Promise<SessionMessagePage>((resolve) => {
+            resolveOlder = resolve;
+          });
+        }
+        return {
+          messages: [message('m20', 20), message('m21', 21)],
+          nextBefore: 'm20',
+        };
+      });
+    const { result } = renderHook(() =>
+      useSessionMessages('agent-main', 'chat:1'),
+    );
+    await waitFor(() =>
+      expect(result.current.messages.map((item) => item.id)).toEqual(['m20', 'm21']),
+    );
+
+    // loadOlder fires "before m20" and is left in flight.
+    let older: Promise<void> | undefined;
+    act(() => {
+      older = result.current.loadOlder();
+    });
+    await waitFor(() => expect(resolveOlder).toBeDefined());
+    expect(result.current.loadingOlder).toBe(true);
+
+    // While that fetch is outstanding, a further gap replaces the list —
+    // "before m20" no longer attaches to anything in `messages`.
+    pages.mockResolvedValue({
+      messages: [message('m22', 22), message('m23', 23)],
+      nextBefore: 'm22',
+    });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.messages.map((item) => item.id)).toEqual(['m22', 'm23']);
+
+    // The stale "before m20" page now resolves; it must be dropped outright
+    // rather than merged onto a list it no longer attaches to (Important,
+    // M2 pre-flight audit fix round 2), and `loadingOlder` must still clear.
+    await act(async () => {
+      resolveOlder?.({
+        messages: [message('m17', 17), message('m18', 18), message('m19', 19)],
+        nextBefore: 'm5',
+      });
+      await older;
+    });
+
+    expect(result.current.messages.map((item) => item.id)).toEqual(['m22', 'm23']);
+    expect(result.current.loadingOlder).toBe(false);
+    expect(result.current.hasOlder).toBe(true);
+
+    // nextBefore must still be the replacement page's cursor ('m22'), not
+    // the stale page's ('m5') — proven by what the next loadOlder requests.
+    await act(async () => {
+      await result.current.loadOlder();
+    });
+    expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', {
+      before: 'm22',
+      limit: 50,
+    });
+  });
+
+  it('still prepends the older page when a non-gap poll runs while it is in flight', async () => {
+    let resolveOlder: ((page: SessionMessagePage) => void) | undefined;
+    const pages = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockImplementation(async (_agentId, _sessionId, options = {}) => {
+        if (options.before === 'm5') {
+          return new Promise<SessionMessagePage>((resolve) => {
+            resolveOlder = resolve;
+          });
+        }
+        return { messages: [message('m5', 5), message('m6', 6)], nextBefore: 'm5' };
+      });
+    const { result } = renderHook(() =>
+      useSessionMessages('agent-main', 'chat:1'),
+    );
+    await waitFor(() =>
+      expect(result.current.messages.map((item) => item.id)).toEqual(['m5', 'm6']),
+    );
+
+    let older: Promise<void> | undefined;
+    act(() => {
+      older = result.current.loadOlder();
+    });
+    await waitFor(() => expect(resolveOlder).toBeDefined());
+
+    // A normal (non-gap) poll runs while the older fetch is outstanding: it
+    // extends the tail without moving the head, so the anchor still matches.
+    pages.mockResolvedValue({
+      messages: [message('m5', 5), message('m6', 6), message('m7', 7)],
+      nextBefore: 'm5',
+    });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm5',
+      'm6',
+      'm7',
+    ]);
+
+    await act(async () => {
+      resolveOlder?.({
+        messages: [
+          message('m1', 1),
+          message('m2', 2),
+          message('m3', 3),
+          message('m4', 4),
+        ],
+        nextBefore: null,
+      });
+      await older;
+    });
+
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm1',
+      'm2',
+      'm3',
+      'm4',
+      'm5',
+      'm6',
+      'm7',
+    ]);
+    expect(result.current.hasOlder).toBe(false);
+    expect(result.current.loadingOlder).toBe(false);
+  });
+
   it('reports a deleted session and stops polling it', async () => {
     const polls = capturePolls();
     const pages = vi

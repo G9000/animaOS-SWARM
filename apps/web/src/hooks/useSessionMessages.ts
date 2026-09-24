@@ -144,6 +144,14 @@ export function useSessionMessages(
   const loadOlder = useCallback(async () => {
     if (!agentId || !sessionId || !nextBefore || loadingOlderRef.current) return;
     const request = generation.current;
+    // The id of the message this fetch's `before` cursor was derived from —
+    // i.e. the list's current head. A gap-triggered `refresh` can replace
+    // the whole list while this fetch is outstanding (fix round 2); if the
+    // head has moved by the time it resolves, the fetched page no longer
+    // attaches to anything and must be dropped, not merged onto the wrong
+    // list. A non-gap `refresh` never moves the head (it only ever extends
+    // the tail), so this only ever blocks a genuinely stale fetch.
+    const anchor = messagesRef.current[0]?.id;
     loadingOlderRef.current = true;
     setLoadingOlder(true);
     try {
@@ -152,6 +160,7 @@ export function useSessionMessages(
         limit: SESSION_MESSAGE_PAGE,
       });
       if (request !== generation.current) return;
+      if (messagesRef.current[0]?.id !== anchor) return;
       loadedOlder.current = true;
       const known = new Set(messagesRef.current.map((message) => message.id));
       const merged = [
