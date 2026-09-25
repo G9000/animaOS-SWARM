@@ -65,6 +65,9 @@ export function useCompanionSessions(
   // just-set value synchronously, before this render (and its dependent
   // effects) has a chance to commit (D3).
   const daemonTooOldRef = useRef(false);
+  /** Arms the next poll while the poll effect runs; a walk that succeeds
+   *  after the daemon was flagged too old re-arms the poll through it (R3). */
+  const resumePollRef = useRef<(() => void) | null>(null);
   const query = filters.query.trim();
   const { archived } = filters;
 
@@ -122,7 +125,10 @@ export function useCompanionSessions(
       setHasMore(more);
       setError(null);
       setDaemonTooOld(false);
-      daemonTooOldRef.current = false;
+      if (daemonTooOldRef.current) {
+        daemonTooOldRef.current = false;
+        resumePollRef.current?.();
+      }
       const target = loadMoreTargetRef.current;
       if (target !== null && pages >= target) {
         loadMoreTargetRef.current = null;
@@ -170,17 +176,20 @@ export function useCompanionSessions(
     let timer: number | undefined;
     const schedule = () => {
       // D3: once the daemon is flagged too old, stop polling rather than
-      // hammering its (missing) sessions routes every 10 s; `refresh` (and
-      // so `daemonTooOldRef`) still work for a manual retry.
-      if (!active || daemonTooOldRef.current) return;
+      // hammering its (missing) sessions routes every 10 s; a later walk that
+      // succeeds (a manual `refresh`) re-arms the poll through
+      // `resumePollRef` (R3).
+      if (!active || timer !== undefined || daemonTooOldRef.current) return;
       timer = window.setTimeout(() => {
         timer = undefined;
         void refresh().finally(schedule);
       }, SESSION_LIST_POLL_MS);
     };
+    resumePollRef.current = schedule;
     void refresh().finally(schedule);
     return () => {
       active = false;
+      if (resumePollRef.current === schedule) resumePollRef.current = null;
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [agentId, refresh]);

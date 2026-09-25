@@ -407,7 +407,7 @@ describe('useCompanionSessions', () => {
     expect(hasMore.slice(loaded)).not.toContain(true);
   });
 
-  it('stops scheduling further polls once the daemon is flagged too old, but a manual refresh still works', async () => {
+  it('stops scheduling further polls once the daemon is flagged too old, and a successful refresh re-arms them', async () => {
     const poll = capturePoll();
     const list = vi
       .spyOn(daemon, 'listSessions')
@@ -430,13 +430,19 @@ describe('useCompanionSessions', () => {
     // No further timer is armed once the daemon is flagged too old.
     expect(poll.armed).toBe(1);
 
-    // A manual refresh still asks the daemon, and can clear the flag again.
-    list.mockResolvedValueOnce({ sessions: [], nextCursor: null });
+    // A manual refresh still asks the daemon, clears the flag, and re-arms
+    // the 10 s poll (R3).
+    list.mockResolvedValue({ sessions: [], nextCursor: null });
     await act(async () => {
       await result.current.refresh();
     });
     expect(list).toHaveBeenCalledTimes(3);
     expect(result.current.daemonTooOld).toBe(false);
+    await waitFor(() => expect(poll.armed).toBe(2));
+    await act(async () => {
+      poll.run?.();
+    });
+    expect(list).toHaveBeenCalledTimes(4);
   });
 
   it('stops adding pages at the page cap', async () => {
