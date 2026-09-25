@@ -340,7 +340,7 @@ After the first completed reply in a `chat` session whose `titleSource` is `firs
 
 ### 13.2 Hot tail
 
-- A message may be pruned from the control plane when it is mirrored, is not among its session's newest 200 messages, is older than 24 hours, and is not referenced by a non-terminal Telegram outbound record, a pending approval, or an active run. Pruning runs every 10 minutes inside a normal transaction and is disabled in ephemeral mode.
+- A message may be pruned from the control plane when it is mirrored, is not among its session's newest 200 visible messages (silent check-in turns among them stay, and pruning removes only whole turns, so a kept tail always starts at a user message), is older than 24 hours, and is not referenced by a non-terminal Telegram outbound record, a pending approval, or an active run. Pruning runs every 10 minutes inside a normal transaction and is disabled in ephemeral mode.
 - Terminal outbound records whose message was pruned are marked `messagePruned`, and snapshot validation accepts that flag for terminal records only.
 - Each agent's stored event log keeps the newest 500 events; `event_count` keeps the running total. No daemon code reads the log beyond its count.
 
@@ -424,7 +424,7 @@ Nothing is deleted. Rolling back to an older daemon requires restoring the backu
 | Run input | 32 KiB text, 10 attachments |
 | Stream | 1,024-event buffer, 16 subscribers, 50 ms / 512-byte delta flush, 2 KiB previews |
 | Context | 60% of the model window, 32k fallback, 4 images |
-| Hot tail | newest 200 per session, 24 hours, mirrored, unreferenced |
+| Hot tail | newest 200 visible per session (whole turns), 24 hours, mirrored, unreferenced |
 | Event log | 500 per agent |
 | Approvals | 30-minute timeout, 15 for Telegram-started runs |
 | Skills | 32 KiB body, 50 in the index, 10 pending drafts per agent |
