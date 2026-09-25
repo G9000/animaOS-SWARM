@@ -1,9 +1,9 @@
+mod run_commit;
 mod runtime_events;
+mod session_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
-mod run_commit;
-mod session_state;
 pub(crate) use self::session_state::RunSessionRequest;
 
 use std::collections::{HashMap, HashSet};
@@ -1167,7 +1167,11 @@ mod tests {
 
         let snapshot = source.control_plane_snapshot();
         assert_eq!(snapshot.version, 5);
-        assert_eq!(snapshot.runs.len(), 3, "runs of deleted agents are not saved");
+        assert_eq!(
+            snapshot.runs.len(),
+            3,
+            "runs of deleted agents are not saved"
+        );
         assert!(snapshot.runs.iter().all(|run| run.agent_id == agent_id));
         let snapshot: ControlPlaneSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
@@ -1186,7 +1190,10 @@ mod tests {
         let never_started = restored.runs.get(&queued.id).unwrap();
         assert_eq!(never_started.status, RunStatus::Interrupted);
         assert_eq!(
-            never_started.error.as_ref().map(|error| error.code.as_str()),
+            never_started
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
             Some("restart_before_start")
         );
         assert_eq!(restored.runs.get(&completed.id), Some(&completed));
@@ -1225,7 +1232,11 @@ mod tests {
         source.sessions.insert(orphan);
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.sessions, vec![chat.clone()], "sessions of deleted agents are not saved");
+        assert_eq!(
+            snapshot.sessions,
+            vec![chat.clone()],
+            "sessions of deleted agents are not saved"
+        );
         let snapshot: ControlPlaneSnapshot =
             serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
 
@@ -1812,7 +1823,11 @@ impl DaemonState {
             .into_iter()
             .map(|schedule| (schedule.id.clone(), schedule))
             .collect();
-        self.goals = snapshot.goals.into_iter().map(|goal| (goal.id.clone(), goal)).collect();
+        self.goals = snapshot
+            .goals
+            .into_iter()
+            .map(|goal| (goal.id.clone(), goal))
+            .collect();
         self.jobs = snapshot
             .jobs
             .into_iter()
@@ -1857,10 +1872,8 @@ impl DaemonState {
             .map(|write| (write.id.clone(), write))
             .collect();
 
-        self.sessions = crate::sessions::SessionRegistry::restored(
-            snapshot.sessions,
-            &self.live_agent_ids(),
-        );
+        self.sessions =
+            crate::sessions::SessionRegistry::restored(snapshot.sessions, &self.live_agent_ids());
         let derived_sessions = self.derive_legacy_sessions();
         let derived_session_count = derived_sessions.len();
         for record in derived_sessions {

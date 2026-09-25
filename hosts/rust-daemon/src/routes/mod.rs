@@ -7,10 +7,10 @@ mod connectors;
 mod contracts;
 mod folder_picker;
 mod gcalendar;
+mod goals;
 mod health;
 mod http;
 mod jobs;
-mod goals;
 mod mail;
 mod memories;
 mod oauth_apps;
@@ -439,18 +439,53 @@ fn router_with_services_with_policies(
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/capabilities", get(capabilities_entry))
-        .route("/api/goals", get(goals::list_goals).post(goals::create_goal))
-        .route("/api/goals/{goal_id}/status", axum::routing::post(goals::change_status))
+        .route(
+            "/api/goals",
+            get(goals::list_goals).post(goals::create_goal),
+        )
+        .route(
+            "/api/goals/{goal_id}/status",
+            axum::routing::post(goals::change_status),
+        )
         .route("/api/goals/{goal_id}/jobs", get(goals::goal_jobs))
-        .route("/api/agents/{agent_id}/jobs", get(jobs::list_jobs).post(jobs::create_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/cancel", axum::routing::post(jobs::cancel_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/retry", axum::routing::post(jobs::retry_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/approve", axum::routing::post(jobs::approve_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/review", axum::routing::post(jobs::review_job))
-        .route("/api/agents/{agent_id}/sessions", get(sessions::list_sessions).post(sessions::create_session))
-        .route("/api/agents/{agent_id}/sessions/{session_id}", get(sessions::get_session).patch(sessions::update_session).delete(sessions::delete_session))
-        .route("/api/agents/{agent_id}/sessions/{session_id}/messages", get(sessions::list_session_messages))
-        .route("/api/agents/{agent_id}/sessions/{session_id}/export", get(sessions::export_session))
+        .route(
+            "/api/agents/{agent_id}/jobs",
+            get(jobs::list_jobs).post(jobs::create_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/cancel",
+            axum::routing::post(jobs::cancel_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/retry",
+            axum::routing::post(jobs::retry_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/approve",
+            axum::routing::post(jobs::approve_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/review",
+            axum::routing::post(jobs::review_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions",
+            get(sessions::list_sessions).post(sessions::create_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}",
+            get(sessions::get_session)
+                .patch(sessions::update_session)
+                .delete(sessions::delete_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/messages",
+            get(sessions::list_session_messages),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/export",
+            get(sessions::export_session),
+        )
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -522,7 +557,9 @@ fn router_with_services_with_policies(
         )
         .route(
             "/api/agents/{agent_id}/avatar",
-            get(get_agent_avatar_entry).put(put_agent_avatar_entry).delete(delete_agent_avatar_entry),
+            get(get_agent_avatar_entry)
+                .put(put_agent_avatar_entry)
+                .delete(delete_agent_avatar_entry),
         )
         .route(
             "/api/agents/{agent_id}/memories/recent",
@@ -732,12 +769,18 @@ async fn health_entry() -> AxumResponse {
 )]
 async fn capabilities_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     let mut response = if state.local_owner.authorize_read(request.headers()).is_err() {
-        ApiError { status: StatusCode::FORBIDDEN, message: "local owner authorization required".into() }.into_response()
+        ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "local owner authorization required".into(),
+        }
+        .into_response()
     } else {
         let guard = state.daemon.read().await;
         json_response(StatusCode::OK, &capabilities::inventory(&guard))
     };
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -1826,11 +1869,11 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
-    mod jobs;
-    mod goals;
     mod capabilities;
-    mod swarm_reliability;
+    mod goals;
+    mod jobs;
     mod sessions;
+    mod swarm_reliability;
 
     use super::{router, router_with_services, router_with_services_with_policies};
     use crate::agent_runs::AgentRunCoordinator;
@@ -3146,11 +3189,37 @@ mod tests {
     #[tokio::test]
     async fn slow_run_uses_its_own_timeout_instead_of_standard_api_timeout() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
-            SlowModelAdapter { delay: Duration::from_millis(50), calls: AtomicUsize::new(0) },
+            SlowModelAdapter {
+                delay: Duration::from_millis(50),
+                calls: AtomicUsize::new(0),
+            },
         ))));
-        let id = state.write().await.create_agent(test_config("slow-run")).unwrap().state.id;
-        let app = router(state, DaemonConfig { request_timeout: Duration::from_millis(1), run_request_timeout: Duration::from_secs(2), ..DaemonConfig::default() });
-        let response = app.oneshot(Request::builder().method("POST").uri(format!("/api/agents/{id}/run")).header("content-type", "application/json").body(Body::from(r#"{"text":"slow work"}"#)).unwrap()).await.unwrap();
+        let id = state
+            .write()
+            .await
+            .create_agent(test_config("slow-run"))
+            .unwrap()
+            .state
+            .id;
+        let app = router(
+            state,
+            DaemonConfig {
+                request_timeout: Duration::from_millis(1),
+                run_request_timeout: Duration::from_secs(2),
+                ..DaemonConfig::default()
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"slow work"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3749,13 +3818,24 @@ mod tests {
 }
 
 #[utoipa::path(get, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 200, description = "Agent avatar"), (status = 404, description = "No avatar")))]
-async fn get_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+async fn get_agent_avatar_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AxumResponse {
     match agent_avatar::get(&id, &state.daemon).await {
         Ok(avatar) => {
             let mut response = avatar.bytes.into_response();
-            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(avatar.content_type));
-            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(avatar.content_type),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
             response
         }
         Err(error) => error.into_response(),
@@ -3763,33 +3843,63 @@ async fn get_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<St
 }
 
 #[utoipa::path(put, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 204, description = "Avatar saved"), (status = 400, description = "Invalid image")))]
-async fn put_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>, request: AxumRequest) -> AxumResponse {
-    let content_type = request.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let body = match read_limited_body(request, workspace::MAX_WORKSPACE_AVATAR_BYTES + 1).await { Ok(body) => body, Err(response) => return response };
+async fn put_agent_avatar_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> AxumResponse {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = match read_limited_body(request, workspace::MAX_WORKSPACE_AVATAR_BYTES + 1).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let _transaction = state.agent_runs.control_plane_transaction().await;
     match agent_avatar::put(&id, body, content_type.as_deref(), &state.daemon).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
 #[utoipa::path(delete, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 204, description = "Avatar removed")))]
-async fn delete_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+async fn delete_agent_avatar_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AxumResponse {
     let _transaction = state.agent_runs.control_plane_transaction().await;
     match agent_avatar::remove(&id, &state.daemon).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
-async fn agent_tasks_context(state: &AppState, id: &str) -> Result<(std::path::PathBuf, String), ApiError> {
+async fn agent_tasks_context(
+    state: &AppState,
+    id: &str,
+) -> Result<(std::path::PathBuf, String), ApiError> {
     let guard = state.daemon.read().await;
     let runtime_id = guard.agent_runtime_id(id).ok_or_else(ApiError::not_found)?;
-    let root = guard.workspace.as_ref().ok_or_else(|| ApiError::conflict("workspace is not configured"))?.root_path.clone();
+    let root = guard
+        .workspace
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("workspace is not configured"))?
+        .root_path
+        .clone();
     Ok((root, runtime_id))
 }
 
 #[utoipa::path(get, path = "/api/agents/{agent_id}/tasks", tag = "agents", params(("agent_id" = String, Path)), responses((status = 200, description = "Agent tasks", body = crate::tools::todo::AgentTodos)))]
-async fn get_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
-    let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
+async fn get_agent_tasks_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AxumResponse {
+    let (root, id) = match agent_tasks_context(&state, &id).await {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
+    };
     match crate::tools::todo::read_agent_todos(Some(&root), &id) {
         Ok(tasks) => json_response(StatusCode::OK, &tasks),
         Err(error) => ApiError::service_unavailable(error).into_response(),
@@ -3797,17 +3907,37 @@ async fn get_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<Str
 }
 
 #[utoipa::path(put, path = "/api/agents/{agent_id}/tasks", tag = "agents", params(("agent_id" = String, Path)), request_body = crate::tools::todo::AgentTodos, responses((status = 200, description = "Agent tasks saved", body = crate::tools::todo::AgentTodos), (status = 409, description = "Tasks changed since read")))]
-async fn put_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<String>, request: AxumRequest) -> AxumResponse {
-    let body = match read_limited_body(request, state.config.max_request_bytes).await { Ok(body) => body, Err(response) => return response };
-    let input: crate::tools::todo::AgentTodos = match parse_json_body(body) { Ok(input) => input, Err(error) => return error.into_response() };
+async fn put_agent_tasks_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> AxumResponse {
+    let body = match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let input: crate::tools::todo::AgentTodos = match parse_json_body(body) {
+        Ok(input) => input,
+        Err(error) => return error.into_response(),
+    };
     let _transaction = state.agent_runs.control_plane_transaction().await;
-    let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
+    let (root, id) = match agent_tasks_context(&state, &id).await {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
+    };
     if state.daemon.read().await.in_flight_runs(&id) > 0 {
         return ApiError::conflict("This agent is working. Wait for the current run to finish, then refresh tasks before saving.").into_response();
     }
-    match crate::tools::todo::write_agent_todos(Some(&root), &id, &input.tasks, Some(&input.revision)) {
+    match crate::tools::todo::write_agent_todos(
+        Some(&root),
+        &id,
+        &input.tasks,
+        Some(&input.revision),
+    ) {
         Ok(tasks) => json_response(StatusCode::OK, &tasks),
-        Err(error) if error.starts_with("Tasks changed.") => ApiError::conflict(error).into_response(),
+        Err(error) if error.starts_with("Tasks changed.") => {
+            ApiError::conflict(error).into_response()
+        }
         Err(error) => ApiError::bad_request(error).into_response(),
     }
 }

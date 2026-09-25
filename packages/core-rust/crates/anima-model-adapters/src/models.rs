@@ -1084,15 +1084,22 @@ pub fn model_info(provider: &str, model: &str) -> Option<&'static ModelInfo> {
     // The ChatGPT subscription runs OpenAI models under the hood; look up context/vision
     // metadata under the `openai` rows even though cost estimation (a separate call) still
     // treats `chatgpt` as a no-per-token subscription.
-    let lookup_provider = if provider == "chatgpt" { "openai" } else { provider };
+    let lookup_provider = if provider == "chatgpt" {
+        "openai"
+    } else {
+        provider
+    };
     model_info_in(MODELS, lookup_provider, model)
 }
 
 fn model_info_in<'a>(table: &'a [ModelInfo], provider: &str, model: &str) -> Option<&'a ModelInfo> {
     let model = model.trim().to_ascii_lowercase();
-    if let Some(canonical) = MODEL_ALIASES.iter().find_map(|(alias_provider, alias, canonical)| {
-        (*alias_provider == provider && *alias == model).then_some(*canonical)
-    }) {
+    if let Some(canonical) = MODEL_ALIASES
+        .iter()
+        .find_map(|(alias_provider, alias, canonical)| {
+            (*alias_provider == provider && *alias == model).then_some(*canonical)
+        })
+    {
         if let Some(info) = table
             .iter()
             .find(|info| info.provider == provider && info.model_prefix == canonical)

@@ -130,7 +130,9 @@ impl TokenUsage {
     /// Adds `other` into `self` field by field, saturating instead of overflowing.
     pub fn saturating_add(&mut self, other: &TokenUsage) {
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
-        self.completion_tokens = self.completion_tokens.saturating_add(other.completion_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
         self.cached_prompt_tokens = self
             .cached_prompt_tokens

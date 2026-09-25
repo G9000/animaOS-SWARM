@@ -911,7 +911,13 @@ async fn run_agent_executes_todo_write_and_read_round_trip() {
             .path()
             .join(".animaos-swarm")
             .join("agent-tasks")
-            .join(format!("{}.json", agent_id.bytes().map(|byte| format!("{byte:02x}")).collect::<String>()))
+            .join(format!(
+                "{}.json",
+                agent_id
+                    .bytes()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            ))
             .exists(),
         "todo_write should persist the todo list inside the temp workspace"
     );
@@ -965,13 +971,17 @@ async fn agent_tasks_api_is_isolated_and_rejects_stale_revision() {
     let path = format!("/api/agents/{first}/tasks");
     let (status, body) = send_json_request(&app, "GET", &path, "").await;
     assert_eq!(status, StatusCode::OK);
-    let revision = response_json(&body)["revision"].as_str().unwrap().to_owned();
+    let revision = response_json(&body)["revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let update = serde_json::json!({"revision":revision,"tasks":[{"content":"Research", "activeForm":"Researching", "status":"pending"}]}).to_string();
     let (status, body) = send_json_request(&app, "PUT", &path, &update).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(response_json(&body)["tasks"][0]["content"], "Research");
     let (status, _) = send_json_request(&app, "PUT", &path, &update).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    let (_, other) = send_json_request(&app, "GET", &format!("/api/agents/{second}/tasks"), "").await;
+    let (_, other) =
+        send_json_request(&app, "GET", &format!("/api/agents/{second}/tasks"), "").await;
     assert_eq!(response_json(&other)["tasks"].as_array().unwrap().len(), 0);
 }
