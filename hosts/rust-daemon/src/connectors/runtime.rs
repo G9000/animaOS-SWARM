@@ -862,7 +862,6 @@ impl ConnectorManager {
     /// session runs route (spec §4.2): the same flow, without the fail-fast
     /// waiting budget (the accepted queue has its own cap) and without the
     /// transcript replay (acceptance already checked the key in the ledger).
-    #[allow(dead_code)] // The session runs route (next commit) starts Telegram turns.
     pub(crate) async fn send_from_owner_accepted(
         &self,
         agent_id: String,

@@ -17,7 +17,6 @@ pub(crate) const MAX_RUN_TOOLS_STARTED: usize = 50;
 /// Per-model-call usage kept per run (spec §4.1 `steps`).
 pub(crate) const MAX_RUN_STEPS: usize = 50;
 /// Attachments per message (spec §4.1, §16).
-#[allow(dead_code)] // The session runs route (next commit) checks it.
 pub(crate) const MAX_RUN_ATTACHMENTS: usize = 10;
 /// A reused `Idempotency-Key` answers with its original run for 24 hours
 /// (spec §4.2), within the ledger's retention: only while the ledger still
@@ -76,8 +75,7 @@ impl RunStatus {
     }
 }
 
-/// What started a run (spec §4.1). `Web` arrives with the async runs route.
-#[allow(dead_code)]
+/// What started a run (spec §4.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RunSource {
@@ -363,7 +361,6 @@ impl RunLedger {
     }
 
     /// This session's runs, newest first.
-    #[allow(dead_code)] // The session runs route (next commit) lists them.
     pub(crate) fn for_session(&self, agent_id: &str, session_id: &str) -> Vec<&RunRecord> {
         let mut records = self
             .records

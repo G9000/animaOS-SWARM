@@ -86,7 +86,6 @@ impl LiveRuns {
             .clone()
     }
 
-    #[allow(dead_code)] // M3 Tasks 7–9 look up a run's control to stop or steer it.
     pub(crate) fn control(&self, run_id: &str) -> Option<RunControl> {
         self.lock().get(run_id).map(|run| run.control.clone())
     }

@@ -16,6 +16,7 @@ mod mail;
 mod memories;
 mod oauth_apps;
 mod profile;
+mod runs;
 mod schedules;
 mod sessions;
 mod swarms;
@@ -168,6 +169,7 @@ use crate::runtime_model::provider_summaries;
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
         sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
         events::agent_events,
+        runs::start_session_run, runs::list_session_runs, runs::get_run,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -497,6 +499,11 @@ fn router_with_services_with_policies(
             "/api/agents/{agent_id}/sessions/{session_id}/export",
             get(sessions::export_session),
         )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/runs",
+            get(runs::list_session_runs).post(runs::start_session_run),
+        )
+        .route("/api/agents/{agent_id}/runs/{run_id}", get(runs::get_run))
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -1885,6 +1892,7 @@ mod tests {
     mod events;
     mod goals;
     mod jobs;
+    mod runs;
     mod sessions;
     mod swarm_reliability;
 

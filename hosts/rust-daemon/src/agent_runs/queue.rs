@@ -35,7 +35,6 @@ pub(crate) const RUN_STOPPED_BEFORE_START: &str = "This run was stopped before i
 const RUN_ENDED_BEFORE_START: &str = "The run stopped unexpectedly before it started";
 
 /// How a message joins its session (spec §4.2, §4.7).
-#[allow(dead_code)] // The session runs route (next commit) builds `Queue`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionRunMode {
     Queue,
@@ -86,7 +85,6 @@ impl AgentRunCoordinator {
     /// a reused key with its original run, and otherwise saves a `queued` run
     /// and appends it to the session's queue, all under the control-plane
     /// transaction, so acceptance order is execution order.
-    #[allow(dead_code)] // The session runs route (next commit) accepts messages.
     pub(crate) async fn accept_run(
         &self,
         request: AcceptRun,
@@ -203,7 +201,6 @@ impl AgentRunCoordinator {
 
     /// The start of an accepted web message: the owner's turn in the
     /// session's room, run by this coordinator.
-    #[allow(dead_code)] // The session runs route (next commit) starts web messages.
     pub(crate) fn web_start(
         &self,
         agent_id: String,

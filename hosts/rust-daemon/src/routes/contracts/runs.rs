@@ -104,3 +104,34 @@ impl From<&RunRecord> for RunResponse {
         }
     }
 }
+
+/// A steer that joined the session's active run (spec §4.2).
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SteerStatusResponse {
+    /// `pending` until the run's next model call drains it.
+    pub(crate) status: String,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunEnvelope {
+    pub(crate) run: RunResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) steer: Option<SteerStatusResponse>,
+}
+
+impl RunEnvelope {
+    pub(crate) fn of(record: &RunRecord) -> Self {
+        Self {
+            run: RunResponse::from(record),
+            steer: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunsEnvelope {
+    pub(crate) runs: Vec<RunResponse>,
+}
