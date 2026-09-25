@@ -20,6 +20,7 @@ use zeroize::Zeroizing;
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::oauth_apps::{OAuthAppService, OAuthProvider, ResolvedOAuthApp};
+use crate::runs::RunSource;
 use crate::state::DaemonState;
 
 use self::client::{GoogleCalendarEvent, GoogleCalendarTransport, GoogleTransportError};
@@ -941,21 +942,34 @@ impl CalendarManager {
     fn notify_agent_write_applied(&self, write: &CalendarPendingWriteRecord) {
         let coordinator = self.agent_runs.clone();
         let agent_id = write.agent_id.clone();
-        let write_id = write.id.clone();
+        let reference = format!(
+            "{}{}",
+            crate::sessions::CALENDAR_WRITE_SOURCE_REF_PREFIX,
+            write.id
+        );
         let text = format!(
             "Calendar change confirmed and applied: {}. Continue the conversation accordingly.",
             write.summary
         );
+        let summary_metadata = std::collections::BTreeMap::from([(
+            crate::sessions::CALENDAR_SUMMARY_METADATA_KEY.to_string(),
+            anima_core::DataValue::String(write.summary.clone()),
+        )]);
         tokio::spawn(async move {
             let _ = coordinator
                 .run(AgentRunRequest {
                     agent_id,
                     content: anima_core::Content {
                         text,
+                        metadata: Some(summary_metadata),
                         ..Default::default()
                     },
                     room: RunRoom::Generated,
-                    idempotency_key: Some(format!("calendar-write:{write_id}")),
+                    idempotency_key: Some(reference.clone()),
+                    // Daemon-internal follow-ups are recorded like API runs.
+                    source: RunSource::Api,
+                    source_ref: Some(reference),
+                    parent: None,
                 })
                 .await;
         });

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::{
-    AgentCommunicationRoute, AgentConfig, AgentConfigUpdate, AgentRuntimeSnapshot, AgentSettings,
+    content_retry_key, AgentCommunicationRoute, AgentConfig, AgentConfigUpdate, AgentSettings,
     AgentState, Content, DataValue, TaskResult,
 };
 use anima_memory::{MemoryType, NewMemory};
@@ -12,6 +12,10 @@ use tracing::warn;
 use crate::app::SharedDaemonState;
 use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
+use crate::runs::{
+    RunChangeSet, RunError, RunOutcome, RunRecord, RunSource, RunStart, RunStatus, COMMIT_FAILED,
+    COMMIT_REJECTED, DEFAULT_MAX_RUNS_PER_AGENT, HELPER_MAX_RUNS, RUN_ABORTED,
+};
 use crate::state::DaemonState;
 
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
@@ -19,9 +23,24 @@ pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
 const MAX_HELPERS_PER_COMPANION: usize = 4;
 const MAX_HELPER_TOOL_ITERATIONS: usize = 8;
 const MAX_HELPER_RUN_MS: u64 = 120_000;
+const DUPLICATE_IN_FLIGHT_RUN: &str = "A run with this idempotency key is already in progress";
+/// Helpers have no chat of their own (spec §3.1); they only run through the
+/// companion that delegates to them. Shared with `routes::sessions::
+/// create_session`'s `409` (fix round 1, M2 review: was duplicated).
+pub(crate) const HELPER_MUST_RUN_THROUGH_COMPANION: &str =
+    "Helpers must run through their owning companion";
+
+/// Upper bound accepted for `ANIMAOS_RS_MAX_RUNS_PER_AGENT` and for
+/// `with_max_runs_per_agent`; keeps `tokio::sync::Semaphore::new` from ever
+/// being asked to build an unreasonably large agent-slot semaphore.
+pub(crate) const MAX_RUNS_PER_AGENT_LIMIT: usize = 64;
 
 fn helper_parent(agent: &AgentState) -> Option<&str> {
-    let settings = agent.config.settings.as_ref()?;
+    config_helper_parent(&agent.config)
+}
+
+pub(crate) fn config_helper_parent(config: &AgentConfig) -> Option<&str> {
+    let settings = config.settings.as_ref()?;
     if settings.additional.get("workspaceRole") != Some(&DataValue::String("helper".into())) {
         return None;
     }
@@ -29,6 +48,19 @@ fn helper_parent(agent: &AgentState) -> Option<&str> {
         Some(DataValue::String(parent)) => Some(parent.as_str()),
         _ => None,
     }
+}
+
+pub(crate) fn is_helper_config(config: &AgentConfig) -> bool {
+    config
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.additional.get("workspaceRole"))
+        == Some(&DataValue::String("helper".into()))
+}
+
+fn run_worker_stopped(error: tokio::task::JoinError) -> ApiError {
+    warn!(error = %error, "agent run worker stopped unexpectedly");
+    ApiError::service_unavailable("agent run worker stopped unexpectedly")
 }
 
 fn is_coordination_tool(name: &str) -> bool {
@@ -67,39 +99,173 @@ fn helper_config(parent: &AgentState, name: String) -> AgentConfig {
 }
 
 fn is_workspace_manager(agent: &AgentState) -> bool {
-    agent
-        .config
+    is_manager_config(&agent.config)
+}
+
+fn is_manager_config(config: &AgentConfig) -> bool {
+    config
         .settings
         .as_ref()
         .and_then(|settings| settings.additional.get("workspaceRole"))
         == Some(&DataValue::String("lead".into()))
 }
 
-type AgentLockMap = Arc<StdMutex<HashMap<String, Arc<Mutex<()>>>>>;
-type AgentRunRollback = Box<
-    dyn FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
->;
+/// Undoes a source's own records after a failed commit; the coordinator has
+/// already removed the run's messages, events, and usage.
+type AgentRunRollback = Box<dyn FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static>;
 
-struct AgentLockCleanup {
+/// Error returned when the global run limit is exhausted on a fail-fast path.
+pub(crate) const RUN_ADMISSION_SATURATED: &str = "too many concurrent run requests";
+
+/// Runs of one agent that fail-fast callers (the legacy run route and
+/// Telegram owner sends) may have waiting at once for a room lock, an agent
+/// slot, or a global permit (spec §16).
+pub(crate) const MAX_QUEUED_RUNS_PER_AGENT: usize = 8;
+
+const SPECIALIST_BUSY: &str = "Specialist is busy";
+
+type SessionLockMap = Arc<StdMutex<HashMap<(String, String), Arc<Mutex<()>>>>>;
+type AgentSlotMap = Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>;
+/// Units of each agent's waiting budget in use; an agent with none has no entry.
+type WaitingBudgetMap = Arc<StdMutex<HashMap<String, usize>>>;
+
+/// One unit of an agent's waiting budget (`MAX_QUEUED_RUNS_PER_AGENT`).
+///
+/// A fail-fast caller takes it without waiting (`try_take_waiting_unit`)
+/// before its run waits for a room lock and an agent slot. The run drops it
+/// as soon as it holds its global permit; any other exit (an error, a panic,
+/// or the run's task being dropped) drops it too. Nothing ever waits for a
+/// unit, so holding one while waiting for a room lock, slot, or permit cannot
+/// deadlock, and a permit holder never needs one.
+pub(crate) struct WaitingBudgetUnit {
     agent_id: String,
-    agent_lock: Arc<Mutex<()>>,
-    agent_locks: AgentLockMap,
+    budget: WaitingBudgetMap,
 }
 
-impl Drop for AgentLockCleanup {
+impl Drop for WaitingBudgetUnit {
     fn drop(&mut self) {
-        let mut locks = self
-            .agent_locks
+        let mut budget = self
+            .budget
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if Arc::strong_count(&self.agent_lock) == 2
-            && locks
-                .get(&self.agent_id)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &self.agent_lock))
-        {
-            locks.remove(&self.agent_id);
+        if let Some(waiting) = budget.get_mut(&self.agent_id) {
+            *waiting = waiting.saturating_sub(1);
+            if *waiting == 0 {
+                budget.remove(&self.agent_id);
+            }
         }
     }
+}
+
+/// How a run waits for its room lock and agent slot (spec §4.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdmitMode {
+    /// Wait in acceptance order (top-level runs).
+    Wait,
+    /// Fail fast with "Specialist is busy" (nested delegated and peer runs).
+    TryNow,
+}
+
+/// How a run takes its global permit once it holds its room and slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PermitMode {
+    Wait,
+    TryNow,
+}
+
+/// One room lock of an agent. tokio's mutex serves waiters in FIFO order,
+/// which keeps same-room runs in acceptance order.
+struct SessionLease {
+    key: (String, String),
+    lock: Option<Arc<Mutex<()>>>,
+    guard: Option<OwnedMutexGuard<()>>,
+    locks: SessionLockMap,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        self.guard.take();
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Take this lease's own reference out of the `Option` (still alive,
+        // just moved into `lock`) and let it drop at the end of this `if
+        // let` block, still *inside* the critical section, before deciding
+        // whether to remove the registry entry. `== 2` means only the
+        // registry's copy and this local `lock` remain, i.e. no other lease
+        // is alive. Leaving this lease's reference to drop only implicitly,
+        // after `drop()` returns, would race another lease's own check here:
+        // both could see the pre-decrement count and neither would remove
+        // the entry, leaking it (spec: room/slot lease cleanup).
+        if let Some(lock) = self.lock.take() {
+            if Arc::strong_count(&lock) == 2
+                && locks
+                    .get(&self.key)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &lock))
+            {
+                locks.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// One of an agent's run slots.
+struct SlotLease {
+    agent_id: String,
+    slots: Option<Arc<Semaphore>>,
+    permit: Option<OwnedSemaphorePermit>,
+    registry: AgentSlotMap,
+}
+
+impl Drop for SlotLease {
+    fn drop(&mut self) {
+        self.permit.take();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // See `SessionLease::drop`: this lease's own reference must drop
+        // inside the critical section (at the end of this `if let` block),
+        // not be left to the automatic field-drop after this function
+        // returns.
+        if let Some(slots) = self.slots.take() {
+            if Arc::strong_count(&slots) == 2
+                && registry
+                    .get(&self.agent_id)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &slots))
+            {
+                registry.remove(&self.agent_id);
+            }
+        }
+    }
+}
+
+/// A run's room lock and agent slot, held until the run finishes.
+pub(crate) struct RunReservation {
+    _session: SessionLease,
+    _slot: SlotLease,
+}
+
+/// Everything a run needs to start: its room, reservation, and global permit,
+/// acquired in that order.
+pub(crate) struct RunTicket {
+    room_id: String,
+    _reservation: RunReservation,
+    permit: AgentRunPermit,
+}
+
+impl RunTicket {
+    /// The room this ticket locked; a ticketed run always runs in it.
+    pub(crate) fn room_id(&self) -> &str {
+        &self.room_id
+    }
+}
+
+/// A room held by a non-run operation (session deletion); runs for the room
+/// wait until it is dropped.
+pub(crate) struct RoomReservation {
+    _lease: SessionLease,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +277,21 @@ pub(crate) enum RunRoom {
     Peer { route: AgentCommunicationRoute },
 }
 
+impl RunRoom {
+    /// The room (session id) this run uses. Generated and delegated rooms get a
+    /// fresh id before the run starts so it can be locked and recorded first.
+    pub(crate) fn resolve(&self, agent_id: &str) -> String {
+        match self {
+            Self::Stable(room_id) => room_id.clone(),
+            Self::Peer { route } => {
+                let participants = route.participants();
+                format!("peer:{}:{}", participants[participants.len() - 2], agent_id)
+            }
+            Self::Generated | Self::Delegated { .. } => anima_core::new_room_id(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AgentRunRequest {
     pub(crate) agent_id: String,
@@ -120,13 +301,22 @@ pub(crate) struct AgentRunRequest {
     /// Whole-run completion is owned by the durable caller record (for example,
     /// a Telegram inbound item), not an in-memory response cache here.
     pub(crate) idempotency_key: Option<String>,
+    /// Ledger source and reference (spec §4.1).
+    pub(crate) source: RunSource,
+    pub(crate) source_ref: Option<String>,
+    /// The run that started this one (a delegation, helper, or peer request);
+    /// recorded on the ledger and on the helper session (spec §3.2, §4.1).
+    pub(crate) parent: Option<crate::runs::RunLink>,
 }
 
 #[derive(Clone)]
 pub(crate) struct AgentRunCoordinator {
     state: SharedDaemonState,
     run_limiter: Arc<Semaphore>,
-    agent_locks: AgentLockMap,
+    session_locks: SessionLockMap,
+    agent_slots: AgentSlotMap,
+    waiting_budget: WaitingBudgetMap,
+    max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
 }
 
@@ -138,12 +328,12 @@ impl AgentRunCoordinator {
     ) -> Result<AgentState, String> {
         let guard = self.state.read().await;
         let matches: Vec<_> = guard
-            .list_agents()
+            .agent_states()
             .into_iter()
-            .filter(|snapshot| {
+            .filter(|agent| {
                 id.map_or_else(
-                    || name.is_some_and(|name| snapshot.state.name == name),
-                    |id| snapshot.state.id == id,
+                    || name.is_some_and(|name| agent.name == name),
+                    |id| agent.id == id,
                 )
             })
             .collect();
@@ -152,16 +342,16 @@ impl AgentRunCoordinator {
                 "Peer not found or name is ambiguous; use an agent ID from the roster".into(),
             );
         }
-        Ok(matches.into_iter().next().unwrap().state)
+        Ok(matches.into_iter().next().unwrap())
     }
 
     pub(crate) async fn peer_ids(&self) -> Vec<String> {
         self.state
             .read()
             .await
-            .list_agents()
+            .agent_states()
             .into_iter()
-            .map(|snapshot| snapshot.state.id)
+            .map(|agent| agent.id)
             .collect()
     }
 
@@ -171,6 +361,7 @@ impl AgentRunCoordinator {
         target: String,
         message: String,
         route: AgentCommunicationRoute,
+        parent: Option<crate::runs::RunLink>,
     ) -> futures::future::BoxFuture<'static, Result<AgentRunEnvelope, ApiError>> {
         let coordinator = self.clone();
         Box::pin(async move {
@@ -202,6 +393,9 @@ impl AgentRunCoordinator {
                     },
                     room: RunRoom::Peer { route },
                     idempotency_key: None,
+                    source: RunSource::Peer,
+                    source_ref: None,
+                    parent,
                 })
                 .await
         })
@@ -221,8 +415,7 @@ impl AgentRunCoordinator {
     }
     pub(crate) async fn team_roster(&self) -> String {
         let guard = self.state.read().await;
-        let agents: Vec<_> = guard.list_agents().iter().map(|snapshot| {
-            let agent = &snapshot.state;
+        let agents: Vec<_> = guard.agent_states().iter().map(|agent| {
             serde_json::json!({"id": agent.id, "name": agent.name, "role": if is_workspace_manager(agent) { "workspace_manager" } else if helper_parent(agent).is_some() { "helper" } else { "specialist" }, "parentAgentId": helper_parent(agent), "description": agent.config.bio, "status": agent.status.as_str()})
         }).collect();
         serde_json::json!({"totalAgents": agents.len(), "agents": agents}).to_string()
@@ -243,6 +436,7 @@ impl AgentRunCoordinator {
         caller: &AgentState,
         target: String,
         task: String,
+        parent: Option<crate::runs::RunLink>,
     ) -> futures::future::BoxFuture<'static, Result<String, String>> {
         let coordinator = self.clone();
         let caller = caller.clone();
@@ -267,6 +461,9 @@ impl AgentRunCoordinator {
                 content: Content { text: format!("Task delegated by workspace manager {} ({}). Return the result and any blockers. Do not delegate further.\n\n{}", caller.name, caller.id, task), attachments: None, metadata: None },
                 room: RunRoom::Delegated { parent_id: caller.id },
                 idempotency_key: None,
+                source: RunSource::Delegation,
+                source_ref: None,
+                parent,
             }).await.map_err(|_| "Specialist unavailable, busy, or outside the manager's tool permissions".to_string())?;
             Ok(serde_json::json!({"agentId": target, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
         })
@@ -277,6 +474,7 @@ impl AgentRunCoordinator {
         parent_id: String,
         name: String,
         task: String,
+        parent_run: Option<crate::runs::RunLink>,
     ) -> futures::future::BoxFuture<'static, Result<String, String>> {
         let coordinator = self.clone();
         Box::pin(async move {
@@ -291,7 +489,7 @@ impl AgentRunCoordinator {
             // between its durable publish and the helper's final state commit.
             tokio::spawn(async move {
                 let transaction = coordinator.control_plane_transaction().await;
-                let (helper, baseline, persist_request, agent_lock, agent_guard, permit) = {
+                let (helper, baseline, persist_request, slot, permit) = {
                     let mut guard = coordinator.state.write().await;
                     let parent = guard.get_agent(&parent_id).ok_or("Companion no longer exists")?;
                     if !is_workspace_manager(&parent.state) {
@@ -300,35 +498,30 @@ impl AgentRunCoordinator {
                     // Reserve shared run capacity before creating any durable agent.
                     let permit = coordinator.try_admit().map_err(|error| error.message().to_string())?;
                     let helpers: Vec<_> = guard.list_agents().into_iter().filter(|agent| helper_parent(&agent.state) == Some(parent_id.as_str())).collect();
+                    // A helper is idle when its single run slot is free; taking that
+                    // slot is the reservation (spec §4.4 item 7). Only the
+                    // non-waiting slot helpers may run under this `state.write()`:
+                    // never call `admit()` here, because its `slot_capacity` takes
+                    // `state.read()` and would deadlock.
                     let available = helpers.iter().find_map(|helper| {
-                        let lock = coordinator.agent_lock(&helper.state.id);
-                        let reservation = lock.clone().try_lock_owned().ok()?;
-                        Some((helper.clone(), lock, reservation))
+                        let slot = coordinator.try_slot_lease(&helper.state.id, HELPER_MAX_RUNS)?;
+                        Some((helper.clone(), slot))
                     });
                     let config = helper_config(&parent.state, name);
-                    let (helper, baseline, lock, reservation) = if let Some((helper, lock, reservation)) = available {
+                    let (helper, baseline, slot) = if let Some((helper, slot)) = available {
                         let baseline = helper.state.config.clone();
                         guard.restore_agent_config(&helper.state.id, config);
-                        (guard.get_agent(&helper.state.id).expect("reserved helper exists"), Some(baseline), lock, reservation)
+                        (guard.get_agent(&helper.state.id).expect("reserved helper exists"), Some(baseline), slot)
                     } else {
                         if helpers.len() >= MAX_HELPERS_PER_COMPANION {
                             return Err("All four helpers are busy; wait for a result before spawning another helper".to_string());
                         }
                         let helper = guard.create_agent(config)?;
-                        let lock = coordinator.agent_lock(&helper.state.id);
-                        let reservation = lock.clone().try_lock_owned().expect("new helper is not running");
-                        (helper, None, lock, reservation)
+                        let slot = coordinator.try_slot_lease(&helper.state.id, HELPER_MAX_RUNS).expect("a new helper has a free slot");
+                        (helper, None, slot)
                     };
-                    (helper, baseline, guard.control_plane_persist_request(), lock, reservation, permit)
+                    (helper, baseline, guard.control_plane_persist_request(), slot, permit)
                 };
-                let _cleanup = AgentLockCleanup {
-                    agent_id: helper.state.id.clone(),
-                    agent_lock,
-                    agent_locks: coordinator.agent_locks.clone(),
-                };
-                // Keep the reservation until after run_locked completes. Selecting an
-                // idle helper and reserving it are one serialized operation.
-                let _agent_guard = agent_guard;
                 if let Err(error) = persist_request.save().await {
                     let mut guard = coordinator.state.write().await;
                     if let Some(config) = baseline {
@@ -339,12 +532,30 @@ impl AgentRunCoordinator {
                     return Err(format!("Could not persist helper creation: {error}"));
                 }
                 drop(transaction);
-                let result = coordinator.run_locked(AgentRunRequest {
+                let request = AgentRunRequest {
                     agent_id: helper.state.id.clone(),
                     content: Content { text: task, ..Content::default() },
                     room: RunRoom::Delegated { parent_id },
                     idempotency_key: None,
-                }, permit, |_, _, _| Ok(()), None).await.map_err(|error| error.message().to_string())?;
+                    source: RunSource::Delegation,
+                    source_ref: None,
+                    parent: parent_run,
+                };
+                let room_id = request.room.resolve(&request.agent_id);
+                // A fresh delegated room is never contended. The permit and slot were
+                // taken above without waiting, so this order cannot deadlock.
+                let session = coordinator
+                    .try_session_lease(&request.agent_id, &room_id)
+                    .expect("a fresh helper room is uncontended");
+                let ticket = RunTicket {
+                    room_id,
+                    _reservation: RunReservation { _session: session, _slot: slot },
+                    permit,
+                };
+                let result = coordinator
+                    .run_locked(request, ticket, |_, _| Ok(()), None)
+                    .await
+                    .map_err(|error| error.message().to_string())?;
                 Ok(serde_json::json!({"agentId": helper.state.id, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
             }).await.map_err(|_| "Helper worker stopped unexpectedly".to_string())?
         })
@@ -353,9 +564,25 @@ impl AgentRunCoordinator {
         Self {
             state,
             run_limiter,
-            agent_locks: Arc::new(StdMutex::new(HashMap::new())),
+            session_locks: Arc::new(StdMutex::new(HashMap::new())),
+            agent_slots: Arc::new(StdMutex::new(HashMap::new())),
+            waiting_budget: Arc::new(StdMutex::new(HashMap::new())),
+            max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Concurrent runs per non-helper agent across different rooms (spec §4.3).
+    /// Clamped to `1..=MAX_RUNS_PER_AGENT_LIMIT` so a misconfigured value can
+    /// never make `Semaphore::new` build an unreasonably large semaphore.
+    pub(crate) fn with_max_runs_per_agent(mut self, max_runs_per_agent: usize) -> Self {
+        self.max_runs_per_agent = max_runs_per_agent.clamp(1, MAX_RUNS_PER_AGENT_LIMIT);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_runs_per_agent(&self) -> usize {
+        self.max_runs_per_agent
     }
 
     /// Serializes every in-memory control-plane mutation through its durable
@@ -371,54 +598,106 @@ impl AgentRunCoordinator {
         Arc::clone(&self.control_plane_transactions)
     }
 
-    /// Advisory admission check; the serialized runner remains authoritative.
+    /// Advisory: the agent has no free run slot (spec §4.4 item 7).
     pub(crate) fn is_agent_busy(&self, agent_id: &str) -> bool {
-        self.agent_locks
+        self.agent_slots
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(agent_id)
-            .is_some_and(|lock| lock.try_lock().is_err())
+            .is_some_and(|slots| slots.available_permits() == 0)
     }
 
-    #[allow(dead_code)] // Used by daemon-owned connector and scheduler workers.
-    pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
-        let permit = self.try_admit()?;
-        self.run_admitted(request, permit).await
-    }
-
-    pub(crate) async fn run_admitted(
+    /// Takes the room's run lock without waiting. `None` while a run holds or
+    /// waits for it (spec §3.3: deleting a session with a run is 409).
+    pub(crate) fn try_reserve_room(
         &self,
-        request: AgentRunRequest,
-        permit: AgentRunPermit,
-    ) -> Result<AgentRunEnvelope, ApiError> {
-        self.run_with_commit_admitted(request, permit, |_, _, _| Ok(()))
+        agent_id: &str,
+        room_id: &str,
+    ) -> Option<RoomReservation> {
+        let in_use = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&(agent_id.to_string(), room_id.to_string()));
+        if in_use {
+            return None;
+        }
+        self.try_session_lease(agent_id, room_id)
+            .map(|lease| RoomReservation { _lease: lease })
+    }
+
+    /// Advisory, reserves nothing: fail-fast callers check this before doing work.
+    pub(crate) fn has_available_permit(&self) -> bool {
+        self.run_limiter.available_permits() > 0
+    }
+
+    /// Takes one unit of the agent's waiting budget without waiting, or
+    /// `None` when `MAX_QUEUED_RUNS_PER_AGENT` of its fail-fast runs are
+    /// already waiting (spec §16). Only the legacy run route and Telegram
+    /// owner sends take units; each answers `None` with its own saturation
+    /// response.
+    pub(crate) fn try_take_waiting_unit(&self, agent_id: &str) -> Option<WaitingBudgetUnit> {
+        let mut budget = self
+            .waiting_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let waiting = budget.entry(agent_id.to_string()).or_insert(0);
+        if *waiting >= MAX_QUEUED_RUNS_PER_AGENT {
+            return None;
+        }
+        *waiting += 1;
+        Some(WaitingBudgetUnit {
+            agent_id: agent_id.to_string(),
+            budget: Arc::clone(&self.waiting_budget),
+        })
+    }
+
+    /// Runs without a source commit. Top-level runs wait for their room and an
+    /// agent slot; nested delegated and peer runs fail fast. The global permit
+    /// is never waited for here (fail-fast 503). Fail-fast HTTP callers use
+    /// `run_budgeted`, which bounds that waiting.
+    pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
+        self.run_spawned(request, PermitMode::TryNow, None, |_, _| Ok(()), None)
             .await
     }
 
-    /// Runs with a state commit captured in the same final control-plane snapshot.
+    /// The legacy run route (spec §4.9): `run`, holding `waiting` (a unit of
+    /// the agent's waiting budget) while the run waits for its room and an
+    /// agent slot, until it has its global permit.
+    pub(crate) async fn run_budgeted(
+        &self,
+        request: AgentRunRequest,
+        waiting: WaitingBudgetUnit,
+    ) -> Result<AgentRunEnvelope, ApiError> {
+        self.run_spawned(
+            request,
+            PermitMode::TryNow,
+            Some(waiting),
+            |_, _| Ok(()),
+            None,
+        )
+        .await
+    }
+
+    /// Runs with a source commit captured in the same final control-plane snapshot.
     ///
     /// A hook that can fail must finish all validation before its first mutation;
-    /// arbitrary `DaemonState` changes cannot be rolled back generically.
-    #[allow(dead_code)] // Used by durable connector inbound processing.
+    /// on failure the coordinator removes only this run's transcript changes.
+    #[allow(dead_code)] // Used by the commit-contract tests.
     pub(crate) async fn run_with_commit<F>(
         &self,
         request: AgentRunRequest,
         commit: F,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
-        let permit = self.try_admit()?;
-        self.run_with_commit_admitted(request, permit, commit).await
+        self.run_spawned(request, PermitMode::TryNow, None, commit, None)
+            .await
     }
 
-    /// Runs durable background work after waiting for shared daemon admission.
+    /// Runs durable background work after waiting for its room, an agent slot,
+    /// and shared daemon admission, in that order.
     ///
     /// Interactive callers deliberately fail fast when the daemon is saturated,
     /// but daemon-owned workers must not turn temporary saturation into a durable
@@ -430,266 +709,440 @@ impl AgentRunCoordinator {
         rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
-        R: FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
-        let permit = self
-            .run_limiter
-            .clone()
-            .acquire_owned()
-            .await
-            .map(AgentRunPermit)
-            .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?;
-        self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
-            .await
+        self.run_spawned(
+            request,
+            PermitMode::Wait,
+            None,
+            commit,
+            Some(Box::new(rollback)),
+        )
+        .await
     }
 
-    pub(crate) async fn run_with_commit_admitted<F>(
+    /// Telegram owner sends: `run_with_commit_waiting`, holding `waiting` (a
+    /// unit of the agent's waiting budget) until the run has its global permit.
+    pub(crate) async fn run_budgeted_with_commit_waiting<F, R>(
         &self,
         request: AgentRunRequest,
-        permit: AgentRunPermit,
-        commit: F,
-    ) -> Result<AgentRunEnvelope, ApiError>
-    where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
-    {
-        self.run_transaction_admitted(request, permit, commit, None)
-            .await
-    }
-
-    pub(crate) async fn run_with_commit_admitted_and_rollback<F, R>(
-        &self,
-        request: AgentRunRequest,
-        permit: AgentRunPermit,
+        waiting: WaitingBudgetUnit,
         commit: F,
         rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
-        R: FnOnce(&mut DaemonState, AgentRuntimeSnapshot) -> Result<(), ApiError> + Send + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
-        self.run_transaction_admitted(request, permit, commit, Some(Box::new(rollback)))
-            .await
+        self.run_spawned(
+            request,
+            PermitMode::Wait,
+            Some(waiting),
+            commit,
+            Some(Box::new(rollback)),
+        )
+        .await
     }
 
-    async fn run_transaction_admitted<F>(
+    /// Runs with a ticket the caller acquired up front (see `try_ticket`).
+    pub(crate) async fn run_ticketed_with_commit_and_rollback<F, R>(
         &self,
         request: AgentRunRequest,
-        permit: AgentRunPermit,
+        ticket: RunTicket,
         commit: F,
-        rollback: Option<AgentRunRollback>,
+        rollback: R,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
     {
+        // The run executes in the ticket's room; a stable request room must name it.
+        debug_assert!(
+            !matches!(&request.room, RunRoom::Stable(room) if room.as_str() != ticket.room_id()),
+            "a ticketed run must use the room its ticket locked"
+        );
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator
-                .run_serialized(request, permit, commit, rollback)
+                .run_locked(request, ticket, commit, Some(Box::new(rollback)))
                 .await
         })
         .await
-        .map_err(|error| {
-            warn!(error = %error, "agent run worker stopped unexpectedly");
-            ApiError::service_unavailable("agent run worker stopped unexpectedly")
-        })?
+        .map_err(run_worker_stopped)?
     }
 
-    async fn run_serialized<F>(
+    async fn run_spawned<F>(
         &self,
         request: AgentRunRequest,
-        permit: AgentRunPermit,
+        permit_mode: PermitMode,
+        waiting: Option<WaitingBudgetUnit>,
         commit: F,
         rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send
-            + 'static,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
-        let agent_lock = self.agent_lock(&request.agent_id);
-        let _cleanup = AgentLockCleanup {
-            agent_id: request.agent_id.clone(),
-            agent_lock: Arc::clone(&agent_lock),
-            agent_locks: Arc::clone(&self.agent_locks),
-        };
-        let _agent_guard = if matches!(
+        let coordinator = self.clone();
+        // The run owns its task, so a dropped caller cannot cancel a commit.
+        // The waiting unit moves into that task too: a run still waiting
+        // after its caller gave up keeps counting against its agent's budget.
+        tokio::spawn(async move {
+            // An invalid request fails before waiting for a room, slot, or permit.
+            coordinator.prevalidate(&request).await?;
+            let ticket = coordinator
+                .acquire_ticket(&request, permit_mode, waiting)
+                .await?;
+            coordinator
+                .run_locked(request, ticket, commit, rollback)
+                .await
+        })
+        .await
+        .map_err(run_worker_stopped)?
+    }
+
+    /// Room, slot, then permit (spec §4.3). `waiting` is released once the
+    /// permit is held, or on any earlier exit.
+    async fn acquire_ticket(
+        &self,
+        request: &AgentRunRequest,
+        permit_mode: PermitMode,
+        waiting: Option<WaitingBudgetUnit>,
+    ) -> Result<RunTicket, ApiError> {
+        debug_assert!(
+            waiting
+                .as_ref()
+                .is_none_or(|unit| unit.agent_id == request.agent_id),
+            "a waiting unit belongs to the agent whose run holds it"
+        );
+        let room_id = request.room.resolve(&request.agent_id);
+        let mode = if matches!(
             request.room,
             RunRoom::Delegated { .. } | RunRoom::Peer { .. }
         ) {
-            agent_lock
-                .try_lock_owned()
-                .map_err(|_| ApiError::service_unavailable("Specialist is busy"))?
+            AdmitMode::TryNow
         } else {
-            agent_lock.lock_owned().await
+            AdmitMode::Wait
         };
-        self.run_locked(request, permit, commit, rollback).await
+        let reservation = self.admit(&request.agent_id, &room_id, mode).await?;
+        let permit = match permit_mode {
+            PermitMode::TryNow => self.try_admit()?,
+            PermitMode::Wait => self
+                .run_limiter
+                .clone()
+                .acquire_owned()
+                .await
+                .map(AgentRunPermit)
+                .map_err(|_| ApiError::service_unavailable("agent run admission is unavailable"))?,
+        };
+        // No longer waiting: the unit goes back to the agent's budget now,
+        // not when the run finishes.
+        drop(waiting);
+        Ok(RunTicket {
+            room_id,
+            _reservation: reservation,
+            permit,
+        })
+    }
+
+    /// Acquires the room lock, then an agent slot (spec §4.3).
+    ///
+    /// Deadlock hazard: a run keeps its own room lock and slot until it
+    /// finishes, so a tool that awaits `coordinator.run()` for its own agent and
+    /// room in `Wait` mode would wait on itself forever (and one waiting for its
+    /// own agent's slot can, once every slot is held). Nested runs use
+    /// `TryNow`, as delegated and peer runs do.
+    pub(crate) async fn admit(
+        &self,
+        agent_id: &str,
+        room_key: &str,
+        mode: AdmitMode,
+    ) -> Result<RunReservation, ApiError> {
+        let capacity = self.slot_capacity(agent_id).await;
+        let session = match mode {
+            AdmitMode::Wait => self.wait_session_lease(agent_id, room_key).await,
+            AdmitMode::TryNow => self
+                .try_session_lease(agent_id, room_key)
+                .ok_or_else(|| ApiError::service_unavailable(SPECIALIST_BUSY))?,
+        };
+        let slot = match mode {
+            AdmitMode::Wait => self.wait_slot_lease(agent_id, capacity).await?,
+            AdmitMode::TryNow => self
+                .try_slot_lease(agent_id, capacity)
+                .ok_or_else(|| ApiError::service_unavailable(SPECIALIST_BUSY))?,
+        };
+        Ok(RunReservation {
+            _session: session,
+            _slot: slot,
+        })
+    }
+
+    /// Room, slot, and permit, in that order, without waiting for any of them.
+    pub(crate) async fn try_ticket(
+        &self,
+        agent_id: &str,
+        room_id: &str,
+    ) -> Result<RunTicket, ApiError> {
+        let reservation = self.admit(agent_id, room_id, AdmitMode::TryNow).await?;
+        let permit = self.try_admit()?;
+        Ok(RunTicket {
+            room_id: room_id.to_string(),
+            _reservation: reservation,
+            permit,
+        })
+    }
+
+    async fn slot_capacity(&self, agent_id: &str) -> usize {
+        if self
+            .state
+            .read()
+            .await
+            .agents
+            .get(agent_id)
+            .is_some_and(|runtime| is_helper_config(runtime.config()))
+        {
+            HELPER_MAX_RUNS
+        } else {
+            self.max_runs_per_agent
+        }
+    }
+
+    fn session_lock(&self, agent_id: &str, room_id: &str) -> ((String, String), Arc<Mutex<()>>) {
+        let key = (agent_id.to_string(), room_id.to_string());
+        let lock = self
+            .session_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        (key, lock)
+    }
+
+    fn try_session_lease(&self, agent_id: &str, room_id: &str) -> Option<SessionLease> {
+        let (key, lock) = self.session_lock(agent_id, room_id);
+        let guard = Arc::clone(&lock).try_lock_owned().ok();
+        let lease = SessionLease {
+            key,
+            lock: Some(lock),
+            guard,
+            locks: Arc::clone(&self.session_locks),
+        };
+        lease.guard.is_some().then_some(lease)
+    }
+
+    async fn wait_session_lease(&self, agent_id: &str, room_id: &str) -> SessionLease {
+        let (key, lock) = self.session_lock(agent_id, room_id);
+        let mut lease = SessionLease {
+            key,
+            lock: Some(Arc::clone(&lock)),
+            guard: None,
+            locks: Arc::clone(&self.session_locks),
+        };
+        lease.guard = Some(lock.lock_owned().await);
+        lease
+    }
+
+    fn agent_slot_semaphore(&self, agent_id: &str, capacity: usize) -> Arc<Semaphore> {
+        self.agent_slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(agent_id.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(capacity)))
+            .clone()
+    }
+
+    fn try_slot_lease(&self, agent_id: &str, capacity: usize) -> Option<SlotLease> {
+        let slots = self.agent_slot_semaphore(agent_id, capacity);
+        let permit = Arc::clone(&slots).try_acquire_owned().ok();
+        let lease = SlotLease {
+            agent_id: agent_id.to_string(),
+            slots: Some(slots),
+            permit,
+            registry: Arc::clone(&self.agent_slots),
+        };
+        lease.permit.is_some().then_some(lease)
+    }
+
+    async fn wait_slot_lease(
+        &self,
+        agent_id: &str,
+        capacity: usize,
+    ) -> Result<SlotLease, ApiError> {
+        let slots = self.agent_slot_semaphore(agent_id, capacity);
+        let mut lease = SlotLease {
+            agent_id: agent_id.to_string(),
+            slots: Some(Arc::clone(&slots)),
+            permit: None,
+            registry: Arc::clone(&self.agent_slots),
+        };
+        lease.permit =
+            Some(slots.acquire_owned().await.map_err(|_| {
+                ApiError::service_unavailable("agent run admission is unavailable")
+            })?);
+        Ok(lease)
+    }
+
+    /// The start checks, run before waiting for a room lock, slot, or permit so
+    /// an invalid request fails fast; `run_locked` repeats them authoritatively
+    /// under the control-plane transaction.
+    async fn prevalidate(&self, request: &AgentRunRequest) -> Result<(), ApiError> {
+        let guard = self.state.read().await;
+        validate_run_request(&guard, &request.agent_id, &request.room)?;
+        if guard.agents.contains_key(&request.agent_id) {
+            Ok(())
+        } else {
+            Err(ApiError::not_found())
+        }
     }
 
     async fn run_locked<F>(
         &self,
-        mut request: AgentRunRequest,
-        permit: AgentRunPermit,
+        request: AgentRunRequest,
+        ticket: RunTicket,
         commit: F,
         mut rollback: Option<AgentRunRollback>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
-        F: FnOnce(
-                &mut DaemonState,
-                &AgentRuntimeSnapshot,
-                &TaskResult<Content>,
-            ) -> Result<(), ApiError>
-            + Send,
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send,
     {
+        let RunTicket {
+            room_id,
+            _reservation,
+            permit,
+        } = ticket;
         let _run_permit = permit.0;
-
-        if let Some(idempotency_key) = request.idempotency_key.take() {
-            request
-                .content
+        let AgentRunRequest {
+            agent_id,
+            mut content,
+            room,
+            idempotency_key,
+            source,
+            source_ref,
+            parent,
+        } = request;
+        if let Some(idempotency_key) = idempotency_key {
+            content
                 .metadata
                 .get_or_insert_with(Default::default)
                 .insert("idempotencyKey".into(), DataValue::String(idempotency_key));
         }
+        let retry_key = content_retry_key(&content).map(str::to_owned);
+        let checkin_input = crate::schedules::is_checkin_content(&content);
 
+        // Phase A: record the run as running and publish that durable marker
+        // before any model work (the run-start save that already existed).
         let transaction = self.control_plane_transaction().await;
-        let Some((mut runtime, tool_context, running_persist_request, mut rollback_baseline)) = ({
+        let (
+            mut runtime,
+            tool_context,
+            base,
+            run_id,
+            session_id,
+            session_created,
+            mut in_flight,
+            running_persist_request,
+        ) = {
             let mut guard = self.state.write().await;
-            if let Some(parent_id) = guard
-                .get_agent(&request.agent_id)
-                .as_ref()
-                .and_then(|agent| helper_parent(&agent.state))
-            {
-                if !matches!(&request.room, RunRoom::Delegated { parent_id: source } if source == parent_id)
-                {
-                    return Err(ApiError::bad_request_static(
-                        "Helpers must run through their owning companion",
-                    ));
-                }
-                if guard.get_agent(&request.agent_id).is_some_and(|helper| {
-                    helper
-                        .state
-                        .config
-                        .tools
-                        .iter()
-                        .flatten()
-                        .any(|tool| crate::tools::is_process_tool(&tool.name))
-                }) {
-                    return Err(ApiError::bad_request_static(
-                        "Process tools are unavailable to helpers until process cancellation is supported",
-                    ));
+            validate_run_request(&guard, &agent_id, &room)?;
+            if let Some(key) = retry_key.as_deref() {
+                // Retry-keyed tool steps stay replay-safe only while one run owns the key.
+                if guard.runs.has_in_flight_idempotency_key(&agent_id, key) {
+                    return Err(ApiError::conflict(DUPLICATE_IN_FLIGHT_RUN));
                 }
             }
-            if let RunRoom::Peer { route } = &request.room {
-                let target = guard
-                    .get_agent(&request.agent_id)
-                    .ok_or_else(ApiError::not_found)?;
-                for source in route
-                    .participants()
-                    .iter()
-                    .take(route.participants().len() - 1)
-                {
-                    let source = guard.get_agent(source).ok_or_else(ApiError::not_found)?;
-                    if target.state.config.tools.iter().flatten().any(|tool| {
-                        !matches!(
-                            tool.name.as_str(),
-                            "list_workspace_agents"
-                                | "send_message"
-                                | "broadcast_message"
-                                | "delegate_to_agent"
-                                | "spawn_helper"
-                        ) && !source.state.config.allows_tool(&tool.name)
-                    }) {
-                        return Err(ApiError::bad_request_static("Peer request would exceed the sender's tool permissions; ask the owner to contact this agent directly"));
-                    }
-                }
-            }
-            if let RunRoom::Delegated { parent_id } = &request.room {
-                let parent = guard.get_agent(parent_id).ok_or_else(ApiError::not_found)?;
-                let target = guard
-                    .get_agent(&request.agent_id)
-                    .ok_or_else(ApiError::not_found)?;
-                if !is_workspace_manager(&parent.state)
-                    || is_workspace_manager(&target.state)
-                    || parent_id == &request.agent_id
-                    || target.state.config.tools.iter().flatten().any(|tool| {
-                        tool.name != "list_workspace_agents"
-                            && tool.name != "delegate_to_agent"
-                            && tool.name != "spawn_helper"
-                            && !parent.state.config.allows_tool(&tool.name)
-                    })
-                {
-                    return Err(ApiError::bad_request_static(
-                        "Delegation cannot escalate permissions or target a manager",
-                    ));
-                }
-            }
-            let rollback_baseline = if rollback.is_some() {
-                Some(
-                    guard
-                        .get_agent(&request.agent_id)
-                        .ok_or_else(ApiError::not_found)?,
-                )
-            } else {
-                None
+            let Some((runtime, tool_context, base)) = guard.build_run_runtime(&agent_id, &room_id)
+            else {
+                return Err(ApiError::not_found());
             };
-            let taken = guard.take_agent_runtime(&request.agent_id);
-            taken.map(|(runtime, tool_context)| {
-                (
-                    runtime,
-                    tool_context,
-                    guard.control_plane_persist_request(),
-                    rollback_baseline,
-                )
-            })
-        }) else {
-            return Err(ApiError::not_found());
+            // Spec §3: every room is a session; a new record is saved with the
+            // run start below, so no extra save is added.
+            let now_ms = anima_core::primitives::now_millis();
+            let session_id = crate::sessions::session_id_for_room(&room_id);
+            let session_created = guard.ensure_run_session(crate::state::RunSessionRequest {
+                agent_id: &agent_id,
+                room_id: &room_id,
+                source,
+                source_ref: source_ref.as_deref(),
+                calendar_summary: content
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| {
+                        metadata.get(crate::sessions::CALENDAR_SUMMARY_METADATA_KEY)
+                    })
+                    .and_then(|value| match value {
+                        DataValue::String(value) => Some(value.as_str()),
+                        _ => None,
+                    }),
+                delegated_parent: match &room {
+                    RunRoom::Delegated { parent_id } => Some(parent_id.as_str()),
+                    _ => None,
+                },
+                peer_sender: match &room {
+                    RunRoom::Peer { route } => {
+                        route.participants().iter().rev().nth(1).map(String::as_str)
+                    }
+                    _ => None,
+                },
+                parent: parent.as_ref(),
+                first_text: &content.text,
+                now_ms,
+            });
+            let record = RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    source,
+                    source_ref,
+                    idempotency_key: retry_key.clone(),
+                    text: content.text.clone(),
+                    model: runtime.config().model.clone(),
+                    provider: runtime.config().provider.clone(),
+                    parent_run_id: parent.as_ref().map(|link| link.run_id.clone()),
+                },
+                now_ms,
+            );
+            let run_id = record.id.clone();
+            guard.runs.insert(record);
+            // Armed before anything else can fail, so a panic before the start
+            // save cannot leave a permanently in-flight record.
+            let in_flight = InFlightRunGuard::new(Arc::clone(&self.state), run_id.clone());
+            (
+                runtime,
+                tool_context,
+                base,
+                run_id,
+                session_id,
+                session_created,
+                in_flight,
+                guard.control_plane_persist_request(),
+            )
         };
-
         if let Err(error) = running_persist_request.save().await {
             let mut guard = self.state.write().await;
-            guard.restore_agent_runtime(runtime);
+            guard.runs.remove(&run_id);
+            if session_created {
+                guard.sessions.remove(&agent_id, &session_id);
+            }
+            drop(guard);
+            in_flight.disarm();
             return Err(ApiError::service_unavailable(error.to_string()));
         }
         drop(transaction);
 
-        let original_config = runtime.state().config;
-        let delegated_parent = match &request.room {
+        // Phase B: per-run configuration applies only to this isolated copy. The
+        // canonical configuration is never rewritten; a PATCH during the run
+        // applies to later runs (spec §4.4 items 1–2).
+        let original_config = runtime.config().clone();
+        let delegated_parent = match &room {
             RunRoom::Delegated { parent_id } => Some(parent_id.clone()),
             _ => None,
         };
-        let peer_route = match &request.room {
+        let peer_route = match &room {
             RunRoom::Peer { route } => route.clone(),
             _ => AgentCommunicationRoute::start(runtime.id()),
         };
-        let peer_sources = match &request.room {
+        let peer_sources = match &room {
             RunRoom::Peer { route } => {
                 route.participants()[..route.participants().len() - 1].to_vec()
             }
@@ -713,7 +1166,6 @@ impl AgentRunCoordinator {
             }
         }
         if can_delegate {
-            let registry = crate::tools::ToolRegistry::new();
             for name in ["list_workspace_agents", "delegate_to_agent", "spawn_helper"] {
                 if !tools.iter().any(|tool| tool.name == name) {
                     tools.push(registry.descriptor(name).expect("registered team tool"));
@@ -735,23 +1187,30 @@ impl AgentRunCoordinator {
                 ..Default::default()
             });
         }
+        runtime.set_run_id(run_id.clone());
+        // `todo_write` may only replace the task list this run started from
+        // (spec §4.4 item 8); another room's update surfaces as a conflict.
+        let todo_baseline = if runtime.config().allows_tool("todo_write") {
+            crate::tools::todo::read_agent_todos(
+                crate::tools::ctx_workspace_root(&tool_context),
+                &agent_id,
+            )
+            .ok()
+            .map(|todos| todos.revision)
+        } else {
+            None
+        };
         let tool_context = tool_context
             .with_team(self.clone(), can_delegate)
             .with_delegated_parent(delegated_parent)
-            .with_peer_route(peer_route, peer_sources);
-
-        let execution_room = match request.room {
-            RunRoom::Stable(room_id) => Some(room_id),
-            RunRoom::Peer { route } => {
-                let participants = route.participants();
-                Some(format!(
-                    "peer:{}:{}",
-                    participants[participants.len() - 2],
-                    request.agent_id
-                ))
-            }
-            _ => None,
-        };
+            .with_peer_route(peer_route, peer_sources)
+            .with_todo_baseline(todo_baseline)
+            .with_run_link(Some(crate::runs::RunLink {
+                run_id: run_id.clone(),
+                session_id: session_id.clone(),
+                agent_id: agent_id.clone(),
+            }));
+        let history = runtime.messages().to_vec();
         let helper_timeout = helper_parent(&runtime.state()).is_some().then(|| {
             original_config
                 .settings
@@ -761,43 +1220,30 @@ impl AgentRunCoordinator {
                 .min(MAX_HELPER_RUN_MS)
         });
         let execution = async {
-            match execution_room {
-                None => {
-                    runtime
-                        .run_with_tools(request.content, |agent, user_message, tool_call| {
-                            let tool_context = tool_context.clone();
-                            async move {
-                                tool_context
-                                    .execute_tool(agent, user_message, tool_call)
-                                    .await
+            runtime
+                .run_in_room_with_context_and_tools(
+                    room_id.clone(),
+                    history,
+                    content,
+                    |agent, user_message, tool_call| {
+                        let tool_context = tool_context.clone();
+                        let state = Arc::clone(&self.state);
+                        let run_id = run_id.clone();
+                        async move {
+                            // Noted before the tool can have effects and kept by
+                            // any later save, so a run a restart interrupts still
+                            // reports the tools it started (spec §4.8). The commit
+                            // fills the final list.
+                            if let Some(record) = state.write().await.runs.get_mut(&run_id) {
+                                record.note_tool_started(&tool_call.name);
                             }
-                        })
-                        .await
-                }
-                Some(room_id) => {
-                    let history = runtime
-                        .messages()
-                        .iter()
-                        .filter(|message| message.room_id == room_id)
-                        .cloned()
-                        .collect();
-                    runtime
-                        .run_in_room_with_context_and_tools(
-                            room_id,
-                            history,
-                            request.content,
-                            |agent, user_message, tool_call| {
-                                let tool_context = tool_context.clone();
-                                async move {
-                                    tool_context
-                                        .execute_tool(agent, user_message, tool_call)
-                                        .await
-                                }
-                            },
-                        )
-                        .await
-                }
-            }
+                            tool_context
+                                .execute_tool(agent, user_message, tool_call)
+                                .await
+                        }
+                    },
+                )
+                .await
         };
         let result = if let Some(timeout_ms) = helper_timeout {
             // This is a cooperative execution deadline, not an effect rollback.
@@ -816,55 +1262,80 @@ impl AgentRunCoordinator {
             execution.await
         };
 
-        runtime.replace_config(original_config);
-
+        // Phase C: merge exactly this run's changes, let the source commit, then
+        // save; a rejected or undurable commit removes exactly those changes
+        // (spec §4.4 items 3–4).
         let transaction = self.control_plane_transaction().await;
         let (
             snapshot,
-            runtime_id,
-            runtime_name,
+            change_set,
             memory,
             memory_embeddings,
             memory_store,
+            history_outbox,
             persist_request,
         ) = {
             let mut guard = self.state.write().await;
-            let restored = guard.restore_agent_runtime(runtime);
-            // Hooks may fail, but arbitrary `DaemonState` mutation cannot be
-            // rolled back generically. Callers must perform all fallible
-            // validation before their first mutation and then mutate as one
-            // infallible unit. In particular, connector hooks must prevalidate
-            // the inbound/outbound transition before changing either record.
-            if let Err(error) = commit(&mut guard, &restored.0, &result) {
-                apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
+            let mut change_set = RunChangeSet::new(
+                run_id.clone(),
+                agent_id.clone(),
+                room_id.clone(),
+                runtime.run_delta_since(&base),
+            );
+            let outcome = RunOutcome::new(&change_set, result.clone());
+            if !guard.commit_run(&mut change_set, &outcome) {
+                // The agent was deleted while this run executed (spec §4.4 item 6).
+                return Err(ApiError::not_found());
+            }
+            if let Err(error) = commit(&mut guard, &outcome) {
+                guard.rollback_run(&change_set, RunError::new(COMMIT_REJECTED, error.message()));
+                apply_run_rollback(&mut guard, &mut rollback)?;
                 return Err(error);
             }
+            let snapshot = guard
+                .get_agent(&agent_id)
+                .expect("a committed agent stays registered");
             (
-                restored.0,
-                restored.1,
-                restored.2,
-                restored.3,
-                restored.4,
-                restored.5,
+                snapshot,
+                change_set,
+                guard.memory_handle(),
+                guard.memory_embeddings_handle(),
+                guard.memory_store_config(),
+                guard.history.clone(),
                 guard.control_plane_persist_request(),
             )
         };
         if let Err(error) = persist_request.save().await {
             let mut guard = self.state.write().await;
-            apply_run_rollback(&mut guard, &mut rollback, &mut rollback_baseline)?;
+            guard.rollback_run(&change_set, RunError::new(COMMIT_FAILED, error.to_string()));
+            apply_run_rollback(&mut guard, &mut rollback)?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
+        // Only a durable commit reaches the history store (spec §13.1). It is
+        // queued inside the transaction, so a deletion of its session, which
+        // takes the same transaction, is always queued after it.
+        history_outbox.enqueue_committed(&agent_id, &session_id, &change_set.delta.messages);
         drop(transaction);
+        in_flight.disarm();
 
-        persist_task_result_memory(
-            &result,
-            &runtime_id,
-            &runtime_name,
-            memory,
-            memory_embeddings,
-            memory_store,
-        )
-        .await;
+        // A silent check-in stores no task-result memory; otherwise silent
+        // check-ins crowd real memories out of the recent-memory context (spec §9.2).
+        let silent_checkin = checkin_input
+            && result
+                .data
+                .as_ref()
+                .is_some_and(|reply| crate::schedules::is_silent_checkin_reply(&reply.text));
+        if !silent_checkin {
+            persist_task_result_memory(
+                &result,
+                &snapshot.state.id,
+                &snapshot.state.name,
+                memory,
+                memory_embeddings,
+                memory_store,
+            )
+            .await;
+        }
 
         Ok(AgentRunEnvelope {
             agent: AgentRuntimeSnapshotResponse::from(&snapshot),
@@ -872,44 +1343,174 @@ impl AgentRunCoordinator {
         })
     }
 
-    fn agent_lock(&self, agent_id: &str) -> Arc<Mutex<()>> {
-        self.agent_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .entry(agent_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    }
-
     pub(crate) fn try_admit(&self) -> Result<AgentRunPermit, ApiError> {
         self.run_limiter
             .clone()
             .try_acquire_owned()
             .map(AgentRunPermit)
-            .map_err(|_| ApiError::service_unavailable("too many concurrent run requests"))
+            .map_err(|_| ApiError::service_unavailable(RUN_ADMISSION_SATURATED))
+    }
+
+    /// Units of the agent's waiting budget in use.
+    #[cfg(test)]
+    pub(crate) fn waiting_runs(&self, agent_id: &str) -> usize {
+        self.waiting_budget
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
-    fn lock_count(&self) -> usize {
-        self.agent_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
+    fn lock_counts(&self) -> (usize, usize) {
+        (
+            self.session_locks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            self.agent_slots
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+        )
     }
 }
 
 fn apply_run_rollback(
     state: &mut DaemonState,
     rollback: &mut Option<AgentRunRollback>,
-    baseline: &mut Option<AgentRuntimeSnapshot>,
 ) -> Result<(), ApiError> {
-    let Some(rollback) = rollback.take() else {
-        return Ok(());
-    };
-    let baseline = baseline.take().ok_or_else(|| {
-        ApiError::service_unavailable("agent run rollback baseline is unavailable")
-    })?;
-    rollback(state, baseline)
+    match rollback.take() {
+        Some(rollback) => rollback(state),
+        None => Ok(()),
+    }
+}
+
+/// A registered agent's canonical configuration, without copying its
+/// transcript or event log the way `DaemonState::get_agent` does.
+fn agent_config<'a>(state: &'a DaemonState, agent_id: &str) -> Option<&'a AgentConfig> {
+    state.agents.get(agent_id).map(|runtime| runtime.config())
+}
+
+/// The start checks that applied before M1: helpers only through their
+/// companion and never with process tools; peer requests within the senders'
+/// permissions; delegation only from a manager to a non-manager without
+/// escalation. They read only configurations, never a transcript copy, so
+/// they stay cheap before admission and under the control-plane transaction.
+fn validate_run_request(
+    state: &DaemonState,
+    agent_id: &str,
+    room: &RunRoom,
+) -> Result<(), ApiError> {
+    if let Some(target) = agent_config(state, agent_id) {
+        if let Some(parent_id) = config_helper_parent(target) {
+            if !matches!(room, RunRoom::Delegated { parent_id: source } if source == parent_id) {
+                return Err(ApiError::bad_request_static(
+                    HELPER_MUST_RUN_THROUGH_COMPANION,
+                ));
+            }
+            if target
+                .tools
+                .iter()
+                .flatten()
+                .any(|tool| crate::tools::is_process_tool(&tool.name))
+            {
+                return Err(ApiError::bad_request_static(
+                    "Process tools are unavailable to helpers until process cancellation is supported",
+                ));
+            }
+        }
+    }
+    if let RunRoom::Peer { route } = room {
+        let target = agent_config(state, agent_id).ok_or_else(ApiError::not_found)?;
+        for source in route
+            .participants()
+            .iter()
+            .take(route.participants().len() - 1)
+        {
+            let source = agent_config(state, source).ok_or_else(ApiError::not_found)?;
+            if target.tools.iter().flatten().any(|tool| {
+                !matches!(
+                    tool.name.as_str(),
+                    "list_workspace_agents"
+                        | "send_message"
+                        | "broadcast_message"
+                        | "delegate_to_agent"
+                        | "spawn_helper"
+                ) && !source.allows_tool(&tool.name)
+            }) {
+                return Err(ApiError::bad_request_static("Peer request would exceed the sender's tool permissions; ask the owner to contact this agent directly"));
+            }
+        }
+    }
+    if let RunRoom::Delegated { parent_id } = room {
+        let parent = agent_config(state, parent_id).ok_or_else(ApiError::not_found)?;
+        let target = agent_config(state, agent_id).ok_or_else(ApiError::not_found)?;
+        if !is_manager_config(parent)
+            || is_manager_config(target)
+            || parent_id == agent_id
+            || target.tools.iter().flatten().any(|tool| {
+                tool.name != "list_workspace_agents"
+                    && tool.name != "delegate_to_agent"
+                    && tool.name != "spawn_helper"
+                    && !parent.allows_tool(&tool.name)
+            })
+        {
+            return Err(ApiError::bad_request_static(
+                "Delegation cannot escalate permissions or target a manager",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Marks a started run failed if its task ends without finishing it (for
+/// example, a panic in a tool), so a crashed run never stays in flight and
+/// never blocks deletion or task edits.
+struct InFlightRunGuard {
+    state: SharedDaemonState,
+    run_id: Option<String>,
+}
+
+impl InFlightRunGuard {
+    fn new(state: SharedDaemonState, run_id: String) -> Self {
+        Self {
+            state,
+            run_id: Some(run_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.run_id = None;
+    }
+}
+
+impl Drop for InFlightRunGuard {
+    fn drop(&mut self) {
+        let Some(run_id) = self.run_id.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = Arc::clone(&self.state);
+        handle.spawn(async move {
+            let mut guard = state.write().await;
+            if let Some(record) = guard.runs.get_mut(&run_id) {
+                if !record.status.is_terminal() {
+                    record.finish(
+                        RunStatus::Failed,
+                        Some(RunError::new(
+                            RUN_ABORTED,
+                            "The run stopped unexpectedly before its result was saved",
+                        )),
+                        anima_core::primitives::now_millis(),
+                    );
+                }
+            }
+        });
+    }
 }
 
 async fn persist_task_result_memory(
@@ -972,6 +1573,7 @@ mod tests {
     use super::{AgentRunCoordinator, AgentRunRequest, RunRoom};
     use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
     use crate::routes::ApiError;
+    use crate::runs::{RunLedger, RunRecord, RunSource, RunStart, RunStatus};
     use crate::state::DaemonState;
     use anima_core::{
         AgentConfig, AgentConfigUpdate, AgentRuntime, AgentSettings, AgentStatus, Content,
@@ -979,7 +1581,8 @@ mod tests {
         ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
-    use std::collections::BTreeMap;
+    use axum::http::StatusCode;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
     use std::time::Duration;
@@ -1121,6 +1724,7 @@ mod tests {
                 alice.id.clone(),
                 "Please review my work".into(),
                 anima_core::AgentCommunicationRoute::start(&bob.id),
+                None,
             )
             .await
             .unwrap();
@@ -1604,7 +2208,12 @@ mod tests {
             .await
             .is_err());
         assert!(coordinator
-            .delegate(&lead, helper.state.id, "Bypass start allowance".into())
+            .delegate(
+                &lead,
+                helper.state.id,
+                "Bypass start allowance".into(),
+                None
+            )
             .await
             .unwrap_err()
             .contains("spawn_helper"));
@@ -1996,26 +2605,34 @@ mod tests {
             .unwrap()
             .state;
         assert!(coordinator
-            .delegate(&manager, manager.id.clone(), "self".into())
+            .delegate(&manager, manager.id.clone(), "self".into(), None)
             .await
             .is_err());
         assert!(coordinator
-            .delegate(&worker, manager.id.clone(), "reverse".into())
+            .delegate(&worker, manager.id.clone(), "reverse".into(), None)
             .await
             .is_err());
         assert!(coordinator
-            .delegate(&manager, "missing".into(), "missing".into())
+            .delegate(&manager, "missing".into(), "missing".into(), None)
             .await
             .is_err());
-        let lock = coordinator.agent_lock(&worker_id).lock_owned().await;
+        let mut held = Vec::new();
+        for room in ["busy-1", "busy-2", "busy-3"] {
+            held.push(
+                coordinator
+                    .admit(&worker_id, room, super::AdmitMode::TryNow)
+                    .await
+                    .expect("worker has a free slot"),
+            );
+        }
         assert!(tokio::time::timeout(
             Duration::from_secs(1),
-            coordinator.delegate(&manager, worker_id.clone(), "busy".into())
+            coordinator.delegate(&manager, worker_id.clone(), "busy".into(), None)
         )
         .await
         .unwrap()
         .is_err());
-        drop(lock);
+        drop(held);
         assert!(
             !coordinator
                 .parent_allows_tool(&manager.id, "write_file")
@@ -2037,7 +2654,7 @@ mod tests {
             )
             .unwrap();
         assert!(coordinator
-            .delegate(&manager, worker_id, "escalate".into())
+            .delegate(&manager, worker_id, "escalate".into(), None)
             .await
             .is_err());
         assert!(captures.lock().unwrap().is_empty());
@@ -2051,6 +2668,35 @@ mod tests {
 
     struct CapturingModelAdapter {
         requests: Arc<StdMutex<Vec<ModelGenerateRequest>>>,
+    }
+
+    struct OrderedGateModelAdapter {
+        order: StdMutex<Vec<String>>,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for OrderedGateModelAdapter {
+        fn provider(&self) -> &str {
+            "ordered-gate"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let text = request
+                .messages
+                .last()
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            self.order.lock().unwrap().push(text.clone());
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(model_response(&text))
+        }
     }
 
     #[async_trait]
@@ -2101,7 +2747,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_agent_runs_wait_then_both_execute() {
+    async fn same_room_runs_wait_in_acceptance_order() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(OrderedGateModelAdapter {
+            order: StdMutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 4).await;
+        let spawn_run = |text: &str| {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-shared", text);
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+
+        let first = spawn_run("first");
+        entered.acquire().await.unwrap().forget();
+        let second = spawn_run("second");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let third = spawn_run("third");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(adapter.order.lock().unwrap().clone(), ["first"]);
+
+        release.add_permits(1);
+        entered.acquire().await.unwrap().forget();
+        release.add_permits(1);
+        entered.acquire().await.unwrap().forget();
+        release.add_permits(1);
+        for task in [first, second, third] {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(
+            adapter.order.lock().unwrap().clone(),
+            ["first", "second", "third"]
+        );
+    }
+
+    #[tokio::test]
+    async fn different_rooms_of_one_agent_run_concurrently_and_both_commit() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let adapter = Arc::new(GateModelAdapter {
@@ -2109,39 +2797,167 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 2).await;
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 4).await;
+        let runs = ["room-a", "room-b"].map(|room| {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, room, room);
+            tokio::spawn(async move { coordinator.run(request).await })
+        });
 
-        let first_coordinator = coordinator.clone();
-        let first_request = request(&agent_id, "first");
-        let first = tokio::spawn(async move { first_coordinator.run(first_request).await });
-        entered
-            .acquire()
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(2))
             .await
-            .expect("first run should enter model")
+            .expect("both rooms enter the model concurrently")
+            .unwrap()
             .forget();
-        let second_coordinator = coordinator.clone();
-        let second_request = request(&agent_id, "second");
-        let second = tokio::spawn(async move { second_coordinator.run(second_request).await });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
+        {
+            let guard = coordinator.state.read().await;
+            assert_eq!(guard.in_flight_runs(&agent_id), 2);
+            assert_eq!(
+                guard.get_agent(&agent_id).unwrap().state.status,
+                AgentStatus::Running
+            );
         }
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+        release.add_permits(2);
+        for run in runs {
+            run.await.unwrap().unwrap();
+        }
 
-        release.add_permits(1);
-        entered
-            .acquire()
-            .await
-            .expect("second run should enter after first completes")
-            .forget();
-        release.add_permits(1);
-
-        assert!(first.await.expect("first task should join").is_ok());
-        assert!(second.await.expect("second task should join").is_ok());
-        assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
+        let guard = coordinator.state.read().await;
+        let agent = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(agent.state.status, AgentStatus::Completed);
+        for room in ["room-a", "room-b"] {
+            assert_eq!(
+                agent
+                    .messages
+                    .iter()
+                    .filter(|message| message.room_id == room)
+                    .count(),
+                2,
+                "{room} keeps its own turn"
+            );
+        }
+        let runs = guard.runs.for_agent(&agent_id);
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| run.status == RunStatus::Completed));
     }
 
     #[tokio::test]
-    async fn aborted_caller_does_not_cancel_restore_or_leave_a_stale_agent_lock() {
+    async fn with_max_runs_per_agent_clamps_to_one_and_sixty_four() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(1)));
+
+        assert_eq!(
+            coordinator
+                .clone()
+                .with_max_runs_per_agent(0)
+                .max_runs_per_agent(),
+            1,
+            "0 (and any non-positive request) clamps up to 1 so the semaphore is never empty"
+        );
+        assert_eq!(
+            coordinator
+                .clone()
+                .with_max_runs_per_agent(super::MAX_RUNS_PER_AGENT_LIMIT)
+                .max_runs_per_agent(),
+            super::MAX_RUNS_PER_AGENT_LIMIT,
+            "the limit itself is accepted unchanged"
+        );
+        assert_eq!(
+            coordinator
+                .clone()
+                .with_max_runs_per_agent(1_000_000)
+                .max_runs_per_agent(),
+            super::MAX_RUNS_PER_AGENT_LIMIT,
+            "an oversized request clamps down to the limit so Semaphore::new can never panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_per_agent_slot_limit_queues_runs_beyond_it() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 8).await;
+        let coordinator = coordinator.with_max_runs_per_agent(2);
+        let runs = ["room-a", "room-b", "room-c"].map(|room| {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, room, room);
+            tokio::spawn(async move { coordinator.run(request).await })
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(2))
+            .await
+            .expect("two rooms start")
+            .unwrap()
+            .forget();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            2,
+            "the third room waits for a free slot"
+        );
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("the third room starts once a slot frees")
+            .unwrap()
+            .forget();
+        release.add_permits(2);
+        for run in runs {
+            assert!(run.await.unwrap().is_ok());
+        }
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn helper_agents_have_a_single_run_slot() {
+        let (coordinator, worker_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let lead = helper_lead(&coordinator).await;
+        let helper = coordinator
+            .state
+            .write()
+            .await
+            .create_agent(super::helper_config(&lead, "Research".into()))
+            .unwrap()
+            .state;
+
+        let _running = coordinator
+            .admit(&helper.id, "room-1", super::AdmitMode::TryNow)
+            .await
+            .expect("the helper's only slot is free");
+        let busy = coordinator
+            .admit(&helper.id, "room-2", super::AdmitMode::TryNow)
+            .await
+            .err()
+            .expect("a helper runs one task at a time");
+        assert_eq!(busy.message(), "Specialist is busy");
+        assert!(coordinator.is_agent_busy(&helper.id));
+
+        let _first = coordinator
+            .admit(&worker_id, "room-1", super::AdmitMode::TryNow)
+            .await
+            .expect("first worker slot");
+        let _second = coordinator
+            .admit(&worker_id, "room-2", super::AdmitMode::TryNow)
+            .await
+            .expect("other agents keep several slots");
+        assert!(!coordinator.is_agent_busy(&worker_id));
+    }
+
+    #[tokio::test]
+    async fn aborted_caller_does_not_cancel_the_commit_or_leak_locks_and_slots() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let adapter = Arc::new(GateModelAdapter {
@@ -2180,7 +2996,7 @@ mod tests {
         release.add_permits(1);
 
         for _ in 0..100 {
-            if coordinator.lock_count() == 0
+            if coordinator.lock_counts() == (0, 0)
                 && state
                     .read()
                     .await
@@ -2191,7 +3007,7 @@ mod tests {
             }
             tokio::task::yield_now().await;
         }
-        assert_eq!(coordinator.lock_count(), 0);
+        assert_eq!(coordinator.lock_counts(), (0, 0));
         assert!(state.read().await.agents.contains_key(&agent_id));
 
         let retry_coordinator = coordinator.clone();
@@ -2204,6 +3020,290 @@ mod tests {
             .forget();
         release.add_permits(1);
         assert!(retry.await.expect("retry should join").is_ok());
+    }
+
+    /// Runs `threads` copies of `make_and_drop_lease` in lockstep for
+    /// `rounds` rounds: every round, all threads rendezvous on `start` before
+    /// building and immediately dropping a lease, so every round's drops
+    /// truly race each other rather than merely interleaving loosely.
+    fn stress_concurrent_drops(
+        threads: usize,
+        rounds: usize,
+        make_and_drop_lease: impl Fn() + Send + Sync + 'static,
+    ) {
+        let make_and_drop_lease = Arc::new(make_and_drop_lease);
+        let start = Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let make_and_drop_lease = Arc::clone(&make_and_drop_lease);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    for _ in 0..rounds {
+                        start.wait();
+                        make_and_drop_lease();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("racer thread should not panic");
+        }
+    }
+
+    #[test]
+    fn concurrent_lease_drops_on_one_key_leave_no_stale_registry_entry() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(1)));
+
+        // Many leases on the SAME (agent, room) key, dropped by many threads
+        // at once, over and over: a failed try-acquire racing the holder's
+        // own release is one instance of this, but any two leases whose
+        // drops overlap can hit it. `SessionLease::drop`/`SlotLease::drop`
+        // must decide removal atomically with releasing their own reference,
+        // or a race here leaks the registry entry forever (nothing else ever
+        // revisits a key once every lease on it has dropped).
+        let session_coordinator = coordinator.clone();
+        stress_concurrent_drops(32, 4000, move || {
+            let (key, lock) = session_coordinator.session_lock("racer-agent", "racer-room");
+            drop(super::SessionLease {
+                key,
+                lock: Some(lock),
+                guard: None,
+                locks: Arc::clone(&session_coordinator.session_locks),
+            });
+        });
+        assert_eq!(
+            coordinator.lock_counts(),
+            (0, 0),
+            "racing session-lease drops on one key must not leak a stale registry entry"
+        );
+
+        let slot_coordinator = coordinator.clone();
+        stress_concurrent_drops(32, 4000, move || {
+            let slots = slot_coordinator.agent_slot_semaphore("racer-agent", 1);
+            drop(super::SlotLease {
+                agent_id: "racer-agent".to_string(),
+                slots: Some(slots),
+                permit: None,
+                registry: Arc::clone(&slot_coordinator.agent_slots),
+            });
+        });
+        assert_eq!(
+            coordinator.lock_counts(),
+            (0, 0),
+            "racing slot-lease drops on one key must not leak a stale registry entry"
+        );
+    }
+
+    /// The waiting budget is per agent and try-only, and a unit comes back on
+    /// every exit of the task holding it, including cancellation and panic.
+    #[tokio::test]
+    async fn waiting_budget_is_per_agent_try_only_and_released_on_every_exit() {
+        let coordinator = AgentRunCoordinator::new(
+            Arc::new(RwLock::new(DaemonState::new())),
+            Arc::new(Semaphore::new(1)),
+        );
+        let mut units: Vec<_> = (0..super::MAX_QUEUED_RUNS_PER_AGENT)
+            .map(|_| {
+                coordinator
+                    .try_take_waiting_unit("agent-x")
+                    .expect("within the budget")
+            })
+            .collect();
+        assert!(
+            coordinator.try_take_waiting_unit("agent-x").is_none(),
+            "a ninth waiter is refused without waiting"
+        );
+        let other = coordinator
+            .try_take_waiting_unit("agent-y")
+            .expect("each agent has its own budget");
+
+        let cancelled = {
+            let unit = units.pop().unwrap();
+            tokio::spawn(async move {
+                let _unit = unit;
+                std::future::pending::<()>().await;
+            })
+        };
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        let panicked = {
+            let unit = units.pop().unwrap();
+            tokio::spawn(async move {
+                let _unit = unit;
+                panic!("simulated panic in a task holding a waiting unit");
+            })
+        };
+        assert!(panicked.await.unwrap_err().is_panic());
+        assert_eq!(
+            coordinator.waiting_runs("agent-x"),
+            super::MAX_QUEUED_RUNS_PER_AGENT - 2
+        );
+        let refill = coordinator
+            .try_take_waiting_unit("agent-x")
+            .expect("a released unit can be taken again");
+
+        drop((units, refill, other));
+        assert!(
+            coordinator.waiting_budget.lock().unwrap().is_empty(),
+            "an agent with no waiting runs keeps no budget entry"
+        );
+    }
+
+    /// No path may hold a global permit while it waits for a room lock or an
+    /// agent slot: room and slot are acquired first, and only then the
+    /// global permit (spec §4.3). A run queued behind another run in the
+    /// *same* room must not starve a run in a *different* room of the same
+    /// agent out of the global permit while it waits.
+    #[tokio::test]
+    async fn a_run_queued_for_a_room_lock_does_not_hold_the_global_permit() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        // Only 2 global permits: if a room-locked waiter held one, a third
+        // room's run would have none left to take.
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 2).await;
+
+        let run_a = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-r", "a");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered
+            .acquire()
+            .await
+            .expect("run A enters the model and holds the global permit")
+            .forget();
+
+        // Run B queues behind A on room R's lock; it must not reach (let
+        // alone hold) the global permit while it waits.
+        let run_b = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-r", "b");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            1,
+            "run B is queued behind A on the room lock, not in the model"
+        );
+
+        // Room R2 of the SAME agent still gets the free global permit even
+        // though B is queued and A has not released.
+        let run_c = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-r2", "c");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("a different room of the same agent still gets the free global permit")
+            .unwrap()
+            .forget();
+
+        release.add_permits(2);
+        assert!(run_a.await.unwrap().is_ok());
+        assert!(run_c.await.unwrap().is_ok());
+
+        entered
+            .acquire()
+            .await
+            .expect("B now runs once A's room lock frees")
+            .forget();
+        release.add_permits(1);
+        assert!(run_b.await.unwrap().is_ok());
+
+        assert_eq!(coordinator.lock_counts(), (0, 0));
+    }
+
+    /// The run owns its task once spawned (see `run_spawned`): a caller
+    /// dropped while still waiting for a room lock or slot must not cancel
+    /// the run itself, any more than a caller dropped while the run is
+    /// already in the model does (see
+    /// `aborted_caller_does_not_cancel_the_commit_or_leak_locks_and_slots`).
+    #[tokio::test]
+    async fn dropped_caller_does_not_cancel_a_run_still_queued_for_a_room_lock() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(GateModelAdapter {
+            calls: AtomicUsize::new(0),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 4).await;
+
+        // Hold the room (and a slot) directly, with no model involved, so the
+        // queued run below is blocked purely on the room lock.
+        let blocker = coordinator
+            .admit(&agent_id, "room-queued", super::AdmitMode::TryNow)
+            .await
+            .expect("the room and a slot are free");
+
+        let caller = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-queued", "queued");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            0,
+            "the run is queued on the room lock, not in the model yet"
+        );
+
+        // Drop (abort) the caller while its run is still queued for the room.
+        caller.abort();
+        assert!(
+            caller
+                .await
+                .expect_err("caller should be aborted")
+                .is_cancelled(),
+            "aborting the waiter should not abort the owned run"
+        );
+
+        // Only now does the blocker release the room; the queued run must
+        // still be there to take it, then reach and finish in the model.
+        drop(blocker);
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("the queued run still enters the model once the blocker releases")
+            .unwrap()
+            .forget();
+        release.add_permits(1);
+
+        for _ in 0..100 {
+            if coordinator.lock_counts() == (0, 0)
+                && coordinator
+                    .state
+                    .read()
+                    .await
+                    .get_agent(&agent_id)
+                    .is_some_and(|snapshot| snapshot.state.status == AgentStatus::Completed)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(coordinator.lock_counts(), (0, 0));
+        let guard = coordinator.state.read().await;
+        let agent = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(agent.state.status, AgentStatus::Completed);
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|message| message.room_id == "room-queued"),
+            "the queued run committed its turn"
+        );
     }
 
     #[tokio::test]
@@ -2285,9 +3385,8 @@ mod tests {
             seeded.message_count = seeded.messages.len();
             guard.agents.insert(
                 agent_id.clone(),
-                AgentRuntime::from_snapshot(seeded.clone(), adapter.clone()),
+                AgentRuntime::from_snapshot(seeded, adapter.clone()),
             );
-            guard.agent_snapshots.insert(agent_id.clone(), seeded);
             agent_id
         };
         let coordinator = AgentRunCoordinator::new(state, Arc::new(Semaphore::new(2)));
@@ -2301,6 +3400,9 @@ mod tests {
                 },
                 room: RunRoom::Stable("room-telegram".into()),
                 idempotency_key: None,
+                source: RunSource::Api,
+                source_ref: None,
+                parent: None,
             })
             .await
             .expect("stable room run should succeed");
@@ -2341,6 +3443,9 @@ mod tests {
                 },
                 room: RunRoom::Stable("room-telegram".into()),
                 idempotency_key: Some("connector:update:42".into()),
+                source: RunSource::Api,
+                source_ref: None,
+                parent: None,
             })
             .await
             .expect("run should succeed");
@@ -2380,7 +3485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_runs_after_runtime_restore_and_before_final_snapshot() {
+    async fn commit_hook_sees_the_merged_run_before_the_final_snapshot() {
         let path = snapshot_path("commit-order");
         let config = ControlPlaneStoreConfig::Json(path.clone());
         let adapter = Arc::new(CapturingModelAdapter {
@@ -2400,23 +3505,35 @@ mod tests {
         let commit_agent_id = agent_id.clone();
 
         coordinator
-            .run_with_commit(
-                request(&agent_id, "commit me"),
-                move |state, snapshot, _| {
-                    assert_eq!(snapshot.state.id, commit_agent_id);
-                    assert!(state.agents.contains_key(&commit_agent_id));
-                    state
-                        .update_agent(
-                            &commit_agent_id,
-                            AgentConfigUpdate {
-                                name: Some("after-commit".into()),
-                                ..AgentConfigUpdate::default()
-                            },
-                        )
-                        .expect("commit mutation should succeed");
-                    Ok(())
-                },
-            )
+            .run_with_commit(request(&agent_id, "commit me"), move |state, outcome| {
+                let agent = state
+                    .get_agent(&commit_agent_id)
+                    .expect("the canonical agent stays registered");
+                let reply = outcome
+                    .reply_message_id
+                    .as_deref()
+                    .expect("a successful run has a reply");
+                assert!(agent.messages.iter().any(|message| {
+                    message.id == reply
+                        && message.role == MessageRole::Assistant
+                        && message.room_id == outcome.session_id
+                }));
+                assert_eq!(outcome.status, RunStatus::Completed);
+                assert_eq!(
+                    state.runs.get(&outcome.run_id).map(|run| run.status),
+                    Some(RunStatus::Completed)
+                );
+                state
+                    .update_agent(
+                        &commit_agent_id,
+                        AgentConfigUpdate {
+                            name: Some("after-commit".into()),
+                            ..AgentConfigUpdate::default()
+                        },
+                    )
+                    .expect("commit mutation should succeed");
+                Ok(())
+            })
             .await
             .expect("run and commit should succeed");
 
@@ -2425,11 +3542,14 @@ mod tests {
             .expect("snapshot should load")
             .expect("snapshot should exist");
         assert_eq!(persisted.agents[0].state.config.name, "after-commit");
+        assert_eq!(persisted.runs.len(), 1);
+        assert_eq!(persisted.runs[0].status, RunStatus::Completed);
+        assert_eq!(persisted.runs[0].source, RunSource::Api);
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
-    async fn failed_commit_leaves_runtime_restored_without_final_snapshot() {
+    async fn rejected_commit_rolls_back_only_the_run_and_keeps_the_running_marker() {
         let path = snapshot_path("commit-failure");
         let config = ControlPlaneStoreConfig::Json(path.clone());
         let adapter = Arc::new(CapturingModelAdapter {
@@ -2447,23 +3567,29 @@ mod tests {
         };
         let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
 
-        let result = coordinator
-            .run_with_commit(request(&agent_id, "fail commit"), |state, snapshot, _| {
-                assert!(state.agents.contains_key(&snapshot.state.id));
+        let error = coordinator
+            .run_with_commit(request(&agent_id, "fail commit"), |state, outcome| {
+                assert!(state.runs.get(&outcome.run_id).is_some());
                 Err(ApiError::bad_request("commit rejected"))
             })
-            .await;
-        assert!(result.is_err());
+            .await
+            .expect_err("a rejected commit fails the run");
+        assert_eq!(error.message(), "commit rejected");
         {
             let guard = state.read().await;
-            assert!(guard.agents.contains_key(&agent_id));
+            let agent = guard
+                .get_agent(&agent_id)
+                .expect("the canonical runtime stays registered");
+            assert!(
+                agent.messages.is_empty(),
+                "the rejected run's messages are removed"
+            );
+            assert_eq!(agent.state.status, AgentStatus::Idle);
+            let run = guard.runs.for_agent(&agent_id)[0].clone();
+            assert_eq!(run.status, RunStatus::Failed);
             assert_eq!(
-                guard
-                    .get_agent(&agent_id)
-                    .expect("runtime should remain visible")
-                    .state
-                    .status,
-                AgentStatus::Completed
+                run.error.map(|error| error.code),
+                Some("commit_rejected".to_string())
             );
         }
         let persisted = load_control_plane_snapshot(&config)
@@ -2471,7 +3597,511 @@ mod tests {
             .expect("snapshot should load")
             .expect("running snapshot should exist");
         assert_eq!(persisted.agents[0].state.status, AgentStatus::Running);
+        assert_eq!(persisted.runs[0].status, RunStatus::Running);
         let _ = std::fs::remove_file(path);
+    }
+
+    struct ConfigGateModelAdapter {
+        names: StdMutex<Vec<String>>,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for ConfigGateModelAdapter {
+        fn provider(&self) -> &str {
+            "config-gate"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.names.lock().unwrap().push(config.name.clone());
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(model_response("done"))
+        }
+    }
+
+    struct PanickingModelAdapter;
+
+    #[async_trait]
+    impl ModelAdapter for PanickingModelAdapter {
+        fn provider(&self) -> &str {
+            "panicking"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            panic!("model adapter crashed");
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_during_a_run_applies_to_later_runs_only() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(ConfigGateModelAdapter {
+            names: StdMutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let (coordinator, agent_id) = coordinator_with_agent(adapter.clone(), 2).await;
+        let running = {
+            let coordinator = coordinator.clone();
+            let request = request(&agent_id, "first");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        coordinator
+            .state
+            .write()
+            .await
+            .update_agent(
+                &agent_id,
+                AgentConfigUpdate {
+                    name: Some("renamed".into()),
+                    ..AgentConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        release.add_permits(1);
+        running.await.unwrap().unwrap();
+
+        let config = coordinator
+            .state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .state
+            .config;
+        assert_eq!(config.name, "renamed");
+        assert_eq!(
+            config.system, None,
+            "per-run prompts never reach the canonical config"
+        );
+        assert_eq!(
+            config.tools, None,
+            "per-run tools never reach the canonical config"
+        );
+        release.add_permits(1);
+        coordinator.run(request(&agent_id, "second")).await.unwrap();
+        assert_eq!(
+            adapter.names.lock().unwrap().clone(),
+            ["operator", "renamed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_run_gets_a_ledger_record_with_its_source_room_and_input() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let mut stable = request(&agent_id, "stable room");
+        stable.room = RunRoom::Stable("direct:ledger".into());
+        coordinator.run(stable).await.unwrap();
+        coordinator
+            .run(request(&agent_id, "generated room"))
+            .await
+            .unwrap();
+
+        let guard = coordinator.state.read().await;
+        let runs = guard.runs.for_agent(&agent_id);
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|run| {
+            run.id.starts_with("run_")
+                && run.status == RunStatus::Completed
+                && run.source == RunSource::Api
+                && run.finished_at_ms.is_some()
+                && !run.mirrored
+        }));
+        let stable = runs
+            .iter()
+            .find(|run| run.input.text == "stable room")
+            .unwrap();
+        assert_eq!(stable.session_id, "direct:ledger");
+        let generated = runs
+            .iter()
+            .find(|run| run.input.text == "generated room")
+            .unwrap();
+        assert!(generated.session_id.starts_with("room-"));
+        let agent = guard.get_agent(&agent_id).unwrap();
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|message| message.room_id == generated.session_id),
+            "a generated room is chosen before the run and used for its messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_in_flight_run_with_the_same_idempotency_key_is_rejected() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            }),
+            2,
+        )
+        .await;
+        coordinator
+            .state
+            .write()
+            .await
+            .runs
+            .insert(RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: "room-other".into(),
+                    source: RunSource::Telegram,
+                    source_ref: None,
+                    idempotency_key: Some("dup-key".into()),
+                    text: "in flight".into(),
+                    model: "gpt-5.4".into(),
+                    provider: None,
+                    parent_run_id: None,
+                },
+                anima_core::primitives::now_millis(),
+            ));
+        let mut duplicate = request(&agent_id, "same logical work");
+        duplicate.idempotency_key = Some("dup-key".into());
+
+        let error = coordinator
+            .run(duplicate)
+            .await
+            .expect_err("one logical unit of work runs once at a time");
+
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error.message(),
+            "A run with this idempotency key is already in progress"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_crashed_run_never_stays_in_flight() {
+        let (coordinator, agent_id) =
+            coordinator_with_agent(Arc::new(PanickingModelAdapter), 2).await;
+
+        let error = coordinator
+            .run(request(&agent_id, "crash"))
+            .await
+            .expect_err("the run task panicked");
+        assert_eq!(error.message(), "agent run worker stopped unexpectedly");
+
+        for _ in 0..100 {
+            if coordinator.state.read().await.in_flight_runs(&agent_id) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let guard = coordinator.state.read().await;
+        assert_eq!(guard.in_flight_runs(&agent_id), 0);
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.error.map(|error| error.code),
+            Some("run_aborted".to_string())
+        );
+        assert_ne!(
+            guard.get_agent(&agent_id).unwrap().state.status,
+            AgentStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_stops_between_its_ledger_insert_and_start_save_never_stays_in_flight() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            }),
+            2,
+        )
+        .await;
+        // The run-start persist request overflows the revision counter, so the
+        // run task panics after recording the run and before its start save.
+        coordinator
+            .state
+            .write()
+            .await
+            .set_control_plane_revision_for_test(u64::MAX);
+
+        let error = coordinator
+            .run(request(&agent_id, "never saved"))
+            .await
+            .expect_err("the run task panicked");
+        assert_eq!(error.message(), "agent run worker stopped unexpectedly");
+
+        for _ in 0..100 {
+            if coordinator.state.read().await.in_flight_runs(&agent_id) == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let guard = coordinator.state.read().await;
+        assert_eq!(guard.in_flight_runs(&agent_id), 0);
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(
+            run.error.map(|error| error.code),
+            Some("run_aborted".to_string())
+        );
+        assert!(requests.lock().unwrap().is_empty(), "the model never ran");
+    }
+
+    struct ToolThenGateModelAdapter {
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for ToolThenGateModelAdapter {
+        fn provider(&self) -> &str {
+            "tool-then-gate"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            if !request
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool)
+            {
+                let mut response = model_response("Calculating");
+                response.stop_reason = ModelStopReason::ToolCall;
+                response.tool_calls = Some(vec![anima_core::ToolCall {
+                    id: "calculate-1".into(),
+                    name: "calculate".into(),
+                    args: BTreeMap::from([(
+                        "expression".into(),
+                        DataValue::String("1 + 2".into()),
+                    )]),
+                }]);
+                return Ok(response);
+            }
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(model_response("The answer is 3"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_interrupted_after_starting_a_tool_keeps_that_tool_across_a_restart() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            ToolThenGateModelAdapter {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            },
+        ))));
+        let mut config = test_config("calculator");
+        config.tools = Some(
+            crate::tools::ToolRegistry::new()
+                .resolve_descriptors(["calculate"])
+                .unwrap(),
+        );
+        let agent_id = state.write().await.create_agent(config).unwrap().state.id;
+        let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
+        let running = {
+            let coordinator = coordinator.clone();
+            let request = request(&agent_id, "what is 1 + 2?");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        // Any save taken now carries the tool the run already started, and a
+        // restart then interrupts the run.
+        let snapshot = state.read().await.control_plane_snapshot();
+        let restored = RunLedger::restored(
+            snapshot.runs,
+            &HashSet::from([agent_id.clone()]),
+            anima_core::primitives::now_millis(),
+        );
+        let interrupted = restored.for_agent(&agent_id)[0].clone();
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        assert_eq!(
+            interrupted.error.map(|error| error.code),
+            Some("restart_during_run".to_string())
+        );
+        assert_eq!(interrupted.tools_started, ["calculate"]);
+
+        release.add_permits(1);
+        running.await.unwrap().unwrap();
+        assert_eq!(
+            state.read().await.runs.for_agent(&agent_id)[0].tools_started,
+            ["calculate"],
+            "the commit-time fill agrees"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_save_leaves_no_ledger_record() {
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            }),
+            2,
+        )
+        .await;
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+
+        let error = coordinator
+            .run(request(&agent_id, "unsaved"))
+            .await
+            .expect_err("the run-start save failed");
+        assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let guard = coordinator.state.read().await;
+        assert!(guard.runs.for_agent(&agent_id).is_empty());
+        assert_eq!(guard.in_flight_runs(&agent_id), 0);
+        assert!(requests.lock().unwrap().is_empty(), "the model never ran");
+    }
+
+    #[tokio::test]
+    async fn a_failed_final_save_fails_the_run_and_reverts_only_its_transcript() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        // A turn committed in another room, which the failed runs must keep.
+        release.add_permits(1);
+        coordinator
+            .run(room_request(&agent_id, "room-kept", "kept turn"))
+            .await
+            .expect("an ordinary run commits");
+        entered.acquire().await.unwrap().forget();
+        let committed = coordinator
+            .state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages;
+        assert_eq!(committed.len(), 2);
+
+        // The legacy route's run, then a job's ticketed run; each fails only its
+        // final save.
+        let legacy = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-legacy", "legacy turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        let legacy_error = legacy.await.unwrap().expect_err("the final save failed");
+
+        let source_rollbacks = Arc::new(AtomicUsize::new(0));
+        let ticket = coordinator
+            .try_ticket(&agent_id, "job:job-1")
+            .await
+            .expect("the job's room, a slot, and a permit are free");
+        let job = {
+            let coordinator = coordinator.clone();
+            let source_rollbacks = Arc::clone(&source_rollbacks);
+            let request = AgentRunRequest {
+                idempotency_key: Some("job:job-1:attempt:1".into()),
+                source: RunSource::Job,
+                source_ref: Some("job-1:1".into()),
+                ..room_request(&agent_id, "job:job-1", "job turn")
+            };
+            tokio::spawn(async move {
+                coordinator
+                    .run_ticketed_with_commit_and_rollback(
+                        request,
+                        ticket,
+                        |_, _| Ok(()),
+                        move |_| {
+                            source_rollbacks.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await
+            })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        let job_error = job.await.unwrap().expect_err("the final save failed");
+
+        for error in [&legacy_error, &job_error] {
+            assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        assert_eq!(
+            source_rollbacks.load(Ordering::SeqCst),
+            1,
+            "the job's own rollback ran"
+        );
+        let guard = coordinator.state.read().await;
+        assert_eq!(
+            guard.get_agent(&agent_id).unwrap().messages,
+            committed,
+            "only the failed runs' messages are removed"
+        );
+        for (room, source) in [
+            ("room-legacy", RunSource::Api),
+            ("job:job-1", RunSource::Job),
+        ] {
+            let run = guard
+                .runs
+                .for_agent(&agent_id)
+                .into_iter()
+                .find(|run| run.session_id == room)
+                .expect("the failed run keeps its ledger record");
+            assert_eq!(run.source, source);
+            assert_eq!(run.status, RunStatus::Failed);
+            assert_eq!(
+                run.error.as_ref().map(|error| error.code.as_str()),
+                Some("commit_failed")
+            );
+        }
+        drop(guard);
+        assert_eq!(coordinator.lock_counts(), (0, 0));
+    }
+
+    /// Waits for the run parked in the gate model, makes the next control-plane
+    /// save (its final save) fail, then releases the run.
+    async fn fail_the_next_final_save(
+        coordinator: &AgentRunCoordinator,
+        entered: &Semaphore,
+        release: &Semaphore,
+    ) {
+        entered.acquire().await.unwrap().forget();
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+        release.add_permits(1);
     }
 
     fn request(agent_id: &str, text: &str) -> AgentRunRequest {
@@ -2483,6 +4113,16 @@ mod tests {
             },
             room: RunRoom::Generated,
             idempotency_key: None,
+            source: RunSource::Api,
+            source_ref: None,
+            parent: None,
+        }
+    }
+
+    fn room_request(agent_id: &str, room_id: &str, text: &str) -> AgentRunRequest {
+        AgentRunRequest {
+            room: RunRoom::Stable(room_id.into()),
+            ..request(agent_id, text)
         }
     }
 
@@ -2557,5 +4197,879 @@ mod tests {
                 .expect("clock should be after epoch")
                 .as_nanos()
         ))
+    }
+
+    #[tokio::test]
+    async fn only_durable_commits_reach_the_history_outbox() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        release.add_permits(1);
+        coordinator
+            .run(room_request(&agent_id, "room-kept", "kept turn"))
+            .await
+            .expect("an ordinary run commits");
+        entered.acquire().await.unwrap().forget();
+        let history = coordinator.state.read().await.history.clone();
+        assert_eq!(history.pending_count(), 2, "the committed turn is queued");
+
+        let failed = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-lost", "lost turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        failed.await.unwrap().expect_err("the final save failed");
+
+        assert_eq!(
+            history.pending_count(),
+            2,
+            "a commit whose save failed never reaches the history store"
+        );
+    }
+
+    /// Flushes while a run's final save is in flight and then fails: the
+    /// flush waits for the rollback, then mirrors the run as failed and none
+    /// of its messages. `reconciled` flushes once first, so the flush under
+    /// test skips the reconcile and reaches the runs read directly.
+    async fn assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(reconciled: bool) {
+        use crate::history::{HistoryService, HistoryStore, MemoryHistoryStore, MessagePageQuery};
+
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        let store = Arc::new(MemoryHistoryStore::new());
+        let history = HistoryService::new(store.clone());
+        coordinator
+            .state
+            .write()
+            .await
+            .set_history(Arc::clone(&history));
+        let transactions = coordinator.control_plane_transactions();
+        if reconciled {
+            history
+                .flush_once(
+                    &coordinator.state,
+                    &transactions,
+                    anima_core::primitives::now_millis(),
+                )
+                .await
+                .unwrap();
+            assert!(history.reconciled());
+        }
+        let run = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "room-lost", "lost turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        release.add_permits(1);
+        // The commit is merged in memory and its final save is in flight.
+        gate.entered.acquire().await.unwrap().forget();
+
+        let flush = {
+            let history = Arc::clone(&history);
+            let state = Arc::clone(&coordinator.state);
+            let transactions = Arc::clone(&transactions);
+            tokio::spawn(async move {
+                history
+                    .flush_once(&state, &transactions, anima_core::primitives::now_millis())
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !flush.is_finished(),
+            "a flush waits until the commit is saved or rolled back"
+        );
+        gate.release.add_permits(1);
+        run.await.unwrap().expect_err("the final save failed");
+        let report = flush.await.unwrap().expect("the flush succeeds");
+
+        let record = coordinator.state.read().await.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(record.status, RunStatus::Failed);
+        let stored = store
+            .get_run(&record.id)
+            .await
+            .unwrap()
+            .expect("the rolled-back run is mirrored");
+        assert_eq!(stored.status, RunStatus::Failed);
+        assert_eq!(report.messages, 0);
+        assert!(
+            store
+                .page_messages(&MessagePageQuery {
+                    agent_id: agent_id.clone(),
+                    session_id: "room-lost".into(),
+                    before: None,
+                    limit: 10,
+                    include_hidden: true,
+                })
+                .await
+                .unwrap()
+                .is_empty(),
+            "no phantom rows for messages the rollback removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flush_during_a_failing_final_save_mirrors_the_rolled_back_run_without_its_messages()
+    {
+        assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_first_flush_during_a_failing_final_save_reconciles_only_saved_messages() {
+        assert_a_flush_during_a_failing_final_save_mirrors_only_saved_state(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_run_saves_its_session_with_the_run_start_and_advances_it_at_commit() {
+        use crate::sessions::{SessionKind, SessionOrigin, TitleSource};
+
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        let path = snapshot_path("session-start");
+        let store = ControlPlaneStoreConfig::Json(path.clone());
+        coordinator
+            .state
+            .write()
+            .await
+            .set_control_plane_store(Some(store.clone()));
+        let running = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "chat:plan", "Plan the offsite\nsoon");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+        let started = saved
+            .sessions
+            .iter()
+            .find(|session| session.id == "chat:plan")
+            .expect("the run-start save carries the new session");
+        assert_eq!(
+            (started.kind, started.origin),
+            (SessionKind::Chat, SessionOrigin::Web)
+        );
+        assert_eq!(started.title, "Plan the offsite");
+        assert_eq!(started.title_source, TitleSource::FirstMessage);
+        assert_eq!(saved.runs[0].session_id, "chat:plan");
+
+        release.add_permits(1);
+        running.await.unwrap().unwrap();
+        let guard = coordinator.state.read().await;
+        let session = guard.sessions.get(&agent_id, "chat:plan").unwrap();
+        let messages = guard.get_agent(&agent_id).unwrap().messages;
+        assert_eq!(
+            session.last_activity_at_ms,
+            messages
+                .iter()
+                .map(|message| message.created_at_ms)
+                .max()
+                .unwrap()
+        );
+        assert_eq!(
+            session.last_read_at_ms,
+            Some(messages[0].created_at_ms),
+            "the owner's own message is read; the reply is not"
+        );
+        drop(guard);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_save_leaves_no_session_record() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+
+        coordinator
+            .run(room_request(&agent_id, "chat:unsaved", "unsaved"))
+            .await
+            .expect_err("the run-start save failed");
+
+        assert!(coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:unsaved")
+            .is_none());
+    }
+
+    /// Pins the `if session_created` guard at `agent_runs.rs`'s run-start
+    /// failure branch: a second run's failed start save in a room that
+    /// already has a session must leave that pre-existing record untouched.
+    #[tokio::test]
+    async fn a_failed_start_save_does_not_remove_a_session_it_did_not_create() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+
+        coordinator
+            .run(room_request(&agent_id, "chat:reused", "first turn"))
+            .await
+            .expect("the first run commits and creates the session");
+        let original = coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:reused")
+            .cloned()
+            .expect("the session exists after the first run");
+
+        let gate = coordinator
+            .state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+        coordinator
+            .run(room_request(&agent_id, "chat:reused", "second turn"))
+            .await
+            .expect_err("the second run's start save failed");
+
+        let after = coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:reused")
+            .cloned()
+            .expect("a session this run did not create must survive its failed start save");
+        assert_eq!(
+            after, original,
+            "a failed start save must not touch a session it found rather than created"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rolled_back_commit_restores_the_session_it_advanced() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(GateModelAdapter {
+                calls: AtomicUsize::new(0),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            4,
+        )
+        .await;
+        let failed = {
+            let coordinator = coordinator.clone();
+            let request = room_request(&agent_id, "chat:lost", "lost turn");
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        fail_the_next_final_save(&coordinator, &entered, &release).await;
+        failed.await.unwrap().expect_err("the final save failed");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&agent_id, "chat:lost")
+            .expect("the session was saved with the run start");
+        assert_eq!(
+            session.last_activity_at_ms, session.created_at_ms,
+            "the rolled-back turn no longer counts as activity"
+        );
+        assert_eq!(session.last_read_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn a_delegated_run_links_its_parent_run_and_session() {
+        use crate::sessions::{SessionKind, SessionOrigin};
+
+        let adapter = Arc::new(TeamModelAdapter {
+            target: StdMutex::new(String::new()),
+            configs: StdMutex::new(vec![]),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let mut manager = test_config("Manager");
+        manager.tools = Some(vec![crate::tools::ToolRegistry::new()
+            .descriptor("send_message")
+            .unwrap()]);
+        manager
+            .settings
+            .as_mut()
+            .unwrap()
+            .additional
+            .insert("workspaceRole".into(), DataValue::String("lead".into()));
+        let manager = state.write().await.create_agent(manager).unwrap().state;
+        let mut worker_config = test_config("Alice");
+        worker_config.tools = manager.config.tools.clone();
+        let worker = state
+            .write()
+            .await
+            .create_agent(worker_config)
+            .unwrap()
+            .state;
+        *adapter.target.lock().unwrap() = worker.id.clone();
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(4)));
+
+        coordinator
+            .run(request(&manager.id, "Ask Alice to draft a plan"))
+            .await
+            .unwrap();
+
+        let guard = state.read().await;
+        let manager_run = guard.runs.for_agent(&manager.id)[0].clone();
+        let worker_run = guard.runs.for_agent(&worker.id)[0].clone();
+        assert_eq!(manager_run.parent_run_id, None);
+        assert_eq!(worker_run.source, RunSource::Delegation);
+        assert_eq!(
+            worker_run.parent_run_id.as_deref(),
+            Some(manager_run.id.as_str())
+        );
+        let helper = guard
+            .sessions
+            .get(&worker.id, &worker_run.session_id)
+            .expect("the delegated room is a session");
+        assert_eq!(
+            (helper.kind, helper.origin),
+            (SessionKind::Helper, SessionOrigin::Delegation)
+        );
+        assert_eq!(
+            helper.parent_run_id.as_deref(),
+            Some(manager_run.id.as_str())
+        );
+        assert_eq!(
+            helper.parent_session_id.as_deref(),
+            Some(manager_run.session_id.as_str())
+        );
+        assert_eq!(helper.parent_agent_id.as_deref(), Some(manager.id.as_str()));
+        assert_eq!(helper.title, "Draft a content plan");
+        assert_eq!(
+            helper.last_read_at_ms, None,
+            "a delegated run is not the owner's own turn"
+        );
+        let chat = guard
+            .sessions
+            .get(&manager.id, &manager_run.session_id)
+            .expect("the manager's generated room is a session too");
+        assert_eq!(chat.kind, SessionKind::Chat);
+    }
+
+    #[tokio::test]
+    async fn spawned_helpers_record_the_companion_run_that_started_them() {
+        use crate::sessions::{SessionKind, SessionOrigin};
+
+        let (coordinator, _) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            4,
+        )
+        .await;
+        let lead = helper_lead(&coordinator).await;
+        let link = crate::runs::RunLink {
+            run_id: "run_companion".into(),
+            session_id: "chat:plan".into(),
+            agent_id: lead.id.clone(),
+        };
+
+        let text = coordinator
+            .spawn_helper(
+                lead.id.clone(),
+                "Scout".into(),
+                "Find three sources".into(),
+                Some(link),
+            )
+            .await
+            .expect("the helper runs");
+
+        let helper_id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["agentId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let guard = coordinator.state.read().await;
+        let run = guard.runs.for_agent(&helper_id)[0].clone();
+        assert_eq!(run.parent_run_id.as_deref(), Some("run_companion"));
+        let session = guard
+            .sessions
+            .get(&helper_id, &run.session_id)
+            .expect("the helper room is a session");
+        assert_eq!(
+            (session.kind, session.origin),
+            (SessionKind::Helper, SessionOrigin::Delegation)
+        );
+        assert_eq!(session.parent_session_id.as_deref(), Some("chat:plan"));
+        assert_eq!(session.parent_agent_id.as_deref(), Some(lead.id.as_str()));
+        assert_eq!(session.title, "Find three sources");
+    }
+
+    #[tokio::test]
+    async fn a_peer_request_is_a_helper_session_of_the_recipient() {
+        use crate::sessions::{SessionKind, SessionOrigin};
+
+        let (coordinator, sender) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            4,
+        )
+        .await;
+        let recipient = coordinator
+            .state
+            .write()
+            .await
+            .create_agent(test_config("Recipient"))
+            .unwrap()
+            .state
+            .id;
+
+        coordinator
+            .send_peer(
+                sender.clone(),
+                recipient.clone(),
+                "Check this".into(),
+                anima_core::AgentCommunicationRoute::start(sender.clone()),
+                None,
+            )
+            .await
+            .expect("the peer request runs");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&recipient, &format!("peer:{sender}:{recipient}"))
+            .expect("the peer room is a session");
+        assert_eq!(
+            (session.kind, session.origin),
+            (SessionKind::Helper, SessionOrigin::Peer)
+        );
+        assert_eq!(session.parent_agent_id.as_deref(), Some(sender.as_str()));
+        assert_eq!(session.parent_run_id, None);
+        assert_eq!(session.title, "Messages from operator");
+        assert_eq!(
+            session.last_read_at_ms, None,
+            "a peer request is not the owner's own turn"
+        );
+    }
+
+    /// The `is_owner_web_turn` branch of `commit_run`'s `owner_authored`
+    /// (`run_commit.rs`): a Telegram owner turn sent from the web console
+    /// runs with `source: telegram`, not `api`/`web`, but its message
+    /// metadata marks it as the owner's own turn (mirrors
+    /// `connectors::runtime::send_from_owner_owned`).
+    #[tokio::test]
+    async fn a_telegram_owner_turn_sent_from_the_web_marks_the_session_read() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+
+        coordinator
+            .run(AgentRunRequest {
+                agent_id: agent_id.clone(),
+                content: Content {
+                    text: "sent from the web console".into(),
+                    metadata: Some(BTreeMap::from([
+                        ("source".into(), DataValue::String("telegramThread".into())),
+                        ("connectorId".into(), DataValue::String("conn-1".into())),
+                    ])),
+                    attachments: None,
+                },
+                room: RunRoom::Stable("telegram:conn-1".into()),
+                idempotency_key: None,
+                source: RunSource::Telegram,
+                source_ref: Some("conn-1".into()),
+                parent: None,
+            })
+            .await
+            .expect("the owner's web-sent telegram turn runs");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&agent_id, "telegram:conn-1")
+            .expect("the telegram room is a session");
+        let messages = guard.get_agent(&agent_id).unwrap().messages;
+        assert_eq!(
+            session.last_read_at_ms,
+            Some(messages[0].created_at_ms),
+            "a telegram-thread turn sent from the web is the owner's own turn even though the run's source is telegram, not api or web"
+        );
+    }
+
+    /// A schedule-triggered run's source is neither `api` nor `web`, and its
+    /// check-in prompt carries no `telegramThread` metadata, so it is not the
+    /// owner's own turn either.
+    #[tokio::test]
+    async fn a_schedule_triggered_run_does_not_mark_its_session_owner_read() {
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+
+        coordinator
+            .run(AgentRunRequest {
+                agent_id: agent_id.clone(),
+                content: Content {
+                    text: "checkin: how is it going?".into(),
+                    ..Content::default()
+                },
+                room: RunRoom::Stable("schedule:sched-1".into()),
+                idempotency_key: None,
+                source: RunSource::Schedule,
+                source_ref: Some("sched-1".into()),
+                parent: None,
+            })
+            .await
+            .expect("the scheduled run commits");
+
+        let guard = coordinator.state.read().await;
+        let session = guard
+            .sessions
+            .get(&agent_id, "schedule:sched-1")
+            .expect("the schedule room is a session");
+        assert_eq!(
+            session.last_read_at_ms, None,
+            "a scheduled check-in is not the owner's own turn"
+        );
+    }
+
+    /// Controller ruling (M2 pre-flight audit): a calendar write's own
+    /// confirmation follow-up (`RunRoom::Generated`, source `api`, `sourceRef
+    /// = calendar-write:<id>`) creates a session titled `system` from the
+    /// write's own summary, and that follow-up is not the owner's own turn,
+    /// so the session stays unread.
+    #[tokio::test]
+    async fn a_calendar_write_followup_gets_a_system_titled_session_that_is_not_owner_read() {
+        use crate::sessions::TitleSource;
+
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let reference = format!("{}evt-1", crate::sessions::CALENDAR_WRITE_SOURCE_REF_PREFIX);
+
+        coordinator
+            .run(AgentRunRequest {
+                agent_id: agent_id.clone(),
+                content: Content {
+                    text: "Calendar change confirmed and applied: Team sync. Continue the conversation accordingly.".into(),
+                    metadata: Some(BTreeMap::from([(
+                        crate::sessions::CALENDAR_SUMMARY_METADATA_KEY.into(),
+                        DataValue::String("Team sync".into()),
+                    )])),
+                    attachments: None,
+                },
+                room: RunRoom::Generated,
+                idempotency_key: Some(reference.clone()),
+                source: RunSource::Api,
+                source_ref: Some(reference),
+                parent: None,
+            })
+            .await
+            .expect("the calendar follow-up runs");
+
+        let guard = coordinator.state.read().await;
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        let session = guard
+            .sessions
+            .get(&agent_id, &run.session_id)
+            .expect("the calendar follow-up room is a session");
+        assert_eq!(session.title, "Calendar · Team sync");
+        assert_eq!(session.title_source, TitleSource::System);
+        assert_eq!(
+            session.last_read_at_ms, None,
+            "a calendar write follow-up is not the owner's own turn"
+        );
+    }
+
+    /// A room id that is not a valid session id (spec §3.1) still runs; the
+    /// ledger record, the session record, and the history outbox all key off
+    /// the same `legacy-room:<hash>` id instead of the raw room.
+    #[tokio::test]
+    async fn an_invalid_room_id_maps_the_ledger_session_and_outbox_to_the_same_legacy_id() {
+        use crate::history::{HistoryService, HistoryStore, MemoryHistoryStore, MessagePageQuery};
+
+        let (coordinator, agent_id) = coordinator_with_agent(
+            Arc::new(CapturingModelAdapter {
+                requests: Arc::new(StdMutex::new(Vec::new())),
+            }),
+            2,
+        )
+        .await;
+        let store = Arc::new(MemoryHistoryStore::new());
+        let history = HistoryService::new(store.clone());
+        coordinator
+            .state
+            .write()
+            .await
+            .set_history(Arc::clone(&history));
+        let transactions = coordinator.control_plane_transactions();
+        let raw_room = "weird room/1";
+        let legacy_id = crate::sessions::session_id_for_room(raw_room);
+        assert_ne!(
+            legacy_id, raw_room,
+            "the raw room id is not a valid session id"
+        );
+
+        coordinator
+            .run(room_request(
+                &agent_id,
+                raw_room,
+                "hello from a legacy room",
+            ))
+            .await
+            .expect("an invalid room id still runs, mapped through its legacy hash");
+
+        let guard = coordinator.state.read().await;
+        let run = guard.runs.for_agent(&agent_id)[0].clone();
+        assert_eq!(
+            run.session_id, legacy_id,
+            "the ledger record uses the legacy session id"
+        );
+        let session = guard
+            .sessions
+            .get(&agent_id, &legacy_id)
+            .expect("the session is keyed by the legacy id");
+        assert_eq!(
+            session.room_id(),
+            raw_room,
+            "the session still remembers the real transcript room"
+        );
+        drop(guard);
+
+        history
+            .flush_once(
+                &coordinator.state,
+                &transactions,
+                anima_core::primitives::now_millis(),
+            )
+            .await
+            .expect("the flush succeeds");
+        let page = store
+            .page_messages(&MessagePageQuery {
+                agent_id: agent_id.clone(),
+                session_id: legacy_id,
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .expect("the store can be queried");
+        assert!(
+            !page.is_empty(),
+            "the outbox queued the turn under the legacy session id"
+        );
+    }
+
+    /// `tools/team.rs::spawn_helper` passes `context.run_link.clone()`
+    /// through to `AgentRunCoordinator::spawn_helper`; this drives it through
+    /// the actual tool call (unlike `spawned_helpers_record_the_companion_run_that_started_them`,
+    /// which calls the coordinator method directly), so the helper session's
+    /// parent fields must match the companion's own run and session, not
+    /// just its `parentAgentId` config fallback.
+    #[tokio::test]
+    async fn spawn_helper_through_the_tool_path_links_the_helper_session_to_the_companion_run() {
+        let adapter = Arc::new(HelperModelAdapter {
+            configs: StdMutex::new(vec![]),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(3)));
+        let lead = helper_lead(&coordinator).await;
+
+        coordinator
+            .run(request(&lead.id, "Ask a helper to check facts"))
+            .await
+            .expect("the companion's run, including its spawn_helper tool call, commits");
+
+        let guard = state.read().await;
+        let lead_run = guard.runs.for_agent(&lead.id)[0].clone();
+        let helper = guard
+            .list_agents()
+            .into_iter()
+            .find(|agent| agent.state.id != lead.id)
+            .expect("a helper was created");
+        let helper_run = guard.runs.for_agent(&helper.state.id)[0].clone();
+        assert_eq!(
+            helper_run.parent_run_id.as_deref(),
+            Some(lead_run.id.as_str()),
+            "the run-link passed through the spawn_helper tool call"
+        );
+        let session = guard
+            .sessions
+            .get(&helper.state.id, &helper_run.session_id)
+            .expect("the helper room is a session");
+        assert_eq!(session.parent_run_id.as_deref(), Some(lead_run.id.as_str()));
+        assert_eq!(
+            session.parent_session_id.as_deref(),
+            Some(lead_run.session_id.as_str())
+        );
+        assert_eq!(session.parent_agent_id.as_deref(), Some(lead.id.as_str()));
+    }
+
+    /// `tools/team.rs::send_message` also passes `context.run_link.clone()`
+    /// through; this existing end-to-end test already drives a `send_message`
+    /// tool call (Alice asking Bob for a review), so the assertion is cheap
+    /// to add here rather than duplicating the whole fixture.
+    #[tokio::test]
+    async fn send_message_through_the_tool_path_links_the_peer_session_to_the_calling_run() {
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            PeerModelAdapter,
+        ))));
+        let alice = state
+            .write()
+            .await
+            .create_agent(test_config("Alice"))
+            .unwrap()
+            .state;
+        state
+            .write()
+            .await
+            .create_agent(test_config("Bob"))
+            .unwrap();
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(4)));
+        let mut direct = request(&alice.id, "Ask Bob for a review");
+        direct.room = RunRoom::Stable(format!("direct:{}", alice.id));
+
+        coordinator
+            .run(direct)
+            .await
+            .expect("alice's run, including its send_message tool call, commits");
+
+        let guard = state.read().await;
+        let alice_run = guard.runs.for_agent(&alice.id)[0].clone();
+        let bob = guard
+            .list_agents()
+            .into_iter()
+            .find(|agent| agent.state.name == "Bob")
+            .expect("bob exists");
+        let bob_run = guard.runs.for_agent(&bob.state.id)[0].clone();
+        assert_eq!(
+            bob_run.parent_run_id.as_deref(),
+            Some(alice_run.id.as_str()),
+            "the run-link passed through the send_message tool call"
+        );
+        let session = guard
+            .sessions
+            .get(&bob.state.id, &bob_run.session_id)
+            .expect("the peer room is a session");
+        assert_eq!(
+            session.parent_run_id.as_deref(),
+            Some(alice_run.id.as_str())
+        );
+        assert_eq!(session.parent_agent_id.as_deref(), Some(alice.id.as_str()));
+    }
+
+    struct CheckinModel;
+
+    #[async_trait]
+    impl ModelAdapter for CheckinModel {
+        fn provider(&self) -> &str {
+            "checkin"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let input = request
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            Ok(model_response(if input.contains("quiet") {
+                "CHECKIN_OK"
+            } else {
+                "Two tasks are overdue"
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silent_checkin_stores_no_task_result_memory_or_reflection() {
+        let (coordinator, agent_id) = coordinator_with_agent(Arc::new(CheckinModel), 4).await;
+        let checkin = |text: &str| AgentRunRequest {
+            content: Content {
+                text: crate::schedules::wrap_checkin_prompt(text),
+                attachments: None,
+                metadata: Some(BTreeMap::from([
+                    ("kind".to_string(), DataValue::String("checkin".into())),
+                    ("id".to_string(), DataValue::String("schedule-1".into())),
+                ])),
+            },
+            source: RunSource::Schedule,
+            ..room_request(&agent_id, "schedule:schedule-1", "unused")
+        };
+        let memory = coordinator.state.read().await.memory_handle();
+
+        coordinator.run(checkin("quiet check")).await.unwrap();
+        assert_eq!(
+            memory.read().await.size(),
+            0,
+            "a silent check-in leaves no memory"
+        );
+
+        coordinator.run(checkin("loud check")).await.unwrap();
+        assert!(
+            memory.read().await.size() >= 1,
+            "a check-in that spoke is remembered as before"
+        );
     }
 }

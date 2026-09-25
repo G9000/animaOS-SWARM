@@ -85,11 +85,77 @@ for (const viewport of [
     const avatars = new Map<string, Buffer>();
     const taskLists = new Map<string, AgentTasks>();
     const schedules = new Map<string, AgentSchedule[]>();
+    const managerChat = {
+      id: 'chat:e2e',
+      agentId: 'manager',
+      roomId: 'chat:e2e',
+      kind: 'chat',
+      origin: 'web',
+      title: 'Companion draft stays here',
+      titleSource: 'first_message',
+      createdAtMs: 10,
+      lastActivityAtMs: 12,
+      lastReadAtMs: null,
+      archived: false,
+      parentSessionId: null,
+      parentRunId: null,
+      parentAgentId: null,
+      summary: null,
+      contextTrimmed: null,
+      messageCount: 0,
+      preview: null,
+      activeRuns: 0,
+      pendingApprovals: 0,
+      unread: false,
+      capabilities: {
+        send: true,
+        steer: true,
+        stop: true,
+        rename: true,
+        archive: true,
+        delete: true,
+        compact: true,
+        export: true,
+      },
+    };
+    let managerChatCreated = false;
     await page.route('**/api/**', async (route) => {
       const request = route.request();
       const path = new URL(request.url()).pathname.replace(/^\/api/, '');
       if (path === '/health') return json(route, { status: 'ok' });
       if (path === '/agents') return json(route, { agents });
+      if (path === '/agents/manager/sessions') {
+        if (request.method() === 'POST') {
+          managerChatCreated = true;
+          return json(route, { session: managerChat });
+        }
+        return json(route, {
+          sessions: managerChatCreated ? [managerChat] : [],
+          nextCursor: null,
+        });
+      }
+      const sessionMessages = path.match(
+        /^\/agents\/manager\/sessions\/([^/]+)\/messages$/,
+      );
+      if (sessionMessages)
+        return json(route, {
+          messages: manager.messages
+            .filter(
+              (message) =>
+                message.roomId === decodeURIComponent(sessionMessages[1]),
+            )
+            .map((message) => ({
+              id: message.id,
+              role: message.role,
+              text: message.content.text,
+              attachments: [],
+              metadata: message.content.metadata ?? {},
+              createdAtMs: message.createdAtMs,
+            })),
+          nextBefore: null,
+        });
+      if (/^\/agents\/manager\/sessions\/[^/]+$/.test(path))
+        return json(route, { session: managerChat });
       const avatarMatch = path.match(/^\/agents\/([^/]+)\/avatar$/);
       if (avatarMatch) {
         if (request.method() === 'PUT') {
@@ -261,8 +327,8 @@ for (const viewport of [
       page.getByText('I compared the sources for Anima.', { exact: true }),
     ).toHaveCount(0);
     await composer.fill('Companion draft stays here');
-    await page.getByRole('button', { name: 'Activity', exact: true }).click();
-    await page.getByRole('button', { name: 'Chat', exact: true }).click();
+    await page.getByRole('button', { name: 'Work', exact: true }).click();
+    await page.getByRole('button', { name: 'Open companion chat' }).click();
     await expect(composer).toHaveValue('Companion draft stays here');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
     await expect(
@@ -272,7 +338,7 @@ for (const viewport of [
       {
         agentId: 'manager',
         text: 'Companion draft stays here',
-        roomId: 'direct:manager',
+        roomId: 'chat:e2e',
       },
     ]);
 

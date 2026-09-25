@@ -495,6 +495,11 @@ fn manager_error(error: ConnectorManagerError) -> AxumResponse {
         ConnectorManagerError::AgentNotFound | ConnectorManagerError::ConnectorNotFound => {
             not_found_error()
         }
+        ConnectorManagerError::AgentBusy => error_response(
+            StatusCode::CONFLICT,
+            "agent_busy",
+            "agent has a run in progress",
+        ),
         ConnectorManagerError::AgentAlreadyConnected => error_response(
             StatusCode::CONFLICT,
             "connector_already_exists",
@@ -615,6 +620,11 @@ mod tests {
                 ConnectorManagerError::AgentNotFound,
                 StatusCode::NOT_FOUND,
                 "connector_not_found",
+            ),
+            (
+                ConnectorManagerError::AgentBusy,
+                StatusCode::CONFLICT,
+                "agent_busy",
             ),
             (
                 ConnectorManagerError::ConnectorNotFound,

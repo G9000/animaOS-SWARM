@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   daemon,
   toAgentDetail,
+  toChatMessage,
   PROFILE_GENERATION_UNAVAILABLE,
   workspaceAvatarUrl,
   type DaemonSnapshot,
@@ -375,17 +376,15 @@ describe('daemon workspace requests', () => {
 
   it('bootstrapWorkspace POSTs workspace and agent payloads', async () => {
     const created = snapshot();
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            workspace: workspaceState.workspace,
-            agent: created,
-          }),
-          { status: 201, headers: { 'content-type': 'application/json' } },
-        ),
-      );
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          workspace: workspaceState.workspace,
+          agent: created,
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      ),
+    );
     vi.stubGlobal('fetch', fetchMock);
 
     const input = {
@@ -636,5 +635,88 @@ describe('daemon integration requests', () => {
         }),
       }),
     );
+  });
+});
+
+describe('daemon session requests', () => {
+  it('reads and changes sessions through the SDK routes', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.endsWith('/export'))
+          return new Response('# Plans\n', {
+            status: 200,
+            headers: { 'content-type': 'text/markdown' },
+          });
+        const body = url.includes('/messages')
+          ? { messages: [], nextBefore: null }
+          : {
+              sessions: [],
+              nextCursor: null,
+              session: { id: 'chat:1' },
+              deleted: true,
+            };
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await daemon.listSessions('agent 1', {
+      includeHelpers: true,
+      archived: false,
+      limit: 200,
+    });
+    await daemon.createSession('agent 1');
+    await daemon.updateSession('agent 1', 'chat:1', { lastReadAtMs: 4 });
+    await daemon.sessionMessages('agent 1', 'chat:1', {
+      before: 'm1',
+      limit: 50,
+    });
+    await daemon.deleteSession('agent 1', 'chat:1');
+    expect(await daemon.exportSession('agent 1', 'chat:1')).toBe('# Plans\n');
+
+    expect(
+      fetchMock.mock.calls.map(
+        ([url, init]) => `${init?.method ?? 'GET'} ${String(url)}`,
+      ),
+    ).toEqual([
+      'GET /api/agents/agent%201/sessions?archived=false&limit=200&includeHelpers=true',
+      'POST /api/agents/agent%201/sessions',
+      'PATCH /api/agents/agent%201/sessions/chat%3A1',
+      'GET /api/agents/agent%201/sessions/chat%3A1/messages?before=m1&limit=50',
+      'DELETE /api/agents/agent%201/sessions/chat%3A1',
+      'GET /api/agents/agent%201/sessions/chat%3A1/export',
+    ]);
+  });
+
+  it('adapts session messages and folds check-in prompts into a system line', () => {
+    expect(
+      toChatMessage({
+        id: 'c1',
+        role: 'user',
+        text: 'Check goals\n\n(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)',
+        attachments: [],
+        metadata: { kind: 'checkin', id: 's1' },
+        createdAtMs: 5,
+      }),
+    ).toEqual({
+      id: 'c1',
+      role: 'System',
+      content: { text: 'Check goals', metadata: { kind: 'checkin', id: 's1' } },
+      created_at_ms: 5,
+    });
+    expect(
+      toChatMessage({
+        id: 't1',
+        role: 'tool',
+        text: '{}',
+        attachments: [],
+        metadata: {},
+        createdAtMs: 6,
+      }).role,
+    ).toBe('Tool');
   });
 });

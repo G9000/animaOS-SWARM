@@ -1,7 +1,10 @@
+mod run_commit;
 mod runtime_events;
+mod session_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
+pub(crate) use self::session_state::RunSessionRequest;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -9,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use anima_core::{
-    AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentStatus,
+    AgentConfig, AgentConfigUpdate, AgentRuntime, AgentRuntimeSnapshot, AgentState, AgentStatus,
     DatabaseAdapter, MessageRole, ModelAdapter, ToolDescriptor,
 };
 use anima_memory::{locomo_query_expander, MemoryManager, QueryExpander, TextAnalyzer};
@@ -19,7 +22,7 @@ use anima_swarm::{SwarmConfig, SwarmCoordinator, SwarmState};
 #[cfg(test)]
 use tokio::sync::Semaphore;
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::components::{default_evaluators, default_providers};
 use crate::connectors::gcalendar::{
@@ -40,7 +43,7 @@ use crate::model::DeterministicModelAdapter;
 use crate::schedules::{ScheduleTarget, ScheduledPromptRecord};
 use crate::tools::{
     background_process_count, new_shared_process_manager_with_limit, SharedProcessManager,
-    ToolExecutionContext, ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    ToolRegistry, DEFAULT_MAX_BACKGROUND_PROCESSES,
 };
 
 use self::swarm_relationships::{persist_swarm_message_relationship, swarm_agent_names};
@@ -959,10 +962,8 @@ mod tests {
         room_id: &str,
         message_id: &str,
     ) {
-        state.agents.remove(agent_id);
-        let snapshot = state
-            .agent_snapshots
-            .get_mut(agent_id)
+        let mut snapshot = state
+            .get_agent(agent_id)
             .expect("fixture agent snapshot should exist");
         snapshot.messages.push(Message {
             id: message_id.into(),
@@ -976,6 +977,9 @@ mod tests {
             created_at_ms: 13,
         });
         snapshot.message_count = snapshot.messages.len();
+        state
+            .restore_agent_snapshot(snapshot)
+            .expect("fixture agent snapshot should restore");
     }
 
     fn assistant_message_for_outbound(snapshot: &mut ControlPlaneSnapshot) -> &mut Message {
@@ -1065,6 +1069,7 @@ mod tests {
             delivered_at_ms: None,
             attempts: 1,
             delivery_state: OutboundDeliveryState::Pending,
+            message_pruned: false,
         }
     }
 
@@ -1126,6 +1131,215 @@ mod tests {
             settings: Some(AgentSettings::default()),
         }
     }
+
+    #[test]
+    fn run_ledger_is_saved_in_the_snapshot_and_restart_interrupts_unfinished_runs() {
+        use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
+
+        let now = anima_core::primitives::now_millis();
+        let start = |agent_id: &str, session_id: &str| RunStart {
+            agent_id: agent_id.into(),
+            session_id: session_id.into(),
+            source: RunSource::Telegram,
+            source_ref: Some("telegram-a:42".into()),
+            idempotency_key: Some("telegram-a:update:42".into()),
+            text: "hello".into(),
+            model: "deterministic".into(),
+            provider: None,
+            parent_run_id: None,
+        };
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("ledger-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let running = RunRecord::running(start(&agent_id, "telegram:telegram-a"), now);
+        let mut completed = RunRecord::running(start(&agent_id, "direct:ledger"), now);
+        completed.finish(RunStatus::Completed, None, now);
+        let mut queued = RunRecord::running(start(&agent_id, "chat:queued"), now);
+        queued.status = RunStatus::Queued;
+        queued.started_at_ms = None;
+        let orphan = RunRecord::running(start("agent-deleted", "direct:gone"), now);
+        for record in [running.clone(), completed.clone(), queued.clone(), orphan] {
+            source.runs.insert(record);
+        }
+
+        let snapshot = source.control_plane_snapshot();
+        assert_eq!(snapshot.version, 5);
+        assert_eq!(
+            snapshot.runs.len(),
+            3,
+            "runs of deleted agents are not saved"
+        );
+        assert!(snapshot.runs.iter().all(|run| run.agent_id == agent_id));
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("snapshot with a run ledger should restore");
+
+        let interrupted = restored.runs.get(&running.id).unwrap();
+        assert_eq!(interrupted.status, RunStatus::Interrupted);
+        assert_eq!(
+            interrupted.error.as_ref().map(|error| error.code.as_str()),
+            Some("restart_during_run")
+        );
+        let never_started = restored.runs.get(&queued.id).unwrap();
+        assert_eq!(never_started.status, RunStatus::Interrupted);
+        assert_eq!(
+            never_started
+                .error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("restart_before_start")
+        );
+        assert_eq!(restored.runs.get(&completed.id), Some(&completed));
+        assert_eq!(restored.in_flight_runs(&agent_id), 0);
+    }
+
+    #[test]
+    fn session_records_are_saved_for_live_agents_and_restored() {
+        use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("session-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let chat = SessionRecord::new(
+            &agent_id,
+            "chat:one",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Plans".into(),
+            TitleSource::Owner,
+            10,
+        );
+        let orphan = SessionRecord::new(
+            "agent-deleted",
+            "chat:two",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Gone".into(),
+            TitleSource::Owner,
+            11,
+        );
+        source.sessions.insert(chat.clone());
+        source.sessions.insert(orphan);
+
+        let snapshot = source.control_plane_snapshot();
+        assert_eq!(
+            snapshot.sessions,
+            vec![chat.clone()],
+            "sessions of deleted agents are not saved"
+        );
+        let snapshot: ControlPlaneSnapshot =
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(snapshot)
+            .expect("sessions should restore");
+        assert_eq!(restored.sessions.get(&agent_id, "chat:one"), Some(&chat));
+        assert_eq!(restored.sessions.len(), 1);
+    }
+
+    #[test]
+    fn restore_rejects_an_invalid_session_record_without_mutation() {
+        use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+
+        let mut source = DaemonState::new();
+        let agent_id = source
+            .create_agent(test_config("session-owner"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let mut snapshot = source.control_plane_snapshot();
+        let mut record = SessionRecord::new(
+            &agent_id,
+            "chat:one",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Plans".into(),
+            TitleSource::Owner,
+            10,
+        );
+        record.id = "bad id".into();
+        snapshot.sessions.push(record);
+
+        let mut state = DaemonState::new();
+        assert!(state.restore_control_plane_snapshot(snapshot).is_err());
+        assert_eq!(state.agent_count(), 0, "invalid restores cannot add agents");
+        assert_eq!(state.sessions.len(), 0);
+    }
+
+    #[test]
+    fn a_pruned_assistant_message_is_accepted_only_for_delivered_records() {
+        let (snapshot, _) = valid_connector_snapshot();
+
+        let mut delivered = snapshot.clone();
+        delivered.outbound[0].delivery_state = OutboundDeliveryState::Delivered;
+        delivered.outbound[0].delivered_at_ms = Some(14);
+        delivered.outbound[0].assistant_message_id = "pruned-message".into();
+        delivered.outbound[0].message_pruned = true;
+        DaemonState::new()
+            .restore_control_plane_snapshot(delivered)
+            .expect("a delivered record may outlive its pruned message");
+
+        for delivery_state in [
+            OutboundDeliveryState::Pending,
+            OutboundDeliveryState::Failed,
+        ] {
+            let mut undelivered = snapshot.clone();
+            undelivered.outbound[0].delivery_state = delivery_state;
+            undelivered.outbound[0].message_pruned = true;
+            assert_eq!(
+                DaemonState::new()
+                    .restore_control_plane_snapshot(undelivered)
+                    .unwrap_err(),
+                "outbound delivery 'outbound-1' is marked messagePruned but was not delivered"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_history_deletions_are_saved_and_restored() {
+        use crate::history::HistoryDeletion;
+
+        let mut source = DaemonState::new();
+        source.record_history_deletion(HistoryDeletion::session("agent-1", "chat:one"));
+        source.record_history_deletion(HistoryDeletion::agent("agent-gone"));
+
+        let payload = serde_json::to_value(source.control_plane_snapshot()).unwrap();
+        assert_eq!(
+            payload["pendingHistoryDeletions"],
+            serde_json::json!([
+                {"agentId": "agent-1", "sessionId": "chat:one"},
+                {"agentId": "agent-gone"}
+            ]),
+            "kept even for agents that no longer exist"
+        );
+        let mut restored = DaemonState::new();
+        restored
+            .restore_control_plane_snapshot(serde_json::from_value(payload).unwrap())
+            .expect("pending deletions restore");
+        assert_eq!(
+            restored.pending_history_deletions,
+            [
+                HistoryDeletion::session("agent-1", "chat:one"),
+                HistoryDeletion::agent("agent-gone")
+            ]
+        );
+        assert!(restored.clear_history_deletion(&HistoryDeletion::agent("agent-gone")));
+        assert!(
+            !restored.clear_history_deletion(&HistoryDeletion::agent("agent-gone")),
+            "each recorded deletion clears once"
+        );
+    }
 }
 
 const MEMORY_QUERY_EXPANDER_ENV: &str = "ANIMAOS_RS_MEMORY_QUERY_EXPANDER";
@@ -1184,8 +1398,6 @@ pub(crate) struct DaemonState {
     control_plane_revision: u64,
     control_plane_persist_order: Arc<ControlPlanePersistOrder>,
     pub(crate) agents: HashMap<String, AgentRuntime>,
-    pub(crate) agent_snapshots: HashMap<String, AgentRuntimeSnapshot>,
-    deleted_agent_ids: HashSet<String>,
     pub(crate) swarms: HashMap<String, SwarmCoordinator>,
     pub(crate) swarm_configs: HashMap<String, SwarmConfig>,
     pub(crate) swarm_events: HashMap<String, EventFanout>,
@@ -1198,6 +1410,14 @@ pub(crate) struct DaemonState {
     pub(crate) schedules: HashMap<String, ScheduledPromptRecord>,
     pub(crate) jobs: HashMap<String, crate::jobs::AgentJobRecord>,
     pub(crate) goals: HashMap<String, crate::jobs::GoalRecord>,
+    pub(crate) runs: crate::runs::RunLedger,
+    pub(crate) sessions: crate::sessions::SessionRegistry,
+    pub(crate) history: crate::history::SharedHistory,
+    /// Session creations per agent per minute (spec §14); not persisted.
+    pub(crate) session_limiter: crate::sessions::SessionCreateLimiter,
+    pub(crate) tool_grants_applied: std::collections::BTreeSet<String>,
+    /// Saved history deletions the store has not applied yet (spec §3.3).
+    pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
     pub(crate) calendar_connectors: HashMap<String, GoogleCalendarConnectorRecord>,
     pub(crate) calendar_writes: HashMap<String, CalendarPendingWriteRecord>,
     calendar_manager: Option<CalendarManager>,
@@ -1333,8 +1553,6 @@ impl DaemonState {
                 test_save_gate: StdMutex::new(None),
             }),
             agents: HashMap::new(),
-            agent_snapshots: HashMap::new(),
-            deleted_agent_ids: HashSet::new(),
             swarms: HashMap::new(),
             swarm_configs: HashMap::new(),
             swarm_events: HashMap::new(),
@@ -1347,6 +1565,12 @@ impl DaemonState {
             schedules: HashMap::new(),
             jobs: HashMap::new(),
             goals: HashMap::new(),
+            runs: crate::runs::RunLedger::default(),
+            sessions: crate::sessions::SessionRegistry::default(),
+            history: crate::history::HistoryService::ephemeral(),
+            session_limiter: crate::sessions::SessionCreateLimiter::default(),
+            tool_grants_applied: std::collections::BTreeSet::new(),
+            pending_history_deletions: Vec::new(),
             calendar_connectors: HashMap::new(),
             calendar_writes: HashMap::new(),
             calendar_manager: None,
@@ -1385,6 +1609,37 @@ impl DaemonState {
 
     pub(crate) fn set_memory_store(&mut self, memory_store: Option<MemoryStoreConfig>) {
         self.memory_store = memory_store;
+    }
+
+    /// Installs a history service; it first replays the saved deletions the
+    /// store may not have applied (the restart rule).
+    pub(crate) fn set_history(&mut self, history: crate::history::SharedHistory) {
+        history.replay_deletions(&self.pending_history_deletions);
+        self.history = history;
+    }
+
+    /// Records a history deletion for the next control-plane save: call it in
+    /// the same save as the session or agent removal, clear it again if that
+    /// save fails, and queue it on `history` once the save succeeded.
+    pub(crate) fn record_history_deletion(&mut self, deletion: crate::history::HistoryDeletion) {
+        self.pending_history_deletions.push(deletion);
+    }
+
+    /// Drops one saved entry for `deletion`, once the store applied it or when
+    /// the deletion's own save failed. False when none was saved.
+    pub(crate) fn clear_history_deletion(
+        &mut self,
+        deletion: &crate::history::HistoryDeletion,
+    ) -> bool {
+        let Some(index) = self
+            .pending_history_deletions
+            .iter()
+            .position(|pending| pending == deletion)
+        else {
+            return false;
+        };
+        self.pending_history_deletions.remove(index);
+        true
     }
 
     pub(crate) fn set_control_plane_store(
@@ -1427,6 +1682,13 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(gate.clone());
         gate
+    }
+
+    /// Lets a test make the next persist request overflow the revision counter,
+    /// which panics at a precise point in a caller's critical section.
+    #[cfg(test)]
+    pub(crate) fn set_control_plane_revision_for_test(&mut self, revision: u64) {
+        self.control_plane_revision = revision;
     }
 
     pub(crate) fn control_plane_snapshot(&self) -> ControlPlaneSnapshot {
@@ -1492,14 +1754,34 @@ impl DaemonState {
         snapshot.jobs.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.goals = self.goals.values().cloned().collect();
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
+        snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
+        snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
+        snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();
+        snapshot.pending_history_deletions = self.pending_history_deletions.clone();
         snapshot
     }
 
     pub(crate) fn restore_control_plane_snapshot(
         &mut self,
-        snapshot: ControlPlaneSnapshot,
+        mut snapshot: ControlPlaneSnapshot,
     ) -> Result<(usize, usize), String> {
         self.validate_control_plane_snapshot(&snapshot)?;
+        // Spec §13.3 step 2: legacy per-tick check-in rooms become their
+        // automation's session. Only a snapshot older than this store version
+        // can still hold a pre-M2 room-* check-in; relabeling a room a live
+        // run created this boot would strand its already-mirrored history
+        // under the old id, so a current snapshot is left alone.
+        let (relabelled_messages, relabelled_runs) =
+            if snapshot.version < crate::control_plane_store::CONTROL_PLANE_STORE_VERSION {
+                crate::sessions::migration::relabel_legacy_checkin_rooms(
+                    &mut snapshot.agents,
+                    &mut snapshot.runs,
+                )
+            } else {
+                (0, 0)
+            };
+        // Ledger session ids follow the room mapping; always idempotent.
+        let mapped_runs = crate::sessions::migration::map_ledger_session_ids(&mut snapshot.runs);
         self.workspace = snapshot.workspace.clone();
         let mut restored_agents = 0;
         let mut restored_swarms = 0;
@@ -1541,7 +1823,11 @@ impl DaemonState {
             .into_iter()
             .map(|schedule| (schedule.id.clone(), schedule))
             .collect();
-        self.goals = snapshot.goals.into_iter().map(|goal| (goal.id.clone(), goal)).collect();
+        self.goals = snapshot
+            .goals
+            .into_iter()
+            .map(|goal| (goal.id.clone(), goal))
+            .collect();
         self.jobs = snapshot
             .jobs
             .into_iter()
@@ -1586,6 +1872,36 @@ impl DaemonState {
             .map(|write| (write.id.clone(), write))
             .collect();
 
+        self.sessions =
+            crate::sessions::SessionRegistry::restored(snapshot.sessions, &self.live_agent_ids());
+        let derived_sessions = self.derive_legacy_sessions();
+        let derived_session_count = derived_sessions.len();
+        for record in derived_sessions {
+            self.sessions.insert(record);
+        }
+        self.tool_grants_applied = snapshot.tool_grants_applied.into_iter().collect();
+        self.pending_history_deletions = snapshot.pending_history_deletions;
+        self.runs = crate::runs::RunLedger::restored(
+            snapshot.runs,
+            &self.live_agent_ids(),
+            anima_core::primitives::now_millis(),
+        );
+
+        if relabelled_messages > 0 || relabelled_runs > 0 || mapped_runs > 0 {
+            info!(
+                relabelled_messages,
+                relabelled_runs,
+                mapped_runs,
+                "upgraded legacy check-in rooms and ledger session ids"
+            );
+        }
+        if derived_session_count > 0 {
+            info!(
+                derived_session_count,
+                "derived sessions for legacy rooms without one"
+            );
+        }
+
         Ok((restored_agents, restored_swarms))
     }
 
@@ -1601,12 +1917,7 @@ impl DaemonState {
         for agent in &snapshot.agents {
             persisted_agents.insert(agent.state.id.clone(), agent.clone());
         }
-        let mut agent_ids = self
-            .agent_snapshots
-            .keys()
-            .chain(self.agents.keys())
-            .cloned()
-            .collect::<HashSet<_>>();
+        let mut agent_ids = self.agents.keys().cloned().collect::<HashSet<_>>();
         let mut snapshot_agent_ids = HashSet::new();
         for agent in &snapshot.agents {
             let agent_id = &agent.state.id;
@@ -1645,6 +1956,8 @@ impl DaemonState {
                 return Err("duplicate job identity or request key in snapshot".into());
             }
         }
+        crate::runs::RunLedger::validate(&snapshot.runs)?;
+        crate::sessions::SessionRegistry::validate(&snapshot.sessions)?;
         let mut swarm_ids = HashSet::new();
         for swarm in &snapshot.swarms {
             let swarm_id = &swarm.state.id;
@@ -1812,6 +2125,12 @@ impl DaemonState {
                     record.id
                 ));
             }
+            if record.message_pruned && record.delivery_state != OutboundDeliveryState::Delivered {
+                return Err(format!(
+                    "outbound delivery '{}' is marked messagePruned but was not delivered",
+                    record.id
+                ));
+            }
             if let Some(agent) = persisted_agents.get(&record.agent_id) {
                 let assistant_message_exists = agent.messages.iter().any(|message| {
                     message.id == record.assistant_message_id
@@ -1819,7 +2138,7 @@ impl DaemonState {
                         && message.room_id == connector.room_id
                         && message.role == MessageRole::Assistant
                 });
-                if !assistant_message_exists {
+                if !assistant_message_exists && !record.message_pruned {
                     return Err(format!(
                         "outbound delivery '{}' references a missing, non-assistant, or wrong-room assistant message '{}'",
                         record.id, record.assistant_message_id
@@ -2029,13 +2348,22 @@ impl DaemonState {
     }
 
     pub(crate) fn agent_count(&self) -> usize {
-        let mut count = self.agent_snapshots.len();
-        for agent_id in self.agents.keys() {
-            if !self.agent_snapshots.contains_key(agent_id) {
-                count += 1;
-            }
-        }
-        count
+        self.agents.len()
+    }
+
+    /// Runs of this agent that are running or awaiting approval (spec §4.4 item 5).
+    pub(crate) fn in_flight_runs(&self, agent_id: &str) -> usize {
+        self.runs.in_flight_count(agent_id)
+    }
+
+    /// Terminal runs the snapshot holds that the history store does not yet,
+    /// oldest finished first; runs of deleted agents are left out.
+    pub(crate) fn unmirrored_terminal_runs(&self, limit: usize) -> Vec<crate::runs::RunRecord> {
+        self.runs.unmirrored_terminal(&self.live_agent_ids(), limit)
+    }
+
+    fn live_agent_ids(&self) -> HashSet<String> {
+        self.agents.keys().cloned().collect()
     }
 
     pub(crate) fn swarm_count(&self) -> usize {
@@ -2258,83 +2586,40 @@ impl DaemonState {
         runtime.init();
         let agent_id = runtime.id().to_string();
         let snapshot = runtime.snapshot();
-        self.agent_snapshots
-            .insert(agent_id.clone(), snapshot.clone());
         self.agents.insert(agent_id, runtime);
         Ok(snapshot)
     }
 
     pub(crate) fn restore_agent_config(&mut self, agent_id: &str, config: AgentConfig) {
         if let Some(runtime) = self.agents.get_mut(agent_id) {
-            runtime.replace_config(config.clone());
-        }
-        if let Some(snapshot) = self.agent_snapshots.get_mut(agent_id) {
-            snapshot.state.name = config.name.clone();
-            snapshot.state.config = config;
+            runtime.replace_config(config);
         }
     }
 
     /// Apply a fully validated partial config update to an existing agent and
-    /// refresh its snapshot.
+    /// refresh its snapshot. Runs in flight keep the config they started with;
+    /// the patch applies to later runs.
     pub(crate) fn update_agent(
         &mut self,
         agent_id: &str,
         mut patch: AgentConfigUpdate,
     ) -> Result<AgentRuntimeSnapshot, UpdateAgentError> {
-        if !self.agents.contains_key(agent_id) && !self.agent_snapshots.contains_key(agent_id) {
+        if !self.agents.contains_key(agent_id) {
             return Err(UpdateAgentError::NotFound);
         }
         patch.tools = self
             .resolve_agent_tools(patch.tools)
             .map_err(UpdateAgentError::InvalidTools)?;
-
-        if let Some(runtime) = self.agents.get_mut(agent_id) {
-            runtime.update_config(patch);
-            let snapshot = runtime.snapshot();
-            self.agent_snapshots
-                .insert(agent_id.to_string(), snapshot.clone());
-            return Ok(snapshot);
-        }
-
-        // The runtime can be checked out for an in-flight run; fall back to
-        // patching the snapshot so the change still persists. The run itself
-        // keeps the config it started with.
-        let snapshot = self
-            .agent_snapshots
+        let runtime = self
+            .agents
             .get_mut(agent_id)
             .expect("agent existence was checked before validation");
-        if let Some(name) = patch.name {
-            snapshot.state.name = name.clone();
-            snapshot.state.config.name = name;
-        }
-        if let Some(model) = patch.model {
-            snapshot.state.config.model = model;
-        }
-        if let Some(provider) = patch.provider {
-            snapshot.state.config.provider = if provider.is_empty() {
-                None
-            } else {
-                Some(provider)
-            };
-        }
-        if let Some(system) = patch.system {
-            snapshot.state.config.system = if system.is_empty() {
-                None
-            } else {
-                Some(system)
-            };
-        }
-        if let Some(tools) = patch.tools {
-            snapshot.state.config.tools = Some(tools);
-        }
-        Ok(snapshot.clone())
+        runtime.update_config(patch);
+        let snapshot = runtime.snapshot();
+        Ok(self.with_derived_status(snapshot))
     }
 
-    fn restore_agent_snapshot(&mut self, mut snapshot: AgentRuntimeSnapshot) -> Result<(), String> {
-        snapshot.state.config.tools =
-            self.resolve_restored_agent_tools(snapshot.state.config.tools)?;
-        let agent_id = snapshot.state.id.clone();
-        let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
+    fn wire_runtime(&self, runtime: &mut AgentRuntime) {
         runtime.set_providers(default_providers(Arc::clone(&self.memory)));
         runtime.set_evaluators(default_evaluators(
             Arc::clone(&self.memory),
@@ -2344,24 +2629,30 @@ impl DaemonState {
         if let Some(db) = &self.db {
             runtime.set_database(Arc::clone(db));
         }
+    }
+
+    fn restore_agent_snapshot(&mut self, mut snapshot: AgentRuntimeSnapshot) -> Result<(), String> {
+        snapshot.state.config.tools =
+            self.resolve_restored_agent_tools(snapshot.state.config.tools)?;
+        let agent_id = snapshot.state.id.clone();
+        let mut runtime = AgentRuntime::from_snapshot(snapshot, Arc::clone(&self.model_adapter));
+        self.wire_runtime(&mut runtime);
         if runtime.state().status == AgentStatus::Running {
             runtime.mark_failed("daemon restarted before task completed", 0);
         }
-
-        let restored_snapshot = runtime.snapshot();
-        self.agent_snapshots
-            .insert(agent_id.clone(), restored_snapshot);
         self.agents.insert(agent_id, runtime);
         Ok(())
     }
 
+    /// Every agent's snapshot, read from its canonical runtime (Controller
+    /// ruling 2, M2 pre-flight audit: no second copy of any transcript is
+    /// kept, so pruning and session deletion free what they remove).
     pub(crate) fn list_agents(&self) -> Vec<AgentRuntimeSnapshot> {
-        let mut snapshots = self.agent_snapshots.clone();
-        for (agent_id, runtime) in &self.agents {
-            snapshots.insert(agent_id.clone(), runtime.snapshot());
-        }
-
-        let mut snapshots: Vec<_> = snapshots.into_values().collect();
+        let mut snapshots: Vec<_> = self
+            .agents
+            .values()
+            .map(|runtime| self.with_derived_status(runtime.snapshot()))
+            .collect();
         snapshots.sort_by(|left, right| {
             left.state
                 .created_at_ms
@@ -2371,19 +2662,32 @@ impl DaemonState {
         snapshots
     }
 
+    /// Every agent's state, ordered like `list_agents`, without cloning any
+    /// transcript or events: the team roster and peer lookups read this on
+    /// every run.
+    pub(crate) fn agent_states(&self) -> Vec<AgentState> {
+        let mut states: Vec<_> = self
+            .agents
+            .values()
+            .map(|runtime| self.with_derived_state(runtime.state()))
+            .collect();
+        states.sort_by(|left, right| {
+            left.created_at_ms
+                .cmp(&right.created_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        states
+    }
+
     pub(crate) fn get_agent(&self, agent_id: &str) -> Option<AgentRuntimeSnapshot> {
         self.agents
             .get(agent_id)
-            .map(AgentRuntime::snapshot)
-            .or_else(|| self.agent_snapshots.get(agent_id).cloned())
+            .map(|runtime| self.with_derived_status(runtime.snapshot()))
     }
 
     pub(crate) fn remove_agent(&mut self, agent_id: &str) {
-        let had_snapshot = self.agent_snapshots.remove(agent_id).is_some();
         if let Some(mut runtime) = self.agents.remove(agent_id) {
             runtime.stop();
-        } else if had_snapshot {
-            self.deleted_agent_ids.insert(agent_id.to_string());
         }
     }
 
@@ -2391,7 +2695,6 @@ impl DaemonState {
         &mut self,
         snapshot: AgentRuntimeSnapshot,
     ) -> Result<(), String> {
-        self.deleted_agent_ids.remove(&snapshot.state.id);
         self.restore_agent_snapshot(snapshot)
     }
 
@@ -2399,93 +2702,6 @@ impl DaemonState {
         self.agents
             .get(agent_id)
             .map(|runtime| runtime.id().to_string())
-            .or_else(|| {
-                self.agent_snapshots
-                    .get(agent_id)
-                    .map(|snapshot| snapshot.state.id.clone())
-            })
-    }
-
-    pub(crate) fn take_agent_runtime(
-        &mut self,
-        agent_id: &str,
-    ) -> Option<(AgentRuntime, ToolExecutionContext)> {
-        let runtime = self.agents.remove(agent_id)?;
-        let mut snapshot = runtime.snapshot();
-        snapshot.state.status = AgentStatus::Running;
-        self.agent_snapshots.insert(agent_id.to_string(), snapshot);
-        let tool_context = ToolExecutionContext::new(
-            Arc::clone(&self.memory),
-            Arc::clone(&self.memory_embeddings),
-            self.memory_store.clone(),
-            self.tool_registry.clone(),
-            Arc::clone(&self.process_manager),
-            self.workspace.as_ref().map(|w| w.root_path.clone()),
-            self.calendar_manager.clone(),
-        )
-        .with_mail(self.mail_manager.clone());
-        Some((runtime, tool_context))
-    }
-
-    pub(crate) fn restore_agent_runtime(
-        &mut self,
-        mut runtime: AgentRuntime,
-    ) -> (
-        AgentRuntimeSnapshot,
-        String,
-        String,
-        SharedMemoryStore,
-        SharedMemoryEmbeddings,
-        Option<MemoryStoreConfig>,
-    ) {
-        let agent_id = runtime.id().to_string();
-        let was_deleted = self.deleted_agent_ids.remove(&agent_id);
-        if let Some(latest_config) = self
-            .agent_snapshots
-            .get(runtime.id())
-            .map(|snapshot| snapshot.state.config.clone())
-        {
-            runtime.update_config(AgentConfigUpdate {
-                name: Some(latest_config.name),
-                model: Some(latest_config.model),
-                provider: Some(latest_config.provider.unwrap_or_default()),
-                system: Some(latest_config.system.unwrap_or_default()),
-                tools: latest_config.tools,
-            });
-        }
-        let snapshot = runtime.snapshot();
-        let agent_name = runtime.state().name;
-        if !was_deleted {
-            self.agent_snapshots
-                .insert(agent_id.clone(), snapshot.clone());
-            self.agents.insert(agent_id.clone(), runtime);
-        }
-
-        (
-            snapshot,
-            agent_id,
-            agent_name,
-            Arc::clone(&self.memory),
-            Arc::clone(&self.memory_embeddings),
-            self.memory_store.clone(),
-        )
-    }
-
-    /// Restores a pre-run transcript after an undurable final snapshot while
-    /// retaining configuration changes accepted during the in-flight run.
-    /// A concurrently deleted agent is never resurrected.
-    pub(crate) fn rollback_agent_runtime(
-        &mut self,
-        mut previous: AgentRuntimeSnapshot,
-    ) -> Result<bool, String> {
-        let agent_id = previous.state.id.clone();
-        let Some(latest) = self.get_agent(&agent_id) else {
-            return Ok(false);
-        };
-        previous.state.name = latest.state.name;
-        previous.state.config = latest.state.config;
-        self.restore_agent_snapshot(previous)?;
-        Ok(true)
     }
 
     fn validate_swarm_tools(&self, config: &SwarmConfig) -> Result<(), String> {

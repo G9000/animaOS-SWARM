@@ -242,6 +242,12 @@ fn completed_response(response: &Value) -> Result<ModelGenerateResponse, String>
             total_tokens: usage["total_tokens"]
                 .as_u64()
                 .unwrap_or(prompt_tokens.saturating_add(completion_tokens)),
+            cached_prompt_tokens: usage["input_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+            reasoning_tokens: usage["output_tokens_details"]["reasoning_tokens"]
+                .as_u64()
+                .unwrap_or(0),
         },
     })
 }

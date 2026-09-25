@@ -111,13 +111,13 @@ pub mod in_memory {
                 .lock()
                 .map_err(|e| PersistenceError::Write(format!("Mutex poisoned: {}", e)))?;
 
-            // Upsert by logical idempotency key first, then step index as a fallback.
+            // Upsert by logical idempotency key, like the Postgres `step_log`
+            // conflict target; concurrent runs can share a step index.
             // preserve input, freeze terminal status+output
-            if let Some(existing) = steps.iter_mut().find(|s| {
-                s.agent_id == step.agent_id
-                    && (s.idempotency_key == step.idempotency_key
-                        || s.step_index == step.step_index)
-            }) {
+            if let Some(existing) = steps
+                .iter_mut()
+                .find(|s| s.agent_id == step.agent_id && s.idempotency_key == step.idempotency_key)
+            {
                 if !matches!(existing.status, StepStatus::Done | StepStatus::Failed) {
                     existing.status = step.status.clone();
                     if step.input.is_some() {
@@ -290,5 +290,25 @@ mod tests {
             "original ordering should be preserved"
         );
         assert_eq!(steps[0].status, StepStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn write_step_keeps_distinct_keys_that_share_a_step_index() {
+        let adapter = InMemoryAdapter::new();
+
+        adapter
+            .write_step(&make_step("agent-4", 0, "run-a-step", StepStatus::Done))
+            .await
+            .expect("first write failed");
+        adapter
+            .write_step(&make_step("agent-4", 0, "run-b-step", StepStatus::Done))
+            .await
+            .expect("second write failed");
+
+        let steps = adapter
+            .list_agent_steps("agent-4")
+            .await
+            .expect("list failed");
+        assert_eq!(steps.len(), 2, "concurrent runs may reuse a step index");
     }
 }

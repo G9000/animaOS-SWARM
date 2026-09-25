@@ -33,7 +33,7 @@ pub(crate) use process::{
 };
 pub(crate) use workspace::{
     canonical_workspace_root, normalized_relative_path, resolve_workspace_write_path,
-    workspace_root_path,
+    workspace_root_path, write_workspace_bytes,
 };
 
 type ToolHandler = fn(
@@ -62,6 +62,8 @@ pub(crate) struct ToolExecutionContext {
     delegated_parent: Option<String>,
     pub(super) peer_route: Option<anima_core::AgentCommunicationRoute>,
     peer_sources: Vec<String>,
+    /// The run executing these tools, so the runs they start can link to it.
+    pub(super) run_link: Option<crate::runs::RunLink>,
     pub(super) memory: SharedMemoryStore,
     pub(super) memory_embeddings: SharedMemoryEmbeddings,
     pub(super) memory_store: Option<MemoryStoreConfig>,
@@ -70,6 +72,9 @@ pub(crate) struct ToolExecutionContext {
     pub(super) workspace_root: Option<PathBuf>,
     pub(super) calendar: Option<CalendarManager>,
     pub(super) mail: Option<MailManager>,
+    /// Task-list revision this run last saw; `todo_write` only replaces the
+    /// list it saw (spec §4.4 item 8). Shared by clones within one run.
+    pub(super) todo_revision: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ToolExecutionContext {
@@ -90,6 +95,7 @@ impl ToolExecutionContext {
             delegated_parent: None,
             peer_route: None,
             peer_sources: vec![],
+            run_link: None,
             memory,
             memory_embeddings,
             memory_store,
@@ -98,6 +104,7 @@ impl ToolExecutionContext {
             workspace_root,
             calendar,
             mail: None,
+            todo_revision: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -128,6 +135,17 @@ impl ToolExecutionContext {
     ) -> Self {
         self.peer_route = Some(route);
         self.peer_sources = sources;
+        self
+    }
+
+    pub(crate) fn with_run_link(mut self, link: Option<crate::runs::RunLink>) -> Self {
+        self.run_link = link;
+        self
+    }
+
+    /// Starts this run's compare-and-swap baseline for `todo_write`.
+    pub(crate) fn with_todo_baseline(mut self, revision: Option<String>) -> Self {
+        self.todo_revision = Arc::new(std::sync::Mutex::new(revision));
         self
     }
 

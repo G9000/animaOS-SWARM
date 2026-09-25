@@ -3,6 +3,7 @@
 @import './cockpit.css';
 @import './operator.css';
 @import './companion.css';
+@import './sessions.css';
 
 @source '../../packages/ui/src/**/*.{ts,tsx}';
 

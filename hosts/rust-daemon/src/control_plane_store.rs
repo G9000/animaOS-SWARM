@@ -15,7 +15,13 @@ use crate::connectors::{
 };
 use crate::schedules::ScheduledPromptRecord;
 
-const CONTROL_PLANE_STORE_VERSION: u32 = 4;
+/// Snapshot format version. Version 5 adds sessions (companion console M2);
+/// older daemons refuse it, so the first start writes a backup (spec §13.3).
+pub(crate) const CONTROL_PLANE_STORE_VERSION: u32 = 5;
+/// JSON snapshots written before the format was versioned.
+const UNVERSIONED_SNAPSHOT_VERSION: u32 = 1;
+/// Suffix of the JSON backup taken before the sessions upgrade (spec §13.3).
+pub(crate) const PRE_SESSIONS_BACKUP_SUFFIX: &str = ".pre-sessions.bak";
 const CONTROL_PLANE_SNAPSHOT_KEY: &str = "control_plane";
 
 #[derive(Clone, Debug)]
@@ -90,6 +96,15 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) mail_drafts: Vec<crate::connectors::mail::MailDraft>,
     #[serde(default)]
     pub(crate) workspace: Option<WorkspaceConfig>,
+    #[serde(default)]
+    pub(crate) runs: Vec<crate::runs::RunRecord>,
+    #[serde(default)]
+    pub(crate) sessions: Vec<crate::sessions::SessionRecord>,
+    /// Tool grant sets already applied (spec §13.3 step 5).
+    #[serde(default)]
+    pub(crate) tool_grants_applied: Vec<String>,
+    #[serde(default)]
+    pub(crate) pending_history_deletions: Vec<crate::history::HistoryDeletion>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -154,7 +169,7 @@ fn load_json_snapshot(path: &Path) -> io::Result<Option<ControlPlaneSnapshot>> {
     let mut snapshot =
         serde_json::from_str::<ControlPlaneSnapshot>(&contents).map_err(serde_error)?;
     if snapshot.version == 0 {
-        snapshot.version = CONTROL_PLANE_STORE_VERSION;
+        snapshot.version = UNVERSIONED_SNAPSHOT_VERSION;
     }
     if snapshot.version > CONTROL_PLANE_STORE_VERSION {
         return Err(io::Error::new(
@@ -167,6 +182,71 @@ fn load_json_snapshot(path: &Path) -> io::Result<Option<ControlPlaneSnapshot>> {
     }
 
     Ok(Some(snapshot))
+}
+
+/// Where the JSON snapshot is backed up before the sessions upgrade.
+pub(crate) fn pre_sessions_backup_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(PRE_SESSIONS_BACKUP_SUFFIX);
+    path.with_file_name(name)
+}
+
+/// The `host_snapshots` key of the Postgres backup of a `version` snapshot.
+pub(crate) fn postgres_backup_key(version: u32) -> String {
+    format!("{CONTROL_PLANE_SNAPSHOT_KEY}.backup.{version}")
+}
+
+/// Saves the loaded snapshot, unchanged, before the upgrade rewrites it
+/// (spec §13.3 step 1), and returns where the backup is.
+pub(crate) async fn write_pre_upgrade_backup(
+    config: &ControlPlaneStoreConfig,
+    loaded_version: u32,
+) -> io::Result<String> {
+    match config {
+        ControlPlaneStoreConfig::Json(path) => {
+            backup_json_snapshot(path).map(|backup| backup.display().to_string())
+        }
+        ControlPlaneStoreConfig::Postgres(pool) => {
+            backup_postgres_snapshot(pool, loaded_version).await
+        }
+    }
+}
+
+fn backup_json_snapshot(path: &Path) -> io::Result<PathBuf> {
+    let bytes = fs::read(path)?;
+    let backup = pre_sessions_backup_path(path);
+    AtomicFile::new(&backup, AllowOverwrite)
+        .write(|file| {
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })
+        .map_err(atomic_write_error)?;
+    sync_snapshot_parent(&backup)?;
+    Ok(backup)
+}
+
+async fn backup_postgres_snapshot(pool: &PgPool, version: u32) -> io::Result<String> {
+    let key = postgres_backup_key(version);
+    sqlx::query(
+        r#"
+        INSERT INTO host_snapshots (key, version, payload, updated_at)
+        SELECT $1::text, version, payload, now() FROM host_snapshots WHERE key = $2
+        ON CONFLICT (key)
+        DO UPDATE SET
+            version = EXCLUDED.version,
+            payload = EXCLUDED.payload,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(&key)
+    .bind(CONTROL_PLANE_SNAPSHOT_KEY)
+    .execute(pool)
+    .await
+    .map_err(postgres_error)?;
+    Ok(format!("postgres:host_snapshots/{key}"))
 }
 
 async fn save_postgres_snapshot(pool: &PgPool, snapshot: &ControlPlaneSnapshot) -> io::Result<()> {
@@ -316,6 +396,10 @@ impl ControlPlaneSnapshot {
             calendar_connectors: vec![],
             calendar_writes: vec![],
             workspace: None,
+            runs: vec![],
+            sessions: vec![],
+            tool_grants_applied: vec![],
+            pending_history_deletions: vec![],
         }
     }
 }
@@ -385,7 +469,7 @@ mod tests {
         let loaded = super::load_json_snapshot(&path)
             .expect("replacement should load")
             .expect("replacement should exist");
-        assert_eq!(loaded.version, 4);
+        assert_eq!(loaded.version, 5);
         assert_no_temp_residue(&path);
         let _ = std::fs::remove_dir_all(path.parent().expect("snapshot path has a parent"));
     }
@@ -443,12 +527,15 @@ mod tests {
         let snapshot = ControlPlaneSnapshot::new(vec![], vec![]);
         let payload = serde_json::to_value(snapshot).expect("snapshot should serialize");
 
-        assert_eq!(payload["version"], 4);
+        assert_eq!(payload["version"], 5);
         assert_eq!(payload["connectors"], serde_json::json!([]));
         assert_eq!(payload["credentialCleanup"], serde_json::json!([]));
         assert_eq!(payload["inbound"], serde_json::json!([]));
         assert_eq!(payload["outbound"], serde_json::json!([]));
         assert_eq!(payload["schedules"], serde_json::json!([]));
+        assert_eq!(payload["runs"], serde_json::json!([]));
+        assert_eq!(payload["sessions"], serde_json::json!([]));
+        assert_eq!(payload["pendingHistoryDeletions"], serde_json::json!([]));
     }
 
     #[test]
@@ -526,5 +613,86 @@ mod tests {
         assert!(snapshot.inbound.is_empty());
         assert!(snapshot.outbound.is_empty());
         assert!(snapshot.schedules.is_empty());
+    }
+
+    #[test]
+    fn version_four_snapshot_loads_with_an_empty_run_ledger() {
+        let snapshot: ControlPlaneSnapshot = serde_json::from_value(serde_json::json!({
+            "version": 4,
+            "agents": [],
+            "swarms": []
+        }))
+        .expect("version-four snapshot should deserialize");
+
+        assert!(snapshot.runs.is_empty());
+        assert!(snapshot.pending_history_deletions.is_empty());
+    }
+
+    #[test]
+    fn unversioned_json_snapshots_load_as_legacy_version_one() {
+        let path = test_snapshot_path("unversioned");
+        std::fs::write(&path, r#"{"agents":[],"swarms":[]}"#).unwrap();
+
+        let loaded = super::load_json_snapshot(&path).unwrap().unwrap();
+
+        assert_eq!(loaded.version, 1, "an unversioned file predates sessions");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_backup_path_appends_the_suffix_to_the_file_name() {
+        assert_eq!(
+            super::pre_sessions_backup_path(std::path::Path::new("/data/control-plane.json")),
+            std::path::PathBuf::from("/data/control-plane.json.pre-sessions.bak")
+        );
+        assert_eq!(super::postgres_backup_key(4), "control_plane.backup.4");
+    }
+
+    #[tokio::test]
+    async fn the_pre_upgrade_backup_copies_the_exact_file_bytes_and_a_later_upgrade_replaces_it() {
+        let path = test_snapshot_path("backup");
+        let original = "{\n  \"version\": 4,\n  \"agents\": [],\n  \"swarms\": []\n}\n";
+        std::fs::write(&path, original).unwrap();
+        let config = super::ControlPlaneStoreConfig::Json(path.clone());
+
+        let location = super::write_pre_upgrade_backup(&config, 4).await.unwrap();
+
+        let backup = super::pre_sessions_backup_path(&path);
+        assert_eq!(location, backup.display().to_string());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+        std::fs::write(&path, "{\"version\":3}").unwrap();
+        super::write_pre_upgrade_backup(&config, 3).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "{\"version\":3}");
+        assert_no_temp_residue(&path);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[ignore = "requires DATABASE_URL-backed Postgres"]
+    #[sqlx::test(migrations = "./migrations")]
+    async fn the_postgres_pre_upgrade_backup_copies_the_snapshot_row(pool: sqlx::PgPool) {
+        use sqlx::Row;
+
+        sqlx::query(
+            "INSERT INTO host_snapshots (key, version, payload) VALUES ('control_plane', 4, '{\"version\":4,\"agents\":[]}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let config = super::ControlPlaneStoreConfig::Postgres(pool.clone());
+
+        let location = super::write_pre_upgrade_backup(&config, 4).await.unwrap();
+
+        assert_eq!(location, "postgres:host_snapshots/control_plane.backup.4");
+        let row = sqlx::query(
+            "SELECT version, payload FROM host_snapshots WHERE key = 'control_plane.backup.4'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i32, _>("version"), 4);
+        assert_eq!(
+            row.get::<serde_json::Value, _>("payload"),
+            serde_json::json!({"version": 4, "agents": []})
+        );
     }
 }

@@ -6,31 +6,152 @@ import {
   useRef,
   useState,
 } from 'react';
+import type { Session, SessionMessage } from '@animaOS-SWARM/sdk';
 
-import { ActivityView } from './components/ActivityView';
-import { Composer, MessageList } from './components/ChatScreen';
 import { AlertIcon } from './components/icons';
 import { CompanionSetup } from './components/onboarding/CompanionSetup';
 import { SettingsPanel } from './components/SettingsPanel';
 import { ConnectorsView } from './components/ConnectorsView';
+import { SessionSidebar } from './components/sessions/SessionSidebar';
+import { SessionView } from './components/sessions/SessionView';
 import { TelegramSettings } from './components/TelegramSettings';
-import { TelegramThread } from './components/TelegramThread';
-import { WorkspaceShell } from './components/WorkspaceShell';
+import { WorkspaceShell, availablePage } from './components/WorkspaceShell';
 import { useAgentIntegrations } from './hooks/useAgentIntegrations';
+import { useCompanionSessions } from './hooks/useCompanionSessions';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
+import {
+  SESSION_MESSAGES_POLL_MS,
+  useSessionMessages,
+} from './hooks/useSessionMessages';
 import { clearCheckins, importLegacyCheckins } from './lib/checkins';
 import {
   daemon,
   toAgentDetail,
+  toChatMessage,
   type AgentUpdateInput,
   type DaemonSnapshot,
 } from './lib/daemon-api';
 import { selectMainAgent } from './lib/agent-access';
+import { useHashRoute, type HashRoute } from './lib/hash-route';
+import { exportFileName, sessionKey } from './lib/session-groups';
+import {
+  createTelegramIdempotencyKey,
+  safeIntegrationError,
+} from './lib/telegram';
 
 interface AgentOperation {
   generation: number;
   lifecycleGeneration: number;
   targetAgentId: string;
+}
+
+interface FailedDraft {
+  requestId: string;
+  text: string;
+  /** A failed Telegram reply keeps its key, so resending it is joined, not doubled. */
+  idempotencyKey?: string;
+}
+
+type ChatState = {
+  draft: string;
+  failedDrafts: FailedDraft[];
+  sending: boolean;
+  error: string | null;
+  /** A restored Telegram reply; sent again unchanged, it reuses its key. */
+  resend: { text: string; idempotencyKey: string } | null;
+  /** The last Telegram reply was accepted and waits for delivery. */
+  deliveryQueued: boolean;
+};
+
+const EMPTY_CHAT: ChatState = {
+  draft: '',
+  failedDrafts: [],
+  sending: false,
+  error: null,
+  resend: null,
+  deliveryQueued: false,
+};
+const HOME_CONVERSATION = 'home';
+/** The daemon's largest message page, so a busy session still shows the request. */
+const REQUEST_CHECK_PAGE = 200;
+
+/** A send whose outcome is unknown: its request failed in transit or timed out. */
+interface UncertainSend {
+  agentId: string;
+  sessionId: string;
+  key: string;
+  text: string;
+  /** Timed out: the run may still be queued or running, so the chat stays locked. */
+  waiting: boolean;
+}
+
+/** What the send's session said when it was last read again. */
+interface SendCheck {
+  activeRuns: number;
+  delivered: boolean;
+}
+
+/** A committed user message with this request ID means its blocking run
+ *  finished (M2 runs commit their messages together). */
+function carriesRequest(message: SessionMessage, requestId: string): boolean {
+  return (
+    message.role === 'user' && message.metadata.clientRequestId === requestId
+  );
+}
+
+function httpStatus(error: unknown): unknown {
+  return typeof error === 'object' && error !== null && 'status' in error
+    ? error.status
+    : undefined;
+}
+
+/** Chat state is kept per agent and conversation (`home` or `session:<id>`). */
+function chatKey(agentId: string, conversation: string): string {
+  return `${agentId}\u0000${conversation}`;
+}
+
+function sessionConversation(sessionId: string): string {
+  return `session:${sessionId}`;
+}
+
+// Drafts are saved per agent and conversation in session storage (spec
+// §15.5), so a reload keeps them. Without storage they live in memory only.
+function draftStorageKey(key: string): string {
+  return `animaos.draft.${key.replace('\u0000', '/')}`;
+}
+
+function loadDraft(key: string): string {
+  try {
+    return window.sessionStorage.getItem(draftStorageKey(key)) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function storeDraft(key: string, draft: string) {
+  try {
+    if (draft) window.sessionStorage.setItem(draftStorageKey(key), draft);
+    else window.sessionStorage.removeItem(draftStorageKey(key));
+  } catch {
+    // Storage is full or blocked: the draft stays in memory for this page.
+  }
+}
+
+function chatState(chats: Record<string, ChatState>, key: string): ChatState {
+  return chats[key] ?? { ...EMPTY_CHAT, draft: loadDraft(key) };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function saveTextFile(name: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 function ConnectingState() {
@@ -117,106 +238,280 @@ export function ViewHarness() {
   const mainAgent = selectMainAgent(agents);
   // Helpers are implementation details, never a second top-level persona.
   const agent = mainAgent;
+  const agentId = agent?.id ?? null;
   const availableAgentIdsRef = useRef(new Set<string>());
   availableAgentIdsRef.current = new Set(agents.map((item) => item.id));
+  const [route, navigate] = useHashRoute();
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  // A page hides the conversation but keeps it: the last chat or session stays loaded.
+  const lastConversationRef = useRef<HashRoute>({ kind: 'home' });
+  if (route.kind !== 'page') lastConversationRef.current = route;
+  const conversationRoute = lastConversationRef.current;
 
-  type ChatState = {
-    draft: string;
-    failedDrafts: { requestId: string; text: string }[];
-    sending: boolean;
-    error: string | null;
-  };
+  const [sessionQuery, setSessionQuery] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
+  const [sessionActionError, setSessionActionError] = useState<string | null>(
+    null,
+  );
+  const sessions = useCompanionSessions(agentId, {
+    archived: showArchived,
+    query: sessionQuery,
+  });
+  // A daemon without the sessions routes cannot take a send (spec §13.4).
+  const daemonTooOld = sessions.daemonTooOld;
+  const listedSessionsRef = useRef(sessions.sessions);
+  listedSessionsRef.current = sessions.sessions;
+  const routeSessionId =
+    conversationRoute.kind === 'session' ? conversationRoute.sessionId : null;
+  const listedSession = routeSessionId
+    ? (sessions.sessions.find((item) => item.id === routeSessionId) ?? null)
+    : null;
+  const sessionListed = listedSession !== null;
+  // A session outside the loaded list (archived, older, or filtered out by a
+  // search) keeps its last known record and is read again on its own.
+  const [knownSession, setKnownSession] = useState<Session | null>(null);
+  const [sessionReadError, setSessionReadError] = useState<string | null>(null);
+  useEffect(() => {
+    if (listedSession) setKnownSession(listedSession);
+  }, [listedSession]);
+  useEffect(() => {
+    setSessionReadError(null);
+    if (!routeSessionId || sessionListed || !agentId) return;
+    let active = true;
+    let timer: number | undefined;
+    // A failed read is retried on the messages' cadence while the route
+    // points here; a missing session shows as deleted through its messages.
+    const read = () => {
+      daemon.getSession(agentId, routeSessionId).then(
+        (session) => {
+          if (!active) return;
+          setKnownSession(session);
+          setSessionReadError(null);
+        },
+        (caught) => {
+          if (!active || httpStatus(caught) === 404) return;
+          setSessionReadError(errorMessage(caught));
+          timer = window.setTimeout(read, SESSION_MESSAGES_POLL_MS);
+        },
+      );
+    };
+    read();
+    return () => {
+      active = false;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [agentId, routeSessionId, sessionListed]);
+  const activeSession =
+    listedSession ??
+    (knownSession && knownSession.id === routeSessionId ? knownSession : null);
+  // The composer waits for the record: a send needs the session's room.
+  const sessionLoading = routeSessionId !== null && activeSession === null;
+  const [messagesRefresh, setMessagesRefresh] = useState(0);
+  const history = useSessionMessages(
+    routeSessionId ? (activeSession?.agentId ?? agentId) : null,
+    routeSessionId,
+    messagesRefresh,
+  );
+  const chatMessages = useMemo(
+    () => history.messages.map(toChatMessage),
+    [history.messages],
+  );
+
+  const conversation = routeSessionId
+    ? sessionConversation(routeSessionId)
+    : HOME_CONVERSATION;
+  const activeChatKey = agentId ? chatKey(agentId, conversation) : null;
   const [chats, setChats] = useState<Record<string, ChatState>>({});
-  const emptyChat: ChatState = {
-    draft: '',
-    failedDrafts: [],
-    sending: false,
-    error: null,
-  };
-  const chat = chats[agent?.id ?? ''] ?? emptyChat;
+  const chat = activeChatKey ? chatState(chats, activeChatKey) : EMPTY_CHAT;
   const { draft, failedDrafts, sending, error: workspaceError } = chat;
   const failedDraft = failedDrafts[0]?.text ?? null;
-  const updateChat = (
-    id: string,
-    patch: Partial<ChatState> | ((value: ChatState) => Partial<ChatState>),
-  ) => {
+  const storedDraftsRef = useRef(new Map<string, string>());
+  useEffect(() => {
+    for (const [key, value] of Object.entries(chats)) {
+      if (storedDraftsRef.current.get(key) === value.draft) continue;
+      storedDraftsRef.current.set(key, value.draft);
+      storeDraft(key, value.draft);
+    }
+  }, [chats]);
+  /** A deleted session's chat state and saved draft go with it. */
+  const forgetChat = (key: string) => {
+    storedDraftsRef.current.delete(key);
+    storeDraft(key, '');
     setChats((current) => {
-      const value = current[id] ?? emptyChat;
-      return {
-        ...current,
-        [id]: {
-          ...value,
-          ...(typeof patch === 'function' ? patch(value) : patch),
-        },
-      };
+      if (!(key in current)) return current;
+      const rest = { ...current };
+      delete rest[key];
+      return rest;
     });
   };
-  const setDraft = (value: string | ((current: string) => string)) => {
-    if (agent)
-      updateChat(agent.id, (current) => ({
-        draft: typeof value === 'function' ? value(current.draft) : value,
-      }));
-  };
+  const updateChat = useCallback(
+    (
+      key: string,
+      patch: Partial<ChatState> | ((value: ChatState) => Partial<ChatState>),
+    ) => {
+      setChats((current) => {
+        const value = chatState(current, key);
+        return {
+          ...current,
+          [key]: {
+            ...value,
+            ...(typeof patch === 'function' ? patch(value) : patch),
+          },
+        };
+      });
+    },
+    [],
+  );
+  const setDraft = useCallback(
+    (value: string | ((current: string) => string)) => {
+      if (activeChatKey)
+        updateChat(activeChatKey, (current) => ({
+          draft: typeof value === 'function' ? value(current.draft) : value,
+        }));
+    },
+    [activeChatKey, updateChat],
+  );
   const setFailedDrafts = (
     value: (current: ChatState['failedDrafts']) => ChatState['failedDrafts'],
   ) => {
-    if (agent)
-      updateChat(agent.id, (current) => ({
+    if (activeChatKey)
+      updateChat(activeChatKey, (current) => ({
         failedDrafts: value(current.failedDrafts),
       }));
   };
   const setWorkspaceError = (error: string | null) => {
-    if (agent) updateChat(agent.id, { error });
+    if (activeChatKey) updateChat(activeChatKey, { error });
   };
   const pendingSendsRef = useRef(new Set<string>());
-  const uncertainSendsRef = useRef(
-    new Map<string, { agentId: string; text: string; waiting: boolean }>(),
-  );
+  const uncertainSendsRef = useRef(new Map<string, UncertainSend>());
+  // A timed-out send is settled from its own session, never from the agent's
+  // status: that also reads "running" for a check-in or Telegram turn in
+  // another session, and it can read idle while this request is still
+  // queued behind another run in its room (not yet in the run ledger).
+  const sendChecksRef = useRef(new Map<string, SendCheck>());
+  const [sendCheckRevision, setSendCheckRevision] = useState(0);
+  const mountedRef = useRef(true);
+  const checkTimersRef = useRef(new Set<number>());
+  useEffect(() => {
+    mountedRef.current = true;
+    const timers = checkTimersRef.current;
+    return () => {
+      mountedRef.current = false;
+      for (const timer of timers) window.clearTimeout(timer);
+      timers.clear();
+    };
+  }, []);
+  /** A fresh record replaces the listed or known copy, so its active runs
+   *  stop holding the composer before the next list poll. */
+  const adoptSessionRecord = (session: Session) => {
+    const key = sessionKey(session);
+    if (listedSessionsRef.current.some((item) => sessionKey(item) === key))
+      sessions.upsert(session);
+    setKnownSession((current) =>
+      current && sessionKey(current) === key ? session : current,
+    );
+  };
+  /** Reads a timed-out send's session and then its messages, again while the
+   *  session has active runs. Reading the session first means a page read
+   *  after it reports none already holds what those runs committed. */
+  const checkUncertainSend = async (requestId: string) => {
+    const pending = uncertainSendsRef.current.get(requestId);
+    if (!pending?.waiting || !mountedRef.current) return;
+    let check: SendCheck | null = null;
+    let record: Session | null = null;
+    try {
+      const session = await daemon.getSession(
+        pending.agentId,
+        pending.sessionId,
+      );
+      const page = await daemon.sessionMessages(
+        pending.agentId,
+        pending.sessionId,
+        { limit: REQUEST_CHECK_PAGE },
+      );
+      record = session;
+      check = {
+        activeRuns: session.activeRuns,
+        delivered: page.messages.some((message) =>
+          carriesRequest(message, requestId),
+        ),
+      };
+    } catch (caught) {
+      // A deleted session has nothing left to wait for; other failures retry.
+      if (httpStatus(caught) === 404)
+        check = { activeRuns: 0, delivered: false };
+    }
+    if (
+      !mountedRef.current ||
+      uncertainSendsRef.current.get(requestId) !== pending
+    )
+      return;
+    if (check) {
+      sendChecksRef.current.set(requestId, check);
+      setSendCheckRevision((value) => value + 1);
+      if (check.delivered || check.activeRuns === 0) {
+        if (record) adoptSessionRecord(record);
+        return;
+      }
+    }
+    const timer = window.setTimeout(() => {
+      checkTimersRef.current.delete(timer);
+      void checkUncertainSend(requestId);
+    }, SESSION_MESSAGES_POLL_MS);
+    checkTimersRef.current.add(timer);
+  };
   useEffect(() => {
     for (const [requestId, pending] of uncertainSendsRef.current) {
       const snapshot = agentSnapshots.find(
         (item) => item.state.id === pending.agentId,
       );
       if (!snapshot) continue;
-      const delivered = snapshot.messages.some(
-        (message) =>
-          message.role === 'user' &&
-          message.content.metadata?.clientRequestId === requestId,
-      );
-      const running = snapshot.state.status === 'running';
-      if (!delivered && (!pending.waiting || running)) continue;
-      if (pending.waiting && running) continue;
+      const check = sendChecksRef.current.get(requestId);
+      const delivered =
+        check?.delivered === true ||
+        snapshot.messages.some(
+          (message) =>
+            message.role === 'user' &&
+            message.content.metadata?.clientRequestId === requestId,
+        ) ||
+        history.messages.some((message) => carriesRequest(message, requestId));
+      // A timed-out send stays locked until its session has no active runs.
+      if (!delivered && (!pending.waiting || !check || check.activeRuns > 0))
+        continue;
+      sendChecksRef.current.delete(requestId);
       if (delivered) uncertainSendsRef.current.delete(requestId);
       else
         uncertainSendsRef.current.set(requestId, {
           ...pending,
           waiting: false,
         });
-      if (pending.waiting) pendingSendsRef.current.delete(pending.agentId);
-      updateChat(pending.agentId, (current) => {
+      if (pending.waiting) pendingSendsRef.current.delete(pending.key);
+      updateChat(pending.key, (current) => {
         const index = delivered
           ? current.failedDrafts.findIndex(
-              (draft) => draft.requestId === requestId,
+              (item) => item.requestId === requestId,
             )
           : -1;
-        const failedDrafts = current.failedDrafts.filter((_, i) => i !== index);
+        const remaining = current.failedDrafts.filter(
+          (_, position) => position !== index,
+        );
         return {
-          failedDrafts,
+          failedDrafts: remaining,
           sending: pending.waiting ? false : current.sending,
           error:
             current.sending && !pending.waiting
               ? current.error
               : delivered
-                ? snapshot.state.status === 'failed'
-                  ? 'The agent run failed. Check the conversation for details.'
-                  : failedDrafts.length
-                    ? current.error
-                    : null
+                ? remaining.length
+                  ? current.error
+                  : null
                 : 'The daemon has not confirmed this message. Check the conversation before restoring it.',
         };
       });
+      if (delivered) setMessagesRefresh((value) => value + 1);
     }
-  }, [agentSnapshots]);
+  }, [agentSnapshots, history.messages, sendCheckRevision, updateChat]);
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null,
   );
@@ -224,11 +519,6 @@ export function ViewHarness() {
   const [showSettings, setShowSettings] = useState(false);
   const [savingSettings, setSavingSettings] = useState(false);
   const [resetting, setResetting] = useState(false);
-  const [ciPrompt, setCiPrompt] = useState('');
-  const [ciIntervalMin, setCiIntervalMin] = useState(30);
-  const [ciTarget, setCiTarget] = useState<'workspace' | 'telegram'>(
-    'workspace',
-  );
   const [legacyMigrationError, setLegacyMigrationError] = useState<
     string | null
   >(null);
@@ -242,12 +532,18 @@ export function ViewHarness() {
   const currentAgentIdRef = useRef<string | null>(null);
   const previousSelectedMainIdRef = useRef<string | null>(null);
 
-  const agentId = agent?.id ?? null;
   const integrations = useAgentIntegrations(agentId);
   const telegramConnector = integrations.connectors[0] ?? null;
+  const activeConnector =
+    activeSession?.kind === 'telegram'
+      ? (integrations.connectors.find(
+          (item) => item.roomId === activeSession.roomId,
+        ) ?? null)
+      : null;
   useLayoutEffect(() => {
     if (previousSelectedMainIdRef.current === agentId) return;
 
+    const previousAgentId = previousSelectedMainIdRef.current;
     previousSelectedMainIdRef.current = agentId;
     agentLifecycleGenerationRef.current += 1;
     agentOperationGenerationRef.current += 1;
@@ -257,16 +553,16 @@ export function ViewHarness() {
     settingsTriggerRef.current = null;
     savingSettingsRef.current = false;
 
-    setCiPrompt('');
-    setCiIntervalMin(30);
-    setCiTarget('workspace');
     setLegacyMigrationError(null);
+    setSessionActionError(null);
     setSettingsSaveError(null);
     setResetError(null);
     setShowSettings(false);
     setSavingSettings(false);
     setResetting(false);
-  }, [agentId]);
+    // Another companion has other sessions: start from a new chat.
+    if (previousAgentId !== null) navigate({ kind: 'home' }, { replace: true });
+  }, [agentId, navigate]);
 
   const beginAgentOperation = useCallback(
     (targetAgentId: string): AgentOperation => ({
@@ -328,7 +624,6 @@ export function ViewHarness() {
           );
         } else if (result.imported > 0) {
           setLegacyMigrationError(null);
-          void integrations.refresh();
         }
       })
       .catch(() => {
@@ -342,30 +637,31 @@ export function ViewHarness() {
     };
   }, [agentId]);
 
+  // Opening an unread session marks it read up to its newest message, but
+  // not while a page hides it.
+  const markedReadRef = useRef(new Map<string, number>());
+  const refreshSessions = sessions.refresh;
+  const conversationHidden = availablePage(route) !== null;
   useEffect(() => {
-    if (telegramConnector) void integrations.loadMessages(telegramConnector.id);
-  }, [telegramConnector?.id]);
-
-  const addCheckin = async () => {
-    const text = ciPrompt.trim();
-    if (!text || !agentId) return;
-    const added = await integrations.createSchedule({
-      prompt: text,
-      trigger: {
-        type: 'interval',
-        intervalMs: Math.max(1, ciIntervalMin) * 60_000,
-      },
-      target:
-        ciTarget === 'telegram' && telegramConnector
-          ? { type: 'connector', connectorId: telegramConnector.id }
-          : { type: 'workspace' },
-    });
-    if (added) setCiPrompt('');
-  };
-
-  const removeCheckin = (id: string) => {
-    void integrations.removeSchedule(id);
-  };
+    if (
+      conversationHidden ||
+      !activeSession?.unread ||
+      history.messages.length === 0
+    )
+      return;
+    const newest = history.messages[history.messages.length - 1].createdAtMs;
+    const key = sessionKey(activeSession);
+    if ((markedReadRef.current.get(key) ?? 0) >= newest) return;
+    markedReadRef.current.set(key, newest);
+    void daemon
+      .updateSession(activeSession.agentId, activeSession.id, {
+        lastReadAtMs: newest,
+      })
+      .then(
+        () => refreshSessions(),
+        () => markedReadRef.current.delete(key),
+      );
+  }, [activeSession, conversationHidden, history.messages, refreshSessions]);
 
   const changeWorkspaceAvatar = useCallback(
     async (file: File) => {
@@ -417,9 +713,7 @@ export function ViewHarness() {
       return adopted;
     } catch (caught) {
       if (isCurrentAgentOperation(operation)) {
-        setSettingsSaveError(
-          caught instanceof Error ? caught.message : String(caught),
-        );
+        setSettingsSaveError(errorMessage(caught));
       }
       return false;
     } finally {
@@ -450,9 +744,7 @@ export function ViewHarness() {
         await daemon.deleteAgent(targetAgentId);
       } catch (caught) {
         if (isCurrentResetOperation(operation)) {
-          setResetError(
-            caught instanceof Error ? caught.message : String(caught),
-          );
+          setResetError(errorMessage(caught));
         }
         return;
       }
@@ -478,24 +770,29 @@ export function ViewHarness() {
     }
   };
 
-  const sendToAgent = async (
+  const refreshConversation = () => {
+    setMessagesRefresh((value) => value + 1);
+    void sessions.refresh();
+  };
+
+  /** One blocking run in a session's room (spec §4.9). */
+  const runInSession = async (
     targetId: string,
-    content: string,
+    session: Pick<Session, 'id' | 'roomId'>,
+    text: string,
+    key: string,
     preserveDraft = false,
   ) => {
-    const text = content.trim();
     if (
-      !text ||
       !availableAgentIdsRef.current.has(targetId) ||
       connection !== 'online' ||
-      pendingSendsRef.current.has(targetId) ||
-      agents.find((item) => item.id === targetId)?.status === 'Running' ||
+      pendingSendsRef.current.has(key) ||
       resetInFlightRef.current !== null
     )
       return;
     const clientRequestId = crypto.randomUUID();
-    pendingSendsRef.current.add(targetId);
-    updateChat(targetId, {
+    pendingSendsRef.current.add(key);
+    updateChat(key, {
       sending: true,
       error: null,
       ...(preserveDraft ? {} : { draft: '' }),
@@ -505,7 +802,7 @@ export function ViewHarness() {
         targetId,
         text,
         { clientRequestId },
-        `direct:${targetId}`,
+        session.roomId,
       );
       if (
         availableAgentIdsRef.current.has(targetId) &&
@@ -513,7 +810,7 @@ export function ViewHarness() {
       ) {
         acceptAgentSnapshot(updatedAgent);
         if (result.status === 'error')
-          updateChat(targetId, { error: result.error ?? 'run failed' });
+          updateChat(key, { error: result.error ?? 'run failed' });
       }
     } catch (caught) {
       if (availableAgentIdsRef.current.has(targetId)) {
@@ -523,30 +820,219 @@ export function ViewHarness() {
           caught.status === 408;
         uncertainSendsRef.current.set(clientRequestId, {
           agentId: targetId,
+          sessionId: session.id,
+          key,
           text,
           waiting: timedOut,
         });
-        updateChat(targetId, (current) => ({
+        updateChat(key, (current) => ({
           failedDrafts: [
             ...current.failedDrafts,
             { requestId: clientRequestId, text },
           ],
           error: timedOut
             ? 'The response timed out. Checking the daemon for completion—do not resend yet.'
-            : caught instanceof Error
-              ? caught.message
-              : String(caught),
+            : errorMessage(caught),
         }));
-        if (timedOut) void refreshAgents();
+        if (timedOut) {
+          void refreshAgents();
+          void checkUncertainSend(clientRequestId);
+        }
       }
     } finally {
       if (!uncertainSendsRef.current.get(clientRequestId)?.waiting) {
-        pendingSendsRef.current.delete(targetId);
-        updateChat(targetId, { sending: false });
+        pendingSendsRef.current.delete(key);
+        updateChat(key, { sending: false });
       }
+      refreshConversation();
     }
   };
-  const send = () => (agent ? sendToAgent(agent.id, draft) : Promise.resolve());
+
+  /** A new chat becomes a session with its first message (spec §3.3). */
+  const startChat = async (targetId: string, text: string) => {
+    const homeKey = chatKey(targetId, HOME_CONVERSATION);
+    if (pendingSendsRef.current.has(homeKey)) return;
+    pendingSendsRef.current.add(homeKey);
+    updateChat(homeKey, { sending: true, error: null, draft: '' });
+    let session: Session;
+    try {
+      session = await daemon.createSession(targetId);
+    } catch (caught) {
+      pendingSendsRef.current.delete(homeKey);
+      updateChat(homeKey, (current) => ({
+        sending: false,
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: crypto.randomUUID(), text },
+        ],
+        error: errorMessage(caught),
+      }));
+      return;
+    }
+    pendingSendsRef.current.delete(homeKey);
+    if (currentAgentIdRef.current !== targetId) {
+      updateChat(homeKey, { sending: false });
+      return;
+    }
+    const target = chatKey(targetId, sessionConversation(session.id));
+    // Text typed while the chat was created moves with it.
+    setChats((current) => {
+      const home = chatState(current, homeKey);
+      return {
+        ...current,
+        [homeKey]: { ...home, draft: '', sending: false },
+        [target]: { ...chatState(current, target), draft: home.draft },
+      };
+    });
+    sessions.upsert(session);
+    const created: HashRoute = { kind: 'session', sessionId: session.id };
+    // Follow the new chat only while it is still the conversation on screen
+    // or behind a page: a session opened meanwhile keeps the owner, a page
+    // that hides the chat stays open with the session behind it, and a page
+    // that shows the chat moves to the session so a reload finds it.
+    if (lastConversationRef.current.kind === 'home') {
+      if (availablePage(routeRef.current) !== null)
+        lastConversationRef.current = created;
+      else navigate(created, { replace: true });
+    }
+    await runInSession(targetId, session, text, target, true);
+  };
+
+  /** An owner turn in a Telegram session goes out through its connector. */
+  const replyOnTelegram = async (
+    targetId: string,
+    connectorId: string,
+    text: string,
+    key: string,
+    idempotencyKey: string,
+  ) => {
+    if (pendingSendsRef.current.has(key)) return;
+    pendingSendsRef.current.add(key);
+    updateChat(key, {
+      sending: true,
+      error: null,
+      draft: '',
+      resend: null,
+      deliveryQueued: false,
+    });
+    try {
+      const response = await daemon.sendConnectorMessage(
+        targetId,
+        connectorId,
+        text,
+        idempotencyKey,
+      );
+      updateChat(key, {
+        deliveryQueued: response.deliveryQueued,
+        ...(response.result.status === 'error'
+          ? { error: response.result.error ?? 'run failed' }
+          : {}),
+      });
+    } catch (caught) {
+      updateChat(key, (current) => ({
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: crypto.randomUUID(), text, idempotencyKey },
+        ],
+        error: safeIntegrationError(caught),
+      }));
+    } finally {
+      pendingSendsRef.current.delete(key);
+      updateChat(key, { sending: false });
+      refreshConversation();
+    }
+  };
+
+  const send = () => {
+    if (
+      !agent ||
+      connection !== 'online' ||
+      resetInFlightRef.current !== null ||
+      daemonTooOld
+    )
+      return;
+    const text = draft.trim();
+    if (!text) return;
+    if (!routeSessionId) {
+      void startChat(agent.id, text);
+      return;
+    }
+    // Until its record loads, the session's room and kind are unknown.
+    if (!activeSession) return;
+    const key = chatKey(agent.id, sessionConversation(routeSessionId));
+    if (activeSession.kind === 'telegram') {
+      // A restored reply sent unchanged keeps its key; anything else is new.
+      if (activeConnector)
+        void replyOnTelegram(
+          agent.id,
+          activeConnector.id,
+          text,
+          key,
+          chat.resend?.text === text
+            ? chat.resend.idempotencyKey
+            : createTelegramIdempotencyKey(),
+        );
+      return;
+    }
+    void runInSession(activeSession.agentId, activeSession, text, key);
+  };
+
+  const newChat = () => navigate({ kind: 'home' });
+  const openSession = (session: Session) =>
+    navigate({ kind: 'session', sessionId: session.id });
+  const renameSession = async (session: Session, title: string) => {
+    try {
+      await daemon.updateSession(session.agentId, session.id, { title });
+      setSessionActionError(null);
+      await sessions.refresh();
+      return true;
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+      return false;
+    }
+  };
+  const archiveSession = async (session: Session, archived: boolean) => {
+    try {
+      await daemon.updateSession(session.agentId, session.id, { archived });
+      setSessionActionError(null);
+      await sessions.refresh();
+      return true;
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+      return false;
+    }
+  };
+  const exportSession = async (session: Session) => {
+    try {
+      saveTextFile(
+        exportFileName(session.title),
+        await daemon.exportSession(session.agentId, session.id),
+      );
+      setSessionActionError(null);
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+    }
+  };
+  const deleteSession = async (session: Session) => {
+    try {
+      await daemon.deleteSession(session.agentId, session.id);
+      setSessionActionError(null);
+      sessions.remove(session);
+      if (agentId)
+        forgetChat(chatKey(agentId, sessionConversation(session.id)));
+      // Judge by the route now: a page or another session may have opened meanwhile.
+      const open = lastConversationRef.current;
+      if (open.kind === 'session' && open.sessionId === session.id) {
+        if (routeRef.current.kind === 'page')
+          lastConversationRef.current = { kind: 'home' };
+        else navigate({ kind: 'home' }, { replace: true });
+      }
+      return true;
+    } catch (caught) {
+      setSessionActionError(errorMessage(caught));
+      return false;
+    }
+  };
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {
     return <ConnectingState />;
@@ -597,6 +1083,141 @@ export function ViewHarness() {
     />
   ) : null;
 
+  const sidebar = (
+    <SessionSidebar
+      sessions={sessions.sessions}
+      activeKey={activeSession ? sessionKey(activeSession) : null}
+      query={sessionQuery}
+      onQueryChange={setSessionQuery}
+      showArchived={showArchived}
+      onShowArchivedChange={setShowArchived}
+      error={sessionActionError ?? (daemonTooOld ? null : sessions.error)}
+      hasMore={sessions.hasMore}
+      loadingMore={sessions.loadingMore}
+      onLoadMore={() => void sessions.loadMore()}
+      onOpen={openSession}
+      onRename={renameSession}
+      onArchive={archiveSession}
+      onExport={exportSession}
+      onDelete={deleteSession}
+    />
+  );
+
+  const sessionView = (
+    <SessionView
+      agent={agent}
+      session={activeSession}
+      messages={routeSessionId ? chatMessages : []}
+      hasOlder={history.hasOlder}
+      loadingOlder={history.loadingOlder}
+      onLoadOlder={() => void history.loadOlder()}
+      missing={routeSessionId !== null && history.missing && !daemonTooOld}
+      telegramAvailable={activeConnector !== null}
+      scrollerRef={scrollerRef}
+      onSuggestion={setDraft}
+      composer={{
+        draft,
+        setDraft,
+        sending,
+        disabled:
+          resetting ||
+          sessionLoading ||
+          daemonTooOld ||
+          (activeSession?.activeRuns ?? 0) > 0,
+        offline: connection === 'offline',
+        onSend: send,
+        error: workspaceError,
+        onDismissError: () => setWorkspaceError(null),
+        recovery:
+          failedDraft && !sending
+            ? {
+                count: failedDrafts.length,
+                text: failedDraft,
+                restore: () => {
+                  if (!activeChatKey) return;
+                  updateChat(activeChatKey, (current) => {
+                    const [first, ...rest] = current.failedDrafts;
+                    if (!first) return {};
+                    return {
+                      draft: current.draft.trim()
+                        ? `${current.draft}\n\n${first.text}`
+                        : first.text,
+                      failedDrafts: rest,
+                      resend: first.idempotencyKey
+                        ? {
+                            text: first.text,
+                            idempotencyKey: first.idempotencyKey,
+                          }
+                        : current.resend,
+                    };
+                  });
+                },
+                dismiss: () => setFailedDrafts((current) => current.slice(1)),
+              }
+            : undefined,
+      }}
+      onNewChat={newChat}
+      onOpenWork={() => navigate({ kind: 'page', page: 'work' })}
+      onRename={(title) =>
+        activeSession
+          ? renameSession(activeSession, title)
+          : Promise.resolve(false)
+      }
+      onToggleArchived={() => {
+        if (activeSession)
+          void archiveSession(activeSession, !activeSession.archived);
+      }}
+      onExport={() => {
+        if (activeSession) void exportSession(activeSession);
+      }}
+      notice={
+        <>
+          {legacyMigrationError ? (
+            <p role="status" className="px-4 pt-3 text-xs text-ink-3">
+              {legacyMigrationError}
+            </p>
+          ) : null}
+          {daemonTooOld ? (
+            <div
+              role="alert"
+              className="mx-4 mt-3 rounded-xl border border-danger/25 bg-danger/[0.08] px-3.5 py-2.5 text-xs leading-relaxed"
+            >
+              <p className="font-semibold text-danger">Update the daemon</p>
+              <p className="text-ink-2">
+                This console keeps chats as sessions, which this anima-daemon
+                does not support yet. Update and restart the daemon, then reload
+                this page.
+              </p>
+            </div>
+          ) : null}
+          {chat.deliveryQueued ? (
+            <p
+              role="status"
+              className="px-4 pt-3 text-center font-mono text-[10px] text-mint"
+            >
+              Queued for Telegram delivery
+            </p>
+          ) : null}
+          {sessionActionError ? (
+            <p role="alert" className="px-4 pt-3 text-xs text-danger">
+              {sessionActionError}
+            </p>
+          ) : null}
+          {sessionLoading && sessionReadError ? (
+            <p role="alert" className="px-4 pt-3 text-xs text-danger">
+              Session details could not be loaded: {sessionReadError}. Retrying…
+            </p>
+          ) : null}
+          {routeSessionId && history.error ? (
+            <p role="alert" className="px-4 pt-3 text-xs text-danger">
+              Messages could not be loaded: {history.error}
+            </p>
+          ) : null}
+        </>
+      }
+    />
+  );
+
   return (
     <>
       <div
@@ -609,6 +1230,9 @@ export function ViewHarness() {
           mainAgent={mainAgent ?? agent}
           agents={agents}
           connection={connection}
+          route={route}
+          navigate={navigate}
+          onNewChat={newChat}
           onOpenSettings={openSettings}
           onChangeWorkspaceAvatar={changeWorkspaceAvatar}
           onPickPrompt={(prompt) =>
@@ -635,153 +1259,9 @@ export function ViewHarness() {
             />
           }
           workspaceState={workspace}
-          workspace={
-            <section
-              className="flex h-full min-h-0 flex-col"
-              aria-label="Workspace"
-            >
-              {agent.messages.some((message) =>
-                message.roomId?.startsWith('peer:'),
-              ) && (
-                <details className="shrink-0 border-b border-line px-4 py-2 text-xs text-ink-2">
-                  <summary className="cursor-pointer">Delegated work</summary>
-                  <div
-                    className="mt-2 max-h-48 overflow-y-auto space-y-3"
-                    aria-label="Delegated work"
-                  >
-                    {agent.messages
-                      .filter((message) => message.roomId?.startsWith('peer:'))
-                      .map((message) => {
-                        const ownCommunication = message.content.metadata
-                          ?.communication as
-                          | { fromAgentId?: string; toAgentId?: string }
-                          | undefined;
-                        const incomingCommunication = agent.messages.find(
-                          (item) =>
-                            item.roomId === message.roomId &&
-                            item.role === 'User' &&
-                            item.content.metadata?.communication,
-                        )?.content.metadata?.communication as
-                          | { fromAgentId?: string; toAgentId?: string }
-                          | undefined;
-                        const communication =
-                          ownCommunication ??
-                          (message.role === 'Assistant' ||
-                          message.role === 'Tool'
-                            ? {
-                                fromAgentId: incomingCommunication?.toAgentId,
-                                toAgentId: incomingCommunication?.fromAgentId,
-                              }
-                            : incomingCommunication);
-                        const from =
-                          agents.find(
-                            (item) => item.id === communication?.fromAgentId,
-                          )?.name ??
-                          communication?.fromAgentId ??
-                          agent.name;
-                        const to =
-                          agents.find(
-                            (item) => item.id === communication?.toAgentId,
-                          )?.name ??
-                          communication?.toAgentId ??
-                          'helper';
-                        return (
-                          <article key={message.id}>
-                            <p className="font-medium">
-                              {from} to {to}
-                            </p>
-                            <p className="whitespace-pre-wrap break-words">
-                              {message.content.text}
-                            </p>
-                          </article>
-                        );
-                      })}
-                  </div>
-                </details>
-              )}
-              <MessageList
-                agent={{
-                  ...agent,
-                  messages: agent.messages.filter(
-                    (message) =>
-                      !message.roomId?.startsWith('peer:') &&
-                      (
-                        message.content.metadata?.communication as
-                          | { kind?: string }
-                          | undefined
-                      )?.kind !== 'peer',
-                  ),
-                }}
-                sending={sending || agent.status === 'Running'}
-                scrollerRef={scrollerRef}
-                onSuggestion={setDraft}
-              />
-              <Composer
-                agentName={agent.name}
-                draft={draft}
-                setDraft={setDraft}
-                sending={sending}
-                disabled={resetting || agent.status === 'Running'}
-                offline={connection === 'offline'}
-                onSend={send}
-                error={workspaceError}
-                onDismissError={() => setWorkspaceError(null)}
-                recovery={
-                  failedDraft && !sending
-                    ? {
-                        count: failedDrafts.length,
-                        text: failedDraft,
-                        restore: () => {
-                          setDraft((current) =>
-                            current.trim()
-                              ? `${current}\n\n${failedDraft}`
-                              : failedDraft,
-                          );
-                          setFailedDrafts((current) => current.slice(1));
-                        },
-                        dismiss: () =>
-                          setFailedDrafts((current) => current.slice(1)),
-                      }
-                    : undefined
-                }
-              />
-            </section>
-          }
-          activity={
-            <ActivityView
-              agent={agent}
-              checkins={integrations.schedules}
-              prompt={ciPrompt}
-              setPrompt={setCiPrompt}
-              intervalMin={ciIntervalMin}
-              setIntervalMin={setCiIntervalMin}
-              addCheckin={addCheckin}
-              removeCheckin={removeCheckin}
-              error={integrations.scheduleError ?? legacyMigrationError}
-              target={ciTarget}
-              setTarget={setCiTarget}
-              telegramAvailable={telegramConnector?.approvedChat != null}
-              busy={integrations.scheduleBusy}
-            />
-          }
-          telegram={
-            telegramConnector ? (
-              <TelegramThread
-                agentName={agent.name}
-                messages={integrations.messages}
-                hasOlder={integrations.nextBefore !== null}
-                busy={integrations.connectorBusy}
-                error={integrations.connectorError}
-                deliveryQueued={integrations.deliveryQueued}
-                loadOlder={() =>
-                  integrations.loadMessages(telegramConnector.id, true)
-                }
-                send={(text) =>
-                  integrations.sendTelegramMessage(telegramConnector.id, text)
-                }
-              />
-            ) : null
-          }
+          sidebar={sidebar}
+          conversation={sessionView}
+          conversationRoute={conversationRoute}
         />
       </div>
       {settingsPanel}

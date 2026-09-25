@@ -22,11 +22,19 @@ use crate::runtime_serde::{
     tool_step_input_json, tool_step_output_json,
 };
 
+#[path = "runtime/run_delta.rs"]
+mod run_delta;
+pub use run_delta::{new_room_id, RuntimeRunBase, RuntimeRunDelta, RuntimeRunUndo};
+
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_ROOM_ID: AtomicU64 = AtomicU64::new(0);
 pub const MAX_TOOL_ITERATIONS: usize = 8;
+/// Newest engine events kept in memory and in snapshots; `event_count` keeps the running total.
+pub const MAX_RETAINED_EVENTS: usize = 500;
+/// Extra events tolerated before trimming, so trimming is amortized.
+const EVENT_TRIM_SLACK: usize = 64;
 const MAX_EVALUATOR_RETRIES: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -34,7 +42,11 @@ pub struct AgentRuntimeSnapshot {
     pub state: AgentState,
     pub message_count: usize,
     pub messages: Vec<Message>,
+    /// Running total of events ever recorded by this agent, including ones no longer
+    /// present in `events` because they were trimmed.
     pub event_count: usize,
+    /// At most the newest [`MAX_RETAINED_EVENTS`] events. May hold fewer events than
+    /// `event_count` once older events have been trimmed.
     pub events: Vec<EngineEvent>,
     pub last_task: Option<TaskResult<Content>>,
     pub step_count: u64,
@@ -45,6 +57,7 @@ pub struct AgentRuntime {
     messages: Vec<Message>,
     last_task: Option<TaskResult<Content>>,
     events: Vec<EngineEvent>,
+    event_total: usize,
     event_listener: Option<Arc<dyn Fn(EngineEvent) + Send + Sync>>,
     providers: Vec<Arc<dyn Provider>>,
     evaluators: Vec<Arc<dyn Evaluator>>,
@@ -52,6 +65,9 @@ pub struct AgentRuntime {
     db: Option<Arc<dyn DatabaseAdapter>>,
     persistence_agent_id: Option<String>,
     step_counter: u64,
+    /// Host run this runtime executes; scopes tool step keys (see
+    /// `tool_step_idempotency_key`). Never persisted.
+    run_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +104,7 @@ impl AgentRuntime {
             messages: Vec::new(),
             last_task: None,
             events: Vec::new(),
+            event_total: 0,
             event_listener: None,
             providers: Vec::new(),
             evaluators: Vec::new(),
@@ -95,6 +112,7 @@ impl AgentRuntime {
             db: None,
             persistence_agent_id: None,
             step_counter: 0,
+            run_id: None,
         }
     }
 
@@ -115,11 +133,17 @@ impl AgentRuntime {
         snapshot: AgentRuntimeSnapshot,
         model_adapter: Arc<dyn ModelAdapter>,
     ) -> Self {
+        let event_total = snapshot.event_count.max(snapshot.events.len());
+        let mut events = snapshot.events;
+        if events.len() > MAX_RETAINED_EVENTS {
+            events.drain(..events.len() - MAX_RETAINED_EVENTS);
+        }
         Self {
             state: snapshot.state,
             messages: snapshot.messages,
             last_task: snapshot.last_task,
-            events: snapshot.events,
+            events,
+            event_total,
             event_listener: None,
             providers: Vec::new(),
             evaluators: Vec::new(),
@@ -127,6 +151,7 @@ impl AgentRuntime {
             db: None,
             persistence_agent_id: None,
             step_counter: snapshot.step_count,
+            run_id: None,
         }
     }
 
@@ -140,6 +165,17 @@ impl AgentRuntime {
 
     pub fn set_persistence_agent_id(&mut self, agent_id: impl Into<String>) {
         self.persistence_agent_id = Some(agent_id.into());
+    }
+
+    /// Scopes persisted tool step keys to one host run so concurrent runs that
+    /// start from the same canonical record never share step-log rows. A
+    /// durable retry key on the input still takes precedence.
+    pub fn set_run_id(&mut self, run_id: impl Into<String>) {
+        self.run_id = Some(run_id.into());
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 
     pub fn init(&mut self) {
@@ -212,8 +248,8 @@ impl AgentRuntime {
             state: self.state(),
             message_count: self.messages.len(),
             messages: self.messages.clone(),
-            event_count: self.events.len(),
-            events: self.events.clone(),
+            event_count: self.event_total,
+            events: self.events().to_vec(),
             last_task: self.last_task.clone(),
             step_count: self.step_counter,
         }
@@ -224,7 +260,8 @@ impl AgentRuntime {
     }
 
     pub fn events(&self) -> &[EngineEvent] {
-        &self.events
+        let start = self.events.len().saturating_sub(MAX_RETAINED_EVENTS);
+        &self.events[start..]
     }
 
     pub fn register_provider(&mut self, provider: Arc<dyn Provider>) {
@@ -760,6 +797,11 @@ impl AgentRuntime {
             data,
         };
         self.events.push(event.clone());
+        self.event_total += 1;
+        if self.events.len() > MAX_RETAINED_EVENTS + EVENT_TRIM_SLACK {
+            let excess = self.events.len() - MAX_RETAINED_EVENTS;
+            self.events.drain(..excess);
+        }
         if let Some(listener) = &self.event_listener {
             listener(event);
         }
@@ -878,10 +920,12 @@ impl AgentRuntime {
         let mut prepared_steps = Vec::with_capacity(tool_calls.len());
         let db = self.db.clone();
         let persistence_agent_id = self.persistence_agent_id().to_string();
+        let run_id = self.run_id.clone();
 
         for (i, tool_call) in tool_calls.iter().cloned().enumerate() {
             let idempotency_key = tool_step_idempotency_key(
                 &persistence_agent_id,
+                run_id.as_deref(),
                 user_message,
                 iteration,
                 i,
@@ -933,9 +977,7 @@ impl AgentRuntime {
     }
 
     fn apply_token_usage(&mut self, usage: &TokenUsage) {
-        self.state.token_usage.prompt_tokens += usage.prompt_tokens;
-        self.state.token_usage.completion_tokens += usage.completion_tokens;
-        self.state.token_usage.total_tokens += usage.total_tokens;
+        self.state.token_usage.saturating_add(usage);
     }
 
     fn record_token_event(&mut self) {
@@ -1032,6 +1074,7 @@ fn tool_after_event_data(
 
 fn tool_step_idempotency_key(
     agent_id: &str,
+    run_id: Option<&str>,
     message: &Message,
     iteration: usize,
     tool_position: usize,
@@ -1046,25 +1089,41 @@ fn tool_step_idempotency_key(
     );
 
     if let Some(retry_key) = message_retry_key(message) {
+        // A durable retry key names one logical unit of work across re-runs
+        // (for example a Telegram update re-run after a restart under a new
+        // host run), so the run id is deliberately left out: recovery must
+        // find the earlier run's steps.
         let seed = format!("{}\n{}\n{}", agent_id, retry_key, step_seed);
         return Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()).to_string();
     }
 
-    let seed = format!(
-        "{}\n{}\n{}\n{}",
-        agent_id, message.id, message.room_id, step_seed,
-    );
+    let seed = match run_id {
+        Some(run_id) => format!(
+            "{}\n{}\n{}\n{}\n{}",
+            agent_id, run_id, message.id, message.room_id, step_seed,
+        ),
+        None => format!(
+            "{}\n{}\n{}\n{}",
+            agent_id, message.id, message.room_id, step_seed,
+        ),
+    };
     Uuid::new_v5(&Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 
-fn message_retry_key(message: &Message) -> Option<&str> {
-    let metadata = message.content.metadata.as_ref()?;
+/// The durable retry key a host put on a run's input, if any (`retryKey`,
+/// `retry_key`, `idempotencyKey`, or `idempotency_key` metadata).
+pub fn content_retry_key(content: &Content) -> Option<&str> {
+    let metadata = content.metadata.as_ref()?;
     ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"]
         .iter()
         .find_map(|key| match metadata.get(*key) {
             Some(DataValue::String(value)) if !value.is_empty() => Some(value.as_str()),
             _ => None,
         })
+}
+
+fn message_retry_key(message: &Message) -> Option<&str> {
+    content_retry_key(&message.content)
 }
 
 fn next_id(prefix: &str, counter: &AtomicU64) -> String {
@@ -1075,3 +1134,7 @@ fn next_id(prefix: &str, counter: &AtomicU64) -> String {
 #[cfg(test)]
 #[path = "runtime/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "runtime/run_tests.rs"]
+mod run_tests;

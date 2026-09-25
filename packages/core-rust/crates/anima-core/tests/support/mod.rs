@@ -52,6 +52,7 @@ impl ModelAdapter for ScriptedModelAdapter {
                     prompt_tokens: 5,
                     completion_tokens: 7,
                     total_tokens: 12,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             });
@@ -79,6 +80,7 @@ impl ModelAdapter for ScriptedModelAdapter {
                 prompt_tokens: 3,
                 completion_tokens: 2,
                 total_tokens: 5,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::ToolCall,
         })
@@ -118,6 +120,7 @@ impl ModelAdapter for UnknownToolModelAdapter {
                     prompt_tokens: 4,
                     completion_tokens: 6,
                     total_tokens: 10,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             });
@@ -137,6 +140,7 @@ impl ModelAdapter for UnknownToolModelAdapter {
                 prompt_tokens: 2,
                 completion_tokens: 1,
                 total_tokens: 3,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::ToolCall,
         })
@@ -164,6 +168,7 @@ impl ModelAdapter for FinalAnswerModelAdapter {
                 prompt_tokens: 2,
                 completion_tokens: 2,
                 total_tokens: 4,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::End,
         })

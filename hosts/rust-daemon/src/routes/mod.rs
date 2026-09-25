@@ -7,15 +7,16 @@ mod connectors;
 mod contracts;
 mod folder_picker;
 mod gcalendar;
+mod goals;
 mod health;
 mod http;
 mod jobs;
-mod goals;
 mod mail;
 mod memories;
 mod oauth_apps;
 mod profile;
 mod schedules;
+mod sessions;
 mod swarms;
 mod workspace;
 mod workspace_agent_yaml;
@@ -162,7 +163,10 @@ use crate::runtime_model::provider_summaries;
         schedules::update_schedule,
         schedules::delete_schedule,
         schedules::import_legacy_schedules,
+        sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
+        sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
     ),
+    components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
         (name = "health", description = "Daemon health endpoints"),
         (name = "agencies", description = "Agency generation and team drafting"),
@@ -173,6 +177,7 @@ use crate::runtime_model::provider_summaries;
         (name = "connectors", description = "Agent-scoped connector administration"),
         (name = "connector-thread", description = "Dedicated connector-room messages"),
         (name = "schedules", description = "Daemon-backed scheduled prompts"),
+        (name = "sessions", description = "Agent sessions and their transcripts"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -191,6 +196,8 @@ struct AppState {
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
     local_owner: self::http::LocalOwnerPolicy,
+    /// Keeps the history worker's loop running while this router lives.
+    _history_owner: crate::history::HistoryWorkerOwner,
 }
 
 impl AppState {
@@ -248,6 +255,11 @@ impl ApiError {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
@@ -337,6 +349,7 @@ pub(crate) fn router_with_services(
         oauth_apps,
         scheduler,
         jobs,
+        crate::history::HistoryWorkerOwner::new(),
         bind_is_loopback,
     )
 }
@@ -352,6 +365,7 @@ pub(crate) fn router_with_all_services(
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
+    history_owner: crate::history::HistoryWorkerOwner,
     bind_is_loopback: bool,
 ) -> Router {
     router_with_services_with_policies(
@@ -365,6 +379,7 @@ pub(crate) fn router_with_all_services(
         oauth_apps,
         scheduler,
         jobs,
+        history_owner,
         self::http::LocalOwnerPolicy::from_env(bind_is_loopback),
         self::http::ApiKeyPolicy::from_env(),
     )
@@ -381,6 +396,7 @@ fn router_with_services_with_policies(
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     jobs: crate::jobs::JobService,
+    history_owner: crate::history::HistoryWorkerOwner,
     local_owner: self::http::LocalOwnerPolicy,
     api_key: self::http::ApiKeyPolicy,
 ) -> Router {
@@ -400,6 +416,7 @@ fn router_with_services_with_policies(
         scheduler,
         jobs,
         local_owner,
+        _history_owner: history_owner,
     };
     let request_middleware = ServiceBuilder::new()
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
@@ -422,14 +439,53 @@ fn router_with_services_with_policies(
         .route("/metrics", get(metrics_entry))
         .route("/api/health", get(api_health_entry))
         .route("/api/capabilities", get(capabilities_entry))
-        .route("/api/goals", get(goals::list_goals).post(goals::create_goal))
-        .route("/api/goals/{goal_id}/status", axum::routing::post(goals::change_status))
+        .route(
+            "/api/goals",
+            get(goals::list_goals).post(goals::create_goal),
+        )
+        .route(
+            "/api/goals/{goal_id}/status",
+            axum::routing::post(goals::change_status),
+        )
         .route("/api/goals/{goal_id}/jobs", get(goals::goal_jobs))
-        .route("/api/agents/{agent_id}/jobs", get(jobs::list_jobs).post(jobs::create_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/cancel", axum::routing::post(jobs::cancel_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/retry", axum::routing::post(jobs::retry_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/approve", axum::routing::post(jobs::approve_job))
-        .route("/api/agents/{agent_id}/jobs/{job_id}/review", axum::routing::post(jobs::review_job))
+        .route(
+            "/api/agents/{agent_id}/jobs",
+            get(jobs::list_jobs).post(jobs::create_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/cancel",
+            axum::routing::post(jobs::cancel_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/retry",
+            axum::routing::post(jobs::retry_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/approve",
+            axum::routing::post(jobs::approve_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/jobs/{job_id}/review",
+            axum::routing::post(jobs::review_job),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions",
+            get(sessions::list_sessions).post(sessions::create_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}",
+            get(sessions::get_session)
+                .patch(sessions::update_session)
+                .delete(sessions::delete_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/messages",
+            get(sessions::list_session_messages),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/export",
+            get(sessions::export_session),
+        )
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -501,7 +557,9 @@ fn router_with_services_with_policies(
         )
         .route(
             "/api/agents/{agent_id}/avatar",
-            get(get_agent_avatar_entry).put(put_agent_avatar_entry).delete(delete_agent_avatar_entry),
+            get(get_agent_avatar_entry)
+                .put(put_agent_avatar_entry)
+                .delete(delete_agent_avatar_entry),
         )
         .route(
             "/api/agents/{agent_id}/memories/recent",
@@ -678,7 +736,8 @@ pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
     use crate::connectors::telegram::TelegramClient;
 
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+        .with_max_runs_per_agent(config.max_runs_per_agent);
     let connector_manager = ConnectorManager::new(
         Arc::clone(&state),
         agent_runs.clone(),
@@ -710,12 +769,18 @@ async fn health_entry() -> AxumResponse {
 )]
 async fn capabilities_entry(State(state): State<AppState>, request: AxumRequest) -> AxumResponse {
     let mut response = if state.local_owner.authorize_read(request.headers()).is_err() {
-        ApiError { status: StatusCode::FORBIDDEN, message: "local owner authorization required".into() }.into_response()
+        ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "local owner authorization required".into(),
+        }
+        .into_response()
     } else {
         let guard = state.daemon.read().await;
         json_response(StatusCode::OK, &capabilities::inventory(&guard))
     };
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 
@@ -1133,13 +1198,31 @@ async fn generate_profile_entry(
     }
 }
 
+/// Controller ruling 1 (M2 pre-flight audit): an unrecognized `view` value is
+/// ignored (the full response), preserving prior behaviour; only
+/// `view=summary` changes the shape. Fix round 1 (M2 review): a malformed
+/// query string is treated the same as no `view` (the full response) -- this
+/// route used to ignore the URI entirely, and a query it cannot parse is not
+/// a reason to reject the request now.
 #[utoipa::path(
     get,
     path = "/api/agents",
     tag = "agents",
-    responses((status = 200, description = "List agents", body = AgentsEnvelope))
+    params(("view" = Option<String>, Query, description = "summary returns AgentSummariesEnvelope: the agents without their messages")),
+    responses(
+        (status = 200, description = "List agents (AgentSummariesEnvelope with view=summary). messages and messageCount cover only the hot tail: each session's newest 200 visible messages (silent check-in turns among them stay) plus anything from the last 24 hours. The session routes cover the full history; page it with GET /api/agents/{agent_id}/sessions/{session_id}/messages", body = AgentsEnvelope)
+    )
 )]
-async fn list_agents_entry(State(state): State<AppState>) -> AxumResponse {
+async fn list_agents_entry(State(state): State<AppState>, uri: Uri) -> AxumResponse {
+    let view = request_query(&uri)
+        .ok()
+        .and_then(|query| query.get("view").filter(|view| !view.is_empty()).cloned());
+    if view.as_deref() == Some("summary") {
+        return json_response(
+            StatusCode::OK,
+            &agents::handle_list_agent_summaries(&state.daemon).await,
+        );
+    }
     match agents::handle_list_agents(&state.daemon).await {
         Ok(response) => json_response(StatusCode::OK, &response),
         Err(error) => error.into_response(),
@@ -1175,7 +1258,7 @@ async fn create_agent_entry(State(state): State<AppState>, request: AxumRequest)
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent identifier")),
     responses(
-        (status = 200, description = "Agent snapshot", body = AgentEnvelope),
+        (status = 200, description = "Agent snapshot. messages and messageCount cover only the hot tail: each session's newest 200 visible messages (silent check-in turns among them stay) plus anything from the last 24 hours. The session routes cover the full history; page it with GET /api/agents/{agent_id}/sessions/{session_id}/messages", body = AgentEnvelope),
         (status = 404, description = "Not found", body = ErrorBody)
     )
 )]
@@ -1197,7 +1280,8 @@ async fn get_agent_entry(
     responses(
         (status = 200, description = "Agent deleted", body = DeleteResponse),
         (status = 403, description = "Local owner authorization required", body = ErrorBody),
-        (status = 404, description = "Not found", body = ErrorBody)
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 409, description = "The agent has a run in progress", body = ErrorBody)
     )
 )]
 async fn delete_agent_entry(
@@ -1221,8 +1305,17 @@ async fn delete_agent_entry(
     }
     match state.connector_manager.delete_agent(agent_id).await {
         Ok(()) => json_response(StatusCode::OK, &DeleteResponse { deleted: true }),
-        Err(ConnectorManagerError::AgentNotFound) => ApiError::not_found().into_response(),
-        Err(error) => ApiError::service_unavailable(error.to_string()).into_response(),
+        Err(error) => delete_agent_error(error),
+    }
+}
+
+fn delete_agent_error(error: ConnectorManagerError) -> AxumResponse {
+    match error {
+        ConnectorManagerError::AgentNotFound => ApiError::not_found().into_response(),
+        ConnectorManagerError::AgentBusy => {
+            ApiError::conflict(agents::AGENT_BUSY_MESSAGE).into_response()
+        }
+        error => ApiError::service_unavailable(error.to_string()).into_response(),
     }
 }
 
@@ -1273,7 +1366,8 @@ async fn update_agent_entry(
     responses(
         (status = 200, description = "Task result", body = AgentRunEnvelope),
         (status = 400, description = "Invalid request", body = ErrorBody),
-        (status = 404, description = "Not found", body = ErrorBody)
+        (status = 404, description = "Not found", body = ErrorBody),
+        (status = 503, description = "Too many concurrent runs, or too many runs already waiting for this agent", body = ErrorBody)
     )
 )]
 async fn run_agent_entry(
@@ -1281,18 +1375,20 @@ async fn run_agent_entry(
     Path(agent_id): Path<String>,
     request: AxumRequest,
 ) -> AxumResponse {
-    let permit = match state.agent_runs.try_admit() {
-        Ok(permit) => permit,
-        Err(error) => return error.into_response(),
-    };
+    // Fail fast before reading the body when the daemon is saturated. Nothing is
+    // reserved here. Once the body parses, the run takes a unit of its agent's
+    // waiting budget (503 when that is exhausted), its room, an agent slot, and
+    // then a global permit, and fails fast again if the permit is gone by then.
+    if !state.agent_runs.has_available_permit() {
+        return ApiError::service_unavailable(crate::agent_runs::RUN_ADMISSION_SATURATED)
+            .into_response();
+    }
 
     match read_limited_body(request, state.config.max_request_bytes).await {
-        Ok(body) => {
-            match agents::handle_run_agent(&agent_id, body, &state.agent_runs, permit).await {
-                Ok(response) => json_response(StatusCode::OK, &response),
-                Err(error) => error.into_response(),
-            }
-        }
+        Ok(body) => match agents::handle_run_agent(&agent_id, body, &state.agent_runs).await {
+            Ok(response) => json_response(StatusCode::OK, &response),
+            Err(error) => error.into_response(),
+        },
         Err(response) => response,
     }
 }
@@ -1325,6 +1421,7 @@ async fn peer_message_entry(
             input.to_agent_id,
             input.message,
             anima_core::AgentCommunicationRoute::start(sender_id),
+            None,
         )
         .await
     {
@@ -1772,9 +1869,10 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 
 #[cfg(test)]
 mod tests {
-    mod jobs;
-    mod goals;
     mod capabilities;
+    mod goals;
+    mod jobs;
+    mod sessions;
     mod swarm_reliability;
 
     use super::{router, router_with_services, router_with_services_with_policies};
@@ -1783,7 +1881,7 @@ mod tests {
     use crate::connectors::credentials::{
         ConnectorCredentialStore, CredentialStoreError, InMemoryCredentialStore, TelegramBotToken,
     };
-    use crate::connectors::runtime::{ConnectorManager, TelegramTransport};
+    use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError, TelegramTransport};
     use crate::connectors::telegram::{
         TelegramClient, TelegramSentMessage, TelegramTransportError, TelegramUpdateBatch,
     };
@@ -1888,6 +1986,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             })
@@ -2029,6 +2128,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             })
@@ -2117,6 +2217,7 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 1,
                 total_tokens: 2,
+                ..TokenUsage::default()
             },
             stop_reason: ModelStopReason::End,
         }
@@ -2642,6 +2743,7 @@ mod tests {
             oauth_apps,
             scheduler,
             jobs,
+            crate::history::HistoryWorkerOwner::new(),
             LocalOwnerPolicy::for_test(true, Some("local-admin")),
             ApiKeyPolicy::for_test(Some("global-api")),
         );
@@ -3087,11 +3189,37 @@ mod tests {
     #[tokio::test]
     async fn slow_run_uses_its_own_timeout_instead_of_standard_api_timeout() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
-            SlowModelAdapter { delay: Duration::from_millis(50), calls: AtomicUsize::new(0) },
+            SlowModelAdapter {
+                delay: Duration::from_millis(50),
+                calls: AtomicUsize::new(0),
+            },
         ))));
-        let id = state.write().await.create_agent(test_config("slow-run")).unwrap().state.id;
-        let app = router(state, DaemonConfig { request_timeout: Duration::from_millis(1), run_request_timeout: Duration::from_secs(2), ..DaemonConfig::default() });
-        let response = app.oneshot(Request::builder().method("POST").uri(format!("/api/agents/{id}/run")).header("content-type", "application/json").body(Body::from(r#"{"text":"slow work"}"#)).unwrap()).await.unwrap();
+        let id = state
+            .write()
+            .await
+            .create_agent(test_config("slow-run"))
+            .unwrap()
+            .state
+            .id;
+        let app = router(
+            state,
+            DaemonConfig {
+                request_timeout: Duration::from_millis(1),
+                run_request_timeout: Duration::from_secs(2),
+                ..DaemonConfig::default()
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"slow work"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 
@@ -3325,8 +3453,223 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
     }
 
+    /// Records each run's input text in model-call order; every call parks
+    /// until the test releases it.
+    struct OrderedGateModelAdapter {
+        order: StdMutex<Vec<String>>,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for OrderedGateModelAdapter {
+        fn provider(&self) -> &str {
+            "ordered-gate"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            let text = request
+                .messages
+                .last()
+                .map(|message| message.content.text.clone())
+                .unwrap_or_default();
+            self.order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(text);
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .map_err(|_| "release gate closed".to_string())?
+                .forget();
+            Ok(model_response(config))
+        }
+    }
+
+    fn legacy_run_request(agent_id: &str, room_id: &str, text: &str) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/api/agents/{agent_id}/run"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "text": text, "roomId": room_id }).to_string(),
+            ))
+            .expect("run request builds")
+    }
+
+    async fn error_message(response: axum::response::Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        serde_json::from_slice::<serde_json::Value>(&body).expect("error body is JSON")["error"]
+            .as_str()
+            .expect("error body has a message")
+            .to_string()
+    }
+
+    /// A legacy run waiting for a busy room or agent slot holds no global
+    /// permit, so its waiting is bounded per agent instead (spec §4.9, §16):
+    /// with one run parked in room R, eight more requests for R wait in
+    /// acceptance order and the next one is refused at once.
+    #[tokio::test]
+    async fn legacy_run_route_accepts_eight_waiters_per_agent_then_fails_fast() {
+        use crate::agent_runs::MAX_QUEUED_RUNS_PER_AGENT;
+
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(OrderedGateModelAdapter {
+            order: StdMutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(
+            adapter.clone(),
+        )));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        // Enough global permits that only the room and the waiting budget
+        // decide admission.
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        let app = custom_router(Arc::clone(&state), runs.clone(), DaemonConfig::default());
+        let send = |text: String| {
+            let app = app.clone();
+            let request = legacy_run_request(&agent_id, "room-r", &text);
+            tokio::spawn(async move { app.oneshot(request).await.expect("app responds") })
+        };
+
+        let parked = send("parked".into());
+        entered
+            .acquire()
+            .await
+            .expect("the parked run enters the model")
+            .forget();
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            0,
+            "a run holding its global permit is no longer waiting"
+        );
+
+        let mut waiters = Vec::new();
+        for index in 1..=MAX_QUEUED_RUNS_PER_AGENT {
+            waiters.push(send(format!("waiter-{index}")));
+            // Let this waiter queue on room R before the next one arrives.
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let refused = tokio::time::timeout(Duration::from_secs(1), send("refused".into()))
+            .await
+            .expect("the ninth waiting request is answered at once")
+            .expect("request task joins");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error_message(refused).await,
+            "too many concurrent run requests"
+        );
+        assert_eq!(runs.waiting_runs(&agent_id), MAX_QUEUED_RUNS_PER_AGENT);
+
+        release.add_permits(MAX_QUEUED_RUNS_PER_AGENT + 1);
+        assert_eq!(parked.await.unwrap().status(), StatusCode::OK);
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap().status(), StatusCode::OK);
+        }
+        let expected: Vec<String> = std::iter::once("parked".to_string())
+            .chain((1..=MAX_QUEUED_RUNS_PER_AGENT).map(|index| format!("waiter-{index}")))
+            .collect();
+        assert_eq!(
+            *adapter.order.lock().unwrap(),
+            expected,
+            "the waiters run in acceptance order"
+        );
+        assert_eq!(runs.waiting_runs(&agent_id), 0);
+    }
+
+    /// A legacy run that waited behind its room still fails fast at the
+    /// global permit (spec §4.3, §4.9) and gives its waiting unit back.
+    #[tokio::test]
+    async fn legacy_run_that_waited_for_its_room_fails_fast_without_a_free_permit() {
+        use crate::agent_runs::AdmitMode;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            CountingModelAdapter {
+                calls: Arc::clone(&calls),
+            },
+        ))));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let limiter = Arc::new(Semaphore::new(1));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let app = custom_router(Arc::clone(&state), runs.clone(), DaemonConfig::default());
+
+        // Hold room R (and a slot) without a permit, so the request below
+        // passes the permit pre-check and then waits purely on the room lock.
+        let blocker = runs
+            .admit(&agent_id, "room-r", AdmitMode::TryNow)
+            .await
+            .expect("room R is free");
+        let queued = {
+            let app = app.clone();
+            let request = legacy_run_request(&agent_id, "room-r", "queued");
+            tokio::spawn(async move { app.oneshot(request).await.expect("app responds") })
+        };
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!queued.is_finished(), "the request waits for room R");
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            1,
+            "the waiting request holds one unit of its agent's waiting budget"
+        );
+
+        // The only permit is taken while the request waits, so none is left
+        // once it holds its room.
+        let _elsewhere = limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("the permit is free");
+        drop(blocker);
+        let response = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("the run fails fast at the permit stage")
+            .expect("request task joins");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error_message(response).await,
+            "too many concurrent run requests"
+        );
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            0,
+            "the refused run gives its unit back"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "the run never started");
+        assert!(state.read().await.runs.for_agent(&agent_id).is_empty());
+    }
+
+    /// The route reserves nothing before the body parses: a malformed body
+    /// gets 400 before its run takes a waiting unit, a room, a slot, or a
+    /// global permit, so with one global permit the next valid run still
+    /// runs.
     #[tokio::test(flavor = "multi_thread")]
-    async fn malformed_run_body_releases_early_admission_permit() {
+    async fn malformed_run_body_is_rejected_before_admission() {
         let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
             SlowModelAdapter {
                 delay: Duration::ZERO,
@@ -3376,6 +3719,85 @@ mod tests {
         assert_eq!(valid.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn agent_deletion_errors_map_to_http_statuses() {
+        assert_eq!(
+            super::delete_agent_error(ConnectorManagerError::AgentBusy).status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            super::delete_agent_error(ConnectorManagerError::AgentNotFound).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            super::delete_agent_error(ConnectorManagerError::Persistence).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn put_agent_tasks_is_rejected_while_a_run_is_in_flight() {
+        use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
+
+        let workspace = WorkspaceAvatarTemp::new("tasks-in-flight");
+        let state = workspace.state();
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+        let app = router(Arc::clone(&state), DaemonConfig::default());
+        let revision = crate::tools::todo::read_agent_todos(Some(&workspace.root), &agent_id)
+            .expect("tasks should read")
+            .revision;
+        let body = serde_json::json!({
+            "revision": revision,
+            "tasks": [{"content": "Research", "activeForm": "Researching", "status": "pending"}]
+        })
+        .to_string();
+        let put = |body: String| {
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/agents/{agent_id}/tasks"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request builds")
+        };
+        let run_id = {
+            let mut guard = state.write().await;
+            let record = RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: "direct:operator".into(),
+                    source: RunSource::Api,
+                    source_ref: None,
+                    idempotency_key: None,
+                    text: "working".into(),
+                    model: "gpt-5.4".into(),
+                    provider: None,
+                    parent_run_id: None,
+                },
+                anima_core::primitives::now_millis(),
+            );
+            let run_id = record.id.clone();
+            guard.runs.insert(record);
+            run_id
+        };
+
+        let busy = app.clone().oneshot(put(body.clone())).await.unwrap();
+        assert_eq!(busy.status(), StatusCode::CONFLICT);
+
+        state.write().await.runs.get_mut(&run_id).unwrap().finish(
+            RunStatus::Completed,
+            None,
+            anima_core::primitives::now_millis(),
+        );
+        let saved = app.oneshot(put(body)).await.unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+    }
+
     fn test_config(name: &str) -> AgentConfig {
         AgentConfig {
             name: name.into(),
@@ -3396,13 +3818,24 @@ mod tests {
 }
 
 #[utoipa::path(get, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 200, description = "Agent avatar"), (status = 404, description = "No avatar")))]
-async fn get_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+async fn get_agent_avatar_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AxumResponse {
     match agent_avatar::get(&id, &state.daemon).await {
         Ok(avatar) => {
             let mut response = avatar.bytes.into_response();
-            response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static(avatar.content_type));
-            response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            response.headers_mut().insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(avatar.content_type),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response.headers_mut().insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
             response
         }
         Err(error) => error.into_response(),
@@ -3410,33 +3843,63 @@ async fn get_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<St
 }
 
 #[utoipa::path(put, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 204, description = "Avatar saved"), (status = 400, description = "Invalid image")))]
-async fn put_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>, request: AxumRequest) -> AxumResponse {
-    let content_type = request.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_owned);
-    let body = match read_limited_body(request, workspace::MAX_WORKSPACE_AVATAR_BYTES + 1).await { Ok(body) => body, Err(response) => return response };
+async fn put_agent_avatar_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> AxumResponse {
+    let content_type = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let body = match read_limited_body(request, workspace::MAX_WORKSPACE_AVATAR_BYTES + 1).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let _transaction = state.agent_runs.control_plane_transaction().await;
     match agent_avatar::put(&id, body, content_type.as_deref(), &state.daemon).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
 #[utoipa::path(delete, path = "/api/agents/{agent_id}/avatar", tag = "agents", params(("agent_id" = String, Path)), responses((status = 204, description = "Avatar removed")))]
-async fn delete_agent_avatar_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
+async fn delete_agent_avatar_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AxumResponse {
     let _transaction = state.agent_runs.control_plane_transaction().await;
     match agent_avatar::remove(&id, &state.daemon).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(), Err(error) => error.into_response(),
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
-async fn agent_tasks_context(state: &AppState, id: &str) -> Result<(std::path::PathBuf, String), ApiError> {
+async fn agent_tasks_context(
+    state: &AppState,
+    id: &str,
+) -> Result<(std::path::PathBuf, String), ApiError> {
     let guard = state.daemon.read().await;
     let runtime_id = guard.agent_runtime_id(id).ok_or_else(ApiError::not_found)?;
-    let root = guard.workspace.as_ref().ok_or_else(|| ApiError::conflict("workspace is not configured"))?.root_path.clone();
+    let root = guard
+        .workspace
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("workspace is not configured"))?
+        .root_path
+        .clone();
     Ok((root, runtime_id))
 }
 
 #[utoipa::path(get, path = "/api/agents/{agent_id}/tasks", tag = "agents", params(("agent_id" = String, Path)), responses((status = 200, description = "Agent tasks", body = crate::tools::todo::AgentTodos)))]
-async fn get_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<String>) -> AxumResponse {
-    let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
+async fn get_agent_tasks_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AxumResponse {
+    let (root, id) = match agent_tasks_context(&state, &id).await {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
+    };
     match crate::tools::todo::read_agent_todos(Some(&root), &id) {
         Ok(tasks) => json_response(StatusCode::OK, &tasks),
         Err(error) => ApiError::service_unavailable(error).into_response(),
@@ -3444,17 +3907,37 @@ async fn get_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<Str
 }
 
 #[utoipa::path(put, path = "/api/agents/{agent_id}/tasks", tag = "agents", params(("agent_id" = String, Path)), request_body = crate::tools::todo::AgentTodos, responses((status = 200, description = "Agent tasks saved", body = crate::tools::todo::AgentTodos), (status = 409, description = "Tasks changed since read")))]
-async fn put_agent_tasks_entry(State(state): State<AppState>, Path(id): Path<String>, request: AxumRequest) -> AxumResponse {
-    let body = match read_limited_body(request, state.config.max_request_bytes).await { Ok(body) => body, Err(response) => return response };
-    let input: crate::tools::todo::AgentTodos = match parse_json_body(body) { Ok(input) => input, Err(error) => return error.into_response() };
+async fn put_agent_tasks_entry(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    request: AxumRequest,
+) -> AxumResponse {
+    let body = match read_limited_body(request, state.config.max_request_bytes).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    let input: crate::tools::todo::AgentTodos = match parse_json_body(body) {
+        Ok(input) => input,
+        Err(error) => return error.into_response(),
+    };
     let _transaction = state.agent_runs.control_plane_transaction().await;
-    let (root, id) = match agent_tasks_context(&state, &id).await { Ok(context) => context, Err(error) => return error.into_response() };
-    if state.daemon.read().await.get_agent(&id).is_some_and(|snapshot| snapshot.state.status == anima_core::AgentStatus::Running) {
+    let (root, id) = match agent_tasks_context(&state, &id).await {
+        Ok(context) => context,
+        Err(error) => return error.into_response(),
+    };
+    if state.daemon.read().await.in_flight_runs(&id) > 0 {
         return ApiError::conflict("This agent is working. Wait for the current run to finish, then refresh tasks before saving.").into_response();
     }
-    match crate::tools::todo::write_agent_todos(Some(&root), &id, &input.tasks, Some(&input.revision)) {
+    match crate::tools::todo::write_agent_todos(
+        Some(&root),
+        &id,
+        &input.tasks,
+        Some(&input.revision),
+    ) {
         Ok(tasks) => json_response(StatusCode::OK, &tasks),
-        Err(error) if error.starts_with("Tasks changed.") => ApiError::conflict(error).into_response(),
+        Err(error) if error.starts_with("Tasks changed.") => {
+            ApiError::conflict(error).into_response()
+        }
         Err(error) => ApiError::bad_request(error).into_response(),
     }
 }

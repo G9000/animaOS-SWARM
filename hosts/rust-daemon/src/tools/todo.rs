@@ -5,7 +5,10 @@ use anima_core::{AgentState, Content, DataValue, Message, TaskResult, ToolCall};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 
-use super::workspace::{canonical_workspace_root, workspace_root_path};
+use super::workspace::{
+    canonical_workspace_root, ensure_path_within_workspace, resolve_workspace_write_path,
+    workspace_root_path, write_workspace_bytes,
+};
 use super::{ctx_workspace_root, ToolExecutionContext};
 
 const TODO_DIRECTORY_NAME: &str = ".animaos-swarm";
@@ -18,6 +21,8 @@ pub(crate) struct TodoItem {
     #[serde(rename = "activeForm")]
     pub(crate) active_form: String,
 }
+
+const TASKS_CHANGED_PREFIX: &str = "Tasks changed.";
 
 pub(super) fn execute_todo_write(
     context: ToolExecutionContext,
@@ -41,20 +46,51 @@ pub(super) fn execute_todo_write(
             None => return TaskResult::error("todo_write todos is required", 0),
         };
 
-        match write_agent_todos(ctx_workspace_root(&context), &agent.id, &todos, None)
-            .map(|_| format!("Todos updated ({} completed, {} in progress, {} pending). Proceed with current tasks.",
-                todos.iter().filter(|task| task.status == "completed").count(),
-                todos.iter().filter(|task| task.status == "in_progress").count(),
-                todos.iter().filter(|task| task.status == "pending").count()))
-        {
-            Ok(message) => TaskResult::success(
-                Content {
-                    text: message,
-                    attachments: None,
-                    metadata: None,
-                },
-                0,
-            ),
+        let root = ctx_workspace_root(&context);
+        let expected = context
+            .todo_revision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match write_agent_todos(root, &agent.id, &todos, expected.as_deref()) {
+            Ok(saved) => {
+                *context
+                    .todo_revision
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(saved.revision);
+                TaskResult::success(
+                    Content {
+                        text: format!(
+                            "Todos updated ({} completed, {} in progress, {} pending). Proceed with current tasks.",
+                            todos.iter().filter(|task| task.status == "completed").count(),
+                            todos.iter().filter(|task| task.status == "in_progress").count(),
+                            todos.iter().filter(|task| task.status == "pending").count()
+                        ),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    0,
+                )
+            }
+            // Another room updated the list since this run saw it: save nothing,
+            // show the latest list, and let a merged retry succeed.
+            Err(error) if error.starts_with(TASKS_CHANGED_PREFIX) => {
+                match read_agent_todos(root, &agent.id) {
+                    Ok(latest) => {
+                        let message = format!(
+                            "Tasks changed since this run last saw them, so nothing was saved. The latest tasks are:\n{}\nMerge your changes into this list and call todo_write again with the complete list.",
+                            render_agent_todos(&latest.tasks)
+                        );
+                        *context
+                            .todo_revision
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(latest.revision);
+                        TaskResult::error(message, 0)
+                    }
+                    Err(read_error) => TaskResult::error(read_error, 0),
+                }
+            }
             Err(error) => TaskResult::error(error, 0),
         }
     })
@@ -67,42 +103,49 @@ pub(super) fn execute_todo_read(
     _tool_call: ToolCall,
 ) -> BoxFuture<'static, TaskResult<Content>> {
     Box::pin(async move {
-        match read_agent_todos(ctx_workspace_root(&context), &agent.id).map(|snapshot| {
-            if snapshot.tasks.is_empty() {
-                "No todos set.".to_string()
-            } else {
-                snapshot
-                    .tasks
-                    .iter()
-                    .enumerate()
-                    .map(|(index, task)| {
-                        format!(
-                            "{} {}. [{}] {}",
-                            match task.status.as_str() {
-                                "completed" => "[x]",
-                                "in_progress" => "[>]",
-                                _ => "[ ]",
-                            },
-                            index + 1,
-                            task.status,
-                            task.content
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+        match read_agent_todos(ctx_workspace_root(&context), &agent.id) {
+            Ok(snapshot) => {
+                *context
+                    .todo_revision
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some(snapshot.revision.clone());
+                TaskResult::success(
+                    Content {
+                        text: render_agent_todos(&snapshot.tasks),
+                        attachments: None,
+                        metadata: None,
+                    },
+                    0,
+                )
             }
-        }) {
-            Ok(message) => TaskResult::success(
-                Content {
-                    text: message,
-                    attachments: None,
-                    metadata: None,
-                },
-                0,
-            ),
             Err(error) => TaskResult::error(error, 0),
         }
     })
+}
+
+fn render_agent_todos(tasks: &[TodoItem]) -> String {
+    if tasks.is_empty() {
+        return "No todos set.".to_string();
+    }
+    tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            format!(
+                "{} {}. [{}] {}",
+                match task.status.as_str() {
+                    "completed" => "[x]",
+                    "in_progress" => "[>]",
+                    _ => "[ ]",
+                },
+                index + 1,
+                task.status,
+                task.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_todo_list(configured_root: Option<&Path>, todos: &[TodoItem]) -> Result<String, String> {
@@ -115,20 +158,17 @@ pub(super) fn write_todo_list_from_root(
     todos: &[TodoItem],
 ) -> Result<String, String> {
     let warnings = validate_todo_items(todos)?;
-    let todo_file = todo_file_path_from_root(workspace_root, "todo_write")?;
-    if let Some(parent) = todo_file.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "todo_write failed to create todo directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-
     let serialized = serde_json::to_string_pretty(todos)
         .map_err(|error| format!("todo_write failed to serialize todos: {error}"))?;
-    fs::write(&todo_file, serialized)
-        .map_err(|error| format!("todo_write failed to persist todo list: {error}"))?;
+    // Spec §14: every workspace writer must use the hardened write path (rejects
+    // `..`, root/drive prefixes, the workspace root itself, and dangling or
+    // escaping symlinks anywhere in `.animaos-swarm/todos.json`).
+    write_workspace_bytes(
+        workspace_root,
+        &format!("{TODO_DIRECTORY_NAME}/{TODO_FILE_NAME}"),
+        serialized.as_bytes(),
+        "todo_write",
+    )?;
 
     let completed = todos
         .iter()
@@ -290,14 +330,18 @@ pub(crate) struct AgentTodos {
 
 static AGENT_TODO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Workspace-relative path of one agent's task file. Hex-encoding `id` byte by
+/// byte keeps it a single path component (never `..` or a separator), so only
+/// the fixed `.animaos-swarm/agent-tasks` prefix can introduce a symlink escape.
+fn agent_todo_relative_path(id: &str) -> String {
+    let filename: String = id.bytes().map(|byte| format!("{byte:02x}")).collect();
+    format!("{TODO_DIRECTORY_NAME}/agent-tasks/{filename}.json")
+}
+
 fn agent_todo_path(root: Option<&Path>, id: &str) -> Result<PathBuf, String> {
     let root = workspace_root_path("agent tasks", root)?;
     let canonical = canonical_workspace_root(&root, "agent tasks")?;
-    let filename: String = id.bytes().map(|byte| format!("{byte:02x}")).collect();
-    Ok(canonical
-        .join(TODO_DIRECTORY_NAME)
-        .join("agent-tasks")
-        .join(format!("{filename}.json")))
+    Ok(canonical.join(agent_todo_relative_path(id)))
 }
 
 fn agent_todos_at(path: &Path) -> Result<AgentTodos, String> {
@@ -336,13 +380,31 @@ pub(crate) fn write_agent_todos(
     let _lock = AGENT_TODO_LOCK
         .lock()
         .map_err(|_| "Task store unavailable")?;
-    let path = agent_todo_path(root, id)?;
+    // Spec §14: every workspace writer must use the hardened write path. This
+    // atomic write can't go through `write_workspace_bytes` directly (that helper
+    // truncates in place), so its two checks are replicated by hand: resolve and
+    // validate the target up front, then re-verify the canonical parent stays
+    // inside the workspace after `create_dir_all` (mirrors `write_workspace_bytes`).
+    let workspace_root = workspace_root_path("agent tasks", root)?;
+    let relative_path = agent_todo_relative_path(id);
+    let path = resolve_workspace_write_path(&workspace_root, &relative_path, "agent tasks")?;
     if let Some(expected) = expected_revision {
         if agent_todos_at(&path)?.revision != expected {
             return Err("Tasks changed. Refresh before saving again.".into());
         }
     }
-    fs::create_dir_all(path.parent().expect("task parent")).map_err(|e| e.to_string())?;
+    let parent = path.parent().expect("task parent");
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let canonical_root = canonical_workspace_root(&workspace_root, "agent tasks")?;
+    let canonical_parent = parent.canonicalize().map_err(|error| {
+        format!("agent tasks path could not be resolved: {relative_path} ({error})")
+    })?;
+    ensure_path_within_workspace(
+        &canonical_root,
+        &canonical_parent,
+        "agent tasks",
+        &relative_path,
+    )?;
     let bytes = serde_json::to_vec_pretty(tasks).map_err(|e| e.to_string())?;
     atomicwrites::AtomicFile::new(&path, atomicwrites::AllowOverwrite)
         .write(|file| file.write_all(&bytes))
@@ -388,5 +450,230 @@ mod agent_tests {
             .unwrap()
             .starts_with(root.canonicalize().unwrap()));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    use anima_core::TaskStatus;
+    use std::sync::Arc;
+
+    fn todo_agent(id: &str) -> AgentState {
+        AgentState {
+            id: id.into(),
+            name: "todo-agent".into(),
+            status: anima_core::AgentStatus::Idle,
+            config: anima_core::AgentConfig {
+                name: "todo-agent".into(),
+                model: "test".into(),
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                provider: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            },
+            created_at_ms: 1,
+            token_usage: anima_core::TokenUsage::default(),
+        }
+    }
+
+    fn todo_context(root: &Path) -> ToolExecutionContext {
+        ToolExecutionContext::new(
+            Arc::new(tokio::sync::RwLock::new(anima_memory::MemoryManager::new())),
+            Arc::new(tokio::sync::RwLock::new(
+                crate::memory_embeddings::MemoryEmbeddingRuntime::disabled(),
+            )),
+            None,
+            crate::tools::ToolRegistry::new(),
+            crate::tools::new_shared_process_manager_with_limit(1),
+            Some(root.to_path_buf()),
+            None,
+        )
+    }
+
+    fn user_message() -> Message {
+        Message {
+            id: "todo-message".into(),
+            agent_id: "agent-cas".into(),
+            room_id: "room-a".into(),
+            content: Content::default(),
+            role: anima_core::MessageRole::User,
+            created_at_ms: 1,
+        }
+    }
+
+    fn write_call(items: &[&str]) -> ToolCall {
+        ToolCall {
+            id: "todo-write".into(),
+            name: "todo_write".into(),
+            args: std::collections::BTreeMap::from([(
+                "todos".to_string(),
+                DataValue::Array(
+                    items
+                        .iter()
+                        .map(|content| {
+                            DataValue::Object(std::collections::BTreeMap::from([
+                                ("content".to_string(), DataValue::String((*content).into())),
+                                ("status".to_string(), DataValue::String("pending".into())),
+                                (
+                                    "activeForm".to_string(),
+                                    DataValue::String(format!("Doing {content}")),
+                                ),
+                            ]))
+                        })
+                        .collect(),
+                ),
+            )]),
+        }
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("{label}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn todo_write_is_compare_and_swap_across_concurrent_runs() {
+        let root = temp_root("agent-todo-cas");
+        let baseline = read_agent_todos(Some(&root), "agent-cas").unwrap().revision;
+        let first = todo_context(&root).with_todo_baseline(Some(baseline.clone()));
+        let second = todo_context(&root).with_todo_baseline(Some(baseline));
+
+        let saved = execute_todo_write(
+            second,
+            todo_agent("agent-cas"),
+            user_message(),
+            write_call(&["From room B"]),
+        )
+        .await;
+        assert_eq!(saved.status, TaskStatus::Success);
+
+        let conflict = execute_todo_write(
+            first.clone(),
+            todo_agent("agent-cas"),
+            user_message(),
+            write_call(&["From room A"]),
+        )
+        .await;
+        assert_eq!(conflict.status, TaskStatus::Error);
+        let message = conflict.error.unwrap();
+        assert!(
+            message
+                .starts_with("Tasks changed since this run last saw them, so nothing was saved."),
+            "{message}"
+        );
+        assert!(
+            message.contains("[ ] 1. [pending] From room B"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("call todo_write again with the complete list."),
+            "{message}"
+        );
+        assert_eq!(
+            read_agent_todos(Some(&root), "agent-cas").unwrap().tasks[0].content,
+            "From room B"
+        );
+
+        let merged = execute_todo_write(
+            first,
+            todo_agent("agent-cas"),
+            user_message(),
+            write_call(&["From room B", "From room A"]),
+        )
+        .await;
+        assert_eq!(merged.status, TaskStatus::Success);
+        assert_eq!(
+            merged.data.unwrap().text,
+            "Todos updated (0 completed, 0 in progress, 2 pending). Proceed with current tasks."
+        );
+        assert_eq!(
+            read_agent_todos(Some(&root), "agent-cas")
+                .unwrap()
+                .tasks
+                .len(),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_read_refreshes_the_revision_a_run_writes_against() {
+        let root = temp_root("agent-todo-read");
+        let context = todo_context(&root).with_todo_baseline(Some("stale-revision".into()));
+
+        let read = execute_todo_read(
+            context.clone(),
+            todo_agent("agent-read"),
+            user_message(),
+            ToolCall {
+                id: "todo-read".into(),
+                name: "todo_read".into(),
+                args: std::collections::BTreeMap::new(),
+            },
+        )
+        .await;
+        assert_eq!(read.data.unwrap().text, "No todos set.");
+
+        let written = execute_todo_write(
+            context,
+            todo_agent("agent-read"),
+            user_message(),
+            write_call(&["Plan"]),
+        )
+        .await;
+        assert_eq!(written.status, TaskStatus::Success);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn todo_write_without_a_baseline_replaces_the_list() {
+        let root = temp_root("agent-todo-blind");
+
+        let written = execute_todo_write(
+            todo_context(&root),
+            todo_agent("agent-blind"),
+            user_message(),
+            write_call(&["Plan"]),
+        )
+        .await;
+
+        assert_eq!(written.status, TaskStatus::Success);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_agent_todos_rejects_symlinked_animaos_swarm_directory_pointing_outside() {
+        let sandbox = temp_root("agent-todo-symlink-sandbox");
+        let workspace = sandbox.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let outside = sandbox.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join(".animaos-swarm")).unwrap();
+
+        let task = TodoItem {
+            content: "Leak".into(),
+            status: "pending".into(),
+            active_form: "Leaking".into(),
+        };
+        let error = write_agent_todos(Some(&workspace), "agent-x", &[task], None)
+            .expect_err("symlinked .animaos-swarm directory must be rejected");
+        assert_eq!(
+            error,
+            format!(
+                "agent tasks path escapes workspace root: .animaos-swarm/agent-tasks/{}.json",
+                "agent-x"
+                    .bytes()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        );
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        fs::remove_dir_all(sandbox).unwrap();
     }
 }

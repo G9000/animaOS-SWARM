@@ -83,8 +83,28 @@ pub(crate) struct TaskRequest {
     pub(crate) metadata: Option<BTreeMap<String, Value>>,
 }
 
+/// Content metadata names the runtime reads as a durable retry key
+/// (`anima_core::content_retry_key`).
+const RUNTIME_RETRY_KEY_METADATA: [&str; 4] =
+    ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"];
+
 impl TaskRequest {
+    /// The run input without client-supplied retry keys: only daemon-owned
+    /// callers choose a runtime retry key, through `AgentRunRequest`.
     pub(crate) fn into_domain(self) -> Result<Content, &'static str> {
+        let mut content = self.into_domain_with_client_retry_key()?;
+        if let Some(metadata) = content.metadata.as_mut() {
+            for key in RUNTIME_RETRY_KEY_METADATA {
+                metadata.remove(key);
+            }
+        }
+        Ok(content)
+    }
+
+    /// The run input with any client retry key kept. Only swarm runs use this:
+    /// their HTTP retry contract recovers completed tool steps under the
+    /// client's key, and swarm step keys are scoped to the swarm's own agents.
+    pub(crate) fn into_domain_with_client_retry_key(self) -> Result<Content, &'static str> {
         let text = self
             .text
             .filter(|value| !value.is_empty())

@@ -189,11 +189,17 @@ pub(super) fn parse_anthropic_response(payload: &Value) -> Result<ModelGenerateR
     };
 
     let usage = if let Some(usage) = payload.get("usage") {
+        let cache_read = value_to_u64(usage.get("cache_read_input_tokens"));
+        let prompt = value_to_u64(usage.get("input_tokens"))
+            + cache_read
+            + value_to_u64(usage.get("cache_creation_input_tokens"));
+        let completion = value_to_u64(usage.get("output_tokens"));
         TokenUsage {
-            prompt_tokens: value_to_u64(usage.get("input_tokens")),
-            completion_tokens: value_to_u64(usage.get("output_tokens")),
-            total_tokens: value_to_u64(usage.get("input_tokens"))
-                + value_to_u64(usage.get("output_tokens")),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_prompt_tokens: cache_read,
+            reasoning_tokens: 0,
         }
     } else {
         TokenUsage::default()

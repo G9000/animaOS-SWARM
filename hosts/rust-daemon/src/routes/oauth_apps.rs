@@ -377,6 +377,7 @@ mod tests {
             oauth_apps,
             scheduler,
             jobs,
+            crate::history::HistoryWorkerOwner::new(),
             LocalOwnerPolicy::for_test(true, None),
             ApiKeyPolicy::for_test(None),
         )

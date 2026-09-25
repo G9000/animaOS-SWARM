@@ -5,6 +5,7 @@ mod gcalendar;
 mod memories;
 mod providers;
 mod schedules;
+mod sessions;
 mod shared;
 mod swarms;
 mod workspace;
@@ -15,8 +16,9 @@ pub(crate) use agencies::{
 };
 pub(crate) use agents::{
     AgentConfigRequest, AgentEnvelope, AgentProfileEnvelope, AgentProfileResponse,
-    AgentRecentMemoriesQuery, AgentRunEnvelope, AgentRuntimeSnapshotResponse, AgentUpdateRequest,
-    AgentsEnvelope, GenerateProfileRequest,
+    AgentRecentMemoriesQuery, AgentRunEnvelope, AgentRuntimeSnapshotResponse,
+    AgentSummariesEnvelope, AgentSummaryResponse, AgentUpdateRequest, AgentsEnvelope,
+    GenerateProfileRequest,
 };
 pub(crate) use connectors::*;
 pub(crate) use gcalendar::*;
@@ -32,6 +34,7 @@ pub(crate) use memories::{
 };
 pub(crate) use providers::{ProviderResponse, ProvidersEnvelope};
 pub(crate) use schedules::*;
+pub(crate) use sessions::*;
 pub(crate) use shared::{
     DeleteResponse, ErrorBody, HealthResponse, ReadinessResponse, TaskRequest, TaskResultResponse,
 };

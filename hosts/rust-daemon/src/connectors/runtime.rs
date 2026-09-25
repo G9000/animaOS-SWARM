@@ -20,7 +20,9 @@ use super::{
 use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
+use crate::history::HistoryDeletion;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
+use crate::runs::RunSource;
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
 use crate::state::DaemonState;
 
@@ -93,6 +95,7 @@ pub(crate) enum ConnectorRuntimeStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConnectorManagerError {
     AgentNotFound,
+    AgentBusy,
     ConnectorNotFound,
     AgentAlreadyConnected,
     PendingPairingNotFound,
@@ -111,6 +114,7 @@ impl fmt::Display for ConnectorManagerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::AgentNotFound => "agent not found",
+            Self::AgentBusy => "agent has a run in progress",
             Self::ConnectorNotFound => "connector not found",
             Self::AgentAlreadyConnected => "agent already has an active Telegram connector",
             Self::PendingPairingNotFound => "Telegram pairing candidate was not found",
@@ -898,10 +902,17 @@ impl ConnectorManager {
         if let Some(replay) = replay {
             return Ok(replay);
         }
-        let permit = self
+        // Only a unit of the agent's waiting budget is reserved here, without
+        // waiting (spec §16). The run then waits for the Telegram room, an
+        // agent slot, and a global permit, in that order (spec §4.3), and
+        // gives the unit back once it holds the permit.
+        if !self.runs.has_available_permit() {
+            return Err(ConnectorManagerError::Backpressure);
+        }
+        let waiting = self
             .runs
-            .try_admit()
-            .map_err(|_| ConnectorManagerError::Backpressure)?;
+            .try_take_waiting_unit(&connector.agent_id)
+            .ok_or(ConnectorManagerError::Backpressure)?;
         let commit_connector_id = connector.id.clone();
         let commit_agent_id = connector.agent_id.clone();
         let commit_room_id = connector.room_id.clone();
@@ -926,13 +937,16 @@ impl ConnectorManager {
             },
             room: RunRoom::Stable(connector.room_id.clone()),
             idempotency_key: Some(idempotency_key),
+            source: RunSource::Telegram,
+            source_ref: Some(connector.id.clone()),
+            parent: None,
         };
         let run = self
             .runs
-            .run_with_commit_admitted_and_rollback(
+            .run_budgeted_with_commit_waiting(
                 request,
-                permit,
-                move |state, snapshot, result| {
+                waiting,
+                move |state, outcome| {
                     let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
                         ApiError::service_unavailable("connector lifecycle changed during run")
                     })?;
@@ -948,18 +962,20 @@ impl ConnectorManager {
                             "connector worker changed during run",
                         ));
                     }
-                    let current = state
+                    let connector_unchanged = state
                         .connectors
                         .get(&commit_connector_id)
-                        .filter(|current| {
+                        .is_some_and(|current| {
                             current.is_active()
                                 && current.agent_id == commit_agent_id
                                 && current.room_id == commit_room_id
                                 && current.approved_chat.as_ref().map(|chat| &chat.id)
                                     == commit_chat_id.as_ref()
-                        })
-                        .ok_or_else(|| ApiError::not_found())?;
-                    if result.status == TaskStatus::Error || commit_chat_id.is_none() {
+                        });
+                    if !connector_unchanged {
+                        return Err(ApiError::not_found());
+                    }
+                    if outcome.result.status == TaskStatus::Error || commit_chat_id.is_none() {
                         return Ok(());
                     }
                     if state
@@ -976,33 +992,26 @@ impl ConnectorManager {
                             "connector outbound capacity is exhausted",
                         ));
                     }
-                    let assistant = snapshot
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|message| {
-                            message.room_id == current.room_id
-                                && message.role == MessageRole::Assistant
-                        })
-                        .cloned()
-                        .ok_or_else(|| {
-                            ApiError::bad_request("agent produced no assistant message")
-                        })?;
-                    let outbound_id = format!(
-                        "telegram:{}:web:{}:outbound",
-                        commit_connector_id, assistant.id
-                    );
+                    let (Some(reply_id), Some(reply)) = (
+                        outcome.reply_message_id.clone(),
+                        outcome.result.data.as_ref(),
+                    ) else {
+                        return Err(ApiError::bad_request("agent produced no assistant message"));
+                    };
+                    let outbound_id =
+                        format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
                     let outbound = TelegramOutboundRecord {
                         id: outbound_id.clone(),
                         connector_id: commit_connector_id.clone(),
                         agent_id: commit_agent_id.clone(),
                         room_id: commit_room_id.clone(),
-                        assistant_message_id: assistant.id,
-                        text: assistant.content.text,
+                        assistant_message_id: reply_id,
+                        text: reply.text.clone(),
                         created_at_ms: now_ms(),
                         delivered_at_ms: None,
                         attempts: 0,
                         delivery_state: OutboundDeliveryState::Pending,
+                        message_pruned: false,
                     };
                     if let Some(existing) = state.outbound.get(&outbound_id) {
                         if existing != &outbound {
@@ -1018,7 +1027,7 @@ impl ConnectorManager {
                     }
                     Ok(())
                 },
-                move |state, baseline| {
+                move |state| {
                     if let Some(inserted) = rollback_outbound
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1028,10 +1037,7 @@ impl ConnectorManager {
                             state.outbound.remove(&inserted.id);
                         }
                     }
-                    state
-                        .rollback_agent_runtime(baseline)
-                        .map(|_| ())
-                        .map_err(ApiError::service_unavailable)
+                    Ok(())
                 },
             )
             .await
@@ -1224,13 +1230,16 @@ impl ConnectorManager {
             },
             room: RunRoom::Stable(inbound.room_id.clone()),
             idempotency_key: Some(inbound.run_idempotency_key.clone()),
+            source: RunSource::Telegram,
+            source_ref: Some(format!("{}:{}", inbound.connector_id, inbound.update_id)),
+            parent: None,
         };
 
         let run = self
             .runs
             .run_with_commit_waiting(
                 request,
-                move |state, snapshot, result| {
+                move |state, outcome| {
                     let current = state
                         .inbound
                         .get(&commit_key)
@@ -1242,7 +1251,7 @@ impl ConnectorManager {
                         return Err(ApiError::bad_request("durable inbound changed during run"));
                     }
 
-                    if result.status == TaskStatus::Error {
+                    if outcome.result.status == TaskStatus::Error {
                         let target = state
                             .inbound
                             .get_mut(&commit_key)
@@ -1255,29 +1264,24 @@ impl ConnectorManager {
                         return Ok(());
                     }
 
-                    let assistant = snapshot
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|message| {
-                            message.room_id == commit_room_id
-                                && message.role == MessageRole::Assistant
-                        })
-                        .cloned()
-                        .ok_or_else(|| {
-                            ApiError::bad_request("agent produced no assistant message")
-                        })?;
+                    let (Some(reply_id), Some(reply)) = (
+                        outcome.reply_message_id.clone(),
+                        outcome.result.data.as_ref(),
+                    ) else {
+                        return Err(ApiError::bad_request("agent produced no assistant message"));
+                    };
                     let candidate = TelegramOutboundRecord {
                         id: commit_outbound_id.clone(),
                         connector_id: commit_connector_id.clone(),
                         agent_id: commit_agent_id.clone(),
                         room_id: commit_room_id.clone(),
-                        assistant_message_id: assistant.id,
-                        text: assistant.content.text,
+                        assistant_message_id: reply_id,
+                        text: reply.text.clone(),
                         created_at_ms: now_ms(),
                         delivered_at_ms: None,
                         attempts: 0,
                         delivery_state: OutboundDeliveryState::Pending,
+                        message_pruned: false,
                     };
                     if let Some(existing) = state.outbound.get(&commit_outbound_id) {
                         if existing.connector_id != candidate.connector_id
@@ -1316,7 +1320,7 @@ impl ConnectorManager {
                     delta.removed_terminal = removed_terminal;
                     Ok(())
                 },
-                move |state, baseline| {
+                move |state| {
                     let delta = rollback_delta
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1341,10 +1345,7 @@ impl ConnectorManager {
                             .entry(rollback_outbound_id)
                             .or_insert(previous);
                     }
-                    state
-                        .rollback_agent_runtime(baseline)
-                        .map(|_| ())
-                        .map_err(ApiError::service_unavailable)
+                    Ok(())
                 },
             )
             .await;
@@ -1516,8 +1517,15 @@ impl ConnectorManager {
         tokio::spawn(async move {
             let _lifecycle = manager.lifecycle_lock.lock().await;
             manager.ensure_open()?;
-            if manager.state.read().await.get_agent(&agent_id).is_none() {
-                return Err(ConnectorManagerError::AgentNotFound);
+            {
+                let state = manager.state.read().await;
+                if state.get_agent(&agent_id).is_none() {
+                    return Err(ConnectorManagerError::AgentNotFound);
+                }
+                // Deleting mid-run would discard that run's commit (spec §4.4 item 6).
+                if state.in_flight_runs(&agent_id) > 0 {
+                    return Err(ConnectorManagerError::AgentBusy);
+                }
             }
             let connectors = manager
                 .state
@@ -1558,7 +1566,18 @@ impl ConnectorManager {
             }
 
             let _transaction = manager.mutation_lock.lock().await;
-            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, persist) = {
+            // A run can start between the first check and this transaction; runs
+            // record themselves under this same transaction, so this check is final.
+            if manager.state.read().await.in_flight_runs(&agent_id) > 0 {
+                manager.restore_agent_delete_configuration(&previous).await?;
+                return Err(ConnectorManagerError::AgentBusy);
+            }
+            // Recorded in the same save as the removal below (Controller
+            // ruling 2, M2 pre-flight audit; Task 6's durable-deletion
+            // protocol): a crash right after a successful save still replays
+            // this deletion on restart.
+            let deletion = HistoryDeletion::agent(&agent_id);
+            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, previous_runs, previous_sessions, persist) = {
                 let mut state = manager.state.write().await;
                 let agent_snapshot = state.get_agent(&agent_id);
                 let previous_connectors = previous
@@ -1603,6 +1622,16 @@ impl ConnectorManager {
                 }
                 state.schedules.retain(|_, schedule| schedule.agent_id != agent_id);
                 state.remove_agent(&agent_id);
+                // Without this, the deleted agent's terminal runs would stay
+                // in the ledger until a restart: `unmirrored_terminal` skips
+                // agents that no longer exist, so they would never be
+                // mirrored and never pruned (Controller ruling 2, M2
+                // pre-flight audit, carried forward from Task 6).
+                let previous_runs = state.runs.remove_terminal_for_agent(&agent_id);
+                // Without this, a deleted agent's session records stay in the
+                // registry until a restart (fix round 1, M2 review).
+                let previous_sessions = state.sessions.remove_for_agent(&agent_id);
+                state.record_history_deletion(deletion.clone());
                 let persist = state.control_plane_persist_request();
                 (
                     agent_snapshot,
@@ -1610,6 +1639,8 @@ impl ConnectorManager {
                     previous_inbound,
                     previous_outbound,
                     previous_schedules,
+                    previous_runs,
+                    previous_sessions,
                     persist,
                 )
             };
@@ -1623,6 +1654,13 @@ impl ConnectorManager {
                     state.inbound = previous_inbound;
                     state.outbound = previous_outbound;
                     state.schedules = previous_schedules;
+                    for run in previous_runs {
+                        state.runs.insert(run);
+                    }
+                    for session in previous_sessions {
+                        state.sessions.insert(session);
+                    }
+                    state.clear_history_deletion(&deletion);
                     if let Some(agent_snapshot) = agent_snapshot {
                         state
                             .restore_removed_agent(agent_snapshot)
@@ -1632,6 +1670,16 @@ impl ConnectorManager {
                 manager.restore_agent_delete_configuration(&previous).await?;
                 drop(_transaction);
                 return Err(ConnectorManagerError::Persistence);
+            }
+            // Durable now: the history rows may go (spec §3.3).
+            let history = manager.state.read().await.history.clone();
+            history.enqueue_agent_deletion(&agent_id);
+            // D1 (final fix wave): forget the deleted agent's ids from
+            // `HistoryService`'s mirrored set, the same as a session delete
+            // does (`routes::sessions::delete_session`), or an id already
+            // mirrored before the delete never leaves the set.
+            if let Some(snapshot) = &agent_snapshot {
+                history.forget_mirrored(snapshot.messages.iter().map(|message| message.id.as_str()));
             }
             for (connector, _, _) in &previous {
                 manager.statuses.lock().await.remove(&connector.id);
@@ -2524,6 +2572,7 @@ mod tests {
         InboundProcessingState, TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata,
         TelegramSenderMetadata,
     };
+    use crate::runs::RunSource;
     use crate::state::DaemonState;
 
     #[derive(Default)]
@@ -3528,6 +3577,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 0,
                     delivery_state: crate::connectors::OutboundDeliveryState::Pending,
+                    message_pruned: false,
                 },
             );
         }
@@ -4918,7 +4968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serialized_rollback_preserves_a_turn_committed_while_connector_waited() {
+    async fn cross_room_rollback_preserves_a_turn_committed_while_the_connector_ran() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
@@ -4928,8 +4978,7 @@ mod tests {
         daemon.create_agent(test_config()).unwrap();
         let state = Arc::new(RwLock::new(daemon));
         let agent_id = state.read().await.list_agents()[0].state.id.clone();
-        let limiter = Arc::new(Semaphore::new(2));
-        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(2)));
         let manager = ConnectorManager::new(
             Arc::clone(&state),
             runs.clone(),
@@ -4939,7 +4988,7 @@ mod tests {
         let connector = manager
             .create(
                 agent_id.clone(),
-                TelegramBotToken::parse("42:serialized-token").unwrap(),
+                TelegramBotToken::parse("42:cross-room-token").unwrap(),
             )
             .await
             .unwrap();
@@ -4968,7 +5017,7 @@ mod tests {
         let original = state.read().await.get_agent(&agent_id).unwrap();
 
         let temporary = std::env::temp_dir().join(format!(
-            "anima-connector-serialized-rollback-{}-{}",
+            "anima-connector-cross-room-rollback-{}-{}",
             std::process::id(),
             super::now_ms()
         ));
@@ -4990,36 +5039,32 @@ mod tests {
                     },
                     room: RunRoom::Generated,
                     idempotency_key: None,
+                    source: RunSource::Api,
+                    source_ref: None,
+                    parent: None,
                 })
                 .await
         });
         entered
             .acquire()
             .await
-            .expect("intervening turn should hold the per-agent lock")
+            .expect("the intervening turn should enter the model")
             .forget();
-
         let processing_manager = manager.clone();
         let connector_id = connector.id.clone();
         let processing =
             tokio::spawn(
                 async move { processing_manager.process_pending_once(connector_id).await },
             );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while limiter.available_permits() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("connector should acquire global admission and wait on the agent lock");
-
-        release.add_permits(1);
-        intervening.await.unwrap().unwrap();
         entered
             .acquire()
             .await
-            .expect("connector should enter only after the intervening turn commits")
+            .expect("the connector turn runs concurrently in its own room")
             .forget();
+
+        // The intervening turn waited on the gate first, so it is released first.
+        release.add_permits(1);
+        intervening.await.unwrap().unwrap();
         let committed_intervening = state.read().await.get_agent(&agent_id).unwrap();
         assert_eq!(
             committed_intervening.messages.len(),
@@ -5111,6 +5156,198 @@ mod tests {
         assert_eq!(result, Ok(true));
     }
 
+    /// An owner thread (no paired chat) whose room `blocker` holds without a
+    /// global permit, so the next owner send passes the permit pre-check and
+    /// then waits for that room. Its agent's model calls park on the gate.
+    struct BlockedOwnerThread {
+        manager: ConnectorManager,
+        runs: AgentRunCoordinator,
+        agent_id: String,
+        connector_id: String,
+        blocker: crate::agent_runs::RunReservation,
+        entered: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    async fn owner_thread_with_blocked_room(limiter: Arc<Semaphore>) -> BlockedOwnerThread {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), limiter);
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:owner-waiting").unwrap(),
+            )
+            .await
+            .unwrap();
+        manager.stop_worker(&connector.id).await.unwrap();
+        let blocker = runs
+            .admit(
+                &agent_id,
+                &connector.room_id,
+                crate::agent_runs::AdmitMode::TryNow,
+            )
+            .await
+            .expect("the owner thread's room is free");
+        BlockedOwnerThread {
+            manager,
+            runs,
+            agent_id,
+            connector_id: connector.id,
+            blocker,
+            entered,
+            release,
+        }
+    }
+
+    fn spawn_owner_send(
+        manager: &ConnectorManager,
+        agent_id: &str,
+        connector_id: &str,
+        key: &str,
+    ) -> tokio::task::JoinHandle<
+        Result<(crate::routes::AgentRunEnvelope, bool), super::ConnectorManagerError>,
+    > {
+        let manager = manager.clone();
+        let agent_id = agent_id.to_string();
+        let connector_id = connector_id.to_string();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            manager
+                .send_from_owner(agent_id, connector_id, format!("owner turn {key}"), key)
+                .await
+        })
+    }
+
+    /// Once past the permit pre-check an owner send waits for a global
+    /// permit instead of failing (spec §4.3), and holds one unit of its
+    /// agent's waiting budget only while it waits.
+    #[tokio::test]
+    async fn owner_send_waits_for_a_permit_and_holds_a_waiting_unit_only_while_waiting() {
+        let limiter = Arc::new(Semaphore::new(1));
+        let BlockedOwnerThread {
+            manager,
+            runs,
+            agent_id,
+            connector_id,
+            blocker,
+            entered,
+            release,
+        } = owner_thread_with_blocked_room(Arc::clone(&limiter)).await;
+
+        let sending = spawn_owner_send(&manager, &agent_id, &connector_id, "owner-waits");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!sending.is_finished(), "the send waits for its room");
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            1,
+            "a waiting owner send holds one unit"
+        );
+
+        // The only permit is taken, then the room frees: the send now waits
+        // for a permit rather than failing.
+        let elsewhere = limiter
+            .clone()
+            .try_acquire_owned()
+            .expect("the permit is free");
+        drop(blocker);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !sending.is_finished(),
+            "an owner send waits for a permit instead of failing"
+        );
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            1,
+            "still waiting, so it keeps its unit"
+        );
+
+        drop(elsewhere);
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .expect("the send takes the freed permit and enters the model")
+            .unwrap()
+            .forget();
+        assert_eq!(
+            runs.waiting_runs(&agent_id),
+            0,
+            "a send holding its permit no longer holds a unit"
+        );
+        release.add_permits(1);
+        let (run, delivery_queued) = sending.await.unwrap().expect("the owner send succeeds");
+        assert_eq!(run.result.status, "success");
+        assert!(
+            !delivery_queued,
+            "an unpaired owner thread queues no delivery"
+        );
+        manager.shutdown().await;
+    }
+
+    /// Owner sends share their agent's waiting budget (spec §16): with eight
+    /// sends waiting, the next gets the saturation backpressure at once.
+    #[tokio::test]
+    async fn owner_sends_beyond_the_waiting_budget_get_backpressure_at_once() {
+        use crate::agent_runs::MAX_QUEUED_RUNS_PER_AGENT;
+
+        let BlockedOwnerThread {
+            manager,
+            runs,
+            agent_id,
+            connector_id,
+            blocker,
+            release,
+            ..
+        } = owner_thread_with_blocked_room(Arc::new(Semaphore::new(4))).await;
+        let waiting: Vec<_> = (1..=MAX_QUEUED_RUNS_PER_AGENT)
+            .map(|index| {
+                spawn_owner_send(
+                    &manager,
+                    &agent_id,
+                    &connector_id,
+                    &format!("owner-{index}"),
+                )
+            })
+            .collect();
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(1),
+            spawn_owner_send(&manager, &agent_id, &connector_id, "owner-refused"),
+        )
+        .await
+        .expect("the ninth waiting send is answered at once")
+        .unwrap();
+        assert_eq!(
+            refused.unwrap_err(),
+            super::ConnectorManagerError::Backpressure
+        );
+
+        drop(blocker);
+        release.add_permits(MAX_QUEUED_RUNS_PER_AGENT);
+        for send in waiting {
+            assert!(send.await.unwrap().is_ok(), "every waiting send runs");
+        }
+        assert_eq!(runs.waiting_runs(&agent_id), 0);
+        manager.shutdown().await;
+    }
+
     #[tokio::test]
     async fn processing_commits_agent_message_inbound_and_outbox_then_delivers_stored_text() {
         let state = state_with_agent();
@@ -5187,6 +5424,7 @@ mod tests {
                         delivered_at_ms: Some(1),
                         attempts: 1,
                         delivery_state: crate::connectors::OutboundDeliveryState::Delivered,
+                        message_pruned: false,
                     },
                 );
             }
@@ -5360,6 +5598,7 @@ mod tests {
                         delivered_at_ms: None,
                         attempts: 1,
                         delivery_state: crate::connectors::OutboundDeliveryState::Failed,
+                        message_pruned: false,
                     },
                 );
             }
@@ -5457,6 +5696,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 1,
                     delivery_state: crate::connectors::OutboundDeliveryState::Failed,
+                    message_pruned: false,
                 },
             );
         }
@@ -6027,6 +6267,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 0,
                     delivery_state: crate::connectors::OutboundDeliveryState::Pending,
+                    message_pruned: false,
                 },
             );
         }
@@ -6326,6 +6567,17 @@ mod tests {
         manager.delete_agent(agent_id.clone()).await.unwrap();
         assert!(!state.read().await.connectors[&connector.id].is_active());
         assert!(state.read().await.get_agent(&agent_id).is_none());
+        // Controller ruling 2 (M2 pre-flight audit): the deletion is recorded
+        // durably in the same save as the agent's removal.
+        assert!(
+            state
+                .read()
+                .await
+                .pending_history_deletions
+                .iter()
+                .any(|deletion| deletion.agent_id == agent_id && deletion.session_id.is_none()),
+            "the agent's history deletion is recorded in the saved snapshot"
+        );
         manager.shutdown().await;
     }
 
@@ -6368,8 +6620,231 @@ mod tests {
             "42:agent-delete-token"
         );
         assert_eq!(manager.worker_count().await, 1);
+        // Controller ruling 2 (M2 pre-flight audit): a failed save leaves no
+        // pending history deletion behind, matching the restored agent.
+        assert!(
+            state.read().await.pending_history_deletions.is_empty(),
+            "a failed save leaves no pending entry"
+        );
         manager.shutdown().await;
         std::fs::remove_dir_all(invalid_path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_through_the_manager_is_durable_and_a_flush_clears_its_rows() {
+        // Fix round 1 (M2 review): the two tests above never exercise a real
+        // control-plane store or a flush, so deleting `remove_terminal_for_agent`
+        // or `enqueue_agent_deletion`, or reordering `record_history_deletion`
+        // after the persist request is built, would leave every test green.
+        // This test goes through `ConnectorManager::delete_agent` itself, with a
+        // real JSON store, a mirrored message, a terminal run, and a session
+        // record, then flushes with the coordinator's own transaction mutex.
+        use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+        use crate::history::MessagePageQuery;
+        use crate::runs::{RunRecord, RunSource as RunLedgerSource, RunStart, RunStatus};
+        use crate::sessions::test_support::{message, seed_messages};
+        use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+        use anima_core::MessageRole;
+
+        let state = state_with_agent();
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let survivor_id = state
+            .write()
+            .await
+            .create_agent(AgentConfig {
+                name: "survivor".into(),
+                ..test_config()
+            })
+            .unwrap()
+            .state
+            .id;
+        let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        let manager = ConnectorManager::new(
+            Arc::clone(&state),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(FakeTransport::default()),
+        );
+        let transactions = runs.control_plane_transactions();
+
+        state.write().await.sessions.insert(SessionRecord::new(
+            &agent_id,
+            "chat:one",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Plans".into(),
+            TitleSource::FirstMessage,
+            1,
+        ));
+        seed_messages(
+            &mut *state.write().await,
+            &agent_id,
+            vec![message(
+                &agent_id,
+                "m1",
+                "chat:one",
+                MessageRole::User,
+                "hello",
+                1,
+            )],
+        );
+        seed_messages(
+            &mut *state.write().await,
+            &survivor_id,
+            vec![message(
+                &survivor_id,
+                "s1",
+                "chat:one",
+                MessageRole::User,
+                "unrelated",
+                1,
+            )],
+        );
+        let history = state.read().await.history.clone();
+        history.flush_once(&state, &transactions, 1).await.unwrap();
+        let mirrored = history
+            .store()
+            .page_messages(&MessagePageQuery {
+                agent_id: agent_id.clone(),
+                session_id: "chat:one".into(),
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mirrored.len(), 1, "the message is mirrored before deleting");
+        assert!(
+            history.is_mirrored("m1"),
+            "the message is mirrored before deleting"
+        );
+
+        let run_id = {
+            let mut guard = state.write().await;
+            let mut run = RunRecord::running(
+                RunStart {
+                    agent_id: agent_id.clone(),
+                    session_id: "chat:one".into(),
+                    source: RunLedgerSource::Api,
+                    source_ref: None,
+                    idempotency_key: None,
+                    text: "hi".into(),
+                    model: "gpt-5.4".into(),
+                    provider: None,
+                    parent_run_id: None,
+                },
+                1,
+            );
+            run.finish(RunStatus::Completed, None, 1);
+            let id = run.id.clone();
+            guard.runs.insert(run);
+            id
+        };
+
+        let path = std::env::temp_dir().join(format!(
+            "anima-agent-delete-durable-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let store = ControlPlaneStoreConfig::Json(path.clone());
+        state
+            .write()
+            .await
+            .set_control_plane_store(Some(store.clone()));
+
+        manager.delete_agent(agent_id.clone()).await.unwrap();
+
+        // D1 (mirrored-set leak, final fix wave): `delete_agent` must forget
+        // the deleted agent's ids from `HistoryService`'s mirrored set itself,
+        // the same as a session delete does, or they never leave it (the
+        // rows are gone from the store immediately below, before a restart
+        // could ever repopulate the set from scratch).
+        assert!(
+            !history.is_mirrored("m1"),
+            "delete_agent forgets the deleted agent's ids from the mirrored set"
+        );
+
+        // The saved snapshot (not just in-memory state) holds the deletion and
+        // excludes the agent's runs and session records.
+        let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+        assert!(
+            saved
+                .pending_history_deletions
+                .iter()
+                .any(|deletion| deletion.agent_id == agent_id && deletion.session_id.is_none()),
+            "the saved snapshot records the deletion"
+        );
+        assert!(
+            saved.runs.iter().all(|run| run.agent_id != agent_id),
+            "the saved snapshot holds none of the agent's runs"
+        );
+        assert!(
+            saved
+                .sessions
+                .iter()
+                .all(|session| session.agent_id != agent_id),
+            "the saved snapshot holds none of the agent's sessions"
+        );
+        assert!(
+            state
+                .read()
+                .await
+                .sessions
+                .get(&agent_id, "chat:one")
+                .is_none(),
+            "the agent's session records leave the registry immediately, not just the snapshot"
+        );
+        // Neither the saved snapshot nor a flush would fail to exclude a
+        // lingering run of a deleted agent -- both independently filter to
+        // live agents already -- so this is the only assertion that would
+        // catch a regressed (skipped) `remove_terminal_for_agent` call.
+        assert!(
+            state.read().await.runs.get(&run_id).is_none(),
+            "the agent's terminal run leaves the ledger immediately, not just the snapshot"
+        );
+
+        let report = history.flush_once(&state, &transactions, 2).await.unwrap();
+        assert_eq!(report.deletions, 1);
+
+        let after = history
+            .store()
+            .page_messages(&MessagePageQuery {
+                agent_id: agent_id.clone(),
+                session_id: "chat:one".into(),
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert!(after.is_empty(), "the flush removes the agent's rows");
+        assert_eq!(
+            history.store().get_run(&run_id).await.unwrap(),
+            None,
+            "the flush never mirrors the deleted agent's run"
+        );
+        assert!(
+            state.read().await.pending_history_deletions.is_empty(),
+            "the flush clears the pending entry once applied"
+        );
+        let survivor_rows = history
+            .store()
+            .page_messages(&MessagePageQuery {
+                agent_id: survivor_id.clone(),
+                session_id: "chat:one".into(),
+                before: None,
+                limit: 10,
+                include_hidden: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            survivor_rows.len(),
+            1,
+            "an unrelated agent's rows are untouched"
+        );
+
+        manager.shutdown().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
@@ -6520,6 +6995,7 @@ mod tests {
                         delivered_at_ms,
                         attempts: 1,
                         delivery_state,
+                        message_pruned: false,
                     },
                 );
             }
@@ -6586,6 +7062,7 @@ mod tests {
                     delivered_at_ms,
                     attempts: 1,
                     delivery_state: state,
+                    message_pruned: false,
                 },
             );
         }
@@ -6620,6 +7097,7 @@ mod tests {
                         delivered_at_ms: Some(now - 1_000 + index),
                         attempts: 1,
                         delivery_state: OutboundDeliveryState::Delivered,
+                        message_pruned: false,
                     },
                 );
             }
@@ -6642,6 +7120,7 @@ mod tests {
                     delivered_at_ms: None,
                     attempts: 1,
                     delivery_state: state,
+                    message_pruned: false,
                 },
             );
         }
@@ -6767,6 +7246,82 @@ mod tests {
         }
         assert_eq!(delay, super::POLL_RETRY_MAX);
         assert_eq!(super::next_poll_backoff(delay), super::POLL_RETRY_MAX);
+    }
+
+    #[tokio::test]
+    async fn agent_deletion_is_rejected_while_a_run_is_in_flight() {
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut daemon = DaemonState::with_model_adapter(Arc::new(GateModelAdapter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }));
+        daemon.create_agent(test_config()).unwrap();
+        let state = Arc::new(RwLock::new(daemon));
+        let agent_id = state.read().await.list_agents()[0].state.id.clone();
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let manager = manager(
+            Arc::clone(&state),
+            credentials.clone(),
+            Arc::new(FakeTransport::default()),
+        );
+        let connector = manager
+            .create(
+                agent_id.clone(),
+                TelegramBotToken::parse("42:busy-delete").unwrap(),
+            )
+            .await
+            .unwrap();
+        let running = {
+            let runs = manager.runs.clone();
+            let agent_id = agent_id.clone();
+            tokio::spawn(async move {
+                runs.run(AgentRunRequest {
+                    agent_id,
+                    content: Content {
+                        text: "stay busy".into(),
+                        ..Content::default()
+                    },
+                    room: RunRoom::Stable("direct:busy".into()),
+                    idempotency_key: None,
+                    source: RunSource::Api,
+                    source_ref: None,
+                    parent: None,
+                })
+                .await
+            })
+        };
+        entered
+            .acquire()
+            .await
+            .expect("the run should enter the model")
+            .forget();
+
+        assert_eq!(
+            manager.delete_agent(agent_id.clone()).await.unwrap_err(),
+            super::ConnectorManagerError::AgentBusy
+        );
+        assert!(state.read().await.get_agent(&agent_id).is_some());
+        assert_eq!(state.read().await.connectors[&connector.id], connector);
+        assert_eq!(
+            credentials
+                .load(&connector.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "42:busy-delete"
+        );
+        assert_eq!(manager.worker_count().await, 1);
+
+        release.add_permits(1);
+        running.await.unwrap().expect("the run commits normally");
+        manager
+            .delete_agent(agent_id.clone())
+            .await
+            .expect("deletion succeeds once no run is in flight");
+        assert!(state.read().await.get_agent(&agent_id).is_none());
+        manager.shutdown().await;
     }
 
     fn invalid_snapshot_directory(label: &str) -> std::path::PathBuf {

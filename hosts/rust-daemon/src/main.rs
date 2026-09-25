@@ -32,6 +32,10 @@ async fn main() -> io::Result<()> {
             "ANIMAOS_RS_MAX_CONCURRENT_RUNS",
             default_config.max_concurrent_runs,
         )?,
+        max_runs_per_agent: validate_max_runs_per_agent(parse_env_usize(
+            "ANIMAOS_RS_MAX_RUNS_PER_AGENT",
+            default_config.max_runs_per_agent,
+        )?)?,
         max_background_processes: parse_env_usize(
             "ANIMAOS_RS_MAX_BACKGROUND_PROCESSES",
             default_config.max_background_processes,
@@ -51,6 +55,7 @@ async fn main() -> io::Result<()> {
         run_timeout_secs = config.run_request_timeout.as_secs(),
         persistence_mode = config.persistence_mode.as_str(),
         max_concurrent_runs = config.max_concurrent_runs,
+        max_runs_per_agent = config.max_runs_per_agent,
         max_background_processes = config.max_background_processes,
         runtime_memory_store = runtime_memory_store_label(),
         control_plane_durability = control_plane_store_label(),
@@ -100,6 +105,22 @@ fn parse_env_usize(name: &str, default: usize) -> io::Result<usize> {
             format!("failed to read {name}: {error}"),
         )),
     }
+}
+
+/// Keeps `ANIMAOS_RS_MAX_RUNS_PER_AGENT` within the same hard limit that
+/// `AgentRunCoordinator::with_max_runs_per_agent` clamps to
+/// (`anima_daemon::agent_runs::MAX_RUNS_PER_AGENT_LIMIT`), so a misconfigured
+/// value is rejected at startup instead of being silently clamped.
+const MAX_RUNS_PER_AGENT_UPPER_BOUND: usize = 64;
+
+fn validate_max_runs_per_agent(parsed: usize) -> io::Result<usize> {
+    if parsed > MAX_RUNS_PER_AGENT_UPPER_BOUND {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ANIMAOS_RS_MAX_RUNS_PER_AGENT must be between 1 and 64",
+        ));
+    }
+    Ok(parsed)
 }
 
 fn parse_env_u32(name: &str, default: u32) -> io::Result<u32> {
@@ -179,4 +200,25 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_runs_per_agent_above_64_is_rejected() {
+        let error = validate_max_runs_per_agent(65).expect_err("65 exceeds the limit");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            error.to_string(),
+            "ANIMAOS_RS_MAX_RUNS_PER_AGENT must be between 1 and 64"
+        );
+    }
+
+    #[test]
+    fn max_runs_per_agent_at_or_below_64_is_accepted() {
+        assert_eq!(validate_max_runs_per_agent(64).unwrap(), 64);
+        assert_eq!(validate_max_runs_per_agent(1).unwrap(), 1);
+    }
 }

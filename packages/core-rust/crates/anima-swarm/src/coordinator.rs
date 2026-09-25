@@ -824,16 +824,7 @@ impl SwarmCoordinator {
 
         let mut token_usage = TokenUsage::default();
         for token_hook in token_hooks {
-            let snapshot = token_hook();
-            token_usage.prompt_tokens = token_usage
-                .prompt_tokens
-                .saturating_add(snapshot.prompt_tokens);
-            token_usage.completion_tokens = token_usage
-                .completion_tokens
-                .saturating_add(snapshot.completion_tokens);
-            token_usage.total_tokens = token_usage
-                .total_tokens
-                .saturating_add(snapshot.total_tokens);
+            token_usage.saturating_add(&token_hook());
         }
 
         self.with_state(|state| {
@@ -841,7 +832,9 @@ impl SwarmCoordinator {
                 && self.inner.usage_generation.load(Ordering::Acquire) == generation
                 && state.completed_at.is_none()
             {
-                // A slower poll may finish after a newer model response was observed.
+                // A slower poll may finish after a newer model response was observed, so
+                // each field is merged with max rather than summed; this applies to the
+                // cache/reasoning fields too so they are not silently dropped here.
                 state.token_usage.prompt_tokens = state
                     .token_usage
                     .prompt_tokens
@@ -852,6 +845,14 @@ impl SwarmCoordinator {
                     .max(token_usage.completion_tokens);
                 state.token_usage.total_tokens =
                     state.token_usage.total_tokens.max(token_usage.total_tokens);
+                state.token_usage.cached_prompt_tokens = state
+                    .token_usage
+                    .cached_prompt_tokens
+                    .max(token_usage.cached_prompt_tokens);
+                state.token_usage.reasoning_tokens = state
+                    .token_usage
+                    .reasoning_tokens
+                    .max(token_usage.reasoning_tokens);
             }
         });
     }

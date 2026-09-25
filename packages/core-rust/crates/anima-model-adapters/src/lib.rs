@@ -6,6 +6,7 @@ mod catalog;
 mod chatgpt;
 mod common;
 mod google;
+mod models;
 mod ollama;
 mod openai_compatible;
 mod stream;
@@ -13,6 +14,10 @@ mod stream;
 pub use adapter::ProviderModelAdapter;
 pub use catalog::provider_definitions;
 pub use chatgpt::ChatGptResponsesAdapter;
+pub use models::{
+    estimate_cost_micros, model_info, model_table, price_usage, CostEstimate, ModelInfo,
+    ModelPricing, PRICING_TABLE_DATE,
+};
 pub use stream::DeterministicModelAdapter;
 
 #[derive(Clone)]

@@ -2,13 +2,38 @@ use anima_memory::RecentMemoryOptions;
 
 use super::contracts::{
     AgentConfigRequest, AgentEnvelope, AgentRecentMemoriesQuery, AgentRunEnvelope,
-    AgentRuntimeSnapshotResponse, AgentUpdateRequest, AgentsEnvelope, DeleteResponse,
-    MemoriesEnvelope, MemoryResponse, TaskRequest,
+    AgentRuntimeSnapshotResponse, AgentSummariesEnvelope, AgentSummaryResponse, AgentUpdateRequest,
+    AgentsEnvelope, DeleteResponse, MemoriesEnvelope, MemoryResponse, TaskRequest,
 };
 use super::ApiError;
-use crate::agent_runs::{AgentRunCoordinator, AgentRunPermit, AgentRunRequest, RunRoom};
+use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom, RUN_ADMISSION_SATURATED};
 use crate::app::SharedDaemonState;
+use crate::runs::RunSource;
 use crate::state::UpdateAgentError;
+
+pub(crate) const AGENT_BUSY_MESSAGE: &str =
+    "Agent has a run in progress; wait for it to finish before deleting it";
+
+/// Rooms owned by connectors, automations, jobs, agent-to-agent requests, and
+/// mapped legacy sessions; the generic run route may not write into them, so
+/// a client `roomId` can never alias a mapped `legacy-room:<hash>` session id
+/// (spec §3.1).
+const RESERVED_ROOM_PREFIXES: [&str; 5] = [
+    "telegram:",
+    "schedule:",
+    "job:",
+    "peer:",
+    crate::sessions::LEGACY_ROOM_SESSION_PREFIX,
+];
+
+/// `RESERVED_ROOM_PREFIXES` spelled out for the rejection message below, so
+/// the wording can't drift out of sync with the list it describes.
+fn reserved_room_prefix_list() -> String {
+    let (last, rest) = RESERVED_ROOM_PREFIXES
+        .split_last()
+        .expect("RESERVED_ROOM_PREFIXES is non-empty");
+    format!("{}, and {last}", rest.join(", "))
+}
 
 pub(crate) async fn handle_create_agent(
     body: Vec<u8>,
@@ -52,6 +77,15 @@ pub(crate) async fn handle_list_agents(
     })
 }
 
+pub(crate) async fn handle_list_agent_summaries(
+    state: &SharedDaemonState,
+) -> AgentSummariesEnvelope {
+    let summaries = state.read().await.agent_summaries();
+    AgentSummariesEnvelope {
+        agents: summaries.iter().map(AgentSummaryResponse::from).collect(),
+    }
+}
+
 pub(crate) async fn handle_get_agent(
     agent_id: &str,
     state: &SharedDaemonState,
@@ -76,6 +110,9 @@ pub(crate) async fn handle_delete_agent(
 ) -> Result<DeleteResponse, ApiError> {
     let persist_request = {
         let mut guard = state.write().await;
+        if guard.in_flight_runs(agent_id) > 0 {
+            return Err(ApiError::conflict(AGENT_BUSY_MESSAGE));
+        }
         guard.remove_agent(agent_id);
         guard.control_plane_persist_request()
     };
@@ -174,27 +211,45 @@ pub(crate) async fn handle_run_agent(
     agent_id: &str,
     body: Vec<u8>,
     coordinator: &AgentRunCoordinator,
-    permit: AgentRunPermit,
 ) -> Result<AgentRunEnvelope, ApiError> {
     let request: TaskRequest = super::parse_json_body(body)?;
     let room = match request.room_id.as_deref() {
-        Some(id) if id.trim().is_empty() || id.len() > 256 || id.starts_with("peer:") => return Err(ApiError::bad_request_static("roomId must be non-empty, at most 256 bytes, and outside the reserved peer namespace")),
+        Some(id)
+            if id.trim().is_empty()
+                || id.len() > 256
+                || RESERVED_ROOM_PREFIXES
+                    .iter()
+                    .any(|prefix| id.starts_with(prefix)) =>
+        {
+            return Err(ApiError::bad_request(format!(
+                "roomId must be non-empty, at most 256 bytes, and outside the reserved {} namespaces",
+                reserved_room_prefix_list()
+            )));
+        }
         Some(id) => RunRoom::Stable(id.to_string()),
         None => RunRoom::Generated,
     };
     let content = request
         .into_domain()
         .map_err(ApiError::bad_request_static)?;
+    // Waiting for a busy room or agent slot is bounded per agent (spec §16);
+    // beyond that the route keeps its fail-fast saturation (spec §4.9).
+    let waiting = coordinator
+        .try_take_waiting_unit(agent_id)
+        .ok_or_else(|| ApiError::service_unavailable(RUN_ADMISSION_SATURATED))?;
 
     coordinator
-        .run_admitted(
+        .run_budgeted(
             AgentRunRequest {
                 agent_id: agent_id.to_string(),
                 content,
                 room,
                 idempotency_key: None,
+                source: RunSource::Api,
+                source_ref: None,
+                parent: None,
             },
-            permit,
+            waiting,
         )
         .await
 }
@@ -205,16 +260,20 @@ mod tests {
         handle_create_agent, handle_delete_agent,
         handle_run_agent as handle_run_agent_with_coordinator, handle_update_agent,
     };
-    use crate::agent_runs::AgentRunCoordinator;
+    use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
     use crate::app::SharedDaemonState;
     use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+    use crate::runs::RunSource;
     use crate::state::DaemonState;
     use anima_core::{
-        AgentConfig, AgentSettings, AgentStatus, Content, ModelAdapter, ModelGenerateRequest,
-        ModelGenerateResponse, ModelStopReason, TokenUsage,
+        AgentConfig, AgentSettings, AgentStatus, Content, DataValue, ModelAdapter,
+        ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, TokenUsage,
     };
     use async_trait::async_trait;
+    use axum::http::StatusCode;
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use tokio::sync::{RwLock, Semaphore};
 
     async fn handle_run_agent(
@@ -223,10 +282,7 @@ mod tests {
         state: &SharedDaemonState,
     ) -> Result<crate::routes::AgentRunEnvelope, crate::routes::ApiError> {
         let coordinator = AgentRunCoordinator::new(Arc::clone(state), Arc::new(Semaphore::new(8)));
-        let permit = coordinator
-            .try_admit()
-            .expect("test coordinator should admit the run");
-        handle_run_agent_with_coordinator(agent_id, body, &coordinator, permit).await
+        handle_run_agent_with_coordinator(agent_id, body, &coordinator).await
     }
 
     struct PendingModelAdapter {
@@ -236,6 +292,38 @@ mod tests {
 
     struct CapturingModelAdapter {
         configs: Arc<Mutex<Vec<AgentConfig>>>,
+    }
+
+    struct RequestCapturingModelAdapter {
+        requests: Arc<Mutex<Vec<ModelGenerateRequest>>>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for RequestCapturingModelAdapter {
+        fn provider(&self) -> &str {
+            "request-capturing"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.requests
+                .lock()
+                .expect("capture lock should not be poisoned")
+                .push(request.clone());
+            Ok(ModelGenerateResponse {
+                content: Content {
+                    text: "captured".into(),
+                    attachments: None,
+                    metadata: None,
+                },
+                tool_calls: None,
+                usage: TokenUsage::default(),
+                stop_reason: ModelStopReason::End,
+            })
+        }
     }
 
     #[async_trait]
@@ -266,6 +354,7 @@ mod tests {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     total_tokens: 2,
+                    ..TokenUsage::default()
                 },
                 stop_reason: ModelStopReason::End,
             })
@@ -496,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deleting_agent_during_in_flight_run_stays_deleted_and_persisted() {
+    async fn commit_for_an_agent_deleted_mid_run_is_discarded() {
         let store_path = std::env::temp_dir().join(format!(
             "anima-delete-race-{}-{}.json",
             std::process::id(),
@@ -533,14 +622,23 @@ mod tests {
             .expect("run should enter model")
             .forget();
 
-        handle_delete_agent(&agent_id, &state)
+        // Bypasses the route's in-flight guard, like an internal removal path.
+        let persist_request = {
+            let mut guard = state.write().await;
+            guard.remove_agent(&agent_id);
+            guard.control_plane_persist_request()
+        };
+        persist_request
+            .save()
             .await
-            .expect("deleting the checked-out agent should succeed");
+            .expect("deletion should persist");
         release.add_permits(1);
-        run.await
+        let error = run
+            .await
             .expect("run task should join")
-            .expect("the already-started request may finish");
+            .expect_err("a commit for a deleted agent is discarded");
 
+        assert_eq!(error.status(), StatusCode::NOT_FOUND);
         {
             let guard = state.read().await;
             assert!(guard.get_agent(&agent_id).is_none());
@@ -551,8 +649,219 @@ mod tests {
             .expect("control-plane snapshot should load")
             .expect("control-plane snapshot should exist");
         assert!(persisted.agents.is_empty());
+        assert!(
+            persisted.runs.is_empty(),
+            "the discarded run belonged to a deleted agent"
+        );
 
         let _ = std::fs::remove_file(store_path);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_agent_with_a_run_in_flight_is_rejected_until_the_run_finishes() {
+        let store_path = std::env::temp_dir().join(format!(
+            "anima-delete-busy-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        let store_config = ControlPlaneStoreConfig::Json(store_path.clone());
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let agent_id = {
+            let mut guard = state.write().await;
+            guard.set_control_plane_store(Some(store_config.clone()));
+            guard
+                .create_agent(test_config("operator"))
+                .expect("agent should be created")
+                .state
+                .id
+        };
+        let run_state = Arc::clone(&state);
+        let run_agent_id = agent_id.clone();
+        let run = tokio::spawn(async move {
+            handle_run_agent(
+                &run_agent_id,
+                br#"{"text":"run pending task"}"#.to_vec(),
+                &run_state,
+            )
+            .await
+        });
+        entered
+            .acquire()
+            .await
+            .expect("run should enter model")
+            .forget();
+
+        let error = handle_delete_agent(&agent_id, &state)
+            .await
+            .expect_err("an in-flight run blocks deletion");
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error.message(),
+            "Agent has a run in progress; wait for it to finish before deleting it"
+        );
+        assert!(state.read().await.get_agent(&agent_id).is_some());
+
+        release.add_permits(1);
+        run.await
+            .expect("run task should join")
+            .expect("the run commits normally");
+        handle_delete_agent(&agent_id, &state)
+            .await
+            .expect("deletion succeeds once the run finished");
+        assert!(state.read().await.get_agent(&agent_id).is_none());
+        let persisted = load_control_plane_snapshot(&store_config)
+            .await
+            .expect("control-plane snapshot should load")
+            .expect("control-plane snapshot should exist");
+        assert!(persisted.agents.is_empty());
+
+        let _ = std::fs::remove_file(store_path);
+    }
+
+    #[tokio::test]
+    async fn run_body_metadata_cannot_choose_the_runtime_retry_key() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            RequestCapturingModelAdapter {
+                requests: Arc::clone(&requests),
+            },
+        ))));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+
+        handle_run_agent(
+            &agent_id,
+            br#"{"text":"keyed by the client","metadata":{"idempotencyKey":"telegram-a:update:42","idempotency_key":"client-key","retryKey":"client-key","retry_key":"client-key","source":"client"}}"#
+                .to_vec(),
+            &state,
+        )
+        .await
+        .expect("run should succeed");
+
+        let requests = requests
+            .lock()
+            .expect("capture lock should not be poisoned");
+        let input = requests[0]
+            .messages
+            .last()
+            .expect("the model receives the run input");
+        let metadata = input
+            .content
+            .metadata
+            .as_ref()
+            .expect("other client metadata is kept");
+        for key in ["retryKey", "retry_key", "idempotencyKey", "idempotency_key"] {
+            assert!(
+                !metadata.contains_key(key),
+                "client metadata `{key}` reached the runtime input"
+            );
+        }
+        assert_eq!(
+            metadata.get("source"),
+            Some(&DataValue::String("client".into()))
+        );
+        assert_eq!(
+            state.read().await.runs.for_agent(&agent_id)[0].idempotency_key,
+            None,
+            "the run records no client-chosen retry key"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_run_for_a_helper_fails_fast_while_its_slot_is_held() {
+        let (adapter, entered, release) = pending_adapter();
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let (companion_id, helper_id) = {
+            let mut guard = state.write().await;
+            let mut companion = test_config("companion");
+            companion
+                .settings
+                .as_mut()
+                .expect("test config has settings")
+                .additional
+                .insert("workspaceRole".into(), DataValue::String("lead".into()));
+            let companion_id = guard
+                .create_agent(companion)
+                .expect("companion should be created")
+                .state
+                .id;
+            let mut helper = test_config("helper");
+            helper
+                .settings
+                .as_mut()
+                .expect("test config has settings")
+                .additional = BTreeMap::from([
+                ("workspaceRole".into(), DataValue::String("helper".into())),
+                (
+                    "parentAgentId".into(),
+                    DataValue::String(companion_id.clone()),
+                ),
+            ]);
+            let helper_id = guard
+                .create_agent(helper)
+                .expect("helper should be created")
+                .state
+                .id;
+            (companion_id, helper_id)
+        };
+        let coordinator = AgentRunCoordinator::new(Arc::clone(&state), Arc::new(Semaphore::new(4)));
+        // The companion's delegated run holds the helper's slot while it waits
+        // in the model.
+        let delegated = {
+            let coordinator = coordinator.clone();
+            let request = AgentRunRequest {
+                agent_id: helper_id.clone(),
+                content: Content {
+                    text: "delegated task".into(),
+                    ..Content::default()
+                },
+                room: RunRoom::Delegated {
+                    parent_id: companion_id,
+                },
+                idempotency_key: None,
+                source: RunSource::Delegation,
+                source_ref: None,
+                parent: None,
+            };
+            tokio::spawn(async move { coordinator.run(request).await })
+        };
+        entered
+            .acquire()
+            .await
+            .expect("the delegated run should enter the model")
+            .forget();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle_run_agent_with_coordinator(
+                &helper_id,
+                br#"{"text":"bypass the companion"}"#.to_vec(),
+                &coordinator,
+            ),
+        )
+        .await
+        .expect("an invalid run fails before waiting for the helper's slot")
+        .expect_err("helpers run only through their companion");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message(),
+            "Helpers must run through their owning companion"
+        );
+
+        release.add_permits(1);
+        delegated
+            .await
+            .expect("delegated run should join")
+            .expect("delegated run should finish");
     }
 
     fn pending_adapter() -> (Arc<dyn ModelAdapter>, Arc<Semaphore>, Arc<Semaphore>) {
@@ -584,5 +893,53 @@ mod tests {
             plugins: None,
             settings: Some(AgentSettings::default()),
         }
+    }
+
+    #[tokio::test]
+    async fn run_route_rejects_reserved_room_prefixes() {
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(test_config("operator"))
+            .expect("agent should be created")
+            .state
+            .id;
+
+        for room in [
+            "telegram:connector-1",
+            "schedule:schedule-1",
+            "job:job-1",
+            "peer:alice:bob",
+            "legacy-room:abc",
+        ] {
+            let body = serde_json::json!({"text": "hello", "roomId": room})
+                .to_string()
+                .into_bytes();
+            let error = handle_run_agent(&agent_id, body, &state)
+                .await
+                .expect_err(room);
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{room}");
+            assert_eq!(
+                error.message(),
+                "roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, peer:, and legacy-room: namespaces"
+            );
+        }
+        let accepted = handle_run_agent(
+            &agent_id,
+            br#"{"text":"hello","roomId":"direct:operator"}"#.to_vec(),
+            &state,
+        )
+        .await
+        .expect("ordinary rooms stay available");
+        assert_eq!(accepted.result.status, "success");
+        assert!(state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id == "direct:operator"));
     }
 }

@@ -11,12 +11,13 @@ pub(crate) async fn handle_readiness(
     state: &SharedDaemonState,
     config: &DaemonConfig,
 ) -> ReadinessResponse {
-    let (database_configured, background_process_count, control_plane_durability) = {
+    let (database_configured, background_process_count, control_plane_durability, history) = {
         let guard = state.read().await;
         (
             guard.database_configured(),
             guard.background_process_count(),
             guard.control_plane_durability(),
+            guard.history.clone(),
         )
     };
 
@@ -28,6 +29,9 @@ pub(crate) async fn handle_readiness(
     }
     if let Err(error) = &background_process_count {
         issues.push(format!("background process manager unavailable: {error}"));
+    }
+    if let Some(issue) = history.readiness_issue(anima_core::primitives::now_millis()) {
+        issues.push(issue);
     }
 
     ReadinessResponse {
@@ -149,4 +153,53 @@ pub(crate) async fn handle_metrics(state: &SharedDaemonState, config: &DaemonCon
         ),
     ]
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::conformance::{history_message, FlakyHistoryStore};
+    use crate::history::{HistoryService, HISTORY_READINESS_GRACE_MS};
+    use crate::state::DaemonState;
+    use anima_core::MessageRole;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn readiness_reports_a_history_store_that_has_failed_for_five_minutes() {
+        let store = Arc::new(FlakyHistoryStore::new());
+        store.set_failing(true);
+        let history = HistoryService::new(store);
+        let mut daemon = DaemonState::new();
+        daemon.set_history(Arc::clone(&history));
+        let state = Arc::new(RwLock::new(daemon));
+        let config = DaemonConfig::default();
+        assert_eq!(handle_readiness(&state, &config).await.status, "ready");
+
+        history.enqueue_committed(
+            "agent-1",
+            "chat:one",
+            &[
+                history_message("msg-1-1", "agent-1", "chat:one", MessageRole::User, "hi", 1)
+                    .message,
+            ],
+        );
+        let long_ago = anima_core::primitives::now_millis() - HISTORY_READINESS_GRACE_MS - 1_000;
+        let transactions = tokio::sync::Mutex::new(());
+        assert!(history
+            .flush_once(&state, &transactions, long_ago)
+            .await
+            .is_err());
+
+        let response = handle_readiness(&state, &config).await;
+        assert_eq!(response.status, "not_ready");
+        assert!(
+            response
+                .issues
+                .iter()
+                .any(|issue| issue.starts_with("history store writes have failed for 5 minutes")),
+            "{:?}",
+            response.issues
+        );
+    }
 }

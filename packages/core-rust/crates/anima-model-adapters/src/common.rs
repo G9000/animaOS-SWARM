@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use anima_core::{DataValue, Message, TokenUsage, ToolDescriptor};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 pub(super) fn tool_parameters_schema_json(tool: &ToolDescriptor) -> Value {
     if tool_parameters_are_json_schema(&tool.parameters_schema) {
@@ -184,6 +184,26 @@ pub(super) fn response_usage(value: Option<&Value>) -> TokenUsage {
         prompt_tokens: value_to_u64(usage.get("prompt_tokens")),
         completion_tokens: value_to_u64(usage.get("completion_tokens")),
         total_tokens: value_to_u64(usage.get("total_tokens")),
+        cached_prompt_tokens: cached_prompt_tokens_from(usage),
+        reasoning_tokens: value_to_u64(
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens")),
+        ),
+    }
+}
+
+/// `prompt_tokens_details.cached_tokens` is the OpenAI-shaped field. When it is absent or
+/// `null`, fall back to DeepSeek's `prompt_cache_hit_tokens`
+/// (`docs/superpowers/plans/data/2026-09-23-model-table.md`).
+fn cached_prompt_tokens_from(usage: &Map<String, Value>) -> u64 {
+    let details = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"));
+    if matches!(details, Some(Value::Number(_))) {
+        value_to_u64(details)
+    } else {
+        value_to_u64(usage.get("prompt_cache_hit_tokens"))
     }
 }
 

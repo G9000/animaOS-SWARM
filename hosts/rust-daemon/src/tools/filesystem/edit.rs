@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use super::super::workspace::{
-    resolve_existing_workspace_file, resolve_workspace_write_path, workspace_root_path,
+    resolve_existing_workspace_file, workspace_root_path, write_workspace_bytes,
 };
 use super::FileEditOperation;
 
@@ -20,16 +20,7 @@ pub(in super::super) fn write_workspace_file_from_root(
     file_path: &str,
     content: &str,
 ) -> Result<String, String> {
-    let target = resolve_workspace_write_path(workspace_root, file_path, "write_file")?;
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!("write_file failed to create directories for {file_path}: {error}")
-        })?;
-    }
-
-    fs::write(&target, content)
-        .map_err(|error| format!("write_file failed to write {file_path}: {error}"))?;
-
+    write_workspace_bytes(workspace_root, file_path, content.as_bytes(), "write_file")?;
     Ok(format!(
         "Wrote {} chars to {}",
         content.chars().count(),

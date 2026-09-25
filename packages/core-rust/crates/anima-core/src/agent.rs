@@ -118,6 +118,27 @@ pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// Prompt tokens served from a provider cache; included in `prompt_tokens`.
+    #[serde(default)]
+    pub cached_prompt_tokens: u64,
+    /// Reasoning or thinking tokens; included in `completion_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Adds `other` into `self` field by field, saturating instead of overflowing.
+    pub fn saturating_add(&mut self, other: &TokenUsage) {
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.cached_prompt_tokens = self
+            .cached_prompt_tokens
+            .saturating_add(other.cached_prompt_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,6 +160,59 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::str::FromStr;
+
+    #[test]
+    fn token_usage_saturating_add_sums_all_five_fields_and_saturates_on_overflow() {
+        let mut total = TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 2,
+            total_tokens: 3,
+            cached_prompt_tokens: 4,
+            reasoning_tokens: 5,
+        };
+        total.saturating_add(&TokenUsage {
+            prompt_tokens: 10,
+            completion_tokens: 20,
+            total_tokens: 30,
+            cached_prompt_tokens: 40,
+            reasoning_tokens: 50,
+        });
+        assert_eq!(
+            total,
+            TokenUsage {
+                prompt_tokens: 11,
+                completion_tokens: 22,
+                total_tokens: 33,
+                cached_prompt_tokens: 44,
+                reasoning_tokens: 55,
+            }
+        );
+
+        let mut saturating = TokenUsage {
+            prompt_tokens: u64::MAX,
+            completion_tokens: u64::MAX,
+            total_tokens: u64::MAX,
+            cached_prompt_tokens: u64::MAX,
+            reasoning_tokens: u64::MAX,
+        };
+        saturating.saturating_add(&TokenUsage {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 1,
+            cached_prompt_tokens: 1,
+            reasoning_tokens: 1,
+        });
+        assert_eq!(
+            saturating,
+            TokenUsage {
+                prompt_tokens: u64::MAX,
+                completion_tokens: u64::MAX,
+                total_tokens: u64::MAX,
+                cached_prompt_tokens: u64::MAX,
+                reasoning_tokens: u64::MAX,
+            }
+        );
+    }
 
     #[test]
     fn agent_state_keeps_ts_shape_fields() {
@@ -232,5 +306,28 @@ mod tests {
         assert_eq!(settings.timeout_ms, None);
         assert_eq!(settings.max_retries, None);
         assert!(settings.additional.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod token_usage_tests {
+    use super::TokenUsage;
+
+    #[test]
+    fn usage_saved_before_detail_fields_loads_with_zero_details() {
+        let usage: TokenUsage =
+            serde_json::from_str(r#"{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}"#)
+                .expect("legacy usage deserializes");
+
+        assert_eq!(
+            usage,
+            TokenUsage {
+                prompt_tokens: 3,
+                completion_tokens: 4,
+                total_tokens: 7,
+                cached_prompt_tokens: 0,
+                reasoning_tokens: 0,
+            }
+        );
     }
 }

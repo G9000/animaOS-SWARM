@@ -100,6 +100,7 @@ fn text_response(output_text: String, prompt_tokens: u64) -> ModelGenerateRespon
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            ..TokenUsage::default()
         },
         stop_reason: ModelStopReason::End,
     }
@@ -125,6 +126,7 @@ fn tool_call_response(
             prompt_tokens,
             completion_tokens: 1,
             total_tokens: prompt_tokens + 1,
+            ..TokenUsage::default()
         },
         stop_reason: ModelStopReason::ToolCall,
     }

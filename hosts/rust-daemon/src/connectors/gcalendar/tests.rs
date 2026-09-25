@@ -1088,11 +1088,14 @@ async fn calendar_state_round_trips_through_the_control_plane_snapshot() {
 async fn list_events_tool_reports_connection_guidance_when_unconnected() {
     let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
     let (context, agent) = {
-        let mut guard = fixture.state.write().await;
-        let (runtime, context) = guard
-            .take_agent_runtime(&fixture.agent_id)
-            .expect("runtime available");
-        (context, runtime.state().clone())
+        let guard = fixture.state.read().await;
+        (
+            guard.tool_execution_context(),
+            guard
+                .get_agent(&fixture.agent_id)
+                .expect("agent available")
+                .state,
+        )
     };
     let handler = crate::tools::ToolRegistry::new()
         .lookup("calendar_list_events")
@@ -1129,11 +1132,14 @@ async fn create_tool_records_pending_write_without_calling_google() {
     let fixture = fixture(Some(GoogleOAuthConfig::for_tests())).await;
     connect(&fixture).await;
     let (context, agent) = {
-        let mut guard = fixture.state.write().await;
-        let (runtime, context) = guard
-            .take_agent_runtime(&fixture.agent_id)
-            .expect("runtime available");
-        (context, runtime.state().clone())
+        let guard = fixture.state.read().await;
+        (
+            guard.tool_execution_context(),
+            guard
+                .get_agent(&fixture.agent_id)
+                .expect("agent available")
+                .state,
+        )
     };
     let handler = crate::tools::ToolRegistry::new()
         .lookup("calendar_create_event")

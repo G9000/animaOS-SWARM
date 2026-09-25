@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anima_core::{Content, DataValue, MessageRole, TaskStatus};
+use anima_core::{Content, DataValue, TaskStatus};
 use chrono::{LocalResult, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ use crate::app::SharedDaemonState;
 use crate::connectors::runtime::{ConnectorManager, ConnectorRuntimeStatus};
 use crate::connectors::{OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::ApiError;
+use crate::runs::RunSource;
 
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
@@ -112,7 +113,8 @@ struct SchedulerInner {
     state: SharedDaemonState,
     runs: AgentRunCoordinator,
     connectors: ConnectorManager,
-    // A job owns its slot until the detached agent run and durable commit finish.
+    // One live run per automation (spec §4.3); a job owns its entry until the
+    // detached agent run and durable commit finish.
     jobs: Mutex<BTreeMap<String, JoinHandle<()>>>,
 }
 
@@ -395,8 +397,8 @@ impl SchedulerService {
         }
         // Reconcile only jobs with no live owner, including failures after startup.
         // Persistence failure closes admission for this tick; the next tick retries.
-        let active_agents = jobs.keys().cloned().collect();
-        reconcile_interrupted(inner, now, &active_agents).await?;
+        let active_schedules = jobs.keys().cloned().collect();
+        reconcile_interrupted(inner, now, &active_schedules).await?;
         let due_ids = {
             let state = inner.state.read().await;
             let mut ids = state
@@ -405,24 +407,29 @@ impl SchedulerService {
                 .filter(|item| {
                     item.enabled && item.next_due_at_ms <= now && !unresolved_occurrence(item)
                 })
-                .map(|item| (item.next_due_at_ms, item.id.clone(), item.agent_id.clone()))
+                .map(|item| (item.next_due_at_ms, item.id.clone()))
                 .collect::<Vec<_>>();
             ids.sort();
             ids
         };
         let mut claimed = 0;
-        for (_, id, agent_id) in due_ids {
+        for (_, id) in due_ids {
             if jobs.len() >= MAX_ACTIVE_SCHEDULES {
                 break;
             }
-            if jobs.contains_key(&agent_id) {
+            if jobs.contains_key(&id) {
                 continue;
             }
+            // The claim is durable before the run waits for its room, slot, and
+            // permit. Two automations sharing a room (one connector's chat, say)
+            // are both claimed and one may wait on the room lock; a restart in
+            // that window auto-disables the waiting occurrence under the
+            // interrupted-schedule rule. Accepted for M1.
             if let Some(record) = claim_due(inner, &id, now).await? {
                 claimed += 1;
                 let inner = inner.clone();
                 jobs.insert(
-                    agent_id,
+                    id,
                     tokio::spawn(async move {
                         execute_claimed(&inner, record, now).await;
                     }),
@@ -454,7 +461,7 @@ fn unresolved_occurrence(record: &ScheduledPromptRecord) -> bool {
 async fn reconcile_interrupted(
     inner: &Arc<SchedulerInner>,
     now: u64,
-    active_agents: &BTreeSet<String>,
+    active_schedules: &BTreeSet<String>,
 ) -> Result<(), ScheduleError> {
     let _transaction = inner.runs.control_plane_transaction().await;
     let (previous, persist) = {
@@ -463,7 +470,7 @@ async fn reconcile_interrupted(
         for schedule in state
             .schedules
             .values_mut()
-            .filter(|s| !active_agents.contains(&s.agent_id) && unresolved_occurrence(s))
+            .filter(|s| !active_schedules.contains(&s.id) && unresolved_occurrence(s))
         {
             previous.push(schedule.clone());
             schedule.enabled = false;
@@ -531,7 +538,8 @@ async fn claim_due(
 
 async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRecord, now: u64) {
     let room = match &record.target {
-        ScheduleTarget::Workspace => RunRoom::Generated,
+        // Spec §9.2: a workspace automation runs in its own `schedule:<id>` session.
+        ScheduleTarget::Workspace => RunRoom::Stable(crate::sessions::schedule_room_id(&record.id)),
         ScheduleTarget::Connector { connector_id } => {
             let connector = {
                 let state = inner.state.read().await;
@@ -579,16 +587,20 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             .last_fired
             .as_ref()
             .map(|item| item.run_idempotency_key.clone()),
+        source: RunSource::Schedule,
+        source_ref: Some(record.id.clone()),
+        parent: None,
     };
-    let outcome = Arc::new(std::sync::Mutex::new(
+    let recorded = Arc::new(std::sync::Mutex::new(
         None::<(ScheduleSafeOutcome, Option<TelegramOutboundRecord>)>,
     ));
-    let commit_outcome = Arc::clone(&outcome);
+    let commit_recorded = Arc::clone(&recorded);
     let result = inner
         .runs
         .run_with_commit_waiting(
             request,
-            move |state, snapshot, result| {
+            move |state, outcome| {
+                let result = &outcome.result;
                 let status = if result.status == TaskStatus::Error {
                     ScheduleOutcomeStatus::Failed
                 } else if result
@@ -620,32 +632,29 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                             .get(connector_id)
                             .filter(|item| item.is_active() && item.approved_chat.is_some())
                             .ok_or_else(ApiError::not_found)?;
-                        let assistant = snapshot
-                            .messages
-                            .iter()
-                            .rev()
-                            .find(|message| {
-                                message.room_id == connector.room_id
-                                    && message.role == MessageRole::Assistant
-                            })
-                            .ok_or_else(|| {
-                                ApiError::bad_request("agent produced no assistant message")
-                            })?;
-                        if !is_silent_checkin_reply(&assistant.content.text) {
+                        let (Some(reply_id), Some(reply)) =
+                            (outcome.reply_message_id.as_ref(), result.data.as_ref())
+                        else {
+                            return Err(ApiError::bad_request(
+                                "agent produced no assistant message",
+                            ));
+                        };
+                        if !is_silent_checkin_reply(&reply.text) {
                             let item = TelegramOutboundRecord {
                                 id: format!(
                                     "telegram:{}:schedule:{}:{}",
-                                    connector_id, schedule_id, assistant.id
+                                    connector_id, schedule_id, reply_id
                                 ),
                                 connector_id: connector_id.clone(),
                                 agent_id: connector.agent_id.clone(),
                                 room_id: connector.room_id.clone(),
-                                assistant_message_id: assistant.id.clone(),
-                                text: assistant.content.text.clone(),
+                                assistant_message_id: reply_id.clone(),
+                                text: reply.text.clone(),
                                 created_at_ms: now,
                                 delivered_at_ms: None,
                                 attempts: 0,
                                 delivery_state: OutboundDeliveryState::Pending,
+                                message_pruned: false,
                             };
                             state
                                 .outbound
@@ -655,23 +664,17 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
                         }
                     }
                 }
-                *commit_outcome.lock().unwrap_or_else(|p| p.into_inner()) = Some((safe, outbound));
+                *commit_recorded.lock().unwrap_or_else(|p| p.into_inner()) = Some((safe, outbound));
                 Ok(())
             },
-            move |state, baseline| {
-                if let Some((_, outbound)) =
-                    outcome.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+            move |state| {
+                if let Some((_, Some(outbound))) =
+                    recorded.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
                 {
-                    if let Some(outbound) = outbound {
-                        if state.outbound.get(&outbound.id) == Some(outbound) {
-                            state.outbound.remove(&outbound.id);
-                        }
+                    if state.outbound.get(&outbound.id) == Some(outbound) {
+                        state.outbound.remove(&outbound.id);
                     }
                 }
-                state
-                    .rollback_agent_runtime(baseline)
-                    .map(|_| ())
-                    .map_err(ApiError::service_unavailable)?;
                 if let Some(schedule) = state.schedules.get_mut(&rollback_schedule_id) {
                     schedule.last_safe_outcome = None;
                 }
@@ -822,6 +825,20 @@ pub(crate) fn legacy_next_due_at_ms(
 pub(crate) fn wrap_checkin_prompt(prompt: &str) -> String {
     format!("{}\n\n{}", prompt.trim(), CHECKIN_SUFFIX)
 }
+/// The owner's prompt inside a wrapped check-in input.
+pub(crate) fn unwrap_checkin_prompt(text: &str) -> &str {
+    text.strip_suffix(CHECKIN_SUFFIX)
+        .map(str::trim_end)
+        .unwrap_or(text)
+        .trim()
+}
+/// Input the scheduler tagged as a check-in prompt.
+pub(crate) fn is_checkin_content(content: &Content) -> bool {
+    matches!(
+        content.metadata.as_ref().and_then(|metadata| metadata.get("kind")),
+        Some(DataValue::String(kind)) if kind == "checkin"
+    )
+}
 pub(crate) fn is_silent_checkin_reply(reply: &str) -> bool {
     reply.trim() == CHECKIN_SENTINEL
 }
@@ -923,7 +940,7 @@ mod tests {
         TelegramBotIdentity, TelegramChatKind, TelegramChatMetadata, TelegramConnectorRecord,
     };
     use crate::state::DaemonState;
-    use anima_core::{AgentConfig, AgentSettings};
+    use anima_core::{AgentConfig, AgentSettings, MessageRole};
     use async_trait::async_trait;
     use tokio::sync::{RwLock, Semaphore};
 
@@ -1059,41 +1076,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_starts_new_due_agent_while_another_is_running() {
+    async fn scheduler_runs_other_automations_of_a_busy_agent_concurrently() {
         let entered = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let daemon = DaemonState::with_model_adapter(Arc::new(GatedModel {
             entered: entered.clone(),
             release: release.clone(),
         }));
-        let (service, state, first, _) = service_with_daemon(daemon);
+        let (mut service, state, first, _) = service_with_daemon(daemon);
+        Arc::get_mut(&mut service.inner).unwrap().runs =
+            AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(8)));
         let second = {
             let mut state = state.write().await;
             let mut config = state.get_agent(&first).unwrap().state.config;
             config.name = "second".into();
             state.create_agent(config).unwrap().state.id
         };
-        due_schedule(&service, &first).await;
+        let running = due_schedule(&service, &first).await;
         service.start().await;
         tokio::time::timeout(Duration::from_secs(3), entered.acquire())
             .await
             .unwrap()
             .unwrap()
             .forget();
-        // A second due occurrence for the busy agent must not monopolize admission.
-        due_schedule(&service, &first).await;
-        let second_record = due_schedule(&service, &second).await;
-        let independent_started =
-            tokio::time::timeout(Duration::from_secs(2), entered.acquire()).await;
+        let running_fired = state.read().await.schedules[&running.id].last_fired.clone();
+
+        // Another automation of the busy agent and one of another agent.
+        let sibling = due_schedule(&service, &first).await;
+        let other = due_schedule(&service, &second).await;
+        let both_started =
+            tokio::time::timeout(Duration::from_secs(3), entered.acquire_many(2)).await;
+        let running_fired_later = state.read().await.schedules[&running.id].last_fired.clone();
         release.add_permits(10);
         service.shutdown().await;
+
         assert!(
-            independent_started.is_ok(),
-            "an unrelated newly due agent must start before the first finishes"
+            both_started.is_ok(),
+            "one run per automation: a busy agent's other automation starts too"
         );
-        assert!(state.read().await.schedules[&second_record.id]
-            .last_safe_outcome
-            .is_some());
+        assert_eq!(
+            running_fired_later, running_fired,
+            "a running automation is never claimed again while it runs"
+        );
+        for id in [&running.id, &sibling.id, &other.id] {
+            assert!(
+                state.read().await.schedules[id].last_safe_outcome.is_some(),
+                "{id} should finish"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1391,7 +1421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn due_workspace_schedule_claims_before_running_and_tags_the_generated_room() {
+    async fn due_workspace_schedule_runs_in_its_stable_schedule_room() {
         let (service, state, agent_id, manager) = service();
         let (record, _) = service
             .create(
@@ -1407,15 +1437,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.tick_at(2).await.unwrap(), 1);
+        assert_eq!(
+            service.tick_at(1_002).await.unwrap(),
+            1,
+            "the next occurrence fires too"
+        );
         let guard = state.read().await;
         let schedule = &guard.schedules[&record.id];
-        assert_eq!(schedule.next_due_at_ms, 1_002);
-        assert_eq!(schedule.last_fired.as_ref().unwrap().fired_at_ms, 2);
+        assert_eq!(schedule.next_due_at_ms, 2_002);
+        assert_eq!(schedule.last_fired.as_ref().unwrap().fired_at_ms, 1_002);
         assert_eq!(
             schedule.last_safe_outcome.as_ref().unwrap().status,
             ScheduleOutcomeStatus::Spoke
         );
+        let room = crate::sessions::schedule_room_id(&record.id);
         let snapshot = guard.get_agent(&agent_id).unwrap();
+        assert_eq!(snapshot.messages.len(), 4);
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| message.room_id == room),
+            "both occurrences share the automation's room"
+        );
         let input = snapshot
             .messages
             .iter()
@@ -1427,8 +1471,14 @@ mod tests {
         );
         assert_eq!(
             input.content.metadata.as_ref().unwrap().get("id"),
-            Some(&DataValue::String(record.id))
+            Some(&DataValue::String(record.id.clone()))
         );
+        let session = guard
+            .sessions
+            .get(&agent_id, &room)
+            .expect("the automation's room is a check-in session");
+        assert_eq!(session.kind, crate::sessions::SessionKind::Checkin);
+        assert_eq!(session.title, "Check-in · Check status");
         drop(guard);
         manager.shutdown().await;
     }

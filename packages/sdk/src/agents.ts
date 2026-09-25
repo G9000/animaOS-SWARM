@@ -16,6 +16,14 @@ export interface AgentSnapshot {
   lastTask: DaemonTaskResult | null;
 }
 
+/** An agent without its transcript (`GET /api/agents?view=summary`). */
+export interface AgentSummary {
+  state: DaemonAgentState;
+  messageCount: number;
+  eventCount: number;
+  lastTask: DaemonTaskResult | null;
+}
+
 export interface AgentMemory {
   id: string;
   agentId: string;
@@ -191,6 +199,13 @@ export class AgentsClient {
   async list(): Promise<AgentSnapshot[]> {
     const response = await this.client.requestJson<{ agents: AgentSnapshot[] }>(
       '/api/agents',
+    );
+    return response.agents;
+  }
+
+  async listSummaries(): Promise<AgentSummary[]> {
+    const response = await this.client.requestJson<{ agents: AgentSummary[] }>(
+      '/api/agents?view=summary',
     );
     return response.agents;
   }

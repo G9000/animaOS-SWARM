@@ -42,6 +42,7 @@ struct DaemonRuntime {
     oauth_apps: crate::connectors::oauth_apps::OAuthAppService,
     scheduler: SchedulerService,
     jobs: JobService,
+    history: crate::history::HistoryWorker,
 }
 
 const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
@@ -70,6 +71,9 @@ pub struct DaemonConfig {
     pub run_request_timeout: Duration,
     pub persistence_mode: PersistenceMode,
     pub max_concurrent_runs: usize,
+    /// Concurrent runs of one agent across different conversation rooms
+    /// (`ANIMAOS_RS_MAX_RUNS_PER_AGENT`); generated helpers are fixed at 1.
+    pub max_runs_per_agent: usize,
     pub max_background_processes: usize,
     /// Postgres connection pool size when `persistence_mode` is `Postgres`.
     /// Should comfortably exceed `max_concurrent_runs` to leave headroom for
@@ -89,6 +93,7 @@ impl Default for DaemonConfig {
             run_request_timeout: Duration::from_secs(600),
             persistence_mode: PersistenceMode::Memory,
             max_concurrent_runs: DEFAULT_MAX_CONCURRENT_RUNS,
+            max_runs_per_agent: crate::runs::DEFAULT_MAX_RUNS_PER_AGENT,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
             db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
             event_buffer: DEFAULT_EVENT_BUFFER,
@@ -136,6 +141,15 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
     let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+    app_with_runtime(state, config, runtime)
+}
+
+/// The router `app_with_state` builds, over a prepared runtime.
+fn app_with_runtime(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    runtime: DaemonRuntime,
+) -> Router {
     // Construction-time state is uncontended, so this always succeeds in
     // practice; calendar tools simply report "unconfigured" otherwise.
     if let Ok(mut guard) = state.try_write() {
@@ -212,6 +226,7 @@ pub(crate) async fn serve_with_state(
     let connectors = runtime.connectors.clone();
     let scheduler = runtime.scheduler.clone();
     let jobs = runtime.jobs.clone();
+    let history = runtime.history.clone();
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
@@ -219,6 +234,7 @@ pub(crate) async fn serve_with_state(
             jobs.shutdown().await;
             scheduler.shutdown().await;
             connectors.shutdown().await;
+            history.shutdown().await;
         })
         .await
 }
@@ -237,7 +253,8 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
     let oauth_apps =
         crate::connectors::oauth_apps::OAuthAppService::new_for_origin(public_origin.as_deref())?;
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+        .with_max_runs_per_agent(config.max_runs_per_agent);
     let transport = TelegramClient::new()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
     let connectors = ConnectorManager::new(
@@ -263,6 +280,10 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         oauth_apps.clone(),
     );
     let jobs = JobService::new(Arc::clone(&state), agent_runs.clone());
+    let history = crate::history::HistoryWorker::new(
+        Arc::clone(&state),
+        agent_runs.control_plane_transactions(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     Ok(DaemonRuntime {
         run_limiter,
@@ -273,6 +294,7 @@ fn daemon_runtime(state: SharedDaemonState, config: &DaemonConfig) -> io::Result
         oauth_apps,
         scheduler,
         jobs,
+        history,
     })
 }
 
@@ -290,7 +312,8 @@ fn deterministic_daemon_runtime_with_mail_transport(
     mail_transport: Arc<dyn crate::connectors::mail::client::MailTransport>,
 ) -> DaemonRuntime {
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter));
+    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+        .with_max_runs_per_agent(config.max_runs_per_agent);
     let connectors = ConnectorManager::new(
         Arc::clone(&state),
         agent_runs.clone(),
@@ -313,6 +336,10 @@ fn deterministic_daemon_runtime_with_mail_transport(
         oauth_apps.clone(),
     );
     let jobs = JobService::new(Arc::clone(&state), agent_runs.clone());
+    let history = crate::history::HistoryWorker::new(
+        Arc::clone(&state),
+        agent_runs.control_plane_transactions(),
+    );
     let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());
     DaemonRuntime {
         run_limiter,
@@ -323,16 +350,23 @@ fn deterministic_daemon_runtime_with_mail_transport(
         oauth_apps,
         scheduler,
         jobs,
+        history,
     }
 }
 
+/// Builds the router and starts the history loop it owns, when a Tokio
+/// runtime is present. The loop runs while the router or one of its clones
+/// lives, or until `HistoryWorker::shutdown`. It starts after construction,
+/// which relies on `try_write` finding the state uncontended.
 fn router_with_runtime(
     state: SharedDaemonState,
     config: DaemonConfig,
     runtime: DaemonRuntime,
     bind_is_loopback: bool,
 ) -> Router {
-    routes::router_with_all_services(
+    let history = runtime.history;
+    let history_owner = crate::history::HistoryWorkerOwner::new();
+    let router = routes::router_with_all_services(
         state,
         config,
         runtime.run_limiter,
@@ -343,8 +377,13 @@ fn router_with_runtime(
         runtime.oauth_apps,
         runtime.scheduler,
         runtime.jobs,
+        history_owner.clone(),
         bind_is_loopback,
-    )
+    );
+    if tokio::runtime::Handle::try_current().is_ok() {
+        history.start(&history_owner);
+    }
+    router
 }
 
 /// Deterministic Telegram boundary paired with the deterministic model in the
@@ -586,5 +625,152 @@ mod tests {
             .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Waits until the store holds every id, failing after `within`.
+    async fn wait_until_mirrored(
+        store: &dyn crate::history::HistoryStore,
+        ids: &[String],
+        within: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + within;
+        while store.existing_message_ids(ids).await.unwrap().len() < ids.len() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{ids:?} were not mirrored within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn app_with_state_routers_keep_mirroring_committed_messages() {
+        use crate::history::{HistoryService, MemoryHistoryStore, HISTORY_FLUSH_INTERVAL};
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::util::ServiceExt;
+
+        let store = Arc::new(MemoryHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(store.clone()));
+        let agent_id = daemon
+            .create_agent(anima_core::AgentConfig {
+                name: "historian".to_string(),
+                model: "deterministic".to_string(),
+                provider: None,
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            })
+            .unwrap()
+            .state
+            .id;
+        let state = Arc::new(RwLock::new(daemon));
+        let router = app_with_state(Arc::clone(&state), DaemonConfig::default());
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/agents/{agent_id}/run"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"text":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let committed = state
+            .read()
+            .await
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 2);
+        wait_until_mirrored(&*store, &committed, HISTORY_FLUSH_INTERVAL).await;
+        drop(router);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_app_with_state_router_stops_its_history_loop() {
+        use crate::history::{
+            HistoryService, HistoryStore, MemoryHistoryStore, HISTORY_FLUSH_INTERVAL,
+        };
+
+        let store = Arc::new(MemoryHistoryStore::new());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(HistoryService::new(store.clone()));
+        let state = Arc::new(RwLock::new(daemon));
+        let config = DaemonConfig::default();
+        let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);
+        // A handle does not keep the loop running; the router does.
+        let worker = runtime.history.clone();
+        let router = app_with_runtime(Arc::clone(&state), config, runtime);
+
+        let message = |id: &str| {
+            crate::history::conformance::history_message(
+                id,
+                "agent-1",
+                "chat:one",
+                anima_core::MessageRole::User,
+                "hello",
+                1,
+            )
+            .message
+        };
+        let history = state.read().await.history.clone();
+        history.enqueue_committed("agent-1", "chat:one", &[message("msg-1-1")]);
+        wait_until_mirrored(&*store, &["msg-1-1".to_string()], HISTORY_FLUSH_INTERVAL).await;
+        assert!(
+            !worker.has_stopped(),
+            "the loop runs while its router lives"
+        );
+
+        drop(router);
+        let deadline = tokio::time::Instant::now() + HISTORY_FLUSH_INTERVAL;
+        while !worker.has_stopped() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop keeps running after its router is gone"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        history.enqueue_committed("agent-1", "chat:one", &[message("msg-2-2")]);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            store
+                .existing_message_ids(&["msg-2-2".to_string()])
+                .await
+                .unwrap()
+                .is_empty(),
+            "a stopped loop writes nothing more"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_agent_run_limit_defaults_to_three_and_reaches_the_coordinator() {
+        assert_eq!(DaemonConfig::default().max_runs_per_agent, 3);
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+
+        let runtime = deterministic_daemon_runtime(
+            state,
+            &DaemonConfig {
+                max_runs_per_agent: 2,
+                ..DaemonConfig::default()
+            },
+        );
+
+        assert_eq!(runtime.agent_runs.max_runs_per_agent(), 2);
     }
 }
