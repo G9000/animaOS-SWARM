@@ -595,6 +595,56 @@ pub(crate) async fn assert_history_store_indexed_text_cap_conformance(store: &dy
     );
 }
 
+/// SQLite FTS5's default `unicode61` tokenizer strips diacritics (`café`
+/// would index as `cafe`), while the memory store, the hot-tail matcher
+/// (`sessions::views`), and Postgres's `simple` text-search config don't
+/// (final fix wave item D4); every store must agree. Fresh agent id per
+/// call.
+pub(crate) async fn assert_history_store_diacritics_conformance(store: &dyn HistoryStore) {
+    let agent = format!("agent-{}", uuid::Uuid::new_v4());
+    let base = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as u64 * 1_000;
+    let msg_id = format!("msg-{base}-1");
+    store
+        .upsert_messages(&[history_message(
+            &msg_id,
+            &agent,
+            "chat:a",
+            MessageRole::User,
+            "Let's meet at the café tomorrow",
+            base,
+        )])
+        .await
+        .expect("diacritics message upsert");
+
+    let agents = [agent.clone()];
+    assert!(
+        store
+            .search_messages(&agents, "cafe", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a search without the diacritic must not match café"
+    );
+    assert!(
+        store
+            .search_sessions(&agents, "cafe", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a search without the diacritic must not match café (search_sessions)"
+    );
+    assert_eq!(
+        ids(&store.search_messages(&agents, "café", 10).await.unwrap()),
+        [msg_id.clone()],
+        "a search with the diacritic must match café"
+    );
+    assert_eq!(
+        ids(&store.search_sessions(&agents, "café", 10).await.unwrap()),
+        [msg_id.clone()],
+        "a search with the diacritic must match café (search_sessions)"
+    );
+}
+
 /// A memory store whose every call fails while `failing` is set. Unlike the
 /// memory store it is not ephemeral, so pruning tests can use it.
 pub(crate) struct FlakyHistoryStore {

@@ -334,6 +334,7 @@ mod tests {
     use super::*;
     use crate::history::conformance::{
         assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance,
     };
@@ -354,6 +355,7 @@ mod tests {
         assert_history_store_session_search_conformance(&store).await;
         assert_history_store_checkin_text_conformance(&store).await;
         assert_history_store_indexed_text_cap_conformance(&store).await;
+        assert_history_store_diacritics_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }

@@ -33,7 +33,7 @@ CREATE TABLE messages (
     record TEXT NOT NULL
 );
 CREATE INDEX messages_session_order ON messages (agent_id, session_id, created_at_ms, ordinal, id);
-CREATE VIRTUAL TABLE messages_fts USING fts5(text, content = 'messages', content_rowid = 'rowid');
+CREATE VIRTUAL TABLE messages_fts USING fts5(text, content = 'messages', content_rowid = 'rowid', tokenize = 'unicode61 remove_diacritics 0');
 CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
     INSERT INTO messages_fts (rowid, text) VALUES (new.rowid, new.text);
 END;
@@ -602,6 +602,7 @@ mod tests {
     use super::*;
     use crate::history::conformance::{
         assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_diacritics_conformance,
         assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance, history_message,
     };
@@ -637,6 +638,7 @@ mod tests {
         assert_history_store_session_search_conformance(&store).await;
         assert_history_store_checkin_text_conformance(&store).await;
         assert_history_store_indexed_text_cap_conformance(&store).await;
+        assert_history_store_diacritics_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }
