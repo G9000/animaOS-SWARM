@@ -59,12 +59,17 @@ export function useCompanionSessions(
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const generation = useRef(0);
   const firstPageKeysRef = useRef<ReadonlySet<string>>(new Set());
+  // Mirrors `daemonTooOld` for the poll scheduler below: a ref reads the
+  // just-set value synchronously, before this render (and its dependent
+  // effects) has a chance to commit (D3).
+  const daemonTooOldRef = useRef(false);
   const query = filters.query.trim();
   const { archived } = filters;
 
   useLayoutEffect(() => {
     generation.current += 1;
     firstPageKeysRef.current = new Set();
+    daemonTooOldRef.current = false;
     setSessions([]);
     setError(null);
     setDaemonTooOld(false);
@@ -92,11 +97,15 @@ export function useCompanionSessions(
       setNextCursor(page.nextCursor);
       setError(null);
       setDaemonTooOld(false);
+      daemonTooOldRef.current = false;
     } catch (caught) {
       if (request !== generation.current) return;
       setError(caught instanceof Error ? caught.message : String(caught));
       // Only a successful list clears it; a dropped connection proves nothing.
-      if (isDaemonTooOld(caught)) setDaemonTooOld(true);
+      if (isDaemonTooOld(caught)) {
+        setDaemonTooOld(true);
+        daemonTooOldRef.current = true;
+      }
     } finally {
       if (request === generation.current) setLoading(false);
     }
@@ -127,7 +136,10 @@ export function useCompanionSessions(
     } catch (caught) {
       if (request !== generation.current) return;
       setError(caught instanceof Error ? caught.message : String(caught));
-      if (isDaemonTooOld(caught)) setDaemonTooOld(true);
+      if (isDaemonTooOld(caught)) {
+        setDaemonTooOld(true);
+        daemonTooOldRef.current = true;
+      }
     } finally {
       if (request === generation.current) setLoadingMore(false);
     }
@@ -138,7 +150,10 @@ export function useCompanionSessions(
     let active = true;
     let timer: number | undefined;
     const schedule = () => {
-      if (!active) return;
+      // D3: once the daemon is flagged too old, stop polling rather than
+      // hammering its (missing) sessions routes every 10 s; `refresh` (and
+      // so `daemonTooOldRef`) still work for a manual retry.
+      if (!active || daemonTooOldRef.current) return;
       timer = window.setTimeout(() => {
         timer = undefined;
         void refresh().finally(schedule);

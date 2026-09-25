@@ -233,4 +233,48 @@ describe('useCompanionSessions', () => {
       'chat:1',
     ]);
   });
+
+  it('stops scheduling further polls once the daemon is flagged too old, but a manual refresh still works', async () => {
+    let poll: (() => void) | undefined;
+    let scheduledCount = 0;
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === SESSION_LIST_POLL_MS) {
+        scheduledCount += 1;
+        poll = handler as () => void;
+        return 1;
+      }
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    const list = vi
+      .spyOn(daemon, 'listSessions')
+      .mockResolvedValueOnce({ sessions: [sessionFixture('chat:1')], nextCursor: null })
+      .mockRejectedValueOnce(new DaemonTooOldError('agent-main'));
+    const { result } = renderHook(() =>
+      useCompanionSessions('agent-main', { archived: false, query: '' }),
+    );
+
+    // The first refresh succeeds and arms the routine 10 s poll.
+    await waitFor(() => expect(result.current.sessions).toHaveLength(1));
+    await waitFor(() => expect(scheduledCount).toBe(1));
+
+    // That poll flags the daemon as too old.
+    await act(async () => {
+      poll?.();
+    });
+    await waitFor(() => expect(result.current.daemonTooOld).toBe(true));
+    expect(list).toHaveBeenCalledTimes(2);
+    // No further timer is armed once the daemon is flagged too old.
+    expect(scheduledCount).toBe(1);
+
+    // A manual refresh still asks the daemon, and can clear the flag again.
+    list.mockResolvedValueOnce({ sessions: [], nextCursor: null });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(result.current.daemonTooOld).toBe(false);
+  });
 });
