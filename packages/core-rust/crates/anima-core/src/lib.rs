@@ -3,6 +3,7 @@ pub mod communication;
 pub use communication::{AgentCommunicationRoute, MAX_AGENT_COMMUNICATION_HOPS};
 pub mod capability;
 pub mod components;
+pub mod context_window;
 pub mod definition;
 pub mod engine;
 pub mod events;
@@ -37,6 +38,11 @@ pub use capability::{
     MAX_DURABLE_RESULT_SIZE_BYTES,
 };
 pub use components::{Evaluator, EvaluatorDecision, EvaluatorResult, Provider, ProviderResult};
+pub use context_window::{
+    calibration_factor, select_context, turn_starts, ContextSelection, ContextSummary,
+    TokenEstimator, CHARS_PER_TOKEN, MAX_CALIBRATION, MAX_CONTEXT_IMAGES, MESSAGE_OVERHEAD_TOKENS,
+    MIN_CALIBRATION,
+};
 pub use definition::{
     AgentDefinition, AgentDefinitionDraft, CapabilityOverride, DefinitionPublisher,
     DefinitionValidationError, HostRequirement, LifecyclePolicy, MemoryPolicy, ModelPolicy,

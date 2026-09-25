@@ -9,7 +9,6 @@ pub(crate) mod pruning;
 pub(crate) mod test_support;
 pub(crate) mod views;
 
-use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anima_core::{DataValue, Message, MessageRole};
@@ -515,24 +514,9 @@ pub(crate) fn is_calendar_write_followup(source_ref: Option<&str>) -> bool {
     source_ref.is_some_and(|source_ref| source_ref.starts_with(CALENDAR_WRITE_SOURCE_REF_PREFIX))
 }
 
-/// Where each turn of `messages` starts, oldest first; `messages` are one
-/// room's messages in transcript order. A turn starts at a user message and
-/// holds every following assistant, tool, and system message up to the next
-/// user message, so a cut made only at these indices never separates an
-/// assistant tool-call message from its tool results (providers reject a
-/// tool result whose call is missing). Messages before the first user
-/// message end a turn whose start is gone. Hot-tail pruning, a run's
-/// history, and the `schedule:` room context cap all cut here (final fix
-/// wave A); M3's context selection is meant to reuse it.
-pub(crate) fn turn_starts<M: Borrow<Message>>(
-    messages: &[M],
-) -> impl DoubleEndedIterator<Item = usize> + '_ {
-    messages
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| Borrow::<Message>::borrow(*message).role == MessageRole::User)
-        .map(|(index, _)| index)
-}
+/// Where each turn starts; the single definition lives in `anima-core`
+/// (context selection, pruning, and the silent check-in grouping share it).
+pub(crate) use anima_core::turn_starts;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GroupStart {
@@ -548,22 +532,22 @@ enum GroupStart {
 pub(crate) fn hidden_message_ids<'a>(
     messages: impl IntoIterator<Item = &'a Message>,
 ) -> HashSet<String> {
+    let messages: Vec<&Message> = messages.into_iter().collect();
+    let starts: Vec<usize> = turn_starts(&messages).collect();
     let mut hidden = HashSet::new();
-    let mut group: Vec<&Message> = Vec::new();
-    let mut start = GroupStart::Missing;
-    for message in messages {
-        if message.role == MessageRole::User {
-            close_group(&group, start, &mut hidden);
-            group.clear();
-            start = if is_checkin_message(message) {
-                GroupStart::Checkin
-            } else {
-                GroupStart::Other
-            };
-        }
-        group.push(message);
+    // Messages before the first turn belong to a turn whose opening is gone.
+    let first = starts.first().copied().unwrap_or(messages.len());
+    close_group(&messages[..first], GroupStart::Missing, &mut hidden);
+    for (index, &start) in starts.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(messages.len());
+        let group = &messages[start..end];
+        let opening = if is_checkin_message(group[0]) {
+            GroupStart::Checkin
+        } else {
+            GroupStart::Other
+        };
+        close_group(group, opening, &mut hidden);
     }
-    close_group(&group, start, &mut hidden);
     hidden
 }
 
