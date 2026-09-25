@@ -527,6 +527,74 @@ pub(crate) async fn assert_history_store_checkin_text_conformance(store: &dyn Hi
     );
 }
 
+/// A single huge message (final fix wave item B — e.g. a large `web_fetch`
+/// or `read_file` result) must not fail Postgres's generated `search` column,
+/// which errors past roughly 1 MB of distinct words: the stores cap the
+/// indexed/matched text to `MAX_INDEXED_TEXT_BYTES`, but `record` (read back
+/// through `get_message`/`page_messages`) always keeps the full message.
+/// Fresh agent id per call.
+pub(crate) async fn assert_history_store_indexed_text_cap_conformance(store: &dyn HistoryStore) {
+    let agent = format!("agent-{}", uuid::Uuid::new_v4());
+    let base = (uuid::Uuid::new_v4().as_u128() % 1_000_000_000) as u64 * 1_000;
+    let msg_id = format!("msg-{base}-1");
+    // ASCII filler so every byte offset is also a char boundary: "alphaneedle"
+    // sits well inside the cap, "omeganeedle" starts only after it.
+    let filler = "x".repeat(super::MAX_INDEXED_TEXT_BYTES);
+    let text = format!("alphaneedle {filler} omeganeedle");
+    assert!(
+        text.len() > super::MAX_INDEXED_TEXT_BYTES,
+        "the fixture must exceed the cap"
+    );
+    store
+        .upsert_messages(&[history_message(
+            &msg_id,
+            &agent,
+            "chat:a",
+            MessageRole::User,
+            &text,
+            base,
+        )])
+        .await
+        .expect("oversized message upsert");
+
+    let fetched = store
+        .get_message(&agent, "chat:a", &msg_id)
+        .await
+        .unwrap()
+        .expect("the message is found");
+    assert_eq!(
+        fetched.message.content.text, text,
+        "get_message returns the full message unchanged, however long"
+    );
+    let paged = store
+        .page_messages(&page(&agent, "chat:a", None, 10, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        paged.first().map(|row| row.message.content.text.clone()),
+        Some(text.clone()),
+        "page_messages returns the full message unchanged, however long"
+    );
+
+    let agents = [agent.clone()];
+    assert_eq!(
+        ids(&store
+            .search_messages(&agents, "alphaneedle", 10)
+            .await
+            .unwrap()),
+        [msg_id.clone()],
+        "a word inside the first 64 KiB is searchable"
+    );
+    assert!(
+        store
+            .search_messages(&agents, "omeganeedle", 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a word only past the first 64 KiB must not be indexed"
+    );
+}
+
 /// A memory store whose every call fails while `failing` is set. Unlike the
 /// memory store it is not ephemeral, so pruning tests can use it.
 pub(crate) struct FlakyHistoryStore {

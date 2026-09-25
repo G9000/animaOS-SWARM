@@ -269,7 +269,10 @@ impl HistoryStore for SqliteHistoryStore {
                     role: role_name(row.message.role),
                     // Indexed for FTS; a check-in prompt's scheduler suffix
                     // is stripped so it can't match every search (review
-                    // fix, M2 fix round 1). `record` keeps the full message.
+                    // fix, M2 fix round 1), and the text is capped to
+                    // MAX_INDEXED_TEXT_BYTES so one huge message can't break
+                    // FTS indexing (final fix wave item B). `record` keeps
+                    // the full message.
                     text: searchable_text(&row.message).to_string(),
                     hidden: row.hidden,
                     created_at_ms: to_i64(row.message.created_at_ms)?,
@@ -599,6 +602,7 @@ mod tests {
     use super::*;
     use crate::history::conformance::{
         assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance, history_message,
     };
     use anima_core::MessageRole;
@@ -632,6 +636,7 @@ mod tests {
         assert_history_store_conformance(&store).await;
         assert_history_store_session_search_conformance(&store).await;
         assert_history_store_checkin_text_conformance(&store).await;
+        assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_eq!(store.label(), "sqlite");
         assert!(!store.is_ephemeral());
     }

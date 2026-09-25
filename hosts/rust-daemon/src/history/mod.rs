@@ -33,6 +33,13 @@ pub(crate) const EPHEMERAL_HISTORY_MAX_ROWS: usize = 100_000;
 pub(crate) const MAX_SEARCH_TOKENS: usize = 8;
 /// Search snippets hold at most this many characters, plus ellipses.
 pub(crate) const MAX_SNIPPET_CHARS: usize = 160;
+/// The indexed/matched text of one message is capped to this many bytes
+/// (final fix wave item B): Postgres's generated `search` column
+/// (`to_tsvector('simple', text)`) fails with "string is too long for
+/// tsvector" past roughly 1 MB of distinct words, and a single huge message
+/// — a large `web_fetch` or `read_file` result — must not fail the whole
+/// outbox batch forever. `record` (the full message) is never capped.
+pub(crate) const MAX_INDEXED_TEXT_BYTES: usize = 64 * 1024;
 
 /// One committed transcript message as the history store keeps it.
 #[derive(Clone, Debug, PartialEq)]
@@ -242,15 +249,34 @@ fn role_name(role: MessageRole) -> &'static str {
 
 /// The text a search indexes and matches for one message: a check-in
 /// prompt's text without the scheduler's suffix, otherwise the message's own
-/// text. The suffix (`schedules::wrap_checkin_prompt`) carries ordinary
-/// words ("scheduled", "reply", "exactly"...) that must not make a check-in
-/// prompt match every query (review fix, M2 fix round 1).
+/// text, capped to [`MAX_INDEXED_TEXT_BYTES`] on a char boundary. The suffix
+/// (`schedules::wrap_checkin_prompt`) carries ordinary words ("scheduled",
+/// "reply", "exactly"...) that must not make a check-in prompt match every
+/// query (review fix, M2 fix round 1). The cap (final fix wave item B) keeps
+/// one oversized message — e.g. a large `web_fetch` or `read_file` result —
+/// from failing Postgres's generated tsvector column; every caller of this
+/// helper (both persisted stores and the in-memory store's matching) agrees
+/// on what is searchable. `record` (the full message) is never capped.
 pub(crate) fn searchable_text(message: &Message) -> &str {
-    if crate::sessions::is_checkin_message(message) {
+    let text = if crate::sessions::is_checkin_message(message) {
         crate::schedules::unwrap_checkin_prompt(&message.content.text)
     } else {
         &message.content.text
+    };
+    cap_at_byte_boundary(text, MAX_INDEXED_TEXT_BYTES)
+}
+
+/// `text` cut to at most `max_bytes` bytes, backing up to the nearest char
+/// boundary so a multi-byte UTF-8 character is never split.
+fn cap_at_byte_boundary(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
     }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Lowercase query words, at most `MAX_SEARCH_TOKENS`.
@@ -397,5 +423,45 @@ mod tests {
         let snippet = search_snippet(&text, &search_tokens("deploy"));
         assert!(snippet.contains("real deploy here"), "{snippet}");
         assert!(!snippet.contains("underdeploy"), "{snippet}");
+    }
+
+    fn message_with_text(text: &str) -> Message {
+        use anima_core::Content;
+        Message {
+            id: "msg-1-1".into(),
+            agent_id: "agent-1".into(),
+            room_id: "chat:a".into(),
+            content: Content {
+                text: text.into(),
+                ..Content::default()
+            },
+            role: MessageRole::User,
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn searchable_text_caps_at_the_byte_limit_on_a_char_boundary() {
+        let short = message_with_text("short text");
+        assert_eq!(searchable_text(&short), "short text");
+
+        let over = message_with_text(&"a".repeat(MAX_INDEXED_TEXT_BYTES + 10));
+        assert_eq!(
+            searchable_text(&over).len(),
+            MAX_INDEXED_TEXT_BYTES,
+            "text past the cap is dropped"
+        );
+
+        // "é" is 2 bytes (0xC3 0xA9), placed so the cap falls in the middle
+        // of it; the boundary search must back up rather than split it.
+        let straddling = format!("{}é", "a".repeat(MAX_INDEXED_TEXT_BYTES - 1));
+        let straddling_message = message_with_text(&straddling);
+        let capped = searchable_text(&straddling_message);
+        assert_eq!(
+            capped,
+            "a".repeat(MAX_INDEXED_TEXT_BYTES - 1),
+            "a character split by the cap is dropped whole, not corrupted"
+        );
+        assert!(capped.len() < MAX_INDEXED_TEXT_BYTES);
     }
 }

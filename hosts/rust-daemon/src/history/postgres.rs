@@ -90,8 +90,11 @@ impl HistoryStore for PostgresHistoryStore {
                 .bind(role_name(row.message.role))
                 // Indexed (the generated `search` tsvector); a check-in
                 // prompt's scheduler suffix is stripped so it can't match
-                // every search (review fix, M2 fix round 1). `record` keeps
-                // the full message.
+                // every search (review fix, M2 fix round 1), and the text is
+                // capped to MAX_INDEXED_TEXT_BYTES so one huge message can't
+                // fail tsvector generation, which errors past ~1 MB of
+                // distinct words (final fix wave item B). `record` keeps the
+                // full message.
                 .bind(searchable_text(&row.message))
                 .bind(row.hidden)
                 .bind(to_i64(row.message.created_at_ms)?)
@@ -331,6 +334,7 @@ mod tests {
     use super::*;
     use crate::history::conformance::{
         assert_history_store_checkin_text_conformance, assert_history_store_conformance,
+        assert_history_store_indexed_text_cap_conformance,
         assert_history_store_session_search_conformance,
     };
 
@@ -349,6 +353,7 @@ mod tests {
         assert_history_store_conformance(&store).await;
         assert_history_store_session_search_conformance(&store).await;
         assert_history_store_checkin_text_conformance(&store).await;
+        assert_history_store_indexed_text_cap_conformance(&store).await;
         assert_eq!(store.label(), "postgres");
     }
 }
