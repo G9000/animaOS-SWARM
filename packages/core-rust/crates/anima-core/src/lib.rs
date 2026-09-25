@@ -108,6 +108,8 @@ pub use primitives::{
     MessageRole, RoomId, TaskResult, TaskStatus, UuidString,
 };
 pub use runtime::{
-    content_retry_key, new_room_id, AgentRuntime, AgentRuntimeSnapshot, RuntimeRunBase,
-    RuntimeRunDelta, RuntimeRunUndo, MAX_RETAINED_EVENTS,
+    content_retry_key, new_room_id, run_step_id, AgentRuntime, AgentRuntimeSnapshot, RunFrame,
+    RunObserver, RuntimeRunBase, RuntimeRunDelta, RuntimeRunUndo, INCOMPLETE_METADATA_KEY,
+    MAX_RETAINED_EVENTS, MODEL_STREAM_WITHOUT_FINAL, REVISED_METADATA_KEY, RUN_ID_METADATA_KEY,
+    STEP_ID_METADATA_KEY, TOOL_DURATION_METADATA_KEY, TOOL_STATUS_METADATA_KEY,
 };
