@@ -147,9 +147,11 @@ impl DaemonState {
     ///
     /// This is the one exception to "nothing streamed is retracted" (spec
     /// §4.5): a rejected or undurable commit removes the messages that hold
-    /// the text its run streamed. Clients saw that text only as `step.delta`
-    /// events, never as `message.created`, and the run's `run.failed` event
-    /// (`commit_rejected` or `commit_failed`) tells them to drop it.
+    /// the text its run streamed, and so does an agent deleted mid-run, whose
+    /// commit `commit_run` discards. Clients saw that text only as
+    /// `step.delta` events, never as `message.created`, and the run's
+    /// `run.failed` event (`commit_rejected`, `commit_failed`, or
+    /// `agent_deleted`) tells them to drop it.
     pub(crate) fn rollback_run(&mut self, change_set: &RunChangeSet, error: RunError) {
         if let (Some(runtime), Some(undo)) = (
             self.agents.get_mut(&change_set.agent_id),

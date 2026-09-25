@@ -421,9 +421,11 @@ mod coalescing {
     use anima_core::RunFrame;
 
     use super::record;
+    use crate::agent_runs::test_support::next_event;
     use crate::live::fanout::{LiveDelivery, LiveHub};
     use crate::live::observer::{DeltaChunk, DeltaCoalescer, LiveRun};
     use crate::live::{LiveEventBody, DELTA_FLUSH_BYTES, DELTA_FLUSH_MS};
+    use crate::runs::RunStatus;
 
     fn chunk(step_id: &str, offset: u64, text: &str) -> DeltaChunk {
         DeltaChunk {
@@ -507,16 +509,14 @@ mod coalescing {
             text: " there".into(),
         });
         live_run.publish_record(&run);
-        let Some(LiveDelivery::Event(delta)) = subscription.next().await else {
-            panic!("buffered text comes first");
-        };
+        // Buffered text comes first.
+        let delta = next_event(&mut subscription).await;
         assert!(matches!(
             &delta.body,
             LiveEventBody::StepDelta { offset: 2, text, .. } if text == " there"
         ));
-        let Some(LiveDelivery::Event(started)) = subscription.next().await else {
-            panic!("then the run event");
-        };
+        // Then the run event.
+        let started = next_event(&mut subscription).await;
         assert_eq!(started.body.type_name(), "run.started");
 
         drop(observer);
@@ -545,19 +545,17 @@ mod coalescing {
 
         // An aborted run task: its live link goes, then its guard fails it.
         drop(live_run);
-        run.finish(crate::runs::RunStatus::Failed, None, 20);
+        run.finish(RunStatus::Failed, None, 20);
         hub.publish(crate::live::run_status_event(&run), None);
 
-        let Some(LiveDelivery::Event(first)) = subscription.next().await else {
-            panic!("the buffered text arrives");
-        };
+        // The buffered text arrives...
+        let first = next_event(&mut subscription).await;
         assert!(matches!(
             &first.body,
             LiveEventBody::StepDelta { text, .. } if text == "partial"
         ));
-        let Some(LiveDelivery::Event(second)) = subscription.next().await else {
-            panic!("then the result");
-        };
+        // ...then the result.
+        let second = next_event(&mut subscription).await;
         assert_eq!(second.body.type_name(), "run.failed");
         observer.on_frame(RunFrame::TextDelta {
             step_id,
@@ -571,6 +569,78 @@ mod coalescing {
             .await
             .is_err(),
             "a forgotten run publishes nothing more"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flushed_emoji_moves_the_next_deltas_offset_by_two_utf16_units() {
+        let hub = LiveHub::new(16);
+        let run = record("agent-1");
+        let mut subscription = hub.subscribe("agent-1").unwrap();
+        let live_run = LiveRun::register(hub.clone(), &run, None);
+        let observer = live_run.observer();
+        let step_id = format!("{}:1", run.id);
+        observer.on_frame(RunFrame::StepStarted {
+            step_id: step_id.clone(),
+        });
+
+        for text in ["😀", "a"] {
+            observer.on_frame(RunFrame::TextDelta {
+                step_id: step_id.clone(),
+                text: text.into(),
+            });
+            live_run.flush();
+        }
+
+        for (offset, text) in [(0, "😀"), (2, "a")] {
+            assert_eq!(
+                next_event(&mut subscription).await.body,
+                LiveEventBody::StepDelta {
+                    step_id: step_id.clone(),
+                    offset,
+                    text: text.into(),
+                }
+            );
+        }
+        let view = hub.runs().view(&run.id).unwrap();
+        assert_eq!((view.text.as_str(), view.text_offset), ("😀a", 0));
+    }
+
+    #[tokio::test]
+    async fn a_run_announces_one_terminal_event_however_many_are_sent() {
+        let hub = LiveHub::new(16);
+        let mut run = record("agent-1");
+        let mut subscription = hub.subscribe("agent-1").unwrap();
+        let live_run = LiveRun::register(hub.clone(), &run, None);
+        let end = live_run.end();
+        live_run.publish_record(&run);
+        assert!(!end.ended(), "run.started is not an end");
+
+        run.finish(RunStatus::Failed, None, 20);
+        live_run.publish_record(&run);
+        assert!(end.ended());
+        live_run.publish_record(&run);
+        run.status = RunStatus::Completed;
+        end.publish_record(&run);
+        drop(live_run);
+        end.publish_record(&run);
+
+        let names: Vec<&str> = [
+            next_event(&mut subscription).await,
+            next_event(&mut subscription).await,
+        ]
+        .iter()
+        .map(|event| event.body.type_name())
+        .collect();
+        assert_eq!(names, ["run.started", "run.failed"]);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(DELTA_FLUSH_MS * 3),
+                subscription.next()
+            )
+            .await
+            .is_err(),
+            "no second terminal event"
         );
     }
 }

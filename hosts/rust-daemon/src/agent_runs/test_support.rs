@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use tokio::sync::{RwLock, Semaphore};
 
 use super::{AgentRunCoordinator, AgentRunRequest, RunRoom};
-use crate::live::{LiveDelivery, LiveSubscription};
+use crate::live::{LiveDelivery, LiveEvent, LiveSubscription};
 use crate::runs::RunSource;
 use crate::state::DaemonState;
 
@@ -298,6 +298,18 @@ pub(crate) fn chat_request(agent_id: &str, room_id: &str, text: &str) -> AgentRu
     }
 }
 
+/// A subscription's next event, failing the test after five seconds.
+pub(crate) async fn next_event(subscription: &mut LiveSubscription) -> Arc<LiveEvent> {
+    let delivery = tokio::time::timeout(Duration::from_secs(5), subscription.next())
+        .await
+        .expect("an event arrives within five seconds")
+        .expect("the channel stays open");
+    let LiveDelivery::Event(event) = delivery else {
+        panic!("the subscription lagged");
+    };
+    event
+}
+
 /// A subscription's events as JSON, up to and including the first of
 /// `type_name`.
 pub(crate) async fn events_until(
@@ -306,13 +318,7 @@ pub(crate) async fn events_until(
 ) -> Vec<serde_json::Value> {
     let mut events = Vec::new();
     loop {
-        let delivery = tokio::time::timeout(Duration::from_secs(5), subscription.next())
-            .await
-            .expect("an event arrives within five seconds")
-            .expect("the channel stays open");
-        let LiveDelivery::Event(event) = delivery else {
-            panic!("the subscription lagged");
-        };
+        let event = next_event(subscription).await;
         let value = event.to_json(events.len() as u64 + 1);
         let done = value["type"] == type_name;
         events.push(value);

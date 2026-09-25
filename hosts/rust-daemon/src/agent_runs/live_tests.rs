@@ -4,13 +4,14 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 
 use super::test_support::{
-    calculate_call, chat_request, coordinator_with, events_until, lead_config, Gate, ScriptedModel,
-    Step,
+    calculate_call, chat_request, coordinator_with, events_until, lead_config, next_event, Gate,
+    ScriptedModel, Step,
 };
 use super::InFlightRunGuard;
-use crate::live::LiveDelivery;
+use crate::live::{run_status_event, LiveRun};
 use crate::routes::ApiError;
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
+use crate::sessions::test_support::within;
 
 fn types(events: &[Value]) -> Vec<&str> {
     events
@@ -269,7 +270,7 @@ async fn the_observer_publishes_text_and_tool_cards_while_the_state_lock_is_held
     assert_eq!(text.last().unwrap()["text"], "It is 42.");
     drop(guard);
 
-    running.await.unwrap().unwrap();
+    within("the run", running).await.unwrap().unwrap();
     events_until(&mut subscription, "run.completed").await;
 }
 
@@ -290,14 +291,12 @@ async fn a_stop_through_the_registered_control_ends_a_held_model_call() {
 
     // The run uses the control its live registration holds.
     hub.runs().control(&run_id).unwrap().cancel.cancel();
-    running.await.unwrap().unwrap();
+    within("the run", running).await.unwrap().unwrap();
 
     // The owner's turn and the stopped partial reply, then the result.
     let mut between = Vec::new();
     let terminal = loop {
-        let Some(LiveDelivery::Event(event)) = subscription.next().await else {
-            panic!("the run's events continue");
-        };
+        let event = next_event(&mut subscription).await;
         if event.body.type_name().starts_with("run.") {
             break event;
         }
@@ -318,7 +317,7 @@ async fn a_stop_through_the_registered_control_ends_a_held_model_call() {
     assert!(ledger.status.is_terminal());
     assert_eq!(terminal.run_id.as_deref(), Some(run_id.as_str()));
     let announced = terminal.to_json(1);
-    let expected = crate::live::run_status_event(&ledger).to_json(1);
+    let expected = run_status_event(&ledger).to_json(1);
     assert_eq!(announced["type"], expected["type"]);
     assert_eq!(
         announced["run"], expected["run"],
@@ -349,7 +348,7 @@ async fn a_failed_final_save_is_announced_as_a_failed_run_without_its_messages()
     save.release.add_permits(1);
     gate.release();
 
-    let error = running.await.unwrap().unwrap_err();
+    let error = within("the run", running).await.unwrap().unwrap_err();
     assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
     let events = events_until(&mut subscription, "run.failed").await;
     let run_id = events[1]["runId"].as_str().unwrap();
@@ -395,13 +394,16 @@ async fn an_aborted_run_is_announced_as_failed() {
         1,
     );
     let run_id = record.id.clone();
+    let live_run = LiveRun::register(hub.clone(), &record, None);
     coordinator.state.write().await.runs.insert(record);
 
     // What a panicking or aborted run task leaves behind.
     drop(InFlightRunGuard::new(
         std::sync::Arc::clone(&coordinator.state),
         run_id.clone(),
+        live_run.end(),
     ));
+    drop(live_run);
 
     let events = events_until(&mut subscription, "run.failed").await;
     assert_eq!(events.len(), 1);
@@ -441,4 +443,155 @@ async fn the_snapshot_keeps_reply_ids_out_until_the_version_bump() {
         .unwrap();
     assert_eq!(saved.reply_message_id, None);
     assert_eq!(saved.steps, ledger.steps, "steps are a version-5 field");
+}
+
+/// A subscription's events for the next 200 ms, as JSON; for asserting that
+/// nothing more arrives.
+async fn quiet_for(subscription: &mut crate::live::LiveSubscription) -> Vec<Value> {
+    let mut events = Vec::new();
+    while let Ok(Some(crate::live::LiveDelivery::Event(event))) =
+        tokio::time::timeout(std::time::Duration::from_millis(200), subscription.next()).await
+    {
+        events.push(event.to_json(0));
+    }
+    events
+}
+
+fn is_terminal(event: &Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some("run.completed" | "run.failed" | "run.cancelled" | "run.interrupted")
+    )
+}
+
+#[tokio::test]
+async fn a_stream_that_saw_a_run_whose_start_save_failed_is_told_it_ended() {
+    let (coordinator, agent_id) = coordinator_with(ScriptedModel::new(Vec::new())).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let save = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(true);
+    let running = {
+        let coordinator = coordinator.clone();
+        let request = chat_request(&agent_id, "chat:unstarted", "hi");
+        tokio::spawn(async move { coordinator.run(request).await })
+    };
+    within("the start save", save.entered.acquire())
+        .await
+        .unwrap()
+        .forget();
+
+    // A stream opens while the start save is in flight, as the events route
+    // does it: subscribe and snapshot under one read lock.
+    let (mut subscription, snapshot) = {
+        let guard = coordinator.state.read().await;
+        (
+            guard.live.subscribe(&agent_id).unwrap(),
+            guard.live_snapshot_runs(&agent_id),
+        )
+    };
+    assert_eq!(snapshot.len(), 1, "the stream saw the run");
+    let run_id = snapshot[0].record.id.clone();
+    save.release.add_permits(1);
+
+    let error = within("the run", running).await.unwrap().unwrap_err();
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let events = events_until(&mut subscription, "run.failed").await;
+    assert_eq!(
+        types(&events),
+        ["run.failed"],
+        "it never started for anyone"
+    );
+    assert_eq!(events[0]["runId"], run_id.as_str());
+    assert_eq!(events[0]["run"]["error"]["code"], "commit_failed");
+    assert!(quiet_for(&mut subscription).await.is_empty());
+    assert!(coordinator.state.read().await.runs.get(&run_id).is_none());
+    assert!(hub.runs().view(&run_id).is_none());
+}
+
+#[tokio::test]
+async fn a_run_whose_commit_hook_panics_ends_with_one_terminal_event_matching_the_ledger() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["ok"])]);
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+
+    let error = coordinator
+        .run_with_commit(chat_request(&agent_id, "chat:panic", "hi"), |_, _| {
+            panic!("the commit hook panicked")
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.message(), "agent run worker stopped unexpectedly");
+
+    let mut events = Vec::new();
+    while !events.last().is_some_and(is_terminal) {
+        events.push(next_event(&mut subscription).await.to_json(0));
+    }
+    events.extend(quiet_for(&mut subscription).await);
+    let terminal: Vec<&Value> = events.iter().filter(|event| is_terminal(event)).collect();
+    assert_eq!(terminal.len(), 1, "exactly one terminal event: {events:?}");
+    let run_id = events[1]["runId"].as_str().unwrap();
+    let ledger = coordinator
+        .state
+        .read()
+        .await
+        .runs
+        .get(run_id)
+        .cloned()
+        .unwrap();
+    assert!(ledger.status.is_terminal());
+    let expected = run_status_event(&ledger).to_json(0);
+    assert_eq!(terminal[0]["type"], expected["type"]);
+    assert_eq!(terminal[0]["run"], expected["run"], "the ledger's status");
+    assert!(hub.runs().view(run_id).is_none());
+}
+
+#[tokio::test]
+async fn a_helper_deleted_mid_run_is_announced_failed_on_its_companions_stream() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["3"])], gate.clone());
+    let (coordinator, _) = coordinator_with(model).await;
+    let companion = coordinator
+        .state
+        .write()
+        .await
+        .create_agent(lead_config("Companion"))
+        .unwrap()
+        .state
+        .id;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&companion).unwrap();
+    let running = tokio::spawn(coordinator.spawn_helper(
+        companion.clone(),
+        "Adder".into(),
+        "Add 1 and 2".into(),
+        None,
+    ));
+    gate.entered().await;
+    let started = events_until(&mut subscription, "run.started").await;
+    let helper = started[0]["agentId"].as_str().unwrap().to_string();
+    assert_ne!(helper, companion);
+
+    coordinator.state.write().await.remove_agent(&helper);
+    gate.release();
+    within("the helper run", running)
+        .await
+        .unwrap()
+        .expect_err("the helper's commit is discarded");
+
+    let events = events_until(&mut subscription, "run.failed").await;
+    assert!(
+        !types(&events).contains(&"message.created"),
+        "the discarded messages are never announced"
+    );
+    let failed = events.last().unwrap();
+    assert_eq!(failed["agentId"], helper.as_str());
+    assert_eq!(failed["run"]["error"]["code"], "agent_deleted");
+    assert!(quiet_for(&mut subscription)
+        .await
+        .iter()
+        .all(|event| !is_terminal(event)));
 }

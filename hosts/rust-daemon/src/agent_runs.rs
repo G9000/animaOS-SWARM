@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::app::SharedDaemonState;
-use crate::live::{committed_message_events, run_status_event, LiveEventBody, LiveRun};
+use crate::live::{committed_message_events, LiveEventBody, LiveRun, LiveRunEnd};
 use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::{
@@ -1116,7 +1116,8 @@ impl AgentRunCoordinator {
             guard.runs.insert(record);
             // Armed before anything else can fail, so a panic before the start
             // save cannot leave a permanently in-flight record.
-            let in_flight = InFlightRunGuard::new(Arc::clone(&self.state), run_id.clone());
+            let in_flight =
+                InFlightRunGuard::new(Arc::clone(&self.state), run_id.clone(), live_run.end());
             (
                 runtime,
                 tool_context,
@@ -1135,6 +1136,17 @@ impl AgentRunCoordinator {
             if session_created {
                 guard.sessions.remove(&agent_id, &session_id);
             }
+            // A stream opened during the save listed this run in its snapshot
+            // (the record was already active); this ends it there. Published
+            // under the state lock, after the removal, so every stream whose
+            // snapshot held the run hears it. Nobody else ever saw it start.
+            let mut failed = started;
+            failed.finish(
+                RunStatus::Failed,
+                Some(RunError::new(COMMIT_FAILED, error.to_string())),
+                anima_core::primitives::now_millis(),
+            );
+            live_run.publish_record(&failed);
             drop(guard);
             in_flight.disarm();
             return Err(ApiError::service_unavailable(error.to_string()));
@@ -1344,7 +1356,6 @@ impl AgentRunCoordinator {
         // takes the same transaction, is always queued after it.
         history_outbox.enqueue_committed(&agent_id, &session_id, &change_set.delta.messages);
         drop(transaction);
-        in_flight.disarm();
         if let Some(finished) = &finished {
             for event in committed_message_events(finished, &change_set.delta.messages) {
                 live_run.publish(event);
@@ -1352,6 +1363,9 @@ impl AgentRunCoordinator {
             live_run.publish(live_run.session_event(LiveEventBody::SessionUpdated));
             live_run.publish_record(finished);
         }
+        // Disarmed only once the terminal event is out, so a panic before it
+        // still ends the run's events.
+        in_flight.disarm();
 
         // A silent check-in stores no task-result memory; otherwise silent
         // check-ins crowd real memories out of the recent-memory context (spec §9.2).
@@ -1502,17 +1516,22 @@ fn validate_run_request(
 
 /// Marks a started run failed if its task ends without finishing it (for
 /// example, a panic in a tool), so a crashed run never stays in flight and
-/// never blocks deletion or task edits.
+/// never blocks deletion or task edits. A run that stopped before publishing
+/// its terminal event gets one here, with the ledger's status: `failed` for a
+/// run this marks, otherwise whatever its commit recorded (a panic after
+/// `commit_run`).
 struct InFlightRunGuard {
     state: SharedDaemonState,
     run_id: Option<String>,
+    live: LiveRunEnd,
 }
 
 impl InFlightRunGuard {
-    fn new(state: SharedDaemonState, run_id: String) -> Self {
+    fn new(state: SharedDaemonState, run_id: String, live: LiveRunEnd) -> Self {
         Self {
             state,
             run_id: Some(run_id),
+            live,
         }
     }
 
@@ -1526,31 +1545,31 @@ impl Drop for InFlightRunGuard {
         let Some(run_id) = self.run_id.take() else {
             return;
         };
+        // Only terminal records are announced, so the run is settled.
+        if self.live.ended() {
+            return;
+        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let state = Arc::clone(&self.state);
+        let live = self.live.clone();
         handle.spawn(async move {
             let mut guard = state.write().await;
-            let failed = guard.runs.get_mut(&run_id).and_then(|record| {
-                (!record.status.is_terminal()).then(|| {
-                    record.finish(
-                        RunStatus::Failed,
-                        Some(RunError::new(
-                            RUN_ABORTED,
-                            "The run stopped unexpectedly before its result was saved",
-                        )),
-                        anima_core::primitives::now_millis(),
-                    );
-                    record.clone()
-                })
-            });
-            if let Some(record) = failed {
-                let parent = guard.live_parent_agent(&record.agent_id, &record.session_id);
-                guard
-                    .live
-                    .publish(run_status_event(&record), parent.as_deref());
+            let Some(record) = guard.runs.get_mut(&run_id) else {
+                return;
+            };
+            if !record.status.is_terminal() {
+                record.finish(
+                    RunStatus::Failed,
+                    Some(RunError::new(
+                        RUN_ABORTED,
+                        "The run stopped unexpectedly before its result was saved",
+                    )),
+                    anima_core::primitives::now_millis(),
+                );
             }
+            live.publish_record(record);
         });
     }
 }

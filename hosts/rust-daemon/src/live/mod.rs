@@ -7,12 +7,13 @@ pub(crate) mod fanout;
 pub(crate) mod observer;
 pub(crate) mod registry;
 
+#[allow(unused_imports)] // M3 Tasks 7 and 8 publish run status events directly.
+pub(crate) use events::run_status_event;
 pub(crate) use events::{
-    committed_message_events, resync_json, run_status_event, snapshot_json, LiveEvent,
-    LiveEventBody, SnapshotRun,
+    committed_message_events, resync_json, snapshot_json, LiveEvent, LiveEventBody, SnapshotRun,
 };
 pub(crate) use fanout::{LiveDelivery, LiveHub, LiveSubscription};
-pub(crate) use observer::LiveRun;
+pub(crate) use observer::{LiveRun, LiveRunEnd};
 #[cfg(test)]
 pub(crate) use registry::LiveToolView;
 

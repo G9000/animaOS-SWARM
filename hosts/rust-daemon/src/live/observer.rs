@@ -2,7 +2,10 @@
 //! coalesced and published every 50 ms or 512 bytes, whichever comes first.
 //! Every other event of the run is published after the buffered text, under
 //! the same lock as the timer's flush, so a client always sees a step's text
-//! before that step's tool cards and nothing is ever reordered.
+//! before that step's tool cards and nothing is ever reordered. Every run
+//! ends with exactly one terminal event: `LiveRun` sends at most one, and
+//! `LiveRunEnd` lets the coordinator's in-flight guard send it for a run
+//! whose task stopped before it could.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -98,6 +101,8 @@ struct RunInner {
     parent_agent_id: Option<String>,
     coalescer: Mutex<DeltaCoalescer>,
     timer_armed: AtomicBool,
+    /// Set once the run's terminal event is (being) published.
+    ended: AtomicBool,
 }
 
 impl RunInner {
@@ -134,6 +139,14 @@ impl RunInner {
         if let Some(event) = event {
             self.send(event);
         }
+    }
+
+    /// `record`'s lifecycle event; a terminal one goes out once per run.
+    fn publish_status(&self, record: &RunRecord) {
+        if record.status.is_terminal() && self.ended.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.publish_after_flush(Some(run_status_event(record)));
     }
 
     fn text(self: &Arc<Self>, step_id: &str, text: &str) {
@@ -280,6 +293,7 @@ impl LiveRun {
                 parent_agent_id,
                 coalescer: Mutex::new(DeltaCoalescer::default()),
                 timer_armed: AtomicBool::new(false),
+                ended: AtomicBool::new(false),
             }),
             control,
         }
@@ -300,9 +314,17 @@ impl LiveRun {
         self.inner.publish_after_flush(Some(event));
     }
 
-    /// Publishes the lifecycle event of `record`'s status.
+    /// Publishes the lifecycle event of `record`'s status; a second
+    /// terminal event of the run is dropped.
     pub(crate) fn publish_record(&self, record: &RunRecord) {
-        self.publish(run_status_event(record));
+        self.inner.publish_status(record);
+    }
+
+    /// What ends this run's events if its task stops before it did.
+    pub(crate) fn end(&self) -> LiveRunEnd {
+        LiveRunEnd {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Publishes buffered text now.
@@ -319,9 +341,30 @@ impl LiveRun {
 impl Drop for LiveRun {
     fn drop(&mut self) {
         // A run that ends early (an aborted task) sends its buffered text
-        // now, before `InFlightRunGuard`'s `run.failed`, rather than from a
-        // timer after it.
+        // now, before the terminal event `LiveRunEnd` sends, rather than from
+        // a timer after it.
         self.inner.publish_after_flush(None);
         self.inner.hub.runs().remove(&self.inner.run_id);
+    }
+}
+
+/// A run's terminal event for a task that stopped early (a panic or an
+/// abort). The coordinator's in-flight guard holds it, because only the guard
+/// can read the ledger for the status to announce; the observer never takes
+/// the state lock.
+#[derive(Clone)]
+pub(crate) struct LiveRunEnd {
+    inner: Arc<RunInner>,
+}
+
+impl LiveRunEnd {
+    /// Whether the run's terminal event went out.
+    pub(crate) fn ended(&self) -> bool {
+        self.inner.ended.load(Ordering::Acquire)
+    }
+
+    /// Publishes `record`'s status unless the run's terminal event went out.
+    pub(crate) fn publish_record(&self, record: &RunRecord) {
+        self.inner.publish_status(record);
     }
 }
