@@ -27,9 +27,11 @@ export interface SessionSidebarProps {
   onLoadMore?: () => void;
   onOpen: (session: Session) => void;
   onRename: (session: Session, title: string) => Promise<boolean>;
-  onArchive: (session: Session, archived: boolean) => Promise<void>;
+  /** Resolves true once the change is saved, false when it failed. */
+  onArchive: (session: Session, archived: boolean) => Promise<boolean>;
   onExport: (session: Session) => Promise<void>;
-  onDelete: (session: Session) => Promise<void>;
+  /** Resolves true once the session is deleted, false when it failed. */
+  onDelete: (session: Session) => Promise<boolean>;
 }
 
 type RowActions = Pick<
@@ -193,6 +195,8 @@ function SessionRow({
                   role="menuitem"
                   onClick={() => {
                     // D5: parity with Escape — focus returns to the trigger.
+                    // Once the refresh drops the row from this list, the
+                    // sidebar moves focus on to a neighbouring row (R4).
                     closeMenuToTrigger();
                     void actions.onArchive(session, !session.archived);
                   }}
@@ -260,12 +264,14 @@ export function SessionSidebar({
 }: SessionSidebarProps) {
   const [text, setText] = useState(query);
   const [kind, setKind] = useState<SessionKind | null>(null);
+  const navRef = useRef<HTMLElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-  // D5 (Delete): the row and its position are gone once the delete lands, so
-  // the target to focus afterward — a sibling row, found before the delete —
-  // is captured up front and resolved once `sessions` actually drops the key.
-  const pendingDeleteRef = useRef<{
+  // D5 (Delete), R4 (Archive/Unarchive): the row and its position are gone
+  // once the list drops it, so the target to focus afterward — a sibling
+  // row, found before the action — is captured up front and resolved once
+  // `sessions` actually drops the key.
+  const pendingRemovalRef = useRef<{
     key: string;
     target: HTMLElement | null;
   } | null>(null);
@@ -281,29 +287,64 @@ export function SessionSidebar({
     return () => window.clearTimeout(timer);
   }, [text, query, onQueryChange]);
   useEffect(() => {
-    const pending = pendingDeleteRef.current;
+    const pending = pendingRemovalRef.current;
     if (!pending) return;
     if (sessions.some((session) => sessionKey(session) === pending.key)) return;
-    pendingDeleteRef.current = null;
+    pendingRemovalRef.current = null;
+    // Only focus the removal dropped is moved: it sits on the body, or on a
+    // container around the list that caught it (the mobile drawer's panel).
+    // Focus the owner has taken elsewhere meanwhile stays where it is.
+    const active = document.activeElement;
+    const nav = navRef.current;
+    if (active && nav && !active.contains(nav)) return;
     const target = pending.target;
     if (target && target.isConnected) target.focus();
     else searchRef.current?.focus();
   }, [sessions]);
 
-  const handleDelete = (session: Session): Promise<void> => {
+  /** The row to focus once `key`'s row leaves the list: the next row outside
+   *  its own list item (a chat's helpers remount at the top level once it
+   *  goes, R4), or else the previous row. */
+  const rowAfterRemoval = (key: string): HTMLElement | null => {
     const rows = listRef.current
       ? Array.from(
           listRef.current.querySelectorAll<HTMLElement>('[data-session-row]'),
         )
       : [];
-    const key = sessionKey(session);
     const index = rows.findIndex((row) => row.dataset.sessionKey === key);
-    const target =
-      index === -1 ? null : (rows[index + 1] ?? rows[index - 1] ?? null);
-    pendingDeleteRef.current = { key, target };
-    return actions.onDelete(session);
+    if (index === -1) return null;
+    const item = rows[index].closest('li');
+    const next = rows
+      .slice(index + 1)
+      .find((row) => !(item && item.contains(row)));
+    return next ?? rows[index - 1] ?? null;
   };
-  const wrappedActions: RowActions = { ...actions, onDelete: handleDelete };
+  /** Runs an action that takes the row out of the current list (Delete, or
+   *  Archive/Unarchive once the refresh lands) and remembers where focus goes
+   *  then; a failed action leaves the row, so nothing stays armed (R4). */
+  const removing = (
+    session: Session,
+    action: () => Promise<boolean>,
+  ): Promise<boolean> => {
+    const key = sessionKey(session);
+    const pending = { key, target: rowAfterRemoval(key) };
+    pendingRemovalRef.current = pending;
+    const settle = (done: boolean) => {
+      if (!done && pendingRemovalRef.current === pending)
+        pendingRemovalRef.current = null;
+      return done;
+    };
+    return action().then(settle, (caught: unknown) => {
+      settle(false);
+      throw caught;
+    });
+  };
+  const wrappedActions: RowActions = {
+    ...actions,
+    onArchive: (session, archived) =>
+      removing(session, () => actions.onArchive(session, archived)),
+    onDelete: (session) => removing(session, () => actions.onDelete(session)),
+  };
 
   const kinds = presentKinds(sessions);
   const activeKind = kind && kinds.includes(kind) ? kind : null;
@@ -313,7 +354,7 @@ export function SessionSidebar({
   const groups = groupSessions(visible, now ?? new Date(), activeKind === null);
 
   return (
-    <nav className="session-sidebar" aria-label="Sessions">
+    <nav className="session-sidebar" aria-label="Sessions" ref={navRef}>
       <input
         type="search"
         ref={searchRef}

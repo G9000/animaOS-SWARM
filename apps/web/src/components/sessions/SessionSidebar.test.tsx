@@ -1,4 +1,11 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -29,9 +36,9 @@ function renderSidebar(overrides: Partial<SessionSidebarProps> = {}) {
     now: NOW,
     onOpen: vi.fn(),
     onRename: vi.fn().mockResolvedValue(true),
-    onArchive: vi.fn().mockResolvedValue(undefined),
+    onArchive: vi.fn().mockResolvedValue(true),
     onExport: vi.fn().mockResolvedValue(undefined),
-    onDelete: vi.fn().mockResolvedValue(undefined),
+    onDelete: vi.fn().mockResolvedValue(true),
     ...overrides,
   };
   const view = render(<SessionSidebar {...props} />);
@@ -332,6 +339,105 @@ describe('SessionSidebar', () => {
     props.rerenderWith({ sessions });
     await waitFor(() =>
       expect(screen.getByRole('searchbox', { name: 'Search sessions' })).toHaveFocus(),
+    );
+  });
+  // R4 (residual round): focus after a row leaves the list.
+  it('moves focus to the next row once an archived or unarchived row leaves the list', async () => {
+    const user = userEvent.setup();
+    const make = (id: string, title: string, archived = false) =>
+      sessionFixture(`chat:${id}`, {
+        title,
+        archived,
+        lastActivityAtMs: NOW.getTime(),
+      });
+    let sessions = [make('a', 'Alpha'), make('b', 'Bravo'), make('c', 'Charlie')];
+    const props = renderSidebar({ sessions });
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Bravo' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Archive' }));
+    expect(props.onArchive).toHaveBeenCalledWith(sessions[1], true);
+    // The refresh that follows lists Bravo no more.
+    sessions = sessions.filter((item) => item.title !== 'Bravo');
+    props.rerenderWith({ sessions });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Charlie' })).toHaveFocus(),
+    );
+
+    // Unarchive in the archived view does the same (the previous row here).
+    sessions = [make('d', 'Delta', true), make('e', 'Echo', true)];
+    props.rerenderWith({ sessions, showArchived: true });
+    await user.click(screen.getByRole('button', { name: 'Actions for Echo' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Unarchive' }));
+    expect(props.onArchive).toHaveBeenLastCalledWith(sessions[1], false);
+    sessions = sessions.filter((item) => item.title !== 'Echo');
+    props.rerenderWith({ sessions });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Delta' })).toHaveFocus(),
+    );
+  });
+
+  it('forgets the focus target of a Delete or Archive that failed', async () => {
+    const user = userEvent.setup();
+    const make = (id: string, title: string) =>
+      sessionFixture(`chat:${id}`, { title, lastActivityAtMs: NOW.getTime() });
+    let sessions = [make('a', 'Alpha'), make('b', 'Bravo'), make('c', 'Charlie')];
+    const props = renderSidebar({
+      sessions,
+      onDelete: vi.fn().mockResolvedValue(false),
+      onArchive: vi.fn().mockResolvedValue(false),
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Bravo' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
+    await waitFor(() => expect(props.onDelete).toHaveBeenCalledOnce());
+    await act(async () => {});
+    // Bravo leaves later for another reason (another tab deleted it): focus,
+    // wherever it is, is not pulled to the row after it.
+    sessions = sessions.filter((item) => item.title !== 'Bravo');
+    props.rerenderWith({ sessions });
+    await act(async () => {});
+    expect(screen.getByRole('button', { name: 'Charlie' })).not.toHaveFocus();
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Alpha' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Archive' }));
+    await waitFor(() => expect(props.onArchive).toHaveBeenCalledOnce());
+    await act(async () => {});
+    (document.activeElement as HTMLElement | null)?.blur();
+    sessions = sessions.filter((item) => item.title !== 'Alpha');
+    props.rerenderWith({ sessions });
+    await act(async () => {});
+    expect(screen.getByRole('button', { name: 'Charlie' })).not.toHaveFocus();
+  });
+
+  it('skips a deleted chat’s own helpers, which move to the top level, when choosing the next row', async () => {
+    const user = userEvent.setup();
+    const plans = sessionFixture('chat:plans', {
+      title: 'Plans',
+      lastActivityAtMs: NOW.getTime() - HOUR,
+    });
+    const helper = sessionFixture('room-9', {
+      agentId: 'helper-1',
+      kind: 'helper',
+      title: 'Draft a plan',
+      parentAgentId: 'agent-main',
+      parentSessionId: 'chat:plans',
+      capabilities: readOnly,
+      lastActivityAtMs: NOW.getTime() - 2 * HOUR,
+    });
+    const old = sessionFixture('chat:old', {
+      title: 'Old notes',
+      lastActivityAtMs: NOW.getTime() - 40 * 24 * HOUR,
+    });
+    const props = renderSidebar({ sessions: [plans, helper, old] });
+
+    await user.click(screen.getByRole('button', { name: 'Actions for Plans' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
+    props.rerenderWith({ sessions: [helper, old] });
+
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Old notes' })).toHaveFocus(),
     );
   });
 });

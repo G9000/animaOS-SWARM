@@ -995,8 +995,10 @@ export function ViewHarness() {
       await daemon.updateSession(session.agentId, session.id, { archived });
       setSessionActionError(null);
       await sessions.refresh();
+      return true;
     } catch (caught) {
       setSessionActionError(errorMessage(caught));
+      return false;
     }
   };
   const exportSession = async (session: Session) => {
@@ -1023,8 +1025,10 @@ export function ViewHarness() {
           lastConversationRef.current = { kind: 'home' };
         else navigate({ kind: 'home' }, { replace: true });
       }
+      return true;
     } catch (caught) {
       setSessionActionError(errorMessage(caught));
+      return false;
     }
   };
 

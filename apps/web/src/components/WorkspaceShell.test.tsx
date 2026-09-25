@@ -409,6 +409,59 @@ describe('WorkspaceShell', () => {
     expect(screen.getByRole('dialog', { name: 'Sessions' })).toBe(reopened);
   });
 
+  it('moves focus to the next row in the sessions drawer once an archived row leaves the list', async () => {
+    // R4 (residual round): the archived row's own trigger unmounts once the
+    // refresh drops it; focus goes to the next row, not the drawer panel.
+    mobile();
+    const user = userEvent.setup();
+    function ListedSidebar() {
+      const [sessions, setSessions] = useState(() =>
+        ['Trip ideas', 'Budget'].map((title, index) =>
+          sessionFixture(`chat:${index}`, {
+            title,
+            lastActivityAtMs: Date.now() - index * 1_000,
+          }),
+        ),
+      );
+      return (
+        <SessionSidebar
+          sessions={sessions}
+          activeKey={null}
+          query=""
+          onQueryChange={vi.fn()}
+          showArchived={false}
+          onShowArchivedChange={vi.fn()}
+          onOpen={vi.fn()}
+          onRename={vi.fn().mockResolvedValue(true)}
+          onArchive={async (session) => {
+            // The refresh after the archive no longer lists it.
+            setSessions((current) =>
+              current.filter((item) => item.id !== session.id),
+            );
+            return true;
+          }}
+          onExport={vi.fn().mockResolvedValue(undefined)}
+          onDelete={vi.fn().mockResolvedValue(true)}
+        />
+      );
+    }
+    render(<Shell sidebar={<ListedSidebar />} />);
+    await user.click(screen.getByRole('button', { name: 'Open sessions' }));
+    const drawer = screen.getByRole('dialog', { name: 'Sessions' });
+
+    await user.click(
+      within(drawer).getByRole('button', { name: 'Actions for Trip ideas' }),
+    );
+    await user.click(within(drawer).getByRole('menuitem', { name: 'Archive' }));
+
+    await waitFor(() =>
+      expect(within(drawer).getByRole('button', { name: 'Budget' })).toHaveFocus(),
+    );
+    expect(
+      within(drawer).queryByRole('button', { name: 'Trip ideas' }),
+    ).not.toBeInTheDocument();
+  });
+
   it('shows working helpers as status without introducing another persona', () => {
     const main = agent('agent-main', 'Nova', 1);
     render(
