@@ -313,6 +313,30 @@ async fn live_events_follow_the_snapshot_with_increasing_sequence_numbers() {
 }
 
 #[tokio::test]
+async fn a_reconnect_with_last_event_id_starts_again_from_a_snapshot() {
+    let (state, agent) = state_with_agent();
+    let hub = state.read().await.live.clone();
+    let app = router(state, DaemonConfig::default());
+    let mut request = events_request(&agent, OWNER_ORIGIN);
+    request
+        .headers_mut()
+        .insert("last-event-id", "99".parse().unwrap());
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut reader = SseReader::new(response);
+    let snapshot = reader.next().await;
+    assert_eq!(snapshot.id.as_deref(), Some("1"), "there is no replay");
+    assert_eq!(snapshot.event.as_deref(), Some("stream.snapshot"));
+    assert_eq!(snapshot.data["seq"], 1);
+
+    hub.publish(LiveEvent::new(&agent, LiveEventBody::SessionUpdated), None);
+    let next = reader.next().await;
+    assert_eq!(next.id.as_deref(), Some("2"), "numbering starts over");
+    assert_eq!(next.data["seq"], 2);
+}
+
+#[tokio::test]
 async fn a_helpers_events_reach_its_companions_stream() {
     let (state, companion) = state_with_agent();
     let hub = state.read().await.live.clone();

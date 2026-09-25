@@ -292,13 +292,14 @@ async fn a_lagging_subscription_reports_how_many_events_it_missed() {
 }
 
 #[tokio::test]
-async fn the_stream_limits_match_the_spec() {
-    // Spec §6 and §16. The other tests use the names; this pins the values.
+async fn the_live_run_limits_match_the_spec() {
+    // Spec §4.1, §6, and §16. The other tests use the names; this pins the values.
     assert_eq!(MAX_EVENT_SUBSCRIBERS_PER_AGENT, 16);
     assert_eq!(MAX_PREVIEW_BYTES, 2 * 1024);
     assert_eq!(MAX_SNAPSHOT_TEXT_BYTES, 64 * 1024);
     assert_eq!(EVENT_KEEP_ALIVE_SECS, 15);
     assert_eq!(DEFAULT_SESSION_EVENT_BUFFER, 1_024);
+    assert_eq!(MAX_RUN_STEPS, 50, "a run keeps the usage of 50 model calls");
     assert_eq!(
         crate::app::DaemonConfig::default().session_event_buffer,
         DEFAULT_SESSION_EVENT_BUFFER

@@ -1,11 +1,12 @@
 pub(crate) mod lifecycle;
 pub(crate) mod persistence;
 
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anima_core::DatabaseAdapter;
+use anima_core::{DatabaseAdapter, ModelAdapter};
 use async_trait::async_trait;
 use axum::Router;
 use tokio::net::TcpListener;
@@ -25,6 +26,7 @@ use crate::connectors::{
 };
 use crate::events::{EventFanout, DEFAULT_EVENT_BUFFER};
 use crate::jobs::JobService;
+use crate::model::DeterministicModelAdapter;
 use crate::routes;
 use crate::runtime_model::RuntimeModelAdapter;
 use crate::schedules::SchedulerService;
@@ -120,11 +122,10 @@ pub fn app() -> Router {
 /// **Test/embedding helper** — wires the deterministic mock model adapter.
 /// Use [`serve`] for a real daemon.
 pub fn app_with_config(config: DaemonConfig) -> Router {
-    let event_fanout = EventFanout::new(config.event_buffer);
-    let mut daemon_state =
-        DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
-    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
-    let state = Arc::new(RwLock::new(daemon_state));
+    let state = Arc::new(RwLock::new(configured_state(
+        &config,
+        Arc::new(DeterministicModelAdapter),
+    )));
     app_with_state(state, config)
 }
 
@@ -135,13 +136,22 @@ pub fn app_with_config(config: DaemonConfig) -> Router {
 /// production.
 pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
     let config = DaemonConfig::default();
-    let event_fanout = EventFanout::new(config.event_buffer);
-    let mut daemon_state =
-        DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
+    let mut daemon_state = configured_state(&config, Arc::new(DeterministicModelAdapter));
     daemon_state.set_database(db);
-    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
     let state = Arc::new(RwLock::new(daemon_state));
     app_with_state(state, config)
+}
+
+/// The daemon state every public constructor and [`serve`] start from, sized
+/// by `config`: its event buffers and its background-process limit.
+fn configured_state(config: &DaemonConfig, model_adapter: Arc<dyn ModelAdapter>) -> DaemonState {
+    let mut state = DaemonState::with_model_adapter_and_events_and_limits(
+        model_adapter,
+        EventFanout::new(config.event_buffer),
+        config.max_background_processes,
+    );
+    state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
+    state
 }
 
 pub(crate) fn app_with_state(state: SharedDaemonState, config: DaemonConfig) -> Router {
@@ -169,11 +179,10 @@ fn app_with_runtime(
 }
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
-    let event_fanout = EventFanout::new(config.event_buffer);
-    let mut daemon_state =
-        DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
-    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
-    let state = Arc::new(RwLock::new(daemon_state));
+    let state = Arc::new(RwLock::new(configured_state(
+        &config,
+        Arc::new(DeterministicModelAdapter),
+    )));
     configure_persistence(&state, &config).await?;
     state.write().await.chatgpt_auth = crate::chatgpt_auth::ChatGptAuth::new();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
@@ -194,25 +203,24 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
 
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
     let chatgpt_auth = crate::chatgpt_auth::ChatGptAuth::new();
-    let event_fanout = EventFanout::new(config.event_buffer);
-    let mut daemon_state = DaemonState::with_model_adapter_and_events_and_limits(
+    let state = Arc::new(RwLock::new(configured_state(
+        &config,
         Arc::new(RuntimeModelAdapter::from_env(chatgpt_auth.clone())),
-        event_fanout,
-        config.max_background_processes,
-    );
-    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
-    let state = Arc::new(RwLock::new(daemon_state));
+    )));
 
     configure_persistence(&state, &config).await?;
 
     state.write().await.chatgpt_auth = chatgpt_auth;
-    serve_with_state(listener, state, config).await
+    serve_with_state(listener, state, config, shutdown_signal()).await
 }
 
+/// Serves until `shutdown` resolves (Ctrl+C for [`serve`]), then shuts down
+/// gracefully.
 pub(crate) async fn serve_with_state(
     listener: TcpListener,
     state: SharedDaemonState,
     config: DaemonConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
     let bind_is_loopback = listener.local_addr()?.ip().is_loopback();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
@@ -236,7 +244,7 @@ pub(crate) async fn serve_with_state(
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
+            shutdown.await;
             // First: graceful shutdown waits for every response to finish,
             // and an agent event stream never ends on its own.
             live.close();
@@ -765,6 +773,113 @@ mod tests {
                 .is_empty(),
             "a stopped loop writes nothing more"
         );
+    }
+
+    #[tokio::test]
+    async fn the_configured_session_event_buffer_sizes_the_live_hub() {
+        use crate::live::{LiveDelivery, LiveEvent, LiveEventBody};
+
+        let config = DaemonConfig {
+            session_event_buffer: 2,
+            ..DaemonConfig::default()
+        };
+        // `app_with_config`, `app_with_database`,
+        // `app_with_configured_persistence`, and `serve` all build it here.
+        let hub = configured_state(&config, Arc::new(DeterministicModelAdapter)).live;
+        let mut subscription = hub.subscribe("agent-1").unwrap();
+        for n in 0..5u64 {
+            hub.publish(
+                LiveEvent::new(
+                    "agent-1",
+                    LiveEventBody::StepDelta {
+                        step_id: "run_1:1".into(),
+                        offset: n,
+                        text: "x".into(),
+                    },
+                ),
+                None,
+            );
+        }
+        assert!(matches!(
+            subscription.next().await,
+            Some(LiveDelivery::Lagged(3))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn graceful_shutdown_ends_an_open_event_stream_and_serve_returns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = Arc::new(RwLock::new(DaemonState::new()));
+        let agent_id = state
+            .write()
+            .await
+            .create_agent(anima_core::AgentConfig {
+                name: "companion".to_string(),
+                model: "deterministic".to_string(),
+                provider: None,
+                bio: None,
+                lore: None,
+                knowledge: None,
+                topics: None,
+                adjectives: None,
+                style: None,
+                system: None,
+                tools: None,
+                plugins: None,
+                settings: None,
+            })
+            .unwrap()
+            .state
+            .id;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (trigger, triggered) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_with_state(
+            listener,
+            state,
+            DaemonConfig::default(),
+            async move {
+                let _ = triggered.await;
+            },
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let request = format!(
+            "GET /api/agents/{agent_id}/events HTTP/1.1\r\nHost: {address}\r\nOrigin: http://localhost:4200\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut received = String::new();
+        let mut buffer = [0; 4096];
+        while !received.contains("event: stream.snapshot") {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                .await
+                .expect("the snapshot arrives")
+                .unwrap();
+            assert!(
+                read > 0,
+                "the stream closed before its snapshot: {received}"
+            );
+            received.push_str(&String::from_utf8_lossy(&buffer[..read]));
+        }
+        assert!(received.starts_with("HTTP/1.1 200 OK"), "{received}");
+
+        trigger.send(()).unwrap();
+
+        loop {
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buffer))
+                .await
+                .expect("the open stream ends once shutdown starts")
+                .unwrap();
+            if read == 0 {
+                break;
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("serve returns once its streams ended")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

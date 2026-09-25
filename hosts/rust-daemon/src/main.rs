@@ -45,10 +45,10 @@ async fn main() -> io::Result<()> {
             default_config.db_max_connections,
         )?,
         event_buffer: parse_env_usize("ANIMAOS_RS_EVENT_BUFFER", default_config.event_buffer)?,
-        session_event_buffer: parse_env_usize(
+        session_event_buffer: validate_session_event_buffer(parse_env_usize(
             "ANIMAOS_RS_SESSION_EVENT_BUFFER",
             default_config.session_event_buffer,
-        )?,
+        )?)?,
     };
 
     let listener = TcpListener::bind(bind_addr.as_str()).await?;
@@ -122,6 +122,24 @@ fn validate_max_runs_per_agent(parsed: usize) -> io::Result<usize> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "ANIMAOS_RS_MAX_RUNS_PER_AGENT must be between 1 and 64",
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Caps `ANIMAOS_RS_SESSION_EVENT_BUFFER`. Tokio allocates every slot of an
+/// agent's event channel when its first stream opens, under the daemon's
+/// locks, so an absurd value would exhaust memory or panic then; it is
+/// refused here, at startup, instead.
+const MAX_SESSION_EVENT_BUFFER: usize = 65_536;
+
+fn validate_session_event_buffer(parsed: usize) -> io::Result<usize> {
+    if !(1..=MAX_SESSION_EVENT_BUFFER).contains(&parsed) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "ANIMAOS_RS_SESSION_EVENT_BUFFER must be between 1 and {MAX_SESSION_EVENT_BUFFER}"
+            ),
         ));
     }
     Ok(parsed)
@@ -224,5 +242,29 @@ mod tests {
     fn max_runs_per_agent_at_or_below_64_is_accepted() {
         assert_eq!(validate_max_runs_per_agent(64).unwrap(), 64);
         assert_eq!(validate_max_runs_per_agent(1).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_session_event_buffer_outside_1_to_65536_is_rejected() {
+        for value in [0, MAX_SESSION_EVENT_BUFFER + 1] {
+            let error = validate_session_event_buffer(value).expect_err("outside the range");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "ANIMAOS_RS_SESSION_EVENT_BUFFER must be between 1 and 65536"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_event_buffer_from_1_to_65536_is_accepted() {
+        assert_eq!(MAX_SESSION_EVENT_BUFFER, 65_536);
+        for value in [
+            1,
+            DaemonConfig::default().session_event_buffer,
+            MAX_SESSION_EVENT_BUFFER,
+        ] {
+            assert_eq!(validate_session_event_buffer(value).unwrap(), value);
+        }
     }
 }
