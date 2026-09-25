@@ -27,10 +27,10 @@ function isDaemonTooOld(error: unknown): boolean {
 
 /**
  * A fresh first page, replacing any earlier first page in `current` (keyed
- * by `sessionKey`), while keeping every older page `loadMore` already
- * appended. A session `previousFirstPageKeys` remembers as page 1 but that
- * is absent from the fresh `firstPage` has left the window (or was deleted)
- * and is dropped; a session unique to an older page is left untouched.
+ * by `sessionKey`), while leaving every older page `loadMore` already
+ * appended untouched. A session `previousFirstPageKeys` remembers as page 1,
+ * but that the fresh `firstPage` no longer lists, has left the window (or
+ * was deleted), so it is dropped too.
  */
 function mergeFirstPage(
   current: readonly Session[],
