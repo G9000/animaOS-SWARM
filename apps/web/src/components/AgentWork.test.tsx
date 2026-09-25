@@ -1,4 +1,10 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
@@ -51,14 +57,14 @@ it('keeps Telegram delivery off until a chat is approved, then creates a Telegra
   vi.spyOn(daemon, 'listConnectors')
     .mockResolvedValueOnce({ connectors: [telegramConnector(false)] })
     .mockResolvedValue({ connectors: [telegramConnector(true)] });
-  const create = vi
-    .spyOn(daemon, 'createSchedule')
-    .mockResolvedValue({
-      schedule: createdSchedule({ type: 'connector', connectorId: 'tg-1' }),
-    });
+  const create = vi.spyOn(daemon, 'createSchedule').mockResolvedValue({
+    schedule: createdSchedule({ type: 'connector', connectorId: 'tg-1' }),
+  });
   render(<AgentProactiveView agentId="agent-main" name="Nova" />);
 
-  await screen.findByText('Proactive work is off. No schedules configured for Nova.');
+  await screen.findByText(
+    'Proactive work is off. No schedules configured for Nova.',
+  );
   const target = screen.getByRole('combobox', { name: 'Deliver to' });
   expect(target).toHaveValue('workspace');
   expect(screen.getByRole('option', { name: 'Telegram' })).toBeDisabled();
@@ -96,12 +102,16 @@ it('shows schedules without waiting for connectors and says when they cannot be 
   render(<AgentProactiveView agentId="agent-main" name="Nova" />);
 
   expect(
-    await screen.findByText('Proactive work is off. No schedules configured for Nova.'),
+    await screen.findByText(
+      'Proactive work is off. No schedules configured for Nova.',
+    ),
   ).toBeVisible();
   expect(screen.getByRole('option', { name: 'Telegram' })).toBeDisabled();
 
   await act(async () => failConnectors(new Error('connectors unavailable')));
-  expect(screen.getByRole('combobox', { name: 'Deliver to' })).toHaveAccessibleDescription(
+  expect(
+    screen.getByRole('combobox', { name: 'Deliver to' }),
+  ).toHaveAccessibleDescription(
     'Connectors could not be loaded, so Telegram delivery is unavailable. Refresh schedules to try again.',
   );
   expect(screen.getByRole('option', { name: 'Telegram' })).toBeDisabled();

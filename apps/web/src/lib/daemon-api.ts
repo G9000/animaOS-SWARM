@@ -343,10 +343,15 @@ export const daemon = {
     setupClient.sessions.list(agentId, options),
   getSession: (agentId: string, sessionId: string) =>
     setupClient.sessions.get(agentId, sessionId),
-  createSession: (agentId: string, input: { title?: string } = {}): Promise<Session> =>
-    setupClient.sessions.create(agentId, input),
-  updateSession: (agentId: string, sessionId: string, patch: SessionUpdateInput) =>
-    setupClient.sessions.update(agentId, sessionId, patch),
+  createSession: (
+    agentId: string,
+    input: { title?: string } = {},
+  ): Promise<Session> => setupClient.sessions.create(agentId, input),
+  updateSession: (
+    agentId: string,
+    sessionId: string,
+    patch: SessionUpdateInput,
+  ) => setupClient.sessions.update(agentId, sessionId, patch),
   deleteSession: (agentId: string, sessionId: string) =>
     setupClient.sessions.remove(agentId, sessionId),
   sessionMessages: (
@@ -640,7 +645,7 @@ export function toAgentDetail(snapshot: DaemonSnapshot): AgentDetail {
       ? { workspaceRole: 'lead' as const }
       : state.config.settings?.additional?.workspaceRole === 'helper'
         ? { workspaceRole: 'helper' as const }
-      : {}),
+        : {}),
     id: state.id,
     name: state.name,
     ...(state.config.bio ? { bio: state.config.bio } : {}),
@@ -685,7 +690,8 @@ const CHECKIN_SUFFIX = /\n\n\(This is a scheduled check-in\.[\s\S]*\)\s*$/;
 /** A session-route message as the chat components render it. A check-in
  *  prompt becomes a system line without the scheduler's instructions. */
 export function toChatMessage(message: SessionMessage): ChatMessage {
-  const checkin = message.role === 'user' && message.metadata.kind === 'checkin';
+  const checkin =
+    message.role === 'user' && message.metadata.kind === 'checkin';
   return {
     id: message.id,
     role: checkin ? 'System' : SESSION_ROLES[message.role],

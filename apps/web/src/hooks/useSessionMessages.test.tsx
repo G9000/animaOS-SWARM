@@ -48,14 +48,20 @@ describe('useSessionMessages', () => {
       .mockImplementation(async (_agentId, _sessionId, options = {}) =>
         options.before
           ? { messages: [message('m1', 1), message('m2', 2)], nextBefore: null }
-          : { messages: [message('m3', 3), message('m4', 4)], nextBefore: 'm3' },
+          : {
+              messages: [message('m3', 3), message('m4', 4)],
+              nextBefore: 'm3',
+            },
       );
     const { result } = renderHook(() =>
       useSessionMessages('agent-main', 'chat:1'),
     );
 
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m3', 'm4']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm3',
+        'm4',
+      ]),
     );
     expect(result.current.hasOlder).toBe(true);
     expect(pages).toHaveBeenCalledWith('agent-main', 'chat:1', { limit: 50 });
@@ -84,7 +90,8 @@ describe('useSessionMessages', () => {
       nextBefore: null,
     }));
     const { result, rerender } = renderHook(
-      ({ refreshKey }) => useSessionMessages('agent-main', 'chat:1', refreshKey),
+      ({ refreshKey }) =>
+        useSessionMessages('agent-main', 'chat:1', refreshKey),
       { initialProps: { refreshKey: 0 } },
     );
     const ids = () => result.current.messages.map((item) => item.id);
@@ -116,14 +123,20 @@ describe('useSessionMessages', () => {
               ],
               nextBefore: null,
             }
-          : { messages: [message('m5', 5), message('m6', 6)], nextBefore: 'm5' },
+          : {
+              messages: [message('m5', 5), message('m6', 6)],
+              nextBefore: 'm5',
+            },
       );
     const { result } = renderHook(() =>
       useSessionMessages('agent-main', 'chat:1'),
     );
 
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m5', 'm6']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm5',
+        'm6',
+      ]),
     );
     await act(async () => {
       await result.current.loadOlder();
@@ -151,9 +164,14 @@ describe('useSessionMessages', () => {
     // Controller ruling on ruling 2: a gap replaces the list outright rather
     // than splicing older messages back in (which risked misordering once
     // `loadOlder` later re-fetched the skipped range — see the next test).
-    expect(result.current.messages.map((item) => item.id)).toEqual(['m20', 'm21']);
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm20',
+      'm21',
+    ]);
     expect(result.current.hasOlder).toBe(true);
-    expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', { limit: 50 });
+    expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', {
+      limit: 50,
+    });
   });
 
   it('keeps strict chronological order with no duplicates or drops after loadOlder fills a gap', async () => {
@@ -174,7 +192,11 @@ describe('useSessionMessages', () => {
           };
         if (options.before === 'm20')
           return {
-            messages: [message('m17', 17), message('m18', 18), message('m19', 19)],
+            messages: [
+              message('m17', 17),
+              message('m18', 18),
+              message('m19', 19),
+            ],
             nextBefore: null,
           };
         return { messages: newest, nextBefore: newestCursor };
@@ -184,7 +206,10 @@ describe('useSessionMessages', () => {
     );
 
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m5', 'm6']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm5',
+        'm6',
+      ]),
     );
     await act(async () => {
       await result.current.loadOlder();
@@ -204,9 +229,14 @@ describe('useSessionMessages', () => {
     await act(async () => {
       await result.current.refresh();
     });
-    expect(result.current.messages.map((item) => item.id)).toEqual(['m20', 'm21']);
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm20',
+      'm21',
+    ]);
     expect(result.current.hasOlder).toBe(true);
-    expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', { limit: 50 });
+    expect(pages).toHaveBeenLastCalledWith('agent-main', 'chat:1', {
+      limit: 50,
+    });
 
     // Scrolling back from the new frontier re-fetches the skipped range and
     // must merge it in, in order, with no duplicate or dropped ids.
@@ -255,7 +285,10 @@ describe('useSessionMessages', () => {
       });
     });
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m1', 'm2']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm1',
+        'm2',
+      ]),
     );
 
     // …then the older call resolves last, with a smaller/stale page — it
@@ -264,7 +297,10 @@ describe('useSessionMessages', () => {
       resolveFirst?.({ messages: [message('m1', 1)], nextBefore: null });
     });
     await waitFor(() => expect(polls.length).toBeGreaterThan(0));
-    expect(result.current.messages.map((item) => item.id)).toEqual(['m1', 'm2']);
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm1',
+      'm2',
+    ]);
   });
 
   it('drops an older page that no longer attaches to the list after a gap replaces it', async () => {
@@ -286,7 +322,10 @@ describe('useSessionMessages', () => {
       useSessionMessages('agent-main', 'chat:1'),
     );
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m20', 'm21']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm20',
+        'm21',
+      ]),
     );
 
     // loadOlder fires "before m20" and is left in flight.
@@ -306,7 +345,10 @@ describe('useSessionMessages', () => {
     await act(async () => {
       await result.current.refresh();
     });
-    expect(result.current.messages.map((item) => item.id)).toEqual(['m22', 'm23']);
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm22',
+      'm23',
+    ]);
 
     // The stale "before m20" page now resolves; it must be dropped outright
     // rather than merged onto a list it no longer attaches to (Important,
@@ -319,7 +361,10 @@ describe('useSessionMessages', () => {
       await older;
     });
 
-    expect(result.current.messages.map((item) => item.id)).toEqual(['m22', 'm23']);
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm22',
+      'm23',
+    ]);
     expect(result.current.loadingOlder).toBe(false);
     expect(result.current.hasOlder).toBe(true);
 
@@ -344,13 +389,19 @@ describe('useSessionMessages', () => {
             resolveOlder = resolve;
           });
         }
-        return { messages: [message('m5', 5), message('m6', 6)], nextBefore: 'm5' };
+        return {
+          messages: [message('m5', 5), message('m6', 6)],
+          nextBefore: 'm5',
+        };
       });
     const { result } = renderHook(() =>
       useSessionMessages('agent-main', 'chat:1'),
     );
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m5', 'm6']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm5',
+        'm6',
+      ]),
     );
 
     let older: Promise<void> | undefined;
@@ -436,7 +487,10 @@ describe('useSessionMessages', () => {
       await result.current.loadOlder();
     });
     expect(result.current.error).toBeNull();
-    expect(result.current.messages.map((item) => item.id)).toEqual(['m2', 'm3']);
+    expect(result.current.messages.map((item) => item.id)).toEqual([
+      'm2',
+      'm3',
+    ]);
 
     olderFails = true;
     await act(async () => {
@@ -459,7 +513,9 @@ describe('useSessionMessages', () => {
       useSessionMessages('agent-main', 'chat:1'),
     );
 
-    await waitFor(() => expect(result.current.error).toBe('daemon unavailable'));
+    await waitFor(() =>
+      expect(result.current.error).toBe('daemon unavailable'),
+    );
     await waitFor(() => expect(polls.length).toBeGreaterThan(0));
     await act(async () => {
       polls[polls.length - 1]();
@@ -472,7 +528,9 @@ describe('useSessionMessages', () => {
     const polls = capturePolls();
     const pages = vi
       .spyOn(daemon, 'sessionMessages')
-      .mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }));
+      .mockRejectedValue(
+        Object.assign(new Error('not found'), { status: 404 }),
+      );
     const { result } = renderHook(() =>
       useSessionMessages('agent-main', 'chat:gone'),
     );

@@ -117,11 +117,13 @@ function mockSessionRoutes(): SessionRoutes {
     sessions: [...state.sessions],
     nextCursor: null,
   }));
-  vi.spyOn(daemon, 'getSession').mockImplementation(async (_agentId, sessionId) => {
-    const found = state.sessions.find((item) => item.id === sessionId);
-    if (!found) throw Object.assign(new Error('not found'), { status: 404 });
-    return found;
-  });
+  vi.spyOn(daemon, 'getSession').mockImplementation(
+    async (_agentId, sessionId) => {
+      const found = state.sessions.find((item) => item.id === sessionId);
+      if (!found) throw Object.assign(new Error('not found'), { status: 404 });
+      return found;
+    },
+  );
   vi.spyOn(daemon, 'createSession').mockImplementation(async (agentId) => {
     created += 1;
     const session = sessionFixture(`chat:new-${created}`, { agentId });
@@ -135,15 +137,19 @@ function mockSessionRoutes(): SessionRoutes {
         ...state.sessions[index],
         ...patch,
         unread:
-          patch.lastReadAtMs !== undefined ? false : state.sessions[index].unread,
+          patch.lastReadAtMs !== undefined
+            ? false
+            : state.sessions[index].unread,
       };
       state.sessions[index] = updated;
       return updated;
     },
   );
-  vi.spyOn(daemon, 'deleteSession').mockImplementation(async (_agentId, sessionId) => {
-    state.sessions = state.sessions.filter((item) => item.id !== sessionId);
-  });
+  vi.spyOn(daemon, 'deleteSession').mockImplementation(
+    async (_agentId, sessionId) => {
+      state.sessions = state.sessions.filter((item) => item.id !== sessionId);
+    },
+  );
   vi.spyOn(daemon, 'sessionMessages').mockResolvedValue({
     messages: [],
     nextBefore: null,
@@ -312,7 +318,11 @@ it('retains a completed reply after opening Work and keeps settings on the compa
 
 it('lists peer requests as read-only helper sessions apart from the owner chat', async () => {
   const user = userEvent.setup();
-  const alpha = withMessage(snapshot('alpha', 'Alpha', 1), 'Owner reply', 'chat:owner');
+  const alpha = withMessage(
+    snapshot('alpha', 'Alpha', 1),
+    'Owner reply',
+    'chat:owner',
+  );
   alpha.messages.push({
     id: 'peer-message',
     agentId: 'alpha',
@@ -321,7 +331,11 @@ it('lists peer requests as read-only helper sessions apart from the owner chat',
     content: {
       text: 'Private teammate request',
       metadata: {
-        communication: { kind: 'peer', fromAgentId: 'beta', toAgentId: 'alpha' },
+        communication: {
+          kind: 'peer',
+          fromAgentId: 'beta',
+          toAgentId: 'alpha',
+        },
       },
     },
     createdAtMs: 3,
@@ -356,10 +370,16 @@ it('lists peer requests as read-only helper sessions apart from the owner chat',
       'Private teammate request',
     ),
   ).not.toBeInTheDocument();
-  await user.click(await screen.findByRole('button', { name: 'Messages from Beta' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Messages from Beta' }),
+  );
   expect(await screen.findByText('Private teammate request')).toBeVisible();
-  expect(screen.getByRole('note')).toHaveTextContent('Helper sessions are read-only.');
-  expect(screen.queryByPlaceholderText('Message Alpha…')).not.toBeInTheDocument();
+  expect(screen.getByRole('note')).toHaveTextContent(
+    'Helper sessions are read-only.',
+  );
+  expect(
+    screen.queryByPlaceholderText('Message Alpha…'),
+  ).not.toBeInTheDocument();
 });
 
 function capturePollTimer() {
@@ -722,7 +742,9 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
-    routes.sessions.push(sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }));
+    routes.sessions.push(
+      sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }),
+    );
     messagesFromSnapshot(() => nova);
     const updateAgent = vi
       .spyOn(daemon, 'updateAgent')
@@ -1077,7 +1099,9 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
-    routes.sessions.push(sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }));
+    routes.sessions.push(
+      sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }),
+    );
     messagesFromSnapshot(() => nova);
     const updateAgent = vi
       .spyOn(daemon, 'updateAgent')
@@ -1694,7 +1718,11 @@ it('does not clear a newer recovery entry when an older identical send is confir
 
 it('opens an existing session from the sidebar, marks it read, and sends in its room', async () => {
   const user = userEvent.setup();
-  let current = withMessage(snapshot('agent-main', 'Nova', 1), 'Earlier answer', 'room-7');
+  let current = withMessage(
+    snapshot('agent-main', 'Nova', 1),
+    'Earlier answer',
+    'room-7',
+  );
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
     agents: [current],
@@ -1733,7 +1761,11 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
       );
       return {
         agent: current,
-        result: { status: 'success', durationMs: 1, data: { text: 'Saturday works' } },
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Saturday works' },
+        },
       };
     });
   render(<ViewHarness />);
@@ -1747,7 +1779,10 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
       lastReadAtMs: 2,
     }),
   );
-  await user.type(screen.getByPlaceholderText('Message Nova…'), 'Does Saturday work?');
+  await user.type(
+    screen.getByPlaceholderText('Message Nova…'),
+    'Does Saturday work?',
+  );
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
   expect(run).toHaveBeenCalledWith(
@@ -1919,7 +1954,10 @@ it('keeps drafts in memory when session storage refuses them', async () => {
     value: string,
   ) {
     if (this === window.sessionStorage)
-      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+      throw new DOMException(
+        'The quota has been exceeded.',
+        'QuotaExceededError',
+      );
     setItem.call(this, key, value);
   });
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
@@ -1945,7 +1983,9 @@ it('keeps drafts in memory when session storage refuses them', async () => {
   expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(
     'Keep this thought',
   );
-  await user.click(await screen.findByRole('button', { name: 'Weekend plans' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Weekend plans' }),
+  );
   await waitFor(() =>
     expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(''),
   );
@@ -1988,7 +2028,9 @@ it('creates one session for the first send and moves text typed meanwhile into i
 
   await act(async () => creating.resolve());
   await waitFor(() => expect(window.location.hash).toBe('#/s/chat%3Anew-1'));
-  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue('A follow-up');
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(
+    'A follow-up',
+  );
   expect(createSession).toHaveBeenCalledTimes(1);
   expect(runAgent).toHaveBeenCalledTimes(1);
   expect(runAgent).toHaveBeenCalledWith(
@@ -2038,7 +2080,9 @@ it('stays in a session opened while the first send was creating its chat', async
     'Plan the launch',
   );
   await user.click(screen.getByRole('button', { name: 'Send' }));
-  await user.click(await screen.findByRole('button', { name: 'Weekend plans' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Weekend plans' }),
+  );
 
   await act(async () => creating.resolve());
   await waitFor(() =>
@@ -2094,7 +2138,11 @@ it('keeps a page open when the first send creates its session, then returns to t
   const runAgent = vi
     .spyOn(daemon, 'runAgent')
     .mockImplementation(async (id, _text, _metadata, roomId) => {
-      current = withMessage(snapshot(id, 'Nova', 1), 'Launch plan ready', roomId);
+      current = withMessage(
+        snapshot(id, 'Nova', 1),
+        'Launch plan ready',
+        roomId,
+      );
       return {
         agent: current,
         result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
@@ -2119,10 +2167,9 @@ it('keeps a page open when the first send creates its session, then returns to t
     ),
   );
   expect(window.location.hash).toBe('#/work');
-  expect(screen.getByRole('button', { name: 'Work', exact: true })).toHaveAttribute(
-    'aria-current',
-    'page',
-  );
+  expect(
+    screen.getByRole('button', { name: 'Work', exact: true }),
+  ).toHaveAttribute('aria-current', 'page');
 
   await user.click(screen.getByRole('button', { name: 'Open companion chat' }));
   expect(window.location.hash).toBe('#/s/chat%3Anew-1');
@@ -2159,7 +2206,10 @@ it('keeps an opened page when the open session finishes deleting behind it', asy
   });
   mockProviders();
   routes.sessions.push(
-    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+    sessionFixture('chat:old', {
+      title: 'Old plan',
+      lastActivityAtMs: Date.now(),
+    }),
   );
   const deletion = deferred<void>();
   const deleteSession = vi.mocked(daemon.deleteSession);
@@ -2171,7 +2221,9 @@ it('keeps an opened page when the open session finishes deleting behind it', asy
   window.history.replaceState(null, '', '/#/s/chat%3Aold');
   render(<ViewHarness />);
 
-  await user.click(await screen.findByRole('button', { name: 'Actions for Old plan' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Actions for Old plan' }),
+  );
   await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
   await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
   await user.click(screen.getByRole('button', { name: 'Work', exact: true }));
@@ -2227,7 +2279,9 @@ it('keeps the open session while a sidebar search filters it out', async () => {
   expect(screen.getByRole('note')).toHaveTextContent(
     'Replying to a check-in is not available yet.',
   );
-  expect(screen.queryByPlaceholderText('Message Nova…')).not.toBeInTheDocument();
+  expect(
+    screen.queryByPlaceholderText('Message Nova…'),
+  ).not.toBeInTheDocument();
 });
 
 it('shows a failed header action in the session view', async () => {
@@ -2238,9 +2292,14 @@ it('shows a failed header action in the session view', async () => {
   });
   mockProviders();
   routes.sessions.push(
-    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+    sessionFixture('chat:old', {
+      title: 'Old plan',
+      lastActivityAtMs: Date.now(),
+    }),
   );
-  vi.mocked(daemon.updateSession).mockRejectedValue(new Error('archive refused'));
+  vi.mocked(daemon.updateSession).mockRejectedValue(
+    new Error('archive refused'),
+  );
   window.history.replaceState(null, '', '/#/s/chat%3Aold');
   render(<ViewHarness />);
 
@@ -2260,18 +2319,25 @@ it('shows a failed session action in the sidebar instead of rejecting', async ()
   });
   mockProviders();
   routes.sessions.push(
-    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+    sessionFixture('chat:old', {
+      title: 'Old plan',
+      lastActivityAtMs: Date.now(),
+    }),
   );
-  vi.mocked(daemon.updateSession).mockRejectedValue(new Error('archive refused'));
+  vi.mocked(daemon.updateSession).mockRejectedValue(
+    new Error('archive refused'),
+  );
   render(<ViewHarness />);
 
-  await user.click(await screen.findByRole('button', { name: 'Actions for Old plan' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Actions for Old plan' }),
+  );
   await user.click(screen.getByRole('menuitem', { name: 'Archive' }));
 
   expect(
-    await within(screen.getByRole('navigation', { name: 'Sessions' })).findByRole(
-      'alert',
-    ),
+    await within(
+      screen.getByRole('navigation', { name: 'Sessions' }),
+    ).findByRole('alert'),
   ).toHaveTextContent('archive refused');
 });
 
@@ -2327,7 +2393,9 @@ it.each([
   {
     action: 'rename',
     fail: () =>
-      vi.mocked(daemon.updateSession).mockRejectedValue(new Error('rename refused')),
+      vi
+        .mocked(daemon.updateSession)
+        .mockRejectedValue(new Error('rename refused')),
     run: async (user: ReturnType<typeof userEvent.setup>) => {
       await user.click(screen.getByRole('menuitem', { name: 'Rename' }));
       const field = screen.getByRole('textbox', { name: 'Rename Old plan' });
@@ -2338,32 +2406,44 @@ it.each([
     message: 'rename refused',
     // The rename stays open with the typed title, ready to retry.
     kept: () =>
-      expect(screen.getByRole('textbox', { name: 'Rename Old plan' })).toHaveValue(
-        'New plan',
-      ),
+      expect(
+        screen.getByRole('textbox', { name: 'Rename Old plan' }),
+      ).toHaveValue('New plan'),
   },
   {
     action: 'export',
     fail: () =>
-      vi.spyOn(daemon, 'exportSession').mockRejectedValue(new Error('export refused')),
+      vi
+        .spyOn(daemon, 'exportSession')
+        .mockRejectedValue(new Error('export refused')),
     run: async (user: ReturnType<typeof userEvent.setup>) => {
-      await user.click(screen.getByRole('menuitem', { name: 'Export Markdown' }));
+      await user.click(
+        screen.getByRole('menuitem', { name: 'Export Markdown' }),
+      );
     },
     message: 'export refused',
     kept: () =>
-      expect(screen.getByRole('button', { name: 'Old plan' })).toBeInTheDocument(),
+      expect(
+        screen.getByRole('button', { name: 'Old plan' }),
+      ).toBeInTheDocument(),
   },
   {
     action: 'delete',
     fail: () =>
-      vi.mocked(daemon.deleteSession).mockRejectedValue(new Error('delete refused')),
+      vi
+        .mocked(daemon.deleteSession)
+        .mockRejectedValue(new Error('delete refused')),
     run: async (user: ReturnType<typeof userEvent.setup>) => {
       await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
-      await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
+      await user.click(
+        screen.getByRole('menuitem', { name: 'Delete session' }),
+      );
     },
     message: 'delete refused',
     kept: () =>
-      expect(screen.getByRole('button', { name: 'Old plan' })).toBeInTheDocument(),
+      expect(
+        screen.getByRole('button', { name: 'Old plan' }),
+      ).toBeInTheDocument(),
   },
 ])(
   'shows a failed sidebar $action instead of rejecting',
@@ -2375,7 +2455,10 @@ it.each([
     });
     mockProviders();
     routes.sessions.push(
-      sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+      sessionFixture('chat:old', {
+        title: 'Old plan',
+        lastActivityAtMs: Date.now(),
+      }),
     );
     fail();
     render(<ViewHarness />);
@@ -2386,7 +2469,9 @@ it.each([
     await run(user);
 
     const sidebar = screen.getByRole('navigation', { name: 'Sessions' });
-    expect(await within(sidebar).findByRole('alert')).toHaveTextContent(message);
+    expect(await within(sidebar).findByRole('alert')).toHaveTextContent(
+      message,
+    );
     kept();
   },
 );
@@ -2417,7 +2502,10 @@ it('keeps each session’s own messages and draft when switching between them', 
   mockProviders();
   routes.sessions.push(
     sessionFixture('chat:a', { title: 'Plan A', lastActivityAtMs: Date.now() }),
-    sessionFixture('chat:b', { title: 'Plan B', lastActivityAtMs: Date.now() - 1 }),
+    sessionFixture('chat:b', {
+      title: 'Plan B',
+      lastActivityAtMs: Date.now() - 1,
+    }),
   );
   messagesFromSnapshot(() => current);
   render(<ViewHarness />);
@@ -2484,7 +2572,10 @@ it('replies to a Telegram session through its connector', async () => {
   window.history.replaceState(null, '', '/#/s/telegram%3Atg-1');
   render(<ViewHarness />);
 
-  await user.type(await screen.findByPlaceholderText('Reply on Telegram…'), 'On my way');
+  await user.type(
+    await screen.findByPlaceholderText('Reply on Telegram…'),
+    'On my way',
+  );
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
   expect(reply).toHaveBeenCalledWith(
@@ -2511,7 +2602,12 @@ async function openTelegramSession() {
         roomId: 'telegram:tg-1',
         type: 'telegram',
         bot: { id: '1', username: 'nova_bot', displayName: 'Nova' },
-        approvedChat: { id: '42', kind: 'private', title: null, username: 'owner' },
+        approvedChat: {
+          id: '42',
+          kind: 'private',
+          title: null,
+          username: 'owner',
+        },
         pendingPairing: null,
         status: 'ready',
         enabled: true,
@@ -2564,14 +2660,21 @@ it('resends a restored Telegram reply with its key and gives a new reply a new k
   const input = await openTelegramSession();
   await user.type(input, 'On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
-  await user.click(await screen.findByRole('button', { name: 'Restore message' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  );
   expect(input).toHaveValue('On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
   // The daemon joins a retry that reuses the key instead of sending twice.
   await waitFor(() => expect(reply).toHaveBeenCalledTimes(2));
   const [, , , firstKey] = reply.mock.calls[0];
-  expect(reply.mock.calls[1]).toEqual(['agent-main', 'tg-1', 'On my way', firstKey]);
+  expect(reply.mock.calls[1]).toEqual([
+    'agent-main',
+    'tg-1',
+    'On my way',
+    firstKey,
+  ]);
 
   await user.type(input, 'Running late');
   await user.click(screen.getByRole('button', { name: 'Send' }));
@@ -2590,12 +2693,17 @@ it('returns to a new chat when the open session is deleted from the sidebar', as
   });
   mockProviders();
   routes.sessions.push(
-    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+    sessionFixture('chat:old', {
+      title: 'Old plan',
+      lastActivityAtMs: Date.now(),
+    }),
   );
   window.history.replaceState(null, '', '/#/s/chat%3Aold');
   render(<ViewHarness />);
 
-  await user.click(await screen.findByRole('button', { name: 'Actions for Old plan' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Actions for Old plan' }),
+  );
   await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
   await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
 

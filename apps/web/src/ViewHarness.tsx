@@ -271,9 +271,7 @@ export function ViewHarness() {
   // A session outside the loaded list (archived, older, or filtered out by a
   // search) keeps its last known record and is read again on its own.
   const [knownSession, setKnownSession] = useState<Session | null>(null);
-  const [sessionReadError, setSessionReadError] = useState<string | null>(
-    null,
-  );
+  const [sessionReadError, setSessionReadError] = useState<string | null>(null);
   useEffect(() => {
     if (listedSession) setKnownSession(listedSession);
   }, [listedSession]);
@@ -441,7 +439,8 @@ export function ViewHarness() {
       };
     } catch (caught) {
       // A deleted session has nothing left to wait for; other failures retry.
-      if (httpStatus(caught) === 404) check = { activeRuns: 0, delivered: false };
+      if (httpStatus(caught) === 404)
+        check = { activeRuns: 0, delivered: false };
     }
     if (
       !mountedRef.current ||
@@ -816,7 +815,9 @@ export function ViewHarness() {
     } catch (caught) {
       if (availableAgentIdsRef.current.has(targetId)) {
         const timedOut =
-          caught instanceof Error && 'status' in caught && caught.status === 408;
+          caught instanceof Error &&
+          'status' in caught &&
+          caught.status === 408;
         uncertainSendsRef.current.set(clientRequestId, {
           agentId: targetId,
           sessionId: session.id,
@@ -1017,7 +1018,8 @@ export function ViewHarness() {
       await daemon.deleteSession(session.agentId, session.id);
       setSessionActionError(null);
       sessions.remove(session);
-      if (agentId) forgetChat(chatKey(agentId, sessionConversation(session.id)));
+      if (agentId)
+        forgetChat(chatKey(agentId, sessionConversation(session.id)));
       // Judge by the route now: a page or another session may have opened meanwhile.
       const open = lastConversationRef.current;
       if (open.kind === 'session' && open.sessionId === session.id) {
@@ -1157,10 +1159,13 @@ export function ViewHarness() {
       onNewChat={newChat}
       onOpenWork={() => navigate({ kind: 'page', page: 'work' })}
       onRename={(title) =>
-        activeSession ? renameSession(activeSession, title) : Promise.resolve(false)
+        activeSession
+          ? renameSession(activeSession, title)
+          : Promise.resolve(false)
       }
       onToggleArchived={() => {
-        if (activeSession) void archiveSession(activeSession, !activeSession.archived);
+        if (activeSession)
+          void archiveSession(activeSession, !activeSession.archived);
       }}
       onExport={() => {
         if (activeSession) void exportSession(activeSession);
@@ -1180,8 +1185,8 @@ export function ViewHarness() {
               <p className="font-semibold text-danger">Update the daemon</p>
               <p className="text-ink-2">
                 This console keeps chats as sessions, which this anima-daemon
-                does not support yet. Update and restart the daemon, then
-                reload this page.
+                does not support yet. Update and restart the daemon, then reload
+                this page.
               </p>
             </div>
           ) : null}
@@ -1200,8 +1205,7 @@ export function ViewHarness() {
           ) : null}
           {sessionLoading && sessionReadError ? (
             <p role="alert" className="px-4 pt-3 text-xs text-danger">
-              Session details could not be loaded: {sessionReadError}.
-              Retrying…
+              Session details could not be loaded: {sessionReadError}. Retrying…
             </p>
           ) : null}
           {routeSessionId && history.error ? (

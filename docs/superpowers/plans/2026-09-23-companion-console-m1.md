@@ -16,7 +16,7 @@
 - **M0 lands first.** Tasks 1–2 build on M0 Tasks 2–3: the private `AgentRuntime.event_total` field, `const EVENT_TRIM_SLACK`, `pub const MAX_RETAINED_EVENTS`, `apply_token_usage` adding all five usage fields, and `TokenUsage { prompt_tokens, completion_tokens, total_tokens, cached_prompt_tokens, reasoning_tokens }`. Task 1 Step 1 checks this; stop if it is missing.
 - Out of scope (M2/M3/M4): the async runs route, SSE, streaming, stop/steer, sessions, approvals, the history store, and parent/child run linkage. The ledger already has `queued`, `awaiting_approval`, `cancelled`, `stop`, `steps`, `parentRunId`, and `mirrored`; M1 produces only `running`, `completed`, `failed`, and `interrupted`, never sets `mirrored`, and leaves `parentRunId` empty.
 - Preserve external behavior: route request/response shapes, the blocking `POST /api/agents/{id}/run` contract and its fail-fast `503 too many concurrent run requests`, Telegram idempotency and reconciliation, schedule outcomes, job semantics, and helper limits. Deliberate additions: 409 when deleting an agent or saving its tasks while one of its runs is in flight; 409 for a second in-flight run with the same idempotency key; 400 for the reserved room prefixes `telegram:`, `schedule:`, `job:`, `peer:`.
-- Admission order everywhere (spec §4.3): room lock → agent slot → global permit. No code path may hold a global permit while *waiting* for a room lock or slot (that combination deadlocks with a waiting run). Fail-fast callers use the non-reserving `has_available_permit()` pre-check.
+- Admission order everywhere (spec §4.3): room lock → agent slot → global permit. No code path may hold a global permit while _waiting_ for a room lock or slot (that combination deadlocks with a waiting run). Fail-fast callers use the non-reserving `has_available_permit()` pre-check.
 - Disk is tight. Iterate with focused tests: `cargo test -p anima-core --lib <module>::` or `cargo test -p anima-daemon --lib <module>::tests::<filter>` (shared `target/`). Run `bun x nx run rust-daemon:test --skipNxCache` only in Task 10 and only with ≥12 GB free in `df -h /System/Volumes/Data`; otherwise run `cargo test -p anima-core -p anima-daemon` and record that the Nx gate is pending disk space.
 - Formatting: `state.rs` and `routes/mod.rs` are not rustfmt-clean today. Do not run `cargo fmt` over the workspace; match the surrounding style by hand. New files may be formatted with `rustfmt --edition 2021 <file>`.
 - Error strings in this plan are exact; tests assert them.
@@ -28,12 +28,14 @@
 ### Task 1: Isolated run copies and run deltas (anima-core)
 
 **Files:**
+
 - Create: `packages/core-rust/crates/anima-core/src/runtime/run_delta.rs`
 - Create: `packages/core-rust/crates/anima-core/src/runtime/run_tests.rs`
 - Modify: `packages/core-rust/crates/anima-core/src/runtime.rs` (two module declarations, one re-export)
 - Modify: `packages/core-rust/crates/anima-core/src/lib.rs` (runtime re-export)
 
 **Interfaces:**
+
 - Consumes (private items of `runtime.rs`, M0 versions): fields `state`, `messages`, `events`, `event_total`, `last_task`, `step_counter`; `const MAX_RETAINED_EVENTS`, `const EVENT_TRIM_SLACK`, `fn next_id`, `static NEXT_ROOM_ID`, `fn apply_token_usage(&mut self, usage: &TokenUsage)`, `fn record_event`.
 - Produces (re-exported from the crate root): `pub fn new_room_id() -> String`; `pub struct RuntimeRunBase { pub message_count: usize, pub event_total: usize, pub token_usage: TokenUsage, pub step_count: u64 }`; `pub struct RuntimeRunDelta { pub messages: Vec<Message>, pub events: Vec<EngineEvent>, pub event_total: usize, pub token_usage: TokenUsage, pub step_count: u64, pub last_task: Option<TaskResult<Content>>, pub status: AgentStatus }`; opaque `pub struct RuntimeRunUndo` (`Clone`); `AgentRuntime::run_snapshot(&self, history: Vec<Message>) -> AgentRuntimeSnapshot`, `run_base(&self) -> RuntimeRunBase`, `run_delta_since(&self, base: &RuntimeRunBase) -> RuntimeRunDelta`, `apply_run_delta(&mut self, delta: &RuntimeRunDelta) -> RuntimeRunUndo`, `revert_run_delta(&mut self, delta: &RuntimeRunDelta, undo: RuntimeRunUndo)`.
 
@@ -522,12 +524,14 @@ git commit -m "feat(core): add isolated run copies and exact run deltas"
 ### Task 2: Run-scoped tool step keys (anima-core)
 
 **Files:**
+
 - Modify: `packages/core-rust/crates/anima-core/src/runtime.rs` (`AgentRuntime` field, `new_with_id`, `from_snapshot`, new `set_run_id`/`run_id`, `prepare_tool_steps`, `tool_step_idempotency_key`, `message_retry_key`, new `content_retry_key`)
 - Modify: `packages/core-rust/crates/anima-core/src/lib.rs` (re-export `content_retry_key`)
 - Modify: `packages/core-rust/crates/anima-core/src/persistence.rs` (`InMemoryAdapter::write_step`, new test)
 - Test: `packages/core-rust/crates/anima-core/src/runtime/run_tests.rs` (append)
 
 **Interfaces:**
+
 - Consumes (Task 1): `AgentRuntime::run_snapshot`, `run_base`, `run_delta_since`, `new_room_id`.
 - Produces: `AgentRuntime::set_run_id(&mut self, run_id: impl Into<String>)`, `AgentRuntime::run_id(&self) -> Option<&str>` (not persisted; `from_snapshot` starts with `None`); `pub fn content_retry_key(content: &Content) -> Option<&str>` re-exported as `anima_core::content_retry_key`. Step-key rule: a durable retry key on the input keeps the key `agent + retry key + step` (unchanged, replay-safe across a restart re-run); otherwise, with a run id set, the key is `agent + run id + message id + room + step`; without a run id it is unchanged from today.
 
@@ -886,13 +890,15 @@ git commit -m "feat(core): scope tool step keys to the run unless a retry key is
 ### Task 3: Durable run ledger with restart recovery (daemon)
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/runs/mod.rs`, `hosts/rust-daemon/src/runs/ledger.rs`
 - Modify: `hosts/rust-daemon/src/lib.rs` (`mod runs;`)
 - Modify: `hosts/rust-daemon/src/control_plane_store.rs` (`runs` field with serde default, constructor, tests; the snapshot version stays 4)
 - Modify: `hosts/rust-daemon/src/state.rs` (`runs` field and init, `control_plane_snapshot`, `validate_control_plane_snapshot`, `restore_control_plane_snapshot`, new `in_flight_runs` and `live_agent_ids`, one test)
 
 **Interfaces:**
-- Produces (in `crate::runs`): `RunStatus { Queued, Running, AwaitingApproval, Completed, Failed, Cancelled, Interrupted }` (snake_case JSON; `is_terminal()`, `is_in_flight()` = running or awaiting approval); `RunSource { Web, Api, Telegram, Schedule, Job, Delegation, Peer }`; `RunInput { text, attachment_ids, skill }`; `RunError { code, message }` + `RunError::new(code: &str, message: impl Into<String>)`; `RunStopRequest { requested_at_ms }`; `RunStepUsage { step_id, usage }`; `RunRecord { id, agent_id, session_id, source, source_ref, status, idempotency_key, input, created_at_ms, started_at_ms, finished_at_ms, error, stop, tools_started, steps, usage, model, provider, parent_run_id, mirrored }` (camelCase JSON; only `id`, `agentId`, `sessionId`, `source`, `status`, and `createdAtMs` are required, every other field has a serde default); `RunStart { agent_id, session_id, source, source_ref, idempotency_key, text, model, provider, parent_run_id }`; `RunRecord::running(start: RunStart, now_ms: u64) -> RunRecord` (id `run_<uuid-v4>`, text truncated to 32 KiB); `RunRecord::finish(&mut self, status: RunStatus, error: Option<RunError>, now_ms: u64)`; `RunLedger` with `insert`, `get`, `get_mut`, `remove`, `in_flight_count(agent_id)`, `has_in_flight_idempotency_key(agent_id, key)`, `for_agent(agent_id) -> Vec<&RunRecord>`, `prune(now_ms)`, `snapshot_records(&HashSet<String>) -> Vec<RunRecord>`, `validate(&[RunRecord]) -> Result<(), String>`, `restored(Vec<RunRecord>, &HashSet<String>, now_ms) -> RunLedger`; constants `TERMINAL_RUN_RETENTION_MS` (24 h), `MAX_TERMINAL_RUNS_PER_AGENT` (50), `MAX_RUN_INPUT_TEXT_BYTES` (32 KiB), `MAX_RUN_TOOLS_STARTED` (50), and error codes `RESTART_BEFORE_START`, `RESTART_DURING_RUN`, `RUN_FAILED`, `RUN_ABORTED`, `COMMIT_REJECTED`, `COMMIT_FAILED`, `AGENT_DELETED`.
+
+- Produces (in `crate::runs`): `RunStatus { Queued, Running, AwaitingApproval, Completed, Failed, Cancelled, Interrupted }` (snake*case JSON; `is_terminal()`, `is_in_flight()` = running or awaiting approval); `RunSource { Web, Api, Telegram, Schedule, Job, Delegation, Peer }`; `RunInput { text, attachment_ids, skill }`; `RunError { code, message }` + `RunError::new(code: &str, message: impl Into<String>)`; `RunStopRequest { requested_at_ms }`; `RunStepUsage { step_id, usage }`; `RunRecord { id, agent_id, session_id, source, source_ref, status, idempotency_key, input, created_at_ms, started_at_ms, finished_at_ms, error, stop, tools_started, steps, usage, model, provider, parent_run_id, mirrored }` (camelCase JSON; only `id`, `agentId`, `sessionId`, `source`, `status`, and `createdAtMs` are required, every other field has a serde default); `RunStart { agent_id, session_id, source, source_ref, idempotency_key, text, model, provider, parent_run_id }`; `RunRecord::running(start: RunStart, now_ms: u64) -> RunRecord` (id `run*<uuid-v4>`, text truncated to 32 KiB); `RunRecord::finish(&mut self, status: RunStatus, error: Option<RunError>, now_ms: u64)`; `RunLedger`with`insert`, `get`, `get_mut`, `remove`, `in_flight_count(agent_id)`, `has_in_flight_idempotency_key(agent_id, key)`, `for_agent(agent_id) -> Vec<&RunRecord>`, `prune(now_ms)`, `snapshot_records(&HashSet<String>) -> Vec<RunRecord>`, `validate(&[RunRecord]) -> Result<(), String>`, `restored(Vec<RunRecord>, &HashSet<String>, now_ms) -> RunLedger`; constants `TERMINAL_RUN_RETENTION_MS`(24 h),`MAX_TERMINAL_RUNS_PER_AGENT`(50),`MAX_RUN_INPUT_TEXT_BYTES`(32 KiB),`MAX_RUN_TOOLS_STARTED`(50), and error codes`RESTART_BEFORE_START`, `RESTART_DURING_RUN`, `RUN_FAILED`, `RUN_ABORTED`, `COMMIT_REJECTED`, `COMMIT_FAILED`, `AGENT_DELETED`.
 - Produces: `DaemonState::runs: RunLedger` (`pub(crate)`), `DaemonState::in_flight_runs(&self, agent_id: &str) -> usize`; `ControlPlaneSnapshot::runs: Vec<RunRecord>` (`#[serde(default)]`); the snapshot version stays 4 (M2 bumps it together with the pre-upgrade backup).
 
 - [ ] **Step 1: Write the failing tests**
@@ -1635,6 +1641,7 @@ pub(crate) use ledger::{
 ```
 
 In `control_plane_store.rs`:
+
 - keep `CONTROL_PLANE_STORE_VERSION` at 4: `ControlPlaneSnapshot` has no `deny_unknown_fields`, so pre-M1 daemons load M1 snapshots and ignore `runs`; M2 bumps the version together with its pre-upgrade backup.
 - add to `ControlPlaneSnapshot`, after `workspace`:
 
@@ -1646,6 +1653,7 @@ In `control_plane_store.rs`:
 - in `with_connector_state_and_cleanup`, add `runs: vec![],` after `workspace: None,`.
 
 In `state.rs`:
+
 - add `pub(crate) runs: crate::runs::RunLedger,` to `DaemonState` after `pub(crate) goals: ...`, and `runs: crate::runs::RunLedger::default(),` after `goals: HashMap::new(),` in `with_model_adapter_and_events_and_limits`.
 - in `control_plane_snapshot`, after `snapshot.goals.sort_by(...);`, add `snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());`.
 - in `validate_control_plane_snapshot`, directly after the `for job in &snapshot.jobs { ... }` loop, add `crate::runs::RunLedger::validate(&snapshot.runs)?;`.
@@ -1693,11 +1701,13 @@ git commit -m "feat(daemon): add the durable run ledger with restart recovery"
 ### Task 4: Per-run isolation and change-set commit primitives (daemon)
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/runs/mod.rs` (`RunChangeSet`, `RunOutcome`, test)
 - Create: `hosts/rust-daemon/src/state/run_commit.rs` (`impl DaemonState` block + tests)
 - Modify: `hosts/rust-daemon/src/state.rs` (`mod run_commit;`, `wire_runtime`, `restore_agent_snapshot`, `get_agent`, `list_agents`)
 
 **Interfaces:**
+
 - Consumes (Task 1): `anima_core::{AgentRuntime::run_snapshot, run_base, run_delta_since, apply_run_delta, revert_run_delta, RuntimeRunBase, RuntimeRunDelta, RuntimeRunUndo}`. (Task 3): `RunLedger`, `RunRecord::finish`, `RunStatus`, `RunError`, `RUN_FAILED`, `AGENT_DELETED`, `MAX_RUN_TOOLS_STARTED`, `DaemonState::in_flight_runs`.
 - Produces:
   - `crate::runs::RunChangeSet { pub run_id: String, pub agent_id: String, pub session_id: String, pub message_ids: Vec<String>, pub event_ids: Vec<String>, pub token_delta: TokenUsage, pub step_delta: u64, pub delta: RuntimeRunDelta, pub undo: Option<RuntimeRunUndo> }` (all `pub(crate)`); `RunChangeSet::new(run_id: String, agent_id: String, session_id: String, delta: RuntimeRunDelta) -> Self`; `reply_message_id(&self, result: &TaskResult<Content>) -> Option<String>` (the run's last message when it is an assistant message in its own room and the run succeeded); `tools_started(&self) -> Vec<String>`.
@@ -2395,6 +2405,7 @@ git commit -m "feat(daemon): add per-run isolation and change-set commit primiti
 ### Task 5: Run agents on isolated runtimes with change-set commits
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/agent_runs.rs` (imports, `AgentRunRollback`, `RunRoom::resolve`, `AgentRunRequest`, `send_peer`, `delegate`, `spawn_helper`, every `run*` method, `apply_run_rollback`, new `validate_run_request` and `InFlightRunGuard`, tests)
 - Modify: `hosts/rust-daemon/src/state.rs` (remove `deleted_agent_ids`, `take_agent_runtime`, `restore_agent_runtime`, `rollback_agent_runtime`; rewrite `update_agent`, `remove_agent`, `restore_removed_agent`; import cleanup; test fixture)
 - Modify: `hosts/rust-daemon/src/connectors/runtime.rs` (`send_from_owner_owned`, `process_pending_once_owned`, import, one test literal)
@@ -2406,6 +2417,7 @@ git commit -m "feat(daemon): add per-run isolation and change-set commit primiti
 - Modify: `hosts/rust-daemon/src/routes/mod.rs` (`ApiError::status`)
 
 **Interfaces:**
+
 - Consumes (Task 2): `anima_core::content_retry_key`, `AgentRuntime::set_run_id`; (Task 1): `anima_core::new_room_id`, `AgentRuntime::run_delta_since`; (Task 3): `RunRecord::running`, `RunStart`, `RunSource`, `RunStatus`, `RunError`, `RunLedger::{insert, remove, get_mut, has_in_flight_idempotency_key}`, codes `COMMIT_REJECTED`, `COMMIT_FAILED`, `RUN_ABORTED`; (Task 4): `RunChangeSet::new`, `RunOutcome::new`, `DaemonState::{build_run_runtime, commit_run, rollback_run, tool_execution_context, with_derived_status}`.
 - Produces:
   - Commit hook type: `F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError>`; source rollback type: `R: FnOnce(&mut DaemonState) -> Result<(), ApiError>` (the coordinator itself rolls back the run's transcript; the closure only undoes the source's own records). Method names and permit parameters are unchanged in this task: `run`, `run_admitted`, `run_with_commit`, `run_with_commit_waiting`, `run_with_commit_admitted`, `run_with_commit_admitted_and_rollback`.
@@ -3528,6 +3540,7 @@ impl Drop for InFlightRunGuard {
 - [ ] **Step 4: Remove the checked-out-runtime model from `DaemonState`**
 
 In `hosts/rust-daemon/src/state.rs`:
+
 - delete the field `deleted_agent_ids: HashSet<String>,` and its initializer `deleted_agent_ids: HashSet::new(),`;
 - delete `pub(crate) fn take_agent_runtime`, `pub(crate) fn restore_agent_runtime`, and `pub(crate) fn rollback_agent_runtime` entirely;
 - remove `ToolExecutionContext` from the `use crate::tools::{...}` list (the tool context is built in `state/run_commit.rs`);
@@ -4089,12 +4102,14 @@ git commit -m "feat(daemon): run agents on isolated runtimes with change-set com
 ### Task 6: Block agent deletion and task edits while runs are in flight
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/connectors/runtime.rs` (`ConnectorManagerError::AgentBusy`, `Display`, `delete_agent`, test)
 - Modify: `hosts/rust-daemon/src/routes/connectors.rs` (`manager_error` arm, test row)
 - Modify: `hosts/rust-daemon/src/routes/agents.rs` (`AGENT_BUSY_MESSAGE`, `handle_delete_agent`, test)
 - Modify: `hosts/rust-daemon/src/routes/mod.rs` (`delete_agent_entry` + new `delete_agent_error`, `put_agent_tasks_entry`, tests)
 
 **Interfaces:**
+
 - Consumes: `DaemonState::in_flight_runs(agent_id) -> usize` (Task 3), ledger records created by the coordinator (Task 5).
 - Produces: `ConnectorManagerError::AgentBusy` (public code `agent_busy`, 409); `crate::routes::agents::AGENT_BUSY_MESSAGE = "Agent has a run in progress; wait for it to finish before deleting it"`; `DELETE /api/agents/{id}` → 409 while a run is running (spec §4.4 item 6; M1 has no queued ledger runs to cancel); `PUT /api/agents/{id}/tasks` guard uses the in-flight count (spec §4.4 item 7).
 
@@ -4352,6 +4367,7 @@ Expected: compile errors: `no variant named AgentBusy` and `cannot find function
 - [ ] **Step 3: Implement the guards**
 
 `hosts/rust-daemon/src/connectors/runtime.rs`:
+
 - add `AgentBusy,` to `enum ConnectorManagerError` after `AgentNotFound,`, and `Self::AgentBusy => "agent has a run in progress",` to its `Display` match after the `AgentNotFound` arm;
 - in `delete_agent`, replace
 
@@ -4418,6 +4434,7 @@ and in `handle_delete_agent` replace the `persist_request` block with:
 ```
 
 `hosts/rust-daemon/src/routes/mod.rs`:
+
 - in the `#[utoipa::path(delete, path = "/api/agents/{agent_id}", ...)]` responses, add `(status = 409, description = "The agent has a run in progress", body = ErrorBody)` after the 404 entry;
 - in `delete_agent_entry`, replace the final `match state.connector_manager.delete_agent(agent_id).await { ... }` with:
 
@@ -4461,6 +4478,7 @@ git commit -m "feat(daemon): block agent deletion and task edits while runs are 
 ### Task 7: Room locks, agent slots, and cross-room concurrency
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/runs/mod.rs` (slot constants)
 - Modify: `hosts/rust-daemon/src/agent_runs.rs` (lock/slot types, coordinator fields, `new`, `with_max_runs_per_agent`, `is_agent_busy`, `has_available_permit`, run API, admission helpers, `run_locked` signature, `spawn_helper`, `try_admit`, test helpers, tests)
 - Modify: `hosts/rust-daemon/src/routes/agents.rs` (`handle_run_agent` signature, test helper)
@@ -4470,6 +4488,7 @@ git commit -m "feat(daemon): block agent deletion and task edits while runs are 
 - Modify: `hosts/rust-daemon/src/schedules.rs` (`SchedulerInner::jobs` keyed by schedule, `tick_inner`, `reconcile_interrupted`, rewrite `scheduler_starts_new_due_agent_while_another_is_running`)
 
 **Interfaces:**
+
 - Consumes: Task 5's `run_locked` body, `RunRoom::resolve`, `InFlightRunGuard`, hook types; Task 3's `RunSource`.
 - Produces:
   - `crate::runs::{DEFAULT_MAX_RUNS_PER_AGENT = 3, HELPER_MAX_RUNS = 1}`.
@@ -5711,6 +5730,7 @@ with
 change `service.execute(job, permit).await;` to `service.execute(job, ticket).await;`, change the signature to `async fn execute(&self, job: AgentJobRecord, ticket: crate::agent_runs::RunTicket) {`, and in `execute` change `.run_with_commit_admitted_and_rollback(` to `.run_ticketed_with_commit_and_rollback(` and its `permit,` argument to `ticket,` (the request and closures are unchanged).
 
 `hosts/rust-daemon/src/schedules.rs`:
+
 - change the comment on `SchedulerInner::jobs` to `// One live run per automation (spec §4.3); a job owns its entry until the detached agent run and durable commit finish.`
 - in `tick_inner`, replace everything from `let active_agents = jobs.keys().cloned().collect();` through the end of the `for (_, id, agent_id) in due_ids { ... }` loop with:
 
@@ -5780,6 +5800,7 @@ git commit -m "feat(daemon): run different rooms of one agent concurrently behin
 ### Task 8: Reserved room prefixes and the per-agent run limit setting
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/routes/agents.rs` (`RESERVED_ROOM_PREFIXES`, `handle_run_agent`, test)
 - Modify: `hosts/rust-daemon/src/routes/mod.rs` (`run_agent_entry` OpenAPI responses, test `router()` helper)
 - Modify: `hosts/rust-daemon/src/app.rs` (`DaemonConfig::max_runs_per_agent`, both runtime builders, test)
@@ -5788,6 +5809,7 @@ git commit -m "feat(daemon): run different rooms of one agent concurrently behin
 - Modify: `hosts/rust-daemon/README.md` (env table row)
 
 **Interfaces:**
+
 - Consumes: `AgentRunCoordinator::with_max_runs_per_agent` (Task 7), `crate::runs::DEFAULT_MAX_RUNS_PER_AGENT` (Task 7).
 - Produces: `POST /api/agents/{id}/run` rejects `roomId` values starting with `telegram:`, `schedule:`, `job:`, or `peer:` with 400 `roomId must be non-empty, at most 256 bytes, and outside the reserved telegram:, schedule:, job:, and peer: namespaces` (spec §3.1); `pub max_runs_per_agent: usize` on `DaemonConfig` (default 3) read from `ANIMAOS_RS_MAX_RUNS_PER_AGENT` (positive integer); `#[cfg(test)] AgentRunCoordinator::max_runs_per_agent(&self) -> usize`.
 
@@ -5898,6 +5920,7 @@ and in `handle_run_agent` replace the `let room = match ... { ... };` statement 
 ```
 
 `hosts/rust-daemon/src/routes/mod.rs`:
+
 - in `#[utoipa::path(post, path = "/api/agents/{agent_id}/run", ...)]`, extend `responses(...)` with `(status = 409, description = "A run with this idempotency key is already in progress", body = ErrorBody)` and `(status = 503, description = "Too many concurrent runs", body = ErrorBody)`;
 - in the test helper `pub(crate) fn router(...)`, change the coordinator line to:
 
@@ -5907,6 +5930,7 @@ and in `handle_run_agent` replace the `let room = match ... { ... };` statement 
 ```
 
 `hosts/rust-daemon/src/app.rs`:
+
 - add to `DaemonConfig` after `max_concurrent_runs`:
 
 ```rust
@@ -5966,11 +5990,13 @@ git commit -m "feat(daemon): reserve connector, automation, and job rooms and ad
 ### Task 9: Compare-and-swap `todo_write` across concurrent runs
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/tools.rs` (`ToolExecutionContext::todo_revision`, `new`, `with_todo_baseline`)
 - Modify: `hosts/rust-daemon/src/tools/todo.rs` (`execute_todo_write`, `execute_todo_read`, new `render_agent_todos`, tests)
 - Modify: `hosts/rust-daemon/src/agent_runs.rs` (`run_locked` phase B baseline)
 
 **Interfaces:**
+
 - Consumes: `crate::tools::todo::{read_agent_todos, write_agent_todos}` (existing; `write_agent_todos(root, id, tasks, Some(expected))` fails with `Tasks changed. Refresh before saving again.` on a stale revision), `crate::tools::ctx_workspace_root`.
 - Produces: `ToolExecutionContext::with_todo_baseline(self, revision: Option<String>) -> Self`; the coordinator seeds it with the agent's task revision at run start when the agent has `todo_write`; `todo_write` only replaces the list its run last saw (baseline, its own last write, or its last `todo_read`). On conflict it saves nothing, returns the error `Tasks changed since this run last saw them, so nothing was saved. The latest tasks are:\n<list>\nMerge your changes into this list and call todo_write again with the complete list.`, and adopts the latest revision so a merged retry succeeds (spec §4.4 item 8). Success and `todo_read` texts are unchanged.
 
@@ -6169,6 +6195,7 @@ Expected: compile error `no method named with_todo_baseline found for struct Too
 - [ ] **Step 3: Implement compare-and-swap**
 
 `hosts/rust-daemon/src/tools.rs`:
+
 - add to `pub(crate) struct ToolExecutionContext`, after `pub(super) mail: Option<MailManager>,`:
 
 ```rust
@@ -6370,6 +6397,7 @@ git commit -m "feat(daemon): make todo_write compare-and-swap across concurrent 
 ### Task 10: M1 verification
 
 **Files:**
+
 - Modify: `docs/superpowers/plans/2026-09-23-companion-console.md` (status table)
 
 - [ ] **Step 1: Check the removed paths and admission rules**
@@ -6383,6 +6411,7 @@ Expected: no output outside `agent_runs.rs` (nothing reserves a global permit be
 - [ ] **Step 2: Run the full suites**
 
 Run: `df -h /System/Volumes/Data`
+
 - With at least 12 GB available: run `bun x nx run rust-daemon:test --skipNxCache` (this also runs `core-rust:test` in its own target directory). Expected: PASS.
 - Otherwise run the fallback in the shared `target/`, library tests first and then each integration-test binary one at a time: `CARGO_INCREMENTAL=0 cargo test -p anima-core --lib`, `CARGO_INCREMENTAL=0 cargo test -p anima-daemon --lib`, then `CARGO_INCREMENTAL=0 cargo test -p anima-core --tests` and `CARGO_INCREMENTAL=0 cargo test -p anima-daemon --tests`. Expected: PASS. The fallback does not satisfy AGENTS.md's completion rule; record that the Nx gate is pending disk space.
 
@@ -6404,9 +6433,9 @@ git commit -m "docs: mark the M1 run coordinator complete"
 ## Notes for the controller
 
 - **Names.** The master plan's `RunCoordinator::admit(agent_id, room_key, mode)` is `AgentRunCoordinator::admit` (the type already exists). `RunChangeSet` keeps the listed fields and adds `agent_id`, `session_id`, `delta`, and `undo`. `DaemonState::rollback_run` takes a second `RunError` argument so the ledger records why a commit did not stand.
-- **Step keys vs. restart recovery (spec §4.4 item 10 vs. §4.8).** Including the run id in every step key would stop Telegram's post-restart re-run (a *new* ledger run with the same inbound idempotency key) from recovering persisted tool steps in Postgres mode, which would replay side effects. The run id is therefore included only when the input has no durable retry key. Concurrent collisions are still impossible: without a retry key the run id differs; with one, the coordinator rejects a second in-flight run holding the same key (new 409). M3 must not forward the HTTP `Idempotency-Key` header as the runtime retry key unless it wants tool-step replay across requests.
+- **Step keys vs. restart recovery (spec §4.4 item 10 vs. §4.8).** Including the run id in every step key would stop Telegram's post-restart re-run (a _new_ ledger run with the same inbound idempotency key) from recovering persisted tool steps in Postgres mode, which would replay side effects. The run id is therefore included only when the input has no durable retry key. Concurrent collisions are still impossible: without a retry key the run id differs; with one, the coordinator rejects a second in-flight run holding the same key (new 409). M3 must not forward the HTTP `Idempotency-Key` header as the runtime retry key unless it wants tool-step replay across requests.
 - **Core test adapter.** `anima-core`'s test-only `InMemoryAdapter` matched steps by step index as a fallback, so two isolated copies (which start at the same index) overwrote each other. It now matches by idempotency key only, like the Postgres `step_log` conflict target. Production is unaffected.
-- **Admission order.** Applying the spec order (room → slot → permit) while fail-fast callers kept reserving a permit first would deadlock (a permit holder waiting on a room lock held by a run waiting for a permit). So: the legacy route and Telegram owner sends use a non-reserving `has_available_permit()` pre-check (the existing 503 and 429 responses are preserved); a legacy run that waited behind its room can still get 503 at the permit stage; owner sends now *wait* for a permit after passing the pre-check (previously reserved up front); the job dispatcher takes a non-waiting ticket (room, slot, permit) before its durable claim, so a claimed job still starts immediately.
+- **Admission order.** Applying the spec order (room → slot → permit) while fail-fast callers kept reserving a permit first would deadlock (a permit holder waiting on a room lock held by a run waiting for a permit). So: the legacy route and Telegram owner sends use a non-reserving `has_available_permit()` pre-check (the existing 503 and 429 responses are preserved); a legacy run that waited behind its room can still get 503 at the permit stage; owner sends now _wait_ for a permit after passing the pre-check (previously reserved up front); the job dispatcher takes a non-waiting ticket (room, slot, permit) before its durable claim, so a claimed job still starts immediately.
 - **toolsStarted.** M1 fills it at commit from the run's tool-call messages. Runs interrupted by a restart keep whatever was saved, which is empty until M3's observer records tools live.
 - **Retention.** M1 prunes terminal runs by age and count without the "only once mirrored" condition, because there is no history store yet. M2 must add that condition to `RunLedger::prune`.
 - **Snapshot version.** M1 keeps the control-plane snapshot at version 4 (controller ruling after the pre-flight audit: a bump without a backup would make the first M1 boot unrecoverable for pre-M1 daemons). M2 performs the single bump together with its pre-upgrade backup.

@@ -56,7 +56,10 @@ export function sameRoute(left: HashRoute, right: HashRoute): boolean {
   return formatHashRoute(left) === formatHashRoute(right);
 }
 
-export type Navigate = (route: HashRoute, options?: { replace?: boolean }) => void;
+export type Navigate = (
+  route: HashRoute,
+  options?: { replace?: boolean },
+) => void;
 
 /** The current hash route; a reload restores it and Back/Forward follow it. */
 export function useHashRoute(): [HashRoute, Navigate] {

@@ -376,17 +376,15 @@ describe('daemon workspace requests', () => {
 
   it('bootstrapWorkspace POSTs workspace and agent payloads', async () => {
     const created = snapshot();
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(
-        new Response(
-          JSON.stringify({
-            workspace: workspaceState.workspace,
-            agent: created,
-          }),
-          { status: 201, headers: { 'content-type': 'application/json' } },
-        ),
-      );
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          workspace: workspaceState.workspace,
+          agent: created,
+        }),
+        { status: 201, headers: { 'content-type': 'application/json' } },
+      ),
+    );
     vi.stubGlobal('fetch', fetchMock);
 
     const input = {
@@ -642,21 +640,28 @@ describe('daemon integration requests', () => {
 
 describe('daemon session requests', () => {
   it('reads and changes sessions through the SDK routes', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.endsWith('/export'))
-        return new Response('# Plans\n', {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.endsWith('/export'))
+          return new Response('# Plans\n', {
+            status: 200,
+            headers: { 'content-type': 'text/markdown' },
+          });
+        const body = url.includes('/messages')
+          ? { messages: [], nextBefore: null }
+          : {
+              sessions: [],
+              nextCursor: null,
+              session: { id: 'chat:1' },
+              deleted: true,
+            };
+        return new Response(JSON.stringify(body), {
           status: 200,
-          headers: { 'content-type': 'text/markdown' },
+          headers: { 'content-type': 'application/json' },
         });
-      const body = url.includes('/messages')
-        ? { messages: [], nextBefore: null }
-        : { sessions: [], nextCursor: null, session: { id: 'chat:1' }, deleted: true };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
       });
-    });
     vi.stubGlobal('fetch', fetchMock);
 
     await daemon.listSessions('agent 1', {
@@ -666,7 +671,10 @@ describe('daemon session requests', () => {
     });
     await daemon.createSession('agent 1');
     await daemon.updateSession('agent 1', 'chat:1', { lastReadAtMs: 4 });
-    await daemon.sessionMessages('agent 1', 'chat:1', { before: 'm1', limit: 50 });
+    await daemon.sessionMessages('agent 1', 'chat:1', {
+      before: 'm1',
+      limit: 50,
+    });
     await daemon.deleteSession('agent 1', 'chat:1');
     expect(await daemon.exportSession('agent 1', 'chat:1')).toBe('# Plans\n');
 

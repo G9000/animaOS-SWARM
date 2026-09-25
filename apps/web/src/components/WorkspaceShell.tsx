@@ -34,7 +34,11 @@ const PRIMARY_DESTINATIONS: Destination[] = [
   { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
 ];
 const SYSTEM_DESTINATIONS: Destination[] = [
-  { page: 'capabilities', label: 'Capabilities', icon: <SparkIcon size={16} /> },
+  {
+    page: 'capabilities',
+    label: 'Capabilities',
+    icon: <SparkIcon size={16} />,
+  },
 ];
 const DESTINATIONS = [...PRIMARY_DESTINATIONS, ...SYSTEM_DESTINATIONS];
 
@@ -129,7 +133,8 @@ function DestinationNavigation({
             <GearIcon size={16} />
             <span>System</span>
           </button>
-          {systemExpanded && SYSTEM_DESTINATIONS.map((item) => destination(item))}
+          {systemExpanded &&
+            SYSTEM_DESTINATIONS.map((item) => destination(item))}
         </>
       ) : (
         SYSTEM_DESTINATIONS.map((item) => destination(item))
@@ -513,7 +518,9 @@ export function WorkspaceShell({
                     type="button"
                     className="studio-tool-button"
                     onClick={() => setFocusMode((value) => !value)}
-                    aria-label={focusMode ? 'Exit focus mode' : 'Enter focus mode'}
+                    aria-label={
+                      focusMode ? 'Exit focus mode' : 'Enter focus mode'
+                    }
                     aria-pressed={focusMode}
                   >
                     {focusMode ? '↙' : '⛶'}

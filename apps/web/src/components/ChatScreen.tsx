@@ -274,7 +274,9 @@ export const MessageList = memo(function MessageList({
                   onClick={onLoadOlder}
                   disabled={loadingOlder}
                 >
-                  {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
+                  {loadingOlder
+                    ? 'Loading older messages…'
+                    : 'Load older messages'}
                 </button>
               )}
               {agent.messages.map((m) => (

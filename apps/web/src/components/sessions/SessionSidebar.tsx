@@ -132,9 +132,13 @@ function SessionRow({
           title={session.preview ?? session.title}
           onClick={() => actions.onOpen(session)}
         >
-          {session.activeRuns > 0 && <span className="session-pulse" aria-hidden />}
+          {session.activeRuns > 0 && (
+            <span className="session-pulse" aria-hidden />
+          )}
           <span className="session-title">{session.title}</span>
-          {session.unread && <span className="session-unread-dot" aria-hidden />}
+          {session.unread && (
+            <span className="session-unread-dot" aria-hidden />
+          )}
         </button>
       )}
       <button
@@ -152,7 +156,11 @@ function SessionRow({
         ⋯
       </button>
       {menuOpen && (
-        <div className="session-menu" role="menu" aria-label={`${session.title} actions`}>
+        <div
+          className="session-menu"
+          role="menu"
+          aria-label={`${session.title} actions`}
+        >
           {confirmDelete ? (
             <>
               <p className="px-2 py-1 text-xs text-ink-2">
@@ -238,7 +246,9 @@ function SessionRow({
 function moveBetweenRows(event: KeyboardEvent<HTMLDivElement>) {
   if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
   const rows = Array.from(
-    event.currentTarget.querySelectorAll<HTMLButtonElement>('[data-session-row]'),
+    event.currentTarget.querySelectorAll<HTMLButtonElement>(
+      '[data-session-row]',
+    ),
   );
   const index = rows.findIndex((row) => row === document.activeElement);
   if (index === -1) return;

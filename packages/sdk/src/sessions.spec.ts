@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { createDaemonClient, DaemonHttpError, DaemonTooOldError } from './index.js';
+import {
+  createDaemonClient,
+  DaemonHttpError,
+  DaemonTooOldError,
+} from './index.js';
 
 function transport(respond: (url: string) => Response) {
   const requests: { url: string; init?: RequestInit }[] = [];
@@ -76,7 +80,9 @@ describe('sessions client', () => {
         : Response.json({ session }),
     );
 
-    expect(await sessions.create('agent/a', { title: 'Trip' })).toEqual(session);
+    expect(await sessions.create('agent/a', { title: 'Trip' })).toEqual(
+      session,
+    );
     expect(await sessions.create('agent/a')).toEqual(session);
     expect(
       await sessions.update('agent/a', 'chat:1', {
@@ -113,15 +119,22 @@ describe('sessions client', () => {
           }),
     );
 
-    expect(await sessions.exportMarkdown('agent/a', 'chat:1')).toBe('# Plans\n');
-    expect(requests[0].url).toBe('/api/agents/agent%2Fa/sessions/chat%3A1/export');
+    expect(await sessions.exportMarkdown('agent/a', 'chat:1')).toBe(
+      '# Plans\n',
+    );
+    expect(requests[0].url).toBe(
+      '/api/agents/agent%2Fa/sessions/chat%3A1/export',
+    );
     expect(
       (requests[0].init?.headers as Record<string, string>).accept,
     ).toContain('text/markdown');
 
     const failure = sessions.exportMarkdown('agent/a', 'chat:missing');
     await expect(failure).rejects.toBeInstanceOf(DaemonHttpError);
-    await expect(failure).rejects.toMatchObject({ status: 404, message: 'not found' });
+    await expect(failure).rejects.toMatchObject({
+      status: 404,
+      message: 'not found',
+    });
   });
 
   // Controller ruling 2 (M2 pre-flight audit): a 404 from the sessions route
@@ -152,7 +165,10 @@ describe('sessions client', () => {
     const failure = sessions.list('agent/missing');
     await expect(failure).rejects.toBeInstanceOf(DaemonHttpError);
     await expect(failure).rejects.not.toBeInstanceOf(DaemonTooOldError);
-    await expect(failure).rejects.toMatchObject({ status: 404, message: 'not found' });
+    await expect(failure).rejects.toMatchObject({
+      status: 404,
+      message: 'not found',
+    });
     expect(requests.map(({ url }) => url)).toEqual([
       '/api/agents/agent%2Fmissing/sessions',
       '/api/agents/agent%2Fmissing',

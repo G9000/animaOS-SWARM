@@ -148,7 +148,9 @@ describe('useCompanionSessions', () => {
       poll?.();
     });
 
-    await waitFor(() => expect(result.current.error).toBe('daemon unavailable'));
+    await waitFor(() =>
+      expect(result.current.error).toBe('daemon unavailable'),
+    );
     expect(result.current.sessions).toHaveLength(1);
     expect(list).toHaveBeenCalledTimes(2);
   });
@@ -411,7 +413,10 @@ describe('useCompanionSessions', () => {
     const poll = capturePoll();
     const list = vi
       .spyOn(daemon, 'listSessions')
-      .mockResolvedValueOnce({ sessions: [sessionFixture('chat:1')], nextCursor: null })
+      .mockResolvedValueOnce({
+        sessions: [sessionFixture('chat:1')],
+        nextCursor: null,
+      })
       .mockRejectedValueOnce(new DaemonTooOldError('agent-main'));
     const { result } = renderHook(() =>
       useCompanionSessions('agent-main', { archived: false, query: '' }),

@@ -24,7 +24,11 @@ export const SESSION_KIND_FILTER_LABELS: Record<SessionKind, string> = {
   helper: 'Helpers',
 };
 
-export type SessionGroupLabel = 'Today' | 'Yesterday' | 'Previous 7 days' | 'Older';
+export type SessionGroupLabel =
+  | 'Today'
+  | 'Yesterday'
+  | 'Previous 7 days'
+  | 'Older';
 
 export interface SessionNode {
   session: Session;
@@ -56,7 +60,11 @@ export function presentKinds(sessions: readonly Session[]): SessionKind[] {
 }
 
 function groupLabel(activityMs: number, now: Date): SessionGroupLabel {
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const today = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
   if (activityMs >= today) return 'Today';
   if (activityMs >= today - DAY_MS) return 'Yesterday';
   if (activityMs >= today - 7 * DAY_MS) return 'Previous 7 days';
@@ -73,7 +81,9 @@ export function groupSessions(
   now: Date = new Date(),
   nestHelpers = true,
 ): SessionGroup[] {
-  const listed = new Map(sessions.map((session) => [sessionKey(session), session]));
+  const listed = new Map(
+    sessions.map((session) => [sessionKey(session), session]),
+  );
   const children = new Map<string, Session[]>();
   const roots: Session[] = [];
   for (const session of sessions) {
@@ -82,7 +92,10 @@ export function groupSessions(
       session.kind === 'helper' &&
       session.parentAgentId &&
       session.parentSessionId
-        ? sessionKey({ agentId: session.parentAgentId, id: session.parentSessionId })
+        ? sessionKey({
+            agentId: session.parentAgentId,
+            id: session.parentSessionId,
+          })
         : null;
     const parent = parentKey ? listed.get(parentKey) : undefined;
     if (parentKey && parent && parent.kind !== 'helper') {

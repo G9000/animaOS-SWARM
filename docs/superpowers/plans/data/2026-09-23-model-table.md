@@ -10,20 +10,20 @@ Every value was read on **2026-09-23** from the official page linked in its row.
 
 Specs come from each model page and prices from the pricing page. The cache-write column shows the 5-minute / 1-hour TTL prices. Dated IDs are covered by their prefix: `claude-haiku-4-5-20251001`, `claude-opus-4-5-20251101`, `claude-sonnet-4-5-20250929`. The 4.6-and-later IDs are dateless pinned snapshots.
 
-| model prefix | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source |
-|---|---|---|---|---|---|---|---|---|
-| `claude-fable-5-1` | 1M | 128K | true | 10 | 50 | 0.25 | 12.50 / 20 | [pricing][a-p] · [model][a-fable-5-1] |
-| `claude-opus-5-5` | 1M | 128K | true | 4 | 20 | 0.20 | 5 / 8 | [pricing][a-p] · [model][a-opus-5-5] |
-| `claude-sonnet-5` | 1M | 128K | true | 2 | 10 | 0.20 | 2.50 / 4 | [pricing][a-p] · [model][a-sonnet-5] |
-| `claude-haiku-4-5` | 200K | 64K | true | 1 | 5 | 0.10 | 1.25 / 2 | [pricing][a-p] · [model][a-haiku-4-5] |
-| `claude-fable-5` | 1M | 128K | true | 10 | 50 | 1 | 12.50 / 20 | [pricing][a-p] · [model][a-fable-5] |
-| `claude-opus-5` | 1M | 128K | true | 5 | 25 | 0.50 | 6.25 / 10 | [pricing][a-p] · [model][a-opus-5] |
-| `claude-opus-4-8` | 1M | 128K | true | 5 | 25 | 0.50 | 6.25 / 10 | [pricing][a-p] · [model][a-opus-4-8] |
-| `claude-opus-4-7` | 1M | 128K | true | 5 | 25 | 0.50 | 6.25 / 10 | [pricing][a-p] · [model][a-opus-4-7] |
-| `claude-opus-4-6` | 1M | 128K | true | 5 | 25 | 0.50 | 6.25 / 10 | [pricing][a-p] · [model][a-opus-4-6] |
-| `claude-opus-4-5` | 200K | 64K | true | 5 | 25 | 0.50 | 6.25 / 10 | [pricing][a-p] · [model][a-opus-4-5] |
-| `claude-sonnet-4-6` | 1M | 128K | true | 3 | 15 | 0.30 | 3.75 / 6 | [pricing][a-p] · [model][a-sonnet-4-6] |
-| `claude-sonnet-4-5` | 200K | 64K | true | 3 | 15 | 0.30 | 3.75 / 6 | [pricing][a-p] · [model][a-sonnet-4-5] |
+| model prefix        | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source                                 |
+| ------------------- | ------- | ---------- | ------ | --------- | ---------- | ---------------- | --------------- | -------------------------------------- |
+| `claude-fable-5-1`  | 1M      | 128K       | true   | 10        | 50         | 0.25             | 12.50 / 20      | [pricing][a-p] · [model][a-fable-5-1]  |
+| `claude-opus-5-5`   | 1M      | 128K       | true   | 4         | 20         | 0.20             | 5 / 8           | [pricing][a-p] · [model][a-opus-5-5]   |
+| `claude-sonnet-5`   | 1M      | 128K       | true   | 2         | 10         | 0.20             | 2.50 / 4        | [pricing][a-p] · [model][a-sonnet-5]   |
+| `claude-haiku-4-5`  | 200K    | 64K        | true   | 1         | 5          | 0.10             | 1.25 / 2        | [pricing][a-p] · [model][a-haiku-4-5]  |
+| `claude-fable-5`    | 1M      | 128K       | true   | 10        | 50         | 1                | 12.50 / 20      | [pricing][a-p] · [model][a-fable-5]    |
+| `claude-opus-5`     | 1M      | 128K       | true   | 5         | 25         | 0.50             | 6.25 / 10       | [pricing][a-p] · [model][a-opus-5]     |
+| `claude-opus-4-8`   | 1M      | 128K       | true   | 5         | 25         | 0.50             | 6.25 / 10       | [pricing][a-p] · [model][a-opus-4-8]   |
+| `claude-opus-4-7`   | 1M      | 128K       | true   | 5         | 25         | 0.50             | 6.25 / 10       | [pricing][a-p] · [model][a-opus-4-7]   |
+| `claude-opus-4-6`   | 1M      | 128K       | true   | 5         | 25         | 0.50             | 6.25 / 10       | [pricing][a-p] · [model][a-opus-4-6]   |
+| `claude-opus-4-5`   | 200K    | 64K        | true   | 5         | 25         | 0.50             | 6.25 / 10       | [pricing][a-p] · [model][a-opus-4-5]   |
+| `claude-sonnet-4-6` | 1M      | 128K       | true   | 3         | 15         | 0.30             | 3.75 / 6        | [pricing][a-p] · [model][a-sonnet-4-6] |
+| `claude-sonnet-4-5` | 200K    | 64K        | true   | 3         | 15         | 0.30             | 3.75 / 6        | [pricing][a-p] · [model][a-sonnet-4-5] |
 
 [a-p]: https://platform.claude.com/docs/en/about-claude/pricing
 [a-fable-5-1]: https://platform.claude.com/docs/en/models/fable-5-1/overview
@@ -43,39 +43,39 @@ Specs come from each model page and prices from the pricing page. The cache-writ
 
 Prices come from the pricing page's Standard table and specs from each model page. Each prefix also covers its dated snapshots (for example `gpt-5.5-2026-04-23` and `o3-2025-04-16`). The one exception is `gpt-4o-2024-05-13`, which is priced separately and has its own row.
 
-| model prefix | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source |
-|---|---|---|---|---|---|---|---|---|
-| `gpt-6-astra` | 1,050,000 (max in 922,000) | 128,000 | true | 10 | 50 | 1 | 12.50 | [pricing][o-p] · [model][o-gpt-6-astra] |
-| `gpt-6-sol` | 1,050,000 (max in 922,000) | 128,000 | true | 2 | 10 | 0.20 | 2.50 | [pricing][o-p] · [model][o-gpt-6-sol] |
-| `gpt-6-luna` | 1,050,000 (max in 922,000) | 128,000 | true | 0.10 | 0.50 | 0.01 | 0.125 | [pricing][o-p] · [model][o-gpt-6-luna] |
-| `gpt-5.6-sol` | 1,050,000 (max in 922,000) | 128,000 | true | 4 | 20 | 0.40 | 5 | [pricing][o-p] · [model][o-gpt-5.6-sol] |
-| `gpt-5.6-terra` | 1,050,000 (max in 922,000) | 128,000 | true | 2 | 12 | 0.20 | 2.50 | [pricing][o-p] · [model][o-gpt-5.6-terra] |
-| `gpt-5.6-luna` | 1,050,000 (max in 922,000) | 128,000 | true | 0.20 | 1.20 | 0.02 | 0.25 | [pricing][o-p] · [model][o-gpt-5.6-luna] |
-| `gpt-5.5` | 1,050,000 | 128,000 | true | 5 | 30 | 0.50 | none | [pricing][o-p] · [model][o-gpt-5.5] |
-| `gpt-5.5-pro` | 1,050,000 | 128,000 | true | 30 | 180 | n/a | none | [pricing][o-p] · [model][o-gpt-5.5-pro] |
-| `gpt-5.4` | 1,050,000 | 128,000 | true | 2.50 | 15 | 0.25 | none | [pricing][o-p] · [model][o-gpt-5.4] |
-| `gpt-5.4-mini` | 400,000 (max in 272,000) | 128,000 | true | 0.75 | 4.50 | 0.075 | none | [pricing][o-p] · [model][o-gpt-5.4-mini] |
-| `gpt-5.4-nano` | 400,000 (max in 272,000) | 128,000 | true | 0.20 | 1.25 | 0.02 | none | [pricing][o-p] · [model][o-gpt-5.4-nano] |
-| `gpt-5.4-pro` | 1,050,000 | 128,000 | true | 30 | 180 | n/a | none | [pricing][o-p] · [model][o-gpt-5.4-pro] |
-| `gpt-5.2` | 400,000 | 128,000 | true | 1.75 | 14 | 0.175 | none | [pricing][o-p] · [model][o-gpt-5.2] |
-| `gpt-5.2-pro` | 400,000 | 128,000 | true | 21 | 168 | n/a | none | [pricing][o-p] · [model][o-gpt-5.2-pro] |
-| `gpt-5.1` | 400,000 | 128,000 | true | 1.25 | 10 | 0.125 | none | [pricing][o-p] · [model][o-gpt-5.1] |
-| `gpt-5` | 400,000 (max in 272,000) | 128,000 | true | 1.25 | 10 | 0.125 | none | [pricing][o-p] · [model][o-gpt-5] |
-| `gpt-5-mini` | 400,000 (max in 272,000) | 128,000 | true | 0.25 | 2 | 0.025 | none | [pricing][o-p] · [model][o-gpt-5-mini] |
-| `gpt-5-nano` | 400,000 (max in 272,000) | 128,000 | true | 0.05 | 0.40 | 0.005 | none | [pricing][o-p] · [model][o-gpt-5-nano] |
-| `gpt-5-pro` | 400,000 | 272,000 | true | 15 | 120 | n/a | none | [pricing][o-p] · [model][o-gpt-5-pro] |
-| `gpt-4.1` | 1,047,576 | 32,768 | true | 2 | 8 | 0.50 | none | [pricing][o-p] · [model][o-gpt-4.1] |
-| `gpt-4.1-mini` | 1,047,576 | 32,768 | true | 0.40 | 1.60 | 0.10 | none | [pricing][o-p] · [model][o-gpt-4.1-mini] |
-| `gpt-4.1-nano` | 1,047,576 | 32,768 | true | 0.10 | 0.40 | 0.025 | none | [pricing][o-p] · [model][o-gpt-4.1-nano] |
-| `gpt-4o` | 128,000 | 16,384 | true | 2.50 | 10 | 1.25 | none | [pricing][o-p] · [model][o-gpt-4o] |
-| `gpt-4o-2024-05-13` | 128,000 † | unknown | true † | 5 | 15 | n/a | none | [pricing][o-p] · [model][o-gpt-4o] |
-| `gpt-4o-mini` | 128,000 | 16,384 | true | 0.15 | 0.60 | 0.075 | none | [pricing][o-p] · [model][o-gpt-4o-mini] |
-| `o3` | 200,000 | 100,000 | true | 2 | 8 | 0.50 | none | [pricing][o-p] · [model][o-o3] |
-| `o3-pro` | 200,000 | 100,000 | true | 20 | 80 | n/a | none | [pricing][o-p] · [model][o-o3-pro] |
-| `o4-mini` | 200,000 | 100,000 | true | 1.10 | 4.40 | 0.275 | none | [pricing][o-p] · [model][o-o4-mini] |
-| `o3-mini` | 200,000 | 100,000 | false | 1.10 | 4.40 | 0.55 | none | [pricing][o-p] · [model][o-o3-mini] |
-| `o1` | 200,000 | 100,000 | true | 15 | 60 | 7.50 | none | [pricing][o-p] · [model][o-o1] |
-| `o1-pro` | 200,000 | 100,000 | true | 150 | 600 | n/a | none | [pricing][o-p] · [model][o-o1-pro] |
+| model prefix        | context                    | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source                                    |
+| ------------------- | -------------------------- | ---------- | ------ | --------- | ---------- | ---------------- | --------------- | ----------------------------------------- |
+| `gpt-6-astra`       | 1,050,000 (max in 922,000) | 128,000    | true   | 10        | 50         | 1                | 12.50           | [pricing][o-p] · [model][o-gpt-6-astra]   |
+| `gpt-6-sol`         | 1,050,000 (max in 922,000) | 128,000    | true   | 2         | 10         | 0.20             | 2.50            | [pricing][o-p] · [model][o-gpt-6-sol]     |
+| `gpt-6-luna`        | 1,050,000 (max in 922,000) | 128,000    | true   | 0.10      | 0.50       | 0.01             | 0.125           | [pricing][o-p] · [model][o-gpt-6-luna]    |
+| `gpt-5.6-sol`       | 1,050,000 (max in 922,000) | 128,000    | true   | 4         | 20         | 0.40             | 5               | [pricing][o-p] · [model][o-gpt-5.6-sol]   |
+| `gpt-5.6-terra`     | 1,050,000 (max in 922,000) | 128,000    | true   | 2         | 12         | 0.20             | 2.50            | [pricing][o-p] · [model][o-gpt-5.6-terra] |
+| `gpt-5.6-luna`      | 1,050,000 (max in 922,000) | 128,000    | true   | 0.20      | 1.20       | 0.02             | 0.25            | [pricing][o-p] · [model][o-gpt-5.6-luna]  |
+| `gpt-5.5`           | 1,050,000                  | 128,000    | true   | 5         | 30         | 0.50             | none            | [pricing][o-p] · [model][o-gpt-5.5]       |
+| `gpt-5.5-pro`       | 1,050,000                  | 128,000    | true   | 30        | 180        | n/a              | none            | [pricing][o-p] · [model][o-gpt-5.5-pro]   |
+| `gpt-5.4`           | 1,050,000                  | 128,000    | true   | 2.50      | 15         | 0.25             | none            | [pricing][o-p] · [model][o-gpt-5.4]       |
+| `gpt-5.4-mini`      | 400,000 (max in 272,000)   | 128,000    | true   | 0.75      | 4.50       | 0.075            | none            | [pricing][o-p] · [model][o-gpt-5.4-mini]  |
+| `gpt-5.4-nano`      | 400,000 (max in 272,000)   | 128,000    | true   | 0.20      | 1.25       | 0.02             | none            | [pricing][o-p] · [model][o-gpt-5.4-nano]  |
+| `gpt-5.4-pro`       | 1,050,000                  | 128,000    | true   | 30        | 180        | n/a              | none            | [pricing][o-p] · [model][o-gpt-5.4-pro]   |
+| `gpt-5.2`           | 400,000                    | 128,000    | true   | 1.75      | 14         | 0.175            | none            | [pricing][o-p] · [model][o-gpt-5.2]       |
+| `gpt-5.2-pro`       | 400,000                    | 128,000    | true   | 21        | 168        | n/a              | none            | [pricing][o-p] · [model][o-gpt-5.2-pro]   |
+| `gpt-5.1`           | 400,000                    | 128,000    | true   | 1.25      | 10         | 0.125            | none            | [pricing][o-p] · [model][o-gpt-5.1]       |
+| `gpt-5`             | 400,000 (max in 272,000)   | 128,000    | true   | 1.25      | 10         | 0.125            | none            | [pricing][o-p] · [model][o-gpt-5]         |
+| `gpt-5-mini`        | 400,000 (max in 272,000)   | 128,000    | true   | 0.25      | 2          | 0.025            | none            | [pricing][o-p] · [model][o-gpt-5-mini]    |
+| `gpt-5-nano`        | 400,000 (max in 272,000)   | 128,000    | true   | 0.05      | 0.40       | 0.005            | none            | [pricing][o-p] · [model][o-gpt-5-nano]    |
+| `gpt-5-pro`         | 400,000                    | 272,000    | true   | 15        | 120        | n/a              | none            | [pricing][o-p] · [model][o-gpt-5-pro]     |
+| `gpt-4.1`           | 1,047,576                  | 32,768     | true   | 2         | 8          | 0.50             | none            | [pricing][o-p] · [model][o-gpt-4.1]       |
+| `gpt-4.1-mini`      | 1,047,576                  | 32,768     | true   | 0.40      | 1.60       | 0.10             | none            | [pricing][o-p] · [model][o-gpt-4.1-mini]  |
+| `gpt-4.1-nano`      | 1,047,576                  | 32,768     | true   | 0.10      | 0.40       | 0.025            | none            | [pricing][o-p] · [model][o-gpt-4.1-nano]  |
+| `gpt-4o`            | 128,000                    | 16,384     | true   | 2.50      | 10         | 1.25             | none            | [pricing][o-p] · [model][o-gpt-4o]        |
+| `gpt-4o-2024-05-13` | 128,000 †                  | unknown    | true † | 5         | 15         | n/a              | none            | [pricing][o-p] · [model][o-gpt-4o]        |
+| `gpt-4o-mini`       | 128,000                    | 16,384     | true   | 0.15      | 0.60       | 0.075            | none            | [pricing][o-p] · [model][o-gpt-4o-mini]   |
+| `o3`                | 200,000                    | 100,000    | true   | 2         | 8          | 0.50             | none            | [pricing][o-p] · [model][o-o3]            |
+| `o3-pro`            | 200,000                    | 100,000    | true   | 20        | 80         | n/a              | none            | [pricing][o-p] · [model][o-o3-pro]        |
+| `o4-mini`           | 200,000                    | 100,000    | true   | 1.10      | 4.40       | 0.275            | none            | [pricing][o-p] · [model][o-o4-mini]       |
+| `o3-mini`           | 200,000                    | 100,000    | false  | 1.10      | 4.40       | 0.55             | none            | [pricing][o-p] · [model][o-o3-mini]       |
+| `o1`                | 200,000                    | 100,000    | true   | 15        | 60         | 7.50             | none            | [pricing][o-p] · [model][o-o1]            |
+| `o1-pro`            | 200,000                    | 100,000    | true   | 150       | 600        | n/a              | none            | [pricing][o-p] · [model][o-o1-pro]        |
 
 † These are family-level values from the `gpt-4o` page, which lists this snapshot. OpenAI does not publish snapshot-specific limits.
 
@@ -115,19 +115,19 @@ Prices come from the pricing page's Standard table and specs from each model pag
 
 Paid-tier Standard prices come from the pricing page and specs from each model page. The input price shown is for text, image and video; audio input costs more on some models (see Notes). The output price includes thinking tokens. Google publishes no per-token cache-write price, only an hourly storage fee for explicit caches, which is shown in the cache-write column.
 
-| model prefix | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source |
-|---|---|---|---|---|---|---|---|---|
-| `gemini-3.8-flash` | 1,048,576 | 65,536 | true | 0.75 | 3.75 | 0.075 | unknown (storage 0.50/M/hr) | [pricing][g-p] · [model][g-3.8-flash] |
-| `gemini-3.7-flash` | 1,048,576 | 65,536 | true | 0.75 | 3.75 | 0.075 | unknown (storage 0.50/M/hr) | [pricing][g-p] · [model][g-3.7-flash] |
-| `gemini-3.6-flash` | 1,048,576 | 65,536 | true | 0.75 | 3.75 | 0.075 | unknown (storage 0.50/M/hr) | [pricing][g-p] · [model][g-3.6-flash] |
-| `gemini-3.5-flash` | 1,048,576 | 65,536 | true | 1.50 | 9 | 0.15 | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3.5-flash] |
-| `gemini-3.5-flash-lite` | 1,048,576 | 65,536 | true | 0.30 | 2.50 | 0.03 | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3.5-flash-lite] |
-| `gemini-3.1-flash-lite` | 1,048,576 | 65,536 | true | 0.25 | 1.50 | 0.025 | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3.1-flash-lite] |
-| `gemini-3.1-pro-preview` | 1,048,576 | 65,536 | true | 2 | 12 | 0.20 | unknown (storage 4.50/M/hr) | [pricing][g-p] · [model][g-3.1-pro-preview] |
-| `gemini-3-flash-preview` | 1,048,576 | 65,536 | true | 0.50 | 3 | 0.05 | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3-flash-preview] |
-| `gemini-2.5-pro` | 1,048,576 | 65,536 | true | 1.25 | 10 | 0.125 | unknown (storage 4.50/M/hr) | [pricing][g-p] · [model][g-2.5-pro] |
-| `gemini-2.5-flash` | 1,048,576 | 65,536 | true | 0.30 | 2.50 | 0.03 | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-2.5-flash] |
-| `gemini-2.5-flash-lite` | 1,048,576 | 65,536 | true | 0.10 | 0.40 | 0.01 | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-2.5-flash-lite] |
+| model prefix             | context   | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M             | source                                      |
+| ------------------------ | --------- | ---------- | ------ | --------- | ---------- | ---------------- | --------------------------- | ------------------------------------------- |
+| `gemini-3.8-flash`       | 1,048,576 | 65,536     | true   | 0.75      | 3.75       | 0.075            | unknown (storage 0.50/M/hr) | [pricing][g-p] · [model][g-3.8-flash]       |
+| `gemini-3.7-flash`       | 1,048,576 | 65,536     | true   | 0.75      | 3.75       | 0.075            | unknown (storage 0.50/M/hr) | [pricing][g-p] · [model][g-3.7-flash]       |
+| `gemini-3.6-flash`       | 1,048,576 | 65,536     | true   | 0.75      | 3.75       | 0.075            | unknown (storage 0.50/M/hr) | [pricing][g-p] · [model][g-3.6-flash]       |
+| `gemini-3.5-flash`       | 1,048,576 | 65,536     | true   | 1.50      | 9          | 0.15             | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3.5-flash]       |
+| `gemini-3.5-flash-lite`  | 1,048,576 | 65,536     | true   | 0.30      | 2.50       | 0.03             | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3.5-flash-lite]  |
+| `gemini-3.1-flash-lite`  | 1,048,576 | 65,536     | true   | 0.25      | 1.50       | 0.025            | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3.1-flash-lite]  |
+| `gemini-3.1-pro-preview` | 1,048,576 | 65,536     | true   | 2         | 12         | 0.20             | unknown (storage 4.50/M/hr) | [pricing][g-p] · [model][g-3.1-pro-preview] |
+| `gemini-3-flash-preview` | 1,048,576 | 65,536     | true   | 0.50      | 3          | 0.05             | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-3-flash-preview] |
+| `gemini-2.5-pro`         | 1,048,576 | 65,536     | true   | 1.25      | 10         | 0.125            | unknown (storage 4.50/M/hr) | [pricing][g-p] · [model][g-2.5-pro]         |
+| `gemini-2.5-flash`       | 1,048,576 | 65,536     | true   | 0.30      | 2.50       | 0.03             | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-2.5-flash]       |
+| `gemini-2.5-flash-lite`  | 1,048,576 | 65,536     | true   | 0.10      | 0.40       | 0.01             | unknown (storage 1.00/M/hr) | [pricing][g-p] · [model][g-2.5-flash-lite]  |
 
 [g-p]: https://ai.google.dev/gemini-api/docs/pricing
 [g-3.8-flash]: https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
@@ -146,10 +146,10 @@ Paid-tier Standard prices come from the pricing page and specs from each model p
 
 Prices are shown as **peak / off-peak**. Off-peak is half of peak (see Notes for the hours). DeepSeek bills "number of tokens × price" using only its cache-hit, cache-miss (input) and output prices. No cache-write price exists: uncached tokens bill at the cache-miss rate.
 
-| model prefix | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source |
-|---|---|---|---|---|---|---|---|---|
-| `deepseek-flash` (legacy names `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp` bill as this) | 1M | 384K | true | 0.30 / 0.15 | 1.20 / 0.60 | 0.006 / 0.003 | none | [pricing][d-p] |
-| `deepseek-v4-pro` | 1M | 384K | false | 1.32 / 0.66 | 3.96 / 1.98 | 0.044 / 0.022 | none | [pricing][d-p] |
+| model prefix                                                                                     | context | max output | vision | input $/M   | output $/M  | cached input $/M | cache write $/M | source         |
+| ------------------------------------------------------------------------------------------------ | ------- | ---------- | ------ | ----------- | ----------- | ---------------- | --------------- | -------------- |
+| `deepseek-flash` (legacy names `deepseek-v4-flash`, `deepseek-v4-flash-vision-exp` bill as this) | 1M      | 384K       | true   | 0.30 / 0.15 | 1.20 / 0.60 | 0.006 / 0.003    | none            | [pricing][d-p] |
+| `deepseek-v4-pro`                                                                                | 1M      | 384K       | false  | 1.32 / 0.66 | 3.96 / 1.98 | 0.044 / 0.022    | none            | [pricing][d-p] |
 
 [d-p]: https://api-docs.deepseek.com/quick_start/pricing
 [d-news]: https://api-docs.deepseek.com/updates
@@ -158,14 +158,14 @@ Prices are shown as **peak / off-peak**. Off-peak is half of peak (see Notes for
 
 Prices come from the pricing page (below the 200k-prompt threshold) and specs from each model page. The billing table on xAI's caching page lists no cache-write charge: uncached prompt tokens bill at the full input price.
 
-| model prefix | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source |
-|---|---|---|---|---|---|---|---|---|
-| `grok-4.7` | 500,000 | none ("no text output limit") | true | 2 | 6 | 0.50 | none | [pricing][x-p] · [model][x-4.7] · [guide][x-4.7g] |
-| `grok-4.6` | 500,000 | none ("no text output limit") | true | 2 | 6 | 0.50 | none | [pricing][x-p] · [model][x-4.6] · [notes][x-rn] |
-| `grok-4.5` (aliases `grok-4.5-latest`, `grok-build-latest`) | 500,000 | unknown | true | 2 | 6 | 0.30 | none | [pricing][x-p] · [model][x-4.5] |
-| `grok-4.3` (alias `grok-4.3-latest`) | 1,000,000 | unknown | true | 1.25 | 2.50 | 0.20 | none | [pricing][x-p] · [model][x-4.3] |
-| `grok-4.20` (covers `grok-4.20-0309-reasoning`, `-0309-non-reasoning`, `-multi-agent-0309` and their aliases) | 1,000,000 | unknown | true | 1.25 | 2.50 | 0.20 | none | [pricing][x-p] · [r][x-4.20r] · [nr][x-4.20nr] · [ma][x-4.20ma] |
-| `grok-build-0.1` (aliases `grok-code-fast-1`, `grok-code-fast`, `grok-code-fast-1-0825`) | 256,000 | unknown | true | 1 | 2 | 0.20 | none | [pricing][x-p] · [model][x-build] |
+| model prefix                                                                                                  | context   | max output                    | vision | input $/M | output $/M | cached input $/M | cache write $/M | source                                                          |
+| ------------------------------------------------------------------------------------------------------------- | --------- | ----------------------------- | ------ | --------- | ---------- | ---------------- | --------------- | --------------------------------------------------------------- |
+| `grok-4.7`                                                                                                    | 500,000   | none ("no text output limit") | true   | 2         | 6          | 0.50             | none            | [pricing][x-p] · [model][x-4.7] · [guide][x-4.7g]               |
+| `grok-4.6`                                                                                                    | 500,000   | none ("no text output limit") | true   | 2         | 6          | 0.50             | none            | [pricing][x-p] · [model][x-4.6] · [notes][x-rn]                 |
+| `grok-4.5` (aliases `grok-4.5-latest`, `grok-build-latest`)                                                   | 500,000   | unknown                       | true   | 2         | 6          | 0.30             | none            | [pricing][x-p] · [model][x-4.5]                                 |
+| `grok-4.3` (alias `grok-4.3-latest`)                                                                          | 1,000,000 | unknown                       | true   | 1.25      | 2.50       | 0.20             | none            | [pricing][x-p] · [model][x-4.3]                                 |
+| `grok-4.20` (covers `grok-4.20-0309-reasoning`, `-0309-non-reasoning`, `-multi-agent-0309` and their aliases) | 1,000,000 | unknown                       | true   | 1.25      | 2.50       | 0.20             | none            | [pricing][x-p] · [r][x-4.20r] · [nr][x-4.20nr] · [ma][x-4.20ma] |
+| `grok-build-0.1` (aliases `grok-code-fast-1`, `grok-code-fast`, `grok-code-fast-1-0825`)                      | 256,000   | unknown                       | true   | 1         | 2          | 0.20             | none            | [pricing][x-p] · [model][x-build]                               |
 
 [x-p]: https://docs.x.ai/developers/pricing
 [x-4.7]: https://docs.x.ai/developers/models/grok-4.7
@@ -185,17 +185,17 @@ Prices come from the pricing page (below the 200k-prompt threshold) and specs fr
 
 Standard prices come from the docs pricing page and specs (API names, context, modalities) from each model page. Cached input is billed at 10% of the input price.
 
-| model prefix | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source |
-|---|---|---|---|---|---|---|---|---|
-| `mistral-medium-3-5` (aliases `mistral-medium-3`, `mistral-medium-latest`) | 256k | unknown | true | 1.50 | 7.50 | 0.15 | unknown | [pricing][m-p] · [model][m-medium-3.5] |
-| `mistral-large-2512` (alias `mistral-large-latest`) | 256k | unknown | true | 0.50 | 1.50 | 0.05 | unknown | [pricing][m-p] · [model][m-large-3] |
-| `mistral-small-2603` (alias `mistral-small-latest`) | 256k | unknown | true | 0.15 | 0.60 | 0.015 | unknown | [pricing][m-p] · [model][m-small-4] |
-| `ministral-14b-2512` (alias `ministral-14b-latest`) | 256k | unknown | true | 0.20 | 0.20 | 0.02 | unknown | [pricing][m-p] · [model][m-14b] |
-| `ministral-8b-2512` (alias `ministral-8b-latest`) | 256k | unknown | true | 0.15 | 0.15 | 0.015 | unknown | [pricing][m-p] · [model][m-8b] |
-| `ministral-3b-2512` (alias `ministral-3b-latest`) | 256k | unknown | true | 0.10 | 0.10 | 0.01 | unknown | [pricing][m-p] · [model][m-3b] |
-| `codestral-2508` (alias `codestral-latest`) | 128k | unknown | false | 0.30 | 0.90 | 0.03 | unknown | [pricing][m-p] · [model][m-codestral] |
-| `zai-glm-5-3` (aliases `zai-glm-5`, `zai-glm-latest`; third-party) | 1M | unknown | false | 1.40 | 4.40 | 0.14 | unknown | [pricing][m-p] · [model][m-glm-5.3] |
-| `zai-glm-5-2` (third-party) | 1M | unknown | false | 1.40 | 4.40 | 0.14 | unknown | [pricing][m-p] · [model][m-glm-5.2] |
+| model prefix                                                               | context | max output | vision | input $/M | output $/M | cached input $/M | cache write $/M | source                                 |
+| -------------------------------------------------------------------------- | ------- | ---------- | ------ | --------- | ---------- | ---------------- | --------------- | -------------------------------------- |
+| `mistral-medium-3-5` (aliases `mistral-medium-3`, `mistral-medium-latest`) | 256k    | unknown    | true   | 1.50      | 7.50       | 0.15             | unknown         | [pricing][m-p] · [model][m-medium-3.5] |
+| `mistral-large-2512` (alias `mistral-large-latest`)                        | 256k    | unknown    | true   | 0.50      | 1.50       | 0.05             | unknown         | [pricing][m-p] · [model][m-large-3]    |
+| `mistral-small-2603` (alias `mistral-small-latest`)                        | 256k    | unknown    | true   | 0.15      | 0.60       | 0.015            | unknown         | [pricing][m-p] · [model][m-small-4]    |
+| `ministral-14b-2512` (alias `ministral-14b-latest`)                        | 256k    | unknown    | true   | 0.20      | 0.20       | 0.02             | unknown         | [pricing][m-p] · [model][m-14b]        |
+| `ministral-8b-2512` (alias `ministral-8b-latest`)                          | 256k    | unknown    | true   | 0.15      | 0.15       | 0.015            | unknown         | [pricing][m-p] · [model][m-8b]         |
+| `ministral-3b-2512` (alias `ministral-3b-latest`)                          | 256k    | unknown    | true   | 0.10      | 0.10       | 0.01             | unknown         | [pricing][m-p] · [model][m-3b]         |
+| `codestral-2508` (alias `codestral-latest`)                                | 128k    | unknown    | false  | 0.30      | 0.90       | 0.03             | unknown         | [pricing][m-p] · [model][m-codestral]  |
+| `zai-glm-5-3` (aliases `zai-glm-5`, `zai-glm-latest`; third-party)         | 1M      | unknown    | false  | 1.40      | 4.40       | 0.14             | unknown         | [pricing][m-p] · [model][m-glm-5.3]    |
+| `zai-glm-5-2` (third-party)                                                | 1M      | unknown    | false  | 1.40      | 4.40       | 0.14             | unknown         | [pricing][m-p] · [model][m-glm-5.2]    |
 
 [m-p]: https://docs.mistral.ai/inference/pricing
 [m-medium-3.5]: https://docs.mistral.ai/models/mistral-medium-3-5-26-04
@@ -244,14 +244,14 @@ Standard prices come from the docs pricing page and specs (API names, context, m
 - **openai**
   - For `gpt-6-*` and `gpt-5.6-*`, a prompt over **272K input tokens** bills the whole request at 2x input, cached-input and cache-write rates and 1.5x output. Long-context rates (input / cached / write / output):
 
-    | model | input | cached | write | output |
-    |---|---|---|---|---|
-    | gpt-6-astra | 20 | 2 | 25 | 75 |
-    | gpt-6-sol | 4 | 0.40 | 5 | 15 |
-    | gpt-6-luna | 0.20 | 0.02 | 0.25 | 0.75 |
-    | gpt-5.6-sol | 8 | 0.80 | 10 | 30 |
-    | gpt-5.6-terra | 4 | 0.40 | 5 | 18 |
-    | gpt-5.6-luna | 0.40 | 0.04 | 0.50 | 1.80 |
+    | model         | input | cached | write | output |
+    | ------------- | ----- | ------ | ----- | ------ |
+    | gpt-6-astra   | 20    | 2      | 25    | 75     |
+    | gpt-6-sol     | 4     | 0.40   | 5     | 15     |
+    | gpt-6-luna    | 0.20  | 0.02   | 0.25  | 0.75   |
+    | gpt-5.6-sol   | 8     | 0.80   | 10    | 30     |
+    | gpt-5.6-terra | 4     | 0.40   | 5     | 18     |
+    | gpt-5.6-luna  | 0.40  | 0.04   | 0.50  | 1.80   |
 
   - For `gpt-5.5`, `gpt-5.5-pro`, `gpt-5.4` and `gpt-5.4-pro`, a prompt over 272K bills at 2x input and 1.5x output. Long-context rates (input / cached / output): gpt-5.5 10 / 1 / 45; gpt-5.4 5 / 0.50 / 22.50; both pro models 60 / – / 270.
   - No other row has a long-context tier.
@@ -260,6 +260,7 @@ Standard prices come from the docs pricing page and specs (API names, context, m
   - Batch and Flex are 50% of Standard.
   - Fast mode (renamed from Priority on 2026-07-30) is 2x on GPT-6 and GPT-5.6; other models vary.
   - Data-residency endpoints add 10% for models released on or after 2026-03-05.
+
 - **google**
   - Prompts over 200k: `gemini-3.1-pro-preview` bills 4 / 18 / cached 0.40; `gemini-2.5-pro` bills 2.50 / 15 / cached 0.25.
   - The prices shown for 3.8, 3.7 and 3.6 Flash apply through 2026-12-31. From 2027-01-01 they become 1.50 / 7.50 / cached 0.15, with storage at 1.00/M/hr.

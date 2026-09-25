@@ -467,8 +467,8 @@ export function AgentProactiveView({
         </label>
         {connectors === 'failed' ? (
           <p id={telegramHintId} className="text-xs text-danger">
-            Connectors could not be loaded, so Telegram delivery is
-            unavailable. Refresh schedules to try again.
+            Connectors could not be loaded, so Telegram delivery is unavailable.
+            Refresh schedules to try again.
           </p>
         ) : connectors === 'loaded' && telegram === null ? (
           <p id={telegramHintId} className="text-xs text-ink-3">

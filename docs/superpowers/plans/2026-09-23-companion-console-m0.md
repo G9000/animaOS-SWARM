@@ -21,12 +21,14 @@
 ### Task 1: Harden workspace writes
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/tools/workspace.rs` (imports; `resolve_workspace_write_path`; new helpers)
 - Modify: `hosts/rust-daemon/src/tools/filesystem/edit.rs:1-37` (`write_workspace_file_from_root` delegates)
 - Modify: `hosts/rust-daemon/src/tools.rs:34-37` (re-export)
 - Test: `hosts/rust-daemon/src/tools/tests.rs` (append after `write_workspace_file_creates_parent_directories`)
 
 **Interfaces:**
+
 - Consumes: `canonical_workspace_root`, `resolve_input_path`, `ensure_path_within_workspace`, `ensure_write_path_within_workspace` (existing, same file).
 - Produces: `pub(crate) fn write_workspace_bytes(workspace_root: &Path, file_path: &str, bytes: &[u8], tool_name: &str) -> Result<PathBuf, String>` re-exported as `crate::tools::write_workspace_bytes`; `resolve_workspace_write_path` keeps its signature and now rejects `..` and escaping or dangling final symlinks.
 
@@ -282,10 +284,12 @@ git commit -m "fix(daemon): reject workspace writes that escape through '..' or 
 ### Task 2: Cap the stored event log
 
 **Files:**
+
 - Modify: `packages/core-rust/crates/anima-core/src/runtime.rs` (struct field, constructors, `snapshot`, `events`, `record_event`, new constants)
 - Test: `packages/core-rust/crates/anima-core/src/runtime/tests.rs` (append)
 
 **Interfaces:**
+
 - Produces: `pub const MAX_RETAINED_EVENTS: usize = 500;` exported from `anima_core` (add to the crate root re-exports where `MAX_TOOL_ITERATIONS` is exported, if it is; otherwise `pub use runtime::MAX_RETAINED_EVENTS;` in `lib.rs`). `AgentRuntimeSnapshot.event_count` becomes the running total; `events` holds at most the newest 500.
 
 - [ ] **Step 1: Write the failing tests**
@@ -421,12 +425,14 @@ git commit -m "feat(core): cap retained engine events at 500 while counting all 
 ### Task 3: Record cached and reasoning tokens
 
 **Files:**
+
 - Modify: `packages/core-rust/crates/anima-core/src/agent.rs:116-121` (`TokenUsage`), `packages/core-rust/crates/anima-core/src/runtime.rs:935-939` (`apply_token_usage`)
 - Modify: `packages/core-rust/crates/anima-model-adapters/src/common.rs:178-188`, `anthropic.rs:191-200`, `google.rs:244-252`, `stream.rs:102-107,355-417`, `adapter.rs:188-224,316-323`, `chatgpt.rs:228-245`, `ollama.rs:88`
 - Modify every other `TokenUsage { .. }` literal (list: `anima-swarm/tests/message_bus.rs`, `anima-swarm/tests/coordinator.rs`, `anima-core/tests/durable_engine_contract.rs`, `anima-core/tests/support/mod.rs`, `anima-core/src/runtime/tests.rs`, `hosts/rust-daemon/src/model.rs`, `hosts/rust-daemon/src/state/swarm_runtime.rs`, `hosts/rust-daemon/src/routes/agents.rs`, `hosts/rust-daemon/src/routes/mod.rs`) by appending `..TokenUsage::default()` (or `..anima_core::TokenUsage::default()`).
 - Test: `packages/core-rust/crates/anima-core/src/agent.rs` (new test module), `packages/core-rust/crates/anima-model-adapters/src/tests.rs`, `packages/core-rust/crates/anima-model-adapters/src/chatgpt/tests.rs`
 
 **Interfaces:**
+
 - Produces: `TokenUsage { prompt_tokens, completion_tokens, total_tokens, cached_prompt_tokens, reasoning_tokens }` where cached tokens are included in `prompt_tokens` and reasoning tokens are included in `completion_tokens`; both new fields `#[serde(default)]`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -916,12 +922,14 @@ git commit -m "feat(adapters): record cached and reasoning tokens and request st
 ### Task 4: Model table and cost estimation
 
 **Files:**
+
 - Create: `packages/core-rust/crates/anima-model-adapters/src/models.rs`
 - Modify: `packages/core-rust/crates/anima-model-adapters/src/lib.rs` (module + exports)
 - Test: `packages/core-rust/crates/anima-model-adapters/src/models.rs` (inline `#[cfg(test)] mod tests`)
 - Data source: `docs/superpowers/plans/data/2026-09-23-model-table.md` (verified 2026-09-23)
 
 **Interfaces:**
+
 - Consumes: `crate::catalog::resolve_provider(id: &str) -> Option<CatalogEntry>` (entry has `.definition.id`), `anima_core::TokenUsage` (Task 3 fields).
 - Produces (re-exported from the crate root): `ModelPricing`, `ModelInfo`, `CostEstimate`, `PRICING_TABLE_DATE`, `model_table() -> &'static [ModelInfo]`, `model_info(provider: &str, model: &str) -> Option<&'static ModelInfo>`, `estimate_cost_micros(provider: &str, model: &str, usage: &TokenUsage) -> CostEstimate`, `price_usage(pricing: &ModelPricing, usage: &TokenUsage) -> u64`.
 
@@ -1161,6 +1169,7 @@ Expected: `every_row_is_well_formed_unique_and_sourced` and `table_resolves_repr
 - [ ] **Step 3: Transcribe the verified rows**
 
 Fill `MODELS` with one `ModelInfo` per row of every provider table in `docs/superpowers/plans/data/2026-09-23-model-table.md`, in the file's order, using these rules:
+
 - `provider` is the section id (`anthropic`, `openai`, `google`, `deepseek`, `xai`, `mistral`); `model_prefix` is the backticked prefix, lowercase.
 - Context like `1M` → `1_000_000`, `200K` → `200_000`, `1,050,000 (max in 922,000)` → `1_050_000`. Max output `unknown` or "no limit" → `None`.
 - Prices: `$/M` × 1,000,000 → micro-USD (`0.25` → `250_000`, `12.50` → `12_500_000`). Cached input `none` or `n/a` → `None`. Cache-write columns are not stored.

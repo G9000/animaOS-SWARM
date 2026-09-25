@@ -87,8 +87,12 @@ describe('SessionView', () => {
     });
 
     expect(screen.getByRole('heading', { name: 'Plans' })).toBeVisible();
-    expect(screen.getByText('Chat', { selector: '.session-kind-badge' })).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Load older messages' }));
+    expect(
+      screen.getByText('Chat', { selector: '.session-kind-badge' }),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Load older messages' }),
+    );
     expect(props.onLoadOlder).toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: 'Rename' }));
     const title = screen.getByRole('textbox', { name: 'Session title' });
@@ -121,7 +125,9 @@ describe('SessionView', () => {
     });
 
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
-    expect(screen.getByRole('note')).toHaveTextContent('Job sessions are read-only');
+    expect(screen.getByRole('note')).toHaveTextContent(
+      'Job sessions are read-only',
+    );
     expect(screen.getByText('No messages yet.')).toBeVisible();
     await userEvent.click(screen.getByRole('button', { name: 'Open Work' }));
     expect(props.onOpenWork).toHaveBeenCalled();
@@ -133,7 +139,9 @@ describe('SessionView', () => {
       missing: true,
     });
     expect(screen.getByText('This session was deleted.')).toBeVisible();
-    await userEvent.click(screen.getByRole('button', { name: 'Start a new chat' }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Start a new chat' }),
+    );
     expect(props.onNewChat).toHaveBeenCalled();
   });
 });

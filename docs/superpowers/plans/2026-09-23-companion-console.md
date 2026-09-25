@@ -31,19 +31,19 @@
 
 ## Status
 
-| Milestone | Detailed plan | Status |
-|---|---|---|
-| M0 Security and groundwork | `2026-09-23-companion-console-m0.md` | done (Nx rust-daemon:test 1,082 passed at 4e3eb7d) |
-| M1 Run coordinator | `2026-09-23-companion-console-m1.md` | done (Nx rust-daemon:test 1,141 passed at ef5b6fe) |
-| M2 Sessions | `2026-09-23-companion-console-m2.md` | done (Nx rust-daemon:test 1,287 passed; sdk + web test, typecheck, build green at 5b020c4) |
-| M3 Live runs | (written before M3) | pending |
-| M4 Approvals | (written before M4) | pending |
-| M5 Skills | (written before M5) | pending |
-| M6 Automations | (written before M6) | pending |
-| M7 Memory | (written before M7) | pending |
-| M8 Usage, logs, health | (written before M8) | pending |
-| M9 Attachments and voice | (written before M9) | pending |
-| M10 Deployment and docs | (written before M10) | pending |
+| Milestone                  | Detailed plan                        | Status                                                                                     |
+| -------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------ |
+| M0 Security and groundwork | `2026-09-23-companion-console-m0.md` | done (Nx rust-daemon:test 1,082 passed at 4e3eb7d)                                         |
+| M1 Run coordinator         | `2026-09-23-companion-console-m1.md` | done (Nx rust-daemon:test 1,141 passed at ef5b6fe)                                         |
+| M2 Sessions                | `2026-09-23-companion-console-m2.md` | done (Nx rust-daemon:test 1,287 passed; sdk + web test, typecheck, build green at 5b020c4) |
+| M3 Live runs               | (written before M3)                  | pending                                                                                    |
+| M4 Approvals               | (written before M4)                  | pending                                                                                    |
+| M5 Skills                  | (written before M5)                  | pending                                                                                    |
+| M6 Automations             | (written before M6)                  | pending                                                                                    |
+| M7 Memory                  | (written before M7)                  | pending                                                                                    |
+| M8 Usage, logs, health     | (written before M8)                  | pending                                                                                    |
+| M9 Attachments and voice   | (written before M9)                  | pending                                                                                    |
+| M10 Deployment and docs    | (written before M10)                 | pending                                                                                    |
 
 Dependencies: M0 → M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10. M4–M9 depend on M3's ledger, runs, and event stream; their internal order follows the spec's milestone list.
 

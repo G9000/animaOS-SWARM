@@ -29,17 +29,17 @@
 
 ## File map
 
-| Area | Files |
-|---|---|
-| Core | `packages/core-rust/crates/anima-core/src/runtime/run_delta.rs`, `…/runtime/run_tests.rs` |
-| Sessions | create `hosts/rust-daemon/src/sessions/{mod.rs,migration.rs,views.rs,pruning.rs,test_support.rs}` |
-| History | create `hosts/rust-daemon/src/history/{mod.rs,memory.rs,conformance.rs,sqlite.rs,postgres.rs,outbox.rs}`, `hosts/rust-daemon/migrations/20260923000000_history_store.sql` |
-| State | modify `state.rs`, `state/run_commit.rs`; create `state/session_state.rs` |
-| Persistence | modify `control_plane_store.rs`, `app/persistence.rs`, `app.rs`, `lib.rs`, `README.md` |
-| Runs | modify `runs/mod.rs`, `runs/ledger.rs`, `agent_runs.rs`, `tools.rs`, `tools/team.rs`, `schedules.rs`, `components/evaluators.rs`, `connectors/mod.rs`, `connectors/runtime.rs`, `jobs.rs`, `jobs/tests.rs`, `connectors/gcalendar/mod.rs` |
-| Routes | create `routes/sessions.rs`, `routes/contracts/sessions.rs`, `routes/tests/sessions.rs`; modify `routes/mod.rs`, `routes/agents.rs`, `routes/contracts/{mod.rs,agents.rs}`, `routes/health.rs` |
-| SDK | create `packages/sdk/src/sessions.ts`, `packages/sdk/src/sessions.spec.ts`; modify `client.ts`, `agents.ts`, `agents.spec.ts`, `index.ts` |
-| Web | create `apps/web/src/lib/{hash-route.ts,hash-route.test.ts,session-groups.ts,session-groups.test.ts}`, `apps/web/src/test/sessions.ts`, `apps/web/src/hooks/{useCompanionSessions.ts,useCompanionSessions.test.tsx,useSessionMessages.ts,useSessionMessages.test.tsx}`, `apps/web/src/components/sessions/{SessionSidebar.tsx,SessionSidebar.test.tsx,SessionView.tsx,SessionView.test.tsx}`, `apps/web/src/sessions.css`; modify `ViewHarness.tsx`, `ViewHarness.test.tsx`, `components/WorkspaceShell.tsx`, `components/WorkspaceShell.test.tsx`, `components/CompanionShell.test.tsx`, `components/ChatScreen.tsx`, `lib/daemon-api.ts`, `lib/daemon-api.test.ts`, `styles.css`; delete `components/{ActivityView.tsx,CheckinsView.tsx,CheckinsView.test.tsx,TelegramThread.tsx,TelegramThread.test.tsx}`; modify `apps/web-e2e/src/{companion.spec.ts,independent-agents.spec.ts,main-workspace-agent.spec.ts}` |
+| Area        | Files                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Core        | `packages/core-rust/crates/anima-core/src/runtime/run_delta.rs`, `…/runtime/run_tests.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Sessions    | create `hosts/rust-daemon/src/sessions/{mod.rs,migration.rs,views.rs,pruning.rs,test_support.rs}`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| History     | create `hosts/rust-daemon/src/history/{mod.rs,memory.rs,conformance.rs,sqlite.rs,postgres.rs,outbox.rs}`, `hosts/rust-daemon/migrations/20260923000000_history_store.sql`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| State       | modify `state.rs`, `state/run_commit.rs`; create `state/session_state.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Persistence | modify `control_plane_store.rs`, `app/persistence.rs`, `app.rs`, `lib.rs`, `README.md`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Runs        | modify `runs/mod.rs`, `runs/ledger.rs`, `agent_runs.rs`, `tools.rs`, `tools/team.rs`, `schedules.rs`, `components/evaluators.rs`, `connectors/mod.rs`, `connectors/runtime.rs`, `jobs.rs`, `jobs/tests.rs`, `connectors/gcalendar/mod.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Routes      | create `routes/sessions.rs`, `routes/contracts/sessions.rs`, `routes/tests/sessions.rs`; modify `routes/mod.rs`, `routes/agents.rs`, `routes/contracts/{mod.rs,agents.rs}`, `routes/health.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| SDK         | create `packages/sdk/src/sessions.ts`, `packages/sdk/src/sessions.spec.ts`; modify `client.ts`, `agents.ts`, `agents.spec.ts`, `index.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Web         | create `apps/web/src/lib/{hash-route.ts,hash-route.test.ts,session-groups.ts,session-groups.test.ts}`, `apps/web/src/test/sessions.ts`, `apps/web/src/hooks/{useCompanionSessions.ts,useCompanionSessions.test.tsx,useSessionMessages.ts,useSessionMessages.test.tsx}`, `apps/web/src/components/sessions/{SessionSidebar.tsx,SessionSidebar.test.tsx,SessionView.tsx,SessionView.test.tsx}`, `apps/web/src/sessions.css`; modify `ViewHarness.tsx`, `ViewHarness.test.tsx`, `components/WorkspaceShell.tsx`, `components/WorkspaceShell.test.tsx`, `components/CompanionShell.test.tsx`, `components/ChatScreen.tsx`, `lib/daemon-api.ts`, `lib/daemon-api.test.ts`, `styles.css`; delete `components/{ActivityView.tsx,CheckinsView.tsx,CheckinsView.test.tsx,TelegramThread.tsx,TelegramThread.test.tsx}`; modify `apps/web-e2e/src/{companion.spec.ts,independent-agents.spec.ts,main-workspace-agent.spec.ts}` |
 
 ## Task list
 
@@ -67,10 +67,12 @@
 ### Task 1: Transcript maintenance primitive (anima-core)
 
 **Files:**
+
 - Modify: `packages/core-rust/crates/anima-core/src/runtime/run_delta.rs` (one method)
 - Modify: `packages/core-rust/crates/anima-core/src/runtime/run_tests.rs` (one test)
 
 **Interfaces:**
+
 - Consumes: private `AgentRuntime.messages: Vec<Message>`.
 - Produces: `pub fn AgentRuntime::retain_messages(&mut self, keep: impl FnMut(&Message) -> bool) -> Vec<Message>` — removes the messages `keep` rejects, returns them in transcript order, and leaves counters, events, usage, status, and the last task untouched. Used by session deletion (Task 12) and hot-tail pruning (Task 13).
 
@@ -151,9 +153,11 @@ git commit -m "feat(core): let hosts drop transcript messages they keep elsewher
 ```
 
 ---
+
 ### Task 2: Session records, ids, kinds, titles, and the registry
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/sessions/mod.rs`
 - Modify: `hosts/rust-daemon/src/lib.rs` (`mod sessions;`)
 - Modify: `hosts/rust-daemon/src/schedules.rs` (`unwrap_checkin_prompt`)
@@ -161,6 +165,7 @@ git commit -m "feat(core): let hosts drop transcript messages they keep elsewher
 - Modify: `hosts/rust-daemon/src/state.rs` (`sessions` field and init; snapshot, validation, restore; two tests)
 
 **Interfaces:**
+
 - Consumes: `crate::runs::RunSource`; `crate::schedules::{is_silent_checkin_reply, wrap_checkin_prompt}` (existing).
 - Produces (in `crate::sessions`):
   - constants `MAX_SESSION_ID_BYTES` (200), `MAX_SESSION_TITLE_CHARS` (120), `DERIVED_TITLE_CHARS` (60), `MAX_SESSION_PREVIEW_CHARS` (160), `DEFAULT_CHAT_TITLE` (`"New chat"`), `LEGACY_ROOM_SESSION_PREFIX` (`"legacy-room:"`), `MAX_SESSION_CREATIONS_PER_MINUTE` (60), `SCHEDULE_ROOM_PREFIX` (`"schedule:"`);
@@ -1459,6 +1464,7 @@ pub(crate) fn unwrap_checkin_prompt(text: &str) -> &str {
 ```
 
 In `hosts/rust-daemon/src/control_plane_store.rs`:
+
 - add to `ControlPlaneSnapshot`, after `runs`:
 
 ```rust
@@ -1469,6 +1475,7 @@ In `hosts/rust-daemon/src/control_plane_store.rs`:
 - in `with_connector_state_and_cleanup`, add `sessions: vec![],` after `runs: vec![],`.
 
 In `hosts/rust-daemon/src/state.rs` (hand-formatted):
+
 - add `pub(crate) sessions: crate::sessions::SessionRegistry,` to `DaemonState` after `pub(crate) runs: crate::runs::RunLedger,`, and `sessions: crate::sessions::SessionRegistry::default(),` after `runs: crate::runs::RunLedger::default(),` in `with_model_adapter_and_events_and_limits`;
 - in `control_plane_snapshot`, after `snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());`, add `snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());`;
 - in `validate_control_plane_snapshot`, after `crate::runs::RunLedger::validate(&snapshot.runs)?;`, add `crate::sessions::SessionRegistry::validate(&snapshot.sessions)?;`;
@@ -1494,6 +1501,7 @@ git commit -m "feat(daemon): add session records, room mapping, titles, and the 
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Add `legacy-room:` to `RESERVED_ROOM_PREFIXES` in `hosts/rust-daemon/src/routes/agents.rs`, so a client `roomId` can never alias a mapped `legacy-room:<hash>` session id. Test: `POST /api/agents/{id}/run` with `roomId: "legacy-room:abc"` returns the existing reserved-prefix 400.
@@ -1504,10 +1512,12 @@ git commit -m "feat(daemon): add session records, room mapping, titles, and the 
 ### Task 3: History store contract and the bounded in-memory store
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/history/mod.rs`, `hosts/rust-daemon/src/history/memory.rs`, `hosts/rust-daemon/src/history/conformance.rs`
 - Modify: `hosts/rust-daemon/src/lib.rs` (`mod history;`)
 
 **Interfaces:**
+
 - Consumes: `anima_core::Message`; `crate::runs::{RunRecord, RunStart, RunSource, RunStatus}`.
 - Produces (in `crate::history`):
   - constants `EPHEMERAL_HISTORY_MAX_ROWS` (100,000), `MAX_SEARCH_TOKENS` (8), `MAX_SNIPPET_CHARS` (160);
@@ -2354,13 +2364,16 @@ git commit -m "feat(daemon): add the history store contract and the bounded in-m
 ```
 
 ---
+
 ### Task 4: SQLite history store (WAL, FTS5, versioned schema)
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/history/sqlite.rs`
 - Modify: `hosts/rust-daemon/src/history/mod.rs` (`mod sqlite;` and re-export)
 
 **Interfaces:**
+
 - Consumes: Task 3's `HistoryStore`, `HistoryMessage`, `MessagePageQuery`, `HistoryError`, `message_ordinal`, `search_tokens`, and `conformance::{assert_history_store_conformance, history_message}`.
 - Produces: `crate::history::SqliteHistoryStore` with `async fn open(path: PathBuf) -> Result<Self, HistoryError>` (creates parent directories, enables WAL, `synchronous = FULL`, creates or checks the schema) and `path(&self) -> &Path`; label `"sqlite"`; `SQLITE_HISTORY_SCHEMA_VERSION` (1) in `PRAGMA user_version`; tables `messages` (+ external-content FTS5 `messages_fts` kept in sync by triggers), `runs`, `usage`, `approvals`, `schedule_runs`, `attachments` (the last four are created now and filled by M4/M6/M8/M9); `impl From<rusqlite::Error> for HistoryError`. A newer `user_version` is refused with `history store schema version <n> is newer than this daemon supports (1)`.
 
@@ -3024,11 +3037,13 @@ git commit -m "feat(daemon): add the SQLite history store with WAL and full-text
 ### Task 5: Postgres history store and migration
 
 **Files:**
+
 - Create: `hosts/rust-daemon/migrations/20260923000000_history_store.sql`
 - Create: `hosts/rust-daemon/src/history/postgres.rs`
 - Modify: `hosts/rust-daemon/src/history/mod.rs` (`mod postgres;` and re-export)
 
 **Interfaces:**
+
 - Consumes: Task 3's contract and conformance suite.
 - Produces: `crate::history::PostgresHistoryStore::new(pool: PgPool) -> Self` (label `"postgres"`); tables `history_messages` (generated `search tsvector` over `to_tsvector('simple', text)` with a GIN index), `history_runs`, `history_usage`, `history_approvals`, `history_schedule_runs`, `history_attachments` (the `history_` prefix keeps them apart from `step_log` and `host_snapshots` in the shared database; requires Postgres 12+ for the generated column); `impl From<sqlx::Error> for HistoryError`; `prefix_tsquery(&[String]) -> String` (`deploy:* & build:*`).
 
@@ -3457,6 +3472,7 @@ git commit -m "feat(daemon): add the Postgres history store and its migration"
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Document in `hosts/rust-daemon/README.md` (Postgres persistence) that the history tables require Postgres 12+, and that rolling back to a pre-M2 daemon in Postgres mode also requires `DELETE FROM _sqlx_migrations WHERE version = 20260923000000;` (optionally dropping the `history_*` tables) besides restoring `control_plane.backup.<version>`, because sqlx refuses to start when an applied migration is missing (`VersionMissing`).
@@ -3466,6 +3482,7 @@ git commit -m "feat(daemon): add the Postgres history store and its migration"
 ### Task 6: History outbox, worker, readiness, and wiring
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/history/outbox.rs`
 - Modify: `hosts/rust-daemon/src/history/mod.rs` (`mod outbox;` and re-exports), `hosts/rust-daemon/src/history/conformance.rs` (`FlakyHistoryStore`)
 - Modify: `hosts/rust-daemon/src/runs/ledger.rs` (`prune` only once mirrored, `unmirrored_terminal`, `mark_mirrored`, tests)
@@ -3477,6 +3494,7 @@ git commit -m "feat(daemon): add the Postgres history store and its migration"
 - Modify: `hosts/rust-daemon/README.md` (env table row)
 
 **Interfaces:**
+
 - Consumes: Tasks 3–5 stores; `crate::sessions::{hidden_message_ids, session_id_for_room}` (Task 2); `AgentRunCoordinator::control_plane_transactions()` (existing).
 - Produces (in `crate::history`):
   - constants `HISTORY_FLUSH_INTERVAL` (1 s), `HISTORY_FLUSH_BATCH` (500), `HISTORY_RUN_BATCH` (200), `HISTORY_MAX_BACKOFF` (30 s), `HISTORY_READINESS_GRACE_MS` (5 min), `MAX_OUTBOX_ITEMS` (100,000);
@@ -4687,6 +4705,7 @@ pub(crate) use outbox::{
 Also change the `mirrored` field's doc comment on `RunRecord` to `/// Set once the history store holds this terminal record (spec §4.1).`
 
 `hosts/rust-daemon/src/state.rs` (hand-formatted):
+
 - add `pub(crate) history: crate::history::SharedHistory,` to `DaemonState` after `pub(crate) sessions: crate::sessions::SessionRegistry,`, and `history: crate::history::HistoryService::ephemeral(),` after `sessions: crate::sessions::SessionRegistry::default(),`;
 - add after `set_memory_store`:
 
@@ -4697,6 +4716,7 @@ Also change the `mirrored` field's doc comment on `RunRecord` to `/// Set once t
 ```
 
 `hosts/rust-daemon/src/agent_runs.rs`, in `run_locked` Phase C:
+
 - change `let (snapshot, change_set, memory, memory_embeddings, memory_store, persist_request) = {` to `let (snapshot, change_set, memory, memory_embeddings, memory_store, history_outbox, persist_request) = {` (Phase B already has a local `history` for the room transcript, so use this distinct name);
 - in the tuple at the end of that block, add `guard.history.clone(),` directly before `guard.control_plane_persist_request(),`;
 - directly after `in_flight.disarm();` (which follows the successful save and `drop(transaction);`), add:
@@ -4713,6 +4733,7 @@ Also change the `mirrored` field's doc comment on `RunRecord` to `/// Set once t
 - [ ] **Step 5: Implement persistence, startup, shutdown, and readiness**
 
 `hosts/rust-daemon/src/app/persistence.rs`:
+
 - change `use std::path::PathBuf;` to `use std::path::{Path, PathBuf};`, add `use crate::history::{HistoryService, HistoryStore, MemoryHistoryStore, PostgresHistoryStore, SqliteHistoryStore};`, and extend `use crate::control_plane_store::{...}` unchanged;
 - in `configure_persistence`, replace `configure_control_plane_store(state, control_plane_store).await?;` with:
 
@@ -4769,6 +4790,7 @@ pub(crate) fn default_history_sqlite_path(control_plane_file: &Path) -> PathBuf 
 ```
 
 `hosts/rust-daemon/src/app.rs`:
+
 - add `history: crate::history::HistoryWorker,` to `struct DaemonRuntime` after `jobs: JobService,`;
 - in `daemon_runtime` and in `deterministic_daemon_runtime_with_mail_transport`, add directly before `let scheduler = SchedulerService::new(state, agent_runs.clone(), connectors.clone());`:
 
@@ -4777,7 +4799,8 @@ pub(crate) fn default_history_sqlite_path(control_plane_file: &Path) -> PathBuf 
         crate::history::HistoryWorker::new(Arc::clone(&state), agent_runs.control_plane_transactions());
 ```
 
-  and add `history,` to both `DaemonRuntime { ... }` literals after `jobs,`;
+and add `history,` to both `DaemonRuntime { ... }` literals after `jobs,`;
+
 - in `app_with_state`, add after `let runtime = deterministic_daemon_runtime(Arc::clone(&state), &config);`:
 
 ```rust
@@ -4831,6 +4854,7 @@ git commit -m "feat(daemon): mirror committed turns and finished runs through th
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Mirror only durable state: `flush_once` reads `unmirrored_terminal` runs and `reconcile` takes its hot snapshot while holding the control-plane transaction mutex (`HistoryWorker.transactions`); `rollback_run` sets the record's `mirrored = false` (in `RunRecord::finish` or explicitly) so a rolled-back run is re-mirrored with its final status. Test: a flush that mirrors a completed run followed by a failed final save leaves the store row rewritten as `failed` after the next flush, with no phantom message rows.
@@ -4845,17 +4869,20 @@ git commit -m "feat(daemon): mirror committed turns and finished runs through th
 ### Task 7: Snapshot version 5 with the pre-upgrade backup
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/control_plane_store.rs` (version 5, unversioned files load as version 1, backup functions, tests)
 - Modify: `hosts/rust-daemon/src/app/persistence.rs` (backup before the first save of an older snapshot; tests)
 - Modify: `hosts/rust-daemon/src/state.rs` (one version assertion)
 
 **Interfaces:**
+
 - Consumes: the existing JSON (`AtomicFile`, `sync_snapshot_parent`) and Postgres (`host_snapshots`) helpers in `control_plane_store.rs`.
 - Produces: `pub(crate) const CONTROL_PLANE_STORE_VERSION: u32 = 5` (the single M2 bump, M1 carry-forward); `pub(crate) const PRE_SESSIONS_BACKUP_SUFFIX: &str = ".pre-sessions.bak"`; `pre_sessions_backup_path(&Path) -> PathBuf`; `postgres_backup_key(version: u32) -> String` (`control_plane.backup.<version>`); `async write_pre_upgrade_backup(&ControlPlaneStoreConfig, loaded_version: u32) -> io::Result<String>` (JSON: exact file bytes to `<file>.pre-sessions.bak`, written atomically with `sync_all` and a synced parent directory; Postgres: server-side copy of the `control_plane` row, upserted). `configure_control_plane_store` writes the backup whenever the loaded version is below 5 — including unversioned JSON files, which now load as version 1 instead of the current version — before restoring and before the first save.
 
 - [ ] **Step 1: Write the failing tests**
 
 In `hosts/rust-daemon/src/control_plane_store.rs` tests:
+
 - in `json_snapshot_replaces_an_existing_snapshot_only_after_a_synced_temp_write`, change `assert_eq!(loaded.version, 4);` to `assert_eq!(loaded.version, 5);`;
 - in `snapshot_serializes_current_version_with_empty_connector_collections`, change `assert_eq!(payload["version"], 4);` to `assert_eq!(payload["version"], 5);`;
 - append:
@@ -5028,6 +5055,7 @@ Expected: compile errors `cannot find function pre_sessions_backup_path`, `canno
 - [ ] **Step 3: Implement**
 
 `hosts/rust-daemon/src/control_plane_store.rs`:
+
 - replace `const CONTROL_PLANE_STORE_VERSION: u32 = 4;` with:
 
 ```rust
@@ -5111,6 +5139,7 @@ async fn backup_postgres_snapshot(pool: &PgPool, version: u32) -> io::Result<Str
 ```
 
 `hosts/rust-daemon/src/app/persistence.rs`:
+
 - change the import to `use crate::control_plane_store::{load_control_plane_snapshot, write_pre_upgrade_backup, ControlPlaneStoreConfig, CONTROL_PLANE_STORE_VERSION};`;
 - in `configure_control_plane_store`, directly after `let snapshot = load_control_plane_snapshot(&config).await?;`, add:
 
@@ -5151,6 +5180,7 @@ git commit -m "feat(daemon): bump the control plane to version 5 behind a pre-up
 ### Task 8: Legacy migration — check-in relabel, legacy sessions, ledger ids, tool grants
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/sessions/migration.rs`
 - Create: `hosts/rust-daemon/src/state/session_state.rs`
 - Modify: `hosts/rust-daemon/src/sessions/mod.rs` (`pub(crate) mod migration;`)
@@ -5160,6 +5190,7 @@ git commit -m "feat(daemon): bump the control plane to version 5 behind a pre-up
 - Modify: `hosts/rust-daemon/src/app/persistence.rs` (apply pending tool grants before the first save)
 
 **Interfaces:**
+
 - Consumes: Task 2's `kind_for_room`, `session_title`, `TitleContext`, `session_id_for_room`, `schedule_room_id`, `schedule_id_of_room`, `connector_id_of_room`, `job_id_of_room`, `peer_sender_of_room`, `delegating_agent_id`, `is_checkin_message`, `SessionRecord::new`, `SessionRegistry::{contains, insert}`; `ToolRegistry::{descriptor, resolve_descriptors}`.
 - Produces (in `crate::sessions::migration`): `relabel_legacy_checkin_rooms(&mut [AgentRuntimeSnapshot], &mut [RunRecord]) -> usize` (messages moved); `map_ledger_session_ids(&mut [RunRecord]) -> usize` (F17); `LegacyAgent<'a> { agent_id: &'a str, config: &'a AgentConfig, messages: &'a [Message] }`; `LegacySessionContext<'a> { schedules, jobs, connectors, agent_names }` (maps by id); `derive_sessions_for_legacy_rooms(&SessionRegistry, &[LegacyAgent], &LegacySessionContext) -> Vec<SessionRecord>` (only rooms without a record; `lastReadAtMs` = last activity so upgraded history is not unread; helper sessions get `parentAgentId` from the helper's settings, a delegation preamble, or the peer room); `ToolGrantSet { id, read_class, write_class }` (all `&'static`); `TOOL_GRANTS: &[ToolGrantSet]` (empty in M2 — M3, M5, and M6 append theirs).
 - Produces: `crate::agent_runs::config_helper_parent` (`pub(crate)`); `DaemonState::tool_grants_applied: BTreeSet<String>` (saved as `ControlPlaneSnapshot::tool_grants_applied: Vec<String>`, `#[serde(default)]`); `DaemonState::derive_legacy_sessions(&self) -> Vec<SessionRecord>`; `DaemonState::apply_pending_tool_grants(&mut self, &[ToolGrantSet]) -> Vec<String>` (agents that gained tools). Grants go to non-helper agents that have a tool list: read-class tools to all of them, write-class tools to those with `write_file`; unregistered names are skipped; each set applies once. `restore_control_plane_snapshot` relabels and maps before restoring agents and derives missing sessions after; `configure_control_plane_store` applies pending grants before its first save (also on a fresh start, so later agents never get retroactive grants).
@@ -5914,6 +5945,7 @@ impl DaemonState {
 ```
 
 `hosts/rust-daemon/src/state.rs` (hand-formatted):
+
 - add `mod session_state;` after `mod run_commit;`;
 - add `pub(crate) tool_grants_applied: std::collections::BTreeSet<String>,` to `DaemonState` after `pub(crate) history: crate::history::SharedHistory,`, and `tool_grants_applied: std::collections::BTreeSet::new(),` after `history: crate::history::HistoryService::ephemeral(),`;
 - in `control_plane_snapshot`, after the `snapshot.sessions = …` line, add `snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();`;
@@ -5976,9 +6008,11 @@ git commit -m "feat(daemon): migrate legacy rooms to sessions and add the one-ti
 ```
 
 ---
+
 ### Task 9: Session records at run time and helper linkage
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/runs/mod.rs` (`RunLink`, `RunChangeSet::session_undo`)
 - Modify: `hosts/rust-daemon/src/state/session_state.rs` (`RunSessionRequest`, `ensure_run_session`)
 - Modify: `hosts/rust-daemon/src/state.rs` (re-export `RunSessionRequest`)
@@ -5989,6 +6023,7 @@ git commit -m "feat(daemon): migrate legacy rooms to sessions and add the one-ti
 - Modify (mechanical, add `parent: None,`): `hosts/rust-daemon/src/schedules.rs`, `hosts/rust-daemon/src/jobs.rs`, `hosts/rust-daemon/src/jobs/tests.rs`, `hosts/rust-daemon/src/connectors/runtime.rs`, `hosts/rust-daemon/src/connectors/gcalendar/mod.rs`, `hosts/rust-daemon/src/routes/agents.rs`, `hosts/rust-daemon/src/routes/mod.rs`, `hosts/rust-daemon/src/history/outbox.rs`
 
 **Interfaces:**
+
 - Consumes: Task 2's `SessionRegistry::{contains, insert, remove, record_commit, revert_commit}`, `SessionRecord::new`, `kind_for_room`, `session_title`, `TitleContext`, room helpers, `is_owner_web_turn`, `SessionCommitUndo`; Task 8's `config_helper_parent`; Task 6's `history_outbox.enqueue_committed`.
 - Produces: `crate::runs::RunLink { run_id, session_id, agent_id }` (`Clone + Debug + PartialEq + Eq`); `RunChangeSet::session_undo: Option<SessionCommitUndo>` (set by `commit_run`, used by `rollback_run`); `AgentRunRequest::parent: Option<RunLink>`; `ToolExecutionContext::with_run_link(self, Option<RunLink>) -> Self` and field `run_link`; `crate::state::RunSessionRequest<'a> { agent_id, room_id, source, delegated_parent, peer_sender, parent: Option<&RunLink>, first_text, now_ms }`; `DaemonState::ensure_run_session(&mut self, RunSessionRequest) -> bool` (true when it created the record); new signatures `AgentRunCoordinator::send_peer(sender, target, message, route, parent: Option<RunLink>)`, `delegate(&caller, target, task, parent: Option<RunLink>)`, `spawn_helper(parent_id, name, task, parent_run: Option<RunLink>)`.
 - Behavior: every coordinator run makes sure its room has a session record inside the run-start save (no extra save), removes a record it created if that save fails, records the mapped session id and `parentRunId` on its ledger record, and gives its tools a `RunLink` to itself. Helper sessions record `parentSessionId`, `parentRunId`, and `parentAgentId` (falling back to the delegating agent, the peer sender, or the helper's companion). `commit_run` advances `lastActivityAtMs`, marks the owner's own turn read (source `api` or `web`, or a Telegram owner turn from the web), and titles placeholder chats; a rolled-back commit reverts exactly that. Committed messages are enqueued under the mapped session id.
@@ -6263,6 +6298,7 @@ Expected: compile errors such as `no field parent on type AgentRunRequest`, `thi
 - [ ] **Step 3: Add the link, session request, and commit bookkeeping**
 
 `hosts/rust-daemon/src/runs/mod.rs`:
+
 - add after the `pub(crate) use ledger::{…};` block:
 
 ```rust
@@ -6282,7 +6318,7 @@ pub(crate) struct RunLink {
     pub(crate) session_undo: Option<crate::sessions::SessionCommitUndo>,
 ```
 
-  and `session_undo: None,` after `undo: None,` in `RunChangeSet::new`. (`RunChangeSet::session_id` stays the room id: the reply detection compares it with `Message::room_id`.)
+and `session_undo: None,` after `undo: None,` in `RunChangeSet::new`. (`RunChangeSet::session_id` stays the room id: the reply detection compares it with `Message::room_id`.)
 
 Append to `hosts/rust-daemon/src/state/session_state.rs`:
 
@@ -6367,6 +6403,7 @@ impl DaemonState {
 `hosts/rust-daemon/src/state.rs`: add `pub(crate) use self::session_state::RunSessionRequest;` after `mod session_state;`.
 
 `hosts/rust-daemon/src/state/run_commit.rs`:
+
 - change the imports to `use anima_core::{AgentRuntime, AgentRuntimeSnapshot, AgentStatus, MessageRole, RuntimeRunBase};` and `use crate::runs::{RunChangeSet, RunError, RunOutcome, RunSource, RunStatus, AGENT_DELETED};`;
 - in `commit_run`, directly after `change_set.undo = Some(runtime.apply_run_delta(&change_set.delta));`, add:
 
@@ -6401,6 +6438,7 @@ impl DaemonState {
 - [ ] **Step 4: Thread the parent through the coordinator and tools**
 
 `hosts/rust-daemon/src/agent_runs.rs`:
+
 - add to `AgentRunRequest`, after `pub(crate) source_ref: Option<String>,`:
 
 ```rust
@@ -6438,7 +6476,8 @@ impl DaemonState {
             });
 ```
 
-  in the `RunRecord::running(RunStart { … }, …)` call change `session_id: room_id.clone(),` to `session_id: session_id.clone(),`, `parent_run_id: None,` to `parent_run_id: parent.as_ref().map(|link| link.run_id.clone()),`, and the timestamp argument `anima_core::primitives::now_millis(),` to `now_ms,`; and the block's final tuple becomes `(runtime, tool_context, base, run_id, session_id, session_created, in_flight, guard.control_plane_persist_request())`;
+in the `RunRecord::running(RunStart { … }, …)` call change `session_id: room_id.clone(),` to `session_id: session_id.clone(),`, `parent_run_id: None,` to `parent_run_id: parent.as_ref().map(|link| link.run_id.clone()),`, and the timestamp argument `anima_core::primitives::now_millis(),` to `now_ms,`; and the block's final tuple becomes `(runtime, tool_context, base, run_id, session_id, session_created, in_flight, guard.control_plane_persist_request())`;
+
 - replace the run-start save failure branch
 
 ```rust
@@ -6449,7 +6488,7 @@ impl DaemonState {
         }
 ```
 
-  with
+with
 
 ```rust
         if let Err(error) = running_persist_request.save().await {
@@ -6468,6 +6507,7 @@ impl DaemonState {
 - `run_locked` Phase C: in the `history_outbox.enqueue_committed(…)` call (Task 6), replace `&crate::sessions::session_id_for_room(&room_id),` with `&session_id,`.
 
 `hosts/rust-daemon/src/tools.rs`:
+
 - add to `ToolExecutionContext`, after `peer_sources: Vec<String>,`:
 
 ```rust
@@ -6486,6 +6526,7 @@ impl DaemonState {
 ```
 
 `hosts/rust-daemon/src/tools/team.rs`:
+
 - `send_message`: `coordinator.send_peer(agent.id, target.id.clone(), message.into(), route)` → `coordinator.send_peer(agent.id, target.id.clone(), message.into(), route, context.run_link.clone())`;
 - `broadcast_message`: add `context.run_link.clone(),` as the last argument of the `coordinator.send_peer(agent.id.clone(), target.clone(), message.clone(), route.clone())` call;
 - `delegate_to_agent`: `coordinator.delegate(&agent, target, task)` → `coordinator.delegate(&agent, target, task, context.run_link.clone())`;
@@ -6496,6 +6537,7 @@ impl DaemonState {
 `hosts/rust-daemon/src/routes/mod.rs`, `peer_message_entry`: add `None,` as the last argument of `.send_peer(sender_id.clone(), input.to_agent_id, input.message, anima_core::AgentCommunicationRoute::start(sender_id))`.
 
 Add `parent: None,` after the `source_ref: …,` field of every other `AgentRunRequest { … }` literal:
+
 - `hosts/rust-daemon/src/schedules.rs`: `execute_claimed`;
 - `hosts/rust-daemon/src/jobs.rs`: `JobService::execute`;
 - `hosts/rust-daemon/src/jobs/tests.rs`: `a_chat_run_in_another_room_does_not_hold_back_the_agents_job`;
@@ -6530,11 +6572,13 @@ git commit -m "feat(daemon): give every run's room a session and link helper run
 ### Task 10: Stable check-in rooms and the silent check-in memory skip
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/schedules.rs` (workspace check-ins run in `schedule:<id>`; `is_checkin_content`; one test rewritten)
 - Modify: `hosts/rust-daemon/src/agent_runs.rs` (no task-result memory for silent check-ins; one test)
 - Modify: `hosts/rust-daemon/src/components/evaluators.rs` (no reflection for silent check-ins; one test)
 
 **Interfaces:**
+
 - Consumes: `crate::sessions::{schedule_room_id, is_checkin_message, SessionKind}` (Task 2); Task 9's session creation.
 - Produces: `crate::schedules::is_checkin_content(&Content) -> bool`. Workspace-target automations run in `RunRoom::Stable("schedule:<scheduleId>")` (spec §9.2; connector-target check-ins keep the Telegram room). A run whose input is a check-in and whose reply is exactly `CHECKIN_OK` (trimmed) stores no task-result memory and no evaluator reflection (spec §9.2); spoken check-ins and every other run are unchanged.
 
@@ -6731,6 +6775,7 @@ Expected: FAIL — the schedule messages are in two generated `room-*` rooms (`b
 - [ ] **Step 3: Implement**
 
 `hosts/rust-daemon/src/schedules.rs`:
+
 - in `execute_claimed`, replace `ScheduleTarget::Workspace => RunRoom::Generated,` with:
 
 ```rust
@@ -6751,6 +6796,7 @@ pub(crate) fn is_checkin_content(content: &Content) -> bool {
 ```
 
 `hosts/rust-daemon/src/agent_runs.rs`, in `run_locked`:
+
 - directly after `let retry_key = content_retry_key(&content).map(str::to_owned);`, add:
 
 ```rust
@@ -6771,7 +6817,7 @@ pub(crate) fn is_checkin_content(content: &Content) -> bool {
         .await;
 ```
 
-  with
+with
 
 ```rust
         // A silent check-in stores no task-result memory; otherwise silent
@@ -6818,6 +6864,7 @@ git commit -m "feat(daemon): run workspace check-ins in their session and skip m
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Interim context guard (controller ruling): when building a run's history for a `schedule:` room, exclude silent check-in pairs (the same hidden-message rule the session views use) and keep only the newest 10 turns, where a turn starts at a user message and an assistant tool-call message is never separated from its tool results. Other rooms are unchanged in M2; M3's context selection replaces this. Tests: a schedule room with 30 prior ticks (half silent) gives the model at most 10 visible turns and no `CHECKIN_OK` pairs; a tool-call turn is kept whole.
@@ -6827,6 +6874,7 @@ git commit -m "feat(daemon): run workspace check-ins in their session and skip m
 ### Task 11: Session read routes and `GET /api/agents?view=summary`
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/sessions/views.rs`, `hosts/rust-daemon/src/sessions/test_support.rs`
 - Modify: `hosts/rust-daemon/src/sessions/mod.rs` (declare both modules)
 - Modify: `hosts/rust-daemon/src/runs/ledger.rs` (`active_count_for_session`; one test)
@@ -6836,6 +6884,7 @@ git commit -m "feat(daemon): run workspace check-ins in their session and skip m
 - Modify: `hosts/rust-daemon/README.md` (the `GET /api/agents` row)
 
 **Interfaces:**
+
 - Consumes: Task 2's `SessionRecord`, `SessionKind`, `SessionCapabilities`, `hidden_message_ids`, `is_checkin_message`, `is_inbound_message`, `preview_text`, `schedule_id_of_room`, `is_valid_session_id`, `schedules::unwrap_checkin_prompt`; Task 3's `HistoryStore`, `MessageOrder`, `MessagePageQuery`, `search_tokens`, `text_matches`, `search_snippet`, `conformance::history_message`; Task 6's `DaemonState::history` (`store()`, `is_mirrored`, `flush_once`), `HistoryService::new`, `DaemonState::set_history`, `conformance::FlakyHistoryStore::{new, set_failing}`; Task 8's `config_helper_parent`; `routes::jobs::{authorize, no_store}`.
 - Produces:
   - `crate::sessions::views`: constants `DEFAULT_SESSION_PAGE` (50), `MAX_SESSION_PAGE` (200), `DEFAULT_MESSAGE_PAGE` (50), `MAX_MESSAGE_PAGE` (200), `MAX_SEARCH_QUERY_CHARS` (200); `SessionListQuery { kind, archived, q, cursor, limit, include_helpers }` (`Default`: unarchived, 50, helpers included); `SessionCursor { last_activity_at_ms, agent_id, session_id }` with `encode()` / `decode(&str) -> Option<Self>`; `SessionMatch { message_id: Option<String>, snippet }`; `SessionView { record, message_count, preview, active_runs, unread, capabilities, matched }`; `SessionPage { sessions, next_cursor }`; `MessagePageRequest { before: Option<String>, limit, include_hidden }`; `PageMessage { message, hidden }`; `MessagePage { messages (oldest first), next_before }`; `MessagePageError { NotFound, BeforeNotFound, Unavailable }`; `async fn list_sessions(&SharedDaemonState, agent_id, &SessionListQuery) -> Option<SessionPage>` (`None`: unknown agent); `async fn session_view(&SharedDaemonState, agent_id, session_id) -> Option<SessionView>`; `async fn session_messages(&SharedDaemonState, agent_id, session_id, &MessagePageRequest) -> Result<MessagePage, MessagePageError>`;
@@ -8757,6 +8806,7 @@ pub(super) async fn list_session_messages(
 ```
 
 In `hosts/rust-daemon/src/routes/mod.rs` (hand-format; do not run rustfmt on this file):
+
 - add `mod sessions;` after `mod schedules;` at the top;
 - in `#[openapi(paths(…))]`, add `sessions::list_sessions, sessions::get_session, sessions::list_session_messages,` after `schedules::import_legacy_schedules,`; after the closing `),` of `paths(…)` add the line `    components(schemas(self::contracts::AgentSummariesEnvelope)),`; and add `(name = "sessions", description = "Agent sessions and their transcripts"),` to `tags(…)` after the `schedules` tag;
 - in `timed_routes`, after the `.route("/api/agents/{agent_id}/jobs/{job_id}/review", …)` line, add:
@@ -8814,6 +8864,7 @@ git commit -m "feat(daemon): add owner-only session list, detail, and message ro
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. `GET /api/agents` ignores unknown `view` values (default full response) instead of returning 400, preserving existing route behavior (spec §13.4); only `view=summary` changes the shape. Test. (Supersedes the earlier acceptance of 400.)
@@ -8824,6 +8875,7 @@ git commit -m "feat(daemon): add owner-only session list, detail, and message ro
 ### Task 12: Session mutation routes and Markdown export
 
 **Files:**
+
 - Modify: `hosts/rust-daemon/src/sessions/views.rs` (`full_transcript`, `transcript_markdown`, `export_file_stem`, `automation_exists`; one test)
 - Modify: `hosts/rust-daemon/src/runs/ledger.rs` (`remove_terminal_for_session`; one test)
 - Modify: `hosts/rust-daemon/src/agent_runs.rs` (`RoomReservation`, `try_reserve_room`)
@@ -8832,6 +8884,7 @@ git commit -m "feat(daemon): add owner-only session list, detail, and message ro
 - Modify: `hosts/rust-daemon/README.md` (Sessions route table)
 
 **Interfaces:**
+
 - Consumes: Task 1's `AgentRuntime::retain_messages`; Task 2's `SessionRecord::new`, `SessionCreateLimiter::try_acquire`, `clean_owner_title`, `new_chat_session_id`, `DEFAULT_CHAT_TITLE`, `TitleSource`, `SessionOrigin`; Task 6's `HistoryService::{enqueue_session_deletion, forget_mirrored, flush_once, store}`; Task 11's views, contracts, `routes::sessions::rejected`, `session_view`, `MessagePageError`, `test_support`, the route-test helpers `get`, `json`, `app_with_session`, `OWNER_ORIGIN`; `DaemonState::restore_removed_agent` (existing).
 - Produces:
   - `crate::sessions::views::{full_transcript(&SharedDaemonState, agent_id, session_id) -> Result<(SessionRecord, String /* agent name */, Vec<Message>), MessagePageError>, transcript_markdown(&SessionRecord, agent_name, &[Message]) -> String, export_file_stem(title) -> String, automation_exists(&DaemonState, &SessionRecord) -> bool}`;
@@ -9800,6 +9853,7 @@ pub(super) async fn export_session(
 (The delete handler removes the messages before the record so the borrow of `runtime` ends before `guard.sessions` is touched; the `let … else` restore path covers a record that vanished, which cannot happen while the transaction is held but keeps the state consistent if it did.)
 
 In `hosts/rust-daemon/src/routes/mod.rs` (hand-format):
+
 - in `#[openapi(paths(…))]`, after `sessions::list_session_messages,` add `sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,`;
 - replace the two session route lines added in Task 11 for `/api/agents/{agent_id}/sessions` and `/api/agents/{agent_id}/sessions/{session_id}` with:
 
@@ -9816,15 +9870,15 @@ In `hosts/rust-daemon/README.md`, add after the Agents table (before `### Agenci
 
 Every session route requires local-owner authorization, and reads answer `Cache-Control: no-store`.
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/agents/{agent_id}/sessions` | Sessions, newest activity first. Optional `?kind=`, `?archived=`, `?q=`, `?cursor=`, `?limit=` (1–200, default 50), and `?includeHelpers=` (default `true`). Returns `{ sessions, nextCursor }`. |
-| `POST` | `/api/agents/{agent_id}/sessions` | Create a chat. Body `{ "title"?: string }`. Returns `201` with `{ session }`; `429` beyond 60 per minute per agent. |
-| `GET` | `/api/agents/{agent_id}/sessions/{session_id}` | One session with `messageCount`, `preview`, `activeRuns`, `unread`, and `capabilities`. |
-| `PATCH` | `/api/agents/{agent_id}/sessions/{session_id}` | Rename, archive, or mark read: `{ "title"?, "archived"?, "lastReadAtMs"? }`. |
-| `DELETE` | `/api/agents/{agent_id}/sessions/{session_id}` | Delete a session its kind allows; `409` while a run in it is active. Memories are kept. |
-| `GET` | `/api/agents/{agent_id}/sessions/{session_id}/messages` | Messages oldest to newest: `?before=<messageId>&limit=50&includeHidden=false`. Returns `{ messages, nextBefore }`. |
-| `GET` | `/api/agents/{agent_id}/sessions/{session_id}/export` | The visible transcript as `text/markdown`, including messages kept only in the history store. |
+| Method   | Path                                                    | Description                                                                                                                                                                                      |
+| -------- | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET`    | `/api/agents/{agent_id}/sessions`                       | Sessions, newest activity first. Optional `?kind=`, `?archived=`, `?q=`, `?cursor=`, `?limit=` (1–200, default 50), and `?includeHelpers=` (default `true`). Returns `{ sessions, nextCursor }`. |
+| `POST`   | `/api/agents/{agent_id}/sessions`                       | Create a chat. Body `{ "title"?: string }`. Returns `201` with `{ session }`; `429` beyond 60 per minute per agent.                                                                              |
+| `GET`    | `/api/agents/{agent_id}/sessions/{session_id}`          | One session with `messageCount`, `preview`, `activeRuns`, `unread`, and `capabilities`.                                                                                                          |
+| `PATCH`  | `/api/agents/{agent_id}/sessions/{session_id}`          | Rename, archive, or mark read: `{ "title"?, "archived"?, "lastReadAtMs"? }`.                                                                                                                     |
+| `DELETE` | `/api/agents/{agent_id}/sessions/{session_id}`          | Delete a session its kind allows; `409` while a run in it is active. Memories are kept.                                                                                                          |
+| `GET`    | `/api/agents/{agent_id}/sessions/{session_id}/messages` | Messages oldest to newest: `?before=<messageId>&limit=50&includeHidden=false`. Returns `{ messages, nextBefore }`.                                                                               |
+| `GET`    | `/api/agents/{agent_id}/sessions/{session_id}/export`   | The visible transcript as `text/markdown`, including messages kept only in the history store.                                                                                                    |
 ```
 
 - [ ] **Step 6: Run the tests to verify they pass**
@@ -9840,6 +9894,7 @@ git commit -m "feat(daemon): create, rename, archive, delete, and export session
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. `POST /api/agents/{id}/sessions` returns 409 for helper agents (they can only run through their companion).
@@ -9851,6 +9906,7 @@ git commit -m "feat(daemon): create, rename, archive, delete, and export session
 ### Task 13: Hot-tail pruning and `messagePruned`
 
 **Files:**
+
 - Create: `hosts/rust-daemon/src/sessions/pruning.rs`
 - Modify: `hosts/rust-daemon/src/sessions/mod.rs` (`pub(crate) mod pruning;`)
 - Modify: `hosts/rust-daemon/src/runs/ledger.rs` (`active_sessions`)
@@ -9861,6 +9917,7 @@ git commit -m "feat(daemon): create, rename, archive, delete, and export session
 - Modify: `hosts/rust-daemon/src/routes/mod.rs` (OpenAPI descriptions), `hosts/rust-daemon/README.md` (hot-tail note)
 
 **Interfaces:**
+
 - Consumes: Task 1's `retain_messages`; Task 2's `session_id_for_room`; Task 6's `HistoryService::{is_ephemeral, reconciled, is_mirrored, forget_mirrored, flush_once}`, `HistoryWorker` (its `transactions` field), `FlakyHistoryStore`; Task 11's `test_support`; `DaemonState::{restore_removed_agent, install_test_control_plane_save_gate}` (existing).
 - Produces: `crate::sessions::pruning::{HOT_TAIL_MESSAGES (200), HOT_TAIL_MIN_AGE_MS (24 h), PRUNE_INTERVAL_MS (10 min), PruneUndo { message_ids, .. }, async fn prune_once(&SharedDaemonState, &Arc<tokio::sync::Mutex<()>>, now_ms) -> Result<usize, String>}`; `DaemonState::prune_hot_tail(&mut self, now_ms) -> Option<PruneUndo>` and `DaemonState::revert_prune(&mut self, PruneUndo)`; `RunLedger::active_sessions() -> HashSet<(String, String)>`; `TelegramOutboundRecord::message_pruned: bool` (JSON `messagePruned`, omitted when false).
 - Behavior (spec §13.2): a message leaves the control plane only when it is mirrored, outside its session's newest 200 (by transcript position), created more than 24 hours ago, not referenced by an undelivered Telegram outbound record (`Pending` or `Failed`; the delivery loop retries `Failed`), and not in a session with a queued, running, or awaiting-approval run. The history worker prunes every 10 minutes inside a control-plane transaction; it never prunes with an ephemeral store or before the outbox reconciled since startup. `Delivered` records whose message was pruned get `messagePruned: true`; snapshot validation accepts a missing assistant message only for such records and rejects `messagePruned` on an undelivered record with `outbound delivery '<id>' is marked messagePruned but was not delivered`. A failed prune save restores the agents and flags; a saved prune forgets the pruned ids in the mirrored set. `GET /api/agents` and `GET /api/agents/{id}` then carry only the hot tail (documented in OpenAPI and the README); `list_connector_messages` shows only the hot tail, and an owner-send retry older than 24 hours no longer finds its earlier turn (see Notes).
@@ -10087,6 +10144,7 @@ In `hosts/rust-daemon/src/connectors/mod.rs`, add to `TelegramOutboundRecord` af
 ```
 
 Add `message_pruned: false,` after the `delivery_state` field of every `TelegramOutboundRecord { … }` literal:
+
 - `hosts/rust-daemon/src/state.rs`: `test_outbound`;
 - `hosts/rust-daemon/src/schedules.rs`: `execute_claimed`;
 - `hosts/rust-daemon/src/connectors/runtime.rs`: `send_from_owner_owned`, `process_pending_once_owned`, and the tests `revoked_delivery_credential_stops_worker_and_requires_replacement`, `processing_commits_agent_message_inbound_and_outbox_then_delivers_stored_text`, `undelivered_outbox_backpressure_preserves_inbound_without_running_agent`, `inbound_backpressure_is_bounded_and_worker_recovers_without_losing_the_batch`, `failed_replacement_never_lets_old_worker_deliver_with_uncommitted_new_token`, `deletion_archives_completed_history_purges_pending_work_and_disables_schedules`, `outbox_compaction_removes_old_delivered_but_never_pending_or_failed`, and both literals in `outbox_compaction_caps_only_the_selected_connector`.
@@ -10273,6 +10331,7 @@ pub(crate) async fn prune_once(
 ```
 
 In `hosts/rust-daemon/src/history/outbox.rs`:
+
 - remove the `#[allow(dead_code)]` line above `transactions: Arc<Mutex<()>>,` in `HistoryWorker`;
 - in `HistoryWorker::start`, replace
 
@@ -10282,7 +10341,7 @@ In `hosts/rust-daemon/src/history/outbox.rs`:
             loop {
 ```
 
-  with
+with
 
 ```rust
         let state = Arc::clone(&self.state);
@@ -10293,7 +10352,7 @@ In `hosts/rust-daemon/src/history/outbox.rs`:
             loop {
 ```
 
-  and replace the loop's last statement `let _ = history.flush_once(&state, now_millis()).await;` with:
+and replace the loop's last statement `let _ = history.flush_once(&state, now_millis()).await;` with:
 
 ```rust
                 let _ = history.flush_once(&state, now_millis()).await;
@@ -10318,6 +10377,7 @@ In `hosts/rust-daemon/src/history/outbox.rs`:
 - [ ] **Step 5: Document the hot tail**
 
 In `hosts/rust-daemon/src/routes/mod.rs` (hand-format):
+
 - in the `list_agents_entry` attribute, change the 200 description to `"List agents (AgentSummariesEnvelope with view=summary). messages hold the hot tail: each session's newest 200 messages plus anything from the last 24 hours; page older ones with GET /api/agents/{agent_id}/sessions/{session_id}/messages"`;
 - in the `get_agent_entry` attribute, change `description = "Agent snapshot"` to `description = "Agent snapshot. messages hold the hot tail: each session's newest 200 messages plus anything from the last 24 hours; page older ones with GET /api/agents/{agent_id}/sessions/{session_id}/messages"`.
 
@@ -10340,6 +10400,7 @@ git commit -m "feat(daemon): prune mirrored messages from the control plane's ho
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. The newest-200 hot-tail rank counts visible messages only (silent check-in pairs do not consume the window).
@@ -10350,10 +10411,12 @@ git commit -m "feat(daemon): prune mirrored messages from the control plane's ho
 ### Task 14: SDK sessions client
 
 **Files:**
+
 - Create: `packages/sdk/src/sessions.ts`, `packages/sdk/src/sessions.spec.ts`
 - Modify: `packages/sdk/src/client.ts` (`requestText`, `sessions`), `packages/sdk/src/agents.ts` (`AgentSummary`, `listSummaries`), `packages/sdk/src/agents.spec.ts` (one test), `packages/sdk/src/index.ts` (exports)
 
 **Interfaces:**
+
 - Consumes: the Task 11–12 routes and JSON shapes (camelCase): `GET/POST /api/agents/{id}/sessions`, `GET/PATCH/DELETE /api/agents/{id}/sessions/{sid}`, `GET …/messages`, `GET …/export`, `GET /api/agents?view=summary`.
 - Produces (exported from `@animaOS-SWARM/sdk`): `SessionsClient` with `list(agentId, SessionListOptions?) -> Promise<SessionPage>`, `get(agentId, sessionId, { signal? }?) -> Promise<Session>`, `messages(agentId, sessionId, SessionMessageOptions?) -> Promise<SessionMessagePage>`, `create(agentId, { title? }?) -> Promise<Session>`, `update(agentId, sessionId, SessionUpdateInput) -> Promise<Session>`, `remove(agentId, sessionId) -> Promise<void>`, `exportMarkdown(agentId, sessionId, { signal? }?) -> Promise<string>`; types `Session`, `SessionKind`, `SessionOrigin`, `SessionTitleSource`, `SessionCapabilities`, `SessionSummary`, `SessionContextTrimmed`, `SessionMatch`, `SessionPage`, `SessionListOptions`, `SessionMessage`, `SessionMessageAttachment`, `SessionMessagePage`, `SessionMessageOptions`, `SessionUpdateInput`; `DaemonClient.sessions`; `DaemonClient.requestText(path, init?) -> Promise<string>`; `AgentsClient.listSummaries() -> Promise<AgentSummary[]>` and type `AgentSummary`. Changes are additive.
 
@@ -10440,7 +10503,9 @@ describe('sessions client', () => {
         : Response.json({ session }),
     );
 
-    expect(await sessions.create('agent/a', { title: 'Trip' })).toEqual(session);
+    expect(await sessions.create('agent/a', { title: 'Trip' })).toEqual(
+      session,
+    );
     expect(await sessions.create('agent/a')).toEqual(session);
     expect(
       await sessions.update('agent/a', 'chat:1', {
@@ -10477,15 +10542,22 @@ describe('sessions client', () => {
           }),
     );
 
-    expect(await sessions.exportMarkdown('agent/a', 'chat:1')).toBe('# Plans\n');
-    expect(requests[0].url).toBe('/api/agents/agent%2Fa/sessions/chat%3A1/export');
+    expect(await sessions.exportMarkdown('agent/a', 'chat:1')).toBe(
+      '# Plans\n',
+    );
+    expect(requests[0].url).toBe(
+      '/api/agents/agent%2Fa/sessions/chat%3A1/export',
+    );
     expect(
       (requests[0].init?.headers as Record<string, string>).accept,
     ).toContain('text/markdown');
 
     const failure = sessions.exportMarkdown('agent/a', 'chat:missing');
     await expect(failure).rejects.toBeInstanceOf(DaemonHttpError);
-    await expect(failure).rejects.toMatchObject({ status: 404, message: 'not found' });
+    await expect(failure).rejects.toMatchObject({
+      status: 404,
+      message: 'not found',
+    });
   });
 });
 ```
@@ -10493,17 +10565,17 @@ describe('sessions client', () => {
 Append to the `describe('agent transport', …)` block in `packages/sdk/src/agents.spec.ts`:
 
 ```ts
-  it('lists agent summaries without transcripts', async () => {
-    const summary = {
-      state: { id: 'agent/a b' },
-      messageCount: 3,
-      eventCount: 1,
-      lastTask: null,
-    };
-    const { agents, requests } = transport({ agents: [summary] });
-    expect(await agents.listSummaries()).toEqual([summary]);
-    expect(requests[0].url).toBe('/api/agents?view=summary');
-  });
+it('lists agent summaries without transcripts', async () => {
+  const summary = {
+    state: { id: 'agent/a b' },
+    messageCount: 3,
+    eventCount: 1,
+    lastTask: null,
+  };
+  const { agents, requests } = transport({ agents: [summary] });
+  expect(await agents.listSummaries()).toEqual([summary]);
+  expect(requests[0].url).toBe('/api/agents?view=summary');
+});
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -10527,7 +10599,11 @@ export type SessionOrigin =
   | 'job'
   | 'delegation'
   | 'peer';
-export type SessionTitleSource = 'first_message' | 'generated' | 'owner' | 'system';
+export type SessionTitleSource =
+  | 'first_message'
+  | 'generated'
+  | 'owner'
+  | 'system';
 
 export interface SessionCapabilities {
   send: boolean;
@@ -10725,9 +10801,12 @@ export class SessionsClient {
     sessionId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<string> {
-    return this.client.requestText(`${sessionPath(agentId, sessionId)}/export`, {
-      signal: options.signal,
-    });
+    return this.client.requestText(
+      `${sessionPath(agentId, sessionId)}/export`,
+      {
+        signal: options.signal,
+      },
+    );
   }
 }
 
@@ -10746,6 +10825,7 @@ function withQuery(path: string, search: URLSearchParams): string {
 ```
 
 In `packages/sdk/src/client.ts`:
+
 - add `import { SessionsClient } from './sessions.js';` after `import { SwarmsClient } from './swarms.js';`;
 - add `readonly sessions: SessionsClient;` after `readonly swarms: SwarmsClient;` in `DaemonClient`, and `this.sessions = new SessionsClient(this);` after `this.swarms = new SwarmsClient(this);` in the constructor;
 - add after `requestJson`:
@@ -10791,6 +10871,7 @@ and add to `AgentsClient` after `list()`:
 ```
 
 In `packages/sdk/src/index.ts`:
+
 - add `AgentSummary,` to the `export type { … } from './agents.js';` list after `AgentSnapshot,`;
 - add after the `ConnectorsClient` export line:
 
@@ -10831,6 +10912,7 @@ git commit -m "feat(sdk): add the sessions client and agent summaries"
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. End the task by running `bun x nx run @animaOS-SWARM/sdk:build` so later direct `vitest` runs in apps/web resolve the new sessions client from `packages/sdk/dist`.
@@ -10841,10 +10923,12 @@ git commit -m "feat(sdk): add the sessions client and agent summaries"
 ### Task 15: Web hash routing and session data hooks
 
 **Files:**
+
 - Create: `apps/web/src/lib/hash-route.ts`, `apps/web/src/lib/hash-route.test.ts`, `apps/web/src/lib/session-groups.ts`, `apps/web/src/lib/session-groups.test.ts`, `apps/web/src/test/sessions.ts`, `apps/web/src/hooks/useCompanionSessions.ts`, `apps/web/src/hooks/useCompanionSessions.test.tsx`, `apps/web/src/hooks/useSessionMessages.ts`, `apps/web/src/hooks/useSessionMessages.test.tsx`
 - Modify: `apps/web/src/lib/daemon-api.ts` (session methods, `toChatMessage`), `apps/web/src/lib/daemon-api.test.ts` (two tests)
 
 **Interfaces:**
+
 - Consumes: Task 14's `Session`, `SessionKind`, `SessionMessage`, `SessionListOptions`, `SessionMessageOptions`, `SessionUpdateInput` and `setupClient.sessions` (the SDK client already created in `daemon-api.ts`).
 - Produces:
   - `lib/hash-route.ts`: `HASH_PAGES` (the 11 pages of §15.1), `HashPage`, `HashRoute = { kind: 'home' } | { kind: 'session'; sessionId } | { kind: 'page'; page }`, `parseHashRoute(hash)`, `formatHashRoute(route)`, `sameRoute(a, b)`, `Navigate = (route, { replace? }?) => void`, `useHashRoute(): [HashRoute, Navigate]` (listens to `hashchange` and `popstate`; navigation uses `pushState`/`replaceState`, so it never fires events itself);
@@ -10863,7 +10947,10 @@ Create `apps/web/src/test/sessions.ts`:
 import type { Session } from '@animaOS-SWARM/sdk';
 
 /** A read-write chat of `agent-main` with every derived field. */
-export function sessionFixture(id: string, overrides: Partial<Session> = {}): Session {
+export function sessionFixture(
+  id: string,
+  overrides: Partial<Session> = {},
+): Session {
   return {
     id,
     agentId: 'agent-main',
@@ -11017,7 +11104,10 @@ describe('session groups', () => {
       lastActivityAtMs: NOW.getTime() - 30 * 24 * HOUR,
     });
 
-    const groups = groupSessions([today, helper, orphan, yesterday, week, older], NOW);
+    const groups = groupSessions(
+      [today, helper, orphan, yesterday, week, older],
+      NOW,
+    );
 
     expect(
       groups.map((group) => [
@@ -11040,7 +11130,9 @@ describe('session groups', () => {
       ['Older', [['chat:older', []]]],
     ]);
     expect(
-      groupSessions([today, helper], NOW, false)[0].nodes.map((node) => node.session.id),
+      groupSessions([today, helper], NOW, false)[0].nodes.map(
+        (node) => node.session.id,
+      ),
     ).toEqual(['chat:today', 'room-9']);
   });
 
@@ -11055,7 +11147,9 @@ describe('session groups', () => {
   });
 
   it('names export files like the daemon', () => {
-    expect(exportFileName('Check-in · Check status')).toBe('check-in-check-status.md');
+    expect(exportFileName('Check-in · Check status')).toBe(
+      'check-in-check-status.md',
+    );
     expect(exportFileName('···')).toBe('session.md');
   });
 });
@@ -11138,7 +11232,9 @@ describe('useCompanionSessions', () => {
       poll?.();
     });
 
-    await waitFor(() => expect(result.current.error).toBe('daemon unavailable'));
+    await waitFor(() =>
+      expect(result.current.error).toBe('daemon unavailable'),
+    );
     expect(result.current.sessions).toHaveLength(1);
     expect(list).toHaveBeenCalledTimes(2);
   });
@@ -11219,14 +11315,20 @@ describe('useSessionMessages', () => {
       .mockImplementation(async (_agentId, _sessionId, options = {}) =>
         options.before
           ? { messages: [message('m1', 1), message('m2', 2)], nextBefore: null }
-          : { messages: [message('m3', 3), message('m4', 4)], nextBefore: 'm3' },
+          : {
+              messages: [message('m3', 3), message('m4', 4)],
+              nextBefore: 'm3',
+            },
       );
     const { result } = renderHook(() =>
       useSessionMessages('agent-main', 'chat:1'),
     );
 
     await waitFor(() =>
-      expect(result.current.messages.map((item) => item.id)).toEqual(['m3', 'm4']),
+      expect(result.current.messages.map((item) => item.id)).toEqual([
+        'm3',
+        'm4',
+      ]),
     );
     expect(result.current.hasOlder).toBe(true);
     expect(pages).toHaveBeenCalledWith('agent-main', 'chat:1', { limit: 50 });
@@ -11255,7 +11357,8 @@ describe('useSessionMessages', () => {
       nextBefore: null,
     }));
     const { result, rerender } = renderHook(
-      ({ refreshKey }) => useSessionMessages('agent-main', 'chat:1', refreshKey),
+      ({ refreshKey }) =>
+        useSessionMessages('agent-main', 'chat:1', refreshKey),
       { initialProps: { refreshKey: 0 } },
     );
     const ids = () => result.current.messages.map((item) => item.id);
@@ -11277,7 +11380,9 @@ describe('useSessionMessages', () => {
     const polls = capturePolls();
     const pages = vi
       .spyOn(daemon, 'sessionMessages')
-      .mockRejectedValue(Object.assign(new Error('not found'), { status: 404 }));
+      .mockRejectedValue(
+        Object.assign(new Error('not found'), { status: 404 }),
+      );
     const { result } = renderHook(() =>
       useSessionMessages('agent-main', 'chat:gone'),
     );
@@ -11304,21 +11409,28 @@ Append to `apps/web/src/lib/daemon-api.test.ts` (add `toChatMessage` to the impo
 ```ts
 describe('daemon session requests', () => {
   it('reads and changes sessions through the SDK routes', async () => {
-    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async (input) => {
-      const url = String(input);
-      if (url.endsWith('/export'))
-        return new Response('# Plans\n', {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async (input) => {
+        const url = String(input);
+        if (url.endsWith('/export'))
+          return new Response('# Plans\n', {
+            status: 200,
+            headers: { 'content-type': 'text/markdown' },
+          });
+        const body = url.includes('/messages')
+          ? { messages: [], nextBefore: null }
+          : {
+              sessions: [],
+              nextCursor: null,
+              session: { id: 'chat:1' },
+              deleted: true,
+            };
+        return new Response(JSON.stringify(body), {
           status: 200,
-          headers: { 'content-type': 'text/markdown' },
+          headers: { 'content-type': 'application/json' },
         });
-      const body = url.includes('/messages')
-        ? { messages: [], nextBefore: null }
-        : { sessions: [], nextCursor: null, session: { id: 'chat:1' }, deleted: true };
-      return new Response(JSON.stringify(body), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
       });
-    });
     vi.stubGlobal('fetch', fetchMock);
 
     await daemon.listSessions('agent 1', {
@@ -11328,7 +11440,10 @@ describe('daemon session requests', () => {
     });
     await daemon.createSession('agent 1');
     await daemon.updateSession('agent 1', 'chat:1', { lastReadAtMs: 4 });
-    await daemon.sessionMessages('agent 1', 'chat:1', { before: 'm1', limit: 50 });
+    await daemon.sessionMessages('agent 1', 'chat:1', {
+      before: 'm1',
+      limit: 50,
+    });
     await daemon.deleteSession('agent 1', 'chat:1');
     expect(await daemon.exportSession('agent 1', 'chat:1')).toBe('# Plans\n');
 
@@ -11444,7 +11559,10 @@ export function sameRoute(left: HashRoute, right: HashRoute): boolean {
   return formatHashRoute(left) === formatHashRoute(right);
 }
 
-export type Navigate = (route: HashRoute, options?: { replace?: boolean }) => void;
+export type Navigate = (
+  route: HashRoute,
+  options?: { replace?: boolean },
+) => void;
 
 /** The current hash route; a reload restores it and Back/Forward follow it. */
 export function useHashRoute(): [HashRoute, Navigate] {
@@ -11502,7 +11620,11 @@ export const SESSION_KIND_FILTER_LABELS: Record<SessionKind, string> = {
   helper: 'Helpers',
 };
 
-export type SessionGroupLabel = 'Today' | 'Yesterday' | 'Previous 7 days' | 'Older';
+export type SessionGroupLabel =
+  | 'Today'
+  | 'Yesterday'
+  | 'Previous 7 days'
+  | 'Older';
 
 export interface SessionNode {
   session: Session;
@@ -11534,7 +11656,11 @@ export function presentKinds(sessions: readonly Session[]): SessionKind[] {
 }
 
 function groupLabel(activityMs: number, now: Date): SessionGroupLabel {
-  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const today = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
   if (activityMs >= today) return 'Today';
   if (activityMs >= today - DAY_MS) return 'Yesterday';
   if (activityMs >= today - 7 * DAY_MS) return 'Previous 7 days';
@@ -11551,7 +11677,9 @@ export function groupSessions(
   now: Date = new Date(),
   nestHelpers = true,
 ): SessionGroup[] {
-  const listed = new Map(sessions.map((session) => [sessionKey(session), session]));
+  const listed = new Map(
+    sessions.map((session) => [sessionKey(session), session]),
+  );
   const children = new Map<string, Session[]>();
   const roots: Session[] = [];
   for (const session of sessions) {
@@ -11560,7 +11688,10 @@ export function groupSessions(
       session.kind === 'helper' &&
       session.parentAgentId &&
       session.parentSessionId
-        ? sessionKey({ agentId: session.parentAgentId, id: session.parentSessionId })
+        ? sessionKey({
+            agentId: session.parentAgentId,
+            id: session.parentSessionId,
+          })
         : null;
     const parent = parentKey ? listed.get(parentKey) : undefined;
     if (parentKey && parent && parent.kind !== 'helper') {
@@ -11598,7 +11729,13 @@ export function exportFileName(title: string): string {
 Create `apps/web/src/hooks/useCompanionSessions.ts`:
 
 ```ts
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import type { Session } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
@@ -11692,7 +11829,13 @@ export function useCompanionSessions(
 Create `apps/web/src/hooks/useSessionMessages.ts`:
 
 ```ts
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import type { SessionMessage } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
@@ -11779,7 +11922,8 @@ export function useSessionMessages(
   }, [agentId, sessionId]);
 
   const loadOlder = useCallback(async () => {
-    if (!agentId || !sessionId || !nextBefore || loadingOlderRef.current) return;
+    if (!agentId || !sessionId || !nextBefore || loadingOlderRef.current)
+      return;
     const request = generation.current;
     loadingOlderRef.current = true;
     setLoadingOlder(true);
@@ -11839,6 +11983,7 @@ export function useSessionMessages(
 ```
 
 In `apps/web/src/lib/daemon-api.ts`:
+
 - add `type Session`, `type SessionListOptions`, `type SessionMessage`, `type SessionMessageOptions`, and `type SessionUpdateInput` to the `import { createDaemonClient, … } from '@animaOS-SWARM/sdk';` list;
 - add to the `daemon` object, after `goalJobs`:
 
@@ -11874,7 +12019,8 @@ const CHECKIN_SUFFIX = /\n\n\(This is a scheduled check-in\.[\s\S]*\)\s*$/;
 /** A session-route message as the chat components render it. A check-in
  *  prompt becomes a system line without the scheduler's instructions. */
 export function toChatMessage(message: SessionMessage): ChatMessage {
-  const checkin = message.role === 'user' && message.metadata.kind === 'checkin';
+  const checkin =
+    message.role === 'user' && message.metadata.kind === 'checkin';
   return {
     id: message.id,
     role: checkin ? 'System' : SESSION_ROLES[message.role],
@@ -11900,6 +12046,7 @@ git commit -m "feat(web): add hash routes, session grouping, and session data ho
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Before running web tests directly, make sure the SDK dist is current (`bun x nx run @animaOS-SWARM/sdk:build`), or run them through `bun x nx test @animaOS-SWARM/web`.
@@ -11910,10 +12057,12 @@ git commit -m "feat(web): add hash routes, session grouping, and session data ho
 ### Task 16: Sessions sidebar and session view components
 
 **Files:**
+
 - Create: `apps/web/src/components/sessions/SessionSidebar.tsx`, `apps/web/src/components/sessions/SessionSidebar.test.tsx`, `apps/web/src/components/sessions/SessionView.tsx`, `apps/web/src/components/sessions/SessionView.test.tsx`, `apps/web/src/sessions.css`
 - Modify: `apps/web/src/components/ChatScreen.tsx` (optional `MessageList` and `Composer` props), `apps/web/src/styles.css` (import)
 
 **Interfaces:**
+
 - Consumes: Task 14's `Session`, `SessionKind`; Task 15's `SESSION_KIND_LABELS`, `SESSION_KIND_FILTER_LABELS`, `groupSessions`, `presentKinds`, `sessionKey`, `sessionFixture`.
 - Produces:
   - `MessageList` gains optional `hasOlder`, `loadingOlder`, `onLoadOlder` (a "Load older messages" button, loading on scroll to the top, and a kept reading position when older messages are prepended) and `emptyState` (replaces the welcome screen); `Composer` gains optional `label` (the textarea's name and placeholder, default `Message <agent>`). Existing callers are unchanged.
@@ -11926,7 +12075,13 @@ git commit -m "feat(web): add hash routes, session grouping, and session data ho
 Create `apps/web/src/components/sessions/SessionSidebar.test.tsx`:
 
 ```tsx
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -12057,11 +12212,16 @@ describe('SessionSidebar', () => {
 
   it('waits for typing to settle before searching', async () => {
     const props = renderSidebar();
-    fireEvent.change(screen.getByRole('searchbox', { name: 'Search sessions' }), {
-      target: { value: 'budget' },
-    });
+    fireEvent.change(
+      screen.getByRole('searchbox', { name: 'Search sessions' }),
+      {
+        target: { value: 'budget' },
+      },
+    );
     expect(props.onQueryChange).not.toHaveBeenCalled();
-    await waitFor(() => expect(props.onQueryChange).toHaveBeenCalledWith('budget'));
+    await waitFor(() =>
+      expect(props.onQueryChange).toHaveBeenCalledWith('budget'),
+    );
   });
 
   it('renames, archives, exports, and deletes after confirming that memories are kept', async () => {
@@ -12071,7 +12231,8 @@ describe('SessionSidebar', () => {
       lastActivityAtMs: NOW.getTime(),
     });
     const props = renderSidebar({ sessions: [plans] });
-    const menu = () => screen.getByRole('button', { name: 'Actions for Plans' });
+    const menu = () =>
+      screen.getByRole('button', { name: 'Actions for Plans' });
 
     await user.click(menu());
     await user.click(screen.getByRole('menuitem', { name: 'Rename' }));
@@ -12107,12 +12268,18 @@ describe('SessionSidebar', () => {
     });
 
     screen.getByRole('button', { name: 'A' }).focus();
-    fireEvent.keyDown(screen.getByRole('button', { name: 'A' }), { key: 'ArrowDown' });
+    fireEvent.keyDown(screen.getByRole('button', { name: 'A' }), {
+      key: 'ArrowDown',
+    });
     expect(screen.getByRole('button', { name: 'B' })).toHaveFocus();
-    fireEvent.keyDown(screen.getByRole('button', { name: 'B' }), { key: 'ArrowUp' });
+    fireEvent.keyDown(screen.getByRole('button', { name: 'B' }), {
+      key: 'ArrowUp',
+    });
     expect(screen.getByRole('button', { name: 'A' })).toHaveFocus();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Show archived' }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Show archived' }),
+    );
     expect(props.onShowArchivedChange).toHaveBeenCalledWith(true);
   });
 });
@@ -12210,8 +12377,12 @@ describe('SessionView', () => {
     });
 
     expect(screen.getByRole('heading', { name: 'Plans' })).toBeVisible();
-    expect(screen.getByText('Chat', { selector: '.session-kind-badge' })).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Load older messages' }));
+    expect(
+      screen.getByText('Chat', { selector: '.session-kind-badge' }),
+    ).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Load older messages' }),
+    );
     expect(props.onLoadOlder).toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: 'Rename' }));
     const title = screen.getByRole('textbox', { name: 'Session title' });
@@ -12244,7 +12415,9 @@ describe('SessionView', () => {
     });
 
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
-    expect(screen.getByRole('note')).toHaveTextContent('Job sessions are read-only');
+    expect(screen.getByRole('note')).toHaveTextContent(
+      'Job sessions are read-only',
+    );
     expect(screen.getByText('No messages yet.')).toBeVisible();
     await userEvent.click(screen.getByRole('button', { name: 'Open Work' }));
     expect(props.onOpenWork).toHaveBeenCalled();
@@ -12256,7 +12429,9 @@ describe('SessionView', () => {
       missing: true,
     });
     expect(screen.getByText('This session was deleted.')).toBeVisible();
-    await userEvent.click(screen.getByRole('button', { name: 'Start a new chat' }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Start a new chat' }),
+    );
     expect(props.onNewChat).toHaveBeenCalled();
   });
 });
@@ -12270,6 +12445,7 @@ Expected: FAIL — `Failed to resolve import "./SessionSidebar"` and `"./Session
 - [ ] **Step 3: Extend the chat components**
 
 In `apps/web/src/components/ChatScreen.tsx`:
+
 - change the React import to `import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';`;
 - replace the whole `export const MessageList = memo(function MessageList({ … }) { … });` with:
 
@@ -12374,7 +12550,9 @@ export const MessageList = memo(function MessageList({
                   onClick={onLoadOlder}
                   disabled={loadingOlder}
                 >
-                  {loadingOlder ? 'Loading older messages…' : 'Load older messages'}
+                  {loadingOlder
+                    ? 'Loading older messages…'
+                    : 'Load older messages'}
                 </button>
               )}
               {agent.messages.map((m) => (
@@ -12416,7 +12594,7 @@ export const MessageList = memo(function MessageList({
   label?: string;
 ```
 
-  add `const inputLabel = label ?? \`Message ${agentName}\`;` after `const taRef = useRef<HTMLTextAreaElement>(null);`, and change `aria-label={\`Message ${agentName}\`}` to `aria-label={inputLabel}` and `placeholder={\`Message ${agentName}…\`}` to `placeholder={\`${inputLabel}…\`}`.
+add `const inputLabel = label ?? \`Message ${agentName}\`;` after `const taRef = useRef<HTMLTextAreaElement>(null);`, and change `aria-label={\`Message ${agentName}\`}` to `aria-label={inputLabel}` and `placeholder={\`Message ${agentName}…\`}` to `placeholder={\`${inputLabel}…\`}`.
 
 (`function Bubble` through `const SUGGESTIONS` is unchanged, so `visual-tokens.test.ts` still finds `bg-panel-2/90` and no accent there.)
 
@@ -12529,9 +12707,13 @@ function SessionRow({
           title={session.preview ?? session.title}
           onClick={() => actions.onOpen(session)}
         >
-          {session.activeRuns > 0 && <span className="session-pulse" aria-hidden />}
+          {session.activeRuns > 0 && (
+            <span className="session-pulse" aria-hidden />
+          )}
           <span className="session-title">{session.title}</span>
-          {session.unread && <span className="session-unread-dot" aria-hidden />}
+          {session.unread && (
+            <span className="session-unread-dot" aria-hidden />
+          )}
         </button>
       )}
       <button
@@ -12548,7 +12730,11 @@ function SessionRow({
         ⋯
       </button>
       {menuOpen && (
-        <div className="session-menu" role="menu" aria-label={`${session.title} actions`}>
+        <div
+          className="session-menu"
+          role="menu"
+          aria-label={`${session.title} actions`}
+        >
           {confirmDelete ? (
             <>
               <p className="px-2 py-1 text-xs text-ink-2">
@@ -12630,7 +12816,9 @@ function SessionRow({
 function moveBetweenRows(event: KeyboardEvent<HTMLDivElement>) {
   if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
   const rows = Array.from(
-    event.currentTarget.querySelectorAll<HTMLButtonElement>('[data-session-row]'),
+    event.currentTarget.querySelectorAll<HTMLButtonElement>(
+      '[data-session-row]',
+    ),
   );
   const index = rows.findIndex((row) => row === document.activeElement);
   if (index === -1) return;
@@ -12918,7 +13106,9 @@ function SessionHeader({
           {session.title}
         </h2>
       )}
-      <span className="session-kind-badge">{SESSION_KIND_LABELS[session.kind]}</span>
+      <span className="session-kind-badge">
+        {SESSION_KIND_LABELS[session.kind]}
+      </span>
       {!editing && session.capabilities.rename && (
         <button
           type="button"
@@ -12929,7 +13119,11 @@ function SessionHeader({
         </button>
       )}
       {session.capabilities.archive && (
-        <button type="button" className={ghostBtnCls} onClick={onToggleArchived}>
+        <button
+          type="button"
+          className={ghostBtnCls}
+          onClick={onToggleArchived}
+        >
           {session.archived ? 'Unarchive' : 'Archive'}
         </button>
       )}
@@ -12962,7 +13156,10 @@ export function SessionView({
   onExport,
   notice = null,
 }: SessionViewProps) {
-  const conversation = useMemo(() => ({ ...agent, messages }), [agent, messages]);
+  const conversation = useMemo(
+    () => ({ ...agent, messages }),
+    [agent, messages],
+  );
   if (missing) {
     return (
       <section
@@ -13282,6 +13479,7 @@ git commit -m "feat(web): add the sessions sidebar and session view components"
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Row and header menus close on Escape and return focus to their trigger. Test.
@@ -13291,12 +13489,14 @@ git commit -m "feat(web): add the sessions sidebar and session view components"
 ### Task 17: Route-driven shell and session-based chat
 
 **Files:**
+
 - Modify: `apps/web/src/components/WorkspaceShell.tsx` (rewrite), `apps/web/src/ViewHarness.tsx` (rewrite), `apps/web/src/lib/daemon-api.ts` (`getSession`)
 - Modify tests: `apps/web/src/components/WorkspaceShell.test.tsx` (rewrite), `apps/web/src/components/CompanionShell.test.tsx` (rewrite), `apps/web/src/ViewHarness.test.tsx` (helpers, 13 tests changed, 3 added)
 - Delete: `apps/web/src/components/ActivityView.tsx`, `apps/web/src/components/CheckinsView.tsx`, `apps/web/src/components/CheckinsView.test.tsx`, `apps/web/src/components/TelegramThread.tsx`, `apps/web/src/components/TelegramThread.test.tsx`
 - Modify e2e fixtures (not run in the M2 gate): `apps/web-e2e/src/companion.spec.ts`, `apps/web-e2e/src/independent-agents.spec.ts`, `apps/web-e2e/src/main-workspace-agent.spec.ts`
 
 **Interfaces:**
+
 - Consumes: Task 15's `useHashRoute`, `HashRoute`, `HashPage`, `Navigate`, `useCompanionSessions`, `useSessionMessages`, `sessionKey`, `exportFileName`, `sessionFixture`, the `daemon` session methods and `toChatMessage`; Task 16's `SessionSidebar`, `SessionView`; existing `createTelegramIdempotencyKey`, `safeIntegrationError`, `daemon.sendConnectorMessage`, `useAgentIntegrations`.
 - Produces:
   - `WorkspaceShell` props `{ mainAgent, agents, connection, route, navigate, conversation, sidebar?, connectors?, workspaceState?, onOpenSettings, onChangeWorkspaceAvatar?, onPickPrompt?, onNewChat? }` (replacing `workspace`, `activity`, and `telegram`); `AVAILABLE_PAGES` (`work`, `files`, `connectors`, `capabilities`), `AvailablePage`, `availablePage(route)`. Desktop sidebar: identity, "New chat", navigation (Work, Files, Connectors, and a collapsible "System" group with Capabilities), the sessions list, status, Settings. Mobile: an "Open sessions" top-bar button opening a "Sessions" drawer, and a bottom dock with Chats, Work, Files, Connectors, Capabilities. Other hash pages (approvals, automations, memory, skills, usage, logs, health) show the conversation until their milestones. "Back to chat" (`Open companion chat`) returns to the last conversation.
@@ -13451,7 +13651,9 @@ describe('WorkspaceShell', () => {
     await userEvent.click(
       screen.getByRole('button', { name: 'Capabilities', exact: true }),
     );
-    expect(await screen.findByText('Tools follow your authority')).toBeVisible();
+    expect(
+      await screen.findByText('Tools follow your authority'),
+    ).toBeVisible();
     expect(
       screen.getByRole('button', { name: 'Capabilities', exact: true }),
     ).toHaveAttribute('aria-current', 'page');
@@ -13516,8 +13718,12 @@ describe('WorkspaceShell', () => {
 
   it('keeps helpers out of the top-level navigation', () => {
     const nova = agent('agent-main', 'Nova', 1);
-    render(<Shell mainAgent={nova} agents={[nova, agent('scout', 'Scout', 2)]} />);
-    expect(screen.queryByRole('button', { name: 'Team' })).not.toBeInTheDocument();
+    render(
+      <Shell mainAgent={nova} agents={[nova, agent('scout', 'Scout', 2)]} />,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Team' }),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: 'Message Scout' }),
     ).not.toBeInTheDocument();
@@ -13531,12 +13737,15 @@ describe('WorkspaceShell', () => {
     });
     expect(navigation).toHaveAttribute('data-placement', 'sidebar');
     expect(navigation).toHaveAttribute('aria-orientation', 'vertical');
-    expect(navigation.closest('aside')?.nextElementSibling?.tagName).toBe('MAIN');
-    await userEvent.click(within(navigation).getByRole('button', { name: 'Work' }));
-    expect(within(navigation).getByRole('button', { name: 'Work' })).toHaveAttribute(
-      'aria-current',
-      'page',
+    expect(navigation.closest('aside')?.nextElementSibling?.tagName).toBe(
+      'MAIN',
     );
+    await userEvent.click(
+      within(navigation).getByRole('button', { name: 'Work' }),
+    );
+    expect(
+      within(navigation).getByRole('button', { name: 'Work' }),
+    ).toHaveAttribute('aria-current', 'page');
     expect(screen.getByText('Workspace canvas')).not.toBeVisible();
     await userEvent.click(
       screen.getByRole('button', { name: 'Open companion chat' }),
@@ -13555,7 +13764,9 @@ describe('WorkspaceShell', () => {
   it('shows the main agent identity in the sidebar presence block', () => {
     render(<Shell connection="offline" />);
     const sidebar = screen.getByRole('complementary');
-    expect(within(sidebar).getByRole('heading', { name: 'Nova' })).toBeVisible();
+    expect(
+      within(sidebar).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
     expect(within(sidebar).getByText('Welcome back')).toBeVisible();
     expect(within(sidebar).getByText('Companion')).toBeVisible();
   });
@@ -13582,8 +13793,13 @@ describe('WorkspaceShell', () => {
         .querySelector('img'),
     ).toHaveAttribute('src', '/api/workspace/avatar?v=0');
     const file = new File(['avatar'], 'avatar.png', { type: 'image/png' });
-    await user.upload(screen.getByLabelText('Workspace avatar image file'), file);
-    await waitFor(() => expect(onChangeWorkspaceAvatar).toHaveBeenCalledWith(file));
+    await user.upload(
+      screen.getByLabelText('Workspace avatar image file'),
+      file,
+    );
+    await waitFor(() =>
+      expect(onChangeWorkspaceAvatar).toHaveBeenCalledWith(file),
+    );
   });
 
   it('shows a compact presence bar on mobile', () => {
@@ -13607,8 +13823,12 @@ describe('WorkspaceShell', () => {
     await user.click(screen.getByRole('button', { name: 'Open sessions' }));
     const drawer = screen.getByRole('dialog', { name: 'Sessions' });
     expect(within(drawer).getByText('Sessions list')).toBeVisible();
-    await user.click(within(drawer).getByRole('button', { name: 'Close sessions' }));
-    expect(screen.queryByRole('dialog', { name: 'Sessions' })).not.toBeInTheDocument();
+    await user.click(
+      within(drawer).getByRole('button', { name: 'Close sessions' }),
+    );
+    expect(
+      screen.queryByRole('dialog', { name: 'Sessions' }),
+    ).not.toBeInTheDocument();
   });
 
   it('shows working helpers as status without introducing another persona', () => {
@@ -13636,7 +13856,9 @@ describe('WorkspaceShell', () => {
 
   it('places mobile navigation after workspace content in DOM and tab order', () => {
     mobile();
-    render(<Shell conversation={<button type="button">Workspace action</button>} />);
+    render(
+      <Shell conversation={<button type="button">Workspace action</button>} />,
+    );
     const content = screen.getByRole('main');
     const navigation = screen.getByRole('navigation', {
       name: 'Workspace navigation',
@@ -13666,7 +13888,9 @@ describe('WorkspaceShell', () => {
     render(<Shell workspaceState={null} />);
     const sidebar = screen.getByRole('complementary');
     expect(within(sidebar).getByText('Welcome back')).toBeVisible();
-    expect(within(sidebar).getByRole('heading', { name: 'Nova' })).toBeVisible();
+    expect(
+      within(sidebar).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
     expect(
       within(sidebar).queryByText('Northwind Research'),
     ).not.toBeInTheDocument();
@@ -13750,7 +13974,10 @@ function Shell({
 
 beforeEach(() => {
   vi.spyOn(daemon, 'agentJobs').mockResolvedValue([]);
-  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({ tasks: [], revision: '1' });
+  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({
+    tasks: [],
+    revision: '1',
+  });
   vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
 });
 
@@ -13762,7 +13989,10 @@ describe('single companion experience', () => {
   it('opens the conversation immediately without swarm management or agent switching', () => {
     render(
       <Shell
-        agents={[companion, { ...companion, id: 'helper', name: 'Research helper' }]}
+        agents={[
+          companion,
+          { ...companion, id: 'helper', name: 'Research helper' },
+        ]}
         conversation={<div>My conversation</div>}
       />,
     );
@@ -13795,7 +14025,9 @@ describe('single companion experience', () => {
       />,
     );
     const input = screen.getByLabelText('Unsaved draft');
-    await userEvent.click(screen.getByRole('button', { name: 'Work', exact: true }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Work', exact: true }),
+    );
     expect(input).not.toBeVisible();
     await userEvent.click(
       screen.getByRole('button', { name: 'Open companion chat' }),
@@ -13805,7 +14037,9 @@ describe('single companion experience', () => {
   });
 
   it('describes disconnection without promising work is still running', () => {
-    render(<Shell connection="offline" conversation={<div>My conversation</div>} />);
+    render(
+      <Shell connection="offline" conversation={<div>My conversation</div>} />,
+    );
     expect(screen.getByText('Offline')).toBeVisible();
     expect(screen.getByText('Cannot reach your companion')).toBeVisible();
   });
@@ -13856,7 +14090,11 @@ const PRIMARY_DESTINATIONS: Destination[] = [
   { page: 'connectors', label: 'Connectors', icon: <GearIcon size={16} /> },
 ];
 const SYSTEM_DESTINATIONS: Destination[] = [
-  { page: 'capabilities', label: 'Capabilities', icon: <SparkIcon size={16} /> },
+  {
+    page: 'capabilities',
+    label: 'Capabilities',
+    icon: <SparkIcon size={16} />,
+  },
 ];
 const DESTINATIONS = [...PRIMARY_DESTINATIONS, ...SYSTEM_DESTINATIONS];
 
@@ -13951,7 +14189,8 @@ function DestinationNavigation({
             <GearIcon size={16} />
             <span>System</span>
           </button>
-          {systemExpanded && SYSTEM_DESTINATIONS.map((item) => destination(item))}
+          {systemExpanded &&
+            SYSTEM_DESTINATIONS.map((item) => destination(item))}
         </>
       ) : (
         SYSTEM_DESTINATIONS.map((item) => destination(item))
@@ -14012,7 +14251,8 @@ export function WorkspaceShell({
   const openConversation = () => navigate(lastConversation);
 
   useEffect(() => {
-    if (route.kind === 'session' || route.kind === 'home') setLastConversation(route);
+    if (route.kind === 'session' || route.kind === 'home')
+      setLastConversation(route);
     setDrawerOpen(false);
   }, [route]);
 
@@ -14220,7 +14460,9 @@ export function WorkspaceShell({
                     type="button"
                     className="studio-tool-button"
                     onClick={() => setFocusMode((value) => !value)}
-                    aria-label={focusMode ? 'Exit focus mode' : 'Enter focus mode'}
+                    aria-label={
+                      focusMode ? 'Exit focus mode' : 'Enter focus mode'
+                    }
                     aria-pressed={focusMode}
                   >
                     {focusMode ? '↙' : '⛶'}
@@ -14342,11 +14584,13 @@ function mockSessionRoutes(): SessionRoutes {
     sessions: [...state.sessions],
     nextCursor: null,
   }));
-  vi.spyOn(daemon, 'getSession').mockImplementation(async (_agentId, sessionId) => {
-    const found = state.sessions.find((item) => item.id === sessionId);
-    if (!found) throw Object.assign(new Error('not found'), { status: 404 });
-    return found;
-  });
+  vi.spyOn(daemon, 'getSession').mockImplementation(
+    async (_agentId, sessionId) => {
+      const found = state.sessions.find((item) => item.id === sessionId);
+      if (!found) throw Object.assign(new Error('not found'), { status: 404 });
+      return found;
+    },
+  );
   vi.spyOn(daemon, 'createSession').mockImplementation(async (agentId) => {
     created += 1;
     const session = sessionFixture(`chat:new-${created}`, { agentId });
@@ -14360,15 +14604,19 @@ function mockSessionRoutes(): SessionRoutes {
         ...state.sessions[index],
         ...patch,
         unread:
-          patch.lastReadAtMs !== undefined ? false : state.sessions[index].unread,
+          patch.lastReadAtMs !== undefined
+            ? false
+            : state.sessions[index].unread,
       };
       state.sessions[index] = updated;
       return updated;
     },
   );
-  vi.spyOn(daemon, 'deleteSession').mockImplementation(async (_agentId, sessionId) => {
-    state.sessions = state.sessions.filter((item) => item.id !== sessionId);
-  });
+  vi.spyOn(daemon, 'deleteSession').mockImplementation(
+    async (_agentId, sessionId) => {
+      state.sessions = state.sessions.filter((item) => item.id !== sessionId);
+    },
+  );
   vi.spyOn(daemon, 'sessionMessages').mockResolvedValue({
     messages: [],
     nextBefore: null,
@@ -14495,7 +14743,11 @@ it('retains a completed reply after opening Work and keeps settings on the compa
 
 it('lists peer requests as read-only helper sessions apart from the owner chat', async () => {
   const user = userEvent.setup();
-  const alpha = withMessage(snapshot('alpha', 'Alpha', 1), 'Owner reply', 'chat:owner');
+  const alpha = withMessage(
+    snapshot('alpha', 'Alpha', 1),
+    'Owner reply',
+    'chat:owner',
+  );
   alpha.messages.push({
     id: 'peer-message',
     agentId: 'alpha',
@@ -14504,7 +14756,11 @@ it('lists peer requests as read-only helper sessions apart from the owner chat',
     content: {
       text: 'Private teammate request',
       metadata: {
-        communication: { kind: 'peer', fromAgentId: 'beta', toAgentId: 'alpha' },
+        communication: {
+          kind: 'peer',
+          fromAgentId: 'beta',
+          toAgentId: 'alpha',
+        },
       },
     },
     createdAtMs: 3,
@@ -14539,288 +14795,290 @@ it('lists peer requests as read-only helper sessions apart from the owner chat',
       'Private teammate request',
     ),
   ).not.toBeInTheDocument();
-  await user.click(await screen.findByRole('button', { name: 'Messages from Beta' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Messages from Beta' }),
+  );
   expect(await screen.findByText('Private teammate request')).toBeVisible();
-  expect(screen.getByRole('note')).toHaveTextContent('Helper sessions are read-only.');
-  expect(screen.queryByPlaceholderText('Message Alpha…')).not.toBeInTheDocument();
+  expect(screen.getByRole('note')).toHaveTextContent(
+    'Helper sessions are read-only.',
+  );
+  expect(
+    screen.queryByPlaceholderText('Message Alpha…'),
+  ).not.toBeInTheDocument();
 });
 ```
 
 Inside `describe('ViewHarness workspace controller', …)`, replace:
 
 ```tsx
-  it('selects the oldest agent by creation time then id for chat, settings, and Main', async () => {
-    const user = userEvent.setup();
-    const alpha = snapshot('agent-a', 'Alpha', 10);
-    const beta = snapshot('agent-b', 'Beta', 10);
-    const later = snapshot('agent-later', 'Later', 20);
-    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-    vi.spyOn(daemon, 'listAgents').mockResolvedValue({
-      agents: [later, beta, alpha],
-    });
-    mockProviders();
-    const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
-      agent: alpha,
-      result: { status: 'success', durationMs: 1, data: { text: 'done' } },
-    });
-
-    render(<ViewHarness />);
-    await openChat();
-
-    expect(
-      await screen.findByRole('heading', { name: 'Say something to Alpha' }),
-    ).toBeVisible();
-    await user.type(screen.getByPlaceholderText('Message Alpha…'), 'Hello');
-    await user.click(screen.getByRole('button', { name: 'Send' }));
-    await waitFor(() =>
-      expect(runAgent).toHaveBeenCalledWith(
-        'agent-a',
-        'Hello',
-        expect.objectContaining({ clientRequestId: expect.any(String) }),
-        'chat:new-1',
-      ),
-    );
-    expect(daemon.createSession).toHaveBeenCalledWith('agent-a');
-
-    expect(screen.getByText('Companion')).toBeVisible();
-    expect(
-      screen.queryByRole('button', { name: 'Message Beta' }),
-    ).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole('button', { name: 'Settings' }));
-    expect(
-      screen.getByRole('heading', { name: 'Agent settings' }),
-    ).toBeVisible();
-    expect(screen.getByDisplayValue('Alpha')).toBeVisible();
+it('selects the oldest agent by creation time then id for chat, settings, and Main', async () => {
+  const user = userEvent.setup();
+  const alpha = snapshot('agent-a', 'Alpha', 10);
+  const beta = snapshot('agent-b', 'Beta', 10);
+  const later = snapshot('agent-later', 'Later', 20);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [later, beta, alpha],
   });
+  mockProviders();
+  const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
+    agent: alpha,
+    result: { status: 'success', durationMs: 1, data: { text: 'done' } },
+  });
+
+  render(<ViewHarness />);
+  await openChat();
+
+  expect(
+    await screen.findByRole('heading', { name: 'Say something to Alpha' }),
+  ).toBeVisible();
+  await user.type(screen.getByPlaceholderText('Message Alpha…'), 'Hello');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() =>
+    expect(runAgent).toHaveBeenCalledWith(
+      'agent-a',
+      'Hello',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'chat:new-1',
+    ),
+  );
+  expect(daemon.createSession).toHaveBeenCalledWith('agent-a');
+
+  expect(screen.getByText('Companion')).toBeVisible();
+  expect(
+    screen.queryByRole('button', { name: 'Message Beta' }),
+  ).not.toBeInTheDocument();
+
+  await user.click(screen.getByRole('button', { name: 'Settings' }));
+  expect(screen.getByRole('heading', { name: 'Agent settings' })).toBeVisible();
+  expect(screen.getByDisplayValue('Alpha')).toBeVisible();
+});
 ```
 
 ```tsx
-  it('promotes the next agent and keeps its controller usable when local cleanup fails after DELETE', async () => {
-    const user = userEvent.setup();
-    const first = snapshot('agent-first', 'First', 1);
-    const next = snapshot('agent-next', 'Next', 2);
-    let current = next;
-    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [next, first] });
-    mockProviders();
-    vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
-    messagesFromSnapshot(() => current);
-    const runAgent = vi
-      .spyOn(daemon, 'runAgent')
-      .mockImplementation(async (_id, _text, _metadata, roomId) => {
-        current = withMessage(next, 'Next is responsive', roomId);
-        return {
-          agent: current,
-          result: {
-            status: 'success',
-            durationMs: 1,
-            data: { text: 'Next is responsive' },
-          },
-        };
-      });
-    const removeItem = vi
-      .spyOn(Storage.prototype, 'removeItem')
-      .mockImplementation(() => {
-        throw new DOMException('Storage access denied', 'SecurityError');
-      });
+it('promotes the next agent and keeps its controller usable when local cleanup fails after DELETE', async () => {
+  const user = userEvent.setup();
+  const first = snapshot('agent-first', 'First', 1);
+  const next = snapshot('agent-next', 'Next', 2);
+  let current = next;
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [next, first] });
+  mockProviders();
+  vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
+  messagesFromSnapshot(() => current);
+  const runAgent = vi
+    .spyOn(daemon, 'runAgent')
+    .mockImplementation(async (_id, _text, _metadata, roomId) => {
+      current = withMessage(next, 'Next is responsive', roomId);
+      return {
+        agent: current,
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Next is responsive' },
+        },
+      };
+    });
+  const removeItem = vi
+    .spyOn(Storage.prototype, 'removeItem')
+    .mockImplementation(() => {
+      throw new DOMException('Storage access denied', 'SecurityError');
+    });
 
-    render(<ViewHarness />);
-    await openChat();
+  render(<ViewHarness />);
+  await openChat();
 
-    await screen.findByRole('heading', { name: 'Say something to First' });
-    await user.click(screen.getByRole('button', { name: 'Settings' }));
-    await user.click(screen.getByRole('button', { name: 'Reset' }));
+  await screen.findByRole('heading', { name: 'Say something to First' });
+  await user.click(screen.getByRole('button', { name: 'Settings' }));
+  await user.click(screen.getByRole('button', { name: 'Reset' }));
 
-    expect(
-      await screen.findByRole('heading', { name: 'Say something to Next' }),
-    ).toBeVisible();
-    expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-first');
-    await user.type(screen.getByPlaceholderText('Message Next…'), 'Continue');
-    await user.click(screen.getByRole('button', { name: 'Send' }));
-    await waitFor(() =>
-      expect(runAgent).toHaveBeenCalledWith(
-        'agent-next',
-        'Continue',
-        expect.objectContaining({ clientRequestId: expect.any(String) }),
-        'chat:new-1',
-      ),
-    );
-    expect(await screen.findByText('Next is responsive')).toBeVisible();
-  });
+  expect(
+    await screen.findByRole('heading', { name: 'Say something to Next' }),
+  ).toBeVisible();
+  expect(removeItem).toHaveBeenCalledWith('animaos.checkins.agent-first');
+  await user.type(screen.getByPlaceholderText('Message Next…'), 'Continue');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() =>
+    expect(runAgent).toHaveBeenCalledWith(
+      'agent-next',
+      'Continue',
+      expect.objectContaining({ clientRequestId: expect.any(String) }),
+      'chat:new-1',
+    ),
+  );
+  expect(await screen.findByText('Next is responsive')).toBeVisible();
+});
 ```
 
 ```tsx
-  it('patches main identity, provider, model, system, and deliberate access while preserving its messages', async () => {
-    const user = userEvent.setup();
-    const nova = snapshot('agent-main', 'Nova', 1);
-    nova.messages = [
-      {
-        id: 'message-1',
-        agentId: 'agent-main',
-        roomId: 'room-1',
-        role: 'assistant',
-        content: { text: 'Existing conversation' },
-        createdAtMs: 2,
-      },
-    ];
-    nova.messageCount = 1;
-    const updated = structuredClone(nova);
-    updated.state.name = 'Nova Prime';
-    updated.state.config.name = 'Nova Prime';
-    updated.state.config.provider = 'anthropic';
-    updated.state.config.model = 'claude-sonnet-4-6';
-    updated.state.config.system = 'Be concise';
-    updated.state.config.tools = toolNamesForProfile('operate').map((tool) => ({
-      name: tool,
-      description: tool,
-      parameters: {},
-    }));
-    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
-    mockProviders();
-    routes.sessions.push(sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }));
-    messagesFromSnapshot(() => nova);
-    const updateAgent = vi
-      .spyOn(daemon, 'updateAgent')
-      .mockResolvedValue({ agent: updated });
-    window.history.replaceState(null, '', '/#/s/room-1');
+it('patches main identity, provider, model, system, and deliberate access while preserving its messages', async () => {
+  const user = userEvent.setup();
+  const nova = snapshot('agent-main', 'Nova', 1);
+  nova.messages = [
+    {
+      id: 'message-1',
+      agentId: 'agent-main',
+      roomId: 'room-1',
+      role: 'assistant',
+      content: { text: 'Existing conversation' },
+      createdAtMs: 2,
+    },
+  ];
+  nova.messageCount = 1;
+  const updated = structuredClone(nova);
+  updated.state.name = 'Nova Prime';
+  updated.state.config.name = 'Nova Prime';
+  updated.state.config.provider = 'anthropic';
+  updated.state.config.model = 'claude-sonnet-4-6';
+  updated.state.config.system = 'Be concise';
+  updated.state.config.tools = toolNamesForProfile('operate').map((tool) => ({
+    name: tool,
+    description: tool,
+    parameters: {},
+  }));
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }),
+  );
+  messagesFromSnapshot(() => nova);
+  const updateAgent = vi
+    .spyOn(daemon, 'updateAgent')
+    .mockResolvedValue({ agent: updated });
+  window.history.replaceState(null, '', '/#/s/room-1');
 
-    render(<ViewHarness />);
+  render(<ViewHarness />);
 
-    await screen.findByText('Existing conversation');
-    await user.click(screen.getByRole('button', { name: 'Settings' }));
-    const name = screen.getByDisplayValue('Nova');
-    await user.clear(name);
-    await user.type(name, 'Nova Prime');
-    const provider = screen.getByRole('combobox', { name: 'Provider' });
-    const model = screen.getByRole('combobox', { name: 'Model' });
-    await user.selectOptions(provider, 'anthropic');
-    await user.selectOptions(model, 'claude-sonnet-4-6');
-    const system = screen.getByPlaceholderText(
-      'Leave empty for the daemon default.',
-    );
-    await user.clear(system);
-    await user.type(system, 'Be concise');
-    await user.click(screen.getByRole('radio', { name: /^Operate/ }));
-    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+  await screen.findByText('Existing conversation');
+  await user.click(screen.getByRole('button', { name: 'Settings' }));
+  const name = screen.getByDisplayValue('Nova');
+  await user.clear(name);
+  await user.type(name, 'Nova Prime');
+  const provider = screen.getByRole('combobox', { name: 'Provider' });
+  const model = screen.getByRole('combobox', { name: 'Model' });
+  await user.selectOptions(provider, 'anthropic');
+  await user.selectOptions(model, 'claude-sonnet-4-6');
+  const system = screen.getByPlaceholderText(
+    'Leave empty for the daemon default.',
+  );
+  await user.clear(system);
+  await user.type(system, 'Be concise');
+  await user.click(screen.getByRole('radio', { name: /^Operate/ }));
+  await user.click(screen.getByRole('button', { name: 'Save changes' }));
 
-    expect(updateAgent).toHaveBeenCalledWith('agent-main', {
+  expect(updateAgent).toHaveBeenCalledWith('agent-main', {
+    name: 'Nova Prime',
+    provider: 'anthropic',
+    model: 'claude-sonnet-4-6',
+    system: 'Be concise',
+    tools: toolNamesForProfile('operate'),
+  });
+  expect(await screen.findByDisplayValue('Nova Prime')).toBeVisible();
+  expect(screen.getByText('Existing conversation')).toBeVisible();
+  expect(
+    screen.getByRole('heading', {
       name: 'Nova Prime',
-      provider: 'anthropic',
-      model: 'claude-sonnet-4-6',
-      system: 'Be concise',
-      tools: toolNamesForProfile('operate'),
-    });
-    expect(await screen.findByDisplayValue('Nova Prime')).toBeVisible();
-    expect(screen.getByText('Existing conversation')).toBeVisible();
-    expect(
-      screen.getByRole('heading', {
-        name: 'Nova Prime',
-        exact: true,
-        hidden: true,
-      }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole('heading', { name: 'Agent settings' }),
-    ).toBeVisible();
-  });
+      exact: true,
+      hidden: true,
+    }),
+  ).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Agent settings' })).toBeVisible();
+});
 ```
 
 ```tsx
-  it('keeps the full draft mounted through a deferred save failure, then allows close', async () => {
-    const user = userEvent.setup();
-    const nova = snapshot('agent-main', 'Nova', 1);
-    nova.messages = [
-      {
-        id: 'message-1',
-        agentId: 'agent-main',
-        roomId: 'room-1',
-        role: 'assistant',
-        content: { text: 'Existing conversation' },
-        createdAtMs: 2,
-      },
-    ];
-    nova.messageCount = 1;
-    const update = deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
-    vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-    vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
-    mockProviders();
-    routes.sessions.push(sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }));
-    messagesFromSnapshot(() => nova);
-    const updateAgent = vi
-      .spyOn(daemon, 'updateAgent')
-      .mockReturnValue(update.promise);
-    window.history.replaceState(null, '', '/#/s/room-1');
+it('keeps the full draft mounted through a deferred save failure, then allows close', async () => {
+  const user = userEvent.setup();
+  const nova = snapshot('agent-main', 'Nova', 1);
+  nova.messages = [
+    {
+      id: 'message-1',
+      agentId: 'agent-main',
+      roomId: 'room-1',
+      role: 'assistant',
+      content: { text: 'Existing conversation' },
+      createdAtMs: 2,
+    },
+  ];
+  nova.messageCount = 1;
+  const update = deferred<Awaited<ReturnType<typeof daemon.updateAgent>>>();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-1', { title: 'Earlier chat', origin: 'api' }),
+  );
+  messagesFromSnapshot(() => nova);
+  const updateAgent = vi
+    .spyOn(daemon, 'updateAgent')
+    .mockReturnValue(update.promise);
+  window.history.replaceState(null, '', '/#/s/room-1');
 
-    render(<ViewHarness />);
+  render(<ViewHarness />);
 
-    await screen.findByText('Existing conversation');
-    expect(screen.getByText('Welcome back')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Settings' }));
-    const name = screen.getByDisplayValue('Nova');
-    await user.clear(name);
-    await user.type(name, 'Unsaved Nova');
-    const provider = screen.getByRole('combobox', { name: 'Provider' });
-    const model = screen.getByRole('combobox', { name: 'Model' });
-    await user.selectOptions(provider, 'anthropic');
-    await user.selectOptions(model, '__custom__');
-    await user.type(
-      screen.getByPlaceholderText('model id, e.g. llama3.1'),
-      'anthropic/unsaved-model',
-    );
-    const system = screen.getByPlaceholderText(
-      'Leave empty for the daemon default.',
-    );
-    await user.clear(system);
-    await user.type(system, 'Unsaved system');
-    await user.click(screen.getByRole('radio', { name: /^Operate/ }));
-    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+  await screen.findByText('Existing conversation');
+  expect(screen.getByText('Welcome back')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Settings' }));
+  const name = screen.getByDisplayValue('Nova');
+  await user.clear(name);
+  await user.type(name, 'Unsaved Nova');
+  const provider = screen.getByRole('combobox', { name: 'Provider' });
+  const model = screen.getByRole('combobox', { name: 'Model' });
+  await user.selectOptions(provider, 'anthropic');
+  await user.selectOptions(model, '__custom__');
+  await user.type(
+    screen.getByPlaceholderText('model id, e.g. llama3.1'),
+    'anthropic/unsaved-model',
+  );
+  const system = screen.getByPlaceholderText(
+    'Leave empty for the daemon default.',
+  );
+  await user.clear(system);
+  await user.type(system, 'Unsaved system');
+  await user.click(screen.getByRole('radio', { name: /^Operate/ }));
+  await user.click(screen.getByRole('button', { name: 'Save changes' }));
 
-    expect(updateAgent).toHaveBeenCalledWith('agent-main', {
-      name: 'Unsaved Nova',
-      provider: 'anthropic',
-      model: 'anthropic/unsaved-model',
-      system: 'Unsaved system',
-      tools: toolNamesForProfile('operate'),
-    });
-    const close = screen.getByRole('button', { name: 'Close settings' });
-    expect(close).toBeDisabled();
-    expect(close).toHaveAccessibleDescription(/saving/i);
-    await user.click(close);
-    fireEvent.click(screen.getByTestId('settings-backdrop'));
-    await user.keyboard('{Escape}');
-    expect(
-      screen.getByRole('heading', { name: 'Agent settings' }),
-    ).toBeVisible();
-
-    await act(async () => {
-      update.reject(new Error('PATCH denied'));
-      await update.promise.catch(() => undefined);
-    });
-
-    const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent('PATCH denied');
-    expect(alert).toHaveAttribute('aria-live', 'assertive');
-    expect(alert).toHaveFocus();
-    expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
-    expect(screen.getByRole('combobox', { name: 'Provider' })).toHaveValue(
-      'anthropic',
-    );
-    expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
-    expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
-    expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
-    expect(screen.getByText('Welcome back')).toBeVisible();
-    expect(screen.getByText('Existing conversation')).toBeVisible();
-    expect(
-      screen.getByRole('heading', { name: 'Agent settings' }),
-    ).toBeVisible();
-    expect(close).toBeEnabled();
-    await user.click(close);
-    expect(
-      screen.queryByRole('heading', { name: 'Agent settings' }),
-    ).not.toBeInTheDocument();
+  expect(updateAgent).toHaveBeenCalledWith('agent-main', {
+    name: 'Unsaved Nova',
+    provider: 'anthropic',
+    model: 'anthropic/unsaved-model',
+    system: 'Unsaved system',
+    tools: toolNamesForProfile('operate'),
   });
+  const close = screen.getByRole('button', { name: 'Close settings' });
+  expect(close).toBeDisabled();
+  expect(close).toHaveAccessibleDescription(/saving/i);
+  await user.click(close);
+  fireEvent.click(screen.getByTestId('settings-backdrop'));
+  await user.keyboard('{Escape}');
+  expect(screen.getByRole('heading', { name: 'Agent settings' })).toBeVisible();
+
+  await act(async () => {
+    update.reject(new Error('PATCH denied'));
+    await update.promise.catch(() => undefined);
+  });
+
+  const alert = await screen.findByRole('alert');
+  expect(alert).toHaveTextContent('PATCH denied');
+  expect(alert).toHaveAttribute('aria-live', 'assertive');
+  expect(alert).toHaveFocus();
+  expect(screen.getByDisplayValue('Unsaved Nova')).toBeVisible();
+  expect(screen.getByRole('combobox', { name: 'Provider' })).toHaveValue(
+    'anthropic',
+  );
+  expect(screen.getByDisplayValue('anthropic/unsaved-model')).toBeVisible();
+  expect(screen.getByDisplayValue('Unsaved system')).toBeVisible();
+  expect(screen.getByRole('radio', { name: /^Operate/ })).toBeChecked();
+  expect(screen.getByText('Welcome back')).toBeVisible();
+  expect(screen.getByText('Existing conversation')).toBeVisible();
+  expect(screen.getByRole('heading', { name: 'Agent settings' })).toBeVisible();
+  expect(close).toBeEnabled();
+  await user.click(close);
+  expect(
+    screen.queryByRole('heading', { name: 'Agent settings' }),
+  ).not.toBeInTheDocument();
+});
 ```
 
 In `keeps the last-known shell after a late poll failure`, change `fireEvent.click(screen.getByRole('button', { name: 'Chat', exact: true }));` to `fireEvent.click(screen.getByRole('button', { name: 'New chat' }));`.
@@ -14828,14 +15086,14 @@ In `keeps the last-known shell after a late poll failure`, change `fireEvent.cli
 In `does not re-add the previous main when its pending run resolves after poll replacement`, replace the `expect(daemon.runAgent).toHaveBeenCalledWith(…, 'direct:agent-a');` statement with:
 
 ```ts
-    await waitFor(() =>
-      expect(daemon.runAgent).toHaveBeenCalledWith(
-        'agent-a',
-        'Alpha work',
-        expect.objectContaining({ clientRequestId: expect.any(String) }),
-        'chat:new-1',
-      ),
-    );
+await waitFor(() =>
+  expect(daemon.runAgent).toHaveBeenCalledWith(
+    'agent-a',
+    'Alpha work',
+    expect.objectContaining({ clientRequestId: expect.any(String) }),
+    'chat:new-1',
+  ),
+);
 ```
 
 After the `describe` block, replace `reconciles a timed-out send with its saved request ID without offering a duplicate retry` and `keeps a timed-out running request locked until polling confirms its completion` with:
@@ -14948,7 +15206,11 @@ it('keeps a timed-out running request locked until the daemon confirms its compl
 ```tsx
 it('opens an existing session from the sidebar, marks it read, and sends in its room', async () => {
   const user = userEvent.setup();
-  let current = withMessage(snapshot('agent-main', 'Nova', 1), 'Earlier answer', 'room-7');
+  let current = withMessage(
+    snapshot('agent-main', 'Nova', 1),
+    'Earlier answer',
+    'room-7',
+  );
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
     agents: [current],
@@ -14987,7 +15249,11 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
       );
       return {
         agent: current,
-        result: { status: 'success', durationMs: 1, data: { text: 'Saturday works' } },
+        result: {
+          status: 'success',
+          durationMs: 1,
+          data: { text: 'Saturday works' },
+        },
       };
     });
   render(<ViewHarness />);
@@ -15001,7 +15267,10 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
       lastReadAtMs: 2,
     }),
   );
-  await user.type(screen.getByPlaceholderText('Message Nova…'), 'Does Saturday work?');
+  await user.type(
+    screen.getByPlaceholderText('Message Nova…'),
+    'Does Saturday work?',
+  );
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
   expect(run).toHaveBeenCalledWith(
@@ -15055,7 +15324,10 @@ it('replies to a Telegram session through its connector', async () => {
   window.history.replaceState(null, '', '/#/s/telegram%3Atg-1');
   render(<ViewHarness />);
 
-  await user.type(await screen.findByPlaceholderText('Reply on Telegram…'), 'On my way');
+  await user.type(
+    await screen.findByPlaceholderText('Reply on Telegram…'),
+    'On my way',
+  );
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
   expect(reply).toHaveBeenCalledWith(
@@ -15075,12 +15347,17 @@ it('returns to a new chat when the open session is deleted from the sidebar', as
   });
   mockProviders();
   routes.sessions.push(
-    sessionFixture('chat:old', { title: 'Old plan', lastActivityAtMs: Date.now() }),
+    sessionFixture('chat:old', {
+      title: 'Old plan',
+      lastActivityAtMs: Date.now(),
+    }),
   );
   window.history.replaceState(null, '', '/#/s/chat%3Aold');
   render(<ViewHarness />);
 
-  await user.click(await screen.findByRole('button', { name: 'Actions for Old plan' }));
+  await user.click(
+    await screen.findByRole('button', { name: 'Actions for Old plan' }),
+  );
   await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
   await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
 
@@ -15317,7 +15594,9 @@ export function ViewHarness() {
   }, [agentId, routeSessionId, sessionListed]);
   const activeSession =
     listedSession ??
-    (fetchedSession && fetchedSession.id === routeSessionId ? fetchedSession : null);
+    (fetchedSession && fetchedSession.id === routeSessionId
+      ? fetchedSession
+      : null);
   const [messagesRefresh, setMessagesRefresh] = useState(0);
   const history = useSessionMessages(
     routeSessionId ? (activeSession?.agentId ?? agentId) : null,
@@ -15734,7 +16013,9 @@ export function ViewHarness() {
     } catch (caught) {
       if (availableAgentIdsRef.current.has(targetId)) {
         const timedOut =
-          caught instanceof Error && 'status' in caught && caught.status === 408;
+          caught instanceof Error &&
+          'status' in caught &&
+          caught.status === 408;
         uncertainSendsRef.current.set(clientRequestId, {
           agentId: targetId,
           key,
@@ -15899,7 +16180,8 @@ export function ViewHarness() {
       setSessionActionError(null);
       sessions.remove(session);
       if (routeSessionId === session.id) {
-        if (route.kind === 'page') lastConversationRef.current = { kind: 'home' };
+        if (route.kind === 'page')
+          lastConversationRef.current = { kind: 'home' };
         else navigate({ kind: 'home' }, { replace: true });
       }
     } catch (caught) {
@@ -16014,10 +16296,13 @@ export function ViewHarness() {
       onNewChat={newChat}
       onOpenWork={() => navigate({ kind: 'page', page: 'work' })}
       onRename={(title) =>
-        activeSession ? renameSession(activeSession, title) : Promise.resolve(false)
+        activeSession
+          ? renameSession(activeSession, title)
+          : Promise.resolve(false)
       }
       onToggleArchived={() => {
-        if (activeSession) void archiveSession(activeSession, !activeSession.archived);
+        if (activeSession)
+          void archiveSession(activeSession, !activeSession.archived);
       }}
       onExport={() => {
         if (activeSession) void exportSession(activeSession);
@@ -16091,17 +16376,44 @@ Expected: no output.
 - [ ] **Step 5: Update the e2e fixtures (they run with M10's gate, not this one)**
 
 In `apps/web-e2e/src/companion.spec.ts`:
+
 - add after `let sent = 0;`:
 
 ```ts
-  const chatSession = {
-    id: 'chat:e2e', agentId: 'companion', roomId: 'chat:e2e', kind: 'chat', origin: 'web',
-    title: 'Help me plan my day', titleSource: 'first_message', createdAtMs: 2, lastActivityAtMs: 3,
-    lastReadAtMs: null, archived: false, parentSessionId: null, parentRunId: null, parentAgentId: null,
-    summary: null, contextTrimmed: null, messageCount: 0, preview: null, activeRuns: 0, pendingApprovals: 0,
-    unread: false, capabilities: { send: true, steer: true, stop: true, rename: true, archive: true, delete: true, compact: true, export: true },
-  };
-  let created = false;
+const chatSession = {
+  id: 'chat:e2e',
+  agentId: 'companion',
+  roomId: 'chat:e2e',
+  kind: 'chat',
+  origin: 'web',
+  title: 'Help me plan my day',
+  titleSource: 'first_message',
+  createdAtMs: 2,
+  lastActivityAtMs: 3,
+  lastReadAtMs: null,
+  archived: false,
+  parentSessionId: null,
+  parentRunId: null,
+  parentAgentId: null,
+  summary: null,
+  contextTrimmed: null,
+  messageCount: 0,
+  preview: null,
+  activeRuns: 0,
+  pendingApprovals: 0,
+  unread: false,
+  capabilities: {
+    send: true,
+    steer: true,
+    stop: true,
+    rename: true,
+    archive: true,
+    delete: true,
+    compact: true,
+    export: true,
+  },
+};
+let created = false;
 ```
 
 - insert before `else if (path.endsWith('/run')) {`:
@@ -16119,73 +16431,160 @@ In `apps/web-e2e/src/companion.spec.ts`:
 - in the viewport test, replace `await page.getByRole('button', { name: 'Activity', exact: true }).click();` with `await page.getByRole('button', { name: 'Work', exact: true }).click();` and `await page.getByRole('button', { name: 'Chat', exact: true }).click();` with `await page.getByRole('button', { name: 'Open companion chat' }).click();`.
 
 In `apps/web-e2e/src/independent-agents.spec.ts`:
+
 - add before `await page.route('**/api/**', …)`:
 
 ```ts
-    const managerChat = {
-      id: 'chat:e2e', agentId: 'manager', roomId: 'chat:e2e', kind: 'chat', origin: 'web',
-      title: 'Companion draft stays here', titleSource: 'first_message', createdAtMs: 10, lastActivityAtMs: 12,
-      lastReadAtMs: null, archived: false, parentSessionId: null, parentRunId: null, parentAgentId: null,
-      summary: null, contextTrimmed: null, messageCount: 0, preview: null, activeRuns: 0, pendingApprovals: 0,
-      unread: false, capabilities: { send: true, steer: true, stop: true, rename: true, archive: true, delete: true, compact: true, export: true },
-    };
-    let managerChatCreated = false;
+const managerChat = {
+  id: 'chat:e2e',
+  agentId: 'manager',
+  roomId: 'chat:e2e',
+  kind: 'chat',
+  origin: 'web',
+  title: 'Companion draft stays here',
+  titleSource: 'first_message',
+  createdAtMs: 10,
+  lastActivityAtMs: 12,
+  lastReadAtMs: null,
+  archived: false,
+  parentSessionId: null,
+  parentRunId: null,
+  parentAgentId: null,
+  summary: null,
+  contextTrimmed: null,
+  messageCount: 0,
+  preview: null,
+  activeRuns: 0,
+  pendingApprovals: 0,
+  unread: false,
+  capabilities: {
+    send: true,
+    steer: true,
+    stop: true,
+    rename: true,
+    archive: true,
+    delete: true,
+    compact: true,
+    export: true,
+  },
+};
+let managerChatCreated = false;
 ```
 
 - insert directly after `if (path === '/agents') return json(route, { agents });`:
 
 ```ts
-      if (path === '/agents/manager/sessions') {
-        if (request.method() === 'POST') {
-          managerChatCreated = true;
-          return json(route, { session: managerChat });
-        }
-        return json(route, { sessions: managerChatCreated ? [managerChat] : [], nextCursor: null });
-      }
-      const sessionMessages = path.match(/^\/agents\/manager\/sessions\/([^/]+)\/messages$/);
-      if (sessionMessages)
-        return json(route, {
-          messages: manager.messages
-            .filter((message) => message.roomId === decodeURIComponent(sessionMessages[1]))
-            .map((message) => ({ id: message.id, role: message.role, text: message.content.text, attachments: [], metadata: message.content.metadata ?? {}, createdAtMs: message.createdAtMs })),
-          nextBefore: null,
-        });
-      if (/^\/agents\/manager\/sessions\/[^/]+$/.test(path)) return json(route, { session: managerChat });
+if (path === '/agents/manager/sessions') {
+  if (request.method() === 'POST') {
+    managerChatCreated = true;
+    return json(route, { session: managerChat });
+  }
+  return json(route, {
+    sessions: managerChatCreated ? [managerChat] : [],
+    nextCursor: null,
+  });
+}
+const sessionMessages = path.match(
+  /^\/agents\/manager\/sessions\/([^/]+)\/messages$/,
+);
+if (sessionMessages)
+  return json(route, {
+    messages: manager.messages
+      .filter(
+        (message) => message.roomId === decodeURIComponent(sessionMessages[1]),
+      )
+      .map((message) => ({
+        id: message.id,
+        role: message.role,
+        text: message.content.text,
+        attachments: [],
+        metadata: message.content.metadata ?? {},
+        createdAtMs: message.createdAtMs,
+      })),
+    nextBefore: null,
+  });
+if (/^\/agents\/manager\/sessions\/[^/]+$/.test(path))
+  return json(route, { session: managerChat });
 ```
 
 - replace `await page.getByRole('button', { name: 'Activity', exact: true }).click();` with `await page.getByRole('button', { name: 'Work', exact: true }).click();` and `await page.getByRole('button', { name: 'Chat', exact: true }).click();` with `await page.getByRole('button', { name: 'Open companion chat' }).click();`;
 - in the `expect(runs).toEqual([…])` block, change `roomId: 'direct:manager'` to `roomId: 'chat:e2e'`.
 
 In `apps/web-e2e/src/main-workspace-agent.spec.ts`:
+
 - insert in `installApiFixture` before `if (path.includes('/connectors')) {`:
 
 ```ts
-    const sessionsMatch = path.match(/^\/agents\/([^/]+)\/sessions(?:\/([^/]+)(\/messages)?)?$/);
-    if (sessionsMatch) {
-      const owner = state.agents.find((agent) => agent.state.id === sessionsMatch[1]);
-      const rooms = [...new Set((owner?.messages ?? []).map((message) => message.roomId))];
-      const session = (roomId: string) => ({
-        id: roomId, agentId: sessionsMatch[1], roomId, kind: 'chat', origin: 'web', title: 'Earlier chat',
-        titleSource: 'first_message', createdAtMs: 1, lastActivityAtMs: 2, lastReadAtMs: 2, archived: false,
-        parentSessionId: null, parentRunId: null, parentAgentId: null, summary: null, contextTrimmed: null,
-        messageCount: 1, preview: null, activeRuns: 0, pendingApprovals: 0, unread: false,
-        capabilities: { send: true, steer: true, stop: true, rename: true, archive: true, delete: true, compact: true, export: true },
-      });
-      const sessionId = sessionsMatch[2] ? decodeURIComponent(sessionsMatch[2]) : null;
-      if (sessionId && sessionsMatch[3]) {
-        await fulfillJson(route, {
-          messages: (owner?.messages ?? [])
-            .filter((message) => message.roomId === sessionId)
-            .map((message) => ({ id: message.id, role: message.role, text: message.content.text, attachments: [], metadata: message.content.metadata ?? {}, createdAtMs: message.createdAtMs })),
-          nextBefore: null,
-        });
-      } else if (sessionId) {
-        await fulfillJson(route, { session: session(sessionId) });
-      } else {
-        await fulfillJson(route, { sessions: rooms.map(session), nextCursor: null });
-      }
-      return;
-    }
+const sessionsMatch = path.match(
+  /^\/agents\/([^/]+)\/sessions(?:\/([^/]+)(\/messages)?)?$/,
+);
+if (sessionsMatch) {
+  const owner = state.agents.find(
+    (agent) => agent.state.id === sessionsMatch[1],
+  );
+  const rooms = [
+    ...new Set((owner?.messages ?? []).map((message) => message.roomId)),
+  ];
+  const session = (roomId: string) => ({
+    id: roomId,
+    agentId: sessionsMatch[1],
+    roomId,
+    kind: 'chat',
+    origin: 'web',
+    title: 'Earlier chat',
+    titleSource: 'first_message',
+    createdAtMs: 1,
+    lastActivityAtMs: 2,
+    lastReadAtMs: 2,
+    archived: false,
+    parentSessionId: null,
+    parentRunId: null,
+    parentAgentId: null,
+    summary: null,
+    contextTrimmed: null,
+    messageCount: 1,
+    preview: null,
+    activeRuns: 0,
+    pendingApprovals: 0,
+    unread: false,
+    capabilities: {
+      send: true,
+      steer: true,
+      stop: true,
+      rename: true,
+      archive: true,
+      delete: true,
+      compact: true,
+      export: true,
+    },
+  });
+  const sessionId = sessionsMatch[2]
+    ? decodeURIComponent(sessionsMatch[2])
+    : null;
+  if (sessionId && sessionsMatch[3]) {
+    await fulfillJson(route, {
+      messages: (owner?.messages ?? [])
+        .filter((message) => message.roomId === sessionId)
+        .map((message) => ({
+          id: message.id,
+          role: message.role,
+          text: message.content.text,
+          attachments: [],
+          metadata: message.content.metadata ?? {},
+          createdAtMs: message.createdAtMs,
+        })),
+      nextBefore: null,
+    });
+  } else if (sessionId) {
+    await fulfillJson(route, { session: session(sessionId) });
+  } else {
+    await fulfillJson(route, {
+      sessions: rooms.map(session),
+      nextCursor: null,
+    });
+  }
+  return;
+}
 ```
 
 - in `failed settings save preserves draft, conversation and original identity`, change `await page.goto('/');` to `await page.goto('/#/s/direct%3Amain');`;
@@ -16207,6 +16606,7 @@ git commit -m "feat(web): route the console by session with a sessions sidebar a
 ```
 
 ---
+
 #### Controller rulings from the pre-flight audit (binding)
 
 1. Resolve uncertain or timed-out sends from the open session (its `activeRuns` or a re-fetched session plus the session's messages), not agent-wide status, and keep polling while the session has active runs. Tests: a check-in running in another session does not lock an unrelated timed-out send; a send still queued for its room is not declared unconfirmed.
@@ -16224,6 +16624,7 @@ git commit -m "feat(web): route the console by session with a sessions sidebar a
 ### Task 18: M2 verification
 
 **Files:**
+
 - Modify: `docs/superpowers/plans/2026-09-23-companion-console.md` (status table)
 
 - [ ] **Step 1: Check the removed paths and the new contracts**
@@ -16243,6 +16644,7 @@ Expected: every listed literal either contains `parent` (check each hit) or is a
 - [ ] **Step 2: Run the milestone gate**
 
 Run: `df -h /System/Volumes/Data`
+
 - With at least 12 GB available: run `bun x nx run rust-daemon:test --skipNxCache` (it also runs `core-rust:test`). Expected: PASS.
 - Otherwise run the fallback in the shared `target/`: `CARGO_INCREMENTAL=0 cargo test -p anima-core --lib`, `CARGO_INCREMENTAL=0 cargo test -p anima-daemon --lib`, `CARGO_INCREMENTAL=0 cargo test -p anima-core --tests`, then `CARGO_INCREMENTAL=0 cargo test -p anima-daemon --tests`. Expected: PASS. The fallback does not satisfy AGENTS.md's completion rule; record that the Nx gate is pending disk space.
 
@@ -16276,12 +16678,14 @@ git commit -m "docs: mark the M2 sessions milestone complete"
 ## Notes for the controller
 
 **Names and shape (code over plan).**
+
 - The master plan's `HistoryOutbox::enqueue(..)` is `HistoryService` (`enqueue_committed`, `enqueue_session_deletion`, the mirrored-id set, `flush_once`) plus a `HistoryWorker` for the loop. `SessionRecord`, `SessionKind`, `DaemonState::sessions`, and `derive_sessions_for_legacy_rooms(..)` keep their master-plan names.
 - The master plan lists T2.7 (shell) before T2.8 (view). Here the components come first (Task 16) and the shell and harness switch together (Task 17), because the shell's props change and `ViewHarness` must switch in the same commit to keep the tree green.
 - Postgres history tables are prefixed `history_` (SQLite uses the spec's names); the generated `tsvector` column needs Postgres 12+. All six tables exist, but M2 writes only messages and runs; usage (M8), approvals (M4), schedule runs (M6), and attachments (M9) arrive with their milestones.
 - Unversioned JSON snapshots load as version 1, so they get the pre-upgrade backup too. The JSON backup is the file's exact bytes; Postgres uses the `control_plane.backup.<version>` row.
 
 **Spec vs. code decisions.**
+
 - Legacy room ids that fail the session-id pattern map to `legacy-room:<32 hex>` and keep `roomId` (F17). `RunChangeSet::session_id` still holds the room id because reply detection compares it with `Message::room_id`; only ledger records and history rows carry the mapped id.
 - `TOOL_GRANTS` is empty in M2 (none of §13.3's tools exist yet); the helper and the once-only bookkeeping are in place, and the applied set is recorded on a fresh start too, so later agents never get retroactive grants. Agents with `tools: None` and helpers are skipped; grants do not rewrite `anima.yaml`.
 - Session fields not stored in M2: `usage` totals (M8) and `sessionAllowances` (M4). `summary` and `contextTrimmed` exist but stay null until M3; `pendingApprovals` is always 0.
@@ -16293,6 +16697,7 @@ git commit -m "docs: mark the M2 sessions milestone complete"
 - Runs from the blocking route are `source: api`, so they count as the owner's own turns for read state (the route cannot tell the web from the CLI in M2). Every generated API/CLI room becomes a chat session with `origin: api`.
 
 **Behavior changes to accept or schedule.**
+
 - The bootstrap still polls full agents every 5 s; the switch to `view=summary` every 30 s belongs with M3's stream (§15.5). Tool and system messages keep today's pills until M3's tool cards.
 - After pruning, `GET /api/agents` and `list_connector_messages` show only the hot tail, and `owner_send_replay` finds an owner-send retry only while its turn is hot (≥ 24 h).
 - Removing `ActivityView` removes the in-chat check-in form; schedules stay manageable in Work › Schedules until M6's Automations page. The desktop sidebar has no "Chat" destination (New chat plus the sessions list replace it); the mobile dock says "Chats".
@@ -16301,6 +16706,7 @@ git commit -m "docs: mark the M2 sessions milestone complete"
 - A run's model context is its room's hot messages, so after pruning a long chat no longer sends turns older than its newest 200 and the last 24 hours (M3's context budget, spec §5, replaces this). Stable `schedule:<id>` rooms give each check-in its earlier check-ins as context, where per-tick rooms had none; frequent check-ins therefore send more tokens until pruning or M3's budget bounds them.
 
 **Risks.**
+
 - A history store that cannot be opened fails startup; read failures degrade views to the hot tail (a `before` cursor only the store can resolve, and export, return 503).
 - `messageCount` adds unmirrored hot messages to the store's count; right after a restart, before the first reconcile, it can double count (display only).
 - Search matches word prefixes in SQLite and Postgres but substrings in the memory store and the hot tail.

@@ -143,7 +143,9 @@ describe('WorkspaceShell', () => {
     await userEvent.click(
       screen.getByRole('button', { name: 'Capabilities', exact: true }),
     );
-    expect(await screen.findByText('Tools follow your authority')).toBeVisible();
+    expect(
+      await screen.findByText('Tools follow your authority'),
+    ).toBeVisible();
     expect(
       screen.getByRole('button', { name: 'Capabilities', exact: true }),
     ).toHaveAttribute('aria-current', 'page');
@@ -208,8 +210,12 @@ describe('WorkspaceShell', () => {
 
   it('keeps helpers out of the top-level navigation', () => {
     const nova = agent('agent-main', 'Nova', 1);
-    render(<Shell mainAgent={nova} agents={[nova, agent('scout', 'Scout', 2)]} />);
-    expect(screen.queryByRole('button', { name: 'Team' })).not.toBeInTheDocument();
+    render(
+      <Shell mainAgent={nova} agents={[nova, agent('scout', 'Scout', 2)]} />,
+    );
+    expect(
+      screen.queryByRole('button', { name: 'Team' }),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole('button', { name: 'Message Scout' }),
     ).not.toBeInTheDocument();
@@ -223,12 +229,15 @@ describe('WorkspaceShell', () => {
     });
     expect(navigation).toHaveAttribute('data-placement', 'sidebar');
     expect(navigation).toHaveAttribute('aria-orientation', 'vertical');
-    expect(navigation.closest('aside')?.nextElementSibling?.tagName).toBe('MAIN');
-    await userEvent.click(within(navigation).getByRole('button', { name: 'Work' }));
-    expect(within(navigation).getByRole('button', { name: 'Work' })).toHaveAttribute(
-      'aria-current',
-      'page',
+    expect(navigation.closest('aside')?.nextElementSibling?.tagName).toBe(
+      'MAIN',
     );
+    await userEvent.click(
+      within(navigation).getByRole('button', { name: 'Work' }),
+    );
+    expect(
+      within(navigation).getByRole('button', { name: 'Work' }),
+    ).toHaveAttribute('aria-current', 'page');
     expect(screen.getByText('Workspace canvas')).not.toBeVisible();
     await userEvent.click(
       screen.getByRole('button', { name: 'Open companion chat' }),
@@ -247,7 +256,9 @@ describe('WorkspaceShell', () => {
   it('shows the main agent identity in the sidebar presence block', () => {
     render(<Shell connection="offline" />);
     const sidebar = screen.getByRole('complementary');
-    expect(within(sidebar).getByRole('heading', { name: 'Nova' })).toBeVisible();
+    expect(
+      within(sidebar).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
     expect(within(sidebar).getByText('Welcome back')).toBeVisible();
     expect(within(sidebar).getByText('Companion')).toBeVisible();
   });
@@ -274,8 +285,13 @@ describe('WorkspaceShell', () => {
         .querySelector('img'),
     ).toHaveAttribute('src', '/api/workspace/avatar?v=0');
     const file = new File(['avatar'], 'avatar.png', { type: 'image/png' });
-    await user.upload(screen.getByLabelText('Workspace avatar image file'), file);
-    await waitFor(() => expect(onChangeWorkspaceAvatar).toHaveBeenCalledWith(file));
+    await user.upload(
+      screen.getByLabelText('Workspace avatar image file'),
+      file,
+    );
+    await waitFor(() =>
+      expect(onChangeWorkspaceAvatar).toHaveBeenCalledWith(file),
+    );
   });
 
   it('shows a compact presence bar on mobile', () => {
@@ -299,8 +315,12 @@ describe('WorkspaceShell', () => {
     await user.click(screen.getByRole('button', { name: 'Open sessions' }));
     const drawer = screen.getByRole('dialog', { name: 'Sessions' });
     expect(within(drawer).getByText('Sessions list')).toBeVisible();
-    await user.click(within(drawer).getByRole('button', { name: 'Close sessions' }));
-    expect(screen.queryByRole('dialog', { name: 'Sessions' })).not.toBeInTheDocument();
+    await user.click(
+      within(drawer).getByRole('button', { name: 'Close sessions' }),
+    );
+    expect(
+      screen.queryByRole('dialog', { name: 'Sessions' }),
+    ).not.toBeInTheDocument();
   });
 
   it('moves focus into the sessions drawer, keeps it there, and closes on Escape', async () => {
@@ -398,7 +418,9 @@ describe('WorkspaceShell', () => {
     await user.click(
       within(reopened).getByRole('button', { name: 'Actions for Trip ideas' }),
     );
-    await user.click(within(reopened).getByRole('menuitem', { name: 'Rename' }));
+    await user.click(
+      within(reopened).getByRole('menuitem', { name: 'Rename' }),
+    );
     expect(
       within(reopened).getByRole('textbox', { name: 'Rename Trip ideas' }),
     ).toHaveFocus();
@@ -455,7 +477,9 @@ describe('WorkspaceShell', () => {
     await user.click(within(drawer).getByRole('menuitem', { name: 'Archive' }));
 
     await waitFor(() =>
-      expect(within(drawer).getByRole('button', { name: 'Budget' })).toHaveFocus(),
+      expect(
+        within(drawer).getByRole('button', { name: 'Budget' }),
+      ).toHaveFocus(),
     );
     expect(
       within(drawer).queryByRole('button', { name: 'Trip ideas' }),
@@ -487,7 +511,9 @@ describe('WorkspaceShell', () => {
 
   it('places mobile navigation after workspace content in DOM and tab order', () => {
     mobile();
-    render(<Shell conversation={<button type="button">Workspace action</button>} />);
+    render(
+      <Shell conversation={<button type="button">Workspace action</button>} />,
+    );
     const content = screen.getByRole('main');
     const navigation = screen.getByRole('navigation', {
       name: 'Workspace navigation',
@@ -517,7 +543,9 @@ describe('WorkspaceShell', () => {
     render(<Shell workspaceState={null} />);
     const sidebar = screen.getByRole('complementary');
     expect(within(sidebar).getByText('Welcome back')).toBeVisible();
-    expect(within(sidebar).getByRole('heading', { name: 'Nova' })).toBeVisible();
+    expect(
+      within(sidebar).getByRole('heading', { name: 'Nova' }),
+    ).toBeVisible();
     expect(
       within(sidebar).queryByText('Northwind Research'),
     ).not.toBeInTheDocument();

@@ -34,7 +34,10 @@ describe('session groups', () => {
       lastActivityAtMs: NOW.getTime() - 30 * 24 * HOUR,
     });
 
-    const groups = groupSessions([today, helper, orphan, yesterday, week, older], NOW);
+    const groups = groupSessions(
+      [today, helper, orphan, yesterday, week, older],
+      NOW,
+    );
 
     expect(
       groups.map((group) => [
@@ -57,7 +60,9 @@ describe('session groups', () => {
       ['Older', [['chat:older', []]]],
     ]);
     expect(
-      groupSessions([today, helper], NOW, false)[0].nodes.map((node) => node.session.id),
+      groupSessions([today, helper], NOW, false)[0].nodes.map(
+        (node) => node.session.id,
+      ),
     ).toEqual(['chat:today', 'room-9']);
   });
 
@@ -104,7 +109,9 @@ describe('session groups', () => {
   });
 
   it('names export files like the daemon', () => {
-    expect(exportFileName('Check-in · Check status')).toBe('check-in-check-status.md');
+    expect(exportFileName('Check-in · Check status')).toBe(
+      'check-in-check-status.md',
+    );
     expect(exportFileName('···')).toBe('session.md');
   });
 });

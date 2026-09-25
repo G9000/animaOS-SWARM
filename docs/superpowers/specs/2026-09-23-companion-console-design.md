@@ -20,15 +20,15 @@ Non-goals (explicitly excluded):
 
 ## 2. Architecture overview
 
-| Layer | Adds |
-|---|---|
-| `anima-core` | Streaming step frames through a non-recorded run observer; cooperative cancellation; steering inbox; pure context-window selection; event-log cap; optional attachment MIME type; optional cached/reasoning token fields |
-| `anima-model-adapters` | Model table (context window, max output, vision, prices); cost estimation; Google and native Ollama streaming; OpenAI-compatible stream usage; Google thinking-token accounting; cached-token parsing; image rendering for every provider |
-| `anima-memory` | Update a memory with re-indexing; delete an entity with cascade; citation cleanup on forget |
-| `rust-daemon` | Parallel-safe run coordinator; run ledger; async runs, queue, steer, stop for every source; sessions; history store with outbox; agent event stream; approvals; skills; automations (cron, one-time, active hours, run now, history, tools); memory edit routes; usage and pricing; logs ring buffer and stream; status aggregate; attachments; titles; compaction; conversation search; migration; security fixes |
-| `packages/sdk` | Typed clients for every new route and the event stream |
-| `apps/web` | New shell and hash routing; sessions sidebar; live session view; composer with attachments, voice, slash commands, queue/steer/stop; Approvals, Automations, Memory, Skills, Usage, Logs, and Health pages |
-| `deploy/vps` | History store path, backup and upgrade documentation |
+| Layer                  | Adds                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `anima-core`           | Streaming step frames through a non-recorded run observer; cooperative cancellation; steering inbox; pure context-window selection; event-log cap; optional attachment MIME type; optional cached/reasoning token fields                                                                                                                                                                                           |
+| `anima-model-adapters` | Model table (context window, max output, vision, prices); cost estimation; Google and native Ollama streaming; OpenAI-compatible stream usage; Google thinking-token accounting; cached-token parsing; image rendering for every provider                                                                                                                                                                          |
+| `anima-memory`         | Update a memory with re-indexing; delete an entity with cascade; citation cleanup on forget                                                                                                                                                                                                                                                                                                                        |
+| `rust-daemon`          | Parallel-safe run coordinator; run ledger; async runs, queue, steer, stop for every source; sessions; history store with outbox; agent event stream; approvals; skills; automations (cron, one-time, active hours, run now, history, tools); memory edit routes; usage and pricing; logs ring buffer and stream; status aggregate; attachments; titles; compaction; conversation search; migration; security fixes |
+| `packages/sdk`         | Typed clients for every new route and the event stream                                                                                                                                                                                                                                                                                                                                                             |
+| `apps/web`             | New shell and hash routing; sessions sidebar; live session view; composer with attachments, voice, slash commands, queue/steer/stop; Approvals, Automations, Memory, Skills, Usage, Logs, and Health pages                                                                                                                                                                                                         |
+| `deploy/vps`           | History store path, backup and upgrade documentation                                                                                                                                                                                                                                                                                                                                                               |
 
 Daemon storage splits into two tiers:
 
@@ -41,13 +41,13 @@ Daemon storage splits into two tiers:
 
 A session is one conversation room of one agent plus a session record. The session id equals the room id, is opaque to clients, matches `^[A-Za-z0-9._:-]{1,200}$`, and is percent-encoded in URL paths.
 
-| Kind | Room ids | Origin |
-|---|---|---|
-| `chat` | `chat:<uuid-v4>` for new web chats; legacy `direct:<agentId>`; generated `room-*` rooms on the companion from API/CLI runs without a room | `web` or `api` |
-| `telegram` | `telegram:<connectorId>` | `telegram` |
-| `checkin` | `schedule:<scheduleId>` | `schedule` |
-| `job` | `job:<jobId>` | `job` |
-| `helper` | Rooms on helper or specialist agents created by delegation, and `peer:<a>:<b>` rooms | `delegation` or `peer` |
+| Kind       | Room ids                                                                                                                                  | Origin                 |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `chat`     | `chat:<uuid-v4>` for new web chats; legacy `direct:<agentId>`; generated `room-*` rooms on the companion from API/CLI runs without a room | `web` or `api`         |
+| `telegram` | `telegram:<connectorId>`                                                                                                                  | `telegram`             |
+| `checkin`  | `schedule:<scheduleId>`                                                                                                                   | `schedule`             |
+| `job`      | `job:<jobId>`                                                                                                                             | `job`                  |
+| `helper`   | Rooms on helper or specialist agents created by delegation, and `peer:<a>:<b>` rooms                                                      | `delegation` or `peer` |
 
 `POST /api/agents/{id}/run` rejects `roomId` values starting with `telegram:`, `schedule:`, `job:`, or `peer:` (today only `peer:` is blocked).
 
@@ -67,13 +67,13 @@ Derived per response, never stored: `messageCount`, `preview` (last visible mess
 
 Capabilities by kind:
 
-| Kind | Send | Steer | Stop | Rename | Archive | Delete | Compact | Export |
-|---|---|---|---|---|---|---|---|---|
-| chat | yes | yes | yes | yes | yes | yes | yes | yes |
-| telegram | yes, as a Telegram owner turn | no | yes | yes | yes | no | yes | yes |
-| checkin | yes, a reply in the thread | yes | yes | yes | yes | only after its schedule is deleted | yes | yes |
-| job | no; links to Work › Runs | no | yes | no | yes | no | no | yes |
-| helper | no | no | yes | no | yes | no | no | yes |
+| Kind     | Send                          | Steer | Stop | Rename | Archive | Delete                             | Compact | Export |
+| -------- | ----------------------------- | ----- | ---- | ------ | ------- | ---------------------------------- | ------- | ------ |
+| chat     | yes                           | yes   | yes  | yes    | yes     | yes                                | yes     | yes    |
+| telegram | yes, as a Telegram owner turn | no    | yes  | yes    | yes     | no                                 | yes     | yes    |
+| checkin  | yes, a reply in the thread    | yes   | yes  | yes    | yes     | only after its schedule is deleted | yes     | yes    |
+| job      | no; links to Work › Runs      | no    | yes  | no     | yes     | no                                 | no      | yes    |
+| helper   | no                            | no    | yes  | no     | yes     | no                                 | no      | yes    |
 
 ### 3.3 Routes
 
@@ -417,21 +417,21 @@ Nothing is deleted. Rolling back to an older daemon requires restoring the backu
 
 ## 16. Limits and errors
 
-| Item | Limit or behavior |
-|---|---|
-| Queued runs per agent | 8; 429 beyond |
-| Concurrent runs per agent | 3 (configurable); helpers 1 |
-| Run input | 32 KiB text, 10 attachments |
-| Stream | 1,024-event buffer, 16 subscribers, 50 ms / 512-byte delta flush, 2 KiB previews |
-| Context | 60% of the model window, 32k fallback, 4 images |
-| Hot tail | newest 200 visible per session (whole turns), 24 hours, mirrored, unreferenced |
-| Event log | 500 per agent |
-| Approvals | 30-minute timeout, 15 for Telegram-started runs |
-| Skills | 32 KiB body, 50 in the index, 10 pending drafts per agent |
-| Automations | 20 per agent, 5-minute minimum for agent-created, 50 history entries shown |
-| Logs | 2,000 lines of up to 4 KiB |
-| Uploads | 10 MiB images, 1 MiB text, 25 MiB documents |
-| Titles | 2–6 words, 60 characters |
+| Item                      | Limit or behavior                                                                |
+| ------------------------- | -------------------------------------------------------------------------------- |
+| Queued runs per agent     | 8; 429 beyond                                                                    |
+| Concurrent runs per agent | 3 (configurable); helpers 1                                                      |
+| Run input                 | 32 KiB text, 10 attachments                                                      |
+| Stream                    | 1,024-event buffer, 16 subscribers, 50 ms / 512-byte delta flush, 2 KiB previews |
+| Context                   | 60% of the model window, 32k fallback, 4 images                                  |
+| Hot tail                  | newest 200 visible per session (whole turns), 24 hours, mirrored, unreferenced   |
+| Event log                 | 500 per agent                                                                    |
+| Approvals                 | 30-minute timeout, 15 for Telegram-started runs                                  |
+| Skills                    | 32 KiB body, 50 in the index, 10 pending drafts per agent                        |
+| Automations               | 20 per agent, 5-minute minimum for agent-created, 50 history entries shown       |
+| Logs                      | 2,000 lines of up to 4 KiB                                                       |
+| Uploads                   | 10 MiB images, 1 MiB text, 25 MiB documents                                      |
+| Titles                    | 2–6 words, 60 characters                                                         |
 
 Errors surface specifically: stream drops show "Reconnecting…" and resume from the snapshot; 429 queue full; 503 save failure returns the text to the composer; a session deleted elsewhere returns the view to the list; deleting a running session is 409; history store failures keep data in the control plane, raise metrics, and appear in readiness; skills scan and title failures never fail a run.
 

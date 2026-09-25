@@ -45,7 +45,10 @@ function Shell({
 
 beforeEach(() => {
   vi.spyOn(daemon, 'agentJobs').mockResolvedValue([]);
-  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({ tasks: [], revision: '1' });
+  vi.spyOn(daemon, 'agentTasks').mockResolvedValue({
+    tasks: [],
+    revision: '1',
+  });
   vi.spyOn(daemon, 'listSchedules').mockResolvedValue({ schedules: [] });
 });
 
@@ -57,7 +60,10 @@ describe('single companion experience', () => {
   it('opens the conversation immediately without swarm management or agent switching', () => {
     render(
       <Shell
-        agents={[companion, { ...companion, id: 'helper', name: 'Research helper' }]}
+        agents={[
+          companion,
+          { ...companion, id: 'helper', name: 'Research helper' },
+        ]}
         conversation={<div>My conversation</div>}
       />,
     );
@@ -90,7 +96,9 @@ describe('single companion experience', () => {
       />,
     );
     const input = screen.getByLabelText('Unsaved draft');
-    await userEvent.click(screen.getByRole('button', { name: 'Work', exact: true }));
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Work', exact: true }),
+    );
     expect(input).not.toBeVisible();
     await userEvent.click(
       screen.getByRole('button', { name: 'Open companion chat' }),
@@ -100,7 +108,9 @@ describe('single companion experience', () => {
   });
 
   it('describes disconnection without promising work is still running', () => {
-    render(<Shell connection="offline" conversation={<div>My conversation</div>} />);
+    render(
+      <Shell connection="offline" conversation={<div>My conversation</div>} />,
+    );
     expect(screen.getByText('Offline')).toBeVisible();
     expect(screen.getByText('Cannot reach your companion')).toBeVisible();
   });

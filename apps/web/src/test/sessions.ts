@@ -1,7 +1,10 @@
 import type { Session } from '@animaOS-SWARM/sdk';
 
 /** A read-write chat of `agent-main` with every derived field. */
-export function sessionFixture(id: string, overrides: Partial<Session> = {}): Session {
+export function sessionFixture(
+  id: string,
+  overrides: Partial<Session> = {},
+): Session {
   return {
     id,
     agentId: 'agent-main',

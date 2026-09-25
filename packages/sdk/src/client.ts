@@ -143,7 +143,10 @@ export class DaemonClient {
       },
     });
     if (!response.ok) {
-      throw new DaemonHttpError(response.status, await readResponseBody(response));
+      throw new DaemonHttpError(
+        response.status,
+        await readResponseBody(response),
+      );
     }
     return response.text();
   }

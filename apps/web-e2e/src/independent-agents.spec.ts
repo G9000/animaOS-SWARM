@@ -86,11 +86,37 @@ for (const viewport of [
     const taskLists = new Map<string, AgentTasks>();
     const schedules = new Map<string, AgentSchedule[]>();
     const managerChat = {
-      id: 'chat:e2e', agentId: 'manager', roomId: 'chat:e2e', kind: 'chat', origin: 'web',
-      title: 'Companion draft stays here', titleSource: 'first_message', createdAtMs: 10, lastActivityAtMs: 12,
-      lastReadAtMs: null, archived: false, parentSessionId: null, parentRunId: null, parentAgentId: null,
-      summary: null, contextTrimmed: null, messageCount: 0, preview: null, activeRuns: 0, pendingApprovals: 0,
-      unread: false, capabilities: { send: true, steer: true, stop: true, rename: true, archive: true, delete: true, compact: true, export: true },
+      id: 'chat:e2e',
+      agentId: 'manager',
+      roomId: 'chat:e2e',
+      kind: 'chat',
+      origin: 'web',
+      title: 'Companion draft stays here',
+      titleSource: 'first_message',
+      createdAtMs: 10,
+      lastActivityAtMs: 12,
+      lastReadAtMs: null,
+      archived: false,
+      parentSessionId: null,
+      parentRunId: null,
+      parentAgentId: null,
+      summary: null,
+      contextTrimmed: null,
+      messageCount: 0,
+      preview: null,
+      activeRuns: 0,
+      pendingApprovals: 0,
+      unread: false,
+      capabilities: {
+        send: true,
+        steer: true,
+        stop: true,
+        rename: true,
+        archive: true,
+        delete: true,
+        compact: true,
+        export: true,
+      },
     };
     let managerChatCreated = false;
     await page.route('**/api/**', async (route) => {
@@ -103,17 +129,33 @@ for (const viewport of [
           managerChatCreated = true;
           return json(route, { session: managerChat });
         }
-        return json(route, { sessions: managerChatCreated ? [managerChat] : [], nextCursor: null });
+        return json(route, {
+          sessions: managerChatCreated ? [managerChat] : [],
+          nextCursor: null,
+        });
       }
-      const sessionMessages = path.match(/^\/agents\/manager\/sessions\/([^/]+)\/messages$/);
+      const sessionMessages = path.match(
+        /^\/agents\/manager\/sessions\/([^/]+)\/messages$/,
+      );
       if (sessionMessages)
         return json(route, {
           messages: manager.messages
-            .filter((message) => message.roomId === decodeURIComponent(sessionMessages[1]))
-            .map((message) => ({ id: message.id, role: message.role, text: message.content.text, attachments: [], metadata: message.content.metadata ?? {}, createdAtMs: message.createdAtMs })),
+            .filter(
+              (message) =>
+                message.roomId === decodeURIComponent(sessionMessages[1]),
+            )
+            .map((message) => ({
+              id: message.id,
+              role: message.role,
+              text: message.content.text,
+              attachments: [],
+              metadata: message.content.metadata ?? {},
+              createdAtMs: message.createdAtMs,
+            })),
           nextBefore: null,
         });
-      if (/^\/agents\/manager\/sessions\/[^/]+$/.test(path)) return json(route, { session: managerChat });
+      if (/^\/agents\/manager\/sessions\/[^/]+$/.test(path))
+        return json(route, { session: managerChat });
       const avatarMatch = path.match(/^\/agents\/([^/]+)\/avatar$/);
       if (avatarMatch) {
         if (request.method() === 'PUT') {

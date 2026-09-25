@@ -144,7 +144,9 @@ function SessionHeader({
           {session.title}
         </h2>
       )}
-      <span className="session-kind-badge">{SESSION_KIND_LABELS[session.kind]}</span>
+      <span className="session-kind-badge">
+        {SESSION_KIND_LABELS[session.kind]}
+      </span>
       {!editing && session.capabilities.rename && (
         <button
           type="button"
@@ -155,7 +157,11 @@ function SessionHeader({
         </button>
       )}
       {session.capabilities.archive && (
-        <button type="button" className={ghostBtnCls} onClick={onToggleArchived}>
+        <button
+          type="button"
+          className={ghostBtnCls}
+          onClick={onToggleArchived}
+        >
           {session.archived ? 'Unarchive' : 'Archive'}
         </button>
       )}
@@ -188,7 +194,10 @@ export function SessionView({
   onExport,
   notice = null,
 }: SessionViewProps) {
-  const conversation = useMemo(() => ({ ...agent, messages }), [agent, messages]);
+  const conversation = useMemo(
+    () => ({ ...agent, messages }),
+    [agent, messages],
+  );
   if (missing) {
     return (
       <section

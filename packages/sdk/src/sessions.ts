@@ -10,7 +10,11 @@ export type SessionOrigin =
   | 'job'
   | 'delegation'
   | 'peer';
-export type SessionTitleSource = 'first_message' | 'generated' | 'owner' | 'system';
+export type SessionTitleSource =
+  | 'first_message'
+  | 'generated'
+  | 'owner'
+  | 'system';
 
 export interface SessionCapabilities {
   send: boolean;
@@ -257,9 +261,12 @@ export class SessionsClient {
     sessionId: string,
     options: { signal?: AbortSignal } = {},
   ): Promise<string> {
-    return this.client.requestText(`${sessionPath(agentId, sessionId)}/export`, {
-      signal: options.signal,
-    });
+    return this.client.requestText(
+      `${sessionPath(agentId, sessionId)}/export`,
+      {
+        signal: options.signal,
+      },
+    );
   }
 }
 

@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import type { SessionMessage } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
@@ -147,7 +153,8 @@ export function useSessionMessages(
   }, [agentId, sessionId]);
 
   const loadOlder = useCallback(async () => {
-    if (!agentId || !sessionId || !nextBefore || loadingOlderRef.current) return;
+    if (!agentId || !sessionId || !nextBefore || loadingOlderRef.current)
+      return;
     const request = generation.current;
     // The id of the message this fetch's `before` cursor was derived from —
     // i.e. the list's current head. A gap-triggered `refresh` can replace
