@@ -249,7 +249,9 @@ export class SessionsClient {
     );
   }
 
-  /** The visible transcript as Markdown, including archived history. */
+  /** The full transcript as Markdown, including archived history and
+   *  messages kept only in the history store, with silent check-in turns
+   *  marked rather than hidden. */
   async exportMarkdown(
     agentId: string,
     sessionId: string,

@@ -478,7 +478,7 @@ export function AgentProactiveView({
         <p className="text-xs text-ink-3">
           {target === 'telegram'
             ? 'Updates are sent to your approved Telegram chat.'
-            : 'Updates appear in this agent’s workspace conversation.'}{' '}
+            : 'Updates appear in this agent’s own check-in session.'}{' '}
           Scheduled runs use your configured model.
         </p>
         <button
