@@ -596,6 +596,7 @@ pub(crate) struct SessionCommitUndo {
     last_read_at_ms: Option<u64>,
     title: String,
     title_source: TitleSource,
+    archived: bool,
 }
 
 /// Session records keyed by `(agentId, id)` (spec §3.2).
@@ -719,8 +720,11 @@ impl SessionRegistry {
     /// Advances a session for a committed run: activity moves to the newest
     /// *visible* message (a silent check-in exchange carries none, so it
     /// never bumps a heartbeat session to the top of the list — spec §3.3),
-    /// the owner's own message marks the session read up to itself, and a
-    /// placeholder chat title becomes the first message's title.
+    /// the owner's own message marks the session read up to itself, a
+    /// placeholder chat title becomes the first message's title, and a new
+    /// inbound Telegram message un-hides the session from behind "Show
+    /// archived" (final fix wave D2) -- an owner's own turn or any other
+    /// source never does.
     pub(crate) fn record_commit(
         &mut self,
         agent_id: &str,
@@ -736,6 +740,7 @@ impl SessionRegistry {
             last_read_at_ms: record.last_read_at_ms,
             title: record.title.clone(),
             title_source: record.title_source,
+            archived: record.archived,
         };
         let hidden = hidden_message_ids(messages.iter());
         if let Some(latest) = messages
@@ -768,6 +773,9 @@ impl SessionRegistry {
                 record.title = title;
             }
         }
+        if messages.iter().any(is_inbound_message) {
+            record.archived = false;
+        }
         Some(undo)
     }
 
@@ -780,6 +788,7 @@ impl SessionRegistry {
             record.last_read_at_ms = undo.last_read_at_ms;
             record.title = undo.title;
             record.title_source = undo.title_source;
+            record.archived = undo.archived;
         }
     }
 }
@@ -1276,6 +1285,70 @@ mod tests {
         assert!(registry
             .record_commit("agent-1", "chat:missing", &turn, true)
             .is_none());
+    }
+
+    #[test]
+    fn an_inbound_telegram_commit_unarchives_its_session_and_revert_restores_it() {
+        // Final fix wave D2: `ensure_run_session`/`record_commit` never
+        // touched `archived`, so a new Telegram inbound message stayed
+        // hidden behind "Show archived". An owner's own turn, and any other
+        // source, must leave an archived session archived; a rolled-back
+        // commit must restore whatever `archived` was before it.
+        let mut registry = SessionRegistry::default();
+        registry.insert(chat_record("agent-1", "chat:one", 10));
+        registry.get_mut("agent-1", "chat:one").unwrap().archived = true;
+
+        let owner_turn = vec![
+            message("u1", MessageRole::User, "hi from the web", &[], 20),
+            message("a1", MessageRole::Assistant, "hello", &[], 25),
+        ];
+        let undo = registry
+            .record_commit("agent-1", "chat:one", &owner_turn, true)
+            .expect("the session exists");
+        assert!(
+            registry.get("agent-1", "chat:one").unwrap().archived,
+            "an owner's own turn does not unarchive the session"
+        );
+        registry.revert_commit(undo);
+
+        let other_turn = vec![message(
+            "u2",
+            MessageRole::User,
+            "a delegated task",
+            &[],
+            30,
+        )];
+        registry
+            .record_commit("agent-1", "chat:one", &other_turn, false)
+            .expect("the session exists");
+        assert!(
+            registry.get("agent-1", "chat:one").unwrap().archived,
+            "a non-Telegram, non-owner commit does not unarchive the session"
+        );
+
+        let inbound_turn = vec![
+            message(
+                "u3",
+                MessageRole::User,
+                "hi from telegram",
+                &[("source", "telegram")],
+                40,
+            ),
+            message("a2", MessageRole::Assistant, "hello back", &[], 45),
+        ];
+        let undo = registry
+            .record_commit("agent-1", "chat:one", &inbound_turn, false)
+            .expect("the session exists");
+        assert!(
+            !registry.get("agent-1", "chat:one").unwrap().archived,
+            "a new Telegram inbound message unarchives its session"
+        );
+
+        registry.revert_commit(undo);
+        assert!(
+            registry.get("agent-1", "chat:one").unwrap().archived,
+            "a rolled-back commit restores the archived flag"
+        );
     }
 
     #[test]
