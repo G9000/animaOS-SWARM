@@ -109,4 +109,128 @@ describe('useCompanionSessions', () => {
 
     await waitFor(() => expect(result.current.daemonTooOld).toBe(true));
   });
+
+  it('exposes hasMore from the cursor and appends the next page via loadMore', async () => {
+    const list = vi
+      .spyOn(daemon, 'listSessions')
+      .mockResolvedValueOnce({
+        sessions: [sessionFixture('chat:1')],
+        nextCursor: 'cursor-1',
+      })
+      .mockResolvedValueOnce({
+        sessions: [sessionFixture('chat:2')],
+        nextCursor: null,
+      });
+    const { result } = renderHook(() =>
+      useCompanionSessions('agent-main', { archived: false, query: '' }),
+    );
+
+    await waitFor(() => expect(result.current.sessions).toHaveLength(1));
+    expect(result.current.hasMore).toBe(true);
+
+    await act(async () => {
+      await result.current.loadMore();
+    });
+
+    expect(result.current.sessions.map((session) => session.id)).toEqual([
+      'chat:1',
+      'chat:2',
+    ]);
+    expect(result.current.hasMore).toBe(false);
+    expect(list).toHaveBeenLastCalledWith('agent-main', {
+      includeHelpers: true,
+      archived: false,
+      limit: 200,
+      cursor: 'cursor-1',
+    });
+  });
+
+  it('merges a poll into the first page only, keeping already-loaded older pages', async () => {
+    let poll: (() => void) | undefined;
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (typeof handler === 'function' && timeout === SESSION_LIST_POLL_MS) {
+        poll = handler as () => void;
+        return 1;
+      }
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    const list = vi.spyOn(daemon, 'listSessions').mockResolvedValueOnce({
+      sessions: [sessionFixture('chat:1', { title: 'One' })],
+      nextCursor: 'cursor-1',
+    });
+    const { result } = renderHook(() =>
+      useCompanionSessions('agent-main', { archived: false, query: '' }),
+    );
+    await waitFor(() => expect(result.current.sessions).toHaveLength(1));
+
+    list.mockResolvedValueOnce({
+      sessions: [sessionFixture('chat:2', { title: 'Two' })],
+      nextCursor: 'cursor-2',
+    });
+    await act(async () => {
+      await result.current.loadMore();
+    });
+    expect(result.current.sessions.map((session) => session.id)).toEqual([
+      'chat:1',
+      'chat:2',
+    ]);
+
+    // The 10 s poll refreshes only the first page; "chat:2" (loaded via
+    // loadMore) must survive, and "chat:1" must be updated in place.
+    list.mockResolvedValueOnce({
+      sessions: [sessionFixture('chat:1', { title: 'One (renamed)' })],
+      nextCursor: 'cursor-1',
+    });
+    await waitFor(() => expect(poll).toBeDefined());
+    await act(async () => {
+      poll?.();
+    });
+
+    await waitFor(() =>
+      expect(result.current.sessions.map((session) => session.title)).toEqual([
+        'One (renamed)',
+        'Two',
+      ]),
+    );
+    expect(result.current.sessions.map((session) => session.id)).toEqual([
+      'chat:1',
+      'chat:2',
+    ]);
+    expect(list).toHaveBeenNthCalledWith(3, 'agent-main', {
+      includeHelpers: true,
+      archived: false,
+      limit: 200,
+    });
+  });
+
+  it('removes a session regardless of which page it was loaded from', async () => {
+    vi.spyOn(daemon, 'listSessions')
+      .mockResolvedValueOnce({
+        sessions: [sessionFixture('chat:1')],
+        nextCursor: 'cursor-1',
+      })
+      .mockResolvedValueOnce({
+        sessions: [sessionFixture('chat:2')],
+        nextCursor: null,
+      });
+    const { result } = renderHook(() =>
+      useCompanionSessions('agent-main', { archived: false, query: '' }),
+    );
+    await waitFor(() => expect(result.current.sessions).toHaveLength(1));
+    await act(async () => {
+      await result.current.loadMore();
+    });
+    expect(result.current.sessions.map((session) => session.id)).toEqual([
+      'chat:1',
+      'chat:2',
+    ]);
+
+    act(() => result.current.remove(sessionFixture('chat:2')));
+    expect(result.current.sessions.map((session) => session.id)).toEqual([
+      'chat:1',
+    ]);
+  });
 });

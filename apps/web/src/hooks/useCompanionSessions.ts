@@ -6,7 +6,7 @@ import { sessionKey } from '../lib/session-groups';
 
 /** The sidebar re-reads its sessions this often (the agent poll uses 5 s). */
 export const SESSION_LIST_POLL_MS = 10_000;
-/** Sessions loaded at once; search reaches older ones. */
+/** Sessions loaded per page; `loadMore` reaches older ones. */
 export const SESSION_LIST_LIMIT = 200;
 
 export interface CompanionSessionFilters {
@@ -25,6 +25,27 @@ function isDaemonTooOld(error: unknown): boolean {
   );
 }
 
+/**
+ * A fresh first page, replacing any earlier first page in `current` (keyed
+ * by `sessionKey`), while keeping every older page `loadMore` already
+ * appended. A session `previousFirstPageKeys` remembers as page 1 but that
+ * is absent from the fresh `firstPage` has left the window (or was deleted)
+ * and is dropped; a session unique to an older page is left untouched.
+ */
+function mergeFirstPage(
+  current: readonly Session[],
+  firstPage: readonly Session[],
+  previousFirstPageKeys: ReadonlySet<string>,
+): Session[] {
+  const freshKeys = new Set(firstPage.map(sessionKey));
+  const rest = current.filter((item) => {
+    const key = sessionKey(item);
+    if (freshKeys.has(key)) return false; // superseded by the fresh copy below
+    return !previousFirstPageKeys.has(key); // gone from page 1: drop it
+  });
+  return [...firstPage, ...rest];
+}
+
 /** The companion's sessions plus its helpers' (spec §3.3 `includeHelpers`). */
 export function useCompanionSessions(
   agentId: string | null,
@@ -32,18 +53,25 @@ export function useCompanionSessions(
 ) {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [daemonTooOld, setDaemonTooOld] = useState(false);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
   const generation = useRef(0);
+  const firstPageKeysRef = useRef<ReadonlySet<string>>(new Set());
   const query = filters.query.trim();
   const { archived } = filters;
 
   useLayoutEffect(() => {
     generation.current += 1;
+    firstPageKeysRef.current = new Set();
     setSessions([]);
     setError(null);
     setDaemonTooOld(false);
-  }, [agentId]);
+    setNextCursor(null);
+    // A new agent or filter starts a fresh paged listing: an older page
+    // loaded under the previous agent or filters is no longer meaningful.
+  }, [agentId, archived, query]);
 
   const refresh = useCallback(async () => {
     if (!agentId) return;
@@ -57,7 +85,11 @@ export function useCompanionSessions(
         ...(query ? { q: query } : {}),
       });
       if (request !== generation.current) return;
-      setSessions(page.sessions);
+      setSessions((current) =>
+        mergeFirstPage(current, page.sessions, firstPageKeysRef.current),
+      );
+      firstPageKeysRef.current = new Set(page.sessions.map(sessionKey));
+      setNextCursor(page.nextCursor);
       setError(null);
       setDaemonTooOld(false);
     } catch (caught) {
@@ -69,6 +101,37 @@ export function useCompanionSessions(
       if (request === generation.current) setLoading(false);
     }
   }, [agentId, archived, query]);
+
+  const loadMore = useCallback(async () => {
+    if (!agentId || !nextCursor) return;
+    const request = ++generation.current;
+    setLoadingMore(true);
+    try {
+      const page = await daemon.listSessions(agentId, {
+        includeHelpers: true,
+        archived,
+        limit: SESSION_LIST_LIMIT,
+        cursor: nextCursor,
+        ...(query ? { q: query } : {}),
+      });
+      if (request !== generation.current) return;
+      setSessions((current) => {
+        const known = new Set(current.map(sessionKey));
+        const additions = page.sessions.filter(
+          (item) => !known.has(sessionKey(item)),
+        );
+        return [...current, ...additions];
+      });
+      setNextCursor(page.nextCursor);
+      setError(null);
+    } catch (caught) {
+      if (request !== generation.current) return;
+      setError(caught instanceof Error ? caught.message : String(caught));
+      if (isDaemonTooOld(caught)) setDaemonTooOld(true);
+    } finally {
+      if (request === generation.current) setLoadingMore(false);
+    }
+  }, [agentId, archived, query, nextCursor]);
 
   useEffect(() => {
     if (!agentId) return;
@@ -101,5 +164,16 @@ export function useCompanionSessions(
     );
   }, []);
 
-  return { sessions, loading, error, daemonTooOld, refresh, upsert, remove };
+  return {
+    sessions,
+    loading,
+    loadingMore,
+    hasMore: nextCursor !== null,
+    error,
+    daemonTooOld,
+    refresh,
+    loadMore,
+    upsert,
+    remove,
+  };
 }

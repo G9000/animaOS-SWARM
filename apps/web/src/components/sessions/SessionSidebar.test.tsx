@@ -34,8 +34,12 @@ function renderSidebar(overrides: Partial<SessionSidebarProps> = {}) {
     onDelete: vi.fn().mockResolvedValue(undefined),
     ...overrides,
   };
-  render(<SessionSidebar {...props} />);
-  return props;
+  const view = render(<SessionSidebar {...props} />);
+  const rerenderWith = (nextOverrides: Partial<SessionSidebarProps>) => {
+    Object.assign(props, nextOverrides);
+    view.rerender(<SessionSidebar {...props} />);
+  };
+  return { ...props, rerenderWith };
 }
 
 afterEach(() => {
@@ -240,5 +244,94 @@ describe('SessionSidebar', () => {
     });
     expect(screen.queryByRole('menu')).not.toBeInTheDocument();
     expect(helperTrigger).toHaveFocus();
+  });
+
+  // C: sidebar paging.
+  it('shows a keyboard-reachable Load more sessions button while more sessions remain', async () => {
+    const onLoadMore = vi.fn();
+    const props = renderSidebar({
+      sessions: [sessionFixture('chat:1', { title: 'One', lastActivityAtMs: NOW.getTime() })],
+      hasMore: true,
+      loadingMore: false,
+      onLoadMore,
+    });
+
+    const button = screen.getByRole('button', { name: 'Load more sessions' });
+    expect(button).toBeEnabled();
+    button.focus();
+    expect(button).toHaveFocus();
+    await userEvent.keyboard('{Enter}');
+    expect(onLoadMore).toHaveBeenCalledOnce();
+
+    props.rerenderWith({ loadingMore: true });
+    expect(screen.getByRole('button', { name: 'Load more sessions' })).toBeDisabled();
+  });
+
+  it('hides the Load more sessions button once hasMore is false', () => {
+    renderSidebar({
+      sessions: [sessionFixture('chat:1', { title: 'One' })],
+      hasMore: false,
+    });
+    expect(
+      screen.queryByRole('button', { name: 'Load more sessions' }),
+    ).not.toBeInTheDocument();
+  });
+
+  // D5: focus after a row menu action (Controller ruling 1's parity for the
+  // other row actions, plus Delete's own destination).
+  it('returns focus to the row trigger after Rename, Archive, and Export', async () => {
+    const user = userEvent.setup();
+    const plans = sessionFixture('chat:plans', {
+      title: 'Plans',
+      lastActivityAtMs: NOW.getTime(),
+    });
+    renderSidebar({ sessions: [plans] });
+    const trigger = () => screen.getByRole('button', { name: 'Actions for Plans' });
+
+    await user.click(trigger());
+    await user.click(screen.getByRole('menuitem', { name: 'Rename' }));
+    await user.type(screen.getByRole('textbox', { name: 'Rename Plans' }), '{Enter}');
+    await waitFor(() => expect(trigger()).toHaveFocus());
+
+    await user.click(trigger());
+    await user.click(screen.getByRole('menuitem', { name: 'Archive' }));
+    expect(trigger()).toHaveFocus();
+
+    await user.click(trigger());
+    await user.click(screen.getByRole('menuitem', { name: 'Export Markdown' }));
+    expect(trigger()).toHaveFocus();
+  });
+
+  it('moves focus to the next row, then the previous row, then the search box after Delete', async () => {
+    const user = userEvent.setup();
+    const make = (id: string, title: string) =>
+      sessionFixture(`chat:${id}`, { title, lastActivityAtMs: NOW.getTime() });
+    let sessions = [make('a', 'Alpha'), make('b', 'Bravo'), make('c', 'Charlie')];
+    const props = renderSidebar({ sessions });
+    const deleteRow = async (title: string) => {
+      await user.click(screen.getByRole('button', { name: `Actions for ${title}` }));
+      await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+      await user.click(screen.getByRole('menuitem', { name: 'Delete session' }));
+    };
+
+    // Deleting the middle row moves focus to the next row (Charlie).
+    await deleteRow('Bravo');
+    sessions = sessions.filter((item) => item.title !== 'Bravo');
+    props.rerenderWith({ sessions });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Charlie' })).toHaveFocus());
+
+    // Deleting the last row moves focus to the previous row (Alpha).
+    await deleteRow('Charlie');
+    sessions = sessions.filter((item) => item.title !== 'Charlie');
+    props.rerenderWith({ sessions });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Alpha' })).toHaveFocus());
+
+    // Deleting the only remaining row falls back to the search box.
+    await deleteRow('Alpha');
+    sessions = [];
+    props.rerenderWith({ sessions });
+    await waitFor(() =>
+      expect(screen.getByRole('searchbox', { name: 'Search sessions' })).toHaveFocus(),
+    );
   });
 });

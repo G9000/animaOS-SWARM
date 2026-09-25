@@ -367,13 +367,16 @@ describe('WorkspaceShell', () => {
     expect(opener.closest('[inert]')).not.toBeNull();
     expect(screen.queryByRole('banner')).not.toBeInTheDocument();
 
-    // Archive closes its menu, which removes the focused item.
+    // Archive closes its menu and returns focus to its own trigger (D5),
+    // rather than falling through to the panel's generic body-focus rescue.
     await user.click(
       within(drawer).getByRole('button', { name: 'Actions for Trip ideas' }),
     );
     await user.click(within(drawer).getByRole('menuitem', { name: 'Archive' }));
     expect(onArchive).toHaveBeenCalledOnce();
-    expect(drawer).toContainElement(document.activeElement as HTMLElement);
+    expect(
+      within(drawer).getByRole('button', { name: 'Actions for Trip ideas' }),
+    ).toHaveFocus();
     await user.tab();
     expect(drawer).toContainElement(document.activeElement as HTMLElement);
     await user.keyboard('{Escape}');

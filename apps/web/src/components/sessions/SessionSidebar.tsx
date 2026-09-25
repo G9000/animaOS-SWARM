@@ -21,6 +21,10 @@ export interface SessionSidebarProps {
   onShowArchivedChange: (show: boolean) => void;
   error?: string | null;
   now?: Date;
+  /** Whether an older page (`useCompanionSessions`' `loadMore`) remains. */
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
   onOpen: (session: Session) => void;
   onRename: (session: Session, title: string) => Promise<boolean>;
   onArchive: (session: Session, archived: boolean) => Promise<void>;
@@ -88,7 +92,11 @@ function SessionRow({
           onSubmit={(event) => {
             event.preventDefault();
             void actions.onRename(session, title).then((saved) => {
-              if (saved) setRenaming(false);
+              if (saved) {
+                setRenaming(false);
+                // D5: parity with Escape — focus returns to this row's trigger.
+                menuTriggerRef.current?.focus();
+              }
             });
           }}
         >
@@ -115,6 +123,7 @@ function SessionRow({
         <button
           type="button"
           data-session-row
+          data-session-key={sessionKey(session)}
           className="session-row-button"
           aria-label={rowLabel(session)}
           aria-current={active ? 'page' : undefined}
@@ -183,7 +192,8 @@ function SessionRow({
                   type="button"
                   role="menuitem"
                   onClick={() => {
-                    closeMenu();
+                    // D5: parity with Escape — focus returns to the trigger.
+                    closeMenuToTrigger();
                     void actions.onArchive(session, !session.archived);
                   }}
                 >
@@ -195,7 +205,8 @@ function SessionRow({
                   type="button"
                   role="menuitem"
                   onClick={() => {
-                    closeMenu();
+                    // D5: parity with Escape — focus returns to the trigger.
+                    closeMenuToTrigger();
                     void actions.onExport(session);
                   }}
                 >
@@ -242,10 +253,22 @@ export function SessionSidebar({
   onShowArchivedChange,
   error = null,
   now,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
   ...actions
 }: SessionSidebarProps) {
   const [text, setText] = useState(query);
   const [kind, setKind] = useState<SessionKind | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  // D5 (Delete): the row and its position are gone once the delete lands, so
+  // the target to focus afterward — a sibling row, found before the delete —
+  // is captured up front and resolved once `sessions` actually drops the key.
+  const pendingDeleteRef = useRef<{
+    key: string;
+    target: HTMLElement | null;
+  } | null>(null);
   useEffect(() => {
     setText(query);
   }, [query]);
@@ -257,6 +280,30 @@ export function SessionSidebar({
     );
     return () => window.clearTimeout(timer);
   }, [text, query, onQueryChange]);
+  useEffect(() => {
+    const pending = pendingDeleteRef.current;
+    if (!pending) return;
+    if (sessions.some((session) => sessionKey(session) === pending.key)) return;
+    pendingDeleteRef.current = null;
+    const target = pending.target;
+    if (target && target.isConnected) target.focus();
+    else searchRef.current?.focus();
+  }, [sessions]);
+
+  const handleDelete = (session: Session): Promise<void> => {
+    const rows = listRef.current
+      ? Array.from(
+          listRef.current.querySelectorAll<HTMLElement>('[data-session-row]'),
+        )
+      : [];
+    const key = sessionKey(session);
+    const index = rows.findIndex((row) => row.dataset.sessionKey === key);
+    const target =
+      index === -1 ? null : (rows[index + 1] ?? rows[index - 1] ?? null);
+    pendingDeleteRef.current = { key, target };
+    return actions.onDelete(session);
+  };
+  const wrappedActions: RowActions = { ...actions, onDelete: handleDelete };
 
   const kinds = presentKinds(sessions);
   const activeKind = kind && kinds.includes(kind) ? kind : null;
@@ -269,6 +316,7 @@ export function SessionSidebar({
     <nav className="session-sidebar" aria-label="Sessions">
       <input
         type="search"
+        ref={searchRef}
         className="session-search"
         aria-label="Search sessions"
         placeholder="Search chats…"
@@ -298,7 +346,7 @@ export function SessionSidebar({
           ))}
         </div>
       )}
-      <div className="session-list" onKeyDown={moveBetweenRows}>
+      <div className="session-list" ref={listRef} onKeyDown={moveBetweenRows}>
         {groups.length === 0 ? (
           <p className="px-2 py-3 text-xs text-ink-3">
             {query.trim()
@@ -319,7 +367,7 @@ export function SessionSidebar({
                     <SessionRow
                       session={session}
                       active={activeKey === sessionKey(session)}
-                      actions={actions}
+                      actions={wrappedActions}
                     />
                     {helpers.length > 0 && (
                       <ul
@@ -331,7 +379,7 @@ export function SessionSidebar({
                             <SessionRow
                               session={helper}
                               active={activeKey === sessionKey(helper)}
-                              actions={actions}
+                              actions={wrappedActions}
                             />
                           </li>
                         ))}
@@ -342,6 +390,17 @@ export function SessionSidebar({
               </ul>
             </div>
           ))
+        )}
+        {hasMore && (
+          <button
+            type="button"
+            className="session-load-more"
+            disabled={loadingMore}
+            aria-busy={loadingMore || undefined}
+            onClick={() => onLoadMore?.()}
+          >
+            Load more sessions
+          </button>
         )}
       </div>
       <button

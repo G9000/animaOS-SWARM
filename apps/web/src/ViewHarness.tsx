@@ -1086,6 +1086,9 @@ export function ViewHarness() {
       showArchived={showArchived}
       onShowArchivedChange={setShowArchived}
       error={sessionActionError ?? (daemonTooOld ? null : sessions.error)}
+      hasMore={sessions.hasMore}
+      loadingMore={sessions.loadingMore}
+      onLoadMore={() => void sessions.loadMore()}
       onOpen={openSession}
       onRename={renameSession}
       onArchive={archiveSession}
