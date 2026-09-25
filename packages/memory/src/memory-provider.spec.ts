@@ -26,7 +26,7 @@ function makeMessage(text: string): Message {
 		roomId: "room-uuid-1" as Message["roomId"],
 		content: { text },
 		role: "user",
-		createdAt: Date.now(),
+		createdAtMs: Date.now(),
 	}
 }
 
