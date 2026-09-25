@@ -398,6 +398,74 @@ async fn listing_agents_as_summaries_omits_their_messages() {
     );
 }
 
+#[tokio::test]
+async fn message_pages_expose_tool_status_duration_and_incomplete_but_not_task_results() {
+    use crate::agent_runs::test_support::{
+        calculate_call, chat_request, companion_config, ScriptedModel, Step,
+    };
+
+    let model = ScriptedModel::new(vec![
+        Step::Tools(vec![calculate_call("call-1", "6*7")]),
+        Step::Text(vec!["It is 42."]),
+    ]);
+    let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(model)));
+    let agent = state
+        .write()
+        .await
+        .create_agent(companion_config("companion"))
+        .unwrap()
+        .state
+        .id;
+    crate::agent_runs::AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(8)))
+        .run(chat_request(&agent, "chat:tools", "what is 6*7?"))
+        .await
+        .unwrap();
+    // The text of a model call that failed after streaming (spec §4.5).
+    let mut unfinished = message(
+        &agent,
+        "partial",
+        "chat:tools",
+        MessageRole::Assistant,
+        "It is",
+        anima_core::primitives::now_millis() + 1_000,
+    );
+    unfinished.content.metadata = Some(std::collections::BTreeMap::from([(
+        anima_core::INCOMPLETE_METADATA_KEY.to_string(),
+        DataValue::Bool(true),
+    )]));
+    seed_messages(&mut *state.write().await, &agent, vec![unfinished]);
+    let app = router(state, DaemonConfig::default());
+
+    let page = json(
+        app.oneshot(get(
+            &format!("/api/agents/{agent}/sessions/chat%3Atools/messages"),
+            OWNER_ORIGIN,
+        ))
+        .await
+        .unwrap(),
+    )
+    .await;
+    let messages = page["messages"].as_array().unwrap();
+    let tool = messages
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("the run stored its tool result");
+    let metadata = &tool["metadata"];
+    assert_eq!(metadata["toolCallId"], "call-1");
+    assert_eq!(metadata["toolStatus"], "success");
+    assert!(metadata["toolDurationMs"].is_number(), "{metadata}");
+    assert!(metadata["stepId"].is_string());
+    assert!(
+        metadata.get("taskResult").is_none(),
+        "the whole tool result stays hidden: {metadata}"
+    );
+    let partial = messages
+        .iter()
+        .find(|message| message["id"] == "partial")
+        .unwrap();
+    assert_eq!(partial["metadata"]["incomplete"], true);
+}
+
 #[test]
 fn the_openapi_document_lists_the_session_read_routes() {
     use utoipa::OpenApi;
@@ -409,6 +477,15 @@ fn the_openapi_document_lists_the_session_read_routes() {
         "/api/agents/{agent_id}/sessions/{session_id}/messages",
     ] {
         assert!(paths.contains_key(path), "{path}");
+    }
+    let schema = serde_json::to_value(crate::routes::ApiDoc::openapi()).unwrap()["components"]
+        ["schemas"]["SessionMessageResponse"]["properties"]["metadata"]["description"]
+        .clone();
+    for key in ["toolStatus", "toolDurationMs", "incomplete"] {
+        assert!(
+            schema.as_str().unwrap_or_default().contains(key),
+            "the metadata description names {key}: {schema}"
+        );
     }
 }
 
