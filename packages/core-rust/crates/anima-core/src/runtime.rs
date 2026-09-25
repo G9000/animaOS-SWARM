@@ -3,7 +3,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use futures::future::join_all;
+use futures::future::{join_all, select, Either};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -34,6 +34,13 @@ pub use observer::{
     TOOL_STATUS_METADATA_KEY,
 };
 use observer::{tool_result_text, StepSink};
+
+#[path = "runtime/control.rs"]
+mod control;
+pub use control::{
+    CancelSignal, CancelWait, RunControl, SteeringInbox, CANCELLED_TOOL_RESULT, RUN_STOPPED_ERROR,
+    STEER_METADATA_KEY, STOPPED_METADATA_KEY,
+};
 
 static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(0);
 static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
@@ -79,6 +86,8 @@ pub struct AgentRuntime {
     run_id: Option<String>,
     /// Receives this run's live frames (spec §4.5). Never persisted.
     observer: Option<Arc<dyn RunObserver>>,
+    /// The host's stop signal and steering inbox for this run (spec §4.6–§4.7).
+    control: Option<RunControl>,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +134,7 @@ impl AgentRuntime {
             step_counter: 0,
             run_id: None,
             observer: None,
+            control: None,
         }
     }
 
@@ -165,6 +175,7 @@ impl AgentRuntime {
             step_counter: snapshot.step_count,
             run_id: None,
             observer: None,
+            control: None,
         }
     }
 
@@ -195,6 +206,15 @@ impl AgentRuntime {
     /// happen (spec §4.5). Frames are never recorded.
     pub fn set_run_observer(&mut self, observer: Arc<dyn RunObserver>) {
         self.observer = Some(observer);
+    }
+
+    /// Lets the host stop this run and steer messages into it.
+    pub fn set_run_control(&mut self, control: RunControl) {
+        self.control = Some(control);
+    }
+
+    pub fn run_control(&self) -> Option<&RunControl> {
+        self.control.as_ref()
     }
 
     pub fn init(&mut self) {
@@ -442,6 +462,12 @@ impl AgentRuntime {
             .unwrap_or(MAX_TOOL_ITERATIONS);
 
         loop {
+            // Stop checkpoint before each model call (spec §4.6).
+            if self.stop_requested() {
+                return self.finish_stopped(start);
+            }
+            // Steering joins before each model call (spec §4.7).
+            self.drain_steering(&room_id, &mut conversation);
             model_calls += 1;
             let step_id = self.step_id_for(model_calls);
             self.emit_frame(RunFrame::StepStarted {
@@ -466,11 +492,32 @@ impl AgentRuntime {
             // Every model call streams (spec §4.5); an adapter that only
             // generates emits its final response through the default stream.
             let sink = StepSink::new(self.observer.clone(), step_id.clone());
-            let streamed = self
-                .model_adapter
-                .stream(&self.state.config, &request, &sink)
-                .await;
+            let cancel = self.control.as_ref().map(|control| control.cancel.clone());
+            let streamed = {
+                let call = self
+                    .model_adapter
+                    .stream(&self.state.config, &request, &sink);
+                match cancel {
+                    // Stop checkpoint while streaming: dropping the call drops
+                    // the in-flight request (spec §4.6).
+                    Some(cancel) => match select(call, cancel.cancelled()).await {
+                        Either::Left((streamed, _)) => Some(streamed),
+                        Either::Right(((), _)) => None,
+                    },
+                    None => Some(call.await),
+                }
+            };
             let partial = sink.streamed_text();
+            let Some(streamed) = streamed else {
+                // The partial text stays, marked stopped (spec §4.6).
+                let message_id =
+                    self.record_unfinished_step(&room_id, &step_id, &partial, STOPPED_METADATA_KEY);
+                self.emit_frame(RunFrame::StepFinished {
+                    step_id,
+                    message_id,
+                });
+                return self.finish_stopped(start);
+            };
             let outcome = match streamed {
                 Ok(()) => sink
                     .take_response()
@@ -639,6 +686,30 @@ impl AgentRuntime {
                                 message_id: Some(assistant_message.id.clone()),
                             });
                             conversation.push(assistant_message);
+
+                            // Stop checkpoint before the tool batch (spec §4.6):
+                            // every requested call still gets a result, so the
+                            // transcript never holds a call without one.
+                            if self.stop_requested() {
+                                for tool_call in &tool_calls {
+                                    let cancelled = self.tag_for_run(
+                                        content_from_tool_result(
+                                            tool_call,
+                                            TaskResult::error(CANCELLED_TOOL_RESULT, 0),
+                                            false,
+                                        ),
+                                        Some(&step_id),
+                                        self.tool_markers(TaskStatus::Error, 0),
+                                    );
+                                    self.record_message_in_room(
+                                        room_id.clone(),
+                                        MessageRole::Tool,
+                                        cancelled,
+                                    );
+                                }
+                                self.record_token_event();
+                                return self.finish_stopped(start);
+                            }
 
                             // Assign step indices by position (not by tool_call.id which may not be unique)
                             let step_indices: Vec<i32> = tool_calls
@@ -965,6 +1036,49 @@ impl AgentRuntime {
         self.last_task
             .clone()
             .unwrap_or_else(|| TaskResult::error(error, duration_ms))
+    }
+
+    fn stop_requested(&self) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control.cancel.is_cancelled())
+    }
+
+    /// Ends a stopped run (spec §4.6): the result is the `stopped` error and
+    /// the agent goes back to `Idle`; a stop is never a failure.
+    fn finish_stopped(&mut self, start: u64) -> TaskResult<Content> {
+        let duration_ms = now_millis().saturating_sub(start);
+        let result = TaskResult::error(RUN_STOPPED_ERROR, duration_ms);
+        self.state.status = AgentStatus::Idle;
+        self.last_task = Some(result.clone());
+        self.record_event(
+            EventType::TaskFailed,
+            DataValue::String(RUN_STOPPED_ERROR.to_string()),
+        );
+        result
+    }
+
+    /// Records every steered message (spec §4.7) as a user message marked
+    /// `steer: true` and appends it to the conversation.
+    fn drain_steering(&mut self, room_id: &str, conversation: &mut Vec<Message>) {
+        let Some(control) = self.control.clone() else {
+            return;
+        };
+        for item in control.steering.drain() {
+            let content = self.tag_for_run(
+                item,
+                None,
+                vec![(STEER_METADATA_KEY, DataValue::Bool(true))],
+            );
+            let text = content.text.clone();
+            let message =
+                self.record_message_in_room(room_id.to_string(), MessageRole::User, content);
+            self.emit_frame(RunFrame::Steered {
+                message_id: message.id.clone(),
+                text,
+            });
+            conversation.push(message);
+        }
     }
 
     pub fn mark_running(&mut self) {
@@ -1364,3 +1478,7 @@ mod run_tests;
 #[cfg(test)]
 #[path = "runtime/observer_tests.rs"]
 mod observer_tests;
+
+#[cfg(test)]
+#[path = "runtime/control_tests.rs"]
+mod control_tests;

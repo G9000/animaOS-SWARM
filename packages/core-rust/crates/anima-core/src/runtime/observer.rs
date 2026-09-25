@@ -55,6 +55,8 @@ pub enum RunFrame {
         result: String,
         recovered: bool,
     },
+    /// A steered owner message joined the conversation (spec §4.7).
+    Steered { message_id: String, text: String },
 }
 
 /// Receives a run's live frames. The runtime calls it inline, so an
