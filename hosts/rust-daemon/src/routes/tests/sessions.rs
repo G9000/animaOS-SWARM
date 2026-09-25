@@ -266,7 +266,7 @@ async fn session_routes_list_one_session_and_page_its_messages() {
 async fn search_finds_a_session_whose_only_match_is_older_than_five_hundred_matches_elsewhere() {
     // Controller ruling 2 (M2 pre-flight audit): session search ranks
     // sessions by their newest matching message, so a session with more than
-    // SEARCH_ROW_LIMIT (500) matches must not crowd an older session's only
+    // SEARCH_SESSION_LIMIT (500) matches must not crowd an older session's only
     // match out of the results.
     let (app, state, agent) = app_with_session().await;
     let store = {
