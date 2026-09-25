@@ -247,23 +247,32 @@ fn role_name(role: MessageRole) -> &'static str {
     }
 }
 
-/// The text a search indexes and matches for one message: a check-in
-/// prompt's text without the scheduler's suffix, otherwise the message's own
-/// text, capped to [`MAX_INDEXED_TEXT_BYTES`] on a char boundary. The suffix
-/// (`schedules::wrap_checkin_prompt`) carries ordinary words ("scheduled",
-/// "reply", "exactly"...) that must not make a check-in prompt match every
-/// query (review fix, M2 fix round 1). The cap (final fix wave item B) keeps
-/// one oversized message — e.g. a large `web_fetch` or `read_file` result —
-/// from failing Postgres's generated tsvector column; every caller of this
-/// helper (both persisted stores and the in-memory store's matching) agrees
-/// on what is searchable. `record` (the full message) is never capped.
-pub(crate) fn searchable_text(message: &Message) -> &str {
-    let text = if crate::sessions::is_checkin_message(message) {
+/// The text a person reads for one message: a check-in prompt's text without
+/// the scheduler's suffix, otherwise the message's own full text. It is never
+/// capped: the export (spec §3.3, the full transcript), previews, and search
+/// snippets show it. The suffix (`schedules::wrap_checkin_prompt`) is the
+/// scheduler's instruction to the model, not something the owner wrote, and
+/// it carries ordinary words ("scheduled", "reply", "exactly"...) that must
+/// not make a check-in prompt match every query (review fix, M2 fix round 1).
+pub(crate) fn display_text(message: &Message) -> &str {
+    if crate::sessions::is_checkin_message(message) {
         crate::schedules::unwrap_checkin_prompt(&message.content.text)
     } else {
         &message.content.text
-    };
-    cap_at_byte_boundary(text, MAX_INDEXED_TEXT_BYTES)
+    }
+}
+
+/// The text a search indexes and matches for one message: [`display_text`]
+/// capped to [`MAX_INDEXED_TEXT_BYTES`] on a char boundary. The cap (final
+/// fix wave item B) keeps one oversized message — e.g. a large `web_fetch` or
+/// `read_file` result — from failing Postgres's generated tsvector column.
+/// Only search indexing and matching use it (the persisted stores' `text`
+/// column, the in-memory store's matching, and the hot-tail matcher), so they
+/// all agree on what is searchable; anything shown to a person uses
+/// [`display_text`] instead (residual round R1). `record` (the full message)
+/// is never capped.
+pub(crate) fn searchable_text(message: &Message) -> &str {
+    cap_at_byte_boundary(display_text(message), MAX_INDEXED_TEXT_BYTES)
 }
 
 /// `text` cut to at most `max_bytes` bytes, backing up to the nearest char
@@ -463,5 +472,29 @@ mod tests {
             "a character split by the cap is dropped whole, not corrupted"
         );
         assert!(capped.len() < MAX_INDEXED_TEXT_BYTES);
+    }
+
+    #[test]
+    fn display_text_is_never_capped_and_drops_the_checkin_suffix() {
+        // Residual round R1: the export, previews, and snippets show the
+        // whole message; only search indexing and matching use the cap.
+        let long = "a".repeat(MAX_INDEXED_TEXT_BYTES + 10);
+        assert_eq!(display_text(&message_with_text(&long)), long);
+
+        let prompt = format!("Check {}", "b".repeat(MAX_INDEXED_TEXT_BYTES));
+        let checkin = crate::sessions::test_support::checkin_prompt(
+            "agent-1",
+            "msg-1-1",
+            "schedule:s1",
+            "s1",
+            &prompt,
+            1,
+        );
+        assert_eq!(display_text(&checkin), prompt);
+        assert_eq!(
+            searchable_text(&checkin),
+            &prompt[..MAX_INDEXED_TEXT_BYTES],
+            "the index keeps the capped, suffix-free prompt"
+        );
     }
 }

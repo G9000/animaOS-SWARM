@@ -18,8 +18,8 @@ use super::{
 use crate::agent_runs::config_helper_parent;
 use crate::app::SharedDaemonState;
 use crate::history::{
-    search_snippet, search_tokens, searchable_text, text_matches, HistoryMessage, HistoryStore,
-    MessageOrder, MessagePageQuery,
+    display_text, search_snippet, search_tokens, searchable_text, text_matches, HistoryMessage,
+    HistoryStore, MessageOrder, MessagePageQuery,
 };
 use crate::state::DaemonState;
 
@@ -189,7 +189,7 @@ struct Candidate {
 fn preview_from_newest<'a>(newest_first: impl Iterator<Item = &'a Message>) -> Option<String> {
     newest_first
         .filter(|message| matches!(message.role, MessageRole::User | MessageRole::Assistant))
-        .find_map(|message| preview_text(searchable_text(message)))
+        .find_map(|message| preview_text(display_text(message)))
 }
 
 fn hot_rooms<'a>(state: &'a DaemonState, agent_id: &str) -> HashMap<&'a str, Vec<&'a Message>> {
@@ -228,7 +228,7 @@ fn candidate(
             .find(|message| text_matches(searchable_text(message), tokens))
             .map(|message| SessionMatch {
                 message_id: Some(message.id.clone()),
-                snippet: search_snippet(searchable_text(message), tokens),
+                snippet: search_snippet(display_text(message), tokens),
             })
     };
     Candidate {
@@ -331,7 +331,7 @@ async fn store_matches(
             .entry((row.agent_id.clone(), row.session_id.clone()))
             .or_insert_with(|| SessionMatch {
                 message_id: Some(row.message.id.clone()),
-                snippet: search_snippet(searchable_text(&row.message), tokens),
+                snippet: search_snippet(display_text(&row.message), tokens),
             });
     }
     matches
@@ -724,7 +724,7 @@ pub(crate) fn transcript_markdown(
         markdown.push_str(&format!(
             "\n---\n\n**{speaker}** · {}{marker}\n\n{}\n",
             format_time(message.created_at_ms),
-            searchable_text(message).trim_end()
+            display_text(message).trim_end()
         ));
     }
     markdown

@@ -1225,6 +1225,71 @@ async fn exporting_a_session_returns_its_full_markdown_transcript() {
 }
 
 #[tokio::test]
+async fn exporting_a_session_keeps_messages_longer_than_the_search_index_cap_whole() {
+    // Residual round R1 (M2 final fix wave re-review): search indexes only the
+    // first MAX_INDEXED_TEXT_BYTES of a message, but the export promises the
+    // full transcript, so longer messages (kept in the store or in the hot
+    // tail) must come out whole.
+    let (app, state, agent) = app_with_session().await;
+    let filler = "x".repeat(crate::history::MAX_INDEXED_TEXT_BYTES);
+    let stored_text = format!("stored alphaneedle {filler} stored omeganeedle");
+    let hot_text = format!("hot alphaneedle {filler} hot omeganeedle");
+    state
+        .read()
+        .await
+        .history
+        .store()
+        .upsert_messages(&[history_message(
+            "m0",
+            &agent,
+            "chat:plans",
+            MessageRole::Tool,
+            &stored_text,
+            0,
+        )])
+        .await
+        .unwrap();
+    seed_messages(
+        &mut *state.write().await,
+        &agent,
+        vec![message(
+            &agent,
+            "m3",
+            "chat:plans",
+            MessageRole::Assistant,
+            &hot_text,
+            3,
+        )],
+    );
+
+    let response = app
+        .clone()
+        .oneshot(get(
+            &format!("/api/agents/{agent}/sessions/chat%3Aplans/export"),
+            OWNER_ORIGIN,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains(&stored_text),
+        "a stored message over the index cap is exported whole"
+    );
+    assert!(
+        body.contains(&hot_text),
+        "a hot message over the index cap is exported whole"
+    );
+}
+
+#[tokio::test]
 async fn exporting_a_session_with_an_unreadable_store_answers_service_unavailable() {
     // Minor 3 (fix round 1, M2 review): the export's 503 string was unasserted.
     use crate::history::conformance::FlakyHistoryStore;
