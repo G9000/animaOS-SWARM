@@ -17,6 +17,7 @@ use super::jobs::{authorize, body, no_store};
 use super::{parse_json_body, ApiError, AppState};
 use crate::agent_runs::HELPER_MUST_RUN_THROUGH_COMPANION;
 use crate::history::HistoryDeletion;
+use crate::live::{LiveEvent, LiveEventBody};
 use crate::sessions::views::{
     self, MessagePageError, MessagePageRequest, SessionCursor, SessionListQuery,
     DEFAULT_MESSAGE_PAGE, DEFAULT_SESSION_PAGE, MAX_MESSAGE_PAGE, MAX_SEARCH_QUERY_CHARS,
@@ -319,6 +320,11 @@ pub(super) async fn create_session(
             .remove(&agent_id, &session_id);
         return rejected(ApiError::service_unavailable(error.to_string()));
     }
+    state.daemon.read().await.publish_session_event(
+        &agent_id,
+        &session_id,
+        LiveEventBody::SessionCreated,
+    );
     drop(transaction);
     session_response(&state, &agent_id, &session_id, StatusCode::CREATED).await
 }
@@ -399,6 +405,11 @@ pub(super) async fn update_session(
         state.daemon.write().await.sessions.insert(previous);
         return rejected(ApiError::service_unavailable(error.to_string()));
     }
+    state.daemon.read().await.publish_session_event(
+        &agent_id,
+        &session_id,
+        LiveEventBody::SessionUpdated,
+    );
     drop(transaction);
     session_response(&state, &agent_id, &session_id, StatusCode::OK).await
 }
@@ -502,7 +513,18 @@ pub(super) async fn delete_session(
         return rejected(ApiError::service_unavailable(error.to_string()));
     }
     // Durable now: the history rows may go (spec §3.3).
-    let history = state.daemon.read().await.history.clone();
+    let history = {
+        let guard = state.daemon.read().await;
+        // The record is gone, so its parent comes from the removed copy.
+        let parent = guard
+            .live_parent_agent(&agent_id, &session_id)
+            .or(record.parent_agent_id);
+        guard.live.publish(
+            LiveEvent::new(&agent_id, LiveEventBody::SessionDeleted).session(&session_id),
+            parent.as_deref(),
+        );
+        guard.history.clone()
+    };
     history.enqueue_session_deletion(&agent_id, &session_id);
     history.forget_mirrored(removed_ids.iter().map(String::as_str));
     drop(transaction);

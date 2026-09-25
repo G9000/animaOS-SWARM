@@ -1,14 +1,15 @@
 //! The events of an agent's stream (spec §6) and their JSON.
 
 use anima_core::primitives::now_millis;
+use anima_core::{DataValue, Message, STEP_ID_METADATA_KEY};
 use serde_json::{json, Value};
 
 use super::registry::LiveRunView;
 use super::MAX_PREVIEW_BYTES;
+use crate::history::role_name;
 use crate::routes::RunResponse;
 use crate::runs::{RunRecord, RunStatus};
 
-#[allow(dead_code)] // M3 Tasks 6–12 publish these; until then tests build some of them.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LiveEventBody {
     SessionCreated,
@@ -17,6 +18,7 @@ pub(crate) enum LiveEventBody {
     RunQueued(RunRecord),
     RunStarted(RunRecord),
     RunAwaitingApproval(RunRecord),
+    #[allow(dead_code)] // M3 Task 12 publishes compaction progress.
     RunProgress {
         phase: &'static str,
     },
@@ -92,7 +94,6 @@ pub(crate) struct LiveEvent {
     pub(crate) body: LiveEventBody,
 }
 
-#[allow(dead_code)] // M3 Task 6's coordinator builds events; until then only tests do.
 impl LiveEvent {
     pub(crate) fn new(agent_id: &str, body: LiveEventBody) -> Self {
         Self {
@@ -213,7 +214,6 @@ fn run_json(record: &RunRecord) -> Value {
 }
 
 /// The lifecycle event for `record`'s current status.
-#[allow(dead_code)] // M3 Task 6's coordinator publishes it.
 pub(crate) fn run_status_event(record: &RunRecord) -> LiveEvent {
     let body = match record.status {
         RunStatus::Queued => LiveEventBody::RunQueued(record.clone()),
@@ -274,7 +274,6 @@ pub(crate) fn resync_json(agent_id: &str, seq: u64, missed: u64) -> Value {
 }
 
 /// `text` cut to `MAX_PREVIEW_BYTES` on a char boundary, and whether it was cut.
-#[allow(dead_code)] // M3 Task 6's run observer previews tool arguments and results.
 pub(crate) fn preview(text: &str) -> (String, bool) {
     if text.len() <= MAX_PREVIEW_BYTES {
         return (text.to_string(), false);
@@ -284,4 +283,30 @@ pub(crate) fn preview(text: &str) -> (String, bool) {
         end -= 1;
     }
     (text[..end].to_string(), true)
+}
+
+/// `message.created` for each message a run committed, in order.
+pub(crate) fn committed_message_events(record: &RunRecord, messages: &[Message]) -> Vec<LiveEvent> {
+    messages
+        .iter()
+        .map(|message| {
+            let step_id = match message
+                .content
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(STEP_ID_METADATA_KEY))
+            {
+                Some(DataValue::String(step_id)) => Some(step_id.clone()),
+                _ => None,
+            };
+            LiveEvent::for_run(
+                record,
+                LiveEventBody::MessageCreated {
+                    message_id: message.id.clone(),
+                    role: role_name(message.role),
+                    step_id,
+                },
+            )
+        })
+        .collect()
 }

@@ -45,7 +45,6 @@ use crate::app::{DaemonConfig, SharedDaemonState};
 use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError};
 use crate::schedules::SchedulerService;
 
-#[allow(unused_imports)] // M3 Task 6's live observer previews tool arguments with it.
 pub(crate) use self::contracts::data_value_to_json;
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,

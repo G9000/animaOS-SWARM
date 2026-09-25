@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use super::DaemonState;
 use crate::agent_runs::config_helper_parent;
-use crate::live::{LiveHub, SnapshotRun};
+use crate::live::{LiveEvent, LiveEventBody, LiveHub, SnapshotRun};
 use crate::runs::RunRecord;
 
 impl DaemonState {
@@ -60,5 +60,34 @@ impl DaemonState {
                 .then_with(|| left.record.id.cmp(&right.record.id))
         });
         runs
+    }
+
+    /// The agent whose stream also carries events of `agent_id`'s session
+    /// `session_id`: a helper's companion, otherwise the agent a delegated,
+    /// helper, or peer session came from (spec §6).
+    pub(crate) fn live_parent_agent(&self, agent_id: &str, session_id: &str) -> Option<String> {
+        self.agents
+            .get(agent_id)
+            .and_then(|runtime| config_helper_parent(runtime.config()))
+            .map(str::to_string)
+            .or_else(|| {
+                self.sessions
+                    .get(agent_id, session_id)
+                    .and_then(|session| session.parent_agent_id.clone())
+            })
+    }
+
+    /// Publishes a session lifecycle event (spec §6).
+    pub(crate) fn publish_session_event(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        body: LiveEventBody,
+    ) {
+        let parent = self.live_parent_agent(agent_id, session_id);
+        self.live.publish(
+            LiveEvent::new(agent_id, body).session(session_id),
+            parent.as_deref(),
+        );
     }
 }

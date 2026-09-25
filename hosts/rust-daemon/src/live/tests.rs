@@ -7,8 +7,9 @@ use super::events::{
 use super::fanout::{LiveDelivery, LiveHub};
 use super::registry::LiveToolView;
 use super::{
-    DEFAULT_SESSION_EVENT_BUFFER, EVENT_KEEP_ALIVE_SECS, MAX_EVENT_SUBSCRIBERS_PER_AGENT,
-    MAX_PREVIEW_BYTES, MAX_SNAPSHOT_TEXT_BYTES,
+    DEFAULT_SESSION_EVENT_BUFFER, DELTA_FLUSH_BYTES, DELTA_FLUSH_MS, EVENT_KEEP_ALIVE_SECS,
+    MAX_EVENT_SUBSCRIBERS_PER_AGENT, MAX_LIVE_TOOL_CARDS, MAX_PREVIEW_BYTES,
+    MAX_SNAPSHOT_TEXT_BYTES,
 };
 use crate::runs::{RunRecord, RunSource, RunStart, RunStatus, MAX_RUN_STEPS};
 
@@ -195,6 +196,38 @@ fn the_registry_tracks_a_steps_text_in_utf16_units_and_keeps_its_tail() {
 }
 
 #[test]
+fn a_run_keeps_only_its_newest_tool_cards() {
+    let hub = LiveHub::new(8);
+    let runs = hub.runs();
+    runs.register("run_1");
+    let started = MAX_LIVE_TOOL_CARDS + 3;
+    for n in 0..started {
+        runs.tool_started("run_1", tool(&format!("call-{n}")));
+    }
+    runs.tool_finished("run_1", "call-0", "success", 1, "gone".into(), false);
+    runs.tool_finished(
+        "run_1",
+        &format!("call-{}", started - 1),
+        "error",
+        2,
+        "boom".into(),
+        false,
+    );
+
+    let tools = runs.view("run_1").unwrap().tools;
+    assert_eq!(tools.len(), MAX_LIVE_TOOL_CARDS);
+    assert_eq!(tools[0].tool_call_id, "call-3", "the oldest cards go first");
+    assert!(
+        tools.iter().all(|card| card.tool_call_id != "call-0"),
+        "finishing a dropped card brings nothing back"
+    );
+    let newest = tools.last().unwrap();
+    assert_eq!(newest.tool_call_id, format!("call-{}", started - 1));
+    assert_eq!(newest.status, "error");
+    assert_eq!(runs.tools_started("run_1"), ["search"]);
+}
+
+#[test]
 fn a_tail_cut_inside_a_character_drops_it_whole_and_counts_its_utf16_units() {
     let hub = LiveHub::new(8);
     let runs = hub.runs();
@@ -300,6 +333,9 @@ async fn the_live_run_limits_match_the_spec() {
     assert_eq!(EVENT_KEEP_ALIVE_SECS, 15);
     assert_eq!(DEFAULT_SESSION_EVENT_BUFFER, 1_024);
     assert_eq!(MAX_RUN_STEPS, 50, "a run keeps the usage of 50 model calls");
+    assert_eq!(DELTA_FLUSH_MS, 50);
+    assert_eq!(DELTA_FLUSH_BYTES, 512);
+    assert_eq!(MAX_LIVE_TOOL_CARDS, 50);
     assert_eq!(
         crate::app::DaemonConfig::default().session_event_buffer,
         DEFAULT_SESSION_EVENT_BUFFER
@@ -377,4 +413,164 @@ fn a_snapshot_lists_runs_with_their_live_state() {
     assert_eq!(entry["textOffset"], 0);
     assert_eq!(entry["tools"][0]["toolCallId"], "call-9");
     assert_eq!(entry["tools"][0]["status"], "running");
+}
+
+mod coalescing {
+    use std::time::Duration;
+
+    use anima_core::RunFrame;
+
+    use super::record;
+    use crate::live::fanout::{LiveDelivery, LiveHub};
+    use crate::live::observer::{DeltaChunk, DeltaCoalescer, LiveRun};
+    use crate::live::{LiveEventBody, DELTA_FLUSH_BYTES, DELTA_FLUSH_MS};
+
+    fn chunk(step_id: &str, offset: u64, text: &str) -> DeltaChunk {
+        DeltaChunk {
+            step_id: step_id.into(),
+            offset,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn small_quick_deltas_wait_and_join_into_one_chunk() {
+        let mut coalescer = DeltaCoalescer::default();
+        assert!(coalescer.push("run_1:1", 0, "Hel", 1_000).is_empty());
+        assert!(coalescer.push("run_1:1", 3, "lo", 1_010).is_empty());
+        assert!(!coalescer.is_empty());
+        assert_eq!(coalescer.take(), Some(chunk("run_1:1", 0, "Hello")));
+        assert!(coalescer.is_empty());
+        assert_eq!(coalescer.take(), None);
+    }
+
+    #[test]
+    fn a_full_or_old_buffer_is_due_at_once() {
+        let mut coalescer = DeltaCoalescer::default();
+        let big = "x".repeat(DELTA_FLUSH_BYTES);
+        assert_eq!(
+            coalescer.push("run_1:1", 0, &big, 1_000),
+            [chunk("run_1:1", 0, &big)]
+        );
+        assert!(coalescer.push("run_1:1", 512, "a", 2_000).is_empty());
+        assert_eq!(
+            coalescer.push("run_1:1", 513, "b", 2_000 + DELTA_FLUSH_MS),
+            [chunk("run_1:1", 512, "ab")]
+        );
+    }
+
+    #[test]
+    fn a_new_step_flushes_the_previous_steps_text_first() {
+        let mut coalescer = DeltaCoalescer::default();
+        assert!(coalescer.push("run_1:1", 0, "first", 1_000).is_empty());
+        assert_eq!(
+            coalescer.push("run_1:2", 0, "second", 1_001),
+            [chunk("run_1:1", 0, "first")]
+        );
+        assert_eq!(coalescer.take(), Some(chunk("run_1:2", 0, "second")));
+    }
+
+    #[tokio::test]
+    async fn a_quiet_stream_is_flushed_by_the_timer_and_other_events_follow_its_text() {
+        let hub = LiveHub::new(16);
+        let run = record("agent-1");
+        let mut subscription = hub.subscribe("agent-1").unwrap();
+        let live_run = LiveRun::register(hub.clone(), &run, None);
+        let observer = live_run.observer();
+        let step_id = format!("{}:1", run.id);
+
+        observer.on_frame(RunFrame::StepStarted {
+            step_id: step_id.clone(),
+        });
+        observer.on_frame(RunFrame::TextDelta {
+            step_id: step_id.clone(),
+            text: "Hi".into(),
+        });
+        let delivery = tokio::time::timeout(Duration::from_secs(1), subscription.next())
+            .await
+            .expect("the timer flushes within a second");
+        let Some(LiveDelivery::Event(event)) = delivery else {
+            panic!("a delta arrives");
+        };
+        assert_eq!(
+            event.body,
+            LiveEventBody::StepDelta {
+                step_id: step_id.clone(),
+                offset: 0,
+                text: "Hi".into(),
+            }
+        );
+        assert_eq!(event.run_id.as_deref(), Some(run.id.as_str()));
+
+        observer.on_frame(RunFrame::TextDelta {
+            step_id: step_id.clone(),
+            text: " there".into(),
+        });
+        live_run.publish_record(&run);
+        let Some(LiveDelivery::Event(delta)) = subscription.next().await else {
+            panic!("buffered text comes first");
+        };
+        assert!(matches!(
+            &delta.body,
+            LiveEventBody::StepDelta { offset: 2, text, .. } if text == " there"
+        ));
+        let Some(LiveDelivery::Event(started)) = subscription.next().await else {
+            panic!("then the run event");
+        };
+        assert_eq!(started.body.type_name(), "run.started");
+
+        drop(observer);
+        drop(live_run);
+        assert!(
+            hub.runs().view(&run.id).is_none(),
+            "dropping the run forgets it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_that_ends_early_sends_its_buffered_text_before_its_result() {
+        let hub = LiveHub::new(16);
+        let mut run = record("agent-1");
+        let mut subscription = hub.subscribe("agent-1").unwrap();
+        let live_run = LiveRun::register(hub.clone(), &run, None);
+        let observer = live_run.observer();
+        let step_id = format!("{}:1", run.id);
+        observer.on_frame(RunFrame::StepStarted {
+            step_id: step_id.clone(),
+        });
+        observer.on_frame(RunFrame::TextDelta {
+            step_id: step_id.clone(),
+            text: "partial".into(),
+        });
+
+        // An aborted run task: its live link goes, then its guard fails it.
+        drop(live_run);
+        run.finish(crate::runs::RunStatus::Failed, None, 20);
+        hub.publish(crate::live::run_status_event(&run), None);
+
+        let Some(LiveDelivery::Event(first)) = subscription.next().await else {
+            panic!("the buffered text arrives");
+        };
+        assert!(matches!(
+            &first.body,
+            LiveEventBody::StepDelta { text, .. } if text == "partial"
+        ));
+        let Some(LiveDelivery::Event(second)) = subscription.next().await else {
+            panic!("then the result");
+        };
+        assert_eq!(second.body.type_name(), "run.failed");
+        observer.on_frame(RunFrame::TextDelta {
+            step_id,
+            text: "late".into(),
+        });
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(DELTA_FLUSH_MS * 3),
+                subscription.next()
+            )
+            .await
+            .is_err(),
+            "a forgotten run publishes nothing more"
+        );
+    }
 }

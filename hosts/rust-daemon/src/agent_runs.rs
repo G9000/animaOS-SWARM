@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::app::SharedDaemonState;
+use crate::live::{committed_message_events, run_status_event, LiveEventBody, LiveRun};
 use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::{
@@ -1041,6 +1042,7 @@ impl AgentRunCoordinator {
             session_id,
             session_created,
             mut in_flight,
+            (live_run, started),
             running_persist_request,
         ) = {
             let mut guard = self.state.write().await;
@@ -1103,6 +1105,14 @@ impl AgentRunCoordinator {
                 now_ms,
             );
             let run_id = record.id.clone();
+            // Registered before the start save, so a stop can reach the run
+            // from the moment it is durable (spec §4.6).
+            let live_run = LiveRun::register(
+                guard.live.clone(),
+                &record,
+                guard.live_parent_agent(&agent_id, &session_id),
+            );
+            let started = record.clone();
             guard.runs.insert(record);
             // Armed before anything else can fail, so a panic before the start
             // save cannot leave a permanently in-flight record.
@@ -1115,6 +1125,7 @@ impl AgentRunCoordinator {
                 session_id,
                 session_created,
                 in_flight,
+                (live_run, started),
                 guard.control_plane_persist_request(),
             )
         };
@@ -1129,6 +1140,11 @@ impl AgentRunCoordinator {
             return Err(ApiError::service_unavailable(error.to_string()));
         }
         drop(transaction);
+        // Announced only once durable (spec §6).
+        if session_created {
+            live_run.publish(live_run.session_event(LiveEventBody::SessionCreated));
+        }
+        live_run.publish_record(&started);
 
         // Phase B: per-run configuration applies only to this isolated copy. The
         // canonical configuration is never rewritten; a PATCH during the run
@@ -1188,6 +1204,8 @@ impl AgentRunCoordinator {
             });
         }
         runtime.set_run_id(run_id.clone());
+        runtime.set_run_observer(live_run.observer());
+        runtime.set_run_control(live_run.control());
         // `todo_write` may only replace the task list this run started from
         // (spec §4.4 item 8); another room's update surfaces as a conflict.
         let todo_baseline = if runtime.config().allows_tool("todo_write") {
@@ -1226,17 +1244,14 @@ impl AgentRunCoordinator {
                     history,
                     content,
                     |agent, user_message, tool_call| {
+                        // The observer notes the tool in the live registry
+                        // before it runs and every save merges that list into
+                        // the ledger record, so a run a restart interrupts
+                        // still reports the tools it started (spec §4.8)
+                        // without a state write lock per tool call. The commit
+                        // fills the final list.
                         let tool_context = tool_context.clone();
-                        let state = Arc::clone(&self.state);
-                        let run_id = run_id.clone();
                         async move {
-                            // Noted before the tool can have effects and kept by
-                            // any later save, so a run a restart interrupts still
-                            // reports the tools it started (spec §4.8). The commit
-                            // fills the final list.
-                            if let Some(record) = state.write().await.runs.get_mut(&run_id) {
-                                record.note_tool_started(&tool_call.name);
-                            }
                             tool_context
                                 .execute_tool(agent, user_message, tool_call)
                                 .await
@@ -1261,6 +1276,7 @@ impl AgentRunCoordinator {
         } else {
             execution.await
         };
+        live_run.flush();
 
         // Phase C: merge exactly this run's changes, let the source commit, then
         // save; a rejected or undurable commit removes exactly those changes
@@ -1269,6 +1285,7 @@ impl AgentRunCoordinator {
         let (
             snapshot,
             change_set,
+            finished,
             memory,
             memory_embeddings,
             memory_store,
@@ -1285,19 +1302,27 @@ impl AgentRunCoordinator {
             let outcome = RunOutcome::new(&change_set, result.clone());
             if !guard.commit_run(&mut change_set, &outcome) {
                 // The agent was deleted while this run executed (spec §4.4 item 6).
+                if let Some(record) = guard.runs.get(&run_id) {
+                    live_run.publish_record(record);
+                }
                 return Err(ApiError::not_found());
             }
             if let Err(error) = commit(&mut guard, &outcome) {
                 guard.rollback_run(&change_set, RunError::new(COMMIT_REJECTED, error.message()));
+                if let Some(record) = guard.runs.get(&run_id) {
+                    live_run.publish_record(record);
+                }
                 apply_run_rollback(&mut guard, &mut rollback)?;
                 return Err(error);
             }
             let snapshot = guard
                 .get_agent(&agent_id)
                 .expect("a committed agent stays registered");
+            let finished = guard.runs.get(&run_id).cloned();
             (
                 snapshot,
                 change_set,
+                finished,
                 guard.memory_handle(),
                 guard.memory_embeddings_handle(),
                 guard.memory_store_config(),
@@ -1308,6 +1333,9 @@ impl AgentRunCoordinator {
         if let Err(error) = persist_request.save().await {
             let mut guard = self.state.write().await;
             guard.rollback_run(&change_set, RunError::new(COMMIT_FAILED, error.to_string()));
+            if let Some(record) = guard.runs.get(&run_id) {
+                live_run.publish_record(record);
+            }
             apply_run_rollback(&mut guard, &mut rollback)?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
@@ -1317,6 +1345,13 @@ impl AgentRunCoordinator {
         history_outbox.enqueue_committed(&agent_id, &session_id, &change_set.delta.messages);
         drop(transaction);
         in_flight.disarm();
+        if let Some(finished) = &finished {
+            for event in committed_message_events(finished, &change_set.delta.messages) {
+                live_run.publish(event);
+            }
+            live_run.publish(live_run.session_event(LiveEventBody::SessionUpdated));
+            live_run.publish_record(finished);
+        }
 
         // A silent check-in stores no task-result memory; otherwise silent
         // check-ins crowd real memories out of the recent-memory context (spec §9.2).
@@ -1497,8 +1532,8 @@ impl Drop for InFlightRunGuard {
         let state = Arc::clone(&self.state);
         handle.spawn(async move {
             let mut guard = state.write().await;
-            if let Some(record) = guard.runs.get_mut(&run_id) {
-                if !record.status.is_terminal() {
+            let failed = guard.runs.get_mut(&run_id).and_then(|record| {
+                (!record.status.is_terminal()).then(|| {
                     record.finish(
                         RunStatus::Failed,
                         Some(RunError::new(
@@ -1507,7 +1542,14 @@ impl Drop for InFlightRunGuard {
                         )),
                         anima_core::primitives::now_millis(),
                     );
-                }
+                    record.clone()
+                })
+            });
+            if let Some(record) = failed {
+                let parent = guard.live_parent_agent(&record.agent_id, &record.session_id);
+                guard
+                    .live
+                    .publish(run_status_event(&record), parent.as_deref());
             }
         });
     }
@@ -1568,6 +1610,10 @@ async fn persist_task_result_memory(
     }
 }
 
+#[cfg(test)]
+mod live_tests;
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests {
     use super::{AgentRunCoordinator, AgentRunRequest, RunRoom};

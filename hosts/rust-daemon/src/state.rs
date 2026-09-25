@@ -1758,7 +1758,20 @@ impl DaemonState {
         snapshot.jobs.sort_by(|left, right| left.id.cmp(&right.id));
         snapshot.goals = self.goals.values().cloned().collect();
         snapshot.goals.sort_by(|left, right| left.id.cmp(&right.id));
-        snapshot.runs = self.runs.snapshot_records(&self.live_agent_ids());
+        snapshot.runs = self
+            .runs
+            .snapshot_records(&self.live_agent_ids())
+            .into_iter()
+            .map(|record| {
+                let mut record = self.with_live_tools(record);
+                // Controller ruling (M3 Task 6): nothing M2 cannot read is
+                // saved before Task 7's snapshot version 6, and an M2 daemon
+                // would silently drop this field. Until then the reply id
+                // lives in the ledger's memory and the history store's copy.
+                record.reply_message_id = None;
+                record
+            })
+            .collect();
         snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
         snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();
         snapshot.pending_history_deletions = self.pending_history_deletions.clone();

@@ -7,7 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 use anima_core::{RunControl, TokenUsage};
 use serde::Serialize;
 
-use super::MAX_SNAPSHOT_TEXT_BYTES;
+use super::{MAX_LIVE_TOOL_CARDS, MAX_SNAPSHOT_TEXT_BYTES};
 use crate::runs::{RunStepUsage, MAX_RUN_STEPS, MAX_RUN_TOOLS_STARTED};
 
 /// One tool card of a run.
@@ -34,6 +34,7 @@ pub(crate) struct LiveRunView {
     pub(crate) text: String,
     /// UTF-16 units of the step's text dropped before `text`.
     pub(crate) text_offset: u64,
+    /// The newest `MAX_LIVE_TOOL_CARDS` tool cards, oldest first.
     pub(crate) tools: Vec<LiveToolView>,
 }
 
@@ -61,7 +62,6 @@ fn utf16_len(text: &str) -> u64 {
     text.encode_utf16().count() as u64
 }
 
-#[allow(dead_code)] // M3 Tasks 6–9 register runs and record their steps, tools, and steers.
 impl LiveRuns {
     fn lock(&self) -> MutexGuard<'_, HashMap<String, LiveRunState>> {
         self.runs
@@ -86,6 +86,7 @@ impl LiveRuns {
             .clone()
     }
 
+    #[allow(dead_code)] // M3 Tasks 7–9 look up a run's control to stop or steer it.
     pub(crate) fn control(&self, run_id: &str) -> Option<RunControl> {
         self.lock().get(run_id).map(|run| run.control.clone())
     }
@@ -136,10 +137,12 @@ impl LiveRuns {
             {
                 run.tools_started.push(tool.name.clone());
             }
-            run.view
-                .tools
-                .retain(|known| known.tool_call_id != tool.tool_call_id);
-            run.view.tools.push(tool);
+            let tools = &mut run.view.tools;
+            tools.retain(|known| known.tool_call_id != tool.tool_call_id);
+            tools.push(tool);
+            if tools.len() > MAX_LIVE_TOOL_CARDS {
+                tools.drain(..tools.len() - MAX_LIVE_TOOL_CARDS);
+            }
         }
     }
 
@@ -194,6 +197,7 @@ impl LiveRuns {
 
     /// Remembers a steer's idempotency key and text for the run it joined
     /// (Task 9), so a retried steer is answered instead of sent twice.
+    #[allow(dead_code)] // M3 Task 9 records steer keys.
     pub(crate) fn note_steer_key(&self, run_id: &str, key: &str, text: &str) {
         if let Some(run) = self.lock().get_mut(run_id) {
             run.steer_keys.insert(key.to_string(), text.to_string());
@@ -201,6 +205,7 @@ impl LiveRuns {
     }
 
     /// The text of the steer this run accepted with `key`.
+    #[allow(dead_code)] // M3 Task 9 answers retried steers.
     pub(crate) fn steer_text(&self, run_id: &str, key: &str) -> Option<String> {
         self.lock()
             .get(run_id)

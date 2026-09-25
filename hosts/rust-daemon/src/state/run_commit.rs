@@ -133,6 +133,9 @@ impl DaemonState {
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
             record.usage = change_set.token_delta.clone();
             record.tools_started = change_set.tools_started();
+            // Per-model-call usage the observer kept (spec §4.1 `steps`).
+            record.steps = self.live.runs().steps(&change_set.run_id);
+            record.reply_message_id = outcome.reply_message_id.clone();
             record.finish(outcome.status, outcome.error(), now_ms);
         }
         self.runs.prune(now_ms);
@@ -141,6 +144,12 @@ impl DaemonState {
 
     /// Removes exactly one committed run's messages, events, usage, and steps
     /// and records why its commit did not stand.
+    ///
+    /// This is the one exception to "nothing streamed is retracted" (spec
+    /// §4.5): a rejected or undurable commit removes the messages that hold
+    /// the text its run streamed. Clients saw that text only as `step.delta`
+    /// events, never as `message.created`, and the run's `run.failed` event
+    /// (`commit_rejected` or `commit_failed`) tells them to drop it.
     pub(crate) fn rollback_run(&mut self, change_set: &RunChangeSet, error: RunError) {
         if let (Some(runtime), Some(undo)) = (
             self.agents.get_mut(&change_set.agent_id),
@@ -149,6 +158,7 @@ impl DaemonState {
             runtime.revert_run_delta(&change_set.delta, undo);
         }
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
+            record.reply_message_id = None;
             record.finish(RunStatus::Failed, Some(error), now_millis());
         }
         if let Some(undo) = change_set.session_undo.clone() {

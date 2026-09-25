@@ -446,3 +446,70 @@ async fn a_lagging_stream_is_told_to_resync_and_keeps_going() {
     assert_eq!(next.data["offset"], 3);
     assert_eq!(next.data["seq"], 3);
 }
+
+fn owner_request(method: &str, uri: &str, body: Option<serde_json::Value>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", "127.0.0.1:8080")
+        .header("origin", OWNER_ORIGIN);
+    match body {
+        Some(body) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn session_routes_announce_created_updated_and_deleted_sessions() {
+    let (state, agent) = state_with_agent();
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+    let app = router(state, DaemonConfig::default());
+
+    let created = app
+        .clone()
+        .oneshot(owner_request(
+            "POST",
+            &format!("/api/agents/{agent}/sessions"),
+            Some(serde_json::json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let session_id = body["session"]["id"].as_str().unwrap().to_string();
+    let path = format!(
+        "/api/agents/{agent}/sessions/{}",
+        session_id.replace(':', "%3A")
+    );
+    let renamed = app
+        .clone()
+        .oneshot(owner_request(
+            "PATCH",
+            &path,
+            Some(serde_json::json!({"title": "Trip"})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), StatusCode::OK);
+    let deleted = app
+        .oneshot(owner_request("DELETE", &path, None))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    for expected in ["session.created", "session.updated", "session.deleted"] {
+        let delivery = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.next())
+            .await
+            .unwrap_or_else(|_| panic!("{expected} arrives within five seconds"));
+        let Some(crate::live::LiveDelivery::Event(event)) = delivery else {
+            panic!("{expected} arrives");
+        };
+        assert_eq!(event.body.type_name(), expected);
+        assert_eq!(event.session_id.as_deref(), Some(session_id.as_str()));
+    }
+}

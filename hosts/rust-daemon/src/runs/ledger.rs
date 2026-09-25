@@ -128,8 +128,7 @@ pub(crate) struct RunStopRequest {
     pub(crate) requested_at_ms: u64,
 }
 
-/// Usage of one model call (spec §4.1 `steps`); recorded from M3's observer.
-#[allow(dead_code)]
+/// Usage of one model call (spec §4.1 `steps`), recorded by the live run observer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunStepUsage {

@@ -78,7 +78,6 @@ impl LiveHub {
 
     /// Sends `event` to its agent's stream and, when it differs, to
     /// `parent_agent_id`'s (a helper's or delegated run's companion).
-    #[allow(dead_code)] // M3 Task 6's coordinator and session routes publish.
     pub(crate) fn publish(&self, event: LiveEvent, parent_agent_id: Option<&str>) {
         let event = Arc::new(event);
         let channels = self.inner.channels();
