@@ -6,8 +6,10 @@ import { sessionKey } from '../lib/session-groups';
 
 /** The sidebar re-reads its sessions this often (the agent poll uses 5 s). */
 export const SESSION_LIST_POLL_MS = 10_000;
-/** Sessions loaded per page; `loadMore` reaches older ones. */
+/** Sessions per page of the daemon's listing. */
 export const SESSION_LIST_LIMIT = 200;
+/** Pages a refresh reads at most: `loadMore` adds one page up to this cap. */
+export const SESSION_LIST_MAX_PAGES = 10;
 
 export interface CompanionSessionFilters {
   archived: boolean;
@@ -26,27 +28,18 @@ function isDaemonTooOld(error: unknown): boolean {
 }
 
 /**
- * A fresh first page, replacing any earlier first page in `current` (keyed
- * by `sessionKey`), while leaving every older page `loadMore` already
- * appended untouched. A session `previousFirstPageKeys` remembers as page 1,
- * but that the fresh `firstPage` no longer lists, has left the window (or
- * was deleted), so it is dropped too.
+ * The companion's sessions plus its helpers' (spec §3.3 `includeHelpers`).
+ *
+ * The list is the first `k` pages of the daemon's listing (residual round
+ * R2). Every refresh (the 10 s poll, a manual `refresh()`, and the refreshes
+ * after a rename, archive, or read mark) walks the cursor from page 1 through
+ * page `k`, then replaces the list with what it read in one update, so a
+ * session that moved between pages shows once and older pages stay current.
+ * The newest walk wins; a superseded walk is discarded. `loadMore` raises `k`
+ * by one, up to `SESSION_LIST_MAX_PAGES`, and walks again. A new agent or
+ * filter starts over from one page but keeps the previous list on screen
+ * until the new first page lands.
  */
-function mergeFirstPage(
-  current: readonly Session[],
-  firstPage: readonly Session[],
-  previousFirstPageKeys: ReadonlySet<string>,
-): Session[] {
-  const freshKeys = new Set(firstPage.map(sessionKey));
-  const rest = current.filter((item) => {
-    const key = sessionKey(item);
-    if (freshKeys.has(key)) return false; // superseded by the fresh copy below
-    return !previousFirstPageKeys.has(key); // gone from page 1: drop it
-  });
-  return [...firstPage, ...rest];
-}
-
-/** The companion's sessions plus its helpers' (spec §3.3 `includeHelpers`). */
 export function useCompanionSessions(
   agentId: string | null,
   filters: CompanionSessionFilters,
@@ -54,11 +47,20 @@ export function useCompanionSessions(
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [daemonTooOld, setDaemonTooOld] = useState(false);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  /** Bumped by every walk and every agent or filter change: only the walk
+   *  holding the current value may land. */
   const generation = useRef(0);
-  const firstPageKeysRef = useRef<ReadonlySet<string>>(new Set());
+  /** `k`: the pages every walk reads. */
+  const pagesRef = useRef(1);
+  /** The pages the list on screen was read from. */
+  const shownPagesRef = useRef(1);
+  const hasMoreRef = useRef(false);
+  /** The `k` a `loadMore` waits for: `loadingMore` holds until a walk that
+   *  reads that many pages lands, or until the newest walk fails. */
+  const loadMoreTargetRef = useRef<number | null>(null);
   // Mirrors `daemonTooOld` for the poll scheduler below: a ref reads the
   // just-set value synchronously, before this render (and its dependent
   // effects) has a chance to commit (D3).
@@ -67,37 +69,65 @@ export function useCompanionSessions(
   const { archived } = filters;
 
   useLayoutEffect(() => {
+    // A new agent or filter starts over from one page: any walk in flight is
+    // superseded, and a pending `loadMore` belonged to the old listing.
     generation.current += 1;
-    firstPageKeysRef.current = new Set();
+    pagesRef.current = 1;
+    shownPagesRef.current = 1;
+    loadMoreTargetRef.current = null;
+    setLoadingMore(false);
+    // The previous list stays on screen until the new first page lands.
+    if (agentId) return;
+    hasMoreRef.current = false;
     daemonTooOldRef.current = false;
     setSessions([]);
+    setHasMore(false);
+    setLoading(false);
     setError(null);
     setDaemonTooOld(false);
-    setNextCursor(null);
-    // A new agent or filter starts a fresh paged listing: an older page
-    // loaded under the previous agent or filters is no longer meaningful.
   }, [agentId, archived, query]);
 
   const refresh = useCallback(async () => {
     if (!agentId) return;
     const request = ++generation.current;
+    const pages = pagesRef.current;
     setLoading(true);
     try {
-      const page = await daemon.listSessions(agentId, {
-        includeHelpers: true,
-        archived,
-        limit: SESSION_LIST_LIMIT,
-        ...(query ? { q: query } : {}),
-      });
-      if (request !== generation.current) return;
-      setSessions((current) =>
-        mergeFirstPage(current, page.sessions, firstPageKeysRef.current),
-      );
-      firstPageKeysRef.current = new Set(page.sessions.map(sessionKey));
-      setNextCursor(page.nextCursor);
+      const listed: Session[] = [];
+      const seen = new Set<string>();
+      let cursor: string | null = null;
+      let read = 0;
+      do {
+        const page = await daemon.listSessions(agentId, {
+          includeHelpers: true,
+          archived,
+          limit: SESSION_LIST_LIMIT,
+          ...(cursor ? { cursor } : {}),
+          ...(query ? { q: query } : {}),
+        });
+        if (request !== generation.current) return; // superseded: discarded
+        for (const session of page.sessions) {
+          const key = sessionKey(session);
+          if (seen.has(key)) continue; // the first occurrence wins
+          seen.add(key);
+          listed.push(session);
+        }
+        cursor = page.nextCursor;
+        read += 1;
+      } while (cursor !== null && read < pages);
+      const more = cursor !== null && pages < SESSION_LIST_MAX_PAGES;
+      shownPagesRef.current = pages;
+      hasMoreRef.current = more;
+      setSessions(listed);
+      setHasMore(more);
       setError(null);
       setDaemonTooOld(false);
       daemonTooOldRef.current = false;
+      const target = loadMoreTargetRef.current;
+      if (target !== null && pages >= target) {
+        loadMoreTargetRef.current = null;
+        setLoadingMore(false);
+      }
     } catch (caught) {
       if (request !== generation.current) return;
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -106,44 +136,33 @@ export function useCompanionSessions(
         setDaemonTooOld(true);
         daemonTooOldRef.current = true;
       }
+      if (loadMoreTargetRef.current !== null) {
+        // The page `loadMore` asked for was not read: back to the pages the
+        // list on screen came from, so the next click asks for it again.
+        loadMoreTargetRef.current = null;
+        pagesRef.current = shownPagesRef.current;
+        setLoadingMore(false);
+      }
     } finally {
       if (request === generation.current) setLoading(false);
     }
   }, [agentId, archived, query]);
 
   const loadMore = useCallback(async () => {
-    if (!agentId || !nextCursor) return;
-    const request = ++generation.current;
+    if (
+      !agentId ||
+      !hasMoreRef.current ||
+      loadMoreTargetRef.current !== null ||
+      pagesRef.current >= SESSION_LIST_MAX_PAGES
+    )
+      return;
+    pagesRef.current += 1;
+    loadMoreTargetRef.current = pagesRef.current;
     setLoadingMore(true);
-    try {
-      const page = await daemon.listSessions(agentId, {
-        includeHelpers: true,
-        archived,
-        limit: SESSION_LIST_LIMIT,
-        cursor: nextCursor,
-        ...(query ? { q: query } : {}),
-      });
-      if (request !== generation.current) return;
-      setSessions((current) => {
-        const known = new Set(current.map(sessionKey));
-        const additions = page.sessions.filter(
-          (item) => !known.has(sessionKey(item)),
-        );
-        return [...current, ...additions];
-      });
-      setNextCursor(page.nextCursor);
-      setError(null);
-    } catch (caught) {
-      if (request !== generation.current) return;
-      setError(caught instanceof Error ? caught.message : String(caught));
-      if (isDaemonTooOld(caught)) {
-        setDaemonTooOld(true);
-        daemonTooOldRef.current = true;
-      }
-    } finally {
-      if (request === generation.current) setLoadingMore(false);
-    }
-  }, [agentId, archived, query, nextCursor]);
+    // A walk started meanwhile (a poll, a refresh) also reads the raised `k`,
+    // so a newer walk superseding this one still clears `loadingMore`.
+    await refresh();
+  }, [agentId, refresh]);
 
   useEffect(() => {
     if (!agentId) return;
@@ -183,7 +202,7 @@ export function useCompanionSessions(
     sessions,
     loading,
     loadingMore,
-    hasMore: nextCursor !== null,
+    hasMore,
     error,
     daemonTooOld,
     refresh,
