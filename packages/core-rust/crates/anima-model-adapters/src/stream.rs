@@ -86,6 +86,56 @@ pub(crate) async fn consume_anthropic_sse(
         .map_err(|_| "provider stream consumer failed".to_owned())
 }
 
+pub(crate) async fn consume_google_sse(
+    response: reqwest::Response,
+    sink: &dyn ModelStreamSink,
+) -> Result<(), String> {
+    let mut accumulator = crate::google::GoogleStreamAccumulator::default();
+    consume_sse_events(response, |payload| accumulator.push(payload), sink).await?;
+    sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
+        .await
+        .map_err(|_| "provider stream consumer failed".to_owned())
+}
+
+pub(crate) async fn consume_ollama_ndjson(
+    response: reqwest::Response,
+    sink: &dyn ModelStreamSink,
+) -> Result<(), String> {
+    let mut accumulator = crate::ollama::OllamaStreamAccumulator::default();
+    let mut body = response.bytes_stream();
+    let mut reader = BoundedFrameReader::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk
+            .map_err(|error| format!("provider stream read failed: {}", error.without_url()))?;
+        reader.push(&chunk)?;
+        while let Some(line) = reader.next_frame(ndjson_boundary)? {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let payload: Value = serde_json::from_str(line).map_err(|_| stream_parse_error())?;
+            if let Some(delta) = accumulator.push(&payload)? {
+                let _ = sink.emit(ModelStreamFrame::TextDelta(delta)).await;
+            }
+        }
+    }
+    // A final unterminated line (no trailing `\n`) still carries a real event, unlike
+    // SSE's tail below: Ollama's last NDJSON line is not required to end in a newline.
+    let rest = std::str::from_utf8(&reader.pending)
+        .map_err(|_| stream_parse_error())?
+        .trim()
+        .to_owned();
+    if !rest.is_empty() {
+        let payload: Value = serde_json::from_str(&rest).map_err(|_| stream_parse_error())?;
+        if let Some(delta) = accumulator.push(&payload)? {
+            let _ = sink.emit(ModelStreamFrame::TextDelta(delta)).await;
+        }
+    }
+    sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
+        .await
+        .map_err(|_| "provider stream consumer failed".to_owned())
+}
+
 const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STREAM_EVENT_BYTES: usize = 256 * 1024;
 const MAX_STREAM_TEXT_BYTES: usize = 1024 * 1024;
@@ -553,29 +603,64 @@ fn stream_tool_error() -> String {
     "provider stream tool call invalid".to_owned()
 }
 
+/// Reads a response body in bounded chunks and splits it into frames (SSE events or
+/// NDJSON lines) using a caller-supplied boundary finder. Every stream consumer goes
+/// through this so the whole-stream and per-frame byte bounds are enforced in exactly
+/// one place (audit M13), rather than each protocol re-implementing its own read loop.
+struct BoundedFrameReader {
+    pending: Vec<u8>,
+    total_bytes: usize,
+}
+
+impl BoundedFrameReader {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Appends one chunk, enforcing the whole-stream and single-frame byte bounds.
+    fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len());
+        if self.total_bytes > MAX_STREAM_BYTES
+            || self.pending.len().saturating_add(chunk.len()) > MAX_STREAM_EVENT_BYTES
+        {
+            return Err(stream_parse_error());
+        }
+        self.pending.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    /// Pops the next complete frame found by `boundary`, draining it (and its
+    /// delimiter) from the pending buffer. `Ok(None)` means "not enough data yet".
+    fn next_frame(
+        &mut self,
+        boundary: impl Fn(&[u8]) -> Option<(usize, usize)>,
+    ) -> Result<Option<String>, String> {
+        let Some((index, delimiter)) = boundary(&self.pending) else {
+            return Ok(None);
+        };
+        let frame = std::str::from_utf8(&self.pending[..index])
+            .map_err(|_| stream_parse_error())?
+            .to_owned();
+        self.pending.drain(..index + delimiter);
+        Ok(Some(frame))
+    }
+}
+
 async fn consume_sse_events(
     response: reqwest::Response,
     mut parse: impl FnMut(&Value) -> Result<Option<String>, String>,
     sink: &dyn ModelStreamSink,
 ) -> Result<(), String> {
     let mut body = response.bytes_stream();
-    let mut pending = Vec::new();
-    let mut total_bytes = 0usize;
+    let mut reader = BoundedFrameReader::new();
     while let Some(chunk) = body.next().await {
         let chunk = chunk
             .map_err(|error| format!("provider stream read failed: {}", error.without_url()))?;
-        total_bytes = total_bytes.saturating_add(chunk.len());
-        if total_bytes > MAX_STREAM_BYTES
-            || pending.len().saturating_add(chunk.len()) > MAX_STREAM_EVENT_BYTES
-        {
-            return Err(stream_parse_error());
-        }
-        pending.extend_from_slice(&chunk);
-        while let Some((boundary, delimiter)) = event_boundary(&pending) {
-            let event = std::str::from_utf8(&pending[..boundary])
-                .map_err(|_| stream_parse_error())?
-                .to_owned();
-            pending.drain(..boundary + delimiter);
+        reader.push(&chunk)?;
+        while let Some(event) = reader.next_frame(event_boundary)? {
             for line in event.lines() {
                 let Some(data) = line.strip_prefix("data:") else {
                     continue;
@@ -592,7 +677,11 @@ async fn consume_sse_events(
             }
         }
     }
-    if pending.iter().any(|byte| !byte.is_ascii_whitespace()) {
+    if reader
+        .pending
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
+    {
         return Err(stream_parse_error());
     }
     Ok(())
@@ -609,4 +698,12 @@ fn event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
                 .position(|window| window == b"\n\n")
                 .map(|index| (index, 2))
         })
+}
+
+/// One NDJSON line, terminated by `\n` (Ollama does not use `\r\n`).
+fn ndjson_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map(|index| (index, 1))
 }

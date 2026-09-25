@@ -94,3 +94,41 @@ pub(super) fn parse_ollama_response(payload: &Value) -> Result<ModelGenerateResp
         stop_reason,
     })
 }
+
+/// One streamed native Ollama response (NDJSON lines, spec §12.4).
+#[derive(Default)]
+pub(crate) struct OllamaStreamAccumulator {
+    text: String,
+    done: Option<Value>,
+}
+
+impl OllamaStreamAccumulator {
+    /// Takes one NDJSON line; returns the text it adds.
+    pub(crate) fn push(&mut self, payload: &Value) -> Result<Option<String>, String> {
+        if let Some(error) = payload.get("error").and_then(Value::as_str) {
+            return Err(format!(
+                "Ollama stream failed: {}",
+                error.chars().take(200).collect::<String>()
+            ));
+        }
+        let delta = payload
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        self.text.push_str(&delta);
+        if payload.get("done").and_then(Value::as_bool) == Some(true) {
+            self.done = Some(payload.clone());
+        }
+        Ok((!delta.is_empty()).then_some(delta))
+    }
+
+    pub(crate) fn finish(self) -> Result<ModelGenerateResponse, String> {
+        let mut payload = self
+            .done
+            .ok_or_else(|| "Ollama stream ended before it was done".to_string())?;
+        payload["message"] = json!({ "role": "assistant", "content": self.text });
+        parse_ollama_response(&payload)
+    }
+}

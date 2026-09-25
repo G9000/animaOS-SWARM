@@ -206,6 +206,11 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
 
     if let Some(parts) = parts {
         for part in parts {
+            // Spec §12.4: thinking parts are never shown as response text; the raw
+            // part is still kept in `raw_parts`/`raw_parts_json` above for replay.
+            if part.get("thought").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 text_parts.push(text.to_string());
             }
@@ -274,4 +279,71 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
         usage,
         stop_reason,
     })
+}
+
+/// The parts of one streamed Google response (spec §12.4). Every raw part
+/// is kept, so the final response built from them carries the same replay
+/// metadata as a non-streamed one.
+#[derive(Default)]
+pub(crate) struct GoogleStreamAccumulator {
+    parts: Vec<Value>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+}
+
+/// More parts than any sane response; a stream past this is refused.
+const MAX_GOOGLE_STREAM_PARTS: usize = 4_096;
+
+impl GoogleStreamAccumulator {
+    /// Takes one SSE payload; returns the text it adds. A `thought: true` part
+    /// (spec §12.4) never contributes to the visible delta, though it is still
+    /// kept in the raw parts below for replay.
+    pub(crate) fn push(&mut self, payload: &Value) -> Result<Option<String>, String> {
+        if let Some(usage) = payload.get("usageMetadata") {
+            self.usage = Some(usage.clone());
+        }
+        let Some(candidate) = payload
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|candidates| candidates.first())
+        else {
+            return Ok(None);
+        };
+        if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+            self.finish_reason = Some(reason.to_string());
+        }
+        let mut delta = String::new();
+        for part in candidate
+            .get("content")
+            .and_then(|content| content.get("parts"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if self.parts.len() >= MAX_GOOGLE_STREAM_PARTS {
+                return Err("provider stream parse failed".to_string());
+            }
+            let is_thought = part.get("thought").and_then(Value::as_bool) == Some(true);
+            if !is_thought {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    delta.push_str(text);
+                }
+            }
+            self.parts.push(part.clone());
+        }
+        Ok((!delta.is_empty()).then_some(delta))
+    }
+
+    /// The whole response, parsed like a non-streamed one.
+    pub(crate) fn finish(self) -> Result<ModelGenerateResponse, String> {
+        let mut candidate = json!({ "content": { "role": "model", "parts": self.parts } });
+        if let Some(reason) = self.finish_reason {
+            candidate["finishReason"] = Value::String(reason);
+        }
+        let mut payload = json!({ "candidates": [candidate] });
+        if let Some(usage) = self.usage {
+            payload["usageMetadata"] = usage;
+        }
+        parse_google_response(&payload)
+    }
 }

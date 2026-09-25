@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use anima_core::{
     AgentConfig, Content, Message, MessageRole, ModelAdapter, ModelGenerateRequest, ModelStopReason,
 };
+use anima_core::{ModelStreamFrame, ModelStreamSink};
 use anima_model_adapters::{provider_definitions, ProviderAdapterConfig, ProviderCredential};
 use axum::{http::HeaderMap, routing::post, Json, Router};
 use serde_json::{json, Value};
@@ -179,4 +180,67 @@ async fn spawn_server(app: Router) -> String {
             .expect("test server should serve successfully");
     });
     format!("http://{addr}")
+}
+
+struct Frames(Mutex<Vec<ModelStreamFrame>>);
+
+#[async_trait::async_trait]
+impl ModelStreamSink for Frames {
+    async fn emit(&self, frame: ModelStreamFrame) -> Result<(), String> {
+        self.0.lock().unwrap().push(frame);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn runtime_adapter_streams_provider_deltas_and_deterministic_words() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream"], true);
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"stre\"}}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"amed\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = RuntimeModelAdapter::with_config(ProviderAdapterConfig {
+        providers: BTreeMap::from([(
+            "openai".into(),
+            ProviderCredential {
+                api_key: Some("test-key".into()),
+                base_url: format!("{base_url}/v1"),
+            },
+        )]),
+    });
+
+    let frames = Frames(Mutex::new(Vec::new()));
+    adapter
+        .stream(&agent_config("openai"), &request(), &frames)
+        .await
+        .expect("openai streams through the provider adapter");
+    let provider = frames.0.lock().unwrap().clone();
+    assert_eq!(provider[0], ModelStreamFrame::TextDelta("stre".into()));
+    assert_eq!(provider[1], ModelStreamFrame::TextDelta("amed".into()));
+    assert!(
+        matches!(&provider[2], ModelStreamFrame::Final(response) if response.content.text == "streamed")
+    );
+
+    let frames = Frames(Mutex::new(Vec::new()));
+    adapter
+        .stream(&agent_config("deterministic"), &request(), &frames)
+        .await
+        .unwrap();
+    let words = frames.0.lock().unwrap().clone();
+    assert_eq!(words[0], ModelStreamFrame::TextDelta("operator ".into()));
+    assert!(matches!(
+        words.last(),
+        Some(ModelStreamFrame::Final(response))
+            if response.content.text == "operator handled task: prepare a campaign"
+    ));
 }

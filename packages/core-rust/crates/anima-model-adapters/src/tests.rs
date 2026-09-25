@@ -968,11 +968,11 @@ async fn openai_stream_requests_usage_and_parses_token_details() {
         }),
     );
     let base_url = spawn_server(app).await;
-    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let adapter = adapter_with(&[("vllm", Some("key"), &format!("{base_url}/v1"))]);
     let sink = FrameSink(Mutex::new(Vec::new()));
 
     adapter
-        .stream(&agent_config("openai", false), &request(), &sink)
+        .stream(&agent_config("vllm", false), &request(), &sink)
         .await
         .unwrap();
 
@@ -1073,7 +1073,10 @@ async fn deepseek_stream_falls_back_to_prompt_cache_hit_tokens() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|Json(body): Json<Value>| async move {
-            assert_eq!(body["stream_options"]["include_usage"], true);
+            assert!(
+                body.get("stream_options").is_none(),
+                "a custom DeepSeek endpoint gets no stream_options"
+            );
             (
                 [("content-type", "text/event-stream")],
                 concat!(
@@ -1251,4 +1254,438 @@ async fn openai_stream_tolerates_null_usage_details() {
     assert_eq!(response.usage.total_tokens, 16);
     assert_eq!(response.usage.cached_prompt_tokens, 0);
     assert_eq!(response.usage.reasoning_tokens, 0);
+}
+
+fn google_config(tools: bool) -> AgentConfig {
+    let mut config = agent_config("google", tools);
+    config.model = "gemini-2.0-flash".into();
+    config
+}
+
+#[test]
+fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
+    let definition = |id: &str| {
+        provider_definitions()
+            .iter()
+            .find(|definition| definition.id == id)
+            .unwrap()
+    };
+    let shape = |id: &str, base_url: &str| {
+        let shape = super::adapter::openai_request_shape(definition(id), base_url);
+        (shape.stream_usage, shape.max_completion_tokens)
+    };
+    assert_eq!(shape("openai", "https://api.openai.com/v1"), (true, true));
+    assert_eq!(shape("openai", "https://api.openai.com/v1/"), (true, true));
+    assert_eq!(
+        shape("openai", "https://my-proxy.example/v1"),
+        (false, false)
+    );
+    assert_eq!(
+        shape("deepseek", "https://api.deepseek.com/v1"),
+        (true, false)
+    );
+    assert_eq!(
+        shape("deepseek", "https://gateway.example/v1"),
+        (false, false)
+    );
+    assert_eq!(shape("vllm", "http://gpu-box:8000/v1"), (true, false));
+    assert_eq!(
+        shape("mistral", "https://api.mistral.ai/v1"),
+        (false, false)
+    );
+}
+
+#[tokio::test]
+async fn a_custom_openai_endpoint_keeps_max_tokens_and_no_stream_options() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert!(body.get("stream_options").is_none());
+            assert_eq!(body["max_tokens"], 512);
+            assert!(body.get("max_completion_tokens").is_none());
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("openai", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        sink.0.lock().unwrap().last(),
+        Some(ModelStreamFrame::Final(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_provider_that_ignores_stream_true_still_completes() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream"], true);
+            openai_response("answered without streaming")
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("mistral", Some("key"), &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("mistral", false), &request(), &sink)
+        .await
+        .expect("a JSON answer to a stream request is parsed whole");
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames.len(), 1);
+    let ModelStreamFrame::Final(response) = &frames[0] else {
+        panic!("expected one final frame")
+    };
+    assert_eq!(response.content.text, "answered without streaming");
+    assert_eq!(response.usage.total_tokens, 2);
+}
+
+#[tokio::test]
+async fn google_streams_text_deltas_and_keeps_raw_parts_for_replay() {
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        post(|headers: HeaderMap, uri: Uri, Json(body): Json<Value>| async move {
+            assert_eq!(uri.query(), Some("alt=sse"));
+            assert_eq!(
+                headers.get("x-goog-api-key").and_then(|value| value.to_str().ok()),
+                Some("key")
+            );
+            assert!(body.get("contents").is_some());
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hel\",\"thoughtSignature\":\"sig-1\"}]}}]}\n\n",
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"lo\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":4,\"candidatesTokenCount\":2,\"totalTokenCount\":6}}\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&google_config(false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames[0], ModelStreamFrame::TextDelta("Hel".into()));
+    assert_eq!(frames[1], ModelStreamFrame::TextDelta("lo".into()));
+    let ModelStreamFrame::Final(response) = &frames[2] else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.content.text, "Hello");
+    assert_eq!(response.stop_reason, ModelStopReason::End);
+    assert_eq!(response.usage.total_tokens, 6);
+    let Some(DataValue::String(parts)) = response
+        .content
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("googleResponsePartsJson"))
+    else {
+        panic!("the raw parts are kept for replay")
+    };
+    let parts: Value = serde_json::from_str(parts).unwrap();
+    assert_eq!(parts.as_array().map(Vec::len), Some(2));
+    assert_eq!(parts[0]["thoughtSignature"], "sig-1");
+}
+
+#[tokio::test]
+async fn google_stream_function_calls_come_back_in_the_final_response() {
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":\"fc-1\",\"name\":\"delegate_task\",\"args\":{\"task\":\"research\"}}}]},\"finishReason\":\"STOP\"}]}\n\n",
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&google_config(true), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames.len(), 1, "a function call streams no text");
+    let ModelStreamFrame::Final(response) = &frames[0] else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    let calls = response.tool_calls.as_ref().unwrap();
+    assert_eq!(
+        (calls[0].id.as_str(), calls[0].name.as_str()),
+        ("fc-1", "delegate_task")
+    );
+}
+
+#[tokio::test]
+async fn native_ollama_streams_ndjson_without_tools() {
+    let app = Router::new().route(
+        "/api/chat",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["think"], false);
+            (
+                [("content-type", "application/x-ndjson")],
+                concat!(
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi \"},\"done\":false}\n",
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"there\"},\"done\":false}\n",
+                    "{\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":5,\"eval_count\":2}\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("ollama", None, &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("ollama", false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames[0], ModelStreamFrame::TextDelta("Hi ".into()));
+    assert_eq!(frames[1], ModelStreamFrame::TextDelta("there".into()));
+    let ModelStreamFrame::Final(response) = &frames[2] else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.content.text, "Hi there");
+    assert_eq!(response.usage.total_tokens, 7);
+}
+
+#[tokio::test]
+async fn an_ollama_stream_that_never_finishes_or_reports_an_error_fails() {
+    let unfinished = Router::new().route(
+        "/api/chat",
+        post(|| async {
+            (
+                [("content-type", "application/x-ndjson")],
+                "{\"message\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"done\":false}\n",
+            )
+        }),
+    );
+    let base_url = spawn_server(unfinished).await;
+    let error = adapter_with(&[("ollama", None, &base_url)])
+        .stream(
+            &agent_config("ollama", false),
+            &request(),
+            &FrameSink(Mutex::new(Vec::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, "Ollama stream ended before it was done");
+
+    let failing = Router::new().route(
+        "/api/chat",
+        post(|| async {
+            (
+                [("content-type", "application/x-ndjson")],
+                "{\"error\":\"model 'llama9' not found\"}\n",
+            )
+        }),
+    );
+    let base_url = spawn_server(failing).await;
+    let error = adapter_with(&[("ollama", None, &base_url)])
+        .stream(
+            &agent_config("ollama", false),
+            &request(),
+            &FrameSink(Mutex::new(Vec::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, "Ollama stream failed: model 'llama9' not found");
+}
+
+#[tokio::test]
+async fn ollama_with_tools_streams_through_its_openai_compatible_endpoint() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream"], true);
+            assert_eq!(body["tools"][0]["function"]["name"], "delegate_task");
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tooling\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("ollama", None, &format!("{base_url}/v1"))]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&agent_config("ollama", true), &request(), &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sink.0.lock().unwrap()[0],
+        ModelStreamFrame::TextDelta("tooling".into())
+    );
+}
+
+// --- Controller ruling M12: Google `thought: true` parts are skipped in both the
+// stream accumulator and `parse_google_response`, so live deltas and the final text
+// never surface thinking output, while the raw parts stay in the replay metadata.
+
+#[test]
+fn google_response_skips_thought_parts_from_the_final_text() {
+    let response = crate::google::parse_google_response(&json!({
+        "candidates": [{
+            "content": {
+                "parts": [
+                    {"text": "reasoning about it", "thought": true},
+                    {"text": "the answer"}
+                ]
+            }
+        }]
+    }))
+    .expect("response with thought parts should parse");
+    assert_eq!(response.content.text, "the answer");
+}
+
+#[tokio::test]
+async fn google_stream_skips_thought_parts_but_keeps_them_for_replay() {
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        post(|| async {
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"thinking...\",\"thought\":true}]}}]}\n\n",
+                    "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Hello\"}]},\"finishReason\":\"STOP\"}]}\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&google_config(false), &request(), &sink)
+        .await
+        .unwrap();
+
+    let frames = sink.0.lock().unwrap().clone();
+    assert_eq!(frames.len(), 2, "the thought part streams no text delta");
+    assert_eq!(frames[0], ModelStreamFrame::TextDelta("Hello".into()));
+    let ModelStreamFrame::Final(response) = &frames[1] else {
+        panic!("expected final response")
+    };
+    assert_eq!(
+        response.content.text, "Hello",
+        "thought text is excluded from the final text"
+    );
+    let Some(DataValue::String(parts)) = response
+        .content
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("googleResponsePartsJson"))
+    else {
+        panic!("the raw parts are kept for replay")
+    };
+    let parts: Value = serde_json::from_str(parts).unwrap();
+    assert_eq!(
+        parts.as_array().map(Vec::len),
+        Some(2),
+        "the thought part is preserved in the raw replay metadata"
+    );
+    assert_eq!(parts[0]["thought"], true);
+}
+
+#[tokio::test]
+async fn google_stream_retries_one_retryable_response_then_succeeds() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        post({
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "temporary")
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ok\"}]},\"finishReason\":\"STOP\"}]}\n\n",
+                        )
+                    }
+                }
+            }
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    adapter
+        .stream(&google_config(false), &request(), &sink)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let frames = sink.0.lock().unwrap().clone();
+    let ModelStreamFrame::Final(response) = frames.last().unwrap() else {
+        panic!("expected final response")
+    };
+    assert_eq!(response.content.text, "ok");
+}
+
+// --- Controller ruling M14: a Google stream that fails retryably on both attempts
+// returns the "Google stream retry exhausted" sentinel rather than the raw second
+// failure (a non-retryable failure still surfaces its own message immediately).
+
+#[tokio::test]
+async fn google_stream_retry_exhausted_after_two_retryable_failures() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        post({
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "temporary")
+                }
+            }
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+    let sink = FrameSink(Mutex::new(Vec::new()));
+
+    let error = adapter
+        .stream(&google_config(false), &request(), &sink)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, "Google stream retry exhausted");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
