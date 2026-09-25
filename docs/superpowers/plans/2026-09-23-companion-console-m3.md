@@ -1481,6 +1481,10 @@ git add packages/core-rust/crates/anima-core/src/runtime/observer.rs packages/co
 git commit -m "feat(core): stream every model call through a non-recorded run observer"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The new message metadata keys (`toolStatus`, `toolDurationMs`, `incomplete`) are exposed to the web by Task 6's route change (audit I1); keep their names stable.
+
 ---
 
 ### Task 2: Core stop and steering controls
@@ -3740,6 +3744,12 @@ git add packages/core-rust/crates/anima-model-adapters/src/adapter.rs packages/c
 git commit -m "feat(adapters): stream Google and native Ollama and route every provider to its stream"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Skip Google `thought: true` parts in both the stream accumulator and `parse_google_response` (spec §12.4 streams non-thought text only), with a test (audit M12).
+2. Reuse the existing bounded-read loop for Ollama NDJSON where practical instead of re-implementing it in `consume_ollama_ndjson` (audit M13).
+3. Test the error string `Google stream retry exhausted` (audit M14).
+
 ---
 
 ### Task 5: Live event hub and the agent event stream route
@@ -5529,6 +5539,14 @@ git add hosts/rust-daemon/src/live/mod.rs hosts/rust-daemon/src/live/events.rs h
 git commit -m "feat(daemon): stream each agent's live events over Server-Sent Events"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. Add `LiveHub::close()` (a `watch` flag that every `LiveSubscription::next` selects on, or dropping every channel so `recv` returns closed) and call it at the start of the shutdown future in `serve_with_state`, so an open agent event stream never blocks graceful shutdown; test that an open stream ends once the hub closes (audit I4).
+3. Do not add a fourth `role_name`: make `history/mod.rs`'s helper `pub(crate)` and reuse it in `live/events.rs` (audit M13).
+4. Update `hosts/rust-daemon/README.md`: the events route row, the `ANIMAOS_RS_SESSION_EVENT_BUFFER` env var row, and a note that each open console tab holds one SSE connection (browsers allow about 6 HTTP/1.1 connections per origin through the dev proxy) (audits M22, M29).
+5. Persist nothing new in the control-plane snapshot in this task; if you find you must, stop and tell the controller (the snapshot version bump is scheduled in Task 7).
+
 ---
 
 ### Task 6: Coordinator runs publish their live events
@@ -7207,6 +7225,13 @@ Expected: PASS.
 git add hosts/rust-daemon/src/live/mod.rs hosts/rust-daemon/src/live/events.rs hosts/rust-daemon/src/live/observer.rs hosts/rust-daemon/src/live/tests.rs hosts/rust-daemon/src/state.rs hosts/rust-daemon/src/agent_runs.rs hosts/rust-daemon/src/agent_runs/test_support.rs hosts/rust-daemon/src/agent_runs/live_tests.rs hosts/rust-daemon/src/state/run_commit.rs hosts/rust-daemon/src/state/live_state.rs hosts/rust-daemon/src/routes/sessions.rs hosts/rust-daemon/src/routes/tests/events.rs
 git commit -m "feat(daemon): publish every run's live events from the coordinator"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. Expose `toolStatus`, `toolDurationMs`, and `incomplete` through the session-messages route: add them to `EXPOSED_MESSAGE_METADATA` (`routes/contracts/sessions.rs` ~16-29), with a route test that a stored tool message carries them, and update the OpenAPI description and the README (audit I1). `taskResult` stays filtered.
+3. Document, in a code comment at `rollback_run` and in the README, that a rejected or failed commit removes the run's streamed text — the one exception to "nothing streamed is retracted" (audit M26).
+4. Persist nothing new in the control-plane snapshot in this task (the version bump is in Task 7); if you must, stop and tell the controller.
 
 ---
 
@@ -9515,6 +9540,16 @@ git add hosts/rust-daemon/src/agent_runs.rs hosts/rust-daemon/src/agent_runs/que
 git commit -m "feat(daemon): accept session runs durably and run them per session in order"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5). Commit the ledger and coordinator part and the routes part as separate commits; the task is reviewed once, after both.
+2. Bump the control-plane snapshot to version 6 here, before any M3 task persists a new shape (audit I2). Reuse `write_pre_upgrade_backup`, but pick the JSON backup name by the loaded version so the M2 backup is never overwritten: loaded version below 5 → `<file>.pre-sessions.bak` (unchanged), loaded version 5 → `<file>.pre-live-runs.bak`; Postgres keeps `control_plane.backup.<version>`. Tests: a v5 snapshot writes `.pre-live-runs.bak` and loads; a v4 snapshot still writes `.pre-sessions.bak`; a v6 snapshot writes none. Update the README rollback paragraph (M3 → M2: restore `.pre-live-runs.bak`).
+3. Look up an accepted run record (and reject a non-queued one with `RUN_NOT_QUEUED`) right after `validate_run_request` and the idempotency check, before any session-state mutation in Phase A (audit M6).
+4. Give the runs route a request-body limit large enough for a 32 KiB text under worst-case JSON escaping (for example 256 KiB), so the 32 KiB text check, not the generic body limit, answers; test it (audit M29).
+5. Document in OpenAPI and the README that an idempotency key deduplicates only while its run is still in the ledger (up to 24 hours and 50 finished runs per agent) (audit M1).
+6. Add a 403 test for `GET …/sessions/{sid}/runs` (audit M25) and tests for `RUN_NOT_QUEUED`, `RUN_STOPPED_BEFORE_START`, `The companion no longer exists`, `The session no longer exists`, and `The run stopped unexpectedly before it started` where this task produces them (audit M14). Add the runs routes to the README route table (audit M22).
+7. Carry-forward (M2 T17 Minor 9): queued run records must count in `RunLedger::active_sessions` so the web never declares a queued send unconfirmed; test it.
+
 ---
 
 ### Task 8: Stop runs: the stop route, cooperative cancellation, helpers, schedules, and agent deletion
@@ -10903,6 +10938,14 @@ git add hosts/rust-daemon/src/state/run_stop.rs hosts/rust-daemon/src/state.rs h
 git commit -m "feat(daemon): stop runs of every source and cancel queued ones on agent deletion"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5). Reviewer: check these races explicitly — (i) stop vs. drainer start (a non-queued record is rejected), (ii) the drainer's failure path after `stop_run` removed the control, (iii) a steer push vs. `steering.close()`, (iv) agent deletion vs. an admission wait (audit M5).
+2. An explicit Stop does not requeue the run's undrained steers: turn each into an `interrupted` record (reason `stopped_before_start`, or the plan's equivalent) that the web shows with "Send again", so Stop means stop everything and nothing is lost (audit M8 — a deliberate deviation from spec §4.7's literal text; note it in the README).
+3. The bash stop kills the direct child only (spec-literal); say so in a code comment — a process-group kill is later work (audit M11).
+4. Add an end-to-end test that a stopped check-in records `stopped` and keeps its schedule enabled, and make a stop followed by a restart before the commit keep the schedule enabled too (adjust `reconcile_interrupted`, `schedules.rs` ~461-480) (audit M24, spec §4.6).
+5. Test stopping a run owned by a helper agent (audit M25), and the error strings this task produces, including `The companion was deleted before this message ran` (audit M14). Add the stop route to the README route table (audit M22).
+
 ---
 
 ### Task 9: Steer messages into an active run
@@ -11542,6 +11585,13 @@ Expected: PASS.
 git add hosts/rust-daemon/src/agent_runs.rs hosts/rust-daemon/src/agent_runs/queue.rs hosts/rust-daemon/src/agent_runs/steer_tests.rs hosts/rust-daemon/src/routes/runs.rs hosts/rust-daemon/src/routes/tests/runs.rs
 git commit -m "feat(daemon): steer owner messages into a session's active run"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. Make accepted steers durable (audit I3, option a): in the acceptance save, append each pending steer (key, text, `acceptedAtMs`) to the joined run's ledger record; drop it from the record when the run drains or requeues it; on restart, turn leftovers into `interrupted` records with reason `restart_before_start`, which the web shows with "Send again". Tests: a steer accepted and then a restart before it drains yields that record; a drained steer leaves nothing behind.
+3. `requeue_steers` respects the 8-queued-runs cap: excess steers become `interrupted` records with a clear error instead of bypassing the cap (audit M9).
+4. `steer_replay` iterates only the session's room, not the agent's whole hot transcript, under the state write lock (audit M28).
 
 ---
 
@@ -12668,6 +12718,11 @@ git add hosts/rust-daemon/src/connectors/mod.rs hosts/rust-daemon/src/connectors
 git commit -m "feat(daemon): stop Telegram turns and jobs durably and replay owner sends from the ledger"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The new persisted values in this task (`InboundProcessingState::Stopped`, `OutboundDeliveryState::Suppressed`, `AgentJobStatus::Stopped`) rely on Task 7's snapshot version 6; make sure a v6 snapshot holding them round-trips.
+2. Test the error strings this task produces (audit M14).
+
 ---
 
 ### Task 11: Budgeted context for every run, the trimmed indicator, and calibration
@@ -13585,6 +13640,15 @@ Expected: PASS.
 git add hosts/rust-daemon/src/sessions/context.rs hosts/rust-daemon/src/sessions/mod.rs hosts/rust-daemon/src/state/run_commit.rs hosts/rust-daemon/src/state.rs hosts/rust-daemon/src/agent_runs.rs hosts/rust-daemon/src/agent_runs/context_tests.rs
 git commit -m "feat(daemon): select every run's history within its token budget"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. Pruned history counts as dropped context (audit I5, option a): the pruning transaction records the newest pruned message per session in a new `SessionRecord` field (for example `prunedThroughMessageId`, `#[serde(default)]`, covered by Task 7's version 6); context selection treats that pruned span as dropped when no summary covers it, so `contextTrimmed` is set. Tests: a session whose older turns were pruned and not summarized reports `contextTrimmed`; a summarized one doesn't.
+3. Keep `mark_context_trimmed` after Task 7's accepted-record check, so a rejected accepted record never leaves a session mutation behind (audit M6).
+4. Exclude drafts marked `revised` from `model_visible_history` (audit M17).
+5. Document in a code comment and the test that the calibration denominator leaves out the system prompt and tool schemas (the factor absorbs that fixed overhead) (audit M10).
+6. The default context budget is capped at 200k tokens (unmodeled price tiers); keep the constant named and tested (audit M3; the controller notes it in spec §5.1).
 
 ---
 
@@ -14551,6 +14615,13 @@ git add hosts/rust-daemon/src/sessions/compaction.rs hosts/rust-daemon/src/sessi
 git commit -m "feat(daemon): compact sessions into a summary before runs and on request"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. Automatic compaction also covers pruned turns (audit I5, option a): when a session's pruned span (Task 11's field) is not covered by its summary, read those turns from the history store outside every lock and fold them into the summary; test it with a pruned, unsummarized session.
+3. Race the summarization call (and any secondary model call) with the run's cancel signal, so a Stop during compaction stops at once (audit M7).
+4. Fix the route test's duplicate message ids (`seed_turns(…, 1)` then `seed_turns(…, 2)` appends `u0`/`a0` twice) (audit M16); test `The summary came back empty` (audit M14); add the compaction route to the README route table (audit M22).
+
 ---
 
 ### Task 13: AI titles for new chats
@@ -15109,6 +15180,11 @@ git add hosts/rust-daemon/src/sessions/titles.rs hosts/rust-daemon/src/sessions/
 git commit -m "feat(daemon): title new chats from their first completed reply"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Titles run only when `DaemonState::generated_titles` is on (only `serve` sets it) — accepted (audit M2).
+2. `earlier_reply` ignores assistant messages marked `incomplete` or `stopped`, so a failed or stopped first run doesn't block AI titles for good (audit M19); test the `unusable title reply…` error string (audit M14).
+
 ---
 
 ### Task 14: `search_conversations` and bounded search snippets
@@ -15596,6 +15672,11 @@ Expected: PASS.
 git add hosts/rust-daemon/src/tools.rs hosts/rust-daemon/src/tools/conversations.rs hosts/rust-daemon/src/tools/tests.rs hosts/rust-daemon/src/sessions/views.rs hosts/rust-daemon/src/history/mod.rs hosts/rust-daemon/src/sessions/migration.rs hosts/rust-daemon/src/agent_runs.rs hosts/rust-daemon/src/agent_runs/conversations.rs hosts/rust-daemon/src/agent_runs/conversation_tests.rs apps/web/src/lib/agent-access.ts apps/web/src/lib/agent-access.test.ts
 git commit -m "feat(daemon): let the companion search its past conversations"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Do not grant `search_conversations` to helper agents: exclude it where `helper_config` copies the parent's tools (`agent_runs.rs` ~77-99), per spec §13.3's read-tool grant to non-helpers (audit M18).
+2. Test `Conversation search is unavailable in this execution context` (audit M14).
 
 ---
 
@@ -16277,6 +16358,11 @@ Expected: PASS.
 git add packages/sdk/src/runs.ts packages/sdk/src/runs.spec.ts packages/sdk/src/events.ts packages/sdk/src/events.spec.ts packages/sdk/src/client.ts packages/sdk/src/sessions.ts packages/sdk/src/sessions.spec.ts packages/sdk/src/agents.ts packages/sdk/src/index.ts apps/web/src/lib/daemon-api.ts apps/web/src/components/AgentWork.tsx apps/web/src/components/AgentRuns.tsx apps/web/src/test/sessions.ts
 git commit -m "feat(sdk): add runs, the agent event stream, and session compaction"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. End the task by running `bun x nx run @animaOS-SWARM/sdk:build`, so later direct web vitest runs resolve the new exports (audit I6).
+2. Prettier reformatted some JSX fragments in this plan into invalid code (bare children or props came out as `{ … ; }` statements, attributes as `name = { value };`): drop those wrappers and trailing `;`, write attributes as `name={value}`, and match "old" anchors by content (audit I7).
 
 ---
 
@@ -17521,6 +17607,12 @@ Expected: typecheck passes (`src/test/live.ts` is part of the app's typecheck; t
 git add apps/web/src/lib/session-events.ts apps/web/src/lib/session-events.test.ts apps/web/src/hooks/useAgentEvents.ts apps/web/src/hooks/useAgentEvents.test.tsx apps/web/src/test/live.ts
 git commit -m "feat(web): keep each companion's live runs from one shared event stream"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The SDK `dist` must be current before direct `cd apps/web && bun x vitest run …` runs (rebuild with `bun x nx run @animaOS-SWARM/sdk:build` if Task 15 changed since), or verify through `bun x nx test @animaOS-SWARM/web` (audit I6).
+2. The event stream never swallows failures silently: log non-404 errors, back off on 403/429 instead of retrying forever, and on a 404 probe the agent (like the SDK's sessions client does) to tell an unknown or deleted agent from a daemon too old (audit M15).
+3. Back off after several `stream.resync` events in a row instead of reconnecting immediately every time (audit M21).
 
 ---
 
@@ -19503,6 +19595,12 @@ git add apps/web/src/lib/transcript.ts apps/web/src/lib/transcript.test.ts apps/
 git commit -m "feat(web): show tool steps, helpers, and run outcomes in the transcript"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The SDK `dist` must be current before direct `cd apps/web && bun x vitest run …` runs (rebuild with `bun x nx run @animaOS-SWARM/sdk:build` if Task 15 changed since), or verify through `bun x nx test @animaOS-SWARM/web` (audit I6).
+2. Prettier reformatted some JSX fragments in this plan into invalid code (bare children or props came out as `{ … ; }` statements, attributes as `name = { value };`): drop those wrappers and trailing `;`, write attributes as `name={value}`, and match "old" anchors by content (audit I7).
+3. Historical tool cards (audit I1, web part): `resultText` reads the error from the tool message's JSON text when `taskResult` is absent; the test fixture uses only metadata keys the daemon exposes (`toolStatus`, `toolDurationMs`, `incomplete`, not `taskResult`); an orphan card takes its name from the matching assistant message's `toolCalls` instead of a `toolName` key the daemon never writes.
+
 ---
 
 ### Task 18: Web sends through the runs route: a per-session queue with retries, and check-in replies
@@ -20834,6 +20932,14 @@ git add apps/web/src/lib/drafts.ts apps/web/src/lib/drafts.test.ts apps/web/src/
 git commit -m "feat(web): send messages through the runs route with ordered retries"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. The SDK `dist` must be current before direct `cd apps/web && bun x vitest run …` runs (rebuild with `bun x nx run @animaOS-SWARM/sdk:build` if Task 15 changed since), or verify through `bun x nx test @animaOS-SWARM/web` (audit I6).
+3. Prettier reformatted some JSX fragments in this plan into invalid code (bare children or props came out as `{ … ; }` statements, attributes as `name = { value };`): drop those wrappers and trailing `;`, write attributes as `name={value}`, and match "old" anchors by content (audit I7).
+4. Keep "Queued for Telegram delivery" (audit I8 — M2 restored it deliberately): keep reading `deliveryQueued` where Telegram replies still go through the connector send, or derive it when a Telegram session's run completes while its connector has an approved chat; keep the test "reports a Telegram reply that is queued for delivery".
+5. The Playwright specs that mock `/run` go stale after this task; they are outside the M3 gate — the controller carries their rewrite to M10 (audit M4).
+
 ---
 
 ### Task 19: Web composer: slash commands, Stop, and steering
@@ -21498,6 +21604,10 @@ Expected: PASS.
 git add apps/web/src/lib/slash-commands.ts apps/web/src/lib/slash-commands.test.ts apps/web/src/components/sessions/SlashCommandMenu.tsx apps/web/src/components/ChatScreen.tsx apps/web/src/components/ChatScreen.test.tsx apps/web/src/components/icons.tsx apps/web/src/components/sessions/SessionView.tsx apps/web/src/live-runs.css
 git commit -m "feat(web): add slash commands, Stop, and steering to the composer"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The SDK `dist` must be current before direct `cd apps/web && bun x vitest run …` runs (rebuild with `bun x nx run @animaOS-SWARM/sdk:build` if Task 15 changed since), or verify through `bun x nx test @animaOS-SWARM/web` (audit I6).
 
 ---
 
@@ -22621,6 +22731,11 @@ Expected: PASS.
 git add apps/web/src/lib/hash-route.ts apps/web/src/lib/hash-route.test.ts apps/web/src/hooks/useSessionRuns.ts apps/web/src/hooks/useSessionRuns.test.tsx apps/web/src/hooks/useDaemonBootstrap.ts apps/web/src/hooks/useDaemonBootstrap.test.tsx apps/web/src/hooks/useCompanionSessions.ts apps/web/src/hooks/useCompanionSessions.test.tsx apps/web/src/hooks/useSessionMessages.ts apps/web/src/hooks/useSessionMessages.test.tsx apps/web/src/components/sessions/SessionSidebar.tsx apps/web/src/components/sessions/SessionSidebar.test.tsx
 git commit -m "feat(web): pace polls by the event stream and route helper sessions by agent"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The SDK `dist` must be current before direct `cd apps/web && bun x vitest run …` runs (rebuild with `bun x nx run @animaOS-SWARM/sdk:build` if Task 15 changed since), or verify through `bun x nx test @animaOS-SWARM/web` (audit I6).
+2. Carry-forward: the sessions list's polling glitches M2 left (a session moving up mid-walk, an older walk overwriting an optimistic upsert/remove, a stale-closure `refresh` reading old filters — read filters from refs) should be resolved by event-paced refreshes here; add tests for the ones this task's design touches.
 
 ---
 
@@ -23758,6 +23873,14 @@ git add apps/web/src/ViewHarness.tsx apps/web/src/ViewHarness.test.tsx apps/web/
 git commit -m "feat(web): stream runs into the session view with Stop, steering, and commands"
 ```
 
+#### Controller rulings from the pre-flight audit (binding)
+
+1. Opus implementer and opus reviewer for this task (audit M5).
+2. The SDK `dist` must be current before direct `cd apps/web && bun x vitest run …` runs (rebuild with `bun x nx run @animaOS-SWARM/sdk:build` if Task 15 changed since), or verify through `bun x nx test @animaOS-SWARM/web` (audit I6).
+3. Prettier reformatted some JSX fragments in this plan into invalid code (bare children or props came out as `{ … ; }` statements, attributes as `name = { value };`): drop those wrappers and trailing `;`, write attributes as `name={value}`, and match "old" anchors by content (audit I7). In Step 15, `agent={agent}` occurs twice in `ViewHarness.tsx`; edit the one on `<SessionView`.
+4. Steer bubbles (audit I3, web part): keep a steer's text until it appears in history (`clientRequestId`) or as a queued run with its text; if the joined run ends `interrupted` or `failed`, move the text to the recovery panel; never settle a steer only because the stream reconnected.
+5. Keep "Queued for Telegram delivery" (audit I8), as ruled in Task 18.
+
 ---
 
 ### Task 22: M3 verification
@@ -23815,6 +23938,10 @@ If the Rust gate ran only through the fallback, use `implemented — Nx gate pen
 git add docs/superpowers/plans/2026-09-23-companion-console.md
 git commit -m "docs: mark the M3 live runs milestone complete"
 ```
+
+#### Controller rulings from the pre-flight audit (binding)
+
+1. The controller runs this task. Match the master-plan status row by content (the table is padded); the Rust fallback gate includes every core crate; update the master plan's "Detailed plan" column for M3; check the README rows added in Tasks 5, 7, 8, and 12; note the 200k context cap in spec §5.1 and the Stop-without-requeue deviation in spec §4.7 (audits M3, M8, M22, M23).
 
 ---
 
