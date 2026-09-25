@@ -39,7 +39,7 @@ pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[];
 /// undid may have committed no message to key off, so a schedule-sourced run
 /// whose session id still looks like a per-tick room is also relabelled from
 /// its own `sourceRef`, whether or not its room holds any message. Callers
-/// only run this against a snapshot older than the current store version — a
+/// only run this against a snapshot older than the sessions store version — a
 /// room a live run just created this boot must be left alone, or its
 /// already-mirrored history would be stranded under the old id. Returns how
 /// many messages moved and how many runs were relabelled.
@@ -582,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn relabel_only_runs_on_a_snapshot_older_than_the_current_version() {
+    fn relabel_only_runs_on_a_snapshot_older_than_the_sessions_version() {
         let mut source = DaemonState::new();
         let agent_id = source
             .create_agent(config("companion", &[]))
@@ -628,6 +628,21 @@ mod tests {
             .restore_control_plane_snapshot(current)
             .unwrap();
         assert!(restored_current
+            .get_agent(&agent_id)
+            .unwrap()
+            .messages
+            .iter()
+            .all(|message| message.room_id == "room-1-1"));
+
+        // Nor does an M2 (version-5) snapshot: its check-ins already ran in
+        // `schedule:` rooms, so a `room-*` room there is a run's own room.
+        let mut m2 = source.control_plane_snapshot();
+        m2.version = 5;
+        m2.agents[0].messages = checkin_messages();
+        m2.agents[0].message_count = 2;
+        let mut restored_m2 = DaemonState::new();
+        restored_m2.restore_control_plane_snapshot(m2).unwrap();
+        assert!(restored_m2
             .get_agent(&agent_id)
             .unwrap()
             .messages

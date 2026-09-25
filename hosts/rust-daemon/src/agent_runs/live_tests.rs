@@ -423,7 +423,7 @@ async fn an_aborted_run_is_announced_as_failed() {
 }
 
 #[tokio::test]
-async fn the_snapshot_keeps_reply_ids_out_until_the_version_bump() {
+async fn the_version_six_snapshot_saves_reply_ids() {
     let (coordinator, agent_id) = coordinator_with(ScriptedModel::new(Vec::new())).await;
     coordinator
         .run(chat_request(&agent_id, "chat:saved", "hi"))
@@ -434,15 +434,17 @@ async fn the_snapshot_keeps_reply_ids_out_until_the_version_bump() {
     let ledger = guard.runs.for_agent(&agent_id)[0].clone();
     assert!(ledger.reply_message_id.is_some());
     assert_eq!(ledger.steps.len(), 1);
-    // Controller ruling (M3 Task 6): Task 7's snapshot version 6 saves it.
-    let saved = guard
-        .control_plane_snapshot()
+    // Carry-forward (M3 Task 6): kept out of version-5 snapshots, which an
+    // M2 daemon would load and silently drop it from; version 6 saves it.
+    let snapshot = guard.control_plane_snapshot();
+    assert_eq!(snapshot.version, 6);
+    let saved = snapshot
         .runs
         .into_iter()
         .find(|record| record.id == ledger.id)
         .unwrap();
-    assert_eq!(saved.reply_message_id, None);
-    assert_eq!(saved.steps, ledger.steps, "steps are a version-5 field");
+    assert_eq!(saved.reply_message_id, ledger.reply_message_id);
+    assert_eq!(saved.steps, ledger.steps);
 }
 
 /// A subscription's events for the next 200 ms, as JSON; for asserting that

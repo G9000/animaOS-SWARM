@@ -6,6 +6,7 @@ use anima_core::{
     AgentState, Content, DataValue, TaskResult,
 };
 use anima_memory::{MemoryType, NewMemory};
+use futures::future::{select, Either};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
@@ -15,9 +16,18 @@ use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::{
     RunChangeSet, RunError, RunOutcome, RunRecord, RunSource, RunStart, RunStatus, COMMIT_FAILED,
-    COMMIT_REJECTED, DEFAULT_MAX_RUNS_PER_AGENT, HELPER_MAX_RUNS, RUN_ABORTED,
+    COMMIT_REJECTED, DEFAULT_MAX_RUNS_PER_AGENT, HELPER_MAX_RUNS, RUN_ABORTED, RUN_STOPPED,
+    STOPPED_BY_OWNER,
 };
 use crate::state::DaemonState;
+
+mod queue;
+
+#[allow(unused_imports)] // Tasks 8–9 and the routes use the rest.
+pub(crate) use self::queue::{
+    AcceptRun, AcceptedRun, QueuedRunStart, SessionRunMode, IDEMPOTENCY_KEY_REUSED, QUEUE_FULL,
+    RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START, SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
+};
 
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
 
@@ -317,6 +327,7 @@ pub(crate) struct AgentRunCoordinator {
     session_locks: SessionLockMap,
     agent_slots: AgentSlotMap,
     waiting_budget: WaitingBudgetMap,
+    session_queues: self::queue::SessionQueueMap,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
 }
@@ -554,7 +565,7 @@ impl AgentRunCoordinator {
                     permit,
                 };
                 let result = coordinator
-                    .run_locked(request, ticket, |_, _| Ok(()), None)
+                    .run_locked(request, ticket, |_, _| Ok(()), None, None)
                     .await
                     .map_err(|error| error.message().to_string())?;
                 Ok(serde_json::json!({"agentId": helper.state.id, "status": result.result.status, "result": result.result.data, "error": result.result.error}).to_string())
@@ -568,6 +579,7 @@ impl AgentRunCoordinator {
             session_locks: Arc::new(StdMutex::new(HashMap::new())),
             agent_slots: Arc::new(StdMutex::new(HashMap::new())),
             waiting_budget: Arc::new(StdMutex::new(HashMap::new())),
+            session_queues: Arc::new(StdMutex::new(HashMap::new())),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
         }
@@ -658,7 +670,7 @@ impl AgentRunCoordinator {
     /// is never waited for here (fail-fast 503). Fail-fast HTTP callers use
     /// `run_budgeted`, which bounds that waiting.
     pub(crate) async fn run(&self, request: AgentRunRequest) -> Result<AgentRunEnvelope, ApiError> {
-        self.run_spawned(request, PermitMode::TryNow, None, |_, _| Ok(()), None)
+        self.run_spawned(request, PermitMode::TryNow, None, |_, _| Ok(()), None, None)
             .await
     }
 
@@ -675,6 +687,7 @@ impl AgentRunCoordinator {
             PermitMode::TryNow,
             Some(waiting),
             |_, _| Ok(()),
+            None,
             None,
         )
         .await
@@ -693,7 +706,7 @@ impl AgentRunCoordinator {
     where
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
     {
-        self.run_spawned(request, PermitMode::TryNow, None, commit, None)
+        self.run_spawned(request, PermitMode::TryNow, None, commit, None, None)
             .await
     }
 
@@ -719,6 +732,7 @@ impl AgentRunCoordinator {
             None,
             commit,
             Some(Box::new(rollback)),
+            None,
         )
         .await
     }
@@ -742,6 +756,7 @@ impl AgentRunCoordinator {
             Some(waiting),
             commit,
             Some(Box::new(rollback)),
+            None,
         )
         .await
     }
@@ -766,11 +781,53 @@ impl AgentRunCoordinator {
         let coordinator = self.clone();
         tokio::spawn(async move {
             coordinator
-                .run_locked(request, ticket, commit, Some(Box::new(rollback)))
+                .run_locked(request, ticket, commit, Some(Box::new(rollback)), None)
                 .await
         })
         .await
         .map_err(run_worker_stopped)?
+    }
+
+    /// An accepted run (spec §4.2) without a source commit: it waits for its
+    /// room, an agent slot, and a global permit, and gives up if stopped.
+    pub(crate) async fn run_accepted(
+        &self,
+        request: AgentRunRequest,
+        run_id: String,
+    ) -> Result<AgentRunEnvelope, ApiError> {
+        self.run_spawned(
+            request,
+            PermitMode::Wait,
+            None,
+            |_, _| Ok(()),
+            None,
+            Some(run_id),
+        )
+        .await
+    }
+
+    /// `run_accepted` with a source commit and rollback (a Telegram session's
+    /// owner turn).
+    pub(crate) async fn run_accepted_with_commit<F, R>(
+        &self,
+        request: AgentRunRequest,
+        run_id: String,
+        commit: F,
+        rollback: R,
+    ) -> Result<AgentRunEnvelope, ApiError>
+    where
+        F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
+        R: FnOnce(&mut DaemonState) -> Result<(), ApiError> + Send + 'static,
+    {
+        self.run_spawned(
+            request,
+            PermitMode::Wait,
+            None,
+            commit,
+            Some(Box::new(rollback)),
+            Some(run_id),
+        )
+        .await
     }
 
     async fn run_spawned<F>(
@@ -780,6 +837,7 @@ impl AgentRunCoordinator {
         waiting: Option<WaitingBudgetUnit>,
         commit: F,
         rollback: Option<AgentRunRollback>,
+        accepted: Option<String>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send + 'static,
@@ -791,11 +849,20 @@ impl AgentRunCoordinator {
         tokio::spawn(async move {
             // An invalid request fails before waiting for a room, slot, or permit.
             coordinator.prevalidate(&request).await?;
-            let ticket = coordinator
-                .acquire_ticket(&request, permit_mode, waiting)
-                .await?;
+            let ticket = match accepted.as_deref() {
+                Some(run_id) => {
+                    coordinator
+                        .acquire_accepted_ticket(&request, permit_mode, run_id)
+                        .await?
+                }
+                None => {
+                    coordinator
+                        .acquire_ticket(&request, permit_mode, waiting)
+                        .await?
+                }
+            };
             coordinator
-                .run_locked(request, ticket, commit, rollback)
+                .run_locked(request, ticket, commit, rollback, accepted)
                 .await
         })
         .await
@@ -844,6 +911,34 @@ impl AgentRunCoordinator {
             _reservation: reservation,
             permit,
         })
+    }
+
+    /// `acquire_ticket` for an accepted run, abandoned as soon as its control
+    /// is cancelled (spec §4.6: a stopped queued run never starts). Dropping
+    /// the wait releases whatever it held (see `SessionLease::drop`). Accepted
+    /// runs take no waiting-budget unit: the accepted queue has its own cap.
+    async fn acquire_accepted_ticket(
+        &self,
+        request: &AgentRunRequest,
+        permit_mode: PermitMode,
+        run_id: &str,
+    ) -> Result<RunTicket, ApiError> {
+        let control = self
+            .state
+            .read()
+            .await
+            .live
+            .runs()
+            .control(run_id)
+            .ok_or_else(|| ApiError::conflict(RUN_NOT_QUEUED))?;
+        if control.cancel.is_cancelled() {
+            return Err(ApiError::conflict(RUN_STOPPED_BEFORE_START));
+        }
+        let admission = Box::pin(self.acquire_ticket(request, permit_mode, None));
+        match select(admission, control.cancel.cancelled()).await {
+            Either::Left((ticket, _)) => ticket,
+            Either::Right(((), _)) => Err(ApiError::conflict(RUN_STOPPED_BEFORE_START)),
+        }
     }
 
     /// Acquires the room lock, then an agent slot (spec §4.3).
@@ -1003,6 +1098,7 @@ impl AgentRunCoordinator {
         ticket: RunTicket,
         commit: F,
         mut rollback: Option<AgentRunRollback>,
+        accepted: Option<String>,
     ) -> Result<AgentRunEnvelope, ApiError>
     where
         F: FnOnce(&mut DaemonState, &RunOutcome) -> Result<(), ApiError> + Send,
@@ -1053,6 +1149,19 @@ impl AgentRunCoordinator {
                     return Err(ApiError::conflict(DUPLICATE_IN_FLIGHT_RUN));
                 }
             }
+            // An accepted run starts only from its queued record, checked
+            // before anything below touches session state (audit M6).
+            let session_id = crate::sessions::session_id_for_room(&room_id);
+            if let Some(accepted_id) = accepted.as_deref() {
+                let waiting = guard.runs.get(accepted_id).is_some_and(|record| {
+                    record.status == RunStatus::Queued
+                        && record.agent_id == agent_id
+                        && record.session_id == session_id
+                });
+                if !waiting {
+                    return Err(ApiError::conflict(RUN_NOT_QUEUED));
+                }
+            }
             let Some((runtime, tool_context, base)) = guard.build_run_runtime(&agent_id, &room_id)
             else {
                 return Err(ApiError::not_found());
@@ -1060,7 +1169,6 @@ impl AgentRunCoordinator {
             // Spec §3: every room is a session; a new record is saved with the
             // run start below, so no extra save is added.
             let now_ms = anima_core::primitives::now_millis();
-            let session_id = crate::sessions::session_id_for_room(&room_id);
             let session_created = guard.ensure_run_session(crate::state::RunSessionRequest {
                 agent_id: &agent_id,
                 room_id: &room_id,
@@ -1090,20 +1198,36 @@ impl AgentRunCoordinator {
                 first_text: &content.text,
                 now_ms,
             });
-            let record = RunRecord::running(
-                RunStart {
-                    agent_id: agent_id.clone(),
-                    session_id: session_id.clone(),
-                    source,
-                    source_ref,
-                    idempotency_key: retry_key.clone(),
-                    text: content.text.clone(),
-                    model: runtime.config().model.clone(),
-                    provider: runtime.config().provider.clone(),
-                    parent_run_id: parent.as_ref().map(|link| link.run_id.clone()),
-                },
-                now_ms,
-            );
+            let record = match accepted.as_deref() {
+                // An accepted run starts from its queued record (spec §4.2),
+                // still queued: the lookup above ran under this same lock.
+                Some(accepted_id) => {
+                    let record = guard
+                        .runs
+                        .get_mut(accepted_id)
+                        .expect("the accepted run is queued, checked above");
+                    record.start(
+                        runtime.config().model.clone(),
+                        runtime.config().provider.clone(),
+                        now_ms,
+                    );
+                    record.clone()
+                }
+                None => RunRecord::running(
+                    RunStart {
+                        agent_id: agent_id.clone(),
+                        session_id: session_id.clone(),
+                        source,
+                        source_ref,
+                        idempotency_key: retry_key.clone(),
+                        text: content.text.clone(),
+                        model: runtime.config().model.clone(),
+                        provider: runtime.config().provider.clone(),
+                        parent_run_id: parent.as_ref().map(|link| link.run_id.clone()),
+                    },
+                    now_ms,
+                ),
+            };
             let run_id = record.id.clone();
             // Registered before the start save, so a stop can reach the run
             // from the moment it is durable (spec §4.6).
@@ -1132,21 +1256,51 @@ impl AgentRunCoordinator {
         };
         if let Err(error) = running_persist_request.save().await {
             let mut guard = self.state.write().await;
-            guard.runs.remove(&run_id);
+            if accepted.is_some() {
+                // Durable only as queued, so it never started: it is settled
+                // here, once, as its streams heard it was queued. A stop that
+                // reached its control meanwhile is kept. The next save
+                // persists this; a restart before then interrupts it as never
+                // started. Its session queue then finds it settled.
+                let stopped = live_run.control().cancel.is_cancelled();
+                if let Some(record) = guard.runs.get_mut(&run_id) {
+                    let (status, run_error) = if stopped {
+                        (
+                            RunStatus::Cancelled,
+                            RunError::new(RUN_STOPPED, STOPPED_BY_OWNER),
+                        )
+                    } else {
+                        (
+                            RunStatus::Failed,
+                            RunError::new(COMMIT_FAILED, error.to_string()),
+                        )
+                    };
+                    record.started_at_ms = None;
+                    record.finish(
+                        status,
+                        Some(run_error),
+                        anima_core::primitives::now_millis(),
+                    );
+                    live_run.publish_record(record);
+                }
+            } else {
+                guard.runs.remove(&run_id);
+                // A stream opened during the save listed this run in its
+                // snapshot (the record was already active); this ends it
+                // there. Published under the state lock, after the removal,
+                // so every stream whose snapshot held the run hears it.
+                // Nobody else ever saw it start.
+                let mut failed = started;
+                failed.finish(
+                    RunStatus::Failed,
+                    Some(RunError::new(COMMIT_FAILED, error.to_string())),
+                    anima_core::primitives::now_millis(),
+                );
+                live_run.publish_record(&failed);
+            }
             if session_created {
                 guard.sessions.remove(&agent_id, &session_id);
             }
-            // A stream opened during the save listed this run in its snapshot
-            // (the record was already active); this ends it there. Published
-            // under the state lock, after the removal, so every stream whose
-            // snapshot held the run hears it. Nobody else ever saw it start.
-            let mut failed = started;
-            failed.finish(
-                RunStatus::Failed,
-                Some(RunError::new(COMMIT_FAILED, error.to_string())),
-                anima_core::primitives::now_millis(),
-            );
-            live_run.publish_record(&failed);
             drop(guard);
             in_flight.disarm();
             return Err(ApiError::service_unavailable(error.to_string()));
@@ -1631,6 +1785,8 @@ async fn persist_task_result_memory(
 
 #[cfg(test)]
 mod live_tests;
+#[cfg(test)]
+mod queue_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

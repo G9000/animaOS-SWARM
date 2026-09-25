@@ -22,7 +22,7 @@ use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
 use crate::history::HistoryDeletion;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
-use crate::runs::RunSource;
+use crate::runs::{RunOutcome, RunSource};
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
 use crate::state::DaemonState;
 
@@ -851,8 +851,32 @@ impl ConnectorManager {
         let manager = self.clone();
         tokio::spawn(async move {
             manager
-                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key)
+                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key, None)
                 .await
+        })
+        .await
+        .map_err(|_| ConnectorManagerError::WorkerStopped)?
+    }
+
+    /// A Telegram session's owner turn accepted as run `run_id` by the
+    /// session runs route (spec §4.2): the same flow, without the fail-fast
+    /// waiting budget (the accepted queue has its own cap) and without the
+    /// transcript replay (acceptance already checked the key in the ledger).
+    #[allow(dead_code)] // The session runs route (next commit) starts Telegram turns.
+    pub(crate) async fn send_from_owner_accepted(
+        &self,
+        agent_id: String,
+        connector_id: String,
+        text: String,
+        idempotency_key: String,
+        run_id: String,
+    ) -> Result<(), ConnectorManagerError> {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            manager
+                .send_from_owner_owned(agent_id, connector_id, text, idempotency_key, Some(run_id))
+                .await
+                .map(|_| ())
         })
         .await
         .map_err(|_| ConnectorManagerError::WorkerStopped)?
@@ -864,6 +888,7 @@ impl ConnectorManager {
         connector_id: String,
         text: String,
         idempotency_key: String,
+        accepted: Option<String>,
     ) -> Result<(crate::routes::AgentRunEnvelope, bool), ConnectorManagerError> {
         let owner_send_lock = self.owner_send_lock(&connector_id, &idempotency_key);
         let _owner_send_guard = owner_send_lock.lock().await;
@@ -896,7 +921,11 @@ impl ConnectorManager {
                 .await
                 .get(&connector_id)
                 .map(|worker| worker.generation);
-            let replay = owner_send_replay(&state, &connector, &text, &idempotency_key)?;
+            let replay = if accepted.is_some() {
+                None
+            } else {
+                owner_send_replay(&state, &connector, &text, &idempotency_key)?
+            };
             (connector, worker_generation, replay)
         };
         if let Some(replay) = replay {
@@ -906,13 +935,19 @@ impl ConnectorManager {
         // waiting (spec §16). The run then waits for the Telegram room, an
         // agent slot, and a global permit, in that order (spec §4.3), and
         // gives the unit back once it holds the permit.
-        if !self.runs.has_available_permit() {
-            return Err(ConnectorManagerError::Backpressure);
-        }
-        let waiting = self
-            .runs
-            .try_take_waiting_unit(&connector.agent_id)
-            .ok_or(ConnectorManagerError::Backpressure)?;
+        // An accepted send is counted by the accepted queue's cap instead.
+        let waiting = if accepted.is_some() {
+            None
+        } else {
+            if !self.runs.has_available_permit() {
+                return Err(ConnectorManagerError::Backpressure);
+            }
+            Some(
+                self.runs
+                    .try_take_waiting_unit(&connector.agent_id)
+                    .ok_or(ConnectorManagerError::Backpressure)?,
+            )
+        };
         let commit_connector_id = connector.id.clone();
         let commit_agent_id = connector.agent_id.clone();
         let commit_room_id = connector.room_id.clone();
@@ -941,107 +976,113 @@ impl ConnectorManager {
             source_ref: Some(connector.id.clone()),
             parent: None,
         };
-        let run = self
-            .runs
-            .run_budgeted_with_commit_waiting(
-                request,
-                waiting,
-                move |state, outcome| {
-                    let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
-                        ApiError::service_unavailable("connector lifecycle changed during run")
-                    })?;
-                    let workers = commit_workers.try_lock().map_err(|_| {
-                        ApiError::service_unavailable("connector worker changed during run")
-                    })?;
-                    if workers
-                        .get(&commit_connector_id)
-                        .map(|worker| worker.generation)
-                        != connector_worker_generation
-                    {
-                        return Err(ApiError::service_unavailable(
-                            "connector worker changed during run",
-                        ));
-                    }
-                    let connector_unchanged = state
-                        .connectors
-                        .get(&commit_connector_id)
-                        .is_some_and(|current| {
-                            current.is_active()
-                                && current.agent_id == commit_agent_id
-                                && current.room_id == commit_room_id
-                                && current.approved_chat.as_ref().map(|chat| &chat.id)
-                                    == commit_chat_id.as_ref()
-                        });
-                    if !connector_unchanged {
-                        return Err(ApiError::not_found());
-                    }
-                    if outcome.result.status == TaskStatus::Error || commit_chat_id.is_none() {
-                        return Ok(());
-                    }
-                    if state
-                        .outbound
-                        .values()
-                        .filter(|record| {
-                            record.connector_id == commit_connector_id
-                                && record.delivery_state != OutboundDeliveryState::Delivered
-                        })
-                        .count()
-                        >= MAX_UNDELIVERED_OUTBOUND
-                    {
-                        return Err(ApiError::service_unavailable(
-                            "connector outbound capacity is exhausted",
-                        ));
-                    }
-                    let (Some(reply_id), Some(reply)) = (
-                        outcome.reply_message_id.clone(),
-                        outcome.result.data.as_ref(),
-                    ) else {
-                        return Err(ApiError::bad_request("agent produced no assistant message"));
-                    };
-                    let outbound_id =
-                        format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
-                    let outbound = TelegramOutboundRecord {
-                        id: outbound_id.clone(),
-                        connector_id: commit_connector_id.clone(),
-                        agent_id: commit_agent_id.clone(),
-                        room_id: commit_room_id.clone(),
-                        assistant_message_id: reply_id,
-                        text: reply.text.clone(),
-                        created_at_ms: now_ms(),
-                        delivered_at_ms: None,
-                        attempts: 0,
-                        delivery_state: OutboundDeliveryState::Pending,
-                        message_pruned: false,
-                    };
-                    if let Some(existing) = state.outbound.get(&outbound_id) {
-                        if existing != &outbound {
-                            return Err(ApiError::bad_request(
-                                "connector outbound conflicts with run",
-                            ));
-                        }
-                    } else {
-                        state.outbound.insert(outbound_id, outbound.clone());
-                        *commit_rollback_outbound
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outbound);
-                    }
-                    Ok(())
-                },
-                move |state| {
-                    if let Some(inserted) = rollback_outbound
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .as_ref()
-                    {
-                        if state.outbound.get(&inserted.id) == Some(inserted) {
-                            state.outbound.remove(&inserted.id);
-                        }
-                    }
-                    Ok(())
-                },
-            )
-            .await
-            .map_err(|_| ConnectorManagerError::Persistence)?;
+        let commit = move |state: &mut DaemonState, outcome: &RunOutcome| {
+            let _lifecycle = commit_lifecycle_lock.try_lock().map_err(|_| {
+                ApiError::service_unavailable("connector lifecycle changed during run")
+            })?;
+            let workers = commit_workers.try_lock().map_err(|_| {
+                ApiError::service_unavailable("connector worker changed during run")
+            })?;
+            if workers
+                .get(&commit_connector_id)
+                .map(|worker| worker.generation)
+                != connector_worker_generation
+            {
+                return Err(ApiError::service_unavailable(
+                    "connector worker changed during run",
+                ));
+            }
+            let connector_unchanged =
+                state
+                    .connectors
+                    .get(&commit_connector_id)
+                    .is_some_and(|current| {
+                        current.is_active()
+                            && current.agent_id == commit_agent_id
+                            && current.room_id == commit_room_id
+                            && current.approved_chat.as_ref().map(|chat| &chat.id)
+                                == commit_chat_id.as_ref()
+                    });
+            if !connector_unchanged {
+                return Err(ApiError::not_found());
+            }
+            if outcome.result.status == TaskStatus::Error || commit_chat_id.is_none() {
+                return Ok(());
+            }
+            if state
+                .outbound
+                .values()
+                .filter(|record| {
+                    record.connector_id == commit_connector_id
+                        && record.delivery_state != OutboundDeliveryState::Delivered
+                })
+                .count()
+                >= MAX_UNDELIVERED_OUTBOUND
+            {
+                return Err(ApiError::service_unavailable(
+                    "connector outbound capacity is exhausted",
+                ));
+            }
+            let (Some(reply_id), Some(reply)) = (
+                outcome.reply_message_id.clone(),
+                outcome.result.data.as_ref(),
+            ) else {
+                return Err(ApiError::bad_request("agent produced no assistant message"));
+            };
+            let outbound_id = format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
+            let outbound = TelegramOutboundRecord {
+                id: outbound_id.clone(),
+                connector_id: commit_connector_id.clone(),
+                agent_id: commit_agent_id.clone(),
+                room_id: commit_room_id.clone(),
+                assistant_message_id: reply_id,
+                text: reply.text.clone(),
+                created_at_ms: now_ms(),
+                delivered_at_ms: None,
+                attempts: 0,
+                delivery_state: OutboundDeliveryState::Pending,
+                message_pruned: false,
+            };
+            if let Some(existing) = state.outbound.get(&outbound_id) {
+                if existing != &outbound {
+                    return Err(ApiError::bad_request(
+                        "connector outbound conflicts with run",
+                    ));
+                }
+            } else {
+                state.outbound.insert(outbound_id, outbound.clone());
+                *commit_rollback_outbound
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(outbound);
+            }
+            Ok(())
+        };
+        let rollback = move |state: &mut DaemonState| {
+            if let Some(inserted) = rollback_outbound
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+            {
+                if state.outbound.get(&inserted.id) == Some(inserted) {
+                    state.outbound.remove(&inserted.id);
+                }
+            }
+            Ok(())
+        };
+        let run = match accepted {
+            Some(run_id) => {
+                self.runs
+                    .run_accepted_with_commit(request, run_id, commit, rollback)
+                    .await
+            }
+            None => {
+                let waiting = waiting.expect("a direct owner send holds a waiting unit");
+                self.runs
+                    .run_budgeted_with_commit_waiting(request, waiting, commit, rollback)
+                    .await
+            }
+        }
+        .map_err(|_| ConnectorManagerError::Persistence)?;
         let delivery_queued = delivery_queued && run.result.status == "success";
         Ok((run, delivery_queued))
     }

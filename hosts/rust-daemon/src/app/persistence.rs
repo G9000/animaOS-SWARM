@@ -595,7 +595,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrading_any_older_snapshot_writes_the_backup_before_saving_version_five() {
+    async fn upgrading_any_pre_sessions_snapshot_writes_the_backup_before_saving_version_six() {
         for version in [None, Some(1), Some(2), Some(3), Some(4)] {
             let dir = temp_dir("upgrade");
             std::fs::create_dir_all(&dir).unwrap();
@@ -617,12 +617,72 @@ mod tests {
                 original,
                 "{version:?}: the backup is the untouched original"
             );
+            assert!(
+                !crate::control_plane_store::pre_live_runs_backup_path(&path).exists(),
+                "{version:?}: a pre-sessions snapshot keeps the pre-sessions name"
+            );
             let saved: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-            assert_eq!(saved["version"], 5, "{version:?}");
+            assert_eq!(saved["version"], 6, "{version:?}");
             assert_eq!(state.read().await.agent_count(), 1);
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// Controller ruling (M3 pre-flight audit I2): an M2 (version-5) snapshot
+    /// is backed up as `.pre-live-runs.bak` before version 6 is saved, and the
+    /// `.pre-sessions.bak` the M2 upgrade wrote is left as it was.
+    #[tokio::test]
+    async fn upgrading_a_version_five_snapshot_writes_the_live_runs_backup_and_loads_it() {
+        let dir = temp_dir("upgrade-live-runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("control-plane.json");
+        let mut source = crate::state::DaemonState::new();
+        let agent_id = source.create_agent(upgrader()).unwrap().state.id;
+        source.sessions.insert(crate::sessions::SessionRecord::new(
+            &agent_id,
+            "chat:kept",
+            crate::sessions::SessionKind::Chat,
+            crate::sessions::SessionOrigin::Web,
+            "Kept".into(),
+            crate::sessions::TitleSource::Owner,
+            1,
+        ));
+        let mut value = serde_json::to_value(source.control_plane_snapshot()).unwrap();
+        value["version"] = 5.into();
+        let original = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let m2_backup = older_snapshot_file(Some(4));
+        let pre_sessions = crate::control_plane_store::pre_sessions_backup_path(&path);
+        std::fs::write(&pre_sessions, &m2_backup).unwrap();
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
+
+        configure_control_plane_store(&state, Some(ControlPlaneStoreConfig::Json(path.clone())))
+            .await
+            .unwrap();
+
+        let backup = crate::control_plane_store::pre_live_runs_backup_path(&path);
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            original,
+            "the backup is the untouched version-5 original"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pre_sessions).unwrap(),
+            m2_backup,
+            "the M2 upgrade's backup is never overwritten"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 6);
+        let guard = state.read().await;
+        assert_eq!(guard.agent_count(), 1);
+        assert_eq!(
+            guard.sessions.get(&agent_id, "chat:kept").unwrap().title,
+            "Kept"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -635,7 +695,7 @@ mod tests {
         configure_control_plane_store(&fresh, Some(config.clone()))
             .await
             .unwrap();
-        assert!(path.exists(), "a fresh start saves a version-5 snapshot");
+        assert!(path.exists(), "a fresh start saves a version-6 snapshot");
 
         let restarted = Arc::new(tokio::sync::RwLock::new(crate::state::DaemonState::new()));
         configure_control_plane_store(&restarted, Some(config))
@@ -643,6 +703,10 @@ mod tests {
             .unwrap();
 
         assert!(!crate::control_plane_store::pre_sessions_backup_path(&path).exists());
+        assert!(!crate::control_plane_store::pre_live_runs_backup_path(&path).exists());
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 6, "a version-6 snapshot writes no backup");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -660,7 +724,7 @@ mod tests {
         configure_control_plane_store(&fresh, Some(config.clone()))
             .await
             .unwrap();
-        assert!(path.exists(), "a fresh start saves a version-5 snapshot");
+        assert!(path.exists(), "a fresh start saves a version-6 snapshot");
 
         let backup = crate::control_plane_store::pre_sessions_backup_path(&path);
         let preexisting_backup = "{\"version\":3,\"agents\":[],\"swarms\":[]}";

@@ -1167,7 +1167,7 @@ mod tests {
         }
 
         let snapshot = source.control_plane_snapshot();
-        assert_eq!(snapshot.version, 5);
+        assert_eq!(snapshot.version, 6);
         assert_eq!(
             snapshot.runs.len(),
             3,
@@ -1762,15 +1762,7 @@ impl DaemonState {
             .runs
             .snapshot_records(&self.live_agent_ids())
             .into_iter()
-            .map(|record| {
-                let mut record = self.with_live_tools(record);
-                // Controller ruling (M3 Task 6): nothing M2 cannot read is
-                // saved before Task 7's snapshot version 6, and an M2 daemon
-                // would silently drop this field. Until then the reply id
-                // lives in the ledger's memory and the history store's copy.
-                record.reply_message_id = None;
-                record
-            })
+            .map(|record| self.with_live_tools(record))
             .collect();
         snapshot.sessions = self.sessions.snapshot_records(&self.live_agent_ids());
         snapshot.tool_grants_applied = self.tool_grants_applied.iter().cloned().collect();
@@ -1784,12 +1776,12 @@ impl DaemonState {
     ) -> Result<(usize, usize), String> {
         self.validate_control_plane_snapshot(&snapshot)?;
         // Spec §13.3 step 2: legacy per-tick check-in rooms become their
-        // automation's session. Only a snapshot older than this store version
-        // can still hold a pre-M2 room-* check-in; relabeling a room a live
-        // run created this boot would strand its already-mirrored history
-        // under the old id, so a current snapshot is left alone.
+        // automation's session. Only a snapshot older than the sessions
+        // version can still hold a pre-M2 room-* check-in; relabeling a room a
+        // live run created would strand its already-mirrored history under
+        // the old id, so an M2 or later snapshot is left alone.
         let (relabelled_messages, relabelled_runs) =
-            if snapshot.version < crate::control_plane_store::CONTROL_PLANE_STORE_VERSION {
+            if snapshot.version < crate::control_plane_store::SESSIONS_STORE_VERSION {
                 crate::sessions::migration::relabel_legacy_checkin_rooms(
                     &mut snapshot.agents,
                     &mut snapshot.runs,

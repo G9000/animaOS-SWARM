@@ -16,6 +16,14 @@ pub(crate) const MAX_RUN_INPUT_TEXT_BYTES: usize = 32 * 1024;
 pub(crate) const MAX_RUN_TOOLS_STARTED: usize = 50;
 /// Per-model-call usage kept per run (spec §4.1 `steps`).
 pub(crate) const MAX_RUN_STEPS: usize = 50;
+/// Attachments per message (spec §4.1, §16).
+#[allow(dead_code)] // The session runs route (next commit) checks it.
+pub(crate) const MAX_RUN_ATTACHMENTS: usize = 10;
+/// A reused `Idempotency-Key` answers with its original run for 24 hours
+/// (spec §4.2), within the ledger's retention: only while the ledger still
+/// holds the run, so at most 24 hours and, once mirrored, among the agent's
+/// newest `MAX_TERMINAL_RUNS_PER_AGENT` finished runs (audit M1).
+pub(crate) const IDEMPOTENCY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) const RESTART_BEFORE_START: &str = "restart_before_start";
 pub(crate) const RESTART_DURING_RUN: &str = "restart_during_run";
@@ -24,6 +32,8 @@ pub(crate) const RUN_ABORTED: &str = "run_aborted";
 pub(crate) const COMMIT_REJECTED: &str = "commit_rejected";
 pub(crate) const COMMIT_FAILED: &str = "commit_failed";
 pub(crate) const AGENT_DELETED: &str = "agent_deleted";
+pub(crate) const RUN_STOPPED: &str = "stopped";
+pub(crate) const STOPPED_BY_OWNER: &str = "Stopped by owner";
 
 /// Ledger states (spec §4.1). M1 produces `Running`, `Completed`, `Failed`,
 /// and `Interrupted`; the others arrive with async runs and approvals.
@@ -226,6 +236,23 @@ impl RunRecord {
         }
     }
 
+    /// A run accepted now that starts later (spec §4.2).
+    pub(crate) fn queued(start: RunStart, now_ms: u64) -> Self {
+        let mut record = Self::running(start, now_ms);
+        record.status = RunStatus::Queued;
+        record.started_at_ms = None;
+        record
+    }
+
+    /// A queued run starts executing now, with the model it runs on.
+    pub(crate) fn start(&mut self, model: String, provider: Option<String>, now_ms: u64) {
+        self.status = RunStatus::Running;
+        self.started_at_ms = Some(now_ms.max(self.created_at_ms));
+        self.model = model;
+        self.provider = provider;
+        self.mirrored = false;
+    }
+
     /// Records a terminal status; a later call (for example a rolled-back
     /// commit) replaces an earlier one, so the history store's copy, if any,
     /// is written again.
@@ -304,6 +331,52 @@ impl RunLedger {
             .values()
             .filter(|record| record.agent_id == agent_id && record.status.is_in_flight())
             .count()
+    }
+
+    /// Runs of this agent accepted but not started (spec §4.2's queue).
+    pub(crate) fn queued_count(&self, agent_id: &str) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.agent_id == agent_id && record.status == RunStatus::Queued)
+            .count()
+    }
+
+    /// The newest run of this agent created with `key` at or after `since_ms`.
+    pub(crate) fn find_by_idempotency_key(
+        &self,
+        agent_id: &str,
+        key: &str,
+        since_ms: u64,
+    ) -> Option<&RunRecord> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.agent_id == agent_id
+                    && record.created_at_ms >= since_ms
+                    && record.idempotency_key.as_deref() == Some(key)
+            })
+            .max_by(|left, right| {
+                left.created_at_ms
+                    .cmp(&right.created_at_ms)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+    }
+
+    /// This session's runs, newest first.
+    #[allow(dead_code)] // The session runs route (next commit) lists them.
+    pub(crate) fn for_session(&self, agent_id: &str, session_id: &str) -> Vec<&RunRecord> {
+        let mut records = self
+            .records
+            .values()
+            .filter(|record| record.agent_id == agent_id && record.session_id == session_id)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| {
+            right
+                .created_at_ms
+                .cmp(&left.created_at_ms)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        records
     }
 
     /// Runs of this session that are queued, running, or awaiting approval.
@@ -1030,5 +1103,84 @@ mod tests {
             .for_agent("agent-a")
             .iter()
             .all(|run| run.id == running_id));
+    }
+
+    #[test]
+    fn queued_runs_wait_until_started_and_count_toward_the_queue() {
+        let mut ledger = RunLedger::default();
+        let queued = RunRecord::queued(start("agent-1"), 10);
+        assert_eq!(queued.status, RunStatus::Queued);
+        assert_eq!(queued.started_at_ms, None);
+        ledger.insert(queued.clone());
+        ledger.insert(record("agent-1", 11));
+        ledger.insert(RunRecord::queued(start("agent-2"), 12));
+        assert_eq!(ledger.queued_count("agent-1"), 1);
+        assert_eq!(
+            ledger.in_flight_count("agent-1"),
+            1,
+            "a queued run is not in flight"
+        );
+
+        let run = ledger.get_mut(&queued.id).unwrap();
+        run.start("gpt-5.5".into(), Some("openai".into()), 20);
+        assert_eq!(run.status, RunStatus::Running);
+        assert_eq!(run.started_at_ms, Some(20));
+        assert_eq!(run.model, "gpt-5.5");
+        assert_eq!(ledger.queued_count("agent-1"), 0);
+    }
+
+    #[test]
+    fn idempotency_keys_are_found_per_agent_within_the_window() {
+        let mut ledger = RunLedger::default();
+        let mut keyed = start("agent-1");
+        keyed.idempotency_key = Some("key-1".into());
+        let old = RunRecord::queued(keyed.clone(), 100);
+        let newer = RunRecord::queued(keyed, 200);
+        ledger.insert(old.clone());
+        ledger.insert(newer.clone());
+
+        assert_eq!(
+            ledger
+                .find_by_idempotency_key("agent-1", "key-1", 0)
+                .map(|record| record.id.as_str()),
+            Some(newer.id.as_str())
+        );
+        assert_eq!(
+            ledger.find_by_idempotency_key("agent-1", "key-1", 201),
+            None,
+            "outside the window"
+        );
+        assert_eq!(ledger.find_by_idempotency_key("agent-2", "key-1", 0), None);
+        assert_eq!(ledger.find_by_idempotency_key("agent-1", "key-2", 0), None);
+        let ids: Vec<&str> = ledger
+            .for_session("agent-1", "direct:test")
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        assert_eq!(ids, [newer.id.as_str(), old.id.as_str()], "newest first");
+    }
+
+    /// Carry-forward (M2 T17 Minor 9): a message still waiting to start keeps
+    /// its session active, so the web never declares the send unconfirmed.
+    #[test]
+    fn a_queued_run_alone_keeps_its_session_active() {
+        let mut ledger = RunLedger::default();
+        let queued = RunRecord::queued(start("agent-1"), 10);
+        ledger.insert(queued);
+
+        assert_eq!(
+            ledger.active_sessions(),
+            HashSet::from([("agent-1".to_string(), "direct:test".to_string())])
+        );
+        assert_eq!(ledger.active_count_for_session("agent-1", "direct:test"), 1);
+        assert_eq!(ledger.active_records().len(), 1);
+    }
+
+    #[test]
+    fn the_accepted_run_limits_match_the_spec() {
+        assert_eq!(MAX_RUN_ATTACHMENTS, 10);
+        assert_eq!(IDEMPOTENCY_WINDOW_MS, 24 * 60 * 60 * 1000);
+        assert_eq!(RUN_STOPPED, "stopped");
+        assert_eq!(STOPPED_BY_OWNER, "Stopped by owner");
     }
 }
