@@ -35,9 +35,14 @@ impl DaemonState {
     }
 
     /// An isolated runtime for one run of `agent_id` in `room_id`: the
-    /// canonical state and counters with only that room's history, the
-    /// standard providers, evaluators, and database, and no Running→Failed
-    /// restore conversion. The canonical runtime is not touched.
+    /// canonical state and counters with a trimmed copy of that room's
+    /// history, the standard providers, evaluators, and database, and no
+    /// Running→Failed restore conversion. In every room the copy starts at
+    /// the first user message, so it never opens mid-turn (final fix wave
+    /// A2); a `schedule:` room's copy also drops silent check-in pairs
+    /// and keeps only the newest [`SCHEDULE_ROOM_CONTEXT_TURNS`] turns (the
+    /// interim schedule-room cap). The run base counts the trimmed copy, and
+    /// the canonical runtime and its transcript are not touched.
     pub(crate) fn build_run_runtime(
         &self,
         agent_id: &str,
@@ -53,14 +58,23 @@ impl DaemonState {
         // Interim context guard (controller ruling, M2 pre-flight audit
         // finding 5): a `schedule:` room's history drops silent check-in
         // pairs (the same rule `crate::sessions::hidden_message_ids` gives
-        // session views) and keeps only the newest whole turns. `run_base`
-        // below reads this trimmed copy's own length, so run deltas and
-        // commits still see exactly what this run appends; the canonical
-        // transcript above is only read, never written. Other rooms are
-        // unchanged in M2; M3's context selection replaces this for every room.
+        // session views) and keeps only the newest whole turns. M3's context
+        // selection replaces this for every room.
         if crate::sessions::schedule_id_of_room(room_id).is_some() {
             history = recent_turns(history);
         }
+        // Every room (final fix wave A2): providers reject a tool result
+        // whose call is missing, so a history that starts mid-turn (after a
+        // prune, with an old assistant message kept alone because an
+        // undelivered Telegram record still names it, or in a legacy
+        // transcript) loses its messages before the first user message.
+        // `run_base` below reads this trimmed copy's own length, so run
+        // deltas and commits still see exactly what this run appends; the
+        // canonical transcript above is only read, never written.
+        let first_turn = crate::sessions::turn_starts(&history)
+            .next()
+            .unwrap_or(history.len());
+        history.drain(..first_turn);
         let mut runtime = AgentRuntime::from_snapshot(
             canonical.run_snapshot(history),
             Arc::clone(&self.model_adapter),
@@ -161,27 +175,23 @@ impl DaemonState {
 }
 
 /// `history` with silent check-in pairs excluded and only the newest
-/// [`SCHEDULE_ROOM_CONTEXT_TURNS`] whole turns kept. A turn starts at a user
-/// message; every following assistant and tool message stays with it up to
-/// (not including) the next user message, so a tool-call turn is never split
-/// from its results.
+/// [`SCHEDULE_ROOM_CONTEXT_TURNS`] whole turns kept, cut at a turn start
+/// ([`crate::sessions::turn_starts`]) so a tool-call turn is never split from
+/// its results. With fewer turns nothing is cut here; `build_run_runtime`
+/// drops any messages before the first user message in every room.
 fn recent_turns(history: Vec<Message>) -> Vec<Message> {
     let hidden = crate::sessions::hidden_message_ids(history.iter());
-    let visible: Vec<Message> = history
+    let mut visible: Vec<Message> = history
         .into_iter()
         .filter(|message| !hidden.contains(&message.id))
         .collect();
-    let turn_starts: Vec<usize> = visible
-        .iter()
-        .enumerate()
-        .filter(|(_, message)| message.role == MessageRole::User)
-        .map(|(index, _)| index)
-        .collect();
-    if turn_starts.len() <= SCHEDULE_ROOM_CONTEXT_TURNS {
-        return visible;
+    let cutoff = crate::sessions::turn_starts(&visible)
+        .rev()
+        .nth(SCHEDULE_ROOM_CONTEXT_TURNS - 1);
+    if let Some(cutoff) = cutoff {
+        visible.drain(..cutoff);
     }
-    let cutoff = turn_starts[turn_starts.len() - SCHEDULE_ROOM_CONTEXT_TURNS];
-    visible[cutoff..].to_vec()
+    visible
 }
 
 #[cfg(test)]
@@ -236,8 +246,34 @@ mod tests {
         }
     }
 
+    /// Keeps the messages of every request, then answers like `FixedUsageModel`.
+    #[derive(Default)]
+    struct RecordingModel {
+        requests: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for RecordingModel {
+        fn provider(&self) -> &str {
+            "recording"
+        }
+
+        async fn generate(
+            &self,
+            config: &AgentConfig,
+            request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.requests.lock().unwrap().push(request.messages.clone());
+            FixedUsageModel.generate(config, request).await
+        }
+    }
+
     fn state_with_agent() -> (DaemonState, String) {
-        let mut state = DaemonState::with_model_adapter(Arc::new(FixedUsageModel));
+        state_with_model(Arc::new(FixedUsageModel))
+    }
+
+    fn state_with_model(model: Arc<dyn ModelAdapter>) -> (DaemonState, String) {
+        let mut state = DaemonState::with_model_adapter(model);
         let agent_id = state
             .create_agent(AgentConfig {
                 name: "committer".into(),
@@ -688,5 +724,83 @@ mod tests {
             10,
             "10 turns remain: the tool-call turn plus 9 simple ticks"
         );
+    }
+
+    /// Final fix wave A2: a room's history that starts mid-turn (a tool
+    /// result whose call is gone, or an old assistant message kept alone)
+    /// reaches the model from its first user message in every room, while the
+    /// canonical transcript keeps every message and gains exactly the run.
+    #[tokio::test]
+    async fn a_run_history_that_starts_mid_turn_reaches_the_model_from_its_first_user_message() {
+        let schedule_room = crate::sessions::schedule_room_id("schedule-3");
+        for (room, leading_role) in [
+            ("chat:a", MessageRole::Tool),
+            ("chat:a", MessageRole::Assistant),
+            (schedule_room.as_str(), MessageRole::Tool),
+        ] {
+            let context = format!("{room} starting with a {leading_role:?} message");
+            let model = Arc::new(RecordingModel::default());
+            let (mut state, agent_id) = state_with_model(model.clone());
+            seed_history(
+                &mut state,
+                &agent_id,
+                vec![
+                    history_message(&agent_id, room, "leading", leading_role, "old", false),
+                    history_message(
+                        &agent_id,
+                        room,
+                        "leading-reply",
+                        MessageRole::Assistant,
+                        "old reply",
+                        false,
+                    ),
+                    history_message(&agent_id, room, "user-1", MessageRole::User, "hi", false),
+                    history_message(
+                        &agent_id,
+                        room,
+                        "assistant-1",
+                        MessageRole::Assistant,
+                        "hello",
+                        false,
+                    ),
+                ],
+            );
+            let run_id = start_run(&mut state, &agent_id, room);
+
+            let (mut change_set, outcome) = execute(&state, &agent_id, room, &run_id, "next").await;
+
+            let requests = model.requests.lock().unwrap().clone();
+            let sent: Vec<(&str, MessageRole)> = requests[0]
+                .iter()
+                .map(|message| (message.content.text.as_str(), message.role))
+                .collect();
+            assert_eq!(
+                sent,
+                [
+                    ("hi", MessageRole::User),
+                    ("hello", MessageRole::Assistant),
+                    ("next", MessageRole::User),
+                ],
+                "{context}: the model sees whole turns only"
+            );
+            assert!(state.commit_run(&mut change_set, &outcome));
+            let transcript: Vec<String> = state
+                .get_agent(&agent_id)
+                .unwrap()
+                .messages
+                .into_iter()
+                .map(|message| message.id)
+                .collect();
+            assert_eq!(
+                transcript[..4],
+                ["leading", "leading-reply", "user-1", "assistant-1"],
+                "{context}: the canonical transcript is never trimmed"
+            );
+            assert_eq!(
+                transcript.len(),
+                6,
+                "{context}: the commit adds exactly the run's turn"
+            );
+        }
     }
 }

@@ -32,7 +32,8 @@ pub(crate) struct PruneUndo {
 
 impl DaemonState {
     /// Removes the hot messages that may leave the control plane: mirrored,
-    /// outside their session's newest 200 visible messages, older than 24
+    /// before the turn that holds the oldest of their session's newest 200
+    /// visible messages (the window keeps that turn whole), older than 24
     /// hours, not referenced by an undelivered Telegram record, and not in a
     /// session with an active run. Delivered records of pruned messages are
     /// marked `messagePruned`. `None` when nothing may be pruned (an
@@ -69,7 +70,7 @@ impl DaemonState {
                 }
                 prunable.extend(
                     outside_newest_visible(&messages)
-                        .into_iter()
+                        .iter()
                         .filter(|message| {
                             message.created_at_ms <= cutoff
                                 && !undelivered_references.contains(message.id.as_str())
@@ -140,24 +141,30 @@ impl DaemonState {
     }
 }
 
-/// One room's messages that are not among its newest `HOT_TAIL_MESSAGES`
-/// visible ones, newest first; `messages` are the room's messages in
-/// transcript order. Only visible messages take a place (Controller ruling 1,
-/// M2 pre-flight audit), so a hidden message stays while fewer than
-/// `HOT_TAIL_MESSAGES` visible messages are newer than it.
-fn outside_newest_visible<'a>(messages: &[&'a Message]) -> Vec<&'a Message> {
+/// One room's messages before the turn that holds the oldest of its newest
+/// `HOT_TAIL_MESSAGES` visible messages, oldest first; `messages` are the
+/// room's messages in transcript order. Only visible messages take a place
+/// (Controller ruling 1, M2 pre-flight audit), so a hidden message stays
+/// while fewer than `HOT_TAIL_MESSAGES` visible messages are newer than it.
+/// The cut then moves back to the user message that starts that turn (final
+/// fix wave A1), so the window never holds a tool result without its call;
+/// while the window edge is still before a room's first user message,
+/// nothing is outside.
+fn outside_newest_visible<'m, 'a>(messages: &'m [&'a Message]) -> &'m [&'a Message] {
     let hidden = hidden_message_ids(messages.iter().copied());
+    let mut edge = messages.len();
     let mut newer_visible = 0;
-    let mut outside = Vec::new();
-    for message in messages.iter().rev().copied() {
-        if newer_visible >= HOT_TAIL_MESSAGES {
-            outside.push(message);
-        }
-        if !hidden.contains(&message.id) {
+    while edge > 0 && newer_visible < HOT_TAIL_MESSAGES {
+        edge -= 1;
+        if !hidden.contains(&messages[edge].id) {
             newer_visible += 1;
         }
     }
-    outside
+    let cut = super::turn_starts(messages)
+        .rev()
+        .find(|&start| start <= edge)
+        .unwrap_or(0);
+    &messages[..cut]
 }
 
 /// One pruning pass inside a control-plane transaction; returns how many
@@ -204,9 +211,10 @@ pub(crate) async fn prune_in_transaction(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use anima_core::{Message, MessageRole};
+    use anima_core::{DataValue, Message, MessageRole};
     use tokio::sync::{Mutex, RwLock};
 
     use super::*;
@@ -287,9 +295,11 @@ mod tests {
     #[tokio::test]
     async fn pruning_keeps_each_sessions_newest_recent_unmirrored_and_referenced_messages() {
         let (state, agent) = mirrored_state(|agent| {
-            let mut messages = room(agent, "chat:a", "a", 207);
+            // `a008`, the 200th-newest message, starts a turn, so `a000`
+            // through `a007` fall outside the window.
+            let mut messages = room(agent, "chat:a", "a", 208);
             messages[1].created_at_ms = NOW_MS - 1_000;
-            messages.extend(room(agent, "chat:c", "c", 201));
+            messages.extend(room(agent, "chat:c", "c", 202));
             messages.extend(room(agent, "chat:b", "b", 3));
             messages
         })
@@ -326,9 +336,9 @@ mod tests {
 
         let mut pruned = undo.message_ids.clone();
         pruned.sort();
-        assert_eq!(pruned, ["a000", "a002", "a005"]);
+        assert_eq!(pruned, ["a000", "a002", "a005", "a007"]);
         let hot = guard.get_agent(&agent).unwrap().messages;
-        assert_eq!(hot.len(), 207 + 201 + 3 - 3);
+        assert_eq!(hot.len(), 208 + 202 + 3 - 4);
         assert!(
             hot.iter().any(|message| message.id == "c000"),
             "a session with an active run keeps its whole transcript"
@@ -339,7 +349,7 @@ mod tests {
         guard.revert_prune(undo);
         assert_eq!(
             guard.get_agent(&agent).unwrap().messages.len(),
-            207 + 201 + 3
+            208 + 202 + 3
         );
         assert!(!guard.outbound["delivered"].message_pruned);
     }
@@ -432,6 +442,136 @@ mod tests {
         );
     }
 
+    /// Turn `turn` of `chat:a`: `[User, Assistant(tool calls), Tool,
+    /// Assistant]`, with the call and its result linked the way the runtime
+    /// links them (`toolCalls` on the call, `toolCallId` on the result).
+    fn tool_call_turn(agent_id: &str, turn: usize) -> [Message; 4] {
+        let id = |part: &str| format!("t{turn:03}-{part}");
+        let call_id = format!("call-{turn:03}");
+        let at = 1_000 + 4 * turn as u64;
+        let mut call = message(
+            agent_id,
+            &id("call"),
+            "chat:a",
+            MessageRole::Assistant,
+            "Let me look.",
+            at + 1,
+        );
+        call.content.metadata = Some(BTreeMap::from([(
+            "toolCalls".to_string(),
+            DataValue::Array(vec![DataValue::Object(BTreeMap::from([
+                ("id".to_string(), DataValue::String(call_id.clone())),
+                ("name".to_string(), DataValue::String("read_file".into())),
+                ("args".to_string(), DataValue::Object(BTreeMap::new())),
+            ]))]),
+        )]));
+        let mut result = message(
+            agent_id,
+            &id("result"),
+            "chat:a",
+            MessageRole::Tool,
+            "file contents",
+            at + 2,
+        );
+        result.content.metadata = Some(BTreeMap::from([(
+            "toolCallId".to_string(),
+            DataValue::String(call_id),
+        )]));
+        [
+            message(
+                agent_id,
+                &id("user"),
+                "chat:a",
+                MessageRole::User,
+                "Read the file.",
+                at,
+            ),
+            call,
+            result,
+            message(
+                agent_id,
+                &id("reply"),
+                "chat:a",
+                MessageRole::Assistant,
+                "Done.",
+                at + 3,
+            ),
+        ]
+    }
+
+    /// Fails when a tool result in `messages` has no earlier assistant
+    /// message carrying its call: providers reject such a history.
+    fn assert_no_orphaned_tool_result(messages: &[Message], context: &str) {
+        let mut calls = HashSet::new();
+        for message in messages {
+            let metadata = message.content.metadata.as_ref();
+            match (
+                message.role,
+                metadata.and_then(|metadata| metadata.get("toolCalls")),
+            ) {
+                (MessageRole::Assistant, Some(DataValue::Array(tool_calls))) => {
+                    for tool_call in tool_calls {
+                        if let DataValue::Object(tool_call) = tool_call {
+                            if let Some(DataValue::String(id)) = tool_call.get("id") {
+                                calls.insert(id.clone());
+                            }
+                        }
+                    }
+                }
+                (MessageRole::Tool, _) => {
+                    let Some(DataValue::String(call_id)) =
+                        metadata.and_then(|metadata| metadata.get("toolCallId"))
+                    else {
+                        panic!("{context}: tool result {} names no call", message.id);
+                    };
+                    assert!(
+                        calls.contains(call_id),
+                        "{context}: tool result {} is kept without its call",
+                        message.id
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pruning_keeps_whole_turns_wherever_the_window_edge_falls() {
+        // Final fix wave A1: providers reject a tool result whose call is
+        // gone, so the cut moves back to the start of the turn it lands in.
+        for edge_offset in 0..4 {
+            let (state, agent) = mirrored_state(|agent| {
+                let mut messages: Vec<Message> = (0..52)
+                    .flat_map(|turn| tool_call_turn(agent, turn))
+                    .collect();
+                // The newest turn's first `edge_offset` messages put the
+                // 200th-newest message `edge_offset` messages into turn 2.
+                messages.extend(tool_call_turn(agent, 52).into_iter().take(edge_offset));
+                messages
+            })
+            .await;
+            let context = format!("window edge {edge_offset} messages into a turn");
+            let mut guard = state.write().await;
+
+            let undo = guard
+                .prune_hot_tail(NOW_MS)
+                .expect("the turns before the window edge's turn leave");
+
+            let hot = guard.get_agent(&agent).unwrap().messages;
+            assert_no_orphaned_tool_result(&hot, &context);
+            assert_eq!(
+                hot[0].id, "t002-user",
+                "{context}: the hot tail starts at the user message opening the edge's turn"
+            );
+            assert_eq!(hot.len(), HOT_TAIL_MESSAGES + edge_offset, "{context}");
+            assert_eq!(
+                undo.message_ids.len(),
+                8,
+                "{context}: only turns 0 and 1 leave"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn pruning_is_off_for_ephemeral_stores_and_until_reconciled() {
         let mut ephemeral = DaemonState::new();
@@ -440,7 +580,7 @@ mod tests {
             .unwrap()
             .state
             .id;
-        seed_messages(&mut ephemeral, &agent, room(&agent, "chat:a", "a", 201));
+        seed_messages(&mut ephemeral, &agent, room(&agent, "chat:a", "a", 202));
         let ephemeral = Arc::new(RwLock::new(ephemeral));
         let history = ephemeral.read().await.history.clone();
         history
@@ -459,7 +599,7 @@ mod tests {
             .unwrap()
             .state
             .id;
-        seed_messages(&mut unreconciled, &agent, room(&agent, "chat:a", "a", 201));
+        seed_messages(&mut unreconciled, &agent, room(&agent, "chat:a", "a", 202));
         assert!(
             unreconciled.prune_hot_tail(NOW_MS).is_none(),
             "nothing is pruned before the store was reconciled"
@@ -468,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_prune_save_restores_the_hot_tail_and_a_saved_prune_forgets_mirrored_ids() {
-        let (state, agent) = mirrored_state(|agent| room(agent, "chat:a", "a", 201)).await;
+        let (state, agent) = mirrored_state(|agent| room(agent, "chat:a", "a", 202)).await;
         let transactions = Arc::new(Mutex::new(()));
         let gate = state
             .write()
@@ -482,15 +622,15 @@ mod tests {
         assert_eq!(error, "injected control-plane save failure");
         assert_eq!(
             state.read().await.get_agent(&agent).unwrap().messages.len(),
-            201
+            202
         );
         assert!(state.read().await.history.is_mirrored("a000"));
 
-        assert_eq!(prune_once(&state, &transactions, NOW_MS).await, Ok(1));
+        assert_eq!(prune_once(&state, &transactions, NOW_MS).await, Ok(2));
         let guard = state.read().await;
         let hot = guard.get_agent(&agent).unwrap().messages;
         assert_eq!(hot.len(), 200);
-        assert_eq!(hot[0].id, "a001");
+        assert_eq!(hot[0].id, "a002");
         assert!(
             !guard.history.is_mirrored("a000"),
             "pruned ids are no longer hot"
@@ -499,7 +639,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prune_waits_for_the_transaction_and_saves_without_the_state_lock() {
-        let (state, agent) = mirrored_state(|agent| room(agent, "chat:a", "a", 201)).await;
+        let (state, agent) = mirrored_state(|agent| room(agent, "chat:a", "a", 202)).await;
         let transactions = Arc::new(Mutex::new(()));
         let held = transactions.lock().await;
         let prune = tokio::spawn({
@@ -514,7 +654,7 @@ mod tests {
         );
         assert_eq!(
             state.read().await.get_agent(&agent).unwrap().messages.len(),
-            201
+            202
         );
 
         let gate = state
@@ -533,7 +673,7 @@ mod tests {
             assert_eq!(guard.get_agent(&agent).unwrap().messages.len(), 200);
         }
         gate.release.add_permits(1);
-        assert_eq!(within("the prune to finish", prune).await.unwrap(), Ok(1));
+        assert_eq!(within("the prune to finish", prune).await.unwrap(), Ok(2));
     }
 
     #[tokio::test]
@@ -624,7 +764,7 @@ mod tests {
             .unwrap()
             .state
             .id;
-        seed_messages(&mut source, &agent, room(&agent, "chat:a", "a", 201));
+        seed_messages(&mut source, &agent, room(&agent, "chat:a", "a", 202));
         let mut daemon = DaemonState::new();
         daemon.set_history(HistoryService::new(Arc::new(FlakyHistoryStore::new())));
         daemon
@@ -639,7 +779,7 @@ mod tests {
 
         assert_eq!(
             prune_once(&state, &Arc::new(Mutex::new(())), NOW_MS).await,
-            Ok(1)
+            Ok(2)
         );
 
         let guard = state.read().await;
@@ -647,7 +787,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].message_count, HOT_TAIL_MESSAGES);
         assert_eq!(listed[0].messages.len(), HOT_TAIL_MESSAGES);
-        assert_eq!(listed[0].messages[0].id, "a001");
+        assert_eq!(listed[0].messages[0].id, "a002");
         assert_eq!(
             guard.get_agent(&agent).unwrap().messages.len(),
             HOT_TAIL_MESSAGES

@@ -9,6 +9,7 @@ pub(crate) mod pruning;
 pub(crate) mod test_support;
 pub(crate) mod views;
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anima_core::{DataValue, Message, MessageRole};
@@ -512,6 +513,25 @@ pub(crate) const CALENDAR_SUMMARY_METADATA_KEY: &str = "calendarSummary";
 /// pre-flight audit): its session is titled `system`, not marked owner-read.
 pub(crate) fn is_calendar_write_followup(source_ref: Option<&str>) -> bool {
     source_ref.is_some_and(|source_ref| source_ref.starts_with(CALENDAR_WRITE_SOURCE_REF_PREFIX))
+}
+
+/// Where each turn of `messages` starts, oldest first; `messages` are one
+/// room's messages in transcript order. A turn starts at a user message and
+/// holds every following assistant, tool, and system message up to the next
+/// user message, so a cut made only at these indices never separates an
+/// assistant tool-call message from its tool results (providers reject a
+/// tool result whose call is missing). Messages before the first user
+/// message end a turn whose start is gone. Hot-tail pruning, a run's
+/// history, and the `schedule:` room context cap all cut here (final fix
+/// wave A); M3's context selection is meant to reuse it.
+pub(crate) fn turn_starts<M: Borrow<Message>>(
+    messages: &[M],
+) -> impl DoubleEndedIterator<Item = usize> + '_ {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| Borrow::<Message>::borrow(*message).role == MessageRole::User)
+        .map(|(index, _)| index)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

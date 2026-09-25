@@ -262,8 +262,9 @@ mod tests {
         );
     }
 
-    /// An agent with one more old message in `chat:a` than the hot tail keeps,
-    /// none of them mirrored yet, and a worker that prunes on every pass.
+    /// An agent with one more old turn (a user message and its reply) in
+    /// `chat:a` than the hot tail keeps, none of them mirrored yet, and a
+    /// worker that prunes on every pass.
     fn state_with_an_old_chat(store: Arc<FlakyHistoryStore>) -> (SharedDaemonState, String) {
         let mut daemon = DaemonState::new();
         daemon.set_history(HistoryService::new(store));
@@ -272,7 +273,7 @@ mod tests {
             .unwrap()
             .state
             .id;
-        let messages = (0..=HOT_TAIL_MESSAGES)
+        let messages = (0..HOT_TAIL_MESSAGES + 2)
             .map(|index| {
                 let role = if index % 2 == 0 {
                     MessageRole::User
@@ -320,7 +321,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(hot_ids(&state, &agent).await[0], "m001");
+        assert_eq!(hot_ids(&state, &agent).await[0], "m002");
         assert!(
             store
                 .get_message(&agent, "chat:a", "m000")
@@ -366,7 +367,7 @@ mod tests {
 
         assert_eq!(
             hot_ids(&state, &agent).await.len(),
-            HOT_TAIL_MESSAGES + 1,
+            HOT_TAIL_MESSAGES + 2,
             "a stale instance must not prune and save its snapshot"
         );
         let history = state.read().await.history.clone();
@@ -399,24 +400,25 @@ mod tests {
         worker.start(&owner);
 
         // The first pass reconciles and mirrors every message, which makes
-        // `m000` prunable; `m200`, the newest, is never pruned, so it stays
-        // mirrored either way. Two more passes follow while the test waits.
+        // `m000` and `m001` prunable; `m201`, the newest, is never pruned, so
+        // it stays mirrored either way. Two more passes follow while the test
+        // waits.
         let history = state.read().await.history.clone();
         wait_until("the first pass to mirror the chat", || {
-            history.is_mirrored("m200")
+            history.is_mirrored("m201")
         })
         .await;
         tokio::time::sleep(2 * HISTORY_FLUSH_INTERVAL).await;
 
         assert_eq!(
             hot_ids(&state, &agent).await.len(),
-            HOT_TAIL_MESSAGES + 1,
+            HOT_TAIL_MESSAGES + 2,
             "no flush is followed by a prune before the interval is due"
         );
         assert!(!worker.has_stopped());
         assert_eq!(
             prune_once(&state, &transactions, now_millis()).await,
-            Ok(1),
+            Ok(2),
             "a prune was possible all along"
         );
         drop(owner);
@@ -472,12 +474,12 @@ mod tests {
 
         assert_eq!(
             hot_ids(&state, &agent).await.len(),
-            HOT_TAIL_MESSAGES + 1,
+            HOT_TAIL_MESSAGES + 2,
             "the owner check runs under the transaction, after the wait"
         );
         assert_eq!(
             prune_once(&state, &transactions, now_millis()).await,
-            Ok(1),
+            Ok(2),
             "a prune was possible all along"
         );
     }
