@@ -1674,6 +1674,13 @@ impl ConnectorManager {
             // Durable now: the history rows may go (spec §3.3).
             let history = manager.state.read().await.history.clone();
             history.enqueue_agent_deletion(&agent_id);
+            // D1 (final fix wave): forget the deleted agent's ids from
+            // `HistoryService`'s mirrored set, the same as a session delete
+            // does (`routes::sessions::delete_session`), or an id already
+            // mirrored before the delete never leaves the set.
+            if let Some(snapshot) = &agent_snapshot {
+                history.forget_mirrored(snapshot.messages.iter().map(|message| message.id.as_str()));
+            }
             for (connector, _, _) in &previous {
                 manager.statuses.lock().await.remove(&connector.id);
             }
@@ -6707,6 +6714,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mirrored.len(), 1, "the message is mirrored before deleting");
+        assert!(
+            history.is_mirrored("m1"),
+            "the message is mirrored before deleting"
+        );
 
         let run_id = {
             let mut guard = state.write().await;
@@ -6741,6 +6752,16 @@ mod tests {
             .set_control_plane_store(Some(store.clone()));
 
         manager.delete_agent(agent_id.clone()).await.unwrap();
+
+        // D1 (mirrored-set leak, final fix wave): `delete_agent` must forget
+        // the deleted agent's ids from `HistoryService`'s mirrored set itself,
+        // the same as a session delete does, or they never leave it (the
+        // rows are gone from the store immediately below, before a restart
+        // could ever repopulate the set from scratch).
+        assert!(
+            !history.is_mirrored("m1"),
+            "delete_agent forgets the deleted agent's ids from the mirrored set"
+        );
 
         // The saved snapshot (not just in-memory state) holds the deletion and
         // excludes the agent's runs and session records.

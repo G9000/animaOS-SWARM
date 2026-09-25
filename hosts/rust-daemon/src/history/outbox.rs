@@ -331,7 +331,28 @@ impl HistoryService {
                 Batch::Empty => return Ok(()),
                 Batch::Messages { through, rows } => {
                     self.store.upsert_messages(&rows).await?;
-                    self.mark_mirrored(rows.iter().map(|row| row.message.id.as_str()));
+                    // D1 (mirrored-set leak, final fix wave): a row whose
+                    // session or agent already has a deletion recorded is
+                    // written (so a store that has not applied that deletion
+                    // yet stays consistent once it does) but never marked
+                    // mirrored -- the deletion is always queued behind every
+                    // message it covers (`enqueue_committed` runs before
+                    // `enqueue_session_deletion`/`enqueue_agent_deletion`
+                    // ever queues, in the same control-plane transaction
+                    // this read is under), so it is about to remove the row
+                    // regardless, and nothing else ever forgets a mirrored id
+                    // once the deletion has already applied and cleared.
+                    let pending_deletions = {
+                        let _transaction = transactions.lock().await;
+                        state.read().await.pending_history_deletions.clone()
+                    };
+                    let newly_mirrored = rows.iter().filter_map(|row| {
+                        let deleted = pending_deletions.iter().any(|deletion| {
+                            deletion_covers(deletion, &row.agent_id, &row.session_id)
+                        });
+                        (!deleted).then(|| row.message.id.as_str())
+                    });
+                    self.mark_mirrored(newly_mirrored);
                     self.complete_through(through);
                     report.messages += rows.len();
                 }
@@ -518,6 +539,17 @@ async fn clear_saved_deletion(
             "could not save a finished history deletion; a restart repeats it"
         );
     }
+}
+
+/// Whether a recorded deletion (an agent, or one of its sessions) covers a
+/// row: an agent-wide deletion (`session_id: None`) covers every one of that
+/// agent's sessions.
+fn deletion_covers(deletion: &HistoryDeletion, agent_id: &str, session_id: &str) -> bool {
+    deletion.agent_id == agent_id
+        && match deletion.session_id.as_deref() {
+            Some(deleted_session) => deleted_session == session_id,
+            None => true,
+        }
 }
 
 /// The id of every hot message.
@@ -883,6 +915,60 @@ mod tests {
             1
         );
         assert_eq!(history.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_session_deletion_recorded_before_the_flush_leaves_its_queued_message_unmirrored() {
+        // D1 (mirrored-set leak, final fix wave): the session-delete route
+        // records the deletion (`DaemonState::record_history_deletion`) and
+        // queues it (`enqueue_session_deletion`) only after its own session's
+        // messages are already queued, so the same flush that finally mirrors
+        // a message queued before its session was deleted also deletes that
+        // same row right after. `write_queue` must not mark such a message
+        // mirrored in the first place -- `forget_mirrored`, called by the
+        // route before this flush ever runs, is a no-op for an id that was
+        // never mirrored yet, so nothing else ever forgets it again.
+        let store = Arc::new(MemoryHistoryStore::new());
+        let history = HistoryService::new(store.clone());
+        let mut daemon = DaemonState::new();
+        daemon.set_history(Arc::clone(&history));
+        let state = Arc::new(RwLock::new(daemon));
+        let transactions = Mutex::new(());
+
+        history.enqueue_committed(
+            "agent-1",
+            "chat:one",
+            &[history_message(
+                "msg-1-1",
+                "agent-1",
+                "chat:one",
+                MessageRole::User,
+                "hello",
+                1,
+            )
+            .message],
+        );
+        state
+            .write()
+            .await
+            .record_history_deletion(HistoryDeletion::session("agent-1", "chat:one"));
+        history.enqueue_session_deletion("agent-1", "chat:one");
+
+        let report = history
+            .flush_once(&state, &transactions, now_millis())
+            .await
+            .unwrap();
+
+        assert_eq!((report.messages, report.deletions), (1, 1));
+        assert!(store
+            .page_messages(&page("agent-1", "chat:one"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            !history.is_mirrored("msg-1-1"),
+            "a message mirrored in the same flush that deletes its session must not stay mirrored"
+        );
     }
 
     #[tokio::test]
