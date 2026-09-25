@@ -433,7 +433,10 @@ fn retain_messages_removes_only_rejected_messages_and_keeps_counters() {
     assert_eq!(removed[1].role, MessageRole::Assistant);
     let after = canonical.snapshot();
     assert_eq!(after.messages.len(), 2);
-    assert!(after.messages.iter().all(|message| message.room_id == "room-b"));
+    assert!(after
+        .messages
+        .iter()
+        .all(|message| message.room_id == "room-b"));
     assert_eq!(after.message_count, 2);
     assert_eq!(after.event_count, before.event_count);
     assert_eq!(after.events, before.events);
