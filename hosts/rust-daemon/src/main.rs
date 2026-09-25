@@ -45,6 +45,10 @@ async fn main() -> io::Result<()> {
             default_config.db_max_connections,
         )?,
         event_buffer: parse_env_usize("ANIMAOS_RS_EVENT_BUFFER", default_config.event_buffer)?,
+        session_event_buffer: parse_env_usize(
+            "ANIMAOS_RS_SESSION_EVENT_BUFFER",
+            default_config.session_event_buffer,
+        )?,
     };
 
     let listener = TcpListener::bind(bind_addr.as_str()).await?;

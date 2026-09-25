@@ -1,3 +1,4 @@
+mod live_state;
 mod run_commit;
 mod runtime_events;
 mod session_state;
@@ -1430,6 +1431,8 @@ pub(crate) struct DaemonState {
     pub(crate) tool_registry: ToolRegistry,
     pub(crate) process_manager: SharedProcessManager,
     pub(crate) event_fanout: EventFanout,
+    /// Live runs and per-agent event streams (spec §6).
+    pub(crate) live: crate::live::LiveHub,
     pub(crate) db: Option<Arc<dyn DatabaseAdapter>>,
 }
 
@@ -1582,6 +1585,7 @@ impl DaemonState {
             tool_registry: ToolRegistry::new(),
             process_manager: new_shared_process_manager_with_limit(max_background_processes),
             event_fanout,
+            live: crate::live::LiveHub::new(crate::live::DEFAULT_SESSION_EVENT_BUFFER),
             db: None,
         }
     }

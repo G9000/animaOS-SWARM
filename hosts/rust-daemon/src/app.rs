@@ -83,6 +83,9 @@ pub struct DaemonConfig {
     /// streams. Lagged consumers receive a synthetic gap marker rather than
     /// silent drops; this controls the burst buffer before that triggers.
     pub event_buffer: usize,
+    /// Events buffered per agent for the live event stream before a slow
+    /// subscriber lags (`ANIMAOS_RS_SESSION_EVENT_BUFFER`, spec §6).
+    pub session_event_buffer: usize,
 }
 
 impl Default for DaemonConfig {
@@ -97,6 +100,7 @@ impl Default for DaemonConfig {
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
             db_max_connections: DEFAULT_DB_MAX_CONNECTIONS,
             event_buffer: DEFAULT_EVENT_BUFFER,
+            session_event_buffer: crate::live::DEFAULT_SESSION_EVENT_BUFFER,
         }
     }
 }
@@ -117,10 +121,10 @@ pub fn app() -> Router {
 /// Use [`serve`] for a real daemon.
 pub fn app_with_config(config: DaemonConfig) -> Router {
     let event_fanout = EventFanout::new(config.event_buffer);
-    let state = Arc::new(RwLock::new(DaemonState::with_events_and_limits(
-        event_fanout,
-        config.max_background_processes,
-    )));
+    let mut daemon_state =
+        DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
+    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
+    let state = Arc::new(RwLock::new(daemon_state));
     app_with_state(state, config)
 }
 
@@ -135,6 +139,7 @@ pub fn app_with_database(db: Arc<dyn DatabaseAdapter>) -> Router {
     let mut daemon_state =
         DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
     daemon_state.set_database(db);
+    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
     let state = Arc::new(RwLock::new(daemon_state));
     app_with_state(state, config)
 }
@@ -165,10 +170,10 @@ fn app_with_runtime(
 
 pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result<Router> {
     let event_fanout = EventFanout::new(config.event_buffer);
-    let state = Arc::new(RwLock::new(DaemonState::with_events_and_limits(
-        event_fanout,
-        config.max_background_processes,
-    )));
+    let mut daemon_state =
+        DaemonState::with_events_and_limits(event_fanout, config.max_background_processes);
+    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
+    let state = Arc::new(RwLock::new(daemon_state));
     configure_persistence(&state, &config).await?;
     state.write().await.chatgpt_auth = crate::chatgpt_auth::ChatGptAuth::new();
     let runtime = daemon_runtime(Arc::clone(&state), &config)?;
@@ -190,13 +195,13 @@ pub async fn app_with_configured_persistence(config: DaemonConfig) -> io::Result
 pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()> {
     let chatgpt_auth = crate::chatgpt_auth::ChatGptAuth::new();
     let event_fanout = EventFanout::new(config.event_buffer);
-    let state = Arc::new(RwLock::new(
-        DaemonState::with_model_adapter_and_events_and_limits(
-            Arc::new(RuntimeModelAdapter::from_env(chatgpt_auth.clone())),
-            event_fanout,
-            config.max_background_processes,
-        ),
-    ));
+    let mut daemon_state = DaemonState::with_model_adapter_and_events_and_limits(
+        Arc::new(RuntimeModelAdapter::from_env(chatgpt_auth.clone())),
+        event_fanout,
+        config.max_background_processes,
+    );
+    daemon_state.set_live_hub(crate::live::LiveHub::new(config.session_event_buffer));
+    let state = Arc::new(RwLock::new(daemon_state));
 
     configure_persistence(&state, &config).await?;
 
@@ -227,10 +232,14 @@ pub(crate) async fn serve_with_state(
     let scheduler = runtime.scheduler.clone();
     let jobs = runtime.jobs.clone();
     let history = runtime.history.clone();
+    let live = state.read().await.live.clone();
     let router = router_with_runtime(state, config, runtime, bind_is_loopback);
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            // First: graceful shutdown waits for every response to finish,
+            // and an agent event stream never ends on its own.
+            live.close();
             jobs.shutdown().await;
             scheduler.shutdown().await;
             connectors.shutdown().await;

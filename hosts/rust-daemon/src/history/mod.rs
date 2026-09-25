@@ -237,8 +237,9 @@ fn to_i64(value: u64) -> Result<i64, HistoryError> {
     i64::try_from(value).map_err(|_| HistoryError::new("a timestamp or counter is out of range"))
 }
 
-/// The row value a store writes for a message's role.
-fn role_name(role: MessageRole) -> &'static str {
+/// The row value a store writes for a message's role; `pub(crate)` so the
+/// live stream's `message.created` reuses it rather than keeping a copy.
+pub(crate) fn role_name(role: MessageRole) -> &'static str {
     match role {
         MessageRole::User => "user",
         MessageRole::Assistant => "assistant",

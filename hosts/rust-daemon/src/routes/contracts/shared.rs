@@ -334,7 +334,7 @@ pub(in crate::routes::contracts) fn json_to_data_value(
     }
 }
 
-pub(in crate::routes::contracts) fn data_value_to_json(value: &DataValue) -> Value {
+pub(crate) fn data_value_to_json(value: &DataValue) -> Value {
     match value {
         DataValue::Null => Value::Null,
         DataValue::Bool(value) => Value::Bool(*value),

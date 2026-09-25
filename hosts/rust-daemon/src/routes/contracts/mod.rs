@@ -4,6 +4,7 @@ mod connectors;
 mod gcalendar;
 mod memories;
 mod providers;
+mod runs;
 mod schedules;
 mod sessions;
 mod shared;
@@ -33,10 +34,12 @@ pub(crate) use memories::{
     RecentMemoriesQuery,
 };
 pub(crate) use providers::{ProviderResponse, ProvidersEnvelope};
+pub(crate) use runs::*;
 pub(crate) use schedules::*;
 pub(crate) use sessions::*;
 pub(crate) use shared::{
-    DeleteResponse, ErrorBody, HealthResponse, ReadinessResponse, TaskRequest, TaskResultResponse,
+    data_value_to_json, DeleteResponse, ErrorBody, HealthResponse, ReadinessResponse, TaskRequest,
+    TaskResultResponse,
 };
 pub(crate) use swarms::{
     SwarmCreateRequest, SwarmEnvelope, SwarmEventResponse, SwarmRunEnvelope, SwarmStateResponse,

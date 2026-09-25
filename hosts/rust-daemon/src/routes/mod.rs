@@ -5,6 +5,7 @@ mod capabilities;
 mod chatgpt;
 mod connectors;
 mod contracts;
+mod events;
 mod folder_picker;
 mod gcalendar;
 mod goals;
@@ -44,6 +45,8 @@ use crate::app::{DaemonConfig, SharedDaemonState};
 use crate::connectors::runtime::{ConnectorManager, ConnectorManagerError};
 use crate::schedules::SchedulerService;
 
+#[allow(unused_imports)] // M3 Task 6's live observer previews tool arguments with it.
+pub(crate) use self::contracts::data_value_to_json;
 use self::contracts::{
     AgencyCreateRequest, AgencyCreateResponse, AgencyGenerateRequest, AgencyGenerateResponse,
     AgentConfigRequest, AgentEnvelope, AgentProfileEnvelope, AgentRecentMemoriesQuery,
@@ -61,7 +64,7 @@ use self::contracts::{
     WorkspaceResumeResponse,
 };
 pub(crate) use self::contracts::{
-    AgentRunEnvelope, AgentRuntimeSnapshotResponse, TaskResultResponse,
+    AgentRunEnvelope, AgentRuntimeSnapshotResponse, RunResponse, TaskResultResponse,
 };
 pub(crate) use self::http::configured_bind_is_loopback;
 use self::http::{json_response, make_http_span, read_limited_body, request_query};
@@ -165,6 +168,7 @@ use crate::runtime_model::provider_summaries;
         schedules::import_legacy_schedules,
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
         sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
+        events::agent_events,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -178,6 +182,7 @@ use crate::runtime_model::provider_summaries;
         (name = "connector-thread", description = "Dedicated connector-room messages"),
         (name = "schedules", description = "Daemon-backed scheduled prompts"),
         (name = "sessions", description = "Agent sessions and their transcripts"),
+        (name = "runs", description = "Live runs: the agent event stream, session runs, and stop"),
         (name = "workspace", description = "Workspace configuration and onboarding"),
     )
 )]
@@ -292,6 +297,13 @@ impl ApiError {
     pub(crate) fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
         }
     }
@@ -717,6 +729,7 @@ fn router_with_services_with_policies(
             axum::routing::post(folder_picker::pick_folder),
         )
         .route("/api/swarms/{swarm_id}/events", get(swarm_events_entry))
+        .route("/api/agents/{agent_id}/events", get(events::agent_events))
         // Auth gates everything mounted above this line; the middleware
         // exempts health/readiness/metrics/docs by path. When
         // ANIMAOS_RS_API_KEY is unset the daemon runs in trust-the-network
@@ -1870,6 +1883,7 @@ async fn handle_memory_search(uri: Uri, state: &SharedDaemonState) -> AxumRespon
 #[cfg(test)]
 mod tests {
     mod capabilities;
+    mod events;
     mod goals;
     mod jobs;
     mod sessions;

@@ -14,6 +14,8 @@ pub(crate) const MAX_TERMINAL_RUNS_PER_AGENT: usize = 50;
 pub(crate) const MAX_RUN_INPUT_TEXT_BYTES: usize = 32 * 1024;
 /// Distinct tool names kept per run (spec §4.1).
 pub(crate) const MAX_RUN_TOOLS_STARTED: usize = 50;
+/// Per-model-call usage kept per run (spec §4.1 `steps`).
+pub(crate) const MAX_RUN_STEPS: usize = 50;
 
 pub(crate) const RESTART_BEFORE_START: &str = "restart_before_start";
 pub(crate) const RESTART_DURING_RUN: &str = "restart_during_run";
@@ -50,6 +52,18 @@ impl RunStatus {
     pub(crate) const fn is_in_flight(self) -> bool {
         matches!(self, Self::Running | Self::AwaitingApproval)
     }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::AwaitingApproval => "awaiting_approval",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 /// What started a run (spec §4.1). `Web` arrives with the async runs route.
@@ -64,6 +78,20 @@ pub(crate) enum RunSource {
     Job,
     Delegation,
     Peer,
+}
+
+impl RunSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Api => "api",
+            Self::Telegram => "telegram",
+            Self::Schedule => "schedule",
+            Self::Job => "job",
+            Self::Delegation => "delegation",
+            Self::Peer => "peer",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,6 +173,9 @@ pub(crate) struct RunRecord {
     pub(crate) provider: Option<String>,
     #[serde(default)]
     pub(crate) parent_run_id: Option<String>,
+    /// The committed final reply of a completed run (spec §4.4 item 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reply_message_id: Option<String>,
     /// Set once the history store holds this terminal record (spec §4.1).
     #[serde(default)]
     pub(crate) mirrored: bool,
@@ -191,6 +222,7 @@ impl RunRecord {
             model: start.model,
             provider: start.provider,
             parent_run_id: start.parent_run_id,
+            reply_message_id: None,
             mirrored: false,
         }
     }
@@ -285,6 +317,14 @@ impl RunLedger {
                     && !record.status.is_terminal()
             })
             .count()
+    }
+
+    /// Every run that is queued, running, or awaiting approval.
+    pub(crate) fn active_records(&self) -> Vec<&RunRecord> {
+        self.records
+            .values()
+            .filter(|record| !record.status.is_terminal())
+            .collect()
     }
 
     /// `(agentId, sessionId)` of every run that is queued, running, or awaiting approval.
@@ -542,6 +582,7 @@ mod tests {
             (RunStatus::Interrupted, "interrupted"),
         ] {
             assert_eq!(serde_json::to_value(status).unwrap(), json!(name));
+            assert_eq!(status.as_str(), name);
             assert_eq!(
                 status.is_terminal(),
                 matches!(name, "completed" | "failed" | "cancelled" | "interrupted"),
@@ -563,6 +604,7 @@ mod tests {
             (RunSource::Peer, "peer"),
         ] {
             assert_eq!(serde_json::to_value(source).unwrap(), json!(name));
+            assert_eq!(source.as_str(), name);
         }
     }
 
@@ -587,6 +629,18 @@ mod tests {
         assert_eq!(value["startedAtMs"], 42);
         assert_eq!(value["toolsStarted"], json!([]));
         assert_eq!(value["mirrored"], false);
+        assert!(
+            value.get("replyMessageId").is_none(),
+            "an unset reply is not written, so saved records keep their shape"
+        );
+        let mut replied = record.clone();
+        replied.reply_message_id = Some("msg-1".into());
+        let written = serde_json::to_value(&replied).unwrap();
+        assert_eq!(written["replyMessageId"], "msg-1");
+        assert_eq!(
+            serde_json::from_value::<RunRecord>(written).unwrap(),
+            replied
+        );
 
         let minimal: RunRecord = serde_json::from_value(json!({
             "id": "run_legacy",
@@ -603,6 +657,7 @@ mod tests {
         assert_eq!(minimal.usage, TokenUsage::default());
         assert_eq!(minimal.input, RunInput::default());
         assert_eq!(minimal.parent_run_id, None);
+        assert_eq!(minimal.reply_message_id, None);
     }
 
     #[test]
