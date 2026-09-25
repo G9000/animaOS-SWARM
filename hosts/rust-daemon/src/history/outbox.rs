@@ -233,7 +233,15 @@ impl HistoryService {
         }
     }
 
-    fn mark_mirrored<'a>(&self, message_ids: impl IntoIterator<Item = &'a str>) {
+    /// Adds ids to the mirrored set. Callers pass the control-plane
+    /// transaction they hold across their check of the saved state and this
+    /// call, so a deletion cannot be recorded (and `forget_mirrored` run)
+    /// between the two and leave its ids marked (residual round R6).
+    fn mark_mirrored<'a>(
+        &self,
+        _transaction: &tokio::sync::MutexGuard<'_, ()>,
+        message_ids: impl IntoIterator<Item = &'a str>,
+    ) {
         let mut mirrored = self.mirrored();
         for id in message_ids {
             mirrored.insert(id.to_string());
@@ -341,18 +349,21 @@ impl HistoryService {
                     // ever queues, in the same control-plane transaction
                     // this read is under), so it is about to remove the row
                     // regardless, and nothing else ever forgets a mirrored id
-                    // once the deletion has already applied and cleared.
-                    let pending_deletions = {
-                        let _transaction = transactions.lock().await;
-                        state.read().await.pending_history_deletions.clone()
-                    };
-                    let newly_mirrored = rows.iter().filter_map(|row| {
-                        let deleted = pending_deletions.iter().any(|deletion| {
-                            deletion_covers(deletion, &row.agent_id, &row.session_id)
+                    // once the deletion has already applied and cleared. The
+                    // check and the marking share one hold of the transaction
+                    // (residual round R6), taken only once the store write
+                    // has returned, so no deletion lands between them.
+                    {
+                        let transaction = transactions.lock().await;
+                        let daemon = state.read().await;
+                        let newly_mirrored = rows.iter().filter_map(|row| {
+                            let deleted = daemon.pending_history_deletions.iter().any(|deletion| {
+                                deletion_covers(deletion, &row.agent_id, &row.session_id)
+                            });
+                            (!deleted).then(|| row.message.id.as_str())
                         });
-                        (!deleted).then(|| row.message.id.as_str())
-                    });
-                    self.mark_mirrored(newly_mirrored);
+                        self.mark_mirrored(&transaction, newly_mirrored);
+                    }
                     self.complete_through(through);
                     report.messages += rows.len();
                 }
@@ -462,10 +473,10 @@ impl HistoryService {
         }
         let checked = hot_ids.into_iter().collect::<HashSet<_>>();
 
-        let _transaction = transactions.lock().await;
+        let transaction = transactions.lock().await;
         let guard = state.read().await;
         let (missing, held) = reconcile_rows(&guard, &checked, &stored);
-        self.mark_mirrored(held.iter().map(String::as_str));
+        self.mark_mirrored(&transaction, held.iter().map(String::as_str));
         let mut outbox = self.outbox();
         let queued = outbox
             .items
