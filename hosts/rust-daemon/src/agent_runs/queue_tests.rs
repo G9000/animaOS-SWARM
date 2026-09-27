@@ -292,6 +292,42 @@ async fn a_failed_acceptance_save_answers_503_and_leaves_nothing_behind() {
     );
 }
 
+/// Fix round 1 (review Minor 5): accepted runs of two sessions of one agent
+/// run at once, within the agent's slots; only one session's runs queue.
+#[tokio::test]
+async fn two_sessions_of_one_agent_run_their_messages_in_parallel() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    let coordinator = coordinator.with_max_runs_per_agent(2);
+    add_chat(&coordinator, &agent_id, "chat:one").await;
+    add_chat(&coordinator, &agent_id, "chat:two").await;
+
+    let one = accept_web(&coordinator, &agent_id, "chat:one", "key-one").await;
+    let two = accept_web(&coordinator, &agent_id, "chat:two", "key-two").await;
+    // Both calls are held at once: neither waited for the other.
+    gate.entered().await;
+    gate.entered().await;
+    {
+        let guard = coordinator.state.read().await;
+        assert_eq!(guard.runs.get(&one).unwrap().status, RunStatus::Running);
+        assert_eq!(guard.runs.get(&two).unwrap().status, RunStatus::Running);
+    }
+    let mut texts: Vec<String> = model
+        .requests()
+        .iter()
+        .map(|request| request.messages.last().unwrap().content.text.clone())
+        .collect();
+    texts.sort();
+    assert_eq!(texts, ["key-one", "key-two"]);
+
+    gate.release();
+    gate.release();
+    wait_for(&coordinator, &one, RunStatus::Completed).await;
+    wait_for(&coordinator, &two, RunStatus::Completed).await;
+    assert_eq!(coordinator.lock_counts(), (0, 0));
+}
+
 /// Fix round 1 (review Important 1): a stream opened while the acceptance
 /// save is in flight lists the queued run in its snapshot, so a failed save
 /// must end it there, and a reverted title is announced too.
@@ -428,7 +464,7 @@ async fn a_stopped_queued_run_is_skipped_and_the_next_one_still_runs() {
     assert_eq!(record.started_at_ms, None);
 }
 
-fn crash() -> Result<(), String> {
+fn crash() -> Result<(), super::QueuedStartError> {
     panic!("the start crashed before its run started")
 }
 

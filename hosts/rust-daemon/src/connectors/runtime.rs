@@ -187,6 +187,11 @@ impl ConnectorManager {
         }
     }
 
+    /// Shutdown has begun: no new work starts (see `ensure_open`).
+    pub(crate) fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
     fn ensure_open(&self) -> Result<(), ConnectorManagerError> {
         if self.closing.load(Ordering::SeqCst) {
             Err(ConnectorManagerError::WorkerStopped)

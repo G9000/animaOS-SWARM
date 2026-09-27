@@ -14,8 +14,9 @@ use super::jobs::{authorize, no_store};
 use super::sessions::rejected;
 use super::{parse_json_body, ApiError, AppState};
 use crate::agent_runs::{
-    AcceptRun, AcceptedRun, QueuedRunStart, SessionRunMode, SESSION_CANNOT_SEND,
+    AcceptRun, AcceptedRun, QueuedRunStart, QueuedStartError, SessionRunMode, SESSION_CANNOT_SEND,
 };
+use crate::connectors::runtime::ConnectorManagerError;
 use crate::runs::{RunSource, MAX_RUN_ATTACHMENTS, MAX_RUN_INPUT_TEXT_BYTES};
 use crate::sessions::{is_valid_session_id, SessionKind};
 
@@ -190,18 +191,38 @@ pub(super) async fn start_session_run(
                 idempotency_key.clone(),
                 connector_id.clone(),
             );
-            let start: QueuedRunStart =
-                Box::new(move |run_id| -> BoxFuture<'static, Result<(), String>> {
+            let start: QueuedRunStart = Box::new(
+                move |run_id| -> BoxFuture<'static, Result<(), QueuedStartError>> {
                     Box::pin(async move {
-                        manager
+                        match manager
                             .send_from_owner_accepted(agent, connector, text, key, run_id)
                             .await
-                            .map_err(|error| error.to_string())
+                        {
+                            Ok(()) => Ok(()),
+                            // The connectors closed for shutdown before its
+                            // turn: it stays queued for the restart.
+                            Err(ConnectorManagerError::WorkerStopped) if manager.is_closing() => {
+                                Err(QueuedStartError::ShuttingDown)
+                            }
+                            Err(error) => Err(QueuedStartError::Failed(error.to_string())),
+                        }
                     })
-                });
+                },
+            );
             (RunSource::Telegram, Some(connector_id), start)
         }
-        Some(None) => return rejected(ApiError::conflict(SESSION_CANNOT_SEND)),
+        // No active connector runs it: a new message is refused, but a
+        // retried key still gets its run (review Minor 6).
+        Some(None) => {
+            return match state
+                .agent_runs
+                .replayed_run(&agent_id, &session_id, &input.text, &idempotency_key)
+                .await
+            {
+                Some(answer) => accepted_response(answer),
+                None => rejected(ApiError::conflict(SESSION_CANNOT_SEND)),
+            };
+        }
         None => (
             RunSource::Web,
             None,
@@ -232,6 +253,11 @@ pub(super) async fn start_session_run(
             start,
         )
         .await;
+    accepted_response(accepted)
+}
+
+/// 202 with a new run, 200 with a replayed one, or the refusal.
+fn accepted_response(accepted: Result<AcceptedRun, ApiError>) -> Response {
     match accepted {
         Ok(AcceptedRun::Created(record)) => no_store(json_response(
             StatusCode::ACCEPTED,

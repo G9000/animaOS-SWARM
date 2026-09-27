@@ -713,7 +713,7 @@ mod tests {
     // Controller ruling (pre-flight audit): the backup is written only when the
     // loaded version is below CONTROL_PLANE_STORE_VERSION, so a later version
     // bump can never clobber it. This simulates a backup already on disk from a
-    // prior upgrade and proves loading a current (v5) snapshot never rewrites it.
+    // prior upgrade and proves loading a current (v6) snapshot never rewrites it.
     #[tokio::test]
     async fn loading_a_current_snapshot_leaves_an_existing_pre_upgrade_backup_untouched() {
         let dir = temp_dir("current-with-backup");

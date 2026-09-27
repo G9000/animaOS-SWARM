@@ -2,7 +2,7 @@ use super::*;
 use anima_core::DataValue;
 use serde_json::json;
 
-use crate::agent_runs::test_support::{events_until, Gate, ScriptedModel, Step};
+use crate::agent_runs::test_support::{events_until, next_event, Gate, ScriptedModel, Step};
 use crate::runs::{RunRecord, RunStatus};
 use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource, DEFAULT_CHAT_TITLE};
 
@@ -457,6 +457,82 @@ async fn a_ninth_waiting_message_is_refused_with_429() {
     wait_for(&state, run_ids.last().unwrap(), RunStatus::Completed).await;
 }
 
+/// Fix round 1 (review Minor 5): the 8-queued cap is the agent's, across
+/// its sessions.
+#[tokio::test]
+async fn the_queued_cap_spans_an_agents_sessions() {
+    let gate = Gate::new();
+    let (app, state, agent) = app_with_chat(ScriptedModel::gated(vec![], gate.clone())).await;
+    for session in ["chat:second", "chat:third"] {
+        state.write().await.sessions.insert(SessionRecord::new(
+            &agent,
+            session,
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Chat".into(),
+            TitleSource::Owner,
+            1,
+        ));
+    }
+    let send = |session: &str, key: String| {
+        start_request(
+            &agent,
+            session,
+            Some(key.as_str()),
+            json!({ "text": key.clone() }),
+        )
+    };
+    let mut last = Vec::new();
+    for session in ["chat:plans", "chat:second"] {
+        // Each session's first message runs; the next four wait.
+        let first = app
+            .clone()
+            .oneshot(send(session, format!("{session}-0")))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        gate.entered().await;
+        for n in 1..=4 {
+            let response = app
+                .clone()
+                .oneshot(send(session, format!("{session}-{n}")))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            if n == 4 {
+                last.push(
+                    json_body(response).await["run"]["id"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    assert_eq!(state.read().await.runs.queued_count(&agent), 8);
+
+    for session in ["chat:plans", "chat:third"] {
+        let refused = app
+            .clone()
+            .oneshot(send(session, format!("{session}-refused")))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS, "{session}");
+        assert_eq!(refused.headers()["cache-control"], "no-store");
+        assert_eq!(
+            json_body(refused).await["error"],
+            "This companion already has 8 queued messages; wait for one to start"
+        );
+    }
+
+    for _ in 0..10 {
+        gate.release();
+    }
+    for run_id in &last {
+        wait_for(&state, run_id, RunStatus::Completed).await;
+    }
+}
+
 /// Carry-forward (M2 T17 Minor 9): a message waiting behind another counts in
 /// its session's `activeRuns`, so the web never declares it unconfirmed.
 #[tokio::test]
@@ -618,24 +694,46 @@ async fn read_only_kinds_helpers_and_unsteerable_sessions_are_refused() {
     );
 }
 
-#[tokio::test]
-async fn a_telegram_sessions_message_runs_as_the_connectors_owner_turn() {
-    let mut daemon =
-        DaemonState::with_model_adapter(ScriptedModel::new(vec![Step::Text(vec!["On it"])]));
+const TELEGRAM_CONNECTOR: &str = "telegram-session-runs";
+const TELEGRAM_ROOM: &str = "telegram-room-session-runs";
+
+/// A router over a daemon whose agent has an active Telegram connector and
+/// its Telegram session, with the connector manager the router uses.
+fn telegram_app(
+    model: Arc<dyn ModelAdapter>,
+) -> (
+    axum::Router,
+    Arc<RwLock<DaemonState>>,
+    String,
+    ConnectorManager,
+) {
+    let (app, state, agent, manager, _) = telegram_app_with_runs(model);
+    (app, state, agent, manager)
+}
+
+/// `telegram_app`, also returning the router's run coordinator.
+fn telegram_app_with_runs(
+    model: Arc<dyn ModelAdapter>,
+) -> (
+    axum::Router,
+    Arc<RwLock<DaemonState>>,
+    String,
+    ConnectorManager,
+    AgentRunCoordinator,
+) {
+    let mut daemon = DaemonState::with_model_adapter(model);
     let agent = daemon
         .create_agent(test_config("companion"))
         .unwrap()
         .state
         .id;
-    let connector_id = "telegram-session-runs";
-    let room_id = "telegram-room-session-runs";
     daemon.connectors.insert(
-        connector_id.into(),
-        telegram_connector(&agent, connector_id, room_id),
+        TELEGRAM_CONNECTOR.into(),
+        telegram_connector(&agent, TELEGRAM_CONNECTOR, TELEGRAM_ROOM),
     );
     daemon.sessions.insert(SessionRecord::new(
         &agent,
-        room_id,
+        TELEGRAM_ROOM,
         SessionKind::Telegram,
         SessionOrigin::Telegram,
         "Telegram".into(),
@@ -655,10 +753,19 @@ async fn a_telegram_sessions_message_runs_as_the_connectors_owner_turn() {
         Arc::clone(&state),
         DaemonConfig::default(),
         limiter,
-        runs,
+        runs.clone(),
         manager.clone(),
         true,
     );
+    (app, state, agent, manager, runs)
+}
+
+#[tokio::test]
+async fn a_telegram_sessions_message_runs_as_the_connectors_owner_turn() {
+    let (app, state, agent, manager) =
+        telegram_app(ScriptedModel::new(vec![Step::Text(vec!["On it"])]));
+    let connector_id = TELEGRAM_CONNECTOR;
+    let room_id = TELEGRAM_ROOM;
 
     let response = app
         .oneshot(start_request(
@@ -692,6 +799,156 @@ async fn a_telegram_sessions_message_runs_as_the_connectors_owner_turn() {
             finished.reply_message_id.as_deref()
         );
     }
+    manager.shutdown().await;
+}
+
+/// Fix round 1 (review Minor 4): a queued Telegram message whose turn
+/// comes after the connectors shut down stays queued, in memory and on disk,
+/// so the next start interrupts it as never started instead of it failing.
+#[tokio::test]
+async fn a_telegram_message_whose_turn_comes_after_shutdown_stays_queued() {
+    use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+
+    let model = ScriptedModel::new(vec![]);
+    let (app, state, agent, manager, runs) = telegram_app_with_runs(model.clone());
+    let path = std::env::temp_dir().join(format!(
+        "anima-session-runs-shutdown-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let store = ControlPlaneStoreConfig::Json(path.clone());
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(store.clone()));
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+    manager.shutdown().await;
+
+    let response = app
+        .oneshot(start_request(
+            &agent,
+            TELEGRAM_ROOM,
+            Some("tg-key"),
+            json!({"text": "Remind me at 5"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let run_id = json_body(response).await["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The session's queue is done once its drainer has tried the run.
+    for _ in 0..500 {
+        if !runs.has_session_queue(&agent, TELEGRAM_ROOM) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!runs.has_session_queue(&agent, TELEGRAM_ROOM));
+
+    {
+        let guard = state.read().await;
+        assert_eq!(
+            guard.runs.get(&run_id).unwrap().status,
+            RunStatus::Queued,
+            "left queued"
+        );
+        assert!(
+            guard.live.runs().control(&run_id).is_some(),
+            "still stoppable"
+        );
+    }
+    assert!(model.requests().is_empty());
+    let events = [next_event(&mut subscription).await.to_json(1)];
+    assert_eq!(events[0]["type"], "run.queued");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), subscription.next())
+            .await
+            .is_err(),
+        "nothing ended the run"
+    );
+    let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+    let restored = crate::runs::RunLedger::restored(
+        saved.runs,
+        &std::collections::HashSet::from([agent.clone()]),
+        anima_core::primitives::now_millis(),
+    );
+    assert_eq!(
+        restored.get(&run_id).unwrap().error.as_ref().unwrap().code,
+        "restart_before_start"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Fix round 1 (review Minor 6): a retried key answers with its run even
+/// after the session stopped accepting messages or cannot take the mode.
+#[tokio::test]
+async fn a_retried_key_gets_its_run_after_the_telegram_connector_went_inactive() {
+    let (app, state, agent, manager) =
+        telegram_app(ScriptedModel::new(vec![Step::Text(vec!["On it"])]));
+    let send =
+        |key: &str, body: serde_json::Value| start_request(&agent, TELEGRAM_ROOM, Some(key), body);
+    let first = json_body(
+        app.clone()
+            .oneshot(send("tg-key", json!({"text": "Remind me at 5"})))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let run_id = first["run"]["id"].as_str().unwrap().to_string();
+    wait_for(&state, &run_id, RunStatus::Completed).await;
+    // Telegram sessions cannot steer; with the connector still active the
+    // replay is answered by `accept_run` ahead of that check.
+    let steered = app
+        .clone()
+        .oneshot(send(
+            "tg-key",
+            json!({"text": "Remind me at 5", "mode": "steer"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(steered.status(), StatusCode::OK);
+    assert_eq!(json_body(steered).await["run"]["id"], run_id.as_str());
+    state
+        .write()
+        .await
+        .connectors
+        .get_mut(TELEGRAM_CONNECTOR)
+        .unwrap()
+        .enabled = false;
+
+    for body in [
+        json!({"text": "Remind me at 5"}),
+        // Telegram sessions cannot steer; the replay still answers.
+        json!({"text": "Remind me at 5", "mode": "steer"}),
+    ] {
+        let replay = app.clone().oneshot(send("tg-key", body)).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.headers()["cache-control"], "no-store");
+        let replay = json_body(replay).await;
+        assert_eq!(replay["run"]["id"], run_id.as_str());
+        assert_eq!(replay["run"]["status"], "completed");
+    }
+    let reused = app
+        .clone()
+        .oneshot(send("tg-key", json!({"text": "Something else"})))
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(reused).await["error"],
+        "Idempotency-Key was already used for a different message"
+    );
+    let fresh = app
+        .oneshot(send("tg-key-2", json!({"text": "Remind me at 6"})))
+        .await
+        .unwrap();
+    assert_eq!(fresh.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(fresh).await["error"],
+        "This session cannot receive messages"
+    );
     manager.shutdown().await;
 }
 

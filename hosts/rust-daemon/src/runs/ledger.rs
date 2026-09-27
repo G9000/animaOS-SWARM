@@ -452,8 +452,9 @@ impl RunLedger {
         })
     }
 
-    /// This agent's runs, oldest first. Read by M3's runs routes; tests use it now.
-    #[allow(dead_code)]
+    /// This agent's runs, oldest first, for tests; the runs routes read a
+    /// session's runs with `for_session`.
+    #[cfg(test)]
     pub(crate) fn for_agent(&self, agent_id: &str) -> Vec<&RunRecord> {
         let mut records = self
             .records

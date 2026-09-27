@@ -23,6 +23,7 @@ use crate::runs::{
     RUN_FAILED, RUN_STOPPED, STOPPED_BY_OWNER,
 };
 use crate::sessions::{derived_title, SessionKind, TitleSource, DEFAULT_CHAT_TITLE};
+use crate::state::DaemonState;
 
 pub(crate) const SESSION_CANNOT_SEND: &str = "This session cannot receive messages";
 pub(crate) const SESSION_CANNOT_STEER: &str = "This session cannot be steered";
@@ -64,9 +65,20 @@ pub(crate) enum AcceptedRun {
 }
 
 /// Starts an accepted run given its id and resolves once the run is over;
-/// `Err` carries why it could not run.
+/// `Err` says why it did not run.
 pub(crate) type QueuedRunStart =
-    Box<dyn FnOnce(String) -> BoxFuture<'static, Result<(), String>> + Send>;
+    Box<dyn FnOnce(String) -> BoxFuture<'static, Result<(), QueuedStartError>> + Send>;
+
+/// Why an accepted run's start did not run it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum QueuedStartError {
+    /// It cannot run: its session queue settles it as `failed` with this
+    /// message (or `cancelled` when it was stopped).
+    Failed(String),
+    /// What runs it is shutting down: it stays queued, unsaved, so the next
+    /// start interrupts it as never started (spec §4.8).
+    ShuttingDown,
+}
 
 pub(super) struct QueuedStart {
     run_id: String,
@@ -78,6 +90,34 @@ pub(super) struct QueuedStart {
 /// Accepted runs of each session waiting for their turn, in acceptance
 /// order. A session has an entry exactly while a drainer task works
 /// through it.
+/// The answer to a message whose key this agent used within the window
+/// (spec §4.2): its run for the same session and text, else 409. It comes
+/// before the session's capability checks, so a retried key keeps getting its
+/// run after the session stopped taking messages (review Minor 6).
+fn replayed(
+    state: &DaemonState,
+    agent_id: &str,
+    session_id: &str,
+    text: &str,
+    idempotency_key: &str,
+    now_ms: u64,
+) -> Option<Result<AcceptedRun, ApiError>> {
+    let original = state.runs.find_by_idempotency_key(
+        agent_id,
+        idempotency_key,
+        now_ms.saturating_sub(IDEMPOTENCY_WINDOW_MS),
+    )?;
+    Some(
+        if original.session_id == session_id && original.input.text == text {
+            Ok(AcceptedRun::Replayed(
+                state.with_live_tools(original.clone()),
+            ))
+        } else {
+            Err(ApiError::conflict(IDEMPOTENCY_KEY_REUSED))
+        },
+    )
+}
+
 pub(super) type SessionQueueMap = Arc<StdMutex<HashMap<(String, String), VecDeque<QueuedStart>>>>;
 
 impl AgentRunCoordinator {
@@ -105,6 +145,16 @@ impl AgentRunCoordinator {
             let Some(session) = guard.sessions.get(&request.agent_id, &request.session_id) else {
                 return Err(ApiError::not_found());
             };
+            if let Some(answer) = replayed(
+                &guard,
+                &request.agent_id,
+                &request.session_id,
+                &request.text,
+                &request.idempotency_key,
+                now_ms,
+            ) {
+                return answer;
+            }
             let capabilities =
                 session.capabilities(crate::sessions::views::automation_exists(&guard, session));
             let retitle = session.kind == SessionKind::Chat
@@ -115,21 +165,6 @@ impl AgentRunCoordinator {
             }
             if request.mode == SessionRunMode::Steer && !capabilities.steer {
                 return Err(ApiError::bad_request_static(SESSION_CANNOT_STEER));
-            }
-            if let Some(original) = guard.runs.find_by_idempotency_key(
-                &request.agent_id,
-                &request.idempotency_key,
-                now_ms.saturating_sub(IDEMPOTENCY_WINDOW_MS),
-            ) {
-                return if original.session_id == request.session_id
-                    && original.input.text == request.text
-                {
-                    Ok(AcceptedRun::Replayed(
-                        guard.with_live_tools(original.clone()),
-                    ))
-                } else {
-                    Err(ApiError::conflict(IDEMPOTENCY_KEY_REUSED))
-                };
             }
             if guard.runs.queued_count(&request.agent_id) >= MAX_QUEUED_RUNS_PER_AGENT {
                 return Err(ApiError::too_many_requests(QUEUE_FULL));
@@ -222,6 +257,27 @@ impl AgentRunCoordinator {
         Ok(AcceptedRun::Created(record))
     }
 
+    /// `accept_run`'s answer for a key already used, accepting nothing: for a
+    /// caller that refuses a new message before it reaches `accept_run` (the
+    /// route's Telegram session without its active connector).
+    pub(crate) async fn replayed_run(
+        &self,
+        agent_id: &str,
+        session_id: &str,
+        text: &str,
+        idempotency_key: &str,
+    ) -> Option<Result<AcceptedRun, ApiError>> {
+        let guard = self.state.read().await;
+        replayed(
+            &guard,
+            agent_id,
+            session_id,
+            text,
+            idempotency_key,
+            now_millis(),
+        )
+    }
+
     /// The start of an accepted web message: the owner's turn in the
     /// session's room, run by this coordinator.
     pub(crate) fn web_start(
@@ -233,7 +289,7 @@ impl AgentRunCoordinator {
     ) -> QueuedRunStart {
         let coordinator = self.clone();
         Box::new(
-            move |run_id: String| -> BoxFuture<'static, Result<(), String>> {
+            move |run_id: String| -> BoxFuture<'static, Result<(), QueuedStartError>> {
                 Box::pin(async move {
                     let request = AgentRunRequest {
                         agent_id,
@@ -255,7 +311,7 @@ impl AgentRunCoordinator {
                         .run_accepted(request, run_id)
                         .await
                         .map(|_| ())
-                        .map_err(|error| error.message().to_string())
+                        .map_err(|error| QueuedStartError::Failed(error.message().to_string()))
                 })
             },
         )
@@ -297,6 +353,15 @@ impl AgentRunCoordinator {
         }
     }
 
+    /// Whether a drainer is still working through this session's queue.
+    #[cfg(test)]
+    pub(crate) fn has_session_queue(&self, agent_id: &str, session_id: &str) -> bool {
+        self.session_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&(agent_id.to_string(), session_id.to_string()))
+    }
+
     /// Starts a session's accepted runs one after another, in acceptance order.
     async fn drain_session(&self, key: (String, String)) {
         loop {
@@ -331,7 +396,10 @@ impl AgentRunCoordinator {
             // Its own task, so a panic cannot take the session's queue with it.
             let failure = match tokio::spawn((next.start)(next.run_id.clone())).await {
                 Ok(Ok(())) => None,
-                Ok(Err(message)) => Some(message),
+                // Left as it is: settling or saving it now would turn a run
+                // that never started into a failure (review Minor 4).
+                Ok(Err(QueuedStartError::ShuttingDown)) => None,
+                Ok(Err(QueuedStartError::Failed(message))) => Some(message),
                 Err(_) => Some(RUN_ENDED_BEFORE_START.to_string()),
             };
             if let Some(message) = failure {

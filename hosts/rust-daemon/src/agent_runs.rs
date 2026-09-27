@@ -25,8 +25,9 @@ mod queue;
 
 #[allow(unused_imports)] // The tests and Tasks 8–9 use the rest.
 pub(crate) use self::queue::{
-    AcceptRun, AcceptedRun, QueuedRunStart, SessionRunMode, IDEMPOTENCY_KEY_REUSED, QUEUE_FULL,
-    RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START, SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
+    AcceptRun, AcceptedRun, QueuedRunStart, QueuedStartError, SessionRunMode,
+    IDEMPOTENCY_KEY_REUSED, QUEUE_FULL, RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START,
+    SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
 };
 
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
