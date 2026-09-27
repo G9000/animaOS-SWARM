@@ -157,7 +157,7 @@ Replaces checking the single runtime out of `DaemonState` for the whole run:
 ### 4.7 Steering
 
 - `mode: "steer"` while the session has a running run adds the text to that run's steering inbox. Before the next model call the runtime drains the inbox, records each item as a user message with `metadata.steer: true`, and appends it to the conversation. The stream emits `run.steered`.
-- If the run finishes without another model call, pending steers become queued runs in order.
+- If the run finishes without another model call, pending steers become queued runs in order. As built in M3, steers are saved on the joined run's record when accepted, so they survive a restart. Steers still pending when the run ends another way are not queued: they become `interrupted` runs the owner can send again, with code `stopped_before_start` after an explicit Stop, `failed_before_start` when the run failed, `queue_full_before_start` when the agent's queue of 8 is full, and `restart_before_start` after a restart.
 - Without an active run, `steer` behaves like `queue`. While awaiting approval, steers wait for the next model call.
 
 ### 4.8 Restart recovery
@@ -172,7 +172,7 @@ On boot, ledger runs that were `queued` become `interrupted` with code `restart_
 
 ### 5.1 Budget
 
-A model table in `anima-model-adapters` (`models.rs`) maps `(provider, model prefix)` to `ModelInfo { contextWindow, maxOutput, vision, pricing }`, using alias resolution and the longest matching prefix. A run's context budget is the agent setting `contextBudgetTokens` if set, otherwise 60% of the model's context window, otherwise 32,000 tokens. The reply reserve is the agent's `maxTokens` setting or 4,096.
+A model table in `anima-model-adapters` (`models.rs`) maps `(provider, model prefix)` to `ModelInfo { contextWindow, maxOutput, vision, pricing }`, using alias resolution and the longest matching prefix. A run's context budget is the agent setting `contextBudgetTokens` if set, otherwise 60% of the model's context window, otherwise 32,000 tokens. The reply reserve is the agent's `maxTokens` setting or 4,096. As built in M3: the 60% share is capped at 200,000 tokens (`DEFAULT_CONTEXT_BUDGET_CAP_TOKENS`; an explicit `contextBudgetTokens` is not capped), and the reply reserve never takes more than half the budget (`min(maxTokens or 4,096, budget / 2)`), so an agent with a large `maxTokens` still sends history.
 
 ### 5.2 Selection
 
@@ -191,7 +191,7 @@ When turns are dropped and no summary covers them, the session's `contextTrimmed
 
 - Triggered automatically before a model call when the selection would drop turns not covered by the summary (agent setting `autoCompact`, default on), and manually by `/compact` or the compact route.
 - A secondary call to the agent's provider and model (no tools, `maxTokens` 1,024, temperature 0.2) summarizes the previous summary plus the dropped turns into at most 8 KiB. The summary is stored on the session and injected as a context part labelled as data, not instructions. The stream shows `run.progress { phase: "compacting" }`.
-- If summarizing fails, the run continues with the trimmed context and the session records the error. Usage is recorded with source `compaction`.
+- If summarizing fails, the run continues with the trimmed context and the session records the error. Usage is recorded with source `compaction`. As built in M3: summarizing (reading pruned turns from the history store plus the model call) is bounded by 2 minutes, or by a helper's own deadline if that ends first, and a timeout counts as a failure. Pruned turns that no summary covers are folded in as well. The transcript is indented so message text cannot pose as a speaker or a section, and the summarizer is told that the whole transcript, tool results included, is untrusted data. A Stop during compaction ends the run at once.
 
 ## 6. Event stream
 
@@ -322,7 +322,7 @@ The composer's microphone button uses the existing `useBrowserDictation` hook, s
 
 ### 12.3 Titles
 
-After the first completed reply in a `chat` session whose `titleSource` is `first_message`, the daemon makes a background secondary call (agent's provider and model, no tools, `maxTokens` 32, temperature 0.2, first user message and reply truncated to 2 KiB each) asking for a 2–6 word title. The result is stripped of quotes and newlines, capped at 60 characters, saved with `titleSource: generated`, and announced with `session.updated`. It is skipped if the owner renamed the session meanwhile, failures are logged and ignored, usage is recorded with source `title`, and agent setting `autoTitle` (default on) disables it.
+After the first completed reply in a `chat` session whose `titleSource` is `first_message`, the daemon makes a background secondary call (agent's provider and model, no tools, `maxTokens` 32, temperature 0.2, first user message and reply truncated to 2 KiB each) asking for a 2–6 word title. The result is stripped of quotes and newlines, capped at 60 characters, saved with `titleSource: generated`, and announced with `session.updated`. It is skipped if the owner renamed the session meanwhile, failures are logged and ignored, usage is recorded with source `title`, and agent setting `autoTitle` (default on) disables it. As built in M3: the call is bounded by 30 seconds (a timeout is a failure). A stopped or incomplete earlier reply doesn't count as the first reply. Titles run only in the real daemon (`serve`); test and embedded states leave them off.
 
 ### 12.4 Streaming for every provider
 
