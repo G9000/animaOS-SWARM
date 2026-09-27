@@ -42,6 +42,9 @@ pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
 const MAX_HELPERS_PER_COMPANION: usize = 4;
 const MAX_HELPER_TOOL_ITERATIONS: usize = 8;
 const MAX_HELPER_RUN_MS: u64 = 120_000;
+/// How long a helper past its deadline has, once cancelled, to record its
+/// partial text and its tool calls' results before it is dropped.
+const HELPER_CANCEL_GRACE_MS: u64 = 2_000;
 const DUPLICATE_IN_FLIGHT_RUN: &str = "A run with this idempotency key is already in progress";
 /// Helpers have no chat of their own (spec §3.1); they only run through the
 /// companion that delegates to them. Shared with `routes::sessions::
@@ -1602,9 +1605,18 @@ impl AgentRunCoordinator {
             // This is a cooperative execution deadline, not an effect rollback.
             // Synchronous work must finish before yielding; process tools are
             // excluded because dropping their future would leave children alive.
-            match tokio::time::timeout_at(deadline, execution).await {
+            let mut execution = Box::pin(execution);
+            match tokio::time::timeout_at(deadline, &mut execution).await {
                 Ok(result) => result,
                 Err(_) => {
+                    // Cancelled first, then dropped (final fix wave S2-H): the
+                    // grace lets the runtime keep its partial text and give
+                    // each requested tool call its cancelled result, so no
+                    // call is left without one when the helper is reused.
+                    live_run.control().cancel.cancel();
+                    let grace = std::time::Duration::from_millis(HELPER_CANCEL_GRACE_MS);
+                    let _ = tokio::time::timeout(grace, &mut execution).await;
+                    drop(execution);
                     runtime.mark_failed("Helper task timed out", timeout_ms);
                     TaskResult::error("Helper task timed out", timeout_ms)
                 }
@@ -2892,6 +2904,97 @@ mod tests {
             assert_eq!(helper.state.status, AgentStatus::Failed);
             assert!(!coordinator.is_agent_busy(&helper.state.id));
         }
+    }
+
+    /// Final fix wave S2-H (review A, Minor 4): a helper whose deadline
+    /// passes mid tool batch is cancelled and given a grace period, so the
+    /// tool call it asked for gets its result before the run is dropped; its
+    /// result still says it timed out.
+    #[tokio::test]
+    async fn a_helper_timing_out_mid_tool_batch_leaves_no_call_without_a_result() {
+        assert_eq!(super::HELPER_CANCEL_GRACE_MS, 2_000);
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(Arc::new(
+            RevokedHelperToolAdapter {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        ))));
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(2)));
+        let mut lead = helper_lead(&coordinator).await;
+        lead.config.settings.as_mut().unwrap().timeout_ms = Some(300);
+        state
+            .write()
+            .await
+            .restore_agent_config(&lead.id, lead.config.clone());
+        let running = {
+            let coordinator = coordinator.clone();
+            let lead = lead.clone();
+            tokio::spawn(async move {
+                execute_helper_tool(&coordinator, &lead, true, "Slow tool").await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        // The helper's tool checks its companion's permission under the state
+        // lock: held here, the tool is still running when the deadline passes.
+        let held = state.write().await;
+        release.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(held);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.data.unwrap().text.contains("Helper task timed out"));
+        let helper = state
+            .read()
+            .await
+            .list_agents()
+            .into_iter()
+            .find(|agent| agent.state.id != lead.id)
+            .unwrap();
+        let calls: Vec<String> = helper
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .filter_map(
+                |message| match message.content.metadata.as_ref()?.get("toolCalls")? {
+                    DataValue::Array(calls) => Some(calls.clone()),
+                    _ => None,
+                },
+            )
+            .flatten()
+            .filter_map(|call| match call {
+                DataValue::Object(call) => match call.get("id") {
+                    Some(DataValue::String(id)) => Some(id.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, ["calculate-1"], "the helper asked for its tool");
+        for call in &calls {
+            assert!(
+                helper
+                    .messages
+                    .iter()
+                    .any(|message| message.role == MessageRole::Tool
+                        && message
+                            .content
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("toolCallId"))
+                            == Some(&DataValue::String(call.clone()))),
+                "{call} has its result"
+            );
+        }
+        assert_eq!(helper.state.status, AgentStatus::Failed);
     }
 
     struct RevokedHelperToolAdapter {
