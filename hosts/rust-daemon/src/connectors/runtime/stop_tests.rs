@@ -319,3 +319,131 @@ async fn a_replayed_owner_send_answers_with_the_runs_own_reply() {
     assert!(queued);
     manager.shutdown().await;
 }
+
+/// Final fix wave S2-D (review B, Minor 4): a replayed owner send answers
+/// from its run's ledger record, so a stopped run is not a success, even
+/// though its partial text is the first assistant message after the turn.
+#[tokio::test]
+async fn a_replayed_owner_send_of_a_stopped_run_is_not_a_success() {
+    let model = ScriptedModel::new(vec![Step::Hold(vec!["Let me"])]);
+    let (state, runs, manager, _transport, agent) = fixture(model.clone()).await;
+    let send = || {
+        let manager = manager.clone();
+        let agent = agent.clone();
+        async move {
+            manager
+                .send_from_owner(
+                    agent,
+                    CONNECTOR.into(),
+                    "remind me".into(),
+                    "owner-key".into(),
+                )
+                .await
+        }
+    };
+    let first = tokio::spawn(send());
+    let run_id = streaming_run(&state, "Let me").await;
+    runs.stop_run(&agent, &run_id).await.unwrap();
+    let (first, _) = first.await.unwrap().unwrap();
+    assert_eq!(first.result.status, "error");
+
+    let (replayed, queued) = send().await.unwrap();
+
+    assert_eq!(
+        replayed.result.status, "error",
+        "a stopped run is not a success"
+    );
+    assert_eq!(replayed.result.error.as_deref(), Some("Stopped by owner"));
+    assert!(replayed.result.data.is_none());
+    assert!(!queued);
+    assert_eq!(model.requests().len(), 1, "nothing ran again");
+    manager.shutdown().await;
+}
+
+/// Final fix wave S2-D: a replayed owner send of a failed run answers with
+/// its error instead of running the turn again.
+#[tokio::test]
+async fn a_replayed_owner_send_of_a_failed_run_answers_its_error() {
+    let model = ScriptedModel::new(vec![Step::Fail("provider unavailable")]);
+    let (_state, _runs, manager, _transport, agent) = fixture(model.clone()).await;
+    let send = || {
+        manager.send_from_owner(
+            agent.clone(),
+            CONNECTOR.into(),
+            "remind me".into(),
+            "owner-key".into(),
+        )
+    };
+    let (first, _) = send().await.unwrap();
+    assert_eq!(first.result.status, "error");
+
+    let (replayed, queued) = send().await.unwrap();
+
+    assert_eq!(replayed.result.status, "error");
+    assert!(replayed.result.data.is_none());
+    assert!(!queued);
+    assert_eq!(model.requests().len(), 1, "the turn did not run again");
+    manager.shutdown().await;
+}
+
+/// Final fix wave S2-D: a replayed owner send whose turn and reply left the
+/// hot tail reads the reply from the history store instead of running the
+/// turn again.
+#[tokio::test]
+async fn a_replayed_owner_send_whose_reply_left_the_hot_tail_reads_it_from_history() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["It is 2"])]);
+    let (state, _runs, manager, _transport, agent) = fixture(model.clone()).await;
+    let send = || {
+        manager.send_from_owner(
+            agent.clone(),
+            CONNECTOR.into(),
+            "what is 1+1?".into(),
+            "owner-key".into(),
+        )
+    };
+    send().await.unwrap();
+    let store = {
+        let mut guard = state.write().await;
+        let reply_id = guard
+            .runs
+            .find_by_idempotency_key(&agent, "owner-key", 0)
+            .and_then(|record| record.reply_message_id.clone())
+            .expect("the run saved its reply id");
+        let runtime = guard.agents.get_mut(&agent).unwrap();
+        let reply = runtime
+            .messages()
+            .iter()
+            .find(|message| message.id == reply_id)
+            .cloned()
+            .unwrap();
+        // Pruned: the store holds it, the hot tail no longer does.
+        runtime.retain_messages(|message| message.room_id != ROOM);
+        let store = guard.history.store();
+        store
+            .upsert_messages(&[crate::history::HistoryMessage {
+                agent_id: agent.clone(),
+                session_id: crate::sessions::session_id_for_room(ROOM),
+                hidden: false,
+                message: reply,
+            }])
+            .await
+            .unwrap();
+        store
+    };
+    drop(store);
+
+    let (replayed, queued) = send().await.unwrap();
+
+    assert_eq!(replayed.result.status, "success");
+    assert_eq!(
+        replayed
+            .result
+            .data
+            .as_ref()
+            .map(|content| content.text.as_str()),
+        Some("It is 2")
+    );
+    assert!(queued, "its reply is still queued for delivery");
+    assert_eq!(model.requests().len(), 1, "the turn did not run again");
+    manager.shutdown().await;
+}

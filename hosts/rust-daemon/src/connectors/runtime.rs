@@ -926,14 +926,38 @@ impl ConnectorManager {
                 .get(&connector_id)
                 .map(|worker| worker.generation);
             let replay = if accepted.is_some() {
-                None
+                OwnerSendReplay::New
             } else {
                 owner_send_replay(&state, &connector, &text, &idempotency_key)?
             };
             (connector, worker_generation, replay)
         };
-        if let Some(replay) = replay {
-            return Ok(replay);
+        match replay {
+            OwnerSendReplay::New => {}
+            OwnerSendReplay::Answered(envelope, delivery_queued) => {
+                return Ok((envelope, delivery_queued));
+            }
+            // Read with the state and lifecycle locks released.
+            OwnerSendReplay::FromHistory {
+                snapshot,
+                session_id,
+                reply_id,
+                delivery_queued,
+                store,
+            } => {
+                let reply = match store
+                    .get_message(&connector.agent_id, &session_id, &reply_id)
+                    .await
+                {
+                    Ok(Some(reply)) => reply.message.content,
+                    // Never run the turn again: the caller retries later.
+                    Ok(None) | Err(_) => return Err(ConnectorManagerError::Persistence),
+                };
+                return Ok((
+                    replay_envelope(&snapshot, TaskResult::success(reply, 0)),
+                    delivery_queued,
+                ));
+            }
         }
         // Only a unit of the agent's waiting budget is reserved here, without
         // waiting (spec §16). The run then waits for the Telegram room, an
@@ -2424,15 +2448,122 @@ impl ConnectorManager {
     }
 }
 
+/// What an owner send's key already answers (M1 F16; final fix wave S2-D).
+enum OwnerSendReplay {
+    /// No earlier send has this key: the send runs.
+    New,
+    /// The earlier send's answer, and whether its reply is queued for delivery.
+    Answered(AgentRunEnvelope, bool),
+    /// The earlier send completed, but its reply left the hot tail: read from
+    /// the history store once the locks are released.
+    FromHistory {
+        snapshot: anima_core::AgentRuntimeSnapshot,
+        session_id: String,
+        reply_id: String,
+        delivery_queued: bool,
+        store: Arc<dyn crate::history::HistoryStore>,
+    },
+}
+
+fn replay_envelope(
+    snapshot: &anima_core::AgentRuntimeSnapshot,
+    result: TaskResult<Content>,
+) -> AgentRunEnvelope {
+    AgentRunEnvelope {
+        agent: AgentRuntimeSnapshotResponse::from(snapshot),
+        result: TaskResultResponse::from(&result),
+    }
+}
+
+/// Whether the connector still has `reply_id` to deliver, or delivered it; a
+/// reply a stop suppressed is never sent (spec §4.6).
+fn reply_delivery_queued(
+    state: &DaemonState,
+    connector: &TelegramConnectorRecord,
+    reply_id: &str,
+) -> bool {
+    state.outbound.values().any(|outbound| {
+        outbound.connector_id == connector.id
+            && outbound.assistant_message_id == reply_id
+            && outbound.delivery_state != OutboundDeliveryState::Suppressed
+    })
+}
+
+/// The answer to an owner send whose key was already used: its run's ledger
+/// record when the ledger holds one, from its status and error (a stopped or
+/// failed run is not a success, and a completed run's reply is read from the
+/// history store once it left the hot tail); otherwise, for sends from
+/// before the ledger, the turn found in the transcript.
 fn owner_send_replay(
     state: &DaemonState,
     connector: &TelegramConnectorRecord,
     text: &str,
     idempotency_key: &str,
-) -> Result<Option<(AgentRunEnvelope, bool)>, ConnectorManagerError> {
+) -> Result<OwnerSendReplay, ConnectorManagerError> {
     let snapshot = state
         .get_agent(&connector.agent_id)
         .ok_or(ConnectorManagerError::AgentNotFound)?;
+    let session_id = crate::sessions::session_id_for_room(&connector.room_id);
+    let record = state
+        .runs
+        .for_session(&connector.agent_id, &session_id)
+        .into_iter()
+        .find(|record| record.idempotency_key.as_deref() == Some(idempotency_key));
+    let Some(record) = record else {
+        return transcript_owner_send_replay(state, connector, snapshot, text, idempotency_key);
+    };
+    if record.input.text != text {
+        return Err(ConnectorManagerError::IdempotencyConflict);
+    }
+    if !record.status.is_terminal() {
+        // Still queued or running: its answer is not known yet.
+        return Err(ConnectorManagerError::AgentBusy);
+    }
+    if record.status != RunStatus::Completed {
+        let message = record
+            .error
+            .as_ref()
+            .map(|error| error.message.clone())
+            .unwrap_or_else(|| format!("The run ended {}", record.status.as_str()));
+        return Ok(OwnerSendReplay::Answered(
+            replay_envelope(&snapshot, TaskResult::error(message, 0)),
+            false,
+        ));
+    }
+    let Some(reply_id) = record.reply_message_id.clone() else {
+        // A run completed before replies were saved with their runs.
+        return transcript_owner_send_replay(state, connector, snapshot, text, idempotency_key);
+    };
+    let delivery_queued = reply_delivery_queued(state, connector, &reply_id);
+    let reply = snapshot
+        .messages
+        .iter()
+        .find(|message| message.id == reply_id)
+        .map(|message| message.content.clone());
+    Ok(match reply {
+        Some(reply) => OwnerSendReplay::Answered(
+            replay_envelope(&snapshot, TaskResult::success(reply, 0)),
+            delivery_queued,
+        ),
+        None => OwnerSendReplay::FromHistory {
+            snapshot,
+            session_id,
+            reply_id,
+            delivery_queued,
+            store: state.history.store(),
+        },
+    })
+}
+
+/// A send from before the ledger: its turn in the transcript, and the first
+/// assistant message after it.
+fn transcript_owner_send_replay(
+    state: &DaemonState,
+    connector: &TelegramConnectorRecord,
+    snapshot: anima_core::AgentRuntimeSnapshot,
+    text: &str,
+    idempotency_key: &str,
+) -> Result<OwnerSendReplay, ConnectorManagerError> {
     let Some((user_index, user)) = snapshot.messages.iter().enumerate().find(|(_, message)| {
         message.room_id == connector.room_id
             && message.role == MessageRole::User
@@ -2446,44 +2577,27 @@ fn owner_send_replay(
                 )
             })
     }) else {
-        return Ok(None);
+        return Ok(OwnerSendReplay::New);
     };
     if user.content.text != text {
         return Err(ConnectorManagerError::IdempotencyConflict);
     }
-    // The run's own reply from the ledger (M1 F16); runs from before M3 fall
-    // back to the first assistant message after the owner's turn.
-    let reply_id = state
-        .runs
-        .find_by_idempotency_key(&connector.agent_id, idempotency_key, 0)
-        .and_then(|record| record.reply_message_id.as_deref());
-    let assistant = match reply_id {
-        Some(reply_id) => snapshot
-            .messages
-            .iter()
-            .find(|message| message.id == reply_id),
-        None => snapshot
-            .messages
-            .iter()
-            .skip(user_index + 1)
-            .find(|message| {
-                message.room_id == connector.room_id && message.role == MessageRole::Assistant
-            }),
+    let Some(assistant) = snapshot
+        .messages
+        .iter()
+        .skip(user_index + 1)
+        .find(|message| {
+            message.room_id == connector.room_id && message.role == MessageRole::Assistant
+        })
+    else {
+        return Ok(OwnerSendReplay::New);
     };
-    let Some(assistant) = assistant else {
-        return Ok(None);
-    };
-    let delivery_queued = state.outbound.values().any(|outbound| {
-        outbound.connector_id == connector.id && outbound.assistant_message_id == assistant.id
-    });
+    let delivery_queued = reply_delivery_queued(state, connector, &assistant.id);
     let result = TaskResult::success(assistant.content.clone(), 0);
-    Ok(Some((
-        AgentRunEnvelope {
-            agent: AgentRuntimeSnapshotResponse::from(&snapshot),
-            result: TaskResultResponse::from(&result),
-        },
+    Ok(OwnerSendReplay::Answered(
+        replay_envelope(&snapshot, result),
         delivery_queued,
-    )))
+    ))
 }
 
 fn map_credential_error(error: CredentialStoreError) -> ConnectorManagerError {
