@@ -263,7 +263,7 @@ impl ProviderModelAdapter {
 
     async fn stream_openai_compatible(
         &self,
-        provider_name: &str,
+        provider: &ProviderDefinition,
         endpoint: String,
         api_key: Option<&str>,
         config: &AgentConfig,
@@ -271,6 +271,7 @@ impl ProviderModelAdapter {
         sink: &dyn ModelStreamSink,
         shape: OpenAiRequestShape,
     ) -> Result<(), String> {
+        let provider_name = provider.label;
         for attempt in 0..2 {
             let mut body = build_openai_compatible_body(config, request)?;
             shape_openai_body(&mut body, shape);
@@ -299,7 +300,7 @@ impl ProviderModelAdapter {
                     )
                     .await;
                 }
-                return consume_openai_sse(response, sink).await;
+                return consume_openai_sse(response, sink, provider).await;
             }
             let retry = retryable(response.status()) && attempt == 0;
             let error = response_payload(response, provider_name, api_key)
@@ -496,7 +497,7 @@ impl ModelAdapter for ProviderModelAdapter {
                         .await;
                 }
                 self.stream_openai_compatible(
-                    definition.label,
+                    definition,
                     join_base_url(&credential.base_url, "/chat/completions"),
                     credential.api_key.as_deref(),
                     config,

@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 
+use crate::ProviderDefinition;
+
 /// A host-controlled adapter for deterministic integration tests and local demonstrations.
 #[derive(Clone, Debug)]
 pub struct DeterministicModelAdapter {
@@ -67,8 +69,9 @@ impl ModelAdapter for DeterministicModelAdapter {
 pub(crate) async fn consume_openai_sse(
     response: reqwest::Response,
     sink: &dyn ModelStreamSink,
+    provider: &ProviderDefinition,
 ) -> Result<(), String> {
-    let mut accumulator = StreamAccumulator::default();
+    let mut accumulator = StreamAccumulator::new(provider.id, provider.label);
     consume_sse_events(response, |payload| accumulator.openai(payload), sink).await?;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
         .await
@@ -79,7 +82,7 @@ pub(crate) async fn consume_anthropic_sse(
     response: reqwest::Response,
     sink: &dyn ModelStreamSink,
 ) -> Result<(), String> {
-    let mut accumulator = StreamAccumulator::default();
+    let mut accumulator = StreamAccumulator::new("anthropic", "Anthropic");
     consume_sse_events(response, |payload| accumulator.anthropic(payload), sink).await?;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
         .await
@@ -121,7 +124,7 @@ pub(crate) async fn consume_ollama_ndjson(
     }
     // A final unterminated line (no trailing `\n`) still carries a real event, unlike
     // SSE's tail below: Ollama's last NDJSON line is not required to end in a newline.
-    let rest = std::str::from_utf8(&reader.pending)
+    let rest = std::str::from_utf8(reader.remainder())
         .map_err(|_| stream_parse_error())?
         .trim()
         .to_owned();
@@ -136,13 +139,21 @@ pub(crate) async fn consume_ollama_ndjson(
         .map_err(|_| "provider stream consumer failed".to_owned())
 }
 
-const MAX_STREAM_BYTES: usize = 4 * 1024 * 1024;
-const MAX_STREAM_EVENT_BYTES: usize = 256 * 1024;
+/// The whole-stream bound counts framing bytes as they arrive (SSE events or NDJSON
+/// lines, ids, running usage and all). 64 MiB leaves room for chatty framing on a
+/// long reply (a provider can spend 200+ bytes of JSON per token) while still ending
+/// a runaway stream; the reply's own text and tool arguments have the far smaller
+/// bounds below. Framing is only counted, never kept, so the bound costs no memory.
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// The bound on one SSE event or NDJSON line, checked per frame after splitting.
+pub(crate) const MAX_STREAM_EVENT_BYTES: usize = 256 * 1024;
 const MAX_STREAM_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_STREAM_TOOL_CALLS: usize = 32;
 
-#[derive(Default)]
 struct StreamAccumulator {
+    /// The provider's catalog id and label, for provider-specific stop reasons.
+    provider_id: &'static str,
+    provider_label: &'static str,
     text: String,
     stop_reason: Option<ModelStopReason>,
     usage: StreamUsage,
@@ -169,6 +180,17 @@ struct ToolCallAccumulator {
 }
 
 impl StreamAccumulator {
+    fn new(provider_id: &'static str, provider_label: &'static str) -> Self {
+        Self {
+            provider_id,
+            provider_label,
+            text: String::new(),
+            stop_reason: None,
+            usage: StreamUsage::default(),
+            tools: BTreeMap::new(),
+        }
+    }
+
     fn openai(&mut self, payload: &Value) -> Result<Option<String>, String> {
         self.usage.merge_openai(payload.get("usage"))?;
         let choices = payload
@@ -183,7 +205,8 @@ impl StreamAccumulator {
         }
         let choice = &choices[0];
         if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
-            self.set_stop_reason(parse_stop_reason(reason.as_str(), false)?)?;
+            let reason = self.stop_reason_for(reason, false)?;
+            self.set_stop_reason(reason)?;
         }
         let delta = choice
             .get("delta")
@@ -325,7 +348,8 @@ impl StreamAccumulator {
                     .and_then(|delta| delta.get("stop_reason"))
                     .filter(|reason| !reason.is_null())
                 {
-                    self.set_stop_reason(parse_stop_reason(reason.as_str(), true)?)?;
+                    let reason = self.stop_reason_for(reason, true)?;
+                    self.set_stop_reason(reason)?;
                 }
                 Ok(None)
             }
@@ -344,6 +368,37 @@ impl StreamAccumulator {
         Ok(match self.tools.entry(index) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => entry.insert(ToolCallAccumulator::default()),
+        })
+    }
+
+    /// Maps a provider stop reason the way the non-streamed parsers do: the
+    /// recognized reasons keep their meaning and any other reason (Anthropic
+    /// `refusal`, `pause_turn`, `model_context_window_exceeded`; OpenAI-compatible
+    /// `content_filter`, `insufficient_system_resource`, `model_length`, ...) ends
+    /// the reply, logged at debug level. The one exception is OpenRouter's `error`,
+    /// which it documents as a mid-stream failure.
+    fn stop_reason_for(&self, reason: &Value, anthropic: bool) -> Result<ModelStopReason, String> {
+        Ok(match (reason.as_str(), anthropic) {
+            (Some("length" | "max_tokens"), _) => ModelStopReason::MaxTokens,
+            (Some("tool_calls"), false) | (Some("tool_use"), true) => ModelStopReason::ToolCall,
+            (Some("stop"), false) | (Some("end_turn" | "stop_sequence"), true) => {
+                ModelStopReason::End
+            }
+            (Some("error"), false) if self.provider_id == "openrouter" => {
+                return Err(format!(
+                    "{} stream failed with finish_reason \"error\"",
+                    self.provider_label
+                ));
+            }
+            _ => {
+                let raw = reason.to_string();
+                tracing::debug!(
+                    provider = self.provider_id,
+                    reason = %raw.chars().take(100).collect::<String>(),
+                    "unrecognized stream stop reason ends the reply"
+                );
+                ModelStopReason::End
+            }
         })
     }
 
@@ -384,6 +439,13 @@ impl StreamAccumulator {
             });
         }
         let usage = self.usage.finish()?;
+        // As in the non-streamed parsers, a turn that carries calls is a tool-call
+        // turn whatever its finish reason said (some servers finish it with `stop`).
+        let stop_reason = if calls.is_empty() {
+            self.stop_reason.unwrap_or(ModelStopReason::End)
+        } else {
+            ModelStopReason::ToolCall
+        };
         Ok(ModelGenerateResponse {
             content: Content {
                 text: self.text,
@@ -392,7 +454,7 @@ impl StreamAccumulator {
             },
             tool_calls: (!calls.is_empty()).then_some(calls),
             usage,
-            stop_reason: self.stop_reason.unwrap_or(ModelStopReason::End),
+            stop_reason,
         })
     }
 }
@@ -418,9 +480,7 @@ impl StreamUsage {
             usage.get("total_tokens"),
         )?;
         // `prompt_tokens_details.cached_tokens` is the OpenAI-shaped field; when it is
-        // absent or null, fall back to DeepSeek's `prompt_cache_hit_tokens`. Conflict
-        // detection (a later chunk disagreeing with an earlier one) still applies via
-        // `merge_detail_value` below, whichever field supplied the value.
+        // absent or null, fall back to DeepSeek's `prompt_cache_hit_tokens`.
         let cached_tokens = usage
             .get("prompt_tokens_details")
             .and_then(|details| details.get("cached_tokens"));
@@ -446,10 +506,10 @@ impl StreamUsage {
                 .checked_add(cache_read.unwrap_or(0))
                 .and_then(|value| value.checked_add(cache_write.unwrap_or(0)))
                 .ok_or_else(stream_parse_error)?;
-            merge_usage_number(&mut self.prompt, prompt)?;
+            self.prompt = Some(prompt);
         }
         if let Some(cache_read) = cache_read {
-            merge_usage_number(&mut self.cached_prompt, cache_read)?;
+            self.cached_prompt = Some(cache_read);
         }
         Ok(())
     }
@@ -476,10 +536,9 @@ impl StreamUsage {
         let computed = prompt_tokens
             .checked_add(completion_tokens)
             .ok_or_else(stream_parse_error)?;
+        // A reported total is kept as reported, as the non-streamed parsers do:
+        // xAI's total counts reasoning tokens that its `completion_tokens` leaves out.
         let total_tokens = self.total.unwrap_or(computed);
-        if self.total.is_some() && total_tokens != computed {
-            return Err(stream_parse_error());
-        }
         Ok(TokenUsage {
             prompt_tokens,
             completion_tokens,
@@ -509,40 +568,23 @@ fn optional_usage_value(value: Option<&Value>) -> Result<Option<u64>, String> {
     }
 }
 
-/// Strict merge for the original usage fields: see [`strict_usage_value`].
+/// Strict merge for the original usage fields: see [`strict_usage_value`]. When a
+/// value differs between chunks, the last one wins: xAI and Perplexity repeat running
+/// totals on every chunk, so a later value supersedes an earlier one.
 fn merge_usage_value(target: &mut Option<u64>, value: Option<&Value>) -> Result<(), String> {
-    match strict_usage_value(value)? {
-        Some(value) => merge_usage_number(target, value),
-        None => Ok(()),
+    if let Some(value) = strict_usage_value(value)? {
+        *target = Some(value);
     }
-}
-
-/// Null-tolerant merge for the newer cache/reasoning detail fields: see
-/// [`optional_usage_value`].
-fn merge_detail_value(target: &mut Option<u64>, value: Option<&Value>) -> Result<(), String> {
-    match optional_usage_value(value)? {
-        Some(value) => merge_usage_number(target, value),
-        None => Ok(()),
-    }
-}
-
-fn merge_usage_number(target: &mut Option<u64>, value: u64) -> Result<(), String> {
-    if target.is_some_and(|current| current != value) {
-        return Err(stream_parse_error());
-    }
-    *target = Some(value);
     Ok(())
 }
 
-fn parse_stop_reason(value: Option<&str>, anthropic: bool) -> Result<ModelStopReason, String> {
-    match (value, anthropic) {
-        (Some("length" | "max_tokens"), _) => Ok(ModelStopReason::MaxTokens),
-        (Some("tool_calls"), false) | (Some("tool_use"), true) => Ok(ModelStopReason::ToolCall),
-        (Some("stop"), false) | (Some("end_turn" | "stop_sequence"), true) => {
-            Ok(ModelStopReason::End)
-        }
-        _ => Err(stream_parse_error()),
+/// Null-tolerant merge for the newer cache/reasoning detail fields: see
+/// [`optional_usage_value`]. The last value wins, as in [`merge_usage_value`].
+fn merge_detail_value(target: &mut Option<u64>, value: Option<&Value>) -> Result<(), String> {
+    if let Some(value) = optional_usage_value(value)? {
+        *target = Some(value);
     }
+    Ok(())
 }
 
 fn bounded_index(value: Option<&Value>) -> Result<usize, String> {
@@ -607,45 +649,63 @@ fn stream_tool_error() -> String {
 /// NDJSON lines) using a caller-supplied boundary finder. Every stream consumer goes
 /// through this so the whole-stream and per-frame byte bounds are enforced in exactly
 /// one place (audit M13), rather than each protocol re-implementing its own read loop.
-struct BoundedFrameReader {
+/// The per-frame bound applies to each frame after splitting, so one network chunk
+/// may carry any number of small frames.
+pub(crate) struct BoundedFrameReader {
     pending: Vec<u8>,
+    /// How much of `pending` has already been handed out as frames.
+    consumed: usize,
     total_bytes: usize,
 }
 
 impl BoundedFrameReader {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: Vec::new(),
+            consumed: 0,
             total_bytes: 0,
         }
     }
 
-    /// Appends one chunk, enforcing the whole-stream and single-frame byte bounds.
-    fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
+    /// Appends one chunk, enforcing the whole-stream byte bound.
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Result<(), String> {
         self.total_bytes = self.total_bytes.saturating_add(chunk.len());
-        if self.total_bytes > MAX_STREAM_BYTES
-            || self.pending.len().saturating_add(chunk.len()) > MAX_STREAM_EVENT_BYTES
-        {
+        if self.total_bytes > MAX_STREAM_BYTES {
             return Err(stream_parse_error());
         }
+        self.pending.drain(..self.consumed);
+        self.consumed = 0;
         self.pending.extend_from_slice(chunk);
         Ok(())
     }
 
-    /// Pops the next complete frame found by `boundary`, draining it (and its
-    /// delimiter) from the pending buffer. `Ok(None)` means "not enough data yet".
-    fn next_frame(
+    /// Pops the next complete frame found by `boundary`, enforcing the single-frame
+    /// byte bound on it (or on the unfinished frame so far). `Ok(None)` means "not
+    /// enough data yet".
+    pub(crate) fn next_frame(
         &mut self,
         boundary: impl Fn(&[u8]) -> Option<(usize, usize)>,
     ) -> Result<Option<String>, String> {
-        let Some((index, delimiter)) = boundary(&self.pending) else {
+        let rest = self.remainder();
+        let Some((index, delimiter)) = boundary(rest) else {
+            if rest.len() > MAX_STREAM_EVENT_BYTES {
+                return Err(stream_parse_error());
+            }
             return Ok(None);
         };
-        let frame = std::str::from_utf8(&self.pending[..index])
+        if index > MAX_STREAM_EVENT_BYTES {
+            return Err(stream_parse_error());
+        }
+        let frame = std::str::from_utf8(&rest[..index])
             .map_err(|_| stream_parse_error())?
             .to_owned();
-        self.pending.drain(..index + delimiter);
+        self.consumed += index + delimiter;
         Ok(Some(frame))
+    }
+
+    /// The bytes not yet handed out as a frame.
+    pub(crate) fn remainder(&self) -> &[u8] {
+        &self.pending[self.consumed..]
     }
 }
 
@@ -678,7 +738,7 @@ async fn consume_sse_events(
         }
     }
     if reader
-        .pending
+        .remainder()
         .iter()
         .any(|byte| !byte.is_ascii_whitespace())
     {
@@ -687,17 +747,21 @@ async fn consume_sse_events(
     Ok(())
 }
 
-fn event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4))
-        .or_else(|| {
-            bytes
-                .windows(2)
-                .position(|window| window == b"\n\n")
-                .map(|index| (index, 2))
-        })
+/// The earliest blank line (`\n\n` or `\r\n\r\n`) that ends an SSE event, found in
+/// one pass so splitting a chunk of many events stays linear.
+pub(crate) fn event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(offset) = bytes[from..].iter().position(|byte| *byte == b'\n') {
+        let at = from + offset;
+        if bytes.get(at + 1) == Some(&b'\n') {
+            return Some((at, 2));
+        }
+        if at > 0 && bytes[at - 1] == b'\r' && bytes.get(at + 1..at + 3) == Some(b"\r\n") {
+            return Some((at - 1, 4));
+        }
+        from = at + 1;
+    }
+    None
 }
 
 /// One NDJSON line, terminated by `\n` (Ollama does not use `\r\n`).

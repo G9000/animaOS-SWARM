@@ -6,7 +6,8 @@ use std::sync::{
 
 use anima_core::{
     AgentConfig, AgentSettings, Content, DataValue, Message, MessageRole, ModelAdapter,
-    ModelGenerateRequest, ModelStopReason, ModelStreamFrame, ModelStreamSink, ToolDescriptor,
+    ModelGenerateRequest, ModelGenerateResponse, ModelStopReason, ModelStreamFrame,
+    ModelStreamSink, ToolDescriptor,
 };
 use axum::{
     extract::Json,
@@ -1688,4 +1689,218 @@ async fn google_stream_retry_exhausted_after_two_retryable_failures() {
 
     assert_eq!(error, "Google stream retry exhausted");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+// --- S1-A: streaming is the only production path, so it is no stricter than the
+// non-streamed `generate` parsers it replaced.
+
+async fn sse_server(path: &'static str, body: String) -> String {
+    let app = Router::new().route(
+        path,
+        post(move || {
+            let body = body.clone();
+            async move { ([("content-type", "text/event-stream")], body) }
+        }),
+    );
+    spawn_server(app).await
+}
+
+async fn stream_final(
+    adapter: &ProviderModelAdapter,
+    config: &AgentConfig,
+) -> Result<ModelGenerateResponse, String> {
+    let sink = FrameSink(Mutex::new(Vec::new()));
+    adapter.stream(config, &request(), &sink).await?;
+    let frames = sink.0.lock().unwrap().clone();
+    match frames.last() {
+        Some(ModelStreamFrame::Final(response)) => Ok(response.clone()),
+        other => panic!("expected a final frame, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn xai_running_usage_totals_let_the_last_value_win() {
+    // xAI (and Perplexity) repeat running usage totals on every chunk, and xAI's
+    // total counts reasoning tokens that `completion_tokens` leaves out.
+    let base_url = sse_server(
+        "/v1/chat/completions",
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":1,\"total_tokens\":21,\"prompt_tokens_details\":{\"cached_tokens\":0},\"completion_tokens_details\":{\"reasoning_tokens\":8}}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":22,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens_details\":{\"reasoning_tokens\":8}}}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3,\"total_tokens\":23,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens_details\":{\"reasoning_tokens\":8}}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("xai", Some("key"), &format!("{base_url}/v1"))]);
+
+    let response = stream_final(&adapter, &agent_config("xai", false))
+        .await
+        .expect("running usage totals are not a conflict");
+
+    assert_eq!(response.content.text, "Hello");
+    assert_eq!(response.usage.prompt_tokens, 12);
+    assert_eq!(response.usage.completion_tokens, 3);
+    assert_eq!(response.usage.total_tokens, 23);
+    assert_eq!(response.usage.cached_prompt_tokens, 4);
+    assert_eq!(response.usage.reasoning_tokens, 8);
+}
+
+#[tokio::test]
+async fn anthropic_unrecognized_stop_reasons_end_the_reply() {
+    for reason in ["refusal", "pause_turn", "model_context_window_exceeded"] {
+        let base_url = sse_server(
+            "/v1/messages",
+            format!(
+                concat!(
+                    "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":9}}}}}}\n\n",
+                    "data: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"I can't help\"}}}}\n\n",
+                    "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}},\"usage\":{{\"output_tokens\":3}}}}\n\n",
+                    "data: {{\"type\":\"message_stop\"}}\n\n"
+                ),
+                reason = reason
+            ),
+        )
+        .await;
+        let adapter = adapter_with(&[("anthropic", Some("key"), &base_url)]);
+
+        let response = stream_final(&adapter, &agent_config("anthropic", false))
+            .await
+            .unwrap_or_else(|error| panic!("{reason} should end the reply, got {error}"));
+
+        assert_eq!(response.stop_reason, ModelStopReason::End, "{reason}");
+        assert_eq!(response.content.text, "I can't help", "{reason}");
+        assert_eq!(response.usage.total_tokens, 12, "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn openai_compatible_unrecognized_finish_reasons_end_the_reply() {
+    for reason in [
+        "content_filter",
+        "insufficient_system_resource",
+        "model_length",
+    ] {
+        let base_url = sse_server(
+            "/v1/chat/completions",
+            format!(
+                concat!(
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"partial\"}}}}]}}\n\n",
+                    "data: {{\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                reason = reason
+            ),
+        )
+        .await;
+        let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+
+        let response = stream_final(&adapter, &agent_config("openai", false))
+            .await
+            .unwrap_or_else(|error| panic!("{reason} should end the reply, got {error}"));
+
+        assert_eq!(response.stop_reason, ModelStopReason::End, "{reason}");
+        assert_eq!(response.content.text, "partial", "{reason}");
+    }
+}
+
+#[tokio::test]
+async fn openrouter_error_finish_reason_fails_the_call_by_name() {
+    let body: String = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected\"},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .into();
+    let base_url = sse_server("/api/v1/chat/completions", body.clone()).await;
+    let adapter = adapter_with(&[("openrouter", Some("key"), &format!("{base_url}/api/v1"))]);
+
+    let error = stream_final(&adapter, &agent_config("openrouter", false))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        "OpenRouter stream failed with finish_reason \"error\""
+    );
+
+    // Any other provider's unrecognized `error` reason ends the reply, as `generate` does.
+    let base_url = sse_server("/v1/chat/completions", body).await;
+    let adapter = adapter_with(&[("together", Some("key"), &format!("{base_url}/v1"))]);
+    let response = stream_final(&adapter, &agent_config("together", false))
+        .await
+        .expect("only OpenRouter documents `error` as a failure");
+    assert_eq!(response.stop_reason, ModelStopReason::End);
+}
+
+#[tokio::test]
+async fn streamed_tool_calls_come_back_as_tool_calls_whatever_the_finish_reason() {
+    // Some OpenAI-compatible servers finish a tool-call turn with `stop`; the
+    // non-streamed parser reports any turn with calls as a tool-call turn.
+    let base_url = sse_server(
+        "/v1/chat/completions",
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"delegate_task\",\"arguments\":\"{\\\"task\\\":\\\"research\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+
+    let response = stream_final(&adapter, &agent_config("openai", true))
+        .await
+        .unwrap();
+
+    assert_eq!(response.stop_reason, ModelStopReason::ToolCall);
+    assert_eq!(response.tool_calls.unwrap()[0].name, "delegate_task");
+}
+
+#[tokio::test]
+async fn a_stream_with_more_than_4_mib_of_framing_completes() {
+    let event = "data: {\"id\":\"chatcmpl-0123456789abcdefghij\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o-mini-2024-07-18\",\"system_fingerprint\":\"fp_0123456789\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tok \"},\"logprobs\":null,\"finish_reason\":null}]}\n\n";
+    let count = 24_000;
+    let mut body = event.repeat(count);
+    body.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n");
+    assert!(body.len() > 5 * 1024 * 1024, "{}", body.len());
+    let base_url = sse_server("/v1/chat/completions", body).await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+
+    let response = stream_final(&adapter, &agent_config("openai", false))
+        .await
+        .expect("framing overhead alone does not end a stream");
+
+    assert_eq!(response.content.text.len(), 4 * count);
+}
+
+#[test]
+fn one_network_chunk_carrying_many_small_events_splits_before_the_event_bound() {
+    use crate::stream::{event_boundary, BoundedFrameReader, MAX_STREAM_EVENT_BYTES};
+
+    let event = format!("data: {{\"n\":\"{}\"}}\n\n", "x".repeat(90));
+    let count = (MAX_STREAM_EVENT_BYTES / event.len()) * 3;
+    let chunk = event.repeat(count);
+    assert!(chunk.len() > MAX_STREAM_EVENT_BYTES);
+
+    let mut reader = BoundedFrameReader::new();
+    reader
+        .push(chunk.as_bytes())
+        .expect("the bound applies to each event, not to the chunk");
+    let mut frames = 0;
+    while let Some(frame) = reader.next_frame(event_boundary).unwrap() {
+        assert!(frame.starts_with("data: "));
+        frames += 1;
+    }
+    assert_eq!(frames, count);
+
+    // One event past the bound still fails, whether or not it has ended yet.
+    let oversized = format!("data: {}", "y".repeat(MAX_STREAM_EVENT_BYTES));
+    let mut reader = BoundedFrameReader::new();
+    reader.push(oversized.as_bytes()).unwrap();
+    assert!(reader.next_frame(event_boundary).is_err());
+    let mut reader = BoundedFrameReader::new();
+    reader.push(format!("{oversized}\n\n").as_bytes()).unwrap();
+    assert!(reader.next_frame(event_boundary).is_err());
 }
