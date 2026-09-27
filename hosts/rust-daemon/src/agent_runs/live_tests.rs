@@ -407,6 +407,7 @@ async fn an_aborted_run_is_announced_as_failed() {
         coordinator.control_plane_transactions(),
         run_id.clone(),
         live_run.end(),
+        live_run.control(),
     ));
     drop(live_run);
 

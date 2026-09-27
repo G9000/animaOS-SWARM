@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::{
     content_retry_key, AgentCommunicationRoute, AgentConfig, AgentConfigUpdate, AgentSettings,
-    AgentState, Content, DataValue, TaskResult,
+    AgentState, Content, DataValue, RunControl, TaskResult,
 };
 use anima_memory::{MemoryType, NewMemory};
 use futures::future::{select, Either};
@@ -1263,6 +1263,7 @@ impl AgentRunCoordinator {
                 self.control_plane_transactions(),
                 run_id.clone(),
                 live_run.end(),
+                live_run.control(),
             );
             (
                 runtime,
@@ -1775,12 +1776,14 @@ async fn save_offered_steers(state: &SharedDaemonState, offered: Vec<RunRecord>)
 /// its terminal event gets one here, with the ledger's status: `failed` for a
 /// run this marks, otherwise whatever its commit recorded (a panic after
 /// `commit_run`). The steers a run it marks failed still held are offered
-/// again in the same change (Task 9 fix round 1).
+/// again in the same change, all under the control-plane transaction, as a
+/// rollback does (Task 9 fix rounds 1 and 2).
 struct InFlightRunGuard {
     state: SharedDaemonState,
     transactions: Arc<Mutex<()>>,
     run_id: Option<String>,
     live: LiveRunEnd,
+    control: RunControl,
 }
 
 impl InFlightRunGuard {
@@ -1789,12 +1792,14 @@ impl InFlightRunGuard {
         transactions: Arc<Mutex<()>>,
         run_id: String,
         live: LiveRunEnd,
+        control: RunControl,
     ) -> Self {
         Self {
             state,
             transactions,
             run_id: Some(run_id),
             live,
+            control,
         }
     }
 
@@ -1812,6 +1817,10 @@ impl Drop for InFlightRunGuard {
         if self.live.ended() {
             return;
         }
+        // No steer joins a run whose task is gone: from now on one waits as
+        // a message (`joinable_run` refuses a closed inbox). The steers it
+        // already saved are on its record, offered again below.
+        self.control.steering.close();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -1819,6 +1828,10 @@ impl Drop for InFlightRunGuard {
         let transactions = Arc::clone(&self.transactions);
         let live = self.live.clone();
         handle.spawn(async move {
+            // Taken before the first change, as by every control-plane
+            // mutation: a steer whose acceptance save is in flight is
+            // answered with the run as it was when it joined.
+            let _transaction = transactions.lock_owned().await;
             let offered = {
                 let mut guard = state.write().await;
                 let Some(record) = guard.runs.get_mut(&run_id) else {
@@ -1839,11 +1852,7 @@ impl Drop for InFlightRunGuard {
                     .runs
                     .offer_steers_of_failed_run(&run_id, anima_core::primitives::now_millis())
             };
-            if !offered.is_empty() {
-                // Taken after the state lock is released (lock order).
-                let _transaction = transactions.lock_owned().await;
-                save_offered_steers(&state, offered).await;
-            }
+            save_offered_steers(&state, offered).await;
         });
     }
 }

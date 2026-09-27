@@ -194,8 +194,9 @@ pub(super) struct SteerLeftovers {
     /// Keys of the steers its transcript took in: they stay on its record
     /// until its result is saved with them.
     pub(super) taken: HashSet<String>,
-    /// Whether its control was cancelled; a stop saved on its record counts
-    /// too.
+    /// Whether its control was cancelled (`cancel.is_cancelled()`), read as
+    /// its execution ended. `hand_on_steers` also treats a stop saved on its
+    /// record as one, read under the transaction.
     pub(super) stopped: bool,
 }
 

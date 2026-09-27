@@ -989,3 +989,137 @@ async fn a_saved_stop_that_has_not_reached_the_run_still_keeps_its_steers_from_r
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(model.requests().len(), 1, "the steer never ran");
 }
+
+/// Fix round 2: a crashed run is cleaned up under the control-plane
+/// transaction. A steer whose acceptance save is in flight when the run's
+/// task panics is answered with the run as it was when the steer joined
+/// (still running), never with a run already failed, and is then offered
+/// again once.
+#[tokio::test]
+async fn a_steer_racing_a_crashed_run_is_answered_with_the_run_it_joined() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Panic("the model crashed")], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let AcceptedRun::Created(first) = accept(
+        &coordinator,
+        message(&agent_id, "key-1", "compute", SessionRunMode::Queue),
+    )
+    .await
+    else {
+        panic!("queued");
+    };
+    gate.entered().await;
+    let control = hub.runs().control(&first.id).unwrap();
+    // The steer joins; its acceptance save is held.
+    let save_gate = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(false);
+    let steering = {
+        let coordinator = coordinator.clone();
+        let request = message(&agent_id, "key-2", "also this", SessionRunMode::Steer);
+        tokio::spawn(async move { accept(&coordinator, request).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), save_gate.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    // The run's task panics while that save is in flight.
+    gate.release();
+    for _ in 0..500 {
+        let failed = coordinator
+            .state
+            .read()
+            .await
+            .runs
+            .get(&first.id)
+            .is_some_and(|record| record.status == RunStatus::Failed);
+        if failed || control.steering.is_closed() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    save_gate.release.add_permits(1);
+
+    let answer = steering.await.unwrap();
+    let AcceptedRun::Steered(joined) = &answer else {
+        panic!("the steer joined before the crash: {answer:?}");
+    };
+    assert_eq!(joined.id, first.id);
+    assert_eq!(
+        joined.status,
+        RunStatus::Running,
+        "never answered with a run already failed"
+    );
+    let offered = wait_for_key(&coordinator, &agent_id, "key-2", RunStatus::Interrupted).await;
+    assert_eq!(offered.error.as_ref().unwrap().code, "failed_before_start");
+    let failed = wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Failed).await;
+    assert_eq!(failed.error.as_ref().unwrap().code, "run_aborted");
+    let guard = coordinator.state.read().await;
+    assert!(guard.runs.get(&first.id).unwrap().pending_steers.is_empty());
+    assert_eq!(guard.runs.for_session(&agent_id, "chat:s").len(), 2);
+}
+
+/// Fix round 2: a crashed run's inbox closes as its task ends, so a steer
+/// sent before its cleanup runs is a new message, not a steer into a run
+/// that is about to fail.
+#[tokio::test]
+async fn a_steer_sent_as_a_run_crashes_waits_as_the_next_message() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Panic("the model crashed")], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let AcceptedRun::Created(first) = accept(
+        &coordinator,
+        message(&agent_id, "key-1", "compute", SessionRunMode::Queue),
+    )
+    .await
+    else {
+        panic!("queued");
+    };
+    gate.entered().await;
+    let control = hub.runs().control(&first.id).unwrap();
+    // The cleanup waits for this transaction.
+    let transaction = coordinator.control_plane_transaction().await;
+    gate.release();
+    for _ in 0..500 {
+        if control.steering.is_closed() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(control.steering.is_closed(), "closed as the task ended");
+    assert_eq!(
+        coordinator
+            .state
+            .read()
+            .await
+            .runs
+            .get(&first.id)
+            .unwrap()
+            .status,
+        RunStatus::Running,
+        "not failed outside the transaction"
+    );
+    let steering = {
+        let coordinator = coordinator.clone();
+        let request = message(&agent_id, "key-2", "also this", SessionRunMode::Steer);
+        tokio::spawn(async move { accept(&coordinator, request).await })
+    };
+    drop(transaction);
+
+    let answer = steering.await.unwrap();
+    assert!(
+        matches!(&answer, AcceptedRun::Created(record) if record.status == RunStatus::Queued),
+        "{answer:?}"
+    );
+    gate.release();
+    let second = wait_for_key(&coordinator, &agent_id, "key-2", RunStatus::Completed).await;
+    assert_eq!(second.input.text, "also this");
+    wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Failed).await;
+}
