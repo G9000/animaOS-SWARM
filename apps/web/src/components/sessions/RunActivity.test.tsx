@@ -225,4 +225,68 @@ describe('RunOutcomeCard', () => {
     );
     expect(screen.getByText('Stopped')).toBeVisible();
   });
+
+  it.each([
+    {
+      code: 'restart_during_run',
+      message: 'The daemon restarted during this run.',
+      shown: 'The daemon restarted while this reply was running.',
+    },
+    {
+      code: 'restart_before_start',
+      message:
+        'The daemon restarted before this run started; it is safe to send it again.',
+      shown: 'The daemon restarted before this message was sent.',
+    },
+    {
+      code: 'stopped_before_start',
+      message:
+        'The run was stopped before this message reached it; it is safe to send it again.',
+      shown:
+        'The run was stopped before this message reached it; it is safe to send it again.',
+    },
+    {
+      code: 'queue_full_before_start',
+      message:
+        'Eight messages were already waiting when the run this message joined ended; it is safe to send it again.',
+      shown:
+        'Eight messages were already waiting when the run this message joined ended; it is safe to send it again.',
+    },
+    {
+      code: 'failed_before_start',
+      message:
+        'The run this message joined failed before reading it; send it again.',
+      shown:
+        'The run this message joined failed before reading it; send it again.',
+    },
+    {
+      code: 'failed_before_start',
+      message: '',
+      shown: 'This message wasn’t sent.',
+    },
+  ])(
+    'says why an interrupted message did not run ($code)',
+    ({ code, message, shown }) => {
+      render(
+        <RunOutcomeCard
+          run={runFixture('run_i', {
+            status: 'interrupted',
+            error: { code, message },
+          })}
+          onSendAgain={vi.fn()}
+        />,
+      );
+      expect(screen.getByText(shown)).toBeVisible();
+      expect(screen.getByRole('button', { name: 'Send again' })).toBeVisible();
+    },
+  );
+
+  it('says an interrupted message without a reason was not sent', () => {
+    render(
+      <RunOutcomeCard
+        run={runFixture('run_i', { status: 'interrupted', error: null })}
+      />,
+    );
+    expect(screen.getByText('This message wasn’t sent.')).toBeVisible();
+  });
 });

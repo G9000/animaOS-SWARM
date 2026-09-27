@@ -1,5 +1,19 @@
 import type { Run } from '@animaOS-SWARM/sdk';
 
+/** Why an interrupted run did not reply: a restart in the web's words,
+ *  otherwise the daemon's own reason, such as a stop or a full queue that
+ *  left a steer unread. */
+function interruptedReason(run: Run): string {
+  switch (run.error?.code) {
+    case 'restart_during_run':
+      return 'The daemon restarted while this reply was running.';
+    case 'restart_before_start':
+      return 'The daemon restarted before this message was sent.';
+    default:
+      return run.error?.message.trim() || 'This message wasn’t sent.';
+  }
+}
+
 /** How a run ended when it did not simply reply (spec §15.2). */
 export function RunOutcomeCard({
   run,
@@ -33,14 +47,9 @@ export function RunOutcomeCard({
         )}
       </div>
     );
-  const duringRun = run.error?.code === 'restart_during_run';
   return (
     <div className="run-outcome" data-outcome="interrupted">
-      <p>
-        {duringRun
-          ? 'The daemon restarted while this reply was running.'
-          : 'The daemon restarted before this message was sent.'}
-      </p>
+      <p>{interruptedReason(run)}</p>
       {run.toolsStarted.length > 0 && (
         <p className="run-outcome-warning">
           Tools had started ({run.toolsStarted.join(', ')}). Check their effects
