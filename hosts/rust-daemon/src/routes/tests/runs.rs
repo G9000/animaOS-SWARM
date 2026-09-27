@@ -1920,6 +1920,59 @@ async fn a_retried_steer_still_pending_is_answered_as_a_steer() {
     assert!(body.get("steer").is_none(), "no longer a pending steer");
 }
 
+/// Final fix wave S2-F (review B, Minor 6): a run carries its idempotency key
+/// (owner-only, as every runs route and the event stream are), so a client
+/// matches its sends by key rather than by text.
+#[tokio::test]
+async fn a_run_carries_its_idempotency_key() {
+    let (app, state, agent) = app_with_chat(ScriptedModel::new(vec![])).await;
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+
+    let started = json_body(
+        app.clone()
+            .oneshot(start_request(
+                &agent,
+                "chat:plans",
+                Some("key-7"),
+                json!({"text": "hello"}),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(started["run"]["idempotencyKey"], "key-7");
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    let queued = next_event(&mut subscription).await.to_json(1);
+    assert_eq!(queued["type"], "run.queued");
+    assert_eq!(queued["run"]["idempotencyKey"], "key-7");
+    wait_for(&state, &run_id, RunStatus::Completed).await;
+    let listed = json_body(
+        app.clone()
+            .oneshot(get_request(
+                &format!("/api/agents/{agent}/sessions/chat%3Aplans/runs"),
+                OWNER_ORIGIN,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(listed["runs"][0]["idempotencyKey"], "key-7");
+
+    let mut keyless = state.read().await.runs.get(&run_id).unwrap().clone();
+    keyless.idempotency_key = None;
+    assert_eq!(
+        serde_json::to_value(crate::routes::RunResponse::from(&keyless)).unwrap()["idempotencyKey"],
+        serde_json::Value::Null,
+        "a run without a key answers null"
+    );
+    use utoipa::OpenApi;
+    let schema = serde_json::to_value(crate::routes::ApiDoc::openapi()).unwrap()["components"]
+        ["schemas"]["RunResponse"]["properties"]["idempotencyKey"]
+        .clone();
+    assert!(schema.is_object(), "the OpenAPI schema lists it: {schema}");
+}
+
 fn compact_request(agent: &str, session: &str, origin: &str) -> Request<Body> {
     Request::builder()
         .method("POST")

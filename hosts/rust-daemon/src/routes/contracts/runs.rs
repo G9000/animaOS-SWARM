@@ -44,6 +44,10 @@ pub(crate) struct RunResponse {
     /// `web`, `api`, `telegram`, `schedule`, `job`, `delegation`, or `peer`.
     pub(crate) source: String,
     pub(crate) source_ref: Option<String>,
+    /// The `Idempotency-Key` the run was accepted or started with, so a
+    /// client matches its own sends (owner-only, as every runs route and the
+    /// event stream are); `null` for a run without one.
+    pub(crate) idempotency_key: Option<String>,
     /// `queued`, `running`, `awaiting_approval`, `completed`, `failed`,
     /// `cancelled`, or `interrupted`.
     pub(crate) status: String,
@@ -71,6 +75,7 @@ impl From<&RunRecord> for RunResponse {
             session_id: record.session_id.clone(),
             source: record.source.as_str().into(),
             source_ref: record.source_ref.clone(),
+            idempotency_key: record.idempotency_key.clone(),
             status: record.status.as_str().into(),
             input: RunInputResponse {
                 text: record.input.text.clone(),
