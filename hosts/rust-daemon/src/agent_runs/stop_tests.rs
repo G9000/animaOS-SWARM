@@ -614,6 +614,61 @@ async fn a_stopped_runs_unread_steers_become_interrupted_runs_to_send_again() {
     assert_eq!(guard.runs.queued_count(&agent_id), 0);
 }
 
+/// Fix round 1 (Task 8 review): the interrupted runs a stopped run's unread
+/// steers become are announced only once saved. When that save fails they
+/// stay in the ledger for the next save (the run's own result save, right
+/// after) and nothing announces them.
+#[tokio::test]
+async fn unread_steers_whose_save_fails_are_kept_but_not_announced() {
+    let model = ScriptedModel::new(vec![Step::Hold(vec!["Working"])]);
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+    let run_id = accept_web(&coordinator, &agent_id, "chat:s", "key-1").await;
+    assert_eq!(running_with_text(&coordinator, "Working").await, run_id);
+    let control = hub.runs().control(&run_id).unwrap();
+    let now = anima_core::primitives::now_millis();
+    control
+        .steering
+        .push(steer("key-2", "and the weather?", now))
+        .unwrap();
+    // The next save is the steers' own: it fails. (The control is cancelled
+    // directly, so no stop save comes first.)
+    let save_gate = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(true);
+    save_gate.release.add_permits(1);
+    control.cancel.cancel();
+
+    let events = events_until(&mut subscription, "run.cancelled").await;
+    let after = quiet_for(&mut subscription).await;
+    assert!(
+        events
+            .iter()
+            .chain(&after)
+            .all(|event| event["type"] != "run.interrupted"),
+        "an unsaved run is not announced: {events:?} {after:?}"
+    );
+    let guard = coordinator.state.read().await;
+    let record = guard
+        .runs
+        .find_by_idempotency_key(&agent_id, "key-2", 0)
+        .expect("the steer is kept for the next save");
+    assert_eq!(record.status, RunStatus::Interrupted);
+    assert_eq!(record.error.as_ref().unwrap().code, "stopped_before_start");
+    assert!(
+        guard
+            .control_plane_snapshot()
+            .runs
+            .iter()
+            .any(|saved| saved.id == record.id),
+        "the next save carries it"
+    );
+}
+
 /// A start closure that signals `entered` once its session queue calls it,
 /// then waits for `hold` before starting the run as a web message would.
 fn held_start(
@@ -870,7 +925,8 @@ async fn a_queued_message_whose_stop_cannot_be_saved_still_runs() {
 }
 
 /// The bash polling loop kills its child when the run is stopped (spec
-/// §4.6), so a stop does not wait for a long command.
+/// §4.6), so a stop does not wait for a long command, not even for a process
+/// the command started that keeps its output open (fix round 1).
 #[cfg(unix)]
 #[tokio::test]
 async fn a_stop_kills_the_bash_command_its_run_waits_for() {
@@ -879,7 +935,8 @@ async fn a_stop_kills_the_bash_command_its_run_waits_for() {
         name: "bash".into(),
         args: BTreeMap::from([(
             "command".to_string(),
-            DataValue::String("exec sleep 30".into()),
+            // Not `exec`: the shell's own `sleep` child holds the pipes.
+            DataValue::String("sleep 15 && echo done".into()),
         )]),
     };
     let model = ScriptedModel::new(vec![Step::Tools(vec![bash])]);
@@ -930,13 +987,13 @@ async fn a_stop_kills_the_bash_command_its_run_waits_for() {
     let started = std::time::Instant::now();
 
     coordinator.stop_run(&agent_id, &run_id).await.unwrap();
-    let envelope = tokio::time::timeout(Duration::from_secs(10), running)
+    let envelope = tokio::time::timeout(Duration::from_secs(5), running)
         .await
-        .expect("the stop ends the command")
+        .expect("the stop ends the run without waiting for the command's sleep")
         .unwrap()
         .unwrap();
 
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(started.elapsed() < Duration::from_secs(5));
     assert_eq!(envelope.result.error.as_deref(), Some("stopped"));
     let guard = coordinator.state.read().await;
     let result = guard.agents[&agent_id]

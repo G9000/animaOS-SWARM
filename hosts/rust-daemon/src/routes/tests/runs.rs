@@ -1320,6 +1320,7 @@ async fn stopping_is_idempotent_and_a_finished_run_is_answered_as_it_is() {
     let (app, state, agent) =
         app_with_chat(ScriptedModel::new(vec![Step::Hold(vec!["Thinking"])])).await;
     let run_id = accept_message(&app, &agent, "key-1").await;
+    let mut streaming = false;
     for _ in 0..500 {
         if state
             .read()
@@ -1329,10 +1330,12 @@ async fn stopping_is_idempotent_and_a_finished_run_is_answered_as_it_is() {
             .view(&run_id)
             .is_some_and(|view| view.text == "Thinking")
         {
+            streaming = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(streaming, "the run never streamed its text");
 
     let first = json_body(
         app.clone()

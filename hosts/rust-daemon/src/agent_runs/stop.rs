@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::primitives::now_millis;
 use anima_core::{Content, DataValue};
-use tracing::warn;
+use tracing::error;
 
 use super::queue::{metadata_text, ACCEPTED_AT_METADATA_KEY, CLIENT_REQUEST_ID_METADATA_KEY};
 use super::AgentRunCoordinator;
@@ -197,10 +197,14 @@ impl AgentRunCoordinator {
             )
         };
         if let Err(error) = persist.save().await {
-            // Kept in memory; the next save persists them.
-            warn!(agent_id = %agent_id, session_id = %session_id, error = %error, "could not save the steers a stopped run never read");
+            // Kept in the ledger for the next save (the run's own result
+            // save, right after this), but never announced unsaved: clients
+            // read them from the ledger once the run's end refreshes it.
+            error!(agent_id = %agent_id, session_id = %session_id, error = %error, "could not save the steers a stopped run never read");
+            return;
         }
         drop(transaction);
+        // Announced only once durable (spec §6).
         for record in &records {
             hub.publish(run_status_event(record), parent.as_deref());
         }

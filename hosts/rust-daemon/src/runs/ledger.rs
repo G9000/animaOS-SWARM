@@ -1190,8 +1190,6 @@ mod tests {
         assert_eq!(ids, [newer.id.as_str(), old.id.as_str()], "newest first");
     }
 
-    /// Carry-forward (M2 T17 Minor 9): a message still waiting to start keeps
-    /// its session active, so the web never declares the send unconfirmed.
     /// A deleted agent's queued runs are cancelled, each returned as it was
     /// and as it is now; its running runs and other agents' runs are not
     /// touched (spec §4.4 item 6; M3 Task 7 review Minor 3).
@@ -1227,6 +1225,8 @@ mod tests {
         assert!(ledger.cancel_queued_for_agent("agent-a", 30).is_empty());
     }
 
+    /// Carry-forward (M2 T17 Minor 9): a message still waiting to start keeps
+    /// its session active, so the web never declares the send unconfirmed.
     #[test]
     fn a_queued_run_alone_keeps_its_session_active() {
         let mut ledger = RunLedger::default();

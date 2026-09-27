@@ -357,7 +357,7 @@ pub(super) async fn get_run(
         (status = 202, description = "Stop accepted: a queued run is cancelled; a running run stops at its next checkpoint; a finished run is returned as it is", body = RunEnvelope),
         (status = 403, description = "Local owner required", body = ErrorBody),
         (status = 404, description = "Agent or run not found", body = ErrorBody),
-        (status = 503, description = "The stop could not be saved", body = ErrorBody)
+        (status = 503, description = "The stop could not be saved, or the history store could not be read for a run the ledger no longer holds", body = ErrorBody)
     ))]
 pub(super) async fn stop_run(
     State(state): State<AppState>,

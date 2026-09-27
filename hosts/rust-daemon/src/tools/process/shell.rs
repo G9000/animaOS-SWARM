@@ -22,11 +22,10 @@ const BASH_MAX_CAPTURE_BYTES: usize = 256 * 1024;
 /// A bash command whose run was stopped (spec §4.6).
 pub(in super::super) const BASH_STOPPED: &str = "Command stopped by owner";
 
-/// How the polling loop ended.
+/// How the polling loop ended, when it did not return a stop.
 enum Waited {
     Exited(std::process::ExitStatus),
     TimedOut,
-    Stopped,
 }
 
 /// Environment variables that are safe and necessary to pass through to the
@@ -141,14 +140,19 @@ pub(in super::super) fn execute_bash_command_from_root(
 
         if cancel.is_some_and(|signal| signal.is_cancelled()) {
             // Kills the direct child only (spec §4.6: "kills its child
-            // process"). A grandchild that holds the output pipes keeps
-            // running, and the capture threads below wait for it to close
-            // them; a process-group kill is later work (audit M11).
+            // process"); a process the command started keeps running, and a
+            // process-group kill is later work (audit M11). The answer comes
+            // at once: the capture threads are left to end on their own when
+            // the last holder of the pipes closes them, so such a process
+            // cannot keep the stopped run waiting (Task 8 fix round 1).
             child
                 .kill()
                 .map_err(|error| format!("bash failed to stop the command: {error}"))?;
             let _ = child.wait();
-            break Waited::Stopped;
+            return Ok(BashCommandResult {
+                status: "error",
+                output: BASH_STOPPED.to_string(),
+            });
         }
 
         if start.elapsed() >= Duration::from_millis(timeout_ms) {
@@ -180,12 +184,6 @@ pub(in super::super) fn execute_bash_command_from_root(
             return Ok(BashCommandResult {
                 status: "error",
                 output: format!("Command timed out after {timeout_ms}ms"),
-            });
-        }
-        Waited::Stopped => {
-            return Ok(BashCommandResult {
-                status: "error",
-                output: BASH_STOPPED.to_string(),
             });
         }
     };

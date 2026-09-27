@@ -1402,6 +1402,44 @@ fn execute_bash_command_kills_its_child_when_the_run_is_stopped() {
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 
+/// Fix round 1 (Task 8 review): a stopped command returns at once even when a
+/// process it started still holds its output open; only the direct child is
+/// killed (audit M11), and the grandchild ends on its own.
+#[cfg(unix)]
+#[test]
+fn execute_bash_command_returns_at_once_when_a_stopped_commands_grandchild_holds_its_output() {
+    let workspace = create_temp_workspace("bash-stop-grandchild");
+    let signal = anima_core::CancelSignal::new();
+    let canceller = {
+        let signal = signal.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            signal.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+
+    // Not `exec`: the shell forks `sleep`, which keeps the pipes open.
+    let result = execute_bash_command_from_root(
+        &workspace,
+        "sleep 15 && echo done",
+        60_000,
+        ".",
+        Some(&signal),
+    )
+    .expect("bash command result");
+
+    canceller.join().unwrap();
+    assert_eq!(result.status, "error");
+    assert_eq!(result.output, "Command stopped by owner");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the stop did not wait for the grandchild: {:?}",
+        started.elapsed()
+    );
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
 #[test]
 fn background_process_manager_tracks_process_lifecycle() {
     let workspace = create_temp_workspace("bg-process");
