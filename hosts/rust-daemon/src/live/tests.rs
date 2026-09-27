@@ -675,3 +675,47 @@ async fn closing_an_agents_channel_ends_its_streams_only() {
         "another agent's stream stays open"
     );
 }
+
+/// Final fix wave S2-J (review A, Minor 6): the kept text is trimmed back to
+/// the snapshot cap only once it passes twice the cap, not on every delta
+/// past it, and a snapshot still carries at most the cap, cut on a character
+/// boundary, with the dropped head counted in UTF-16 units.
+#[test]
+fn the_snapshot_tail_is_trimmed_past_twice_its_cap_and_a_snapshot_stays_within_it() {
+    let hub = LiveHub::new(8);
+    let runs = hub.runs();
+    runs.register("run_1");
+    runs.start_step("run_1", "run_1:1");
+    // Two-, four-, and one-byte characters, so cuts fall inside them.
+    let chunk = "é😀a".repeat(90);
+    let chunk_units = chunk.encode_utf16().count() as u64;
+    let mut appended = String::new();
+    let mut units = 0;
+    let mut kept_past_the_cap = false;
+    while appended.len() <= 3 * MAX_SNAPSHOT_TEXT_BYTES {
+        assert_eq!(runs.append_text("run_1", &chunk), Some(units));
+        appended.push_str(&chunk);
+        units += chunk_units;
+        let kept = runs.kept_text_bytes("run_1");
+        assert!(kept <= 2 * MAX_SNAPSHOT_TEXT_BYTES, "kept {kept} bytes");
+        kept_past_the_cap |= kept > MAX_SNAPSHOT_TEXT_BYTES;
+
+        let view = runs.view("run_1").unwrap();
+        assert!(view.text.len() <= MAX_SNAPSHOT_TEXT_BYTES);
+        if appended.len() >= MAX_SNAPSHOT_TEXT_BYTES {
+            assert!(
+                view.text.len() > MAX_SNAPSHOT_TEXT_BYTES - 4,
+                "only a character split by the cut is left out"
+            );
+        }
+        assert!(appended.ends_with(&view.text));
+        assert_eq!(
+            view.text_offset + view.text.encode_utf16().count() as u64,
+            units
+        );
+    }
+    assert!(
+        kept_past_the_cap,
+        "past the cap, the text is kept until it passes twice the cap"
+    );
+}

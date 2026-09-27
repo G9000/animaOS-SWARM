@@ -41,6 +41,8 @@ pub(crate) struct LiveRunView {
 #[derive(Debug)]
 struct LiveRunState {
     control: RunControl,
+    /// What `view` shows, except that `view.text` keeps up to twice
+    /// `MAX_SNAPSHOT_TEXT_BYTES` (S2-J); `view` cuts it to the cap.
     view: LiveRunView,
     /// UTF-16 units of `view.text`, kept so an append costs only its own
     /// length rather than a recount of the retained text.
@@ -58,6 +60,18 @@ pub(crate) struct LiveRuns {
 
 fn utf16_len(text: &str) -> u64 {
     text.encode_utf16().count() as u64
+}
+
+/// Where `text` is cut to keep at most its newest `MAX_SNAPSHOT_TEXT_BYTES`:
+/// on the first character boundary at or after the excess.
+fn tail_cut(text: &str) -> usize {
+    let Some(mut cut) = text.len().checked_sub(MAX_SNAPSHOT_TEXT_BYTES) else {
+        return 0;
+    };
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    cut
 }
 
 impl LiveRuns {
@@ -92,8 +106,25 @@ impl LiveRuns {
         self.lock().remove(run_id).is_some()
     }
 
+    /// What a snapshot shows of the run: at most the newest
+    /// `MAX_SNAPSHOT_TEXT_BYTES` of its step's text.
     pub(crate) fn view(&self, run_id: &str) -> Option<LiveRunView> {
-        self.lock().get(run_id).map(|run| run.view.clone())
+        self.lock().get(run_id).map(|run| {
+            let text = &run.view.text;
+            let cut = tail_cut(text);
+            LiveRunView {
+                step_id: run.view.step_id.clone(),
+                text: text[cut..].to_string(),
+                text_offset: run.view.text_offset + utf16_len(&text[..cut]),
+                tools: run.view.tools.clone(),
+            }
+        })
+    }
+
+    /// Bytes of the current step's text the registry keeps.
+    #[cfg(test)]
+    pub(crate) fn kept_text_bytes(&self, run_id: &str) -> usize {
+        self.lock().get(run_id).map_or(0, |run| run.view.text.len())
     }
 
     pub(crate) fn start_step(&self, run_id: &str, step_id: &str) {
@@ -113,11 +144,11 @@ impl LiveRuns {
         let offset = run.view.text_offset + run.text_units;
         run.view.text.push_str(text);
         run.text_units += utf16_len(text);
-        if run.view.text.len() > MAX_SNAPSHOT_TEXT_BYTES {
-            let mut cut = run.view.text.len() - MAX_SNAPSHOT_TEXT_BYTES;
-            while !run.view.text.is_char_boundary(cut) {
-                cut += 1;
-            }
+        // Trimmed back to the cap only once past twice it (final fix wave
+        // S2-J): a trim moves every byte it keeps, so trimming on each delta
+        // past the cap cost a whole cap per delta.
+        if run.view.text.len() > 2 * MAX_SNAPSHOT_TEXT_BYTES {
+            let cut = tail_cut(&run.view.text);
             let dropped = utf16_len(&run.view.text[..cut]);
             run.view.text_offset += dropped;
             run.text_units -= dropped;
