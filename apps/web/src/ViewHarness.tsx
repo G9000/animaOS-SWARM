@@ -224,8 +224,9 @@ export function ViewHarness() {
     { archived: showArchived, query: sessionQuery },
     { live: streamOpen },
   );
-  // A daemon without the sessions routes cannot take a send (spec §13.4).
-  const daemonTooOld = sessions.daemonTooOld;
+  // A daemon with sessions but no runs route (M2) answers a send for a
+  // session that exists with 404 (spec §13.4).
+  const [runsRouteMissing, setRunsRouteMissing] = useState(false);
   const listedSessionsRef = useRef(sessions.sessions);
   listedSessionsRef.current = sessions.sessions;
   const routeSessionId =
@@ -389,15 +390,33 @@ export function ViewHarness() {
     },
     onFailed: (item, caught) => {
       if (!availableAgentIdsRef.current.has(item.agentId)) return;
-      updateChat(item.conversation, (current) => ({
-        failedDrafts: [
-          ...current.failedDrafts,
-          { requestId: item.key, text: item.text, idempotencyKey: item.key },
-        ],
-        error: item.telegram
-          ? safeIntegrationError(caught)
-          : errorMessage(caught),
-      }));
+      const recover = () =>
+        updateChat(item.conversation, (current) => ({
+          failedDrafts: [
+            ...current.failedDrafts,
+            { requestId: item.key, text: item.text, idempotencyKey: item.key },
+          ],
+          error: item.telegram
+            ? safeIntegrationError(caught)
+            : errorMessage(caught),
+        }));
+      if (httpStatus(caught) !== 404) {
+        recover();
+        return;
+      }
+      // The runs route answers 404 for a session that is gone, and so does
+      // a daemon without the route: the session itself tells them apart.
+      daemon.getSession(item.agentId, item.sessionId).then(() => {
+        if (!availableAgentIdsRef.current.has(item.agentId)) return;
+        // It never reached a daemon that could take it: nothing goes to
+        // recovery, and the text waits in the composer for the update.
+        setRunsRouteMissing(true);
+        updateChat(item.conversation, (current) => ({
+          draft: current.draft.trim()
+            ? `${current.draft}\n\n${item.text}`
+            : item.text,
+        }));
+      }, recover);
     },
   });
   // The last Telegram reply's run, until it is known how it ended.
@@ -427,6 +446,11 @@ export function ViewHarness() {
   useEffect(() => {
     setStreamOpen(live.status === 'open');
   }, [live.status]);
+  // A daemon that cannot take a send asks for an update (spec §13.4): one
+  // without the sessions routes (pre-M2), or one with sessions but neither
+  // the event stream nor the runs route (M2).
+  const daemonTooOld =
+    sessions.daemonTooOld || live.status === 'unsupported' || runsRouteMissing;
   const activeRun = live.activeRun;
   const openPending = useSessionPending({
     sends: sends.sends,
@@ -1097,9 +1121,11 @@ export function ViewHarness() {
             >
               <p className="font-semibold text-danger">Update the daemon</p>
               <p className="text-ink-2">
-                This console keeps chats as sessions, which this anima-daemon
-                does not support yet. Update and restart the daemon, then reload
-                this page.
+                {sessions.daemonTooOld
+                  ? 'This console keeps chats as sessions'
+                  : 'This console sends messages as live runs'}
+                , which this anima-daemon does not support yet. Update and
+                restart the daemon, then reload this page.
               </p>
             </div>
           ) : null}

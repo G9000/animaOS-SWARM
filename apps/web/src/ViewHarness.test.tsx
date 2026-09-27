@@ -3292,10 +3292,14 @@ it('announces each finished reply in the open session once', async () => {
 });
 
 it('keeps polling as before when the daemon has no event stream', async () => {
-  const user = fakeClock();
+  fakeClock();
   vi.spyOn(daemon, 'getAgent').mockResolvedValue({
     agent: snapshot('agent-main', 'Nova', 1),
   });
+  // A daemon without the event stream (M2) has no runs route either.
+  vi.mocked(daemon.startRun).mockRejectedValue(
+    new DaemonHttpError(404, { error: 'Not found' }),
+  );
   const summaries = vi.spyOn(daemon, 'listAgentSummaries');
   const { input, stream } = await openLiveSession();
   await act(async () => {
@@ -3319,13 +3323,61 @@ it('keeps polling as before when the daemon has no event stream', async () => {
   expect(daemon.agentEvents).toHaveBeenCalledTimes(1);
   expect(screen.queryByText('Reconnecting…')).not.toBeInTheDocument();
 
-  await user.type(input, 'Still here{Enter}');
-  expect(daemon.startRun).toHaveBeenCalledWith(
-    'agent-main',
-    'room-7',
-    { text: 'Still here', mode: 'queue' },
-    expect.any(String),
+  // It cannot take a message: the page says to update it instead.
+  expect(screen.getByText('Update the daemon')).toBeVisible();
+  expect(
+    screen.getByText(/sends messages as live runs, which this anima-daemon/),
+  ).toBeVisible();
+  expect(input).toBeDisabled();
+  fireEvent.change(input, { target: { value: 'Still here' } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  expect(daemon.startRun).not.toHaveBeenCalled();
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+});
+
+it('asks for a daemon update when a session that exists has no runs route', async () => {
+  const user = userEvent.setup();
+  vi.mocked(daemon.startRun).mockRejectedValue(
+    new DaemonHttpError(404, { error: 'Not found' }),
   );
+  const { input } = await openLiveSession();
+  const reads = vi.mocked(daemon.getSession).mock.calls.length;
+
+  await user.type(input, 'Still here{Enter}');
+
+  expect(await screen.findByText('Update the daemon')).toBeVisible();
+  // The session was read to tell a missing route from a missing session.
+  expect(vi.mocked(daemon.getSession).mock.calls.slice(reads)).toEqual([
+    ['agent-main', 'room-7'],
+  ]);
+  await waitFor(() => expect(input).toBeDisabled());
+  // Nothing goes to recovery: the message waits in the composer.
+  expect(input).toHaveValue('Still here');
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+  expect(daemon.startRun).toHaveBeenCalledTimes(1);
+});
+
+it('recovers a message sent to a session that is gone, without asking for an update', async () => {
+  const user = userEvent.setup();
+  vi.mocked(daemon.startRun).mockRejectedValue(
+    new DaemonHttpError(404, { error: 'Session not found' }),
+  );
+  const { input } = await openLiveSession();
+  vi.mocked(daemon.getSession).mockRejectedValue(
+    Object.assign(new Error('not found'), { status: 404 }),
+  );
+
+  await user.type(input, 'Still here{Enter}');
+
+  expect(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  ).toBeVisible();
+  expect(screen.queryByText('Update the daemon')).not.toBeInTheDocument();
+  expect(input).toBeEnabled();
 });
 
 it('shows an accepted message as its queued run until the reply begins', async () => {
