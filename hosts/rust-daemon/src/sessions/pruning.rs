@@ -10,6 +10,7 @@ use tracing::warn;
 
 use super::{hidden_message_ids, session_id_for_room};
 use crate::app::SharedDaemonState;
+#[cfg(test)]
 use crate::connectors::OutboundDeliveryState;
 use crate::state::DaemonState;
 
@@ -47,7 +48,7 @@ impl DaemonState {
         let undelivered_references = self
             .outbound
             .values()
-            .filter(|record| record.delivery_state != OutboundDeliveryState::Delivered)
+            .filter(|record| !record.delivery_state.is_settled())
             .map(|record| record.assistant_message_id.as_str())
             .collect::<HashSet<_>>();
         let active_sessions = self.runs.active_sessions();
@@ -106,7 +107,7 @@ impl DaemonState {
             .map(String::as_str)
             .collect::<HashSet<_>>();
         for (id, record) in self.outbound.iter_mut() {
-            if record.delivery_state == OutboundDeliveryState::Delivered
+            if record.delivery_state.is_settled()
                 && !record.message_pruned
                 && pruned.contains(record.assistant_message_id.as_str())
             {

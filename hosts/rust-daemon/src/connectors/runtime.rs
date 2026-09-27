@@ -23,7 +23,7 @@ use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramO
 use crate::history::HistoryDeletion;
 use crate::live::run_status_event;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
-use crate::runs::{RunOutcome, RunSource};
+use crate::runs::{RunOutcome, RunSource, RunStatus};
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
 use crate::state::DaemonState;
 
@@ -912,8 +912,7 @@ impl ConnectorManager {
                     .outbound
                     .values()
                     .filter(|record| {
-                        record.connector_id == connector_id
-                            && record.delivery_state != OutboundDeliveryState::Delivered
+                        record.connector_id == connector_id && !record.delivery_state.is_settled()
                     })
                     .count()
                     >= MAX_UNDELIVERED_OUTBOUND
@@ -1019,7 +1018,7 @@ impl ConnectorManager {
                 .values()
                 .filter(|record| {
                     record.connector_id == commit_connector_id
-                        && record.delivery_state != OutboundDeliveryState::Delivered
+                        && !record.delivery_state.is_settled()
                 })
                 .count()
                 >= MAX_UNDELIVERED_OUTBOUND
@@ -1035,6 +1034,12 @@ impl ConnectorManager {
                 return Err(ApiError::bad_request("agent produced no assistant message"));
             };
             let outbound_id = format!("telegram:{}:web:{}:outbound", commit_connector_id, reply_id);
+            // A stop saved while the run finished anyway: the reply is
+            // kept but never sent (spec §4.6).
+            let stopped = state
+                .runs
+                .get(&outcome.run_id)
+                .is_some_and(|record| record.stop.is_some());
             let outbound = TelegramOutboundRecord {
                 id: outbound_id.clone(),
                 connector_id: commit_connector_id.clone(),
@@ -1045,7 +1050,11 @@ impl ConnectorManager {
                 created_at_ms: now_ms(),
                 delivered_at_ms: None,
                 attempts: 0,
-                delivery_state: OutboundDeliveryState::Pending,
+                delivery_state: if stopped {
+                    OutboundDeliveryState::Suppressed
+                } else {
+                    OutboundDeliveryState::Pending
+                },
                 message_pruned: false,
             };
             if let Some(existing) = state.outbound.get(&outbound_id) {
@@ -1183,8 +1192,7 @@ impl ConnectorManager {
                     .outbound
                     .values()
                     .filter(|record| {
-                        record.connector_id == connector_id
-                            && record.delivery_state != OutboundDeliveryState::Delivered
+                        record.connector_id == connector_id && !record.delivery_state.is_settled()
                     })
                     .count()
                     >= MAX_UNDELIVERED_OUTBOUND
@@ -1290,11 +1298,29 @@ impl ConnectorManager {
                         .inbound
                         .get(&commit_key)
                         .ok_or_else(|| ApiError::bad_request("durable inbound disappeared"))?;
-                    if current.processing_state != InboundProcessingState::Processing
-                        || current.agent_id != commit_agent_id
-                        || current.room_id != commit_room_id
-                    {
+                    if current.agent_id != commit_agent_id || current.room_id != commit_room_id {
                         return Err(ApiError::bad_request("durable inbound changed during run"));
+                    }
+                    match current.processing_state {
+                        // The owner stopped this turn (spec §4.6): a finish with
+                        // no reply, never run again.
+                        InboundProcessingState::Stopped => return Ok(()),
+                        InboundProcessingState::Processing => {}
+                        _ => {
+                            return Err(ApiError::bad_request("durable inbound changed during run"))
+                        }
+                    }
+                    if outcome.status == RunStatus::Cancelled {
+                        let target = state
+                            .inbound
+                            .get_mut(&commit_key)
+                            .expect("inbound was prevalidated");
+                        target.processing_state = InboundProcessingState::Stopped;
+                        commit_rollback_delta
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .committed_target = Some(target.clone());
+                        return Ok(());
                     }
 
                     if outcome.result.status == TaskStatus::Error {
@@ -1646,16 +1672,10 @@ impl ConnectorManager {
                         record.updated_at_ms = now;
                     }
                     state.inbound.retain(|(record_connector_id, _), record| {
-                        record_connector_id != &connector.id
-                            || matches!(
-                                record.processing_state,
-                                InboundProcessingState::Processed
-                                    | InboundProcessingState::Rejected
-                            )
+                        record_connector_id != &connector.id || record.processing_state.is_terminal()
                     });
                     state.outbound.retain(|_, record| {
-                        record.connector_id != connector.id
-                            || record.delivery_state == OutboundDeliveryState::Delivered
+                        record.connector_id != connector.id || record.delivery_state.is_settled()
                     });
                     compact_delivered_outbox(&mut state.outbound, &connector.id, now);
                     for schedule in state.schedules.values_mut() {
@@ -1879,15 +1899,10 @@ impl ConnectorManager {
             connector.pending_pairing = None;
             connector.updated_at_ms = now;
             state.inbound.retain(|(record_connector_id, _), record| {
-                record_connector_id != &connector_id
-                    || matches!(
-                        record.processing_state,
-                        InboundProcessingState::Processed | InboundProcessingState::Rejected
-                    )
+                record_connector_id != &connector_id || record.processing_state.is_terminal()
             });
             state.outbound.retain(|_, record| {
-                record.connector_id != connector_id
-                    || record.delivery_state == OutboundDeliveryState::Delivered
+                record.connector_id != connector_id || record.delivery_state.is_settled()
             });
             compact_delivered_outbox(&mut state.outbound, &connector_id, now);
             for schedule in state.schedules.values_mut() {
@@ -2428,14 +2443,26 @@ fn owner_send_replay(
     if user.content.text != text {
         return Err(ConnectorManagerError::IdempotencyConflict);
     }
-    let Some(assistant) = snapshot
-        .messages
-        .iter()
-        .skip(user_index + 1)
-        .find(|message| {
-            message.room_id == connector.room_id && message.role == MessageRole::Assistant
-        })
-    else {
+    // The run's own reply from the ledger (M1 F16); runs from before M3 fall
+    // back to the first assistant message after the owner's turn.
+    let reply_id = state
+        .runs
+        .find_by_idempotency_key(&connector.agent_id, idempotency_key, 0)
+        .and_then(|record| record.reply_message_id.as_deref());
+    let assistant = match reply_id {
+        Some(reply_id) => snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == reply_id),
+        None => snapshot
+            .messages
+            .iter()
+            .skip(user_index + 1)
+            .find(|message| {
+                message.room_id == connector.room_id && message.role == MessageRole::Assistant
+            }),
+    };
+    let Some(assistant) = assistant else {
         return Ok(None);
     };
     let delivery_queued = state.outbound.values().any(|outbound| {
@@ -2533,32 +2560,34 @@ fn compact_delivered_outbox(
     now: u64,
 ) {
     let cutoff = now.saturating_sub(DELIVERED_RETENTION_MS);
+    // Suppressed replies (spec §4.6) age out like delivered ones, by when
+    // they were committed.
+    let settled_at = |record: &TelegramOutboundRecord| match record.delivery_state {
+        OutboundDeliveryState::Delivered => record.delivered_at_ms,
+        OutboundDeliveryState::Suppressed => Some(record.created_at_ms),
+        OutboundDeliveryState::Pending | OutboundDeliveryState::Failed => None,
+    };
     outbox.retain(|_, record| {
         record.connector_id != connector_id
-            || record.delivery_state != OutboundDeliveryState::Delivered
-            || record
-                .delivered_at_ms
-                .is_none_or(|delivered_at_ms| delivered_at_ms >= cutoff)
+            || !record.delivery_state.is_settled()
+            || settled_at(record).is_none_or(|at| at >= cutoff)
     });
-    let mut delivered = outbox
+    let mut settled = outbox
         .values()
-        .filter(|record| {
-            record.connector_id == connector_id
-                && record.delivery_state == OutboundDeliveryState::Delivered
-        })
+        .filter(|record| record.connector_id == connector_id && record.delivery_state.is_settled())
         .map(|record| {
             (
-                record.delivered_at_ms.unwrap_or(record.created_at_ms),
+                settled_at(record).unwrap_or(record.created_at_ms),
                 record.id.clone(),
             )
         })
         .collect::<Vec<_>>();
-    let excess = delivered.len().saturating_sub(MAX_RETAINED_DELIVERED);
+    let excess = settled.len().saturating_sub(MAX_RETAINED_DELIVERED);
     if excess == 0 {
         return;
     }
-    delivered.sort();
-    for (_, id) in delivered.into_iter().take(excess) {
+    settled.sort();
+    for (_, id) in settled.into_iter().take(excess) {
         outbox.remove(&id);
     }
 }
@@ -2570,11 +2599,7 @@ fn compact_terminal_inbound(
     let mut terminal = inbound
         .iter()
         .filter(|((record_connector_id, _), record)| {
-            record_connector_id == connector_id
-                && matches!(
-                    record.processing_state,
-                    InboundProcessingState::Processed | InboundProcessingState::Rejected
-                )
+            record_connector_id == connector_id && record.processing_state.is_terminal()
         })
         .map(|(key, record)| (record.received_at_ms, record.update_id, key.clone()))
         .collect::<Vec<_>>();
@@ -2613,6 +2638,9 @@ async fn wait_or_stop(
         }
     }
 }
+
+#[cfg(test)]
+mod stop_tests;
 
 #[cfg(test)]
 mod tests {

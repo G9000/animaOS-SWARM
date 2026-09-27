@@ -31,8 +31,8 @@ use crate::connectors::gcalendar::{
     CalendarManager, CalendarPendingWriteRecord, GoogleCalendarConnectorRecord,
 };
 use crate::connectors::{
-    InboundProcessingState, OutboundDeliveryState, TelegramConnectorRecord,
-    TelegramCredentialCleanupIntent, TelegramInboundRecord, TelegramOutboundRecord,
+    TelegramConnectorRecord, TelegramCredentialCleanupIntent, TelegramInboundRecord,
+    TelegramOutboundRecord,
 };
 use crate::control_plane_store::{
     save_control_plane_snapshot, ControlPlaneSnapshot, ControlPlaneStoreConfig,
@@ -1308,6 +1308,88 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_v6_snapshot_holding_stopped_and_suppressed_values_round_trips() {
+        use crate::jobs::{AgentJobAttempt, AgentJobRecord, AgentJobStatus, JOB_STOPPED_ERROR};
+
+        let (mut snapshot, _) = valid_connector_snapshot();
+        snapshot.inbound[0].processing_state = InboundProcessingState::Stopped;
+        snapshot.outbound[0].delivery_state = OutboundDeliveryState::Suppressed;
+        snapshot.jobs.push(AgentJobRecord {
+            id: "job-stop".into(),
+            agent_id: snapshot.inbound[0].agent_id.clone(),
+            title: "Stopped job".into(),
+            prompt: "do it".into(),
+            request_key: "key".into(),
+            status: AgentJobStatus::NeedsReview,
+            revision: 2,
+            attempt: 1,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            started_at_ms: Some(15),
+            finished_at_ms: Some(20),
+            result: None,
+            error: Some(JOB_STOPPED_ERROR.into()),
+            max_attempts: 3,
+            requires_approval: false,
+            approved_at_ms: None,
+            attempts: vec![AgentJobAttempt {
+                attempt: 1,
+                status: AgentJobStatus::Stopped,
+                started_at_ms: 15,
+                finished_at_ms: 20,
+                result: None,
+                error: Some(JOB_STOPPED_ERROR.into()),
+                result_truncated: false,
+                review: None,
+            }],
+            goal_id: None,
+            stop_requested_at_ms: Some(20),
+        });
+        assert_eq!(
+            snapshot.version,
+            crate::control_plane_store::CONTROL_PLANE_STORE_VERSION
+        );
+        assert_eq!(snapshot.version, 6);
+
+        let payload = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(payload["inbound"][0]["processingState"], "stopped");
+        assert_eq!(payload["outbound"][0]["deliveryState"], "suppressed");
+        assert_eq!(payload["jobs"][0]["stopRequestedAtMs"], 20);
+        assert_eq!(payload["jobs"][0]["attempts"][0]["status"], "stopped");
+
+        let path = std::env::temp_dir().join(format!(
+            "anima-stop-roundtrip-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        crate::control_plane_store::save_control_plane_snapshot(
+            Some(&ControlPlaneStoreConfig::Json(path.clone())),
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        let loaded = load_control_plane_snapshot(&ControlPlaneStoreConfig::Json(path.clone()))
+            .await
+            .unwrap()
+            .expect("the saved snapshot should load");
+        assert_eq!(loaded.version, 6);
+        assert_eq!(
+            loaded.inbound[0].processing_state,
+            InboundProcessingState::Stopped
+        );
+        assert_eq!(
+            loaded.outbound[0].delivery_state,
+            OutboundDeliveryState::Suppressed
+        );
+        assert_eq!(loaded.jobs[0].stop_requested_at_ms, Some(20));
+        assert_eq!(loaded.jobs[0].attempts[0].status, AgentJobStatus::Stopped);
+
+        DaemonState::new()
+            .restore_control_plane_snapshot(loaded)
+            .expect("a v6 snapshot holding stopped/suppressed values restores");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn pending_history_deletions_are_saved_and_restored() {
         use crate::history::HistoryDeletion;
@@ -2048,22 +2130,13 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
-            if connector.deleted_at_ms.is_some()
-                && !matches!(
-                    record.processing_state,
-                    InboundProcessingState::Processed | InboundProcessingState::Rejected
-                )
-            {
+            if connector.deleted_at_ms.is_some() && !record.processing_state.is_terminal() {
                 return Err(format!(
                     "inbound update {}:{} cannot remain unprocessed after connector deletion",
                     record.connector_id, record.update_id
                 ));
             }
-            let archived = !connector.is_active()
-                && matches!(
-                    record.processing_state,
-                    InboundProcessingState::Processed | InboundProcessingState::Rejected
-                );
+            let archived = !connector.is_active() && record.processing_state.is_terminal();
             if !agent_ids.contains(&record.agent_id) && !archived {
                 return Err(format!(
                     "inbound update references missing agent '{}'",
@@ -2102,16 +2175,13 @@ impl DaemonState {
                     record.connector_id
                 )
             })?;
-            if connector.deleted_at_ms.is_some()
-                && record.delivery_state != OutboundDeliveryState::Delivered
-            {
+            if connector.deleted_at_ms.is_some() && !record.delivery_state.is_settled() {
                 return Err(format!(
                     "outbound delivery '{}' cannot remain undelivered after connector deletion",
                     record.id
                 ));
             }
-            let archived =
-                !connector.is_active() && record.delivery_state == OutboundDeliveryState::Delivered;
+            let archived = !connector.is_active() && record.delivery_state.is_settled();
             if !agent_ids.contains(&record.agent_id) && !archived {
                 return Err(format!(
                     "outbound delivery references missing agent '{}'",
@@ -2135,7 +2205,7 @@ impl DaemonState {
                     record.id
                 ));
             }
-            if record.message_pruned && record.delivery_state != OutboundDeliveryState::Delivered {
+            if record.message_pruned && !record.delivery_state.is_settled() {
                 return Err(format!(
                     "outbound delivery '{}' is marked messagePruned but was not delivered",
                     record.id

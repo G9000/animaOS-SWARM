@@ -106,6 +106,16 @@ pub(crate) enum InboundProcessingState {
     Processing,
     Processed,
     Rejected,
+    /// The owner stopped its run (spec §4.6): finished without a reply and
+    /// never run again.
+    Stopped,
+}
+
+impl InboundProcessingState {
+    /// Nothing is left to do: processed, rejected, or stopped.
+    pub(crate) const fn is_terminal(&self) -> bool {
+        matches!(self, Self::Processed | Self::Rejected | Self::Stopped)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +145,21 @@ pub(crate) enum OutboundDeliveryState {
     Pending,
     Delivered,
     Failed,
+    /// A reply committed before its run was stopped (spec §4.6): never sent
+    /// and not counted against the connector's outbound capacity.
+    Suppressed,
+}
+
+impl OutboundDeliveryState {
+    /// Nothing is left to deliver: delivered or suppressed.
+    pub(crate) const fn is_settled(&self) -> bool {
+        matches!(self, Self::Delivered | Self::Suppressed)
+    }
+
+    /// Still waiting to be sent.
+    pub(crate) const fn awaits_delivery(&self) -> bool {
+        matches!(self, Self::Pending | Self::Failed)
+    }
 }
 
 fn default_enabled() -> bool {

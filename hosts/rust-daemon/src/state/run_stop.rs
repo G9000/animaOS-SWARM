@@ -4,18 +4,30 @@
 use std::collections::HashSet;
 
 use super::DaemonState;
-use crate::runs::{RunError, RunRecord, RunStatus, RunStopRequest, RUN_STOPPED, STOPPED_BY_OWNER};
+use crate::connectors::{
+    InboundProcessingState, OutboundDeliveryState, TelegramInboundRecord, TelegramOutboundRecord,
+};
+use crate::jobs::{AgentJobRecord, AgentJobStatus};
+use crate::runs::{
+    RunError, RunRecord, RunSource, RunStatus, RunStopRequest, RUN_STOPPED, STOPPED_BY_OWNER,
+};
 
 /// Everything a stop changed, as it was, so a failed save can put it back.
 #[derive(Debug, Default)]
 pub(crate) struct RunStopUndo {
     pub(crate) runs: Vec<RunRecord>,
+    pub(crate) inbound: Vec<TelegramInboundRecord>,
+    pub(crate) outbound: Vec<TelegramOutboundRecord>,
+    pub(crate) jobs: Vec<AgentJobRecord>,
 }
 
 impl RunStopUndo {
     /// Nothing changed, so nothing needs saving (a repeated stop).
     pub(crate) fn is_empty(&self) -> bool {
         self.runs.is_empty()
+            && self.inbound.is_empty()
+            && self.outbound.is_empty()
+            && self.jobs.is_empty()
     }
 }
 
@@ -48,11 +60,16 @@ impl DaemonState {
             .filter(|record| record.agent_id == agent_id)?
             .clone();
         if record.status.is_terminal() {
+            let mut undo = RunStopUndo::default();
+            // A Telegram reply committed but not delivered yet is never sent.
+            if record.source == RunSource::Telegram {
+                self.suppress_undelivered_reply(&record, &mut undo);
+            }
             return Some(RunStopPlan {
                 run: record,
                 signal: Vec::new(),
                 cancelled: Vec::new(),
-                undo: RunStopUndo::default(),
+                undo,
             });
         }
         let mut targets = vec![record.id.clone()];
@@ -75,6 +92,7 @@ impl DaemonState {
             cancelled: Vec::new(),
             undo: RunStopUndo::default(),
         };
+        let mut sources: Vec<(RunSource, String)> = Vec::new();
         for id in &targets {
             let Some(target) = self.runs.get_mut(id) else {
                 continue;
@@ -97,7 +115,18 @@ impl DaemonState {
                     target.stop = Some(RunStopRequest {
                         requested_at_ms: now_ms,
                     });
+                    if let Some(source_ref) = target.source_ref.clone() {
+                        sources.push((target.source, source_ref));
+                    }
                 }
+                _ => {}
+            }
+        }
+        // Source records saved with the stop, before any signal (spec §4.6).
+        for (source, source_ref) in sources {
+            match source {
+                RunSource::Telegram => self.stop_inbound(&source_ref, &mut plan.undo),
+                RunSource::Job => self.stop_job(&source_ref, now_ms, &mut plan.undo),
                 _ => {}
             }
         }
@@ -107,15 +136,92 @@ impl DaemonState {
         Some(plan)
     }
 
+    /// Marks a running Telegram turn (`sourceRef` `<connector>:<update>`)
+    /// stopped, so it finishes without a reply and never runs again.
+    fn stop_inbound(&mut self, source_ref: &str, undo: &mut RunStopUndo) {
+        let Some((connector_id, update)) = source_ref.rsplit_once(':') else {
+            return;
+        };
+        let Ok(update_id) = update.parse::<i64>() else {
+            return;
+        };
+        if let Some(record) = self
+            .inbound
+            .get_mut(&(connector_id.to_string(), update_id))
+            .filter(|record| record.processing_state == InboundProcessingState::Processing)
+        {
+            undo.inbound.push(record.clone());
+            record.processing_state = InboundProcessingState::Stopped;
+        }
+    }
+
+    /// Saves the stop marker of the running job attempt `<job>:<attempt>`.
+    fn stop_job(&mut self, source_ref: &str, now_ms: u64, undo: &mut RunStopUndo) {
+        let Some((job_id, attempt)) = source_ref.rsplit_once(':') else {
+            return;
+        };
+        let Ok(attempt) = attempt.parse::<u32>() else {
+            return;
+        };
+        if let Some(job) = self.jobs.get_mut(job_id).filter(|job| {
+            job.status == AgentJobStatus::Running
+                && job.attempt == attempt
+                && job.stop_requested_at_ms.is_none()
+        }) {
+            undo.jobs.push(job.clone());
+            job.stop_requested_at_ms = Some(now_ms);
+        }
+    }
+
+    /// Suppresses the undelivered outbound record of `record`'s reply.
+    fn suppress_undelivered_reply(&mut self, record: &RunRecord, undo: &mut RunStopUndo) {
+        let Some(reply_id) = record.reply_message_id.as_deref() else {
+            return;
+        };
+        for outbound in self.outbound.values_mut().filter(|outbound| {
+            outbound.agent_id == record.agent_id
+                && outbound.assistant_message_id == reply_id
+                && outbound.delivery_state.awaits_delivery()
+        }) {
+            undo.outbound.push(outbound.clone());
+            outbound.delivery_state = OutboundDeliveryState::Suppressed;
+        }
+    }
+
     /// Puts back what a stop changed after its save failed. A queued run is
     /// restored whole; a running one only loses the stop request, keeping
-    /// anything its run recorded meanwhile.
+    /// anything its run recorded meanwhile; source records go back only if
+    /// nothing else changed them since.
     pub(crate) fn revert_run_stop(&mut self, undo: RunStopUndo) {
         for previous in undo.runs {
             match self.runs.get_mut(&previous.id) {
                 Some(current) if previous.status == RunStatus::Queued => *current = previous,
                 Some(current) => current.stop = previous.stop,
                 None => {}
+            }
+        }
+        for previous in undo.inbound {
+            let key = (previous.connector_id.clone(), previous.update_id);
+            if self
+                .inbound
+                .get(&key)
+                .is_some_and(|current| current.processing_state == InboundProcessingState::Stopped)
+            {
+                self.inbound.insert(key, previous);
+            }
+        }
+        for previous in undo.outbound {
+            if self
+                .outbound
+                .get(&previous.id)
+                .is_some_and(|current| current.delivery_state == OutboundDeliveryState::Suppressed)
+            {
+                self.outbound.insert(previous.id.clone(), previous);
+            }
+        }
+        for previous in undo.jobs {
+            if let Some(current) = self.jobs.get_mut(&previous.id) {
+                current.stop_requested_at_ms = previous.stop_requested_at_ms;
             }
         }
     }

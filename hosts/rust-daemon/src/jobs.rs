@@ -2,7 +2,7 @@ use crate::{
     agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom},
     app::SharedDaemonState,
     routes::ApiError,
-    runs::RunSource,
+    runs::{RunSource, RunStatus},
     state::DaemonState,
 };
 use anima_core::{Content, TaskStatus};
@@ -15,6 +15,7 @@ use tokio::sync::{watch, Mutex, Notify};
 
 const MAX_JOBS: usize = 200;
 const MAX_ACTIVE: usize = 8;
+pub(crate) const JOB_STOPPED_ERROR: &str = "Stopped by owner; inspect effects before retrying";
 
 mod goals;
 pub(crate) use goals::{validate_goals, GoalRecord, GoalStatus, GoalView};
@@ -232,6 +233,7 @@ impl JobService {
                 approved_at_ms: None,
                 attempts: vec![],
                 goal_id,
+                stop_requested_at_ms: None,
             };
             state.jobs.insert(job.id.clone(), job.clone());
             Ok(job)
@@ -298,6 +300,7 @@ impl JobService {
             }
             job.status = if job.requires_approval { AgentJobStatus::AwaitingApproval } else { AgentJobStatus::Queued };
             job.approved_at_ms = None;
+            job.stop_requested_at_ms = None;
             advance(job);
             job.started_at_ms = None;
             job.finished_at_ms = None;
@@ -394,7 +397,7 @@ impl JobService {
                 .values_mut()
                 .filter(|j| j.status == AgentJobStatus::Running)
             {
-                review(
+                settle_uncertain(
                     job,
                     "Daemon restarted during this attempt; inspect effects before retrying",
                 );
@@ -551,6 +554,13 @@ impl JobService {
                         .get_mut(&commit_id)
                         .filter(|j| j.status == AgentJobStatus::Running && j.revision == revision)
                         .ok_or_else(|| ApiError::service_unavailable("Job claim changed"))?;
+                    // The owner stopped this attempt (spec §4.6): uncertain, never failed.
+                    if current.stop_requested_at_ms.is_some()
+                        || outcome.status == RunStatus::Cancelled
+                    {
+                        record_stop(current);
+                        return Ok(());
+                    }
                     current.status = if result.status == TaskStatus::Success {
                         AgentJobStatus::Completed
                     } else {
@@ -568,7 +578,13 @@ impl JobService {
                     Ok(())
                 },
                 move |state| {
-                    state.jobs.insert(rollback_job.id.clone(), rollback_job);
+                    let mut restored = rollback_job;
+                    // A stop saved during the run survives the rollback.
+                    restored.stop_requested_at_ms = state
+                        .jobs
+                        .get(&restored.id)
+                        .and_then(|job| job.stop_requested_at_ms);
+                    state.jobs.insert(restored.id.clone(), restored);
                     Ok(())
                 },
             )
@@ -582,7 +598,7 @@ impl JobService {
                         .get_mut(&id)
                         .filter(|j| j.status == AgentJobStatus::Running && j.revision == revision)
                     {
-                        review(
+                        settle_uncertain(
                             current,
                             "Run did not commit a durable result; inspect effects before retrying",
                         );
@@ -602,7 +618,7 @@ impl JobService {
                     .get_mut(&job.id)
                     .filter(|j| j.status == AgentJobStatus::Running && j.revision == revision)
                 {
-                    review(
+                    settle_uncertain(
                         current,
                         "Result persistence failed; inspect effects before retrying",
                     );
@@ -666,6 +682,41 @@ fn review(job: &mut AgentJobRecord, error: &str) {
     advance(job);
     job.finished_at_ms = Some(job.updated_at_ms);
     job.preserve_legacy_attempt();
+}
+/// A stopped attempt (spec §4.6): the job needs review and the attempt's
+/// history status is `stopped`.
+fn record_stop(job: &mut AgentJobRecord) {
+    job.status = AgentJobStatus::NeedsReview;
+    job.error = Some(JOB_STOPPED_ERROR.into());
+    advance(job);
+    job.finished_at_ms = Some(job.updated_at_ms);
+    if let Some(started_at_ms) = job.started_at_ms {
+        if !job
+            .attempts
+            .iter()
+            .any(|attempt| attempt.attempt == job.attempt)
+        {
+            job.attempts.push(AgentJobAttempt {
+                attempt: job.attempt,
+                status: AgentJobStatus::Stopped,
+                started_at_ms,
+                finished_at_ms: job.updated_at_ms,
+                result: job.result.clone(),
+                error: job.error.clone(),
+                result_truncated: false,
+                review: None,
+            });
+        }
+    }
+}
+/// An attempt whose outcome is unknown: stopped when its stop marker was
+/// saved, otherwise needing review with `error`.
+fn settle_uncertain(job: &mut AgentJobRecord, error: &str) {
+    if job.stop_requested_at_ms.is_some() {
+        record_stop(job);
+    } else {
+        review(job, error);
+    }
 }
 fn job_prompt(job: &AgentJobRecord) -> String {
     let feedback = job
