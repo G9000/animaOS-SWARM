@@ -255,6 +255,38 @@ describe('useLiveSession', () => {
     expect(result.current.runs).toEqual([]);
   });
 
+  it('trims a finished run’s steps and tool cards once its message is committed (S3b-B)', async () => {
+    const { events, result, rerender } = setup();
+    await flush();
+    const run = room7Run();
+    events.streams[0].push(
+      snapshotEvent([snapshotRun(run, { stepId: 'run_7:1', text: 'Working' })]),
+    );
+    await flush(20);
+    const done = { ...run, status: 'completed' as const, finishedAtMs: 2 };
+    events.streams[0].push(runEvent('run.completed', done, 2));
+    await flush(20);
+    expect(result.current.state.runs.run_7?.steps).toEqual([
+      { stepId: 'run_7:1', text: 'Working', textOffset: 0 },
+    ]);
+
+    rerender({
+      messages: [
+        {
+          id: 'a1',
+          role: 'assistant',
+          text: 'Done',
+          attachments: [],
+          metadata: { runId: 'run_7' },
+          createdAtMs: 3,
+        },
+      ],
+    });
+    await flush(20);
+
+    expect(result.current.state.runs.run_7?.steps).toEqual([]);
+  });
+
   it('re-reads the ledger once for a run its history shows but the view thinks is still running', async () => {
     vi.mocked(daemon.sessionRuns).mockResolvedValue([room7Run()]);
     const { rerender, result } = setup();

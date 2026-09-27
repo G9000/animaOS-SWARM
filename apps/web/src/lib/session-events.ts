@@ -43,6 +43,9 @@ export const EMPTY_LIVE_STATE: LiveState = { seq: 0, runs: {}, epoch: 0 };
 export const MAX_LIVE_STEP_CHARS = 200_000;
 /** Finished runs kept for views still waiting on their committed messages. */
 export const MAX_FINISHED_LIVE_RUNS = 50;
+/** Tool cards kept per run, the oldest dropped first past this, matching
+ *  the daemon's live registry (`MAX_LIVE_TOOL_CARDS`, S3b-B). */
+export const MAX_LIVE_TOOL_CARDS = 50;
 
 export function emptyLiveRun(run: Run): LiveRun {
   return { run, steps: [], tools: [], phase: null, steers: [] };
@@ -161,7 +164,12 @@ function upsertTool(
     (tool) =>
       tool.stepId === card.stepId && tool.toolCallId === card.toolCallId,
   );
-  if (index < 0) return [...tools, card];
+  if (index < 0) {
+    const next = [...tools, card];
+    return next.length > MAX_LIVE_TOOL_CARDS
+      ? next.slice(next.length - MAX_LIVE_TOOL_CARDS)
+      : next;
+  }
   const current = tools[index];
   if (!finished && current.status !== 'running') return tools;
   const next = [...tools];
@@ -285,6 +293,20 @@ export function applyEvent(state: LiveState, event: AgentEvent): LiveState {
     default:
       return next;
   }
+}
+
+/** Drops a finished run's steps and tool cards once its messages are
+ *  committed (spec §15.5, S3b-B): the transcript renders it from history
+ *  from then on (`placeRuns`), so the stream's own copy just holds memory.
+ *  A no-op for a run still going, already trimmed, or unknown. */
+export function trimCommittedRun(state: LiveState, runId: string): LiveState {
+  const live = state.runs[runId];
+  if (!live || !isTerminalRunStatus(live.run.status)) return state;
+  if (live.steps.length === 0 && live.tools.length === 0) return state;
+  return {
+    ...state,
+    runs: { ...state.runs, [runId]: { ...live, steps: [], tools: [] } },
+  };
 }
 
 /** The runs of one session, oldest first. */

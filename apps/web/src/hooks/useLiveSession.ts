@@ -267,11 +267,15 @@ export function useLiveSession({
 
   // A run's messages are committed when it ends: history showing a run the
   // view thinks is still going, or one it waits for, prompts one read of
-  // the ledger. A run checked once is not read again, found or not.
+  // the ledger. A run checked once is not read again, found or not. A
+  // finished run's messages committed drop its steps and tool cards from
+  // live state (S3b-B): the transcript renders it from history from then
+  // on, so the stream's own copy just holds memory.
   const checkedRef = useRef(new Set<string>());
   useEffect(() => {
     checkedRef.current.clear();
   }, [key]);
+  const trimFinishedRun = live.trimFinishedRun;
   useEffect(() => {
     if (!key) return;
     const finished = new Set<string>();
@@ -283,9 +287,12 @@ export function useLiveSession({
     let stale = false;
     for (const message of messages) {
       const runId = message.metadata.runId;
+      if (typeof runId !== 'string') continue;
+      if (finished.has(runId)) {
+        trimFinishedRun(runId);
+        continue;
+      }
       if (
-        typeof runId !== 'string' ||
-        finished.has(runId) ||
         checkedRef.current.has(runId) ||
         !(going.has(runId) || watchedRunIds.includes(runId))
       )
@@ -294,7 +301,7 @@ export function useLiveSession({
       stale = true;
     }
     if (stale) refreshRuns();
-  }, [key, messages, runs, watchedRunIds, refreshRuns]);
+  }, [key, messages, runs, watchedRunIds, refreshRuns, trimFinishedRun]);
 
   return {
     status: live.status,

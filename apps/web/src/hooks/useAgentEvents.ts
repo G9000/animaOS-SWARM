@@ -1,10 +1,11 @@
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useSyncExternalStore } from 'react';
 import { DaemonHttpError, type AgentEvent } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
 import {
   EMPTY_LIVE_STATE,
   applyEvent,
+  trimCommittedRun,
   type LiveState,
 } from '../lib/session-events';
 
@@ -42,9 +43,16 @@ export type AgentStreamStatus =
   /** The daemon has no event stream (it predates M3): views poll instead. */
   | 'unsupported';
 
-export interface AgentEventsView {
+/** What the stream itself publishes; the hook adds `trimFinishedRun`. */
+interface StreamSnapshot {
   status: AgentStreamStatus;
   state: LiveState;
+}
+
+export interface AgentEventsView extends StreamSnapshot {
+  /** Drops a finished run's steps and tool cards once its messages are
+   *  committed (S3b-B). */
+  trimFinishedRun: (runId: string) => void;
 }
 
 /** The wait before reconnect `attempt` (0-based): half to all of a doubling
@@ -92,7 +100,7 @@ const streams = new Map<string, AgentStream>();
 class AgentStream {
   private status: AgentStreamStatus = 'connecting';
   private state: LiveState = EMPTY_LIVE_STATE;
-  private published: AgentEventsView = {
+  private published: StreamSnapshot = {
     status: 'connecting',
     state: EMPTY_LIVE_STATE,
   };
@@ -110,7 +118,7 @@ class AgentStream {
 
   constructor(readonly agentId: string) {}
 
-  readonly snapshot = (): AgentEventsView => this.published;
+  readonly snapshot = (): StreamSnapshot => this.published;
 
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
@@ -124,6 +132,15 @@ class AgentStream {
     return () => {
       this.eventListeners.delete(listener);
     };
+  }
+
+  /** Drops a finished run's steps and tool cards once a view reports its
+   *  messages are committed (S3b-B): a no-op once already trimmed. */
+  trim(runId: string): void {
+    const next = trimCommittedRun(this.state, runId);
+    if (next === this.state) return;
+    this.state = next;
+    this.publish();
   }
 
   retain(): void {
@@ -269,7 +286,7 @@ function streamFor(agentId: string): AgentStream {
   return stream;
 }
 
-const IDLE: AgentEventsView = { status: 'connecting', state: EMPTY_LIVE_STATE };
+const IDLE: StreamSnapshot = { status: 'connecting', state: EMPTY_LIVE_STATE };
 const subscribeNowhere = () => () => undefined;
 const idleSnapshot = () => IDLE;
 
@@ -297,8 +314,13 @@ export function useAgentEvents(
       stream.release();
     };
   }, [stream]);
-  return useSyncExternalStore(
+  const snapshot = useSyncExternalStore(
     stream ? stream.subscribe : subscribeNowhere,
     stream ? stream.snapshot : idleSnapshot,
   );
+  const trimFinishedRun = useCallback(
+    (runId: string) => stream?.trim(runId),
+    [stream],
+  );
+  return { ...snapshot, trimFinishedRun };
 }

@@ -95,6 +95,32 @@ describe('useAgentEvents', () => {
     );
   });
 
+  it('trims a finished run’s steps and tool cards on request (S3b-B)', async () => {
+    const { latest } = scriptedAgentEvents();
+    const done = runFixture('run_1', {
+      status: 'completed',
+      finishedAtMs: 9,
+    });
+    const { result } = renderHook(() => useAgentEvents('agent-main'));
+
+    act(() =>
+      latest().push(
+        snapshotEvent([snapshotRun(done, { stepId: 'run_1:1', text: 'Hi' })]),
+      ),
+    );
+    await waitFor(() =>
+      expect(result.current.state.runs.run_1?.steps).toEqual([
+        { stepId: 'run_1:1', text: 'Hi', textOffset: 0 },
+      ]),
+    );
+
+    act(() => result.current.trimFinishedRun('run_1'));
+
+    await waitFor(() =>
+      expect(result.current.state.runs.run_1?.steps).toEqual([]),
+    );
+  });
+
   it('hands every event to its listener as it arrives', async () => {
     const { latest } = scriptedAgentEvents();
     const onEvent = vi.fn();

@@ -5,10 +5,12 @@ import {
   EMPTY_LIVE_STATE,
   MAX_FINISHED_LIVE_RUNS,
   MAX_LIVE_STEP_CHARS,
+  MAX_LIVE_TOOL_CARDS,
   applyEvent,
   isActiveRun,
   sessionLiveRuns,
   stepRunId,
+  trimCommittedRun,
   type LiveState,
 } from './session-events';
 import {
@@ -273,6 +275,24 @@ describe('applyEvent', () => {
     expect(state.runs[`run_${MAX_FINISHED_LIVE_RUNS}`]).toBeDefined();
   });
 
+  it('caps tool cards at 50 per run, dropping the oldest first (S3b-B)', () => {
+    let state = applyEvent(
+      EMPTY_LIVE_STATE,
+      snapshotEvent([snapshotRun(running)]),
+    );
+    for (let index = 0; index <= MAX_LIVE_TOOL_CARDS; index += 1)
+      state = applyEvent(
+        state,
+        toolStartedEvent(running, `call_${index}`, 'search', index + 2),
+      );
+
+    expect(state.runs.run_1.tools).toHaveLength(MAX_LIVE_TOOL_CARDS);
+    expect(state.runs.run_1.tools[0].toolCallId).toBe('call_1');
+    expect(state.runs.run_1.tools[MAX_LIVE_TOOL_CARDS - 1].toolCallId).toBe(
+      `call_${MAX_LIVE_TOOL_CARDS}`,
+    );
+  });
+
   it('caps a long step without splitting a character', () => {
     const long = `👋${'a'.repeat(MAX_LIVE_STEP_CHARS - 1)}`;
     const state = applyAll([
@@ -286,6 +306,47 @@ describe('applyEvent', () => {
     expect(step.text.charCodeAt(0)).toBe('a'.charCodeAt(0));
     expect(step.text.endsWith('ab')).toBe(true);
     expect(step.textOffset + step.text.length).toBe(long.length + 1);
+  });
+});
+
+describe('trimCommittedRun (S3b-B)', () => {
+  it('drops a finished run’s steps and tool cards once its messages are committed', () => {
+    const done = runFixture('run_1', {
+      status: 'completed',
+      finishedAtMs: 9,
+    });
+    const state = applyAll([
+      snapshotEvent([snapshotRun(running)]),
+      deltaEvent(running, 'run_1:1', 0, 'Working on it', 2),
+      toolStartedEvent(running, 'call_1', 'search', 3),
+      runEvent('run.completed', done, 4),
+    ]);
+    expect(state.runs.run_1.steps).not.toEqual([]);
+    expect(state.runs.run_1.tools).not.toEqual([]);
+
+    const trimmed = trimCommittedRun(state, 'run_1');
+
+    expect(trimmed.runs.run_1.steps).toEqual([]);
+    expect(trimmed.runs.run_1.tools).toEqual([]);
+    // Nothing else about the run changes.
+    expect(trimmed.runs.run_1.run).toBe(state.runs.run_1.run);
+  });
+
+  it('never trims a run still going', () => {
+    const state = applyAll([
+      snapshotEvent([snapshotRun(running)]),
+      deltaEvent(running, 'run_1:1', 0, 'Working on it', 2),
+    ]);
+
+    expect(trimCommittedRun(state, 'run_1')).toBe(state);
+  });
+
+  it('is a no-op once a run is already trimmed, or unknown', () => {
+    const done = runFixture('run_1', { status: 'completed' });
+    const state = applyAll([runEvent('run.completed', done, 1)]);
+
+    expect(trimCommittedRun(state, 'run_1')).toBe(state);
+    expect(trimCommittedRun(state, 'run_missing')).toBe(state);
   });
 });
 
