@@ -22,10 +22,36 @@ import {
   type DaemonProvider,
   type DaemonSnapshot,
 } from './lib/daemon-api';
-import { SESSION_MESSAGES_POLL_MS } from './hooks/useSessionMessages';
+import {
+  SESSION_LIST_LIVE_POLL_MS,
+  SESSION_LIST_POLL_MS,
+} from './hooks/useCompanionSessions';
+import { STREAM_RETRY_MIN_MS } from './hooks/useAgentEvents';
+import {
+  SESSION_MESSAGES_LIVE_POLL_MS,
+  SESSION_MESSAGES_POLL_MS,
+} from './hooks/useSessionMessages';
 import { SEND_RETRY_DELAYS_MS } from './hooks/useSessionSends';
+import {
+  BOOTSTRAP_POLL_MS,
+  BOOTSTRAP_SUMMARY_POLL_MS,
+} from './hooks/useDaemonBootstrap';
 import { sessionFixture } from './test/sessions';
-import { runFixture } from './test/live';
+import {
+  deltaEvent,
+  idleAgentEvents,
+  messageCreatedEvent,
+  resyncEvent,
+  runEvent,
+  runFixture,
+  scriptedAgentEvents,
+  sessionEvent,
+  snapshotEvent,
+  snapshotRun,
+  steeredEvent,
+  toolFinishedEvent,
+  toolStartedEvent,
+} from './test/live';
 import { ViewHarness } from './ViewHarness';
 
 const providers: DaemonProvider[] = [
@@ -394,6 +420,8 @@ it('lists peer requests as read-only helper sessions apart from the owner chat',
     await screen.findByRole('button', { name: 'Messages from Beta' }),
   );
   expect(await screen.findByText('Private teammate request')).toBeVisible();
+  // The peer's request is credited to the peer that sent it.
+  expect(screen.getByText('From Beta')).toBeVisible();
   expect(screen.getByRole('note')).toHaveTextContent(
     'Helper sessions are read-only.',
   );
@@ -432,6 +460,9 @@ beforeEach(() => {
   });
   routes = mockSessionRoutes();
   mockRuns();
+  // No stream events unless a test scripts them; the harness polls.
+  idleAgentEvents();
+  vi.spyOn(daemon, 'sessionRuns').mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -2529,10 +2560,13 @@ it('does not report delivery for a Telegram reply whose run failed', async () =>
     expect(daemon.sessionRuns).toHaveBeenCalledWith(
       'agent-main',
       'telegram:tg-1',
+      { limit: 20 },
     ),
   );
   await act(async () => {
-    await vi.mocked(daemon.sessionRuns).mock.results[0].value;
+    await Promise.all(
+      vi.mocked(daemon.sessionRuns).mock.results.map((item) => item.value),
+    );
   });
   expect(
     screen.queryByText('Queued for Telegram delivery'),
@@ -2599,4 +2633,1013 @@ it('returns to a new chat when the open session is deleted from the sidebar', as
     await screen.findByRole('heading', { name: 'Say something to Nova' }),
   ).toBeVisible();
   expect(window.location.hash).toBe('#/');
+});
+
+/** Past the harness's settle for live refreshes (150 ms). */
+const LIVE_SETTLE_MS = 200;
+
+/** Nova with its chat `room-7` open and a scripted event stream. */
+async function openLiveSession(overrides: Partial<Session> = {}) {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+      ...overrides,
+    }),
+  );
+  window.history.replaceState(null, '', '/#/s/room-7');
+  const events = scriptedAgentEvents();
+  render(<ViewHarness />);
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await waitFor(() => expect(events.streams).toHaveLength(1));
+  return { input, stream: events.streams[0], events };
+}
+
+function runningRun() {
+  return runFixture('run_7', {
+    sessionId: 'room-7',
+    status: 'running',
+    createdAtMs: Date.now(),
+    startedAtMs: Date.now(),
+    input: { text: 'Plan Saturday', attachmentIds: [], skill: null },
+  });
+}
+
+it('streams a reply into the open session with its tool steps, then shows the committed reply', async () => {
+  const { stream } = await openLiveSession();
+  const run = runningRun();
+  act(() =>
+    stream.push(
+      snapshotEvent([]),
+      runEvent('run.started', run, 2),
+      toolStartedEvent(
+        run,
+        'call_1',
+        'web_search',
+        3,
+        '{"query":"weather saturday"}',
+      ),
+      deltaEvent(run, 'run_7:2', 0, 'Saturday looks sunny', 4),
+    ),
+  );
+
+  expect(await screen.findByText('Saturday looks sunny')).toBeVisible();
+  expect(screen.getByText('Plan Saturday')).toBeVisible();
+  expect(screen.getByRole('button', { name: /web_search/ })).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Stop' })).toBeVisible();
+
+  vi.mocked(daemon.sessionMessages).mockResolvedValue({
+    messages: [
+      {
+        id: 'u1',
+        role: 'user',
+        text: 'Plan Saturday',
+        attachments: [],
+        metadata: { runId: 'run_7' },
+        createdAtMs: 2,
+      },
+      {
+        id: 'a1',
+        role: 'assistant',
+        text: 'Saturday looks sunny, go hiking.',
+        attachments: [],
+        metadata: { runId: 'run_7', stepId: 'run_7:2' },
+        createdAtMs: 3,
+      },
+    ],
+    nextBefore: null,
+  });
+  act(() =>
+    stream.push(
+      messageCreatedEvent(run, 'u1', 'user', 5),
+      messageCreatedEvent(run, 'a1', 'assistant', 6),
+      runEvent(
+        'run.completed',
+        {
+          ...run,
+          status: 'completed',
+          finishedAtMs: Date.now(),
+          replyMessageId: 'a1',
+        },
+        7,
+      ),
+    ),
+  );
+
+  expect(
+    await screen.findByText('Saturday looks sunny, go hiking.'),
+  ).toBeVisible();
+  await waitFor(() =>
+    expect(screen.queryByText('Saturday looks sunny')).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('Nova replied.')).toHaveAttribute(
+    'aria-live',
+    'polite',
+  );
+  // The stream's state reaches the view once per frame; the history read
+  // that opening the stream started can land first.
+  await waitFor(() =>
+    expect(
+      screen.queryByRole('button', { name: 'Stop' }),
+    ).not.toBeInTheDocument(),
+  );
+});
+
+it('stops the reply in progress from the composer', async () => {
+  const user = userEvent.setup();
+  const stopRun = vi
+    .spyOn(daemon, 'stopRun')
+    .mockImplementation(async (_agentId, runId) =>
+      runFixture(runId, { sessionId: 'room-7', status: 'cancelled' }),
+    );
+  const { stream } = await openLiveSession();
+  act(() =>
+    stream.push(
+      snapshotEvent([
+        snapshotRun(runningRun(), {
+          stepId: 'run_7:1',
+          text: 'Thinking it over',
+        }),
+      ]),
+    ),
+  );
+
+  await user.click(await screen.findByRole('button', { name: 'Stop' }));
+  expect(stopRun).toHaveBeenCalledWith('agent-main', 'run_7');
+});
+
+it('steers a message into the running reply with Ctrl+Enter', async () => {
+  const user = userEvent.setup();
+  const { input, stream } = await openLiveSession();
+  const run = runningRun();
+  act(() => stream.push(snapshotEvent([snapshotRun(run)])));
+  await screen.findByRole('button', { name: 'Stop' });
+  vi.mocked(daemon.startRun).mockResolvedValueOnce({
+    run,
+    steer: { status: 'pending' },
+  });
+
+  await user.type(input, 'also check trains');
+  await user.keyboard('{Control>}{Enter}{/Control}');
+
+  expect(daemon.startRun).toHaveBeenCalledWith(
+    'agent-main',
+    'room-7',
+    { text: 'also check trains', mode: 'steer' },
+    expect.any(String),
+  );
+  expect(
+    await screen.findByText('Joining the reply in progress…'),
+  ).toBeVisible();
+  act(() => stream.push(steeredEvent(run, 'm-steer', 'also check trains', 2)));
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Joining the reply in progress…'),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('also check trains')).toBeVisible();
+});
+
+it('cancels a queued message', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'stopRun').mockImplementation(async (_agentId, runId) =>
+    runFixture(runId, { sessionId: 'room-7', status: 'cancelled' }),
+  );
+  const { stream } = await openLiveSession();
+  act(() =>
+    stream.push(
+      snapshotEvent([
+        snapshotRun(
+          runFixture('run_q', {
+            sessionId: 'room-7',
+            createdAtMs: Date.now(),
+            input: { text: 'Later please', attachmentIds: [], skill: null },
+          }),
+        ),
+      ]),
+    ),
+  );
+
+  expect(await screen.findByText('Later please')).toBeVisible();
+  expect(screen.getByText('Queued')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Cancel' }));
+  expect(daemon.stopRun).toHaveBeenCalledWith('agent-main', 'run_q');
+});
+
+it('offers to send an interrupted message again, warning when tools had started', async () => {
+  const user = userEvent.setup();
+  vi.mocked(daemon.sessionRuns).mockResolvedValue([
+    runFixture('run_i', {
+      sessionId: 'room-7',
+      status: 'interrupted',
+      createdAtMs: Date.now(),
+      toolsStarted: ['bash'],
+      error: { code: 'restart_during_run', message: 'The daemon restarted' },
+      input: { text: 'Clean the logs', attachmentIds: [], skill: null },
+    }),
+  ]);
+  await openLiveSession();
+
+  expect(
+    await screen.findByText(
+      'The daemon restarted while this reply was running.',
+    ),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      'Tools had started (bash). Check their effects before sending again.',
+    ),
+  ).toBeVisible();
+  expect(screen.getByText('Clean the logs')).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Send again' }));
+  expect(daemon.startRun).toHaveBeenCalledWith(
+    'agent-main',
+    'room-7',
+    { text: 'Clean the logs', mode: 'queue' },
+    expect.any(String),
+  );
+});
+
+it('runs slash commands instead of sending them', async () => {
+  const user = userEvent.setup();
+  const { input } = await openLiveSession();
+  const compact = vi
+    .spyOn(daemon, 'compactSession')
+    .mockImplementation(
+      async (_agentId, sessionId) =>
+        routes.sessions.find((item) => item.id === sessionId)!,
+    );
+
+  await user.type(input, '/compact{Enter}');
+  await waitFor(() =>
+    expect(compact).toHaveBeenCalledWith('agent-main', 'room-7'),
+  );
+  expect(input).toHaveValue('');
+
+  await user.type(input, '/rename{Enter}');
+  expect(input).toHaveValue('/rename ');
+  await user.type(input, 'Offsite{Enter}');
+  await waitFor(() =>
+    expect(daemon.updateSession).toHaveBeenCalledWith('agent-main', 'room-7', {
+      title: 'Offsite',
+    }),
+  );
+
+  await user.type(input, '/stop{Enter}');
+  expect(await screen.findByText('/stop is not available here.')).toBeVisible();
+  expect(input).toHaveValue('/stop');
+
+  await user.clear(input);
+  await user.type(input, '/new{Enter}');
+  await waitFor(() => expect(window.location.hash).toBe('#/'));
+  expect(daemon.startRun).not.toHaveBeenCalled();
+});
+
+it('switches the bootstrap to agent summaries once the event stream opens', async () => {
+  fakeClock();
+  const summaries = vi.spyOn(daemon, 'listAgentSummaries').mockResolvedValue([
+    {
+      state: snapshot('agent-main', 'Nova', 1).state,
+      messageCount: 0,
+      eventCount: 0,
+      lastTask: null,
+    },
+  ]);
+  const { stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await elapse(100);
+  const fullReads = vi.mocked(daemon.listAgents).mock.calls.length;
+
+  await elapse(BOOTSTRAP_POLL_MS * 2);
+  expect(vi.mocked(daemon.listAgents).mock.calls.length).toBe(fullReads);
+  await elapse(BOOTSTRAP_SUMMARY_POLL_MS);
+  expect(summaries).toHaveBeenCalled();
+});
+
+it('opens a helper session by its agent and credits its task to the companion', async () => {
+  const helper = snapshot('helper-7', 'Researcher', 2);
+  helper.state.config.settings = { additional: { workspaceRole: 'helper' } };
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1), helper],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('room-9', {
+      agentId: 'helper-7',
+      kind: 'helper',
+      origin: 'delegation',
+      title: 'Compare vendors',
+      parentAgentId: 'agent-main',
+      parentRunId: 'run_1',
+      capabilities: readOnly,
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  vi.mocked(daemon.sessionMessages).mockImplementation(
+    async (agentId, sessionId) => ({
+      messages:
+        agentId === 'helper-7' && sessionId === 'room-9'
+          ? [
+              {
+                id: 't1',
+                role: 'user',
+                text: 'Task delegated by workspace manager Nova (agent-main). Return the result and any blockers. Do not delegate further.\n\nCompare vendors',
+                attachments: [],
+                metadata: {},
+                createdAtMs: 2,
+              },
+              {
+                id: 'r1',
+                role: 'assistant',
+                text: 'Vendor B is cheaper',
+                attachments: [],
+                metadata: {},
+                createdAtMs: 3,
+              },
+            ]
+          : [],
+      nextBefore: null,
+    }),
+  );
+  window.history.replaceState(null, '', '/#/s/helper-7/room-9');
+  render(<ViewHarness />);
+
+  const conversation = await screen.findByLabelText(
+    'Conversation with Researcher',
+  );
+  expect(
+    await within(conversation).findByText('Vendor B is cheaper'),
+  ).toBeVisible();
+  expect(within(conversation).getByText('From Nova')).toBeVisible();
+  expect(within(conversation).getByText('Compare vendors')).toBeVisible();
+  expect(
+    screen.queryByText(/Task delegated by workspace manager/),
+  ).not.toBeInTheDocument();
+  expect(screen.getByRole('note')).toHaveTextContent(
+    'Helper sessions are read-only.',
+  );
+});
+
+it('refreshes the sidebar when the stream reports a session change', async () => {
+  const { stream } = await openLiveSession();
+  routes.sessions.push(
+    sessionFixture('chat:elsewhere', {
+      title: 'Made on Telegram',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  act(() => stream.push(sessionEvent('session.created', 'chat:elsewhere', 1)));
+
+  expect(
+    await screen.findByRole('button', { name: 'Made on Telegram' }),
+  ).toBeVisible();
+});
+
+it('says it is reconnecting when the stream drops', async () => {
+  const { stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  act(() => stream.end());
+
+  expect(await screen.findByText('Reconnecting…')).toBeVisible();
+});
+
+/** A steer the harness accepted into `run_7`, the reply in progress. */
+async function steerIntoRunningReply() {
+  const user = userEvent.setup();
+  const live = await openLiveSession();
+  const run = runningRun();
+  act(() => live.stream.push(snapshotEvent([snapshotRun(run)])));
+  await screen.findByRole('button', { name: 'Stop' });
+  vi.mocked(daemon.startRun).mockResolvedValueOnce({
+    run,
+    steer: { status: 'pending' },
+  });
+  await user.type(live.input, 'also check trains');
+  await user.keyboard('{Control>}{Enter}{/Control}');
+  expect(
+    await screen.findByText('Joining the reply in progress…'),
+  ).toBeVisible();
+  return {
+    ...live,
+    user,
+    run,
+    key: vi.mocked(daemon.startRun).mock.calls[0][3],
+  };
+}
+
+function userMessage(
+  id: string,
+  text: string,
+  metadata: Record<string, unknown>,
+  createdAtMs = 2,
+): SessionMessage {
+  return { id, role: 'user', text, attachments: [], metadata, createdAtMs };
+}
+
+it('keeps a steer through a reconnect until its message is in history', async () => {
+  vi.spyOn(Math, 'random').mockReturnValue(0);
+  const { stream, events, run, key } = await steerIntoRunningReply();
+
+  // A dropped stream and its new snapshot say nothing about the steer.
+  act(() => stream.end());
+  expect(await screen.findByText('Reconnecting…')).toBeVisible();
+  await waitFor(() => expect(events.streams).toHaveLength(2), {
+    timeout: STREAM_RETRY_MIN_MS * 2,
+  });
+  act(() => events.streams[1].push(snapshotEvent([snapshotRun(run)])));
+  await waitFor(() =>
+    expect(screen.queryByText('Reconnecting…')).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('Joining the reply in progress…')).toBeVisible();
+
+  // The reply took it: its message, keyed by the send, is in history.
+  vi.mocked(daemon.sessionMessages).mockResolvedValue({
+    messages: [
+      userMessage('u1', 'Plan Saturday', { runId: 'run_7' }),
+      userMessage(
+        'm-steer',
+        'also check trains',
+        { runId: 'run_7', steer: true, clientRequestId: key },
+        3,
+      ),
+    ],
+    nextBefore: null,
+  });
+  act(() =>
+    events.streams[1].push(
+      messageCreatedEvent(run, 'm-steer', 'user', 2),
+      runEvent(
+        'run.completed',
+        { ...run, status: 'completed', finishedAtMs: Date.now() },
+        3,
+      ),
+    ),
+  );
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Joining the reply in progress…'),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('also check trains')).toBeVisible();
+});
+
+it('shows a steer the reply did not take as a queued message of its own', async () => {
+  const { stream, run } = await steerIntoRunningReply();
+
+  // The reply ended before its next model call: the daemon queued the steer.
+  act(() =>
+    stream.push(
+      runEvent(
+        'run.queued',
+        runFixture('run_8', {
+          sessionId: 'room-7',
+          createdAtMs: Date.now(),
+          input: { text: 'also check trains', attachmentIds: [], skill: null },
+        }),
+        2,
+      ),
+      runEvent(
+        'run.completed',
+        { ...run, status: 'completed', finishedAtMs: Date.now() },
+        3,
+      ),
+    ),
+  );
+
+  await waitFor(() =>
+    expect(
+      screen.queryByText('Joining the reply in progress…'),
+    ).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('also check trains')).toBeVisible();
+  expect(screen.getByText('Queued')).toBeVisible();
+});
+
+it('moves a steer to the recovery panel when its reply fails without it', async () => {
+  const { stream, run, user, input, key } = await steerIntoRunningReply();
+
+  act(() =>
+    stream.push(
+      runEvent(
+        'run.failed',
+        {
+          ...run,
+          status: 'failed',
+          finishedAtMs: Date.now(),
+          error: { code: 'model_error', message: 'provider unavailable' },
+        },
+        2,
+      ),
+    ),
+  );
+
+  await user.click(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  );
+  expect(
+    screen.queryByText('Joining the reply in progress…'),
+  ).not.toBeInTheDocument();
+  expect(input).toHaveValue('also check trains');
+  // Sent again it is a new message: the steer's key still names the old run.
+  await user.keyboard('{Enter}');
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(2));
+  const [, , body, resendKey] = vi.mocked(daemon.startRun).mock.calls[1];
+  expect(body).toEqual({ text: 'also check trains', mode: 'queue' });
+  expect(resendKey).not.toBe(key);
+});
+
+it('announces each finished reply in the open session once', async () => {
+  const { stream } = await openLiveSession();
+  const run = runningRun();
+  const done = {
+    ...run,
+    status: 'completed' as const,
+    finishedAtMs: Date.now(),
+    replyMessageId: 'a1',
+  };
+  act(() =>
+    stream.push(
+      snapshotEvent([snapshotRun(run)]),
+      runEvent('run.completed', done, 2),
+    ),
+  );
+  const region = await screen.findByText('Nova replied.');
+  expect(region.textContent).toBe('Nova replied.');
+
+  // The same finish again and a new snapshot announce nothing new.
+  await act(async () =>
+    stream.push(runEvent('run.completed', done, 3), snapshotEvent([], 4)),
+  );
+  await act(async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, 50));
+  });
+  expect(region.textContent).toBe('Nova replied.');
+
+  // Another session's reply is not announced here; the next one here is,
+  // with text that differs so screen readers read it again.
+  await act(async () =>
+    stream.push(
+      runEvent(
+        'run.completed',
+        runFixture('run_x', {
+          sessionId: 'chat:other',
+          status: 'completed',
+          finishedAtMs: Date.now(),
+        }),
+        5,
+      ),
+    ),
+  );
+  expect(region.textContent).toBe('Nova replied.');
+  await act(async () =>
+    stream.push(
+      runEvent(
+        'run.completed',
+        runFixture('run_9', {
+          sessionId: 'room-7',
+          status: 'completed',
+          finishedAtMs: Date.now(),
+        }),
+        6,
+      ),
+    ),
+  );
+  await waitFor(() => expect(region.textContent).toBe('Nova replied. '));
+});
+
+it('keeps polling as before when the daemon has no event stream', async () => {
+  const user = fakeClock();
+  vi.spyOn(daemon, 'getAgent').mockResolvedValue({
+    agent: snapshot('agent-main', 'Nova', 1),
+  });
+  const summaries = vi.spyOn(daemon, 'listAgentSummaries');
+  const { input, stream } = await openLiveSession();
+  await act(async () => {
+    stream.fail(new DaemonHttpError(404, { error: 'Not found' }));
+    await vi.advanceTimersByTimeAsync(50);
+  });
+  expect(daemon.getAgent).toHaveBeenCalledWith('agent-main');
+  const calls = () => ({
+    agents: vi.mocked(daemon.listAgents).mock.calls.length,
+    sessions: vi.mocked(daemon.listSessions).mock.calls.length,
+    messages: vi.mocked(daemon.sessionMessages).mock.calls.length,
+  });
+  const before = calls();
+
+  await elapse(BOOTSTRAP_POLL_MS);
+  expect(calls().agents).toBeGreaterThan(before.agents);
+  expect(calls().messages).toBeGreaterThan(before.messages);
+  await elapse(SESSION_LIST_POLL_MS);
+  expect(calls().sessions).toBeGreaterThan(before.sessions);
+  expect(summaries).not.toHaveBeenCalled();
+  expect(daemon.agentEvents).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText('Reconnecting…')).not.toBeInTheDocument();
+
+  await user.type(input, 'Still here{Enter}');
+  expect(daemon.startRun).toHaveBeenCalledWith(
+    'agent-main',
+    'room-7',
+    { text: 'Still here', mode: 'queue' },
+    expect.any(String),
+  );
+});
+
+it('shows an accepted message as its queued run until the reply begins', async () => {
+  const user = userEvent.setup();
+  const { input, stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await user.type(input, 'Book the train{Enter}');
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(1));
+  const { run } = await vi.mocked(daemon.startRun).mock.results[0].value;
+
+  act(() => stream.push(runEvent('run.queued', run, 2)));
+  expect(await screen.findByText('Queued')).toBeVisible();
+  expect(screen.getByText('Book the train')).toBeVisible();
+  act(() =>
+    stream.push(
+      runEvent(
+        'run.started',
+        { ...run, status: 'running', startedAtMs: Date.now() },
+        3,
+      ),
+    ),
+  );
+  await waitFor(() =>
+    expect(screen.queryByText('Queued')).not.toBeInTheDocument(),
+  );
+  expect(screen.getByText('Book the train')).toBeVisible();
+  expect(screen.getByRole('button', { name: 'Stop' })).toBeVisible();
+});
+
+it('shows an accepted message from the ledger without the event stream', async () => {
+  const user = userEvent.setup();
+  vi.mocked(daemon.sessionRuns).mockImplementation(async () =>
+    vi.mocked(daemon.startRun).mock.calls.length > 0
+      ? [
+          runFixture('run_1', {
+            sessionId: 'room-7',
+            createdAtMs: Date.now(),
+            input: { text: 'Book the train', attachmentIds: [], skill: null },
+          }),
+        ]
+      : [],
+  );
+  const { input } = await openLiveSession();
+  await user.type(input, 'Book the train{Enter}');
+
+  expect(await screen.findByText('Queued')).toBeVisible();
+  expect(screen.getByText('Book the train')).toBeVisible();
+});
+
+it('says why an accepted message failed and sends it again as a new message', async () => {
+  const user = userEvent.setup();
+  const { input, stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await user.type(input, 'Book the train{Enter}');
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(1));
+  const { run } = await vi.mocked(daemon.startRun).mock.results[0].value;
+
+  act(() =>
+    stream.push(
+      runEvent(
+        'run.failed',
+        {
+          ...run,
+          status: 'failed',
+          startedAtMs: Date.now(),
+          finishedAtMs: Date.now(),
+          error: { code: 'model_error', message: 'provider unavailable' },
+        },
+        2,
+      ),
+    ),
+  );
+  expect(
+    await screen.findByText('This reply failed: provider unavailable'),
+  ).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Retry' }));
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(2));
+  const startRun = vi.mocked(daemon.startRun);
+  expect(startRun.mock.calls[1][2]).toEqual({
+    text: 'Book the train',
+    mode: 'queue',
+  });
+  expect(startRun.mock.calls[1][3]).not.toBe(startRun.mock.calls[0][3]);
+});
+
+it('drops the thinking indicator and marks the reply read once its run ends', async () => {
+  const { stream } = await openLiveSession({ activeRuns: 1 });
+  expect(await screen.findByText('Nova is thinking')).toBeVisible();
+  const run = runningRun();
+  act(() => stream.push(snapshotEvent([snapshotRun(run)])));
+  await waitFor(() =>
+    expect(screen.queryByText('Nova is thinking')).not.toBeInTheDocument(),
+  );
+  await waitFor(() => expect(daemon.sessionRuns).toHaveBeenCalledTimes(2));
+
+  // The run ends; the sidebar's next read is slow to answer.
+  const listing = deferred<Awaited<ReturnType<typeof daemon.listSessions>>>();
+  vi.mocked(daemon.listSessions).mockReturnValueOnce(listing.promise);
+  setSessionFields('room-7', { activeRuns: 0, unread: true });
+  vi.mocked(daemon.sessionMessages).mockResolvedValue({
+    messages: [
+      {
+        id: 'a1',
+        role: 'assistant',
+        text: 'Saturday works',
+        attachments: [],
+        metadata: { runId: 'run_7' },
+        createdAtMs: 5,
+      },
+    ],
+    nextBefore: null,
+  });
+  act(() =>
+    stream.push(
+      messageCreatedEvent(run, 'a1', 'assistant', 2),
+      runEvent(
+        'run.completed',
+        { ...run, status: 'completed', finishedAtMs: Date.now() },
+        3,
+      ),
+    ),
+  );
+  expect(await screen.findByText('Saturday works')).toBeVisible();
+  // The stream knows the run ended: the stale listing is not believed.
+  expect(screen.queryByText('Nova is thinking')).not.toBeInTheDocument();
+
+  await act(async () =>
+    listing.resolve({ sessions: [...routes.sessions], nextCursor: null }),
+  );
+  await waitFor(() =>
+    expect(daemon.updateSession).toHaveBeenCalledWith('agent-main', 'room-7', {
+      lastReadAtMs: 5,
+    }),
+  );
+});
+
+it('reads a new message into the open session when the stream reports it', async () => {
+  const { stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await waitFor(() => expect(daemon.sessionRuns).toHaveBeenCalledTimes(2));
+  vi.mocked(daemon.sessionMessages).mockResolvedValue({
+    messages: [userMessage('in-1', 'Hello from the API', {}, 4)],
+    nextBefore: null,
+  });
+
+  act(() =>
+    stream.push({
+      type: 'message.created',
+      agentId: 'agent-main',
+      sessionId: 'room-7',
+      seq: 2,
+      at: 1,
+      messageId: 'in-1',
+      role: 'user',
+      stepId: null,
+    }),
+  );
+  expect(await screen.findByText('Hello from the API')).toBeVisible();
+});
+
+it('reads the sidebar, the messages, and the ledger again after a resync', async () => {
+  const { stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await waitFor(() => expect(daemon.sessionRuns).toHaveBeenCalledTimes(2));
+  const counts = {
+    sessions: vi.mocked(daemon.listSessions).mock.calls.length,
+    messages: vi.mocked(daemon.sessionMessages).mock.calls.length,
+    runs: vi.mocked(daemon.sessionRuns).mock.calls.length,
+  };
+
+  act(() => stream.push(resyncEvent(12, 2)));
+  await waitFor(() => {
+    expect(vi.mocked(daemon.listSessions).mock.calls.length).toBeGreaterThan(
+      counts.sessions,
+    );
+    expect(vi.mocked(daemon.sessionMessages).mock.calls.length).toBeGreaterThan(
+      counts.messages,
+    );
+    expect(vi.mocked(daemon.sessionRuns).mock.calls.length).toBeGreaterThan(
+      counts.runs,
+    );
+  });
+});
+
+it('reads a Telegram reply’s run once, even when the ledger does not have it', async () => {
+  const user = fakeClock();
+  endTelegramRun('completed');
+  vi.mocked(daemon.sessionRuns).mockResolvedValue([]);
+  const input = await openTelegramSession();
+  await user.type(input, 'On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  expect(await screen.findByText('Be right there')).toBeVisible();
+  await elapse(100);
+  const reads = vi.mocked(daemon.sessionRuns).mock.calls.length;
+  const polls = vi.mocked(daemon.sessionMessages).mock.calls.length;
+
+  await elapse(SESSION_MESSAGES_POLL_MS * 3);
+  expect(vi.mocked(daemon.sessionMessages).mock.calls.length).toBeGreaterThan(
+    polls,
+  );
+  expect(vi.mocked(daemon.sessionRuns).mock.calls.length).toBe(reads);
+  expect(
+    screen.queryByText('Queued for Telegram delivery'),
+  ).not.toBeInTheDocument();
+});
+
+it('reports Telegram delivery when the stream says the reply’s run completed', async () => {
+  const user = userEvent.setup();
+  const events = scriptedAgentEvents();
+  const input = await openTelegramSession();
+  await waitFor(() => expect(events.streams).toHaveLength(1));
+  act(() => events.streams[0].push(snapshotEvent([])));
+  await user.type(input, 'On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(1));
+  const { run } = await vi.mocked(daemon.startRun).mock.results[0].value;
+
+  act(() =>
+    events.streams[0].push(
+      runEvent(
+        'run.completed',
+        { ...run, status: 'completed', finishedAtMs: Date.now() },
+        2,
+      ),
+    ),
+  );
+  expect(await screen.findByText('Queued for Telegram delivery')).toBeVisible();
+});
+
+it('says it is reconnecting once while its retries keep failing', async () => {
+  fakeClock();
+  vi.spyOn(Math, 'random').mockReturnValue(0);
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const { stream, events } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  act(() => stream.end());
+  const notice = await screen.findByText('Reconnecting…');
+
+  await elapse(STREAM_RETRY_MIN_MS);
+  await waitFor(() => expect(events.streams).toHaveLength(2));
+  await act(async () =>
+    events.streams[1].fail(
+      new DaemonConnectionError('', new TypeError('Failed to fetch')),
+    ),
+  );
+  await elapse(0);
+  // The same notice stays: nothing new for a screen reader to read.
+  expect(screen.getByText('Reconnecting…')).toBe(notice);
+
+  await elapse(STREAM_RETRY_MIN_MS * 2);
+  await waitFor(() => expect(events.streams).toHaveLength(3));
+  act(() => events.streams[2].push(snapshotEvent([])));
+  await waitFor(() =>
+    expect(screen.queryByText('Reconnecting…')).not.toBeInTheDocument(),
+  );
+});
+
+it('opens a helper’s session from its card', async () => {
+  const user = userEvent.setup();
+  routes.sessions.push(
+    sessionFixture('room-9', {
+      agentId: 'helper-7',
+      kind: 'helper',
+      origin: 'delegation',
+      title: 'Compare vendors',
+      parentAgentId: 'agent-main',
+      parentRunId: 'run_7',
+      capabilities: readOnly,
+      lastActivityAtMs: Date.now() - 1,
+    }),
+  );
+  const { stream } = await openLiveSession();
+  const run = runningRun();
+  act(() =>
+    stream.push(
+      snapshotEvent([snapshotRun(run)]),
+      toolStartedEvent(
+        run,
+        'call_h',
+        'spawn_helper',
+        2,
+        '{"name":"Researcher","task":"Compare vendors"}',
+      ),
+      toolFinishedEvent(run, 'call_h', 'spawn_helper', 3, {
+        resultPreview: '{"agentId":"helper-7"}',
+      }),
+    ),
+  );
+
+  await user.click(await screen.findByRole('button', { name: 'Open session' }));
+  await waitFor(() => expect(window.location.hash).toBe('#/s/helper-7/room-9'));
+  expect(
+    await screen.findByRole('heading', { name: 'Compare vendors' }),
+  ).toBeVisible();
+  // The helper's session is read through the companion's one stream.
+  expect(daemon.agentEvents).toHaveBeenCalledTimes(1);
+});
+
+it('reads the ledger again when the sidebar shows the open session’s runs changed', async () => {
+  fakeClock();
+  vi.mocked(daemon.sessionRuns).mockResolvedValue([runningRun()]);
+  // The stream never opens: the harness polls.
+  await openLiveSession({ activeRuns: 1 });
+  expect(await screen.findByRole('button', { name: 'Stop' })).toBeVisible();
+
+  vi.mocked(daemon.sessionRuns).mockResolvedValue([
+    {
+      ...runningRun(),
+      status: 'failed',
+      finishedAtMs: Date.now(),
+      error: { code: 'model_error', message: 'provider unavailable' },
+    },
+  ]);
+  setSessionFields('room-7', { activeRuns: 0 });
+  await elapse(SESSION_LIST_POLL_MS);
+
+  expect(
+    await screen.findByText('This reply failed: provider unavailable'),
+  ).toBeVisible();
+  expect(
+    screen.queryByRole('button', { name: 'Stop' }),
+  ).not.toBeInTheDocument();
+});
+
+it('says the open session was deleted as soon as the stream reports it', async () => {
+  const { stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await waitFor(() => expect(daemon.sessionRuns).toHaveBeenCalledTimes(2));
+  vi.mocked(daemon.sessionMessages).mockRejectedValue(
+    Object.assign(new Error('not found'), { status: 404 }),
+  );
+
+  act(() => stream.push(sessionEvent('session.deleted', 'room-7', 2)));
+  expect(await screen.findByText('This session was deleted.')).toBeVisible();
+});
+
+it('reads how a Telegram reply’s run ended once its messages arrive', async () => {
+  const user = userEvent.setup();
+  endTelegramRun('completed');
+  const ended = vi.mocked(daemon.sessionRuns).getMockImplementation()!;
+  const listMessages = vi
+    .mocked(daemon.sessionMessages)
+    .getMockImplementation()!;
+  let replied = false;
+  vi.mocked(daemon.sessionMessages).mockImplementation(async (...args) => {
+    const page = await listMessages(...args);
+    replied ||= page.messages.length > 0;
+    return page;
+  });
+  // The ledger knows how the run ended only once its messages are committed.
+  vi.mocked(daemon.sessionRuns).mockImplementation(async (...args) =>
+    replied ? ended(...args) : [],
+  );
+  const input = await openTelegramSession();
+  await user.type(input, 'On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(await screen.findByText('Queued for Telegram delivery')).toBeVisible();
+});
+
+it('polls slowly while the stream is open and reads full records for Settings', async () => {
+  const user = fakeClock();
+  vi.spyOn(daemon, 'listAgentSummaries').mockResolvedValue([
+    {
+      state: snapshot('agent-main', 'Nova', 1).state,
+      messageCount: 0,
+      eventCount: 0,
+      lastTask: null,
+    },
+  ]);
+  const { stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await elapse(LIVE_SETTLE_MS);
+  const calls = () => ({
+    sessions: vi.mocked(daemon.listSessions).mock.calls.length,
+    messages: vi.mocked(daemon.sessionMessages).mock.calls.length,
+  });
+  const opened = calls();
+
+  await elapse(SESSION_LIST_POLL_MS);
+  expect(calls()).toEqual(opened);
+  await elapse(SESSION_MESSAGES_LIVE_POLL_MS - SESSION_LIST_POLL_MS);
+  expect(calls().messages).toBeGreaterThan(opened.messages);
+  expect(calls().sessions).toBe(opened.sessions);
+  await elapse(SESSION_LIST_LIVE_POLL_MS - SESSION_MESSAGES_LIVE_POLL_MS);
+  expect(calls().sessions).toBeGreaterThan(opened.sessions);
+
+  const fullReads = vi.mocked(daemon.listAgents).mock.calls.length;
+  await user.click(screen.getByRole('button', { name: 'Settings' }));
+  await waitFor(() =>
+    expect(vi.mocked(daemon.listAgents).mock.calls.length).toBe(fullReads + 1),
+  );
 });
