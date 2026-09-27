@@ -493,13 +493,15 @@ export function Composer({
   const menuId = useId();
   const [activeIndex, setActiveIndex] = useState(0);
   const [dismissedFor, setDismissedFor] = useState<string | null>(null);
+  const [blurred, setBlurred] = useState(false);
   const inputLabel = label ?? `Message ${agentName}`;
   const suggestions = commands ? slashSuggestions(draft, commands) : [];
-  const menuOpen = suggestions.length > 0 && dismissedFor !== draft;
+  const menuOpen = suggestions.length > 0 && dismissedFor !== draft && !blurred;
   const selected = menuOpen
     ? suggestions[Math.min(activeIndex, suggestions.length - 1)]
     : null;
   const canSend = !disabled && !sending && !offline && draft.trim().length > 0;
+  const canPick = !disabled && !sending && !offline;
   const steerable = runActive && onSteer !== undefined;
 
   useEffect(() => {
@@ -520,7 +522,7 @@ export function Composer({
       taRef.current?.focus();
       return;
     }
-    if (!disabled && !offline) onSend(`/${command.name}`);
+    if (canPick) onSend(`/${command.name}`);
   };
 
   return (
@@ -604,7 +606,7 @@ export function Composer({
                   return;
                 }
                 if (
-                  e.key === 'Tab' ||
+                  (e.key === 'Tab' && !e.shiftKey) ||
                   (e.key === 'Enter' && !e.shiftKey && !composing)
                 ) {
                   e.preventDefault();
@@ -619,6 +621,8 @@ export function Composer({
                 else onSend();
               }
             }}
+            onFocus={() => setBlurred(false)}
+            onBlur={() => setBlurred(true)}
             rows={1}
             aria-label={inputLabel}
             aria-autocomplete={commands ? 'list' : undefined}

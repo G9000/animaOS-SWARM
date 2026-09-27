@@ -525,4 +525,68 @@ describe('Composer commands and live replies', () => {
     expect(input).not.toHaveAttribute('aria-controls');
     expect(input).not.toHaveAttribute('aria-activedescendant');
   });
+
+  it('lets Shift+Tab move focus away normally instead of completing a command', () => {
+    const props = composerProps({ draft: '/re' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    const notPrevented = fireEvent.keyDown(input, {
+      key: 'Tab',
+      shiftKey: true,
+    });
+    expect(notPrevented).toBe(true);
+    expect(props.setDraft).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it('does not send a picked no-argument command while a send is already in flight', async () => {
+    const props = composerProps({ draft: '/st', sending: true });
+    render(<Composer {...props} />);
+
+    await userEvent.click(screen.getByRole('option', { name: /\/stop/ }));
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it('falls back to a normal send with Ctrl+Enter when a run is active but there is no onSteer', () => {
+    const props = composerProps({
+      draft: 'keep going',
+      runActive: true,
+      onStop: vi.fn(),
+      onSteer: undefined,
+    });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('wraps the active suggestion at both ends of the list with the arrow keys', () => {
+    const props = composerProps({ draft: '/' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+    const last = SLASH_COMMANDS[SLASH_COMMANDS.length - 1];
+
+    fireEvent.keyDown(input, { key: 'ArrowUp' });
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      `/${last.name}`,
+    );
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      `/${SLASH_COMMANDS[0].name}`,
+    );
+  });
+
+  it('closes the menu when the textarea loses focus and reopens it on refocus with a matching draft', () => {
+    const props = composerProps({ draft: '/co' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+    fireEvent.blur(input);
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+    fireEvent.focus(input);
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+  });
 });
