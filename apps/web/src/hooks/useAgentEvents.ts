@@ -23,6 +23,18 @@ export const STREAM_RETRY_MAX_MS = 30_000;
  */
 export const RESYNC_BACKOFF_AFTER = 3;
 
+/**
+ * Fix round 1 (Minor 1): `stream.snapshot` alone doesn't prove a connection
+ * is healthy — a stream that gets its snapshot and then drops immediately,
+ * over and over, must still climb the back-off instead of retrying every
+ * `STREAM_RETRY_MIN_MS` forever. The back-off counter (`failures`) only
+ * resets once the connection proves itself: it delivers a real event (not
+ * the snapshot, not a resync), or it simply stays open this long (covers a
+ * quiet session past its snapshot, including through the daemon's SSE
+ * keep-alive comments, which never reach the generator as events).
+ */
+export const STREAM_HEALTHY_AFTER_MS = 10_000;
+
 export type AgentStreamStatus =
   | 'connecting'
   | 'open'
@@ -89,6 +101,7 @@ class AgentStream {
   private holders = 0;
   private controller: AbortController | null = null;
   private retryTimer: number | undefined;
+  private healthyTimer: number | undefined;
   private cancelFrame: (() => void) | null = null;
   private failures = 0;
   /** Consecutive resync-only connections (Ruling 3); reset by any event that
@@ -127,6 +140,7 @@ class AgentStream {
     this.controller = null;
     if (this.retryTimer !== undefined) window.clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
+    this.clearHealthyTimer();
     this.cancelFrame?.();
     this.cancelFrame = null;
     if (streams.get(this.agentId) === this) streams.delete(this.agentId);
@@ -136,7 +150,26 @@ class AgentStream {
     this.retryTimer = undefined;
     const controller = new AbortController();
     this.controller = controller;
+    this.armHealthyTimer(controller);
     void this.read(controller);
+  }
+
+  /** Minor 1: resets `failures` once this connection has stayed open long
+   *  enough to count as healthy, even without a qualifying event (a quiet
+   *  session past its snapshot). Superseded or dropped connections never
+   *  fire this against the wrong attempt: `connect` re-arms it, and
+   *  `release` clears it. */
+  private armHealthyTimer(controller: AbortController): void {
+    this.clearHealthyTimer();
+    this.healthyTimer = window.setTimeout(() => {
+      this.healthyTimer = undefined;
+      if (this.controller === controller) this.failures = 0;
+    }, STREAM_HEALTHY_AFTER_MS);
+  }
+
+  private clearHealthyTimer(): void {
+    if (this.healthyTimer !== undefined) window.clearTimeout(this.healthyTimer);
+    this.healthyTimer = undefined;
   }
 
   private async read(controller: AbortController): Promise<void> {
@@ -147,12 +180,15 @@ class AgentStream {
       })) {
         if (controller.signal.aborted) return;
         if (event.type === 'stream.snapshot') {
-          this.failures = 0;
           this.status = 'open';
         } else if (event.type !== 'stream.resync') {
           // A real event (not the connection handshake, not another
-          // resync): the stream is keeping up. Ruling 3's streak resets.
+          // resync): the stream is keeping up. Ruling 3's streak resets,
+          // and so does the back-off counter (Minor 1) — no need to wait
+          // out `STREAM_HEALTHY_AFTER_MS` when the stream already proved
+          // itself.
           this.consecutiveResyncs = 0;
+          this.failures = 0;
         }
         this.state = applyEvent(this.state, event);
         this.publish();

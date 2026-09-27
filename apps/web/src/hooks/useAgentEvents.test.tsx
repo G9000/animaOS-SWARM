@@ -14,6 +14,7 @@ import {
 } from '../test/live';
 import {
   RESYNC_BACKOFF_AFTER,
+  STREAM_HEALTHY_AFTER_MS,
   STREAM_RETRY_MAX_MS,
   STREAM_RETRY_MIN_MS,
   retryDelay,
@@ -48,6 +49,31 @@ describe('useAgentEvents', () => {
     expect(streams[0].signal?.aborted).toBe(false);
     second.unmount();
     expect(streams[0].signal?.aborted).toBe(true);
+  });
+
+  it('opens a separate connection for each companion', async () => {
+    const { streams } = scriptedAgentEvents();
+    renderHook(() => useAgentEvents('agent-a'));
+    renderHook(() => useAgentEvents('agent-b'));
+
+    await waitFor(() => expect(streams).toHaveLength(2));
+    expect(streams.map((stream) => stream.agentId).sort()).toEqual([
+      'agent-a',
+      'agent-b',
+    ]);
+  });
+
+  it('opens a fresh stream for a new subscriber after the last one released the old one', async () => {
+    const { streams } = scriptedAgentEvents();
+    const first = renderHook(() => useAgentEvents('agent-main'));
+    await waitFor(() => expect(streams).toHaveLength(1));
+
+    first.unmount();
+    expect(streams[0].signal?.aborted).toBe(true);
+
+    renderHook(() => useAgentEvents('agent-main'));
+    await waitFor(() => expect(streams).toHaveLength(2));
+    expect(streams[1].signal?.aborted).toBe(false);
   });
 
   it('applies events and reports the stream open after its snapshot', async () => {
@@ -131,25 +157,6 @@ describe('useAgentEvents', () => {
     await waitFor(() => expect(result.current.status).toBe('reconnecting'));
     expect(warn).toHaveBeenCalled();
     expect(streams).toHaveLength(2);
-  });
-
-  it('stops for good on a 404 when the agent still exists (the daemon predates the stream)', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    vi.spyOn(daemon, 'getAgent').mockResolvedValue({
-      agent: { state: { id: 'agent-main' } },
-    } as never);
-    const { streams } = scriptedAgentEvents();
-    const { result } = renderHook(() => useAgentEvents('agent-main'));
-
-    await act(async () =>
-      streams[0].fail(new DaemonHttpError(404, { error: 'not found' })),
-    );
-    await waitFor(() => expect(result.current.status).toBe('unsupported'));
-    expect(daemon.getAgent).toHaveBeenCalledWith('agent-main');
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(STREAM_RETRY_MAX_MS);
-    });
-    expect(streams).toHaveLength(1);
   });
 
   it('keeps reconnecting (never "unsupported") on a 404 for an unknown or deleted agent', async () => {
@@ -260,6 +267,10 @@ describe('useAgentEvents', () => {
 
   it('stops for good when the daemon has no event stream', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
+    // Ruling 2: a plain 404 alone can't tell "the agent is gone" apart from
+    // "the daemon predates this route", so the hook probes the agent first;
+    // stubbing the probe to resolve simulates it existing (the route is the
+    // thing missing).
     vi.spyOn(daemon, 'getAgent').mockResolvedValue({
       agent: { state: { id: 'agent-main' } },
     } as never);
@@ -270,9 +281,72 @@ describe('useAgentEvents', () => {
       streams[0].fail(new DaemonHttpError(404, { error: 'not found' })),
     );
     await waitFor(() => expect(result.current.status).toBe('unsupported'));
+    expect(daemon.getAgent).toHaveBeenCalledWith('agent-main');
     await act(async () => {
       await vi.advanceTimersByTimeAsync(STREAM_RETRY_MAX_MS);
     });
     expect(streams).toHaveLength(1);
+  });
+
+  it('keeps growing the back-off across repeated snapshot-then-drop cycles instead of resetting on every snapshot', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    const { streams } = scriptedAgentEvents();
+    renderHook(() => useAgentEvents('agent-main'));
+
+    // Cycle 1: snapshot, then an immediate drop (well short of
+    // STREAM_HEALTHY_AFTER_MS). The first back-off is the floor.
+    await act(async () => streams[0].push(snapshotEvent([])));
+    await act(async () => streams[0].end());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_RETRY_MIN_MS);
+    });
+    expect(streams).toHaveLength(2);
+
+    // Cycle 2: the same thing again. If the snapshot had reset the back-off
+    // counter, this would also reconnect after STREAM_RETRY_MIN_MS; instead
+    // the delay must have grown, since this connection never proved itself
+    // healthy either.
+    await act(async () => streams[1].push(snapshotEvent([])));
+    await act(async () => streams[1].end());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_RETRY_MIN_MS);
+    });
+    expect(streams).toHaveLength(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_RETRY_MIN_MS);
+    });
+    expect(streams).toHaveLength(3);
+  });
+
+  it('resets the back-off once a connection stays open long enough to count as healthy', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    const { streams } = scriptedAgentEvents();
+    renderHook(() => useAgentEvents('agent-main'));
+
+    // Cycle 1: snapshot then drop — the floor delay, and the back-off
+    // counter climbs for next time.
+    await act(async () => streams[0].push(snapshotEvent([])));
+    await act(async () => streams[0].end());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_RETRY_MIN_MS);
+    });
+    expect(streams).toHaveLength(2);
+
+    // This connection gets its snapshot and then just stays open long
+    // enough to count as healthy, with no other event.
+    await act(async () => streams[1].push(snapshotEvent([])));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_HEALTHY_AFTER_MS);
+    });
+    await act(async () => streams[1].end());
+
+    // Back at the floor delay: STREAM_RETRY_MIN_MS is now enough again.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(STREAM_RETRY_MIN_MS);
+    });
+    expect(streams).toHaveLength(3);
   });
 });
