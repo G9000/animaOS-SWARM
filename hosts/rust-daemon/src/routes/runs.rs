@@ -192,7 +192,7 @@ pub(super) async fn start_session_run(
                 idempotency_key.clone(),
                 connector_id.clone(),
             );
-            let start: QueuedRunStart = Box::new(
+            let start = QueuedRunStart::new(
                 move |run_id| -> BoxFuture<'static, Result<(), QueuedStartError>> {
                     Box::pin(async move {
                         match manager

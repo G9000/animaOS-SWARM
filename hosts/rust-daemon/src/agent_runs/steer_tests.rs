@@ -1123,3 +1123,88 @@ async fn a_steer_sent_as_a_run_crashes_waits_as_the_next_message() {
     assert_eq!(second.input.text, "also this");
     wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Failed).await;
 }
+
+/// Final fix wave S2-B (review B, Minor 2): a steer handed on from a run the
+/// session queue does not own (a check-in tick) keeps its acceptance order,
+/// so it runs before a message accepted after it. The session's drainer
+/// takes the room before it picks its next message, and the tick holds the
+/// room until it has handed the steer on.
+#[tokio::test]
+async fn a_steer_a_check_in_left_unread_runs_before_a_later_message() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(
+        vec![
+            Step::Text(vec!["Nothing new"]),
+            Step::Text(vec!["About the check-in"]),
+            Step::Text(vec!["About the question"]),
+        ],
+        gate.clone(),
+    );
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let tick = {
+        let coordinator = coordinator.clone();
+        let mut request = chat_request(&agent_id, "chat:s", "Check in on the owner");
+        request.source = RunSource::Schedule;
+        request.content.metadata = Some(std::collections::BTreeMap::from([(
+            "kind".to_string(),
+            DataValue::String("checkin".into()),
+        )]));
+        tokio::spawn(async move {
+            coordinator
+                .run_with_commit_waiting(request, |_, _| Ok(()), |_| Ok(()))
+                .await
+        })
+    };
+    gate.entered().await;
+    let AcceptedRun::Steered(joined) = accept(
+        &coordinator,
+        message(
+            &agent_id,
+            "key-steer",
+            "and the check-in?",
+            SessionRunMode::Steer,
+        ),
+    )
+    .await
+    else {
+        panic!("the steer joins the check-in");
+    };
+    assert_eq!(joined.source, RunSource::Schedule);
+    let AcceptedRun::Created(_) = accept(
+        &coordinator,
+        message(
+            &agent_id,
+            "key-later",
+            "a new question",
+            SessionRunMode::Queue,
+        ),
+    )
+    .await
+    else {
+        panic!("the later message is queued");
+    };
+    // The later message's session queue is waiting for the room by now.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // The check-in ends without another model call, leaving the steer unread.
+    gate.release();
+    tick.await.unwrap().unwrap();
+    gate.entered().await;
+    gate.release();
+    gate.entered().await;
+    gate.release();
+    wait_for_key(&coordinator, &agent_id, "key-steer", RunStatus::Completed).await;
+    wait_for_key(&coordinator, &agent_id, "key-later", RunStatus::Completed).await;
+
+    let sent: Vec<String> = model
+        .requests()
+        .iter()
+        .map(|request| request.messages.last().unwrap().content.text.clone())
+        .collect();
+    assert_eq!(
+        sent[1..],
+        ["and the check-in?", "a new question"],
+        "the steer, accepted first, runs first"
+    );
+}

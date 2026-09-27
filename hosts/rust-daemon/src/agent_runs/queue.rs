@@ -14,12 +14,12 @@ use anima_core::primitives::now_millis;
 use anima_core::{
     Content, DataValue, Message, MessageRole, RUN_ID_METADATA_KEY, STEER_METADATA_KEY,
 };
-use futures::future::BoxFuture;
+use futures::future::{select, BoxFuture, Either};
 use tokio::sync::OwnedMutexGuard;
 use tracing::{error, warn};
 
 use super::{
-    is_helper_config, AgentRunCoordinator, AgentRunRequest, RunRoom,
+    is_helper_config, AgentRunCoordinator, AgentRunRequest, RunRoom, SessionLease,
     HELPER_MUST_RUN_THROUGH_COMPANION, MAX_QUEUED_RUNS_PER_AGENT,
 };
 use crate::live::{run_status_event, LiveEventBody};
@@ -200,10 +200,31 @@ pub(super) struct SteerLeftovers {
     pub(super) stopped: bool,
 }
 
+type StartFn = Box<dyn FnOnce(String) -> BoxFuture<'static, Result<(), QueuedStartError>> + Send>;
+
 /// Starts an accepted run given its id and resolves once the run is over;
 /// `Err` says why it did not run.
-pub(crate) type QueuedRunStart =
-    Box<dyn FnOnce(String) -> BoxFuture<'static, Result<(), QueuedStartError>> + Send>;
+pub(crate) struct QueuedRunStart {
+    /// The room of a start whose admission (`acquire_accepted_ticket`) can
+    /// take the room from its session queue (final fix wave S2-B): the queue
+    /// then takes the room's lease before it picks the run, and hands it on.
+    /// `None` for a start that takes its room itself, after locks of its own
+    /// (a Telegram owner turn).
+    room_id: Option<String>,
+    start: StartFn,
+}
+
+impl QueuedRunStart {
+    /// A start that takes its room itself.
+    pub(crate) fn new(
+        start: impl FnOnce(String) -> BoxFuture<'static, Result<(), QueuedStartError>> + Send + 'static,
+    ) -> Self {
+        Self {
+            room_id: None,
+            start: Box::new(start),
+        }
+    }
+}
 
 /// Why an accepted run's start did not run it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -725,7 +746,8 @@ impl AgentRunCoordinator {
         idempotency_key: String,
     ) -> QueuedRunStart {
         let coordinator = self.clone();
-        Box::new(
+        let room = room_id.clone();
+        let start: StartFn = Box::new(
             move |run_id: String| -> BoxFuture<'static, Result<(), QueuedStartError>> {
                 Box::pin(async move {
                     let request = AgentRunRequest {
@@ -757,7 +779,13 @@ impl AgentRunCoordinator {
                         })
                 })
             },
-        )
+        );
+        // `run_accepted` reaches `acquire_accepted_ticket` with no lock of its
+        // own, so it can take the room its session queue holds for it.
+        QueuedRunStart {
+            room_id: Some(room),
+            start,
+        }
     }
 
     /// Adds an accepted run to its session's queue by acceptance time, so a
@@ -809,6 +837,39 @@ impl AgentRunCoordinator {
     /// order, until shutdown begins (S2-A).
     async fn drain_session(&self, key: (String, String)) {
         loop {
+            let room_id = {
+                let mut queues = self
+                    .session_queues
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let Some(queue) = queues.get_mut(&key) else {
+                    return;
+                };
+                match queue.front() {
+                    Some(front) => front.start.room_id.clone(),
+                    None => {
+                        queues.remove(&key);
+                        return;
+                    }
+                }
+            };
+            // The room first, then the run (final fix wave S2-B): while
+            // another run holds the room, a steer it hands on is placed by its
+            // acceptance time, so it is picked before a message accepted
+            // after it. The lease is handed to the run it picks.
+            let room = match room_id {
+                Some(room_id) => {
+                    let lease = Box::pin(self.wait_session_lease(&key.0, &room_id));
+                    match select(lease, Box::pin(self.accepted_runs.closed())).await {
+                        Either::Left((lease, _)) => Some(lease),
+                        Either::Right(_) => {
+                            self.end_drain(&key);
+                            return;
+                        }
+                    }
+                }
+                None => None,
+            };
             let next = {
                 let mut queues = self
                     .session_queues
@@ -853,8 +914,14 @@ impl AgentRunCoordinator {
             if !still_queued {
                 continue;
             }
+            if let Some(room) = room {
+                // Same session, same room; any other lease goes back first.
+                if next.start.room_id.as_deref() == Some(room.key.1.as_str()) {
+                    self.hand_room(&next.run_id, room);
+                }
+            }
             // Its own task, so a panic cannot take the session's queue with it.
-            let failure = match tokio::spawn((next.start)(next.run_id.clone())).await {
+            let failure = match tokio::spawn((next.start.start)(next.run_id.clone())).await {
                 Ok(Ok(())) => None,
                 // Left as it is: settling or saving it now would turn a run
                 // that never started into a failure (review Minor 4).
@@ -862,6 +929,9 @@ impl AgentRunCoordinator {
                 Ok(Err(QueuedStartError::Failed(message))) => Some(message),
                 Err(_) => Some(RUN_ENDED_BEFORE_START.to_string()),
             };
+            // A start that ended before its admission took the room gives it
+            // back here.
+            drop(self.take_handed_room(&next.run_id));
             if let Some(message) = failure {
                 let stopped = self
                     .state
@@ -882,6 +952,22 @@ impl AgentRunCoordinator {
                 self.settle_unstarted(&next.run_id, status, error).await;
             }
         }
+    }
+
+    /// Hands `run_id` the room lease its session queue took for it (S2-B).
+    fn hand_room(&self, run_id: &str, room: SessionLease) {
+        self.handed_rooms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(run_id.to_string(), room);
+    }
+
+    /// The room lease `run_id`'s session queue handed it, if it has one.
+    pub(super) fn take_handed_room(&self, run_id: &str) -> Option<SessionLease> {
+        self.handed_rooms
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(run_id)
     }
 
     /// Ends a session's drain at shutdown, leaving the runs it held queued.

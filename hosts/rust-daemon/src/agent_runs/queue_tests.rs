@@ -413,7 +413,7 @@ fn crash() -> Result<(), super::QueuedStartError> {
 async fn a_start_that_panics_is_settled_and_the_session_queue_continues() {
     let (coordinator, agent_id) = coordinator_with(ScriptedModel::new(vec![])).await;
     add_chat(&coordinator, &agent_id, "chat:p").await;
-    let panicking: QueuedRunStart = Box::new(|_| Box::pin(async { crash() }));
+    let panicking = QueuedRunStart::new(|_| Box::pin(async { crash() }));
     let crashed = match coordinator
         .accept_run(accept(&agent_id, "chat:p", "key-1"), panicking)
         .await

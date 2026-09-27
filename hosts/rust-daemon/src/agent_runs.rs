@@ -345,6 +345,9 @@ pub(crate) struct AgentRunCoordinator {
     deleting_agents: self::stop::DeletingAgents,
     /// Whether shutdown has begun, and the accepted runs going (S2-A).
     accepted_runs: self::shutdown::AcceptedRuns,
+    /// Room leases a session queue took for the accepted run it picked,
+    /// until that run's admission takes them (S2-B). A leaf lock.
+    handed_rooms: Arc<StdMutex<HashMap<String, SessionLease>>>,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
     /// How long a compaction's store read and model call may take.
@@ -606,6 +609,7 @@ impl AgentRunCoordinator {
             acceptance_clock: self::queue::AcceptanceClock::default(),
             deleting_agents: Arc::new(StdMutex::new(HashMap::new())),
             accepted_runs: self::shutdown::AcceptedRuns::default(),
+            handed_rooms: Arc::new(StdMutex::new(HashMap::new())),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
             compaction_timeout: std::time::Duration::from_millis(
@@ -903,7 +907,7 @@ impl AgentRunCoordinator {
                 }
                 None => {
                     coordinator
-                        .acquire_ticket(&request, permit_mode, waiting)
+                        .acquire_ticket(&request, permit_mode, waiting, None)
                         .await?
                 }
             };
@@ -916,12 +920,14 @@ impl AgentRunCoordinator {
     }
 
     /// Room, slot, then permit (spec §4.3). `waiting` is released once the
-    /// permit is held, or on any earlier exit.
+    /// permit is held, or on any earlier exit. `room`, a lease the run's
+    /// session queue took for it (S2-B), stands in for waiting for the room.
     async fn acquire_ticket(
         &self,
         request: &AgentRunRequest,
         permit_mode: PermitMode,
         waiting: Option<WaitingBudgetUnit>,
+        room: Option<SessionLease>,
     ) -> Result<RunTicket, ApiError> {
         debug_assert!(
             waiting
@@ -938,7 +944,9 @@ impl AgentRunCoordinator {
         } else {
             AdmitMode::Wait
         };
-        let reservation = self.admit(&request.agent_id, &room_id, mode).await?;
+        let reservation = self
+            .admit_holding(&request.agent_id, &room_id, mode, room)
+            .await?;
         let permit = match permit_mode {
             PermitMode::TryNow => self.try_admit()?,
             PermitMode::Wait => self
@@ -970,6 +978,8 @@ impl AgentRunCoordinator {
         permit_mode: PermitMode,
         run_id: &str,
     ) -> Result<RunTicket, ApiError> {
+        // Taken first, so every exit below gives the room back.
+        let room = self.take_handed_room(run_id);
         let control = self
             .state
             .read()
@@ -985,7 +995,7 @@ impl AgentRunCoordinator {
         if self.accepted_runs.is_closing() {
             return Err(self::shutdown::shutting_down());
         }
-        let admission = Box::pin(self.acquire_ticket(request, permit_mode, None));
+        let admission = Box::pin(self.acquire_ticket(request, permit_mode, None, room));
         let given_up = select(
             control.cancel.cancelled(),
             Box::pin(self.accepted_runs.closed()),
@@ -1016,12 +1026,32 @@ impl AgentRunCoordinator {
         room_key: &str,
         mode: AdmitMode,
     ) -> Result<RunReservation, ApiError> {
+        self.admit_holding(agent_id, room_key, mode, None).await
+    }
+
+    /// `admit`, with `held`, the room's lease when the caller already took
+    /// it (S2-B: a session queue's, handed to the run it picked).
+    async fn admit_holding(
+        &self,
+        agent_id: &str,
+        room_key: &str,
+        mode: AdmitMode,
+        held: Option<SessionLease>,
+    ) -> Result<RunReservation, ApiError> {
         let capacity = self.slot_capacity(agent_id).await;
-        let session = match mode {
-            AdmitMode::Wait => self.wait_session_lease(agent_id, room_key).await,
-            AdmitMode::TryNow => self
-                .try_session_lease(agent_id, room_key)
-                .ok_or_else(|| ApiError::service_unavailable(SPECIALIST_BUSY))?,
+        let key = (agent_id.to_string(), room_key.to_string());
+        let session = match held {
+            Some(lease) if lease.key == key => lease,
+            held => {
+                // Any other lease goes back before this waits for a room.
+                drop(held);
+                match mode {
+                    AdmitMode::Wait => self.wait_session_lease(agent_id, room_key).await,
+                    AdmitMode::TryNow => self
+                        .try_session_lease(agent_id, room_key)
+                        .ok_or_else(|| ApiError::service_unavailable(SPECIALIST_BUSY))?,
+                }
+            }
         };
         let slot = match mode {
             AdmitMode::Wait => self.wait_slot_lease(agent_id, capacity).await?,

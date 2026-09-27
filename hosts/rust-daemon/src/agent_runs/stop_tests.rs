@@ -680,7 +680,7 @@ fn held_start(
 ) -> QueuedRunStart {
     let coordinator = coordinator.clone();
     let request = chat_request(agent_id, session_id, "held");
-    Box::new(
+    QueuedRunStart::new(
         move |run_id: String| -> BoxFuture<'static, Result<(), QueuedStartError>> {
             Box::pin(async move {
                 entered.add_permits(1);
@@ -876,9 +876,9 @@ async fn a_queued_message_whose_stop_cannot_be_saved_still_runs() {
     // The session's first message is held by its own start, outside any
     // transaction, so the queue reaches the second while the stop saves.
     let (entered, hold) = (Arc::new(Semaphore::new(0)), Arc::new(Semaphore::new(0)));
-    let first: QueuedRunStart = {
+    let first = {
         let (entered, hold) = (entered.clone(), hold.clone());
-        Box::new(move |_run_id| {
+        QueuedRunStart::new(move |_run_id| {
             Box::pin(async move {
                 entered.add_permits(1);
                 hold.acquire().await.unwrap().forget();
