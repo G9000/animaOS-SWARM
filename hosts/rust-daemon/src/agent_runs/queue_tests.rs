@@ -292,6 +292,96 @@ async fn a_failed_acceptance_save_answers_503_and_leaves_nothing_behind() {
     );
 }
 
+/// Fix round 1 (review Important 1): a stream opened while the acceptance
+/// save is in flight lists the queued run in its snapshot, so a failed save
+/// must end it there, and a reverted title is announced too.
+#[tokio::test]
+async fn a_stream_that_saw_a_run_whose_acceptance_save_failed_is_told_it_ended() {
+    let (coordinator, agent_id) = coordinator_with(ScriptedModel::new(vec![])).await;
+    coordinator
+        .state
+        .write()
+        .await
+        .sessions
+        .insert(SessionRecord::new(
+            &agent_id,
+            "chat:new",
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            DEFAULT_CHAT_TITLE.into(),
+            TitleSource::FirstMessage,
+            1,
+        ));
+    let save_gate = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(true);
+    let accepting = {
+        let coordinator = coordinator.clone();
+        let start = coordinator.web_start(
+            agent_id.clone(),
+            "chat:new".into(),
+            "Plan the offsite".into(),
+            "key-1".into(),
+        );
+        let mut request = accept(&agent_id, "chat:new", "key-1");
+        request.text = "Plan the offsite".into();
+        tokio::spawn(async move { coordinator.accept_run(request, start).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), save_gate.entered.acquire())
+        .await
+        .expect("the acceptance save starts within five seconds")
+        .unwrap()
+        .forget();
+
+    // A stream opens during the save, as the events route does it:
+    // subscribe and snapshot under one read lock.
+    let (mut subscription, snapshot) = {
+        let guard = coordinator.state.read().await;
+        (
+            guard.live.subscribe(&agent_id).unwrap(),
+            guard.live_snapshot_runs(&agent_id),
+        )
+    };
+    assert_eq!(snapshot.len(), 1, "the stream saw the queued run");
+    assert_eq!(snapshot[0].record.status, RunStatus::Queued);
+    let run_id = snapshot[0].record.id.clone();
+    save_gate.release.add_permits(1);
+
+    let error = tokio::time::timeout(Duration::from_secs(5), accepting)
+        .await
+        .expect("acceptance ends within five seconds")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let events = [
+        next_event(&mut subscription).await.to_json(1),
+        next_event(&mut subscription).await.to_json(2),
+    ];
+    assert_eq!(events[0]["type"], "run.failed");
+    assert_eq!(events[0]["runId"], run_id.as_str());
+    assert_eq!(events[0]["run"]["status"], "failed");
+    assert_eq!(events[0]["run"]["error"]["code"], "commit_failed");
+    assert_eq!(
+        events[0]["run"]["error"]["message"],
+        "injected control-plane save failure"
+    );
+    assert_eq!(events[1]["type"], "session.updated", "the title went back");
+    assert_eq!(events[1]["sessionId"], "chat:new");
+    assert!(
+        quiet_for(&mut subscription).await.is_empty(),
+        "one terminal event only"
+    );
+    let guard = coordinator.state.read().await;
+    assert!(guard.runs.get(&run_id).is_none());
+    assert!(guard.live.runs().control(&run_id).is_none());
+    assert_eq!(
+        guard.sessions.get(&agent_id, "chat:new").unwrap().title,
+        DEFAULT_CHAT_TITLE
+    );
+}
+
 /// A session's next accepted run starts once a stopped one is settled, and
 /// each accepted run has its own control (M3 Task 2 carry-forward), so
 /// stopping one never stops the next.

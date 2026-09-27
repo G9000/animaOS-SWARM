@@ -19,8 +19,8 @@ use super::{
 use crate::live::{run_status_event, LiveEventBody};
 use crate::routes::ApiError;
 use crate::runs::{
-    RunError, RunRecord, RunSource, RunStart, RunStatus, IDEMPOTENCY_WINDOW_MS, RUN_FAILED,
-    RUN_STOPPED, STOPPED_BY_OWNER,
+    RunError, RunRecord, RunSource, RunStart, RunStatus, COMMIT_FAILED, IDEMPOTENCY_WINDOW_MS,
+    RUN_FAILED, RUN_STOPPED, STOPPED_BY_OWNER,
 };
 use crate::sessions::{derived_title, SessionKind, TitleSource, DEFAULT_CHAT_TITLE};
 
@@ -169,11 +169,34 @@ impl AgentRunCoordinator {
         if let Err(error) = persist.save().await {
             let mut guard = self.state.write().await;
             guard.runs.remove(&record.id);
+            let mut title_reverted = false;
             if let Some(title) = previous_title {
                 if let Some(session) = guard.sessions.get_mut(&record.agent_id, &record.session_id)
                 {
                     session.title = title;
+                    title_reverted = true;
                 }
+            }
+            // A stream opened during the save listed this queued run in its
+            // snapshot; this ends it there. Published under the state lock,
+            // after the removal, so every stream whose snapshot held the run
+            // hears it (as for a failed start save).
+            let mut failed = record;
+            failed.finish(
+                RunStatus::Failed,
+                Some(RunError::new(COMMIT_FAILED, error.to_string())),
+                now_millis(),
+            );
+            let parent = guard.live_parent_agent(&failed.agent_id, &failed.session_id);
+            guard
+                .live
+                .publish(run_status_event(&failed), parent.as_deref());
+            if title_reverted {
+                guard.publish_session_event(
+                    &failed.agent_id,
+                    &failed.session_id,
+                    LiveEventBody::SessionUpdated,
+                );
             }
             return Err(ApiError::service_unavailable(error.to_string()));
         }
