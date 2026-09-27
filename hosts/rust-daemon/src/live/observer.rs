@@ -242,6 +242,7 @@ impl RunObserver for RunEvents {
                 let (result_preview, truncated) = preview(&result);
                 inner.hub.runs().tool_finished(
                     &inner.run_id,
+                    &step_id,
                     &tool_call_id,
                     status.as_str(),
                     duration_ms,

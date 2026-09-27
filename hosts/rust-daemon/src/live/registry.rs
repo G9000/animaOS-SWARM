@@ -164,8 +164,12 @@ impl LiveRuns {
             {
                 run.tools_started.push(tool.name.clone());
             }
+            // Keyed by step and call (final fix wave S2-K): a provider may
+            // reuse a call id in a later step.
             let tools = &mut run.view.tools;
-            tools.retain(|known| known.tool_call_id != tool.tool_call_id);
+            tools.retain(|known| {
+                known.step_id != tool.step_id || known.tool_call_id != tool.tool_call_id
+            });
             tools.push(tool);
             if tools.len() > MAX_LIVE_TOOL_CARDS {
                 tools.drain(..tools.len() - MAX_LIVE_TOOL_CARDS);
@@ -173,9 +177,11 @@ impl LiveRuns {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tool_finished(
         &self,
         run_id: &str,
+        step_id: &str,
         tool_call_id: &str,
         status: &'static str,
         duration_ms: u64,
@@ -186,7 +192,7 @@ impl LiveRuns {
             run.view
                 .tools
                 .iter_mut()
-                .find(|tool| tool.tool_call_id == tool_call_id)
+                .find(|tool| tool.step_id == step_id && tool.tool_call_id == tool_call_id)
         }) {
             tool.status = status.to_string();
             tool.duration_ms = Some(duration_ms);

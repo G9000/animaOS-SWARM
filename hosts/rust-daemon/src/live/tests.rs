@@ -163,7 +163,15 @@ fn the_registry_tracks_a_steps_text_in_utf16_units_and_keeps_its_tail() {
     );
 
     runs.tool_started("run_1", tool("call-1"));
-    runs.tool_finished("run_1", "call-1", "success", 5, "ok".into(), false);
+    runs.tool_finished(
+        "run_1",
+        "run_1:1",
+        "call-1",
+        "success",
+        5,
+        "ok".into(),
+        false,
+    );
     let card = runs.view("run_1").unwrap().tools[0].clone();
     assert_eq!(
         (
@@ -198,9 +206,18 @@ fn a_run_keeps_only_its_newest_tool_cards() {
     for n in 0..started {
         runs.tool_started("run_1", tool(&format!("call-{n}")));
     }
-    runs.tool_finished("run_1", "call-0", "success", 1, "gone".into(), false);
     runs.tool_finished(
         "run_1",
+        "run_1:1",
+        "call-0",
+        "success",
+        1,
+        "gone".into(),
+        false,
+    );
+    runs.tool_finished(
+        "run_1",
+        "run_1:1",
         &format!("call-{}", started - 1),
         "error",
         2,
@@ -718,4 +735,45 @@ fn the_snapshot_tail_is_trimmed_past_twice_its_cap_and_a_snapshot_stays_within_i
         kept_past_the_cap,
         "past the cap, the text is kept until it passes twice the cap"
     );
+}
+
+/// Final fix wave S2-K (review A, Minor 3): tool cards are keyed by step and
+/// call, so two steps reusing one toolCallId keep a card each.
+#[test]
+fn two_steps_reusing_one_tool_call_id_keep_a_card_each() {
+    let hub = LiveHub::new(8);
+    let runs = hub.runs();
+    runs.register("run_1");
+    let in_step = |step: &str| LiveToolView {
+        step_id: step.into(),
+        ..tool("call_search")
+    };
+    runs.tool_started("run_1", in_step("run_1:1"));
+    runs.tool_started("run_1", in_step("run_1:2"));
+
+    let cards = runs.view("run_1").unwrap().tools;
+    assert_eq!(
+        cards
+            .iter()
+            .map(|card| (card.step_id.as_str(), card.tool_call_id.as_str()))
+            .collect::<Vec<_>>(),
+        [("run_1:1", "call_search"), ("run_1:2", "call_search")]
+    );
+
+    runs.tool_finished(
+        "run_1",
+        "run_1:2",
+        "call_search",
+        "error",
+        3,
+        "failed".into(),
+        false,
+    );
+    let cards = runs.view("run_1").unwrap().tools;
+    assert_eq!(
+        cards[0].status, "running",
+        "the first step's card is its own"
+    );
+    assert_eq!(cards[1].status, "error");
+    assert_eq!(cards[1].result_preview.as_deref(), Some("failed"));
 }
