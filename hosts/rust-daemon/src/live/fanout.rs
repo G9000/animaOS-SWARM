@@ -15,6 +15,9 @@ use super::MAX_EVENT_SUBSCRIBERS_PER_AGENT;
 struct AgentChannel {
     sender: broadcast::Sender<Arc<LiveEvent>>,
     subscribers: usize,
+    /// Tells this channel apart from a later one of the same agent, so a
+    /// stream of a closed channel never counts against its successor.
+    id: u64,
 }
 
 struct HubInner {
@@ -22,6 +25,7 @@ struct HubInner {
     channels: Mutex<HashMap<String, AgentChannel>>,
     runs: LiveRuns,
     lagged: AtomicU64,
+    next_channel_id: AtomicU64,
     /// Set once, at shutdown; every subscription watches it.
     closed: watch::Sender<bool>,
 }
@@ -60,6 +64,7 @@ impl LiveHub {
                 channels: Mutex::new(HashMap::new()),
                 runs: LiveRuns::default(),
                 lagged: AtomicU64::new(0),
+                next_channel_id: AtomicU64::new(0),
                 closed: watch::channel(false).0,
             }),
         }
@@ -74,6 +79,13 @@ impl LiveHub {
     /// calls this first; otherwise one open console tab would block the exit.
     pub(crate) fn close(&self) {
         self.inner.closed.send_replace(true);
+    }
+
+    /// Ends every open stream of `agent_id`, once the agent is deleted
+    /// (final fix wave S2-I): dropping its channel's sender ends each
+    /// subscription after the events already sent to it.
+    pub(crate) fn close_agent(&self, agent_id: &str) {
+        self.inner.channels().remove(agent_id);
     }
 
     /// Sends `event` to its agent's stream and, when it differs, to
@@ -97,6 +109,7 @@ impl LiveHub {
             .or_insert_with(|| AgentChannel {
                 sender: broadcast::channel(self.inner.capacity).0,
                 subscribers: 0,
+                id: self.inner.next_channel_id.fetch_add(1, Ordering::Relaxed),
             });
         if channel.subscribers >= MAX_EVENT_SUBSCRIBERS_PER_AGENT {
             return Err(SubscriberLimit);
@@ -108,6 +121,7 @@ impl LiveHub {
             guard: SubscriberGuard {
                 hub: Arc::clone(&self.inner),
                 agent_id: agent_id.to_string(),
+                channel_id: channel.id,
             },
         })
     }
@@ -132,12 +146,16 @@ impl LiveHub {
 struct SubscriberGuard {
     hub: Arc<HubInner>,
     agent_id: String,
+    channel_id: u64,
 }
 
 impl Drop for SubscriberGuard {
     fn drop(&mut self) {
         let mut channels = self.hub.channels();
-        if let Some(channel) = channels.get_mut(&self.agent_id) {
+        if let Some(channel) = channels
+            .get_mut(&self.agent_id)
+            .filter(|channel| channel.id == self.channel_id)
+        {
             channel.subscribers = channel.subscribers.saturating_sub(1);
             if channel.subscribers == 0 {
                 channels.remove(&self.agent_id);

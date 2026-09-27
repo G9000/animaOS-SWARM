@@ -411,6 +411,54 @@ async fn an_open_stream_ends_when_the_hub_closes() {
     assert_eq!(hub.subscribers(&agent), 0, "the stream released its slot");
 }
 
+/// Final fix wave S2-I (review A, Minor 5): deleting an agent ends its open
+/// streams, instead of leaving them holding a subscriber slot with only
+/// keep-alives; another agent's stream stays open.
+#[tokio::test]
+async fn deleting_an_agent_ends_its_open_streams() {
+    let (state, agent) = state_with_agent();
+    let other = state
+        .write()
+        .await
+        .create_agent(test_config("other"))
+        .unwrap()
+        .state
+        .id;
+    let hub = state.read().await.live.clone();
+    let app = router(state, DaemonConfig::default());
+    let mut reader = SseReader::new(
+        app.clone()
+            .oneshot(events_request(&agent, OWNER_ORIGIN))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(reader.next().await.data["type"], "stream.snapshot");
+    let mut other_stream = hub.subscribe(&other).unwrap();
+
+    let deleted = app
+        .oneshot(owner_request(
+            "DELETE",
+            &format!("/api/agents/{agent}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::OK);
+
+    let end = tokio::time::timeout(Duration::from_secs(5), reader.body.frame())
+        .await
+        .expect("the deleted agent's stream ends");
+    assert!(end.is_none(), "nothing follows the deletion");
+    assert_eq!(hub.subscribers(&agent), 0, "the stream released its slot");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), other_stream.next())
+            .await
+            .is_err(),
+        "another agent's stream stays open"
+    );
+    assert_eq!(hub.subscribers(&other), 1);
+}
+
 #[tokio::test]
 async fn a_lagging_stream_is_told_to_resync_and_keeps_going() {
     let (state, agent) = state_with_agent();

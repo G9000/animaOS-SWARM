@@ -120,6 +120,7 @@ pub(crate) async fn handle_delete_agent(
         .save()
         .await
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    state.read().await.live.close_agent(agent_id);
 
     Ok(DeleteResponse { deleted: true })
 }

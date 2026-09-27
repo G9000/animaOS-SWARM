@@ -1790,6 +1790,9 @@ impl ConnectorManager {
                     state.live.runs().remove(&cancelled.id);
                     state.live.publish(run_status_event(cancelled), None);
                 }
+                // Its open streams end, after the events above (final fix
+                // wave S2-I); none can open again, the agent being gone.
+                state.live.close_agent(&agent_id);
             }
             // Durable now: the history rows may go (spec §3.3).
             let history = manager.state.read().await.history.clone();

@@ -638,3 +638,40 @@ mod coalescing {
         );
     }
 }
+
+/// Final fix wave S2-I: closing an agent's channel ends its subscriptions
+/// after what they were already sent, and a subscription of the closed
+/// channel never counts against a later one.
+#[tokio::test]
+async fn closing_an_agents_channel_ends_its_streams_only() {
+    let hub = LiveHub::new(8);
+    let mut closed = hub.subscribe("deleted").unwrap();
+    let mut other = hub.subscribe("other").unwrap();
+    hub.publish(
+        LiveEvent::new("deleted", LiveEventBody::SessionDeleted),
+        None,
+    );
+
+    hub.close_agent("deleted");
+
+    assert!(matches!(
+        closed.next().await,
+        Some(LiveDelivery::Event(event)) if event.body.type_name() == "session.deleted"
+    ));
+    assert!(closed.next().await.is_none(), "then the stream ends");
+    assert_eq!(hub.subscribers("deleted"), 0);
+    let later = hub.subscribe("deleted").unwrap();
+    drop(closed);
+    assert_eq!(
+        hub.subscribers("deleted"),
+        1,
+        "the old stream counts nowhere"
+    );
+    drop(later);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), other.next())
+            .await
+            .is_err(),
+        "another agent's stream stays open"
+    );
+}
