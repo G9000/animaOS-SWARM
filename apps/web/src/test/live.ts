@@ -16,6 +16,7 @@ export function runFixture(id: string, overrides: Partial<Run> = {}): Run {
     sessionId: 'chat:1',
     source: 'web',
     sourceRef: null,
+    idempotencyKey: null,
     status: 'queued',
     input: { text: 'Hello', attachmentIds: [], skill: null },
     createdAtMs: 1,
