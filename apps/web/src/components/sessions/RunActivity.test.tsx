@@ -203,6 +203,26 @@ describe('RunOutcomeCard', () => {
     expect(onSendAgain).toHaveBeenCalledWith(run);
   });
 
+  it('disables Retry and Send again once used', () => {
+    const failed = runFixture('run_f', {
+      status: 'failed',
+      error: { code: 'model_error', message: 'provider unavailable' },
+    });
+    const interrupted = runFixture('run_i', {
+      status: 'interrupted',
+      error: { code: 'restart_before_start', message: 'restarted' },
+    });
+    render(
+      <>
+        <RunOutcomeCard run={failed} onSendAgain={vi.fn()} resent />
+        <RunOutcomeCard run={interrupted} onSendAgain={vi.fn()} resent />
+      </>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send again' })).toBeDisabled();
+  });
+
   it('warns before sending an interrupted message again when tools had started', () => {
     render(
       <RunOutcomeCard

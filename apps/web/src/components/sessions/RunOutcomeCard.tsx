@@ -18,9 +18,12 @@ function interruptedReason(run: Run): string {
 export function RunOutcomeCard({
   run,
   onSendAgain,
+  resent = false,
 }: {
   run: Run;
   onSendAgain?: (run: Run) => void;
+  /** Already sent again from this page: its button is used up. */
+  resent?: boolean;
 }) {
   if (run.status === 'cancelled')
     return (
@@ -40,6 +43,7 @@ export function RunOutcomeCard({
           <button
             type="button"
             className="studio-tool-button"
+            disabled={resent}
             onClick={() => onSendAgain(run)}
           >
             Retry
@@ -60,6 +64,7 @@ export function RunOutcomeCard({
         <button
           type="button"
           className="studio-tool-button"
+          disabled={resent}
           onClick={() => onSendAgain(run)}
         >
           Send again

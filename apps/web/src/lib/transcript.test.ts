@@ -3,11 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { emptyLiveRun } from './session-events';
 import {
   argumentsSummary,
+  buildHistory,
   buildTranscript,
   delegatedTaskText,
   formatElapsed,
   liveToolSteps,
   mergeSessionRuns,
+  placeRuns,
   previewSummary,
   type TranscriptItem,
 } from './transcript';
@@ -417,6 +419,83 @@ describe('buildTranscript', () => {
       'run:run_q',
       'pending:k1',
     ]);
+  });
+
+  it('places a finished run with nothing committed where it happened', () => {
+    const failed = runFixture('run_f', {
+      status: 'failed',
+      createdAtMs: 5,
+      startedAtMs: 5,
+      finishedAtMs: 6,
+      error: { code: 'model_error', message: 'provider unavailable' },
+    });
+    const interrupted = runFixture('run_i', {
+      status: 'interrupted',
+      createdAtMs: 12,
+      error: { code: 'restart_before_start', message: 'restarted' },
+    });
+    const active = runFixture('run_a', { status: 'running', createdAtMs: 3 });
+    const items = buildTranscript({
+      messages: [
+        message('u1', 'User', 'first', { runId: 'run_1' }, 1),
+        message('a1', 'Assistant', 'reply', { runId: 'run_1' }, 2),
+        message('u2', 'User', 'second', { runId: 'run_2' }, 10),
+        message('a2', 'Assistant', 'reply', { runId: 'run_2' }, 11),
+      ],
+      runs: [
+        emptyLiveRun(active),
+        emptyLiveRun(failed),
+        emptyLiveRun(interrupted),
+      ],
+    });
+
+    expect(items.map((item) => item.key)).toEqual([
+      'u1',
+      'a1',
+      'run:run_f',
+      'outcome:run_f',
+      'u2',
+      'a2',
+      'run:run_i',
+      'outcome:run_i',
+      // A run still going stays at the end, whenever it was accepted.
+      'run:run_a',
+    ]);
+  });
+
+  it('places a run older than the loaded page only once no older page is left', () => {
+    const failed = runFixture('run_f', {
+      status: 'failed',
+      createdAtMs: 1,
+      error: { code: 'model_error', message: 'gone' },
+    });
+    const history = buildHistory({
+      messages: [message('u1', 'User', 'hi', {}, 100)],
+    });
+
+    expect(
+      placeRuns(history, { runs: [emptyLiveRun(failed)] }).map(
+        (item) => item.key,
+      ),
+    ).toEqual(['u1']);
+    expect(
+      placeRuns(history, {
+        runs: [emptyLiveRun(failed)],
+        olderHistory: false,
+      }).map((item) => item.key),
+    ).toEqual(['run:run_f', 'outcome:run_f', 'u1']);
+  });
+
+  it('keeps the history’s own items when placing runs', () => {
+    const history = buildHistory({
+      messages: [message('u1', 'User', 'hi', {}, 1)],
+    });
+    const items = placeRuns(history, {
+      runs: [emptyLiveRun(runFixture('run_a', { status: 'running' }))],
+    });
+
+    expect(items[0]).toBe(history.items[0]);
+    expect(history.items).toHaveLength(1);
   });
 
   it('keeps a finished run it saw stream until its messages arrive', () => {

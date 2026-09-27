@@ -1,4 +1,4 @@
-import { renderHook } from '@testing-library/react';
+import { act, renderHook } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { emptyLiveRun } from '../lib/session-events';
@@ -135,6 +135,29 @@ describe('useTranscriptActions', () => {
       agentId: 'helper-7',
       sessionId: 'room-live',
     });
+  });
+
+  it('sends a run again once, and remembers it was sent', () => {
+    const sendAgain = vi.fn(() => true);
+    const { result } = actionsFor({ sendAgain });
+    const run = runFixture('run_f', { sessionId: 'room-7', status: 'failed' });
+    expect(result.current.resentRunIds?.has('run_f')).toBe(false);
+
+    act(() => result.current.onSendAgain?.(run));
+    act(() => result.current.onSendAgain?.(run));
+
+    expect(sendAgain).toHaveBeenCalledTimes(1);
+    expect(result.current.resentRunIds?.has('run_f')).toBe(true);
+  });
+
+  it('does not remember a run that could not be sent again', () => {
+    const { result } = actionsFor({ sendAgain: vi.fn(() => false) });
+    act(() =>
+      result.current.onSendAgain?.(
+        runFixture('run_f', { sessionId: 'room-7', status: 'failed' }),
+      ),
+    );
+    expect(result.current.resentRunIds?.has('run_f')).toBe(false);
   });
 
   it('does not send again where the message cannot go', () => {

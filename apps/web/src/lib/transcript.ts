@@ -66,6 +66,9 @@ type ToolsItem = Extract<TranscriptItem, { kind: 'tools' }>;
 export interface TranscriptActions {
   onCancelQueued?: (run: Run) => void;
   onSendAgain?: (run: Run) => void;
+  /** Runs already sent again from this page: their Retry or Send again is
+   *  used up. */
+  resentRunIds?: ReadonlySet<string>;
   onCompact?: () => void;
   helperSession?: (step: ToolStep) => HelperTarget | null;
   onOpenSession?: (target: HelperTarget) => void;
@@ -323,6 +326,8 @@ function messageItem(
  *  among them needs. */
 export interface TranscriptHistory {
   readonly items: readonly TranscriptItem[];
+  /** When each item's first message was created; null for the divider. */
+  readonly startedAtMs: readonly (number | null)[];
   /** The index of each run's last item. */
   readonly lastOfRun: ReadonlyMap<string, number>;
   /** Runs whose committed partial reply is labelled "Stopped". */
@@ -341,6 +346,11 @@ export type HistoryInput = Pick<
  *  session's runs stream and the view skips rendering them again. */
 export function buildHistory(input: HistoryInput): TranscriptHistory {
   const items: TranscriptItem[] = [];
+  const startedAtMs: (number | null)[] = [];
+  const push = (item: TranscriptItem, at: number | null) => {
+    items.push(item);
+    startedAtMs.push(at);
+  };
   const lastOfRun = new Map<string, number>();
   const stoppedRuns = new Set<string>();
   // Ruling 3: an orphan tool card (its call is not in the same block)
@@ -358,7 +368,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
   let blockRunId: string | null = null;
 
   if (trimmed && !input.messages.some((message) => message.id === trimmed))
-    items.push({ kind: 'trimmed', key: 'trimmed' });
+    push({ kind: 'trimmed', key: 'trimmed' }, null);
 
   // The open block belonging to `runId`, or null if there is none (`block`
   // is read live: a same-iteration reset below must be seen by a later
@@ -423,7 +433,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
             messageIds: [message.id],
           };
           blockRunId = runId;
-          items.push(block);
+          push(block, message.created_at_ms);
         }
       }
     } else {
@@ -432,7 +442,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
       if (calls.length === 0 || message.content.text.trim()) {
         block = null;
         blockRunId = null;
-        items.push(messageItem(message, delegatedBy));
+        push(messageItem(message, delegatedBy), message.created_at_ms);
       }
       if (calls.length > 0) {
         const stepId = stringField(metadata, 'stepId');
@@ -465,7 +475,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
             messageIds: [message.id],
           };
           blockRunId = runId;
-          items.push(block);
+          push(block, message.created_at_ms);
         }
       }
     }
@@ -476,7 +486,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
     if (message.id === trimmed) {
       block = null;
       blockRunId = null;
-      items.push({ kind: 'trimmed', key: 'trimmed' });
+      push({ kind: 'trimmed', key: 'trimmed' }, null);
     }
   }
 
@@ -488,6 +498,7 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
 
   return {
     items,
+    startedAtMs,
     lastOfRun,
     stoppedRuns,
     oldestLoadedMs:
@@ -495,18 +506,51 @@ export function buildHistory(input: HistoryInput): TranscriptHistory {
   };
 }
 
-export type LiveInput = Pick<TranscriptInput, 'runs' | 'pending'>;
+export interface LiveInput {
+  runs?: readonly LiveRun[];
+  pending?: readonly PendingBubble[];
+  /** Older history may exist beyond the loaded page (assumed unless said
+   *  otherwise): a run older than the page's oldest message belongs among
+   *  messages not loaded, so it waits for them. */
+  olderHistory?: boolean;
+}
 
-/** The transcript (spec §15.2): the history's own items, unchanged, with
- *  the session's runs and sends placed among and after them. */
+/** An item a run adds, placed after the history item at `after`. */
+interface RunInsert {
+  after: number;
+  /** The run's place in `runs`, which keeps ties in order. */
+  order: number;
+  items: TranscriptItem[];
+}
+
+/**
+ * The transcript (spec §15.2): the history's own items, unchanged, with
+ * the session's runs and sends placed among and after them.
+ *
+ * - A run with committed messages gets its outcome after its last item.
+ * - A finished run with nothing committed (it failed, stopped, or was
+ *   interrupted before any message) sits where it happened: before the
+ *   first history item whose first message was created after it.
+ * - Runs still going, and finished runs this page saw stream (their
+ *   messages are on their way), stay at the end, followed by the sends
+ *   the daemon has not accepted yet.
+ */
 export function placeRuns(
   history: TranscriptHistory,
   input: LiveInput,
 ): TranscriptItem[] {
-  const { lastOfRun, stoppedRuns } = history;
+  const { lastOfRun, stoppedRuns, startedAtMs } = history;
   const oldestLoaded = history.oldestLoadedMs;
+  const olderHistory = input.olderHistory ?? true;
   const items = [...history.items];
-  const inserts: { after: number; order: number; item: TranscriptItem }[] = [];
+  /** The item a run created at `at` goes after. */
+  const anchorFor = (at: number): number => {
+    const next = startedAtMs.findIndex(
+      (started) => started !== null && started > at,
+    );
+    return (next < 0 ? startedAtMs.length : next) - 1;
+  };
+  const inserts: RunInsert[] = [];
   const tail: TranscriptItem[] = [];
   for (const [order, live] of (input.runs ?? []).entries()) {
     const { run } = live;
@@ -521,21 +565,24 @@ export function placeRuns(
         hasOutcome(run) &&
         !(run.status === 'cancelled' && stoppedRuns.has(run.id))
       )
-        inserts.push({ after, order, item: outcome });
+        inserts.push({ after, order, items: [outcome] });
       continue;
     }
     // A queued message the owner cancelled leaves nothing behind.
     if (run.status === 'cancelled' && run.startedAtMs === null) continue;
+    const shown: TranscriptItem[] = [
+      { kind: 'run', key: `run:${run.id}`, live },
+      ...(hasOutcome(run) ? [outcome] : []),
+    ];
     const streamed = live.steps.length > 0 || live.tools.length > 0;
-    const recent = oldestLoaded === null || run.createdAtMs >= oldestLoaded;
-    if (
-      !isTerminalRunStatus(run.status) ||
-      streamed ||
-      (hasOutcome(run) && recent)
-    ) {
-      tail.push({ kind: 'run', key: `run:${run.id}`, live });
-      if (hasOutcome(run)) tail.push(outcome);
+    if (!isTerminalRunStatus(run.status) || streamed) {
+      tail.push(...shown);
+      continue;
     }
+    const loaded =
+      oldestLoaded === null || run.createdAtMs >= oldestLoaded || !olderHistory;
+    if (hasOutcome(run) && loaded)
+      inserts.push({ after: anchorFor(run.createdAtMs), order, items: shown });
   }
   // Descending by anchor so an earlier splice never shifts a later one's
   // target index; descending by original order within a tie so splicing
@@ -544,7 +591,8 @@ export function placeRuns(
   inserts.sort(
     (left, right) => right.after - left.after || right.order - left.order,
   );
-  for (const insert of inserts) items.splice(insert.after + 1, 0, insert.item);
+  for (const insert of inserts)
+    items.splice(insert.after + 1, 0, ...insert.items);
   items.push(...tail);
   for (const pending of input.pending ?? [])
     items.push({ kind: 'pending', key: `pending:${pending.key}`, pending });

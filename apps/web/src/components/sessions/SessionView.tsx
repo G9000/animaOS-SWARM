@@ -235,8 +235,8 @@ export function SessionView({
     [messages, trimmedThrough, delegatedBy],
   );
   const items = useMemo(
-    () => placeRuns(history, { runs, pending }),
-    [history, runs, pending],
+    () => placeRuns(history, { runs, pending, olderHistory: hasOlder }),
+    [history, runs, pending, hasOlder],
   );
   if (missing) {
     return (

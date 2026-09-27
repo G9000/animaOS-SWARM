@@ -2930,13 +2930,18 @@ it('offers to send an interrupted message again, warning when tools had started'
     ),
   ).toBeVisible();
   expect(screen.getByText('Clean the logs')).toBeVisible();
-  await user.click(screen.getByRole('button', { name: 'Send again' }));
+  const sendAgain = screen.getByRole('button', { name: 'Send again' });
+  await user.click(sendAgain);
   expect(daemon.startRun).toHaveBeenCalledWith(
     'agent-main',
     'room-7',
     { text: 'Clean the logs', mode: 'queue' },
     expect.any(String),
   );
+  // Used once, it cannot send the message a second time.
+  await waitFor(() => expect(sendAgain).toBeDisabled());
+  await user.click(sendAgain);
+  expect(daemon.startRun).toHaveBeenCalledTimes(1);
 });
 
 it('runs slash commands instead of sending them', async () => {

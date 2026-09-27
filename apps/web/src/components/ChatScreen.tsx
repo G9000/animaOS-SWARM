@@ -269,7 +269,11 @@ const TranscriptEntry = memo(function TranscriptEntry({
       );
     case 'outcome':
       return (
-        <RunOutcomeCard run={item.run} onSendAgain={actions?.onSendAgain} />
+        <RunOutcomeCard
+          run={item.run}
+          onSendAgain={actions?.onSendAgain}
+          resent={actions?.resentRunIds?.has(item.run.id) ?? false}
+        />
       );
     case 'pending':
       return (

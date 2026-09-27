@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Run, Session } from '@animaOS-SWARM/sdk';
 
 import type { LiveState } from '../lib/session-events';
@@ -39,7 +39,8 @@ export interface TranscriptActionOptions {
   /** The listed sessions, where it finds a finished helper's session. */
   sessions: readonly Session[];
   stopRun: (run: Run) => void;
-  sendAgain: (run: Run) => void;
+  /** Sends a run's message again; false when it could not go. */
+  sendAgain: (run: Run) => boolean;
   compact: (session: Session) => void;
   openSession: (target: HelperTarget) => void;
 }
@@ -72,6 +73,10 @@ export function useTranscriptActions({
   // Read during render, so the cards rendered with it see this render's runs.
   const liveRunsRef = useRef(liveRuns);
   liveRunsRef.current = liveRuns;
+  // A run sent again from this page is not sent a second time: its button
+  // is used up for as long as the page is open.
+  const [resent, setResent] = useState<ReadonlySet<string>>(() => new Set());
+  const resentRef = useRef(resent);
   const cancellable = session?.capabilities.stop === true;
   const canResend = resendable && session?.capabilities.send === true;
   const compactable = session?.capabilities.compact ? session : null;
@@ -81,8 +86,16 @@ export function useTranscriptActions({
         ? { onCancelQueued: (run: Run) => latestRef.current.stopRun(run) }
         : {}),
       ...(canResend
-        ? { onSendAgain: (run: Run) => latestRef.current.sendAgain(run) }
+        ? {
+            onSendAgain: (run: Run) => {
+              if (resentRef.current.has(run.id)) return;
+              if (!latestRef.current.sendAgain(run)) return;
+              resentRef.current = new Set(resentRef.current).add(run.id);
+              setResent(resentRef.current);
+            },
+          }
         : {}),
+      resentRunIds: resent,
       ...(compactable
         ? { onCompact: () => latestRef.current.compact(compactable) }
         : {}),
@@ -90,6 +103,6 @@ export function useTranscriptActions({
         helperSessionTarget(step, liveRunsRef.current, sessions),
       onOpenSession: (target) => latestRef.current.openSession(target),
     }),
-    [cancellable, canResend, compactable, sessions],
+    [cancellable, canResend, compactable, sessions, resent],
   );
 }

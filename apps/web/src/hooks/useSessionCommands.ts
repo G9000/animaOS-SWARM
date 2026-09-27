@@ -78,8 +78,9 @@ export interface SessionCommands {
   stopRun: (run: Pick<Run, 'agentId' | 'id'>) => Promise<void>;
   /** Folds earlier turns into the session summary (spec §5.4). */
   compactSession: (session: Session) => Promise<void>;
-  /** Sends a failed or interrupted run's message again, as a new message. */
-  sendAgain: (run: Run) => void;
+  /** Sends a failed or interrupted run's message again, as a new message;
+   *  false when it cannot go from the open session. */
+  sendAgain: (run: Run) => boolean;
   /** Opens a session, another agent's (a helper's) by its agent. */
   openTarget: (target: HelperTarget) => void;
 }
@@ -208,8 +209,9 @@ export function useSessionCommands(
           run.agentId !== session.agentId ||
           run.sessionId !== session.id
         )
-          return;
+          return false;
         queueSend(session, chatKey, run.input.text, crypto.randomUUID());
+        return true;
       },
       openTarget: (target: HelperTarget) =>
         latest.current.navigate({
