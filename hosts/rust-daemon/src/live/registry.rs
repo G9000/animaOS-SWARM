@@ -49,8 +49,6 @@ struct LiveRunState {
     /// Distinct tool names, noted here instead of under the state write lock
     /// (M1 carry-forward); saves and reads merge them into the ledger record.
     tools_started: Vec<String>,
-    /// Idempotency keys of the steers this run accepted, with their text.
-    steer_keys: HashMap<String, String>,
 }
 
 #[derive(Debug, Default)]
@@ -80,7 +78,6 @@ impl LiveRuns {
                 text_units: 0,
                 steps: Vec::new(),
                 tools_started: Vec::new(),
-                steer_keys: HashMap::new(),
             })
             .control
             .clone()
@@ -192,22 +189,5 @@ impl LiveRuns {
             .get(run_id)
             .map(|run| run.tools_started.clone())
             .unwrap_or_default()
-    }
-
-    /// Remembers a steer's idempotency key and text for the run it joined
-    /// (Task 9), so a retried steer is answered instead of sent twice.
-    #[allow(dead_code)] // M3 Task 9 records steer keys.
-    pub(crate) fn note_steer_key(&self, run_id: &str, key: &str, text: &str) {
-        if let Some(run) = self.lock().get_mut(run_id) {
-            run.steer_keys.insert(key.to_string(), text.to_string());
-        }
-    }
-
-    /// The text of the steer this run accepted with `key`.
-    #[allow(dead_code)] // M3 Task 9 answers retried steers.
-    pub(crate) fn steer_text(&self, run_id: &str, key: &str) -> Option<String> {
-        self.lock()
-            .get(run_id)
-            .and_then(|run| run.steer_keys.get(key).cloned())
     }
 }

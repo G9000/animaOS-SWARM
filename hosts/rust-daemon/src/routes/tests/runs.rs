@@ -1667,3 +1667,45 @@ fn the_openapi_document_lists_the_stop_route_under_runs() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_steer_into_the_active_run_answers_202_with_a_pending_steer() {
+    let gate = Gate::new();
+    let (app, state, agent) = app_with_chat(ScriptedModel::gated(vec![], gate.clone())).await;
+    let first = accept_message(&app, &agent, "key-1").await;
+    gate.entered().await;
+
+    let response = app
+        .clone()
+        .oneshot(start_request(
+            &agent,
+            "chat:plans",
+            Some("key-2"),
+            json!({"text": "and also", "mode": "steer"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = json_body(response).await;
+    assert_eq!(body["run"]["id"], first.as_str());
+    assert_eq!(body["steer"]["status"], "pending");
+
+    // One model call ends the first run, so the steer becomes its own message.
+    gate.release();
+    gate.entered().await;
+    gate.release();
+    let key_two = loop {
+        let found = state
+            .read()
+            .await
+            .runs
+            .find_by_idempotency_key(&agent, "key-2", 0)
+            .map(|record| record.id.clone());
+        if let Some(id) = found {
+            break id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    wait_for(&state, &key_two, RunStatus::Completed).await;
+}

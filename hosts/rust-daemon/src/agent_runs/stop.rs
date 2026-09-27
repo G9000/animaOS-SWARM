@@ -5,17 +5,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::primitives::now_millis;
-use anima_core::{Content, DataValue};
-use tracing::error;
 
-use super::queue::{metadata_text, ACCEPTED_AT_METADATA_KEY, CLIENT_REQUEST_ID_METADATA_KEY};
 use super::AgentRunCoordinator;
 use crate::live::run_status_event;
 use crate::routes::ApiError;
-use crate::runs::{
-    RunError, RunRecord, RunSource, RunStart, RunStatus, STOPPED_BEFORE_START,
-    STOPPED_BEFORE_START_MESSAGE,
-};
+use crate::runs::RunRecord;
 
 pub(crate) const AGENT_BEING_DELETED: &str = "This companion is being deleted";
 
@@ -40,14 +34,6 @@ impl Drop for AgentDeletionGuard {
                 deleting.remove(&self.agent_id);
             }
         }
-    }
-}
-
-/// When a steer was accepted, from its metadata.
-fn accepted_at_ms(content: &Content) -> Option<u64> {
-    match content.metadata.as_ref()?.get(ACCEPTED_AT_METADATA_KEY)? {
-        DataValue::Number(at) if at.is_finite() && *at >= 0.0 => Some(*at as u64),
-        _ => None,
     }
 }
 
@@ -132,81 +118,5 @@ impl AgentRunCoordinator {
         }
         drop(transaction);
         Ok(plan.run)
-    }
-
-    /// Makes the steers a stopped run never read `interrupted` runs of its
-    /// session, which the owner can send again, with one save. An explicit
-    /// stop means stop everything, so they are not requeued (controller
-    /// ruling, M3 pre-flight audit M8: a deliberate deviation from spec
-    /// §4.7, which requeues a finished run's leftover steers).
-    pub(super) async fn interrupt_steers(
-        &self,
-        agent_id: &str,
-        session_id: &str,
-        steers: Vec<Content>,
-    ) {
-        let transaction = self.control_plane_transaction().await;
-        let (records, parent, hub, persist) = {
-            let mut guard = self.state.write().await;
-            let Some(runtime) = guard.agents.get(agent_id) else {
-                return;
-            };
-            let model = runtime.config().model.clone();
-            let provider = runtime.config().provider.clone();
-            let now_ms = now_millis();
-            let records = steers
-                .into_iter()
-                .map(|content| {
-                    let accepted_at_ms = accepted_at_ms(&content).unwrap_or(now_ms);
-                    let idempotency_key =
-                        metadata_text(&content, CLIENT_REQUEST_ID_METADATA_KEY).map(str::to_string);
-                    let mut record = RunRecord::queued(
-                        RunStart {
-                            agent_id: agent_id.to_string(),
-                            session_id: session_id.to_string(),
-                            source: RunSource::Web,
-                            source_ref: None,
-                            idempotency_key,
-                            text: content.text,
-                            model: model.clone(),
-                            provider: provider.clone(),
-                            parent_run_id: None,
-                        },
-                        accepted_at_ms,
-                    );
-                    record.finish(
-                        RunStatus::Interrupted,
-                        Some(RunError::new(
-                            STOPPED_BEFORE_START,
-                            STOPPED_BEFORE_START_MESSAGE,
-                        )),
-                        now_ms,
-                    );
-                    record
-                })
-                .collect::<Vec<_>>();
-            for record in &records {
-                guard.runs.insert(record.clone());
-            }
-            let parent = guard.live_parent_agent(agent_id, session_id);
-            (
-                records,
-                parent,
-                guard.live.clone(),
-                guard.control_plane_persist_request(),
-            )
-        };
-        if let Err(error) = persist.save().await {
-            // Kept in the ledger for the next save (the run's own result
-            // save, right after this), but never announced unsaved: clients
-            // read them from the ledger once the run's end refreshes it.
-            error!(agent_id = %agent_id, session_id = %session_id, error = %error, "could not save the steers a stopped run never read");
-            return;
-        }
-        drop(transaction);
-        // Announced only once durable (spec §6).
-        for record in &records {
-            hub.publish(run_status_event(record), parent.as_deref());
-        }
     }
 }

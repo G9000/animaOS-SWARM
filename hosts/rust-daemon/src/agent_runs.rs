@@ -24,9 +24,9 @@ use crate::state::DaemonState;
 mod queue;
 mod stop;
 
-#[allow(unused_imports)] // The tests and Task 9 use the rest.
+#[allow(unused_imports)] // The tests use the rest.
 pub(crate) use self::queue::{
-    AcceptRun, AcceptedRun, QueuedRunStart, QueuedStartError, SessionRunMode,
+    steers_taken_in, AcceptRun, AcceptedRun, QueuedRunStart, QueuedStartError, SessionRunMode,
     ACCEPTED_AT_METADATA_KEY, CLIENT_REQUEST_ID_METADATA_KEY, IDEMPOTENCY_KEY_REUSED, QUEUE_FULL,
     RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START, SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
 };
@@ -331,6 +331,7 @@ pub(crate) struct AgentRunCoordinator {
     agent_slots: AgentSlotMap,
     waiting_budget: WaitingBudgetMap,
     session_queues: self::queue::SessionQueueMap,
+    acceptance_clock: self::queue::AcceptanceClock,
     deleting_agents: self::stop::DeletingAgents,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
@@ -584,6 +585,7 @@ impl AgentRunCoordinator {
             agent_slots: Arc::new(StdMutex::new(HashMap::new())),
             waiting_budget: Arc::new(StdMutex::new(HashMap::new())),
             session_queues: Arc::new(StdMutex::new(HashMap::new())),
+            acceptance_clock: self::queue::AcceptanceClock::default(),
             deleting_agents: Arc::new(StdMutex::new(HashMap::new())),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
@@ -1464,14 +1466,40 @@ impl AgentRunCoordinator {
             execution.await
         };
         live_run.flush();
-        // A stopped run's steers it never read are not requeued: its inbox
-        // closes, and each becomes a run to send again (audit M8). A steer
-        // arriving from now on is refused by the inbox and queued instead.
-        if live_run.control().cancel.is_cancelled() {
-            let unread = live_run.control().steering.close();
-            if !unread.is_empty() {
-                self.interrupt_steers(&agent_id, &session_id, unread).await;
-            }
+        // The run's steering ends with its execution (spec §4.7): a steer
+        // sent from now on finds the inbox closed and waits as a message
+        // instead. A steer joins only while the inbox is open, and is added to
+        // this run's record under the state lock, so the record read after
+        // the close holds every steer that joined.
+        let unread = live_run.control().steering.close();
+        let holds_steers = !unread.is_empty()
+            || self
+                .state
+                .read()
+                .await
+                .runs
+                .get(&run_id)
+                .is_some_and(|record| !record.pending_steers.is_empty());
+        if holds_steers {
+            let taken = steers_taken_in(
+                runtime
+                    .messages()
+                    .get(base.message_count..)
+                    .unwrap_or_default(),
+            )
+            .into_iter()
+            .map(|steer| steer.idempotency_key)
+            .collect();
+            self.hand_on_steers(self::queue::SteerLeftovers {
+                run_id: run_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                room_id: room_id.clone(),
+                unread,
+                taken,
+                stopped: live_run.control().cancel.is_cancelled(),
+            })
+            .await;
         }
 
         // Phase C: merge exactly this run's changes, let the source commit, then
@@ -1820,6 +1848,8 @@ async fn persist_task_result_memory(
 mod live_tests;
 #[cfg(test)]
 mod queue_tests;
+#[cfg(test)]
+mod steer_tests;
 #[cfg(test)]
 mod stop_tests;
 #[cfg(test)]

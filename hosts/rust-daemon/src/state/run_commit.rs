@@ -136,6 +136,10 @@ impl DaemonState {
             // Per-model-call usage the observer kept (spec §4.1 `steps`).
             record.steps = self.live.runs().steps(&change_set.run_id);
             record.reply_message_id = outcome.reply_message_id.clone();
+            // The steers the run took in are in its transcript now (spec §4.7).
+            record.commit_steers(&crate::agent_runs::steers_taken_in(
+                &change_set.delta.messages,
+            ));
             record.finish(outcome.status, outcome.error(), now_ms);
         }
         self.runs.prune(now_ms);
@@ -161,6 +165,11 @@ impl DaemonState {
         }
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
             record.reply_message_id = None;
+            // The steers its transcript took in are saved with it again, so
+            // a restart offers them to send again (audit I3).
+            record.revert_steers(&crate::agent_runs::steers_taken_in(
+                &change_set.delta.messages,
+            ));
             record.finish(RunStatus::Failed, Some(error), now_millis());
         }
         if let Some(undo) = change_set.session_undo.clone() {

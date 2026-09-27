@@ -25,6 +25,8 @@ pub(crate) const MAX_RUN_ATTACHMENTS: usize = 10;
 pub(crate) const IDEMPOTENCY_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) const RESTART_BEFORE_START: &str = "restart_before_start";
+pub(crate) const RESTART_BEFORE_START_MESSAGE: &str =
+    "The daemon restarted before this run started; it is safe to send it again.";
 pub(crate) const RESTART_DURING_RUN: &str = "restart_during_run";
 pub(crate) const RUN_FAILED: &str = "run_failed";
 pub(crate) const RUN_ABORTED: &str = "run_aborted";
@@ -38,6 +40,12 @@ pub(crate) const STOPPED_BY_OWNER: &str = "Stopped by owner";
 pub(crate) const STOPPED_BEFORE_START: &str = "stopped_before_start";
 pub(crate) const STOPPED_BEFORE_START_MESSAGE: &str =
     "The run was stopped before this message reached it; it is safe to send it again.";
+/// A steer its run left behind when eight messages were already waiting
+/// (controller ruling, M3 pre-flight audit M9): kept as an `interrupted` run to
+/// send again instead of passing the queue cap.
+pub(crate) const QUEUE_FULL_BEFORE_START: &str = "queue_full";
+pub(crate) const QUEUE_FULL_BEFORE_START_MESSAGE: &str =
+    "Eight messages were already waiting when the run this message joined ended; it is safe to send it again.";
 /// A deleted agent's queued message (spec §4.4 item 6).
 pub(crate) const AGENT_DELETED_BEFORE_START_MESSAGE: &str =
     "The companion was deleted before this message ran";
@@ -152,6 +160,16 @@ pub(crate) struct RunStepUsage {
     pub(crate) usage: TokenUsage,
 }
 
+/// A steer saved with the run it joined (spec §4.7; controller ruling, M3
+/// pre-flight audit I3): the owner's message with its key and acceptance time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunSteer {
+    pub(crate) idempotency_key: String,
+    pub(crate) text: String,
+    pub(crate) accepted_at_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunRecord {
@@ -190,6 +208,15 @@ pub(crate) struct RunRecord {
     /// The committed final reply of a completed run (spec §4.4 item 3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reply_message_id: Option<String>,
+    /// Steers accepted into this run that are in no committed transcript or
+    /// run of their own yet, oldest first: each leaves in the save that puts
+    /// it in one, and a restart offers the rest again (audit I3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pending_steers: Vec<RunSteer>,
+    /// Keys of the steers this run's committed transcript took in, so a
+    /// retried one is answered with this run (spec §4.2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) steered_keys: Vec<String>,
     /// Set once the history store holds this terminal record (spec §4.1).
     #[serde(default)]
     pub(crate) mirrored: bool,
@@ -237,6 +264,8 @@ impl RunRecord {
             provider: start.provider,
             parent_run_id: start.parent_run_id,
             reply_message_id: None,
+            pending_steers: Vec::new(),
+            steered_keys: Vec::new(),
             mirrored: false,
         }
     }
@@ -278,12 +307,82 @@ impl RunRecord {
         }
     }
 
+    /// The steers `taken` were committed with this run's transcript: they
+    /// leave its pending steers, and their keys stay to answer a retry.
+    pub(crate) fn commit_steers(&mut self, taken: &[RunSteer]) {
+        if taken.is_empty() {
+            return;
+        }
+        self.pending_steers.retain(|pending| {
+            !taken
+                .iter()
+                .any(|steer| steer.idempotency_key == pending.idempotency_key)
+        });
+        for steer in taken {
+            if !self.steered_keys.contains(&steer.idempotency_key) {
+                self.steered_keys.push(steer.idempotency_key.clone());
+            }
+        }
+    }
+
+    /// Undoes `commit_steers` for a transcript that did not stand: the
+    /// steers are pending again, so nothing the owner sent is lost.
+    pub(crate) fn revert_steers(&mut self, taken: &[RunSteer]) {
+        if taken.is_empty() {
+            return;
+        }
+        self.steered_keys
+            .retain(|key| !taken.iter().any(|steer| &steer.idempotency_key == key));
+        for steer in taken {
+            if !self
+                .pending_steers
+                .iter()
+                .any(|pending| pending.idempotency_key == steer.idempotency_key)
+            {
+                self.pending_steers.push(steer.clone());
+            }
+        }
+        self.pending_steers
+            .sort_by_key(|pending| pending.accepted_at_ms);
+    }
+
+    /// Finished, and holding no steer a restart still has to hand on.
+    fn is_prunable(&self) -> bool {
+        self.status.is_terminal() && self.pending_steers.is_empty()
+    }
+
+    /// A run of this record's session for each steer it still holds, never
+    /// started: the owner can send it again (audit I3).
+    fn steers_to_send_again(&mut self) -> Vec<Self> {
+        if self.pending_steers.is_empty() {
+            return Vec::new();
+        }
+        // The history store's copy, if any, is written again without them.
+        self.mirrored = false;
+        std::mem::take(&mut self.pending_steers)
+            .into_iter()
+            .map(|steer| {
+                Self::queued(
+                    RunStart {
+                        agent_id: self.agent_id.clone(),
+                        session_id: self.session_id.clone(),
+                        source: RunSource::Web,
+                        source_ref: None,
+                        idempotency_key: Some(steer.idempotency_key),
+                        text: steer.text,
+                        model: self.model.clone(),
+                        provider: self.provider.clone(),
+                        parent_run_id: None,
+                    },
+                    steer.accepted_at_ms,
+                )
+            })
+            .collect()
+    }
+
     fn recover_after_restart(&mut self, now_ms: u64) {
         let (code, message) = match self.status {
-            RunStatus::Queued => (
-                RESTART_BEFORE_START,
-                "The daemon restarted before this run started; it is safe to send it again.",
-            ),
+            RunStatus::Queued => (RESTART_BEFORE_START, RESTART_BEFORE_START_MESSAGE),
             RunStatus::Running | RunStatus::AwaitingApproval => (
                 RESTART_DURING_RUN,
                 "The daemon restarted while this run was in progress; tools it started may have had effects.",
@@ -476,6 +575,33 @@ impl RunLedger {
             .collect()
     }
 
+    /// The run of this agent a steer sent with `key` joined, and the steer
+    /// while that run still holds it (spec §4.2, §4.7). Only the ledger's
+    /// records are read, never a transcript (audit M28).
+    pub(crate) fn find_steer(
+        &self,
+        agent_id: &str,
+        key: &str,
+    ) -> Option<(&RunRecord, Option<&RunSteer>)> {
+        self.records
+            .values()
+            .filter(|record| record.agent_id == agent_id)
+            .find_map(|record| {
+                if let Some(steer) = record
+                    .pending_steers
+                    .iter()
+                    .find(|steer| steer.idempotency_key == key)
+                {
+                    return Some((record, Some(steer)));
+                }
+                record
+                    .steered_keys
+                    .iter()
+                    .any(|steered| steered == key)
+                    .then_some((record, None))
+            })
+    }
+
     pub(crate) fn has_in_flight_idempotency_key(&self, agent_id: &str, key: &str) -> bool {
         self.records.values().any(|record| {
             record.agent_id == agent_id
@@ -508,11 +634,7 @@ impl RunLedger {
         let cutoff = now_ms.saturating_sub(TERMINAL_RUN_RETENTION_MS);
         let expired: Vec<String> = {
             let mut terminal: HashMap<&str, Vec<(u64, &str, bool)>> = HashMap::new();
-            for record in self
-                .records
-                .values()
-                .filter(|record| record.status.is_terminal())
-            {
+            for record in self.records.values().filter(|record| record.is_prunable()) {
                 terminal.entry(record.agent_id.as_str()).or_default().push((
                     record.finished_at_ms.unwrap_or(record.created_at_ms),
                     record.id.as_str(),
@@ -618,7 +740,9 @@ impl RunLedger {
     }
 
     /// The ledger after a restart: runs of missing agents are dropped, queued
-    /// and in-flight runs become interrupted (spec §4.8), and retention applies.
+    /// and in-flight runs become interrupted (spec §4.8), each steer a run
+    /// still held becomes an interrupted run of its own (audit I3), and
+    /// retention applies.
     pub(crate) fn restored(
         records: Vec<RunRecord>,
         live_agents: &HashSet<String>,
@@ -628,6 +752,10 @@ impl RunLedger {
         for mut record in records {
             if !live_agents.contains(&record.agent_id) {
                 continue;
+            }
+            for mut steer in record.steers_to_send_again() {
+                steer.recover_after_restart(now_ms);
+                ledger.insert(steer);
             }
             record.recover_after_restart(now_ms);
             ledger.insert(record);
@@ -735,6 +863,25 @@ mod tests {
             value.get("replyMessageId").is_none(),
             "an unset reply is not written, so saved records keep their shape"
         );
+        assert!(value.get("pendingSteers").is_none());
+        assert!(value.get("steeredKeys").is_none());
+        let mut steered = record.clone();
+        steered.pending_steers = vec![RunSteer {
+            idempotency_key: "key-2".into(),
+            text: "and this".into(),
+            accepted_at_ms: 43,
+        }];
+        steered.steered_keys = vec!["key-3".into()];
+        let written = serde_json::to_value(&steered).unwrap();
+        assert_eq!(
+            written["pendingSteers"],
+            json!([{"idempotencyKey": "key-2", "text": "and this", "acceptedAtMs": 43}])
+        );
+        assert_eq!(written["steeredKeys"], json!(["key-3"]));
+        assert_eq!(
+            serde_json::from_value::<RunRecord>(written).unwrap(),
+            steered
+        );
         let mut replied = record.clone();
         replied.reply_message_id = Some("msg-1".into());
         let written = serde_json::to_value(&replied).unwrap();
@@ -760,6 +907,8 @@ mod tests {
         assert_eq!(minimal.input, RunInput::default());
         assert_eq!(minimal.parent_run_id, None);
         assert_eq!(minimal.reply_message_id, None);
+        assert!(minimal.pending_steers.is_empty());
+        assert!(minimal.steered_keys.is_empty());
     }
 
     #[test]
@@ -845,6 +994,74 @@ mod tests {
             "runs of missing agents are dropped"
         );
         assert_eq!(ledger.in_flight_count("agent-a"), 0);
+    }
+
+    /// Controller ruling (M3 pre-flight audit I3): each steer a run still
+    /// held when the daemon stopped becomes one `interrupted` run of the
+    /// run's session to send again, at its acceptance time; the run keeps
+    /// none of them.
+    #[test]
+    fn restart_recovery_offers_the_steers_a_run_still_held_once() {
+        let now = 5 * TERMINAL_RUN_RETENTION_MS;
+        let steer = |key: &str, at: u64| RunSteer {
+            idempotency_key: key.into(),
+            text: format!("text of {key}"),
+            accepted_at_ms: at,
+        };
+        let mut running = record("agent-a", now - 10);
+        running.session_id = "chat:s".into();
+        running.pending_steers = vec![steer("key-2", now - 9), steer("key-3", now - 8)];
+        // A run whose result could not be saved keeps the steers it took in.
+        let mut failed = mirrored("agent-a", now - 7);
+        failed.status = RunStatus::Failed;
+        failed.pending_steers = vec![steer("key-4", now - 6)];
+        let live = HashSet::from(["agent-a".to_string()]);
+
+        let ledger = RunLedger::restored(vec![running.clone(), failed.clone()], &live, now);
+
+        for (key, at, session) in [
+            ("key-2", now - 9, "chat:s"),
+            ("key-3", now - 8, "chat:s"),
+            ("key-4", now - 6, "direct:test"),
+        ] {
+            let offered = ledger
+                .find_by_idempotency_key("agent-a", key, 0)
+                .unwrap_or_else(|| panic!("{key} is offered again"));
+            assert_eq!(offered.status, RunStatus::Interrupted);
+            assert_eq!(offered.error.as_ref().unwrap().code, RESTART_BEFORE_START);
+            assert_eq!(
+                offered.error.as_ref().unwrap().message,
+                RESTART_BEFORE_START_MESSAGE
+            );
+            assert_eq!(offered.source, RunSource::Web);
+            assert_eq!(offered.session_id, session);
+            assert_eq!(offered.input.text, format!("text of {key}"));
+            assert_eq!(offered.created_at_ms, at);
+            assert_eq!(offered.started_at_ms, None);
+            assert!(!offered.mirrored);
+        }
+        assert!(ledger.get(&running.id).unwrap().pending_steers.is_empty());
+        let failed = ledger.get(&failed.id).unwrap();
+        assert!(failed.pending_steers.is_empty());
+        assert!(!failed.mirrored, "the history store gets the change");
+        assert_eq!(ledger.for_agent("agent-a").len(), 5);
+    }
+
+    #[test]
+    fn a_finished_run_still_holding_steers_is_not_pruned() {
+        let now = 10 * TERMINAL_RUN_RETENTION_MS;
+        let mut ledger = RunLedger::default();
+        let mut holding = mirrored("agent-a", now - 2 * TERMINAL_RUN_RETENTION_MS);
+        holding.pending_steers = vec![RunSteer {
+            idempotency_key: "key-2".into(),
+            text: "and this".into(),
+            accepted_at_ms: 1,
+        }];
+        ledger.insert(holding.clone());
+
+        ledger.prune(now);
+
+        assert!(ledger.get(&holding.id).is_some());
     }
 
     #[test]

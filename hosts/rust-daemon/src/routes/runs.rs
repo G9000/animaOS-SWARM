@@ -8,7 +8,7 @@ use futures::future::BoxFuture;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
-use super::contracts::{ErrorBody, RunEnvelope, RunResponse, RunsEnvelope};
+use super::contracts::{ErrorBody, RunEnvelope, RunResponse, RunsEnvelope, SteerStatusResponse};
 use super::http::{json_response, read_limited_body, request_query};
 use super::jobs::{authorize, no_store};
 use super::sessions::rejected;
@@ -129,7 +129,7 @@ fn run_limit(uri: &Uri) -> Result<usize, ApiError> {
     request_body = StartRunRequest,
     responses(
         (status = 200, description = "The key was used for this message within 24 hours: the original run, nothing created", body = RunEnvelope),
-        (status = 202, description = "Accepted: the queued run", body = RunEnvelope),
+        (status = 202, description = "Accepted: the queued run, or the active run a steer joined (with steer.status pending)", body = RunEnvelope),
         (status = 400, description = "Missing or invalid key, empty text with no attachments, text over 32 KiB, over 10 or unknown attachments, unknown skill, steer on a kind that cannot steer, or a body over 256 KiB", body = ErrorBody),
         (status = 403, description = "Local owner required", body = ErrorBody),
         (status = 404, description = "Agent or session not found", body = ErrorBody),
@@ -256,7 +256,8 @@ pub(super) async fn start_session_run(
     accepted_response(accepted)
 }
 
-/// 202 with a new run, 200 with a replayed one, or the refusal.
+/// 202 with a new run or the run a steer joined, 200 with a replayed one, or
+/// the refusal.
 fn accepted_response(accepted: Result<AcceptedRun, ApiError>) -> Response {
     match accepted {
         Ok(AcceptedRun::Created(record)) => no_store(json_response(
@@ -266,6 +267,15 @@ fn accepted_response(accepted: Result<AcceptedRun, ApiError>) -> Response {
         Ok(AcceptedRun::Replayed(record)) => {
             no_store(json_response(StatusCode::OK, &RunEnvelope::of(&record)))
         }
+        Ok(AcceptedRun::Steered(record)) => no_store(json_response(
+            StatusCode::ACCEPTED,
+            &RunEnvelope {
+                run: RunResponse::from(&record),
+                steer: Some(SteerStatusResponse {
+                    status: "pending".into(),
+                }),
+            },
+        )),
         Err(error) => rejected(error),
     }
 }

@@ -184,12 +184,6 @@ fn the_registry_tracks_a_steps_text_in_utf16_units_and_keeps_its_tail() {
         runs.record_step_usage("run_1", &format!("run_1:{n}"), TokenUsage::default());
     }
     assert_eq!(runs.steps("run_1").len(), MAX_RUN_STEPS);
-    runs.note_steer_key("run_1", "key-1", "also this");
-    assert_eq!(
-        runs.steer_text("run_1", "key-1").as_deref(),
-        Some("also this")
-    );
-    assert_eq!(runs.steer_text("run_1", "key-2"), None);
     assert!(runs.remove("run_1"));
     assert!(runs.view("run_1").is_none());
     assert!(!runs.remove("run_1"));
