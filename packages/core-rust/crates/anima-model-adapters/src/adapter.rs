@@ -29,13 +29,15 @@ pub(crate) struct OpenAiRequestShape {
     pub(crate) omit_temperature: bool,
 }
 
-/// `stream_options.include_usage` goes only to endpoints that document it:
-/// any vLLM server, and OpenAI and DeepSeek at their own default endpoints (a
-/// custom base URL may be Azure or a strict proxy that rejects the field).
-/// OpenAI's own endpoint gets `max_completion_tokens`, which its reasoning
-/// models require instead of `max_tokens` (spec §12.4), and no `temperature`
-/// for those reasoning models, which reject any but the default (so a 0.2
-/// compaction or title call still works for them).
+/// `stream_options.include_usage` goes only to providers that document it, at
+/// any base URL: OpenAI, DeepSeek, vLLM, and Ollama (with tools it streams
+/// through its OpenAI-compatible endpoint, which reports usage only when
+/// asked). Other providers never get it; Groq and Moonshot report stream usage
+/// in their own fields without it. OpenAI's own endpoint gets
+/// `max_completion_tokens`, which its reasoning models require instead of
+/// `max_tokens` (spec §12.4), and no `temperature` for those reasoning models,
+/// which reject any but the default (so a 0.2 compaction or title call still
+/// works for them).
 pub(crate) fn openai_request_shape(
     definition: &ProviderDefinition,
     base_url: &str,
@@ -45,11 +47,7 @@ pub(crate) fn openai_request_shape(
         .trim_end_matches('/')
         .eq_ignore_ascii_case(definition.default_base_url.trim_end_matches('/'));
     OpenAiRequestShape {
-        stream_usage: match definition.id {
-            "vllm" => true,
-            "openai" | "deepseek" => default_endpoint,
-            _ => false,
-        },
+        stream_usage: matches!(definition.id, "openai" | "deepseek" | "vllm" | "ollama"),
         max_completion_tokens: definition.id == "openai" && default_endpoint,
         omit_temperature: definition.id == "openai"
             && default_endpoint

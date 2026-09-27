@@ -205,6 +205,9 @@ impl StreamAccumulator {
 
     fn openai(&mut self, payload: &Value) -> Result<Option<String>, String> {
         self.usage.merge_openai(payload.get("usage"))?;
+        // Groq reports stream usage under `x_groq.usage` on its final chunk.
+        self.usage
+            .merge_openai(payload.get("x_groq").and_then(|groq| groq.get("usage")))?;
         let choices = payload
             .get("choices")
             .and_then(Value::as_array)
@@ -216,6 +219,8 @@ impl StreamAccumulator {
             return Err(stream_parse_error());
         }
         let choice = &choices[0];
+        // Moonshot reports stream usage inside its final choice.
+        self.usage.merge_openai(choice.get("usage"))?;
         if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
             let reason = self.stop_reason_for(reason, false)?;
             self.set_stop_reason(reason)?;

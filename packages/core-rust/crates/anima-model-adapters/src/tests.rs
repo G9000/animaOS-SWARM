@@ -1074,9 +1074,9 @@ async fn deepseek_stream_falls_back_to_prompt_cache_hit_tokens() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|Json(body): Json<Value>| async move {
-            assert!(
-                body.get("stream_options").is_none(),
-                "a custom DeepSeek endpoint gets no stream_options"
+            assert_eq!(
+                body["stream_options"]["include_usage"], true,
+                "a custom DeepSeek endpoint asks for stream usage too"
             );
             (
                 [("content-type", "text/event-stream")],
@@ -1279,7 +1279,8 @@ fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
     assert_eq!(shape("openai", "https://api.openai.com/v1/"), (true, true));
     assert_eq!(
         shape("openai", "https://my-proxy.example/v1"),
-        (false, false)
+        (true, false),
+        "the openai provider documents stream usage at any base URL"
     );
     assert_eq!(
         shape("deepseek", "https://api.deepseek.com/v1"),
@@ -1287,21 +1288,26 @@ fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
     );
     assert_eq!(
         shape("deepseek", "https://gateway.example/v1"),
-        (false, false)
+        (true, false)
     );
     assert_eq!(shape("vllm", "http://gpu-box:8000/v1"), (true, false));
+    assert_eq!(shape("ollama", "http://gpu-box:11434/v1"), (true, false));
     assert_eq!(
         shape("mistral", "https://api.mistral.ai/v1"),
+        (false, false)
+    );
+    assert_eq!(
+        shape("groq", "https://api.groq.com/openai/v1"),
         (false, false)
     );
 }
 
 #[tokio::test]
-async fn a_custom_openai_endpoint_keeps_max_tokens_and_no_stream_options() {
+async fn a_custom_openai_endpoint_keeps_max_tokens_and_asks_for_stream_usage() {
     let app = Router::new().route(
         "/v1/chat/completions",
         post(|Json(body): Json<Value>| async move {
-            assert!(body.get("stream_options").is_none());
+            assert_eq!(body["stream_options"]["include_usage"], true);
             assert_eq!(body["max_tokens"], 512);
             assert!(body.get("max_completion_tokens").is_none());
             (
@@ -2132,4 +2138,89 @@ fn openai_reasoning_models_get_no_temperature_and_max_completion_tokens() {
     assert_eq!(body["temperature"], 0.2);
     assert_eq!(body["max_tokens"], 512);
     assert!(body.get("max_completion_tokens").is_none());
+}
+
+// --- S1-D: report token usage for providers that reported zero.
+
+#[tokio::test]
+async fn groq_stream_usage_comes_from_x_groq() {
+    let app = Router::new().route(
+        "/openai/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert!(body.get("stream_options").is_none());
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"x_groq\":{\"id\":\"req_1\",\"usage\":{\"queue_time\":0.02,\"prompt_tokens\":24,\"prompt_time\":0.001,\"completion_tokens\":7,\"completion_time\":0.01,\"total_tokens\":31,\"total_time\":0.011}}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("groq", Some("key"), &format!("{base_url}/openai/v1"))]);
+
+    let response = stream_final(&adapter, &agent_config("groq", false))
+        .await
+        .unwrap();
+
+    assert_eq!(response.usage.prompt_tokens, 24);
+    assert_eq!(response.usage.completion_tokens, 7);
+    assert_eq!(response.usage.total_tokens, 31);
+}
+
+#[tokio::test]
+async fn moonshot_stream_usage_comes_from_its_final_choice() {
+    let base_url = sse_server(
+        "/v1/chat/completions",
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\",\"usage\":{\"prompt_tokens\":19,\"completion_tokens\":13,\"total_tokens\":32}}]}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("moonshot", Some("key"), &format!("{base_url}/v1"))]);
+
+    let response = stream_final(&adapter, &agent_config("moonshot", false))
+        .await
+        .unwrap();
+
+    assert_eq!(response.usage.prompt_tokens, 19);
+    assert_eq!(response.usage.completion_tokens, 13);
+    assert_eq!(response.usage.total_tokens, 32);
+}
+
+#[tokio::test]
+async fn ollama_with_tools_asks_for_and_reports_stream_usage() {
+    // With tools, Ollama streams through its OpenAI-compatible endpoint, which
+    // reports its prompt_eval_count/eval_count as a final usage chunk only when
+    // asked with `stream_options.include_usage` (Ollama documents the field).
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|Json(body): Json<Value>| async move {
+            assert_eq!(body["stream_options"]["include_usage"], true);
+            (
+                [("content-type", "text/event-stream")],
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"tooling\"},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":26,\"completion_tokens\":5,\"total_tokens\":31}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+            )
+        }),
+    );
+    let base_url = spawn_server(app).await;
+    let adapter = adapter_with(&[("ollama", None, &format!("{base_url}/v1"))]);
+
+    let response = stream_final(&adapter, &agent_config("ollama", true))
+        .await
+        .unwrap();
+
+    assert_eq!(response.content.text, "tooling");
+    assert_eq!(response.usage.prompt_tokens, 26);
+    assert_eq!(response.usage.completion_tokens, 5);
+    assert_eq!(response.usage.total_tokens, 31);
 }
