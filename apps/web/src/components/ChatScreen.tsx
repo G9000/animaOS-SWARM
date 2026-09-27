@@ -193,7 +193,7 @@ function ThinkingIndicator({ name }: { name: string }) {
   );
 }
 
-function anchorIds(item: TranscriptItem): string[] {
+function candidateAnchorIds(item: TranscriptItem): string[] {
   switch (item.kind) {
     case 'message':
     case 'delegated':
@@ -204,6 +204,24 @@ function anchorIds(item: TranscriptItem): string[] {
     default:
       return [];
   }
+}
+
+/**
+ * The ids each transcript item owns for scroll-jump and search-highlight
+ * (spec §15.3), one array per item in `transcript` order. A message with
+ * both text and tool calls produces two items that both cite its id (its
+ * bubble and its tools block); exactly one may claim it, or the jump
+ * target and the highlighted item become ambiguous and unmounting either
+ * item deletes the id mapping the other still needs. The text bubble
+ * (pushed first, see `buildTranscript`) wins.
+ */
+function anchorsFor(transcript: readonly TranscriptItem[]): string[][] {
+  const claimed = new Set<string>();
+  return transcript.map((item) => {
+    const owned = candidateAnchorIds(item).filter((id) => !claimed.has(id));
+    for (const id of owned) claimed.add(id);
+    return owned;
+  });
 }
 
 const renderBubble = (message: ChatMessage) => <Bubble message={message} />;
@@ -295,6 +313,7 @@ export const MessageList = memo(function MessageList({
     () => items ?? buildTranscript({ messages: agent.messages }),
     [items, agent.messages],
   );
+  const anchorsByItem = useMemo(() => anchorsFor(transcript), [transcript]);
   const jumpToMessage = useCallback((id: string) => {
     atBottom.current = false;
     setAwayFromBottom(true);
@@ -370,15 +389,25 @@ export const MessageList = memo(function MessageList({
                     : 'Load older messages'}
                 </button>
               )}
-              {transcript.map((item) => {
-                const ids = anchorIds(item);
+              {transcript.map((item, index) => {
+                const ids = anchorsByItem[index];
+                // This item's own last-registered element, so cleanup
+                // only ever removes what THIS ref put there — never a
+                // different item's registration for the same id.
+                let ownElement: HTMLDivElement | null = null;
                 return (
                   <div
                     key={item.key}
                     ref={(element) => {
-                      for (const id of ids) {
-                        if (element) messageElements.current.set(id, element);
-                        else messageElements.current.delete(id);
+                      if (element) {
+                        ownElement = element;
+                        for (const id of ids)
+                          messageElements.current.set(id, element);
+                      } else {
+                        for (const id of ids)
+                          if (messageElements.current.get(id) === ownElement)
+                            messageElements.current.delete(id);
+                        ownElement = null;
                       }
                     }}
                     data-search-match={

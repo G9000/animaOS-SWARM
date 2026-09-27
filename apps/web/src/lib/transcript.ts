@@ -193,9 +193,19 @@ function storedCalls(metadata: Fields): StoredCall[] {
 }
 
 /** `"success"` or `"error"` from the daemon's own `toolStatus` marker
- *  (spec §3.3); `taskResult` is never exposed to the web (Ruling 3). */
-function resultStatus(metadata: Fields): 'success' | 'error' {
-  return stringField(metadata, 'toolStatus') === 'error' ? 'error' : 'success';
+ *  (spec §3.3); `taskResult` is never exposed to the web (Ruling 3). A
+ *  pre-M3 tool message carries no `toolStatus` marker at all, so its
+ *  status falls back to the `{status,data,error}` JSON shape of its own
+ *  text (the same shape a failed result's text uses). */
+function resultStatus(
+  message: ChatMessage,
+  metadata: Fields,
+): 'success' | 'error' {
+  const marker = stringField(metadata, 'toolStatus');
+  if (marker) return marker === 'error' ? 'error' : 'success';
+  return stringField(parsedFields(message.content.text), 'status') === 'error'
+    ? 'error'
+    : 'success';
 }
 
 function resultDuration(metadata: Fields): number | null {
@@ -233,8 +243,25 @@ export function liveToolSteps(live: LiveRun): ToolStep[] {
   }));
 }
 
+/** Where a non-terminal status sits in the run lifecycle (spec §4.1). */
+const NON_TERMINAL_ORDER: Record<string, number> = {
+  queued: 0,
+  running: 1,
+  awaiting_approval: 2,
+};
+
+/** Whether `next` is further along the (non-terminal) lifecycle than
+ *  `current` — never true once either side is terminal (a finish is
+ *  decided by the terminal-status branch above, not this one). */
+function isMoreAdvanced(next: Run['status'], current: Run['status']): boolean {
+  if (isTerminalRunStatus(next) || isTerminalRunStatus(current)) return false;
+  return NON_TERMINAL_ORDER[next] > NON_TERMINAL_ORDER[current];
+}
+
 /** The session's runs: the stream's view of each, the ledger's record for
- *  the rest, and the ledger's finish when the stream missed it. */
+ *  the rest, and the ledger's finish when the stream missed it. When both
+ *  are still mid-flight, the more advanced status wins, so a stale
+ *  `queued` snapshot never outlives the ledger's `running`. */
 export function mergeSessionRuns(
   live: readonly LiveRun[],
   ledger: readonly Run[],
@@ -247,6 +274,8 @@ export function mergeSessionRuns(
       isTerminalRunStatus(run.status) &&
       !isTerminalRunStatus(current.run.status)
     )
+      byId.set(run.id, { ...current, run });
+    else if (isMoreAdvanced(run.status, current.run.status))
       byId.set(run.id, { ...current, run });
   }
   return [...byId.values()].sort(
@@ -294,28 +323,41 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
   const stoppedRuns = new Set<string>();
   // Ruling 3: an orphan tool card (its call is not in the same block)
   // takes its name from the matching assistant message's `toolCalls`,
-  // never a `toolName` metadata key the daemon does not write.
+  // never a `toolName` metadata key the daemon does not write. This spans
+  // the whole loaded page, not just the current block, so a delayed or
+  // recovered result still gets the name its call used.
   const callNames = new Map<string, string>();
   const trimmed = input.trimmedThrough ?? null;
   const delegatedBy = input.delegatedBy ?? null;
   let block: ToolsItem | null = null;
+  // The run `block` belongs to; a message from a different run (or a
+  // known run following an unattributed one, or vice versa) starts a new
+  // block instead of joining it, even with nothing textual in between.
+  let blockRunId: string | null = null;
 
   if (trimmed && !input.messages.some((message) => message.id === trimmed))
     items.push({ kind: 'trimmed', key: 'trimmed' });
+
+  // The open block belonging to `runId`, or null if there is none (`block`
+  // is read live: a same-iteration reset below must be seen by a later
+  // check in that same iteration, not a value captured before it).
+  const openBlockFor = (runId: string | null): ToolsItem | null =>
+    block && blockRunId === runId ? block : null;
 
   for (const message of input.messages) {
     const runId = messageRunId(message);
     const metadata = metadataOf(message);
     if (message.role === 'Tool') {
       const callId = stringField(metadata, 'toolCallId');
-      const status = resultStatus(metadata);
+      const status = resultStatus(message, metadata);
       const result = resultText(message, status);
-      const step = block
-        ? block.steps.find(
+      const current = openBlockFor(runId);
+      const step = current
+        ? current.steps.find(
             (item) => item.toolCallId === callId && item.result === null,
           )
         : undefined;
-      if (block && step) {
+      if (current && step) {
         step.status = status;
         step.durationMs = resultDuration(metadata);
         step.result = result;
@@ -324,9 +366,10 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
             ...step.helper,
             agentId: stringField(parsedFields(message.content.text), 'agentId'),
           };
-        block.messageIds.push(message.id);
+        current.messageIds.push(message.id);
       } else {
-        // A result whose call is on an older page still gets its card.
+        // A result whose call is on an older page, or not in this block,
+        // still gets its own card.
         const orphan: ToolStep = {
           toolCallId: callId ?? message.id,
           name: (callId && callNames.get(callId)) ?? 'tool',
@@ -338,9 +381,9 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
           runId,
           helper: null,
         };
-        if (block) {
-          block.steps.push(orphan);
-          block.messageIds.push(message.id);
+        if (current) {
+          current.steps.push(orphan);
+          current.messageIds.push(message.id);
         } else {
           block = {
             kind: 'tools',
@@ -348,6 +391,7 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
             steps: [orphan],
             messageIds: [message.id],
           };
+          blockRunId = runId;
           items.push(block);
         }
       }
@@ -356,6 +400,7 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
       for (const call of calls) callNames.set(call.id, call.name);
       if (calls.length === 0 || message.content.text.trim()) {
         block = null;
+        blockRunId = null;
         items.push(messageItem(message, delegatedBy));
       }
       if (calls.length > 0) {
@@ -372,9 +417,13 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
             helper: toolHelper(call.name, call.args, null),
           }),
         );
-        if (block) {
-          block.steps.push(...steps);
-          block.messageIds.push(message.id);
+        // Re-checked after the reset just above: a message with both text
+        // and calls always starts its tool block fresh, never merging
+        // into the block its own leading bubble just closed.
+        const current = openBlockFor(runId);
+        if (current) {
+          current.steps.push(...steps);
+          current.messageIds.push(message.id);
         } else {
           block = {
             kind: 'tools',
@@ -382,6 +431,7 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
             steps,
             messageIds: [message.id],
           };
+          blockRunId = runId;
           items.push(block);
         }
       }
@@ -392,6 +442,7 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
     }
     if (message.id === trimmed) {
       block = null;
+      blockRunId = null;
       items.push({ kind: 'trimmed', key: 'trimmed' });
     }
   }
@@ -404,9 +455,9 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
 
   const oldestLoaded =
     input.messages.length > 0 ? input.messages[0].created_at_ms : null;
-  const inserts: { after: number; item: TranscriptItem }[] = [];
+  const inserts: { after: number; order: number; item: TranscriptItem }[] = [];
   const tail: TranscriptItem[] = [];
-  for (const live of input.runs ?? []) {
+  for (const [order, live] of (input.runs ?? []).entries()) {
     const { run } = live;
     const outcome: TranscriptItem = {
       kind: 'outcome',
@@ -419,7 +470,7 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
         hasOutcome(run) &&
         !(run.status === 'cancelled' && stoppedRuns.has(run.id))
       )
-        inserts.push({ after, item: outcome });
+        inserts.push({ after, order, item: outcome });
       continue;
     }
     // A queued message the owner cancelled leaves nothing behind.
@@ -435,7 +486,13 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
       if (hasOutcome(run)) tail.push(outcome);
     }
   }
-  inserts.sort((left, right) => right.after - left.after);
+  // Descending by anchor so an earlier splice never shifts a later one's
+  // target index; descending by original order within a tie so splicing
+  // (which pushes the most-recently-inserted item back) still lands the
+  // ties in their original relative order (spec §15.2).
+  inserts.sort(
+    (left, right) => right.after - left.after || right.order - left.order,
+  );
   for (const insert of inserts) items.splice(insert.after + 1, 0, insert.item);
   items.push(...tail);
   for (const pending of input.pending ?? [])

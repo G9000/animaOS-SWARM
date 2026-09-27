@@ -160,6 +160,22 @@ describe('ToolBlock', () => {
       sessionId: 'room-9',
     });
   });
+
+  it('renders duplicate tool-call ids without a duplicate-key warning', () => {
+    // Some providers (e.g. the Google adapter's `call_{name}` fallback)
+    // reuse the same id when a run calls the same tool twice.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(
+      <ToolBlock steps={[step, { ...step, toolCallId: 'call_1' }]} active />,
+    );
+
+    expect(
+      errorSpy.mock.calls.some((call) =>
+        String(call[0]).toLowerCase().includes('same key'),
+      ),
+    ).toBe(false);
+    errorSpy.mockRestore();
+  });
 });
 
 describe('RunOutcomeCard', () => {

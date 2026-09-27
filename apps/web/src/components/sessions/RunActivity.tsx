@@ -76,8 +76,12 @@ export function ToolBlock({
       )}
       {expanded && count > 0 && (
         <ul className="tool-block-steps">
-          {steps.map((step) => (
-            <li key={step.toolCallId}>
+          {steps.map((step, index) => (
+            // `toolCallId` is not always unique: some providers (e.g. the
+            // Google adapter's `call_{name}` fallback) reuse the same id
+            // when a run calls the same tool twice, so the index breaks
+            // the tie.
+            <li key={`${index}:${step.toolCallId}`}>
               {step.helper ? (
                 <HelperCard
                   step={step}

@@ -101,6 +101,9 @@ describe('buildTranscript', () => {
     expect(block.kind === 'tools' && block.steps).toEqual([
       expect.objectContaining({
         toolCallId: 'call_0',
+        // The call itself is on an older, unloaded page: nothing named
+        // it, so the card falls back to the generic label.
+        name: 'tool',
         status: 'error',
         result: 'file not found',
         durationMs: 12,
@@ -117,25 +120,33 @@ describe('buildTranscript', () => {
   // Ruling 3 (web part): an orphan card — a tool result whose call is not
   // in the same block — takes its name from the matching assistant
   // message's `toolCalls` (found anywhere in the loaded history), never
-  // from a `toolName` metadata key the daemon does not write.
-  it('names an orphan card from the assistant message that made its call', () => {
+  // from a `toolName` metadata key the daemon does not write. A user turn
+  // can't land between a call and its own result (the run is mid-tool);
+  // the realistic way a result arrives detached from its call's block is
+  // a recovered/delayed result recorded after the run moved on (spec
+  // §4.6's restart recovery) — here, after an unrelated later run's own
+  // turn closed the block.
+  it('names a recovered orphan card from the assistant message that made its call', () => {
     const items = buildTranscript({
       messages: [
-        message('a0', 'Assistant', '', {
+        message('a0', 'Assistant', 'On it.', {
+          runId: 'run_1',
           toolCalls: [{ id: 'call_9', name: 'search', args: {} }],
         }),
-        message('u1', 'User', 'hang on'),
+        message('a1', 'Assistant', 'Retrying separately.', {
+          runId: 'run_2',
+        }),
         message(
           't0',
           'Tool',
           '{"status":"error","data":null,"error":"timed out"}',
-          { toolCallId: 'call_9', toolStatus: 'error' },
+          { runId: 'run_1', toolCallId: 'call_9', toolStatus: 'error' },
         ),
       ],
     });
 
-    expect(kinds(items)).toEqual(['tools', 'message', 'tools']);
-    const orphanBlock = items[2];
+    expect(kinds(items)).toEqual(['message', 'tools', 'message', 'tools']);
+    const orphanBlock = items[3];
     expect(orphanBlock.kind === 'tools' && orphanBlock.steps).toEqual([
       expect.objectContaining({
         toolCallId: 'call_9',
@@ -144,6 +155,140 @@ describe('buildTranscript', () => {
         result: 'timed out',
       }),
     ]);
+  });
+
+  it('reads a legacy tool result’s status from its JSON text when `toolStatus` is absent', () => {
+    // Pre-M3 tool messages carry no `toolStatus` marker at all.
+    const items = buildTranscript({
+      messages: [
+        message('a1', 'Assistant', '', {
+          toolCalls: [{ id: 'call_1', name: 'bash', args: {} }],
+        }),
+        message('t1', 'Tool', '{"status":"error","data":null,"error":"boom"}', {
+          toolCallId: 'call_1',
+        }),
+      ],
+    });
+
+    expect(kinds(items)).toEqual(['tools']);
+    const block = items[0];
+    expect(block.kind === 'tools' && block.steps).toEqual([
+      expect.objectContaining({
+        toolCallId: 'call_1',
+        status: 'error',
+        result: 'boom',
+      }),
+    ]);
+  });
+
+  it('starts a new tool block when the run changes, even with no message in between', () => {
+    const items = buildTranscript({
+      messages: [
+        message('a1', 'Assistant', '', {
+          runId: 'run_a',
+          toolCalls: [{ id: 'c1', name: 'search', args: {} }],
+        }),
+        message('t1', 'Tool', 'ok', {
+          runId: 'run_a',
+          toolCallId: 'c1',
+          toolStatus: 'success',
+        }),
+        // run_b's first visible message is itself a tool call, with
+        // nothing textual closing run_a's block first.
+        message('a2', 'Assistant', '', {
+          runId: 'run_b',
+          toolCalls: [{ id: 'c2', name: 'write', args: {} }],
+        }),
+      ],
+    });
+
+    expect(kinds(items)).toEqual(['tools', 'tools']);
+    expect(
+      items[0].kind === 'tools' && items[0].steps.map((s) => s.toolCallId),
+    ).toEqual(['c1']);
+    expect(
+      items[1].kind === 'tools' && items[1].steps.map((s) => s.toolCallId),
+    ).toEqual(['c2']);
+  });
+
+  it('collapses a multi-step run’s tool calls into one block', () => {
+    const items = buildTranscript({
+      messages: [
+        message('a1', 'Assistant', '', {
+          runId: 'run_1',
+          stepId: 'run_1:1',
+          toolCalls: [{ id: 'call_1', name: 'search', args: {} }],
+        }),
+        message('t1', 'Tool', 'found', {
+          runId: 'run_1',
+          toolCallId: 'call_1',
+          toolStatus: 'success',
+        }),
+        message('a2', 'Assistant', '', {
+          runId: 'run_1',
+          stepId: 'run_1:2',
+          toolCalls: [{ id: 'call_2', name: 'write', args: {} }],
+        }),
+        message('t2', 'Tool', 'done', {
+          runId: 'run_1',
+          toolCallId: 'call_2',
+          toolStatus: 'success',
+        }),
+      ],
+    });
+
+    expect(kinds(items)).toEqual(['tools']);
+    expect(
+      items[0].kind === 'tools' && items[0].steps.map((s) => s.toolCallId),
+    ).toEqual(['call_1', 'call_2']);
+  });
+
+  it('hides an old failed run this page never saw stream, because it is old — not because it failed', () => {
+    const oldFailed = runFixture('run_old_f', {
+      status: 'failed',
+      createdAtMs: 1,
+      error: { code: 'model_error', message: 'gone' },
+    });
+    const items = buildTranscript({
+      messages: [message('u1', 'User', 'hi', {}, 100)],
+      runs: [emptyLiveRun(oldFailed)],
+    });
+
+    expect(items.map((item) => item.key)).toEqual(['u1']);
+  });
+
+  it('keeps same-anchor outcome inserts in the order they were given', () => {
+    // buildTranscript's own contract does not require a pre-deduplicated
+    // `runs` list (mergeSessionRuns is what normally deduplicates before
+    // this is called); if a caller passes the same run twice — e.g. a
+    // stale copy from a race between the live stream and a ledger refetch
+    // — both outcome inserts share the same anchor and must not flip
+    // relative order.
+    const first = runFixture('run_dup', {
+      status: 'failed',
+      startedAtMs: 1,
+      error: { code: 'model_error', message: 'first' },
+    });
+    const staleCopy = {
+      ...first,
+      error: { code: 'model_error', message: 'stale' },
+    };
+    const items = buildTranscript({
+      messages: [message('u1', 'User', 'go', { runId: 'run_dup' }, 1)],
+      runs: [emptyLiveRun(first), emptyLiveRun(staleCopy)],
+    });
+
+    expect(items.map((item) => item.key)).toEqual([
+      'u1',
+      'outcome:run_dup',
+      'outcome:run_dup',
+    ]);
+    expect(items[1].kind === 'outcome' && items[1].run.error?.message).toBe(
+      'first',
+    );
+    expect(items[2].kind === 'outcome' && items[2].run.error?.message).toBe(
+      'stale',
+    );
   });
 
   it('collapses revised drafts and credits delegated turns to their author', () => {
@@ -376,5 +521,28 @@ describe('mergeSessionRuns', () => {
     expect(merged[1].run.status).toBe('failed');
     expect(merged[1].steps[0].text).toBe('Hi');
     expect(mergeSessionRuns([live], [running])[0]).toBe(live);
+  });
+
+  it('prefers the more advanced status when live and ledger are both mid-flight', () => {
+    const queued = runFixture('run_1', { status: 'queued', createdAtMs: 1 });
+    const staleQueuedLive = emptyLiveRun(queued);
+    const ledgerRunning = { ...queued, status: 'running' as const };
+
+    // A stale live `queued` snapshot must not shadow the ledger's `running`
+    // (it would otherwise still show "Queued" with a Cancel button).
+    expect(
+      mergeSessionRuns([staleQueuedLive], [ledgerRunning])[0].run.status,
+    ).toBe('running');
+
+    // The reverse never regresses a fresher live status back down.
+    const runningLive = emptyLiveRun({ ...queued, status: 'running' });
+    expect(mergeSessionRuns([runningLive], [queued])[0].run.status).toBe(
+      'running',
+    );
+
+    const awaitingLedger = { ...queued, status: 'awaiting_approval' as const };
+    expect(
+      mergeSessionRuns([runningLive], [awaitingLedger])[0].run.status,
+    ).toBe('awaiting_approval');
   });
 });

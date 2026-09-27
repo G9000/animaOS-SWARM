@@ -200,6 +200,7 @@
   text-transform: uppercase;
 }
 .context-trimmed {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -208,4 +209,12 @@
   padding-top: 8px;
   color: var(--color-ink-3);
   font-size: 11px;
+}
+/* Decorative-only: carries the separator role without joining the flex
+ * layout (the dashed border above is the visible divider). */
+.context-trimmed-rule {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
 }

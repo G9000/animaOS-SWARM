@@ -176,6 +176,116 @@ describe('MessageList', () => {
     expect(screen.getByText('Stopped')).toBeVisible();
   });
 
+  it('labels an incomplete reply', () => {
+    render(
+      <MessageList
+        agent={{
+          ...agent,
+          messages: [
+            {
+              id: 'incomplete',
+              role: 'Assistant',
+              content: {
+                text: 'Half an answer',
+                metadata: { incomplete: true },
+              },
+              created_at_ms: 1_725_000_000_000,
+            },
+          ],
+        }}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Incomplete')).toBeVisible();
+  });
+
+  it('anchors a message id shared by a bubble and its tool block to the bubble alone', async () => {
+    // An assistant message with both text and tool calls produces two
+    // transcript items that both cite its id; only one may own it, or
+    // jump/highlight are ambiguous and unmounting either item deletes the
+    // other's registration.
+    const calledOn: Element[] = [];
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (this: Element) {
+      calledOn.push(this);
+    };
+    try {
+      const user = userEvent.setup();
+      render(
+        <MessageList
+          agent={{
+            ...agent,
+            messages: [
+              {
+                id: 'a1',
+                role: 'Assistant',
+                content: {
+                  text: 'Let me check.',
+                  metadata: {
+                    toolCalls: [{ id: 'call_1', name: 'calculate', args: {} }],
+                  },
+                },
+                created_at_ms: 1_725_000_000_000,
+              },
+            ],
+          }}
+          sending={false}
+          scrollerRef={{ current: null }}
+          onSuggestion={vi.fn()}
+        />,
+      );
+
+      const bubbleAnchor = screen
+        .getByText('Let me check.')
+        .closest('.studio-message-anchor');
+      const toolAnchor = screen
+        .getByRole('button', { name: /Used 1 tool/ })
+        .closest('.studio-message-anchor');
+      expect(bubbleAnchor).not.toBeNull();
+      expect(bubbleAnchor).not.toBe(toolAnchor);
+
+      await user.click(
+        screen.getByRole('button', { name: 'Search conversation' }),
+      );
+      await user.type(
+        screen.getByRole('searchbox', { name: 'Search messages' }),
+        'Let me check',
+      );
+      expect(bubbleAnchor).toHaveAttribute('data-search-match', 'true');
+      expect(toolAnchor).not.toHaveAttribute('data-search-match');
+
+      fireEvent.keyDown(
+        screen.getByRole('searchbox', { name: 'Search messages' }),
+        { key: 'Enter' },
+      );
+      expect(calledOn).toContain(bubbleAnchor);
+      expect(calledOn).not.toContain(toolAnchor);
+    } finally {
+      Element.prototype.scrollIntoView = original;
+    }
+  });
+
+  it('renders the context-trimmed divider without nesting its Compact button inside the separator', () => {
+    const onCompact = vi.fn();
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        items={[{ kind: 'trimmed', key: 'trimmed' }]}
+        actions={{ onCompact }}
+      />,
+    );
+
+    const separator = screen.getByRole('separator');
+    const button = screen.getByRole('button', { name: 'Compact' });
+    expect(separator.contains(button)).toBe(false);
+  });
+
   it('renders a helper session’s delegated turn from the delegating companion, not the owner', () => {
     render(
       <MessageList
