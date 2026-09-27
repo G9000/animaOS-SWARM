@@ -10,6 +10,7 @@ import type { Session } from '@animaOS-SWARM/sdk';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
+import { buildTranscript, type PendingBubble } from '../../lib/transcript';
 import { ghostBtnCls } from '../ui-bits';
 
 export interface SessionComposerState {
@@ -34,6 +35,8 @@ export interface SessionViewProps {
   /** null for a new chat that has no session yet. */
   session: Session | null;
   messages: ChatMessage[];
+  /** Messages on their way to the daemon (spec §15.5). */
+  pending?: readonly PendingBubble[];
   hasOlder: boolean;
   loadingOlder: boolean;
   onLoadOlder: () => void;
@@ -53,7 +56,7 @@ export interface SessionViewProps {
 
 export type SessionFooter =
   | { kind: 'composer'; label?: string }
-  | { kind: 'note'; text: string; action?: 'new-chat' | 'work' };
+  | { kind: 'note'; text: string; action?: 'work' };
 
 /** What replaces the composer for each kind (spec §3.2, §15.2). */
 export function sessionFooter(
@@ -72,11 +75,7 @@ export function sessionFooter(
             text: 'This Telegram connection is not available. Reconnect it in Connectors to reply.',
           };
     case 'checkin':
-      return {
-        kind: 'note',
-        text: 'Replying to a check-in is not available yet. Start a new chat to follow up.',
-        action: 'new-chat',
-      };
+      return { kind: 'composer', label: 'Reply to this check-in' };
     case 'job':
       return {
         kind: 'note',
@@ -174,11 +173,14 @@ function SessionHeader({
   );
 }
 
-/** One session (or a new chat) on today's blocking run route (spec §15.2). */
+const EMPTY_PENDING: readonly PendingBubble[] = [];
+
+/** One session (or a new chat): its transcript and composer (spec §15.2). */
 export function SessionView({
   agent,
   session,
   messages,
+  pending = EMPTY_PENDING,
   hasOlder,
   loadingOlder,
   onLoadOlder,
@@ -197,6 +199,10 @@ export function SessionView({
   const conversation = useMemo(
     () => ({ ...agent, messages }),
     [agent, messages],
+  );
+  const items = useMemo(
+    () => buildTranscript({ messages, pending }),
+    [messages, pending],
   );
   if (missing) {
     return (
@@ -228,6 +234,7 @@ export function SessionView({
       {notice}
       <MessageList
         agent={conversation}
+        items={items}
         sending={composer.sending || (session?.activeRuns ?? 0) > 0}
         scrollerRef={scrollerRef}
         onSuggestion={onSuggestion}
@@ -257,11 +264,6 @@ export function SessionView({
       ) : (
         <div className="session-footer-note" role="note">
           <p>{footer.text}</p>
-          {footer.action === 'new-chat' && (
-            <button type="button" className={ghostBtnCls} onClick={onNewChat}>
-              Start a new chat
-            </button>
-          )}
           {footer.action === 'work' && (
             <button type="button" className={ghostBtnCls} onClick={onOpenWork}>
               Open Work

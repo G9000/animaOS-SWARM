@@ -115,6 +115,35 @@ describe('SessionView', () => {
     expect(screen.getByPlaceholderText('Reply on Telegram…')).toBeVisible();
   });
 
+  it('replies to a check-in through its own composer', () => {
+    renderView({
+      session: sessionFixture('schedule:daily', {
+        kind: 'checkin',
+        origin: 'schedule',
+        title: 'Check-in · goals',
+      }),
+    });
+    expect(
+      screen.getByPlaceholderText('Reply to this check-in…'),
+    ).toBeVisible();
+  });
+
+  it('shows a message that is still on its way', () => {
+    renderView({
+      session: sessionFixture('chat:plans', { title: 'Plans' }),
+      pending: [
+        {
+          key: 'k1',
+          text: 'Book the train',
+          createdAtMs: 1,
+          status: 'retrying',
+        },
+      ],
+    });
+    expect(screen.getByText('Book the train')).toBeVisible();
+    expect(screen.getByText('Not delivered yet · retrying…')).toBeVisible();
+  });
+
   it('shows a read-only note instead of a composer for jobs', async () => {
     const props = renderView({
       session: sessionFixture('job:1', {

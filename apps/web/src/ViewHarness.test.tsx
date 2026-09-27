@@ -9,6 +9,8 @@ import {
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DaemonConnectionError,
+  DaemonHttpError,
   DaemonTooOldError,
   type Session,
   type SessionMessage,
@@ -21,7 +23,9 @@ import {
   type DaemonSnapshot,
 } from './lib/daemon-api';
 import { SESSION_MESSAGES_POLL_MS } from './hooks/useSessionMessages';
+import { SEND_RETRY_DELAYS_MS } from './hooks/useSessionSends';
 import { sessionFixture } from './test/sessions';
+import { runFixture } from './test/live';
 import { ViewHarness } from './ViewHarness';
 
 const providers: DaemonProvider[] = [
@@ -164,12 +168,6 @@ function setSessionFields(sessionId: string, patch: Partial<Session>) {
   );
 }
 
-function sessionReads(sessionId: string): number {
-  return vi
-    .mocked(daemon.getSession)
-    .mock.calls.filter(([, id]) => id === sessionId).length;
-}
-
 /** Session messages read from an agent snapshot's room, like the daemon route. */
 function messagesFromSnapshot(snapshotOf: () => DaemonSnapshot) {
   vi.spyOn(daemon, 'sessionMessages').mockImplementation(
@@ -195,6 +193,35 @@ function mockProviders() {
   vi.spyOn(daemon, 'listProviders').mockResolvedValue({ providers });
 }
 
+/** `daemon.startRun` accepting every message as a queued run (spec §4.2). */
+function mockRuns() {
+  let accepted = 0;
+  vi.spyOn(daemon, 'startRun').mockImplementation(
+    async (agentId, sessionId, input) => {
+      accepted += 1;
+      return {
+        run: runFixture(`run_${accepted}`, {
+          agentId,
+          sessionId,
+          input: { text: input.text, attachmentIds: [], skill: null },
+        }),
+      };
+    },
+  );
+}
+
+/** What the runs route answers for a message whose run already finished. */
+function acceptedRun(agentId: string, sessionId: string, text: string) {
+  return {
+    run: runFixture('run_done', {
+      agentId,
+      sessionId,
+      status: 'completed' as const,
+      input: { text, attachmentIds: [], skill: null },
+    }),
+  };
+}
+
 /** Fake timers that keep pace with real time, so user-event and findBy work
  *  as usual, while `elapse` runs the polls that are due at once. */
 function fakeClock() {
@@ -218,7 +245,7 @@ it('opens the main companion without automatically executing a prepared assignme
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
   mockProviders();
-  const send = vi.spyOn(daemon, 'runAgent');
+  const send = vi.mocked(daemon.startRun);
   render(<ViewHarness />);
   expect(await screen.findByPlaceholderText('Message Alpha…')).toBeVisible();
   expect(send).not.toHaveBeenCalled();
@@ -236,8 +263,8 @@ it('keeps the companion draft and failed send while opening Work', async () => {
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
   vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha] });
   mockProviders();
-  const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
-  vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+  const run = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+  vi.mocked(daemon.startRun).mockReturnValue(run.promise);
   render(<ViewHarness />);
   await user.type(
     await screen.findByPlaceholderText('Message Alpha…'),
@@ -286,8 +313,8 @@ it('retains a completed reply after opening Work and keeps settings on the compa
   vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha, beta] });
   mockProviders();
   messagesFromSnapshot(() => current);
-  const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
-  vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+  const run = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+  vi.mocked(daemon.startRun).mockReturnValue(run.promise);
   render(<ViewHarness />);
   await user.type(
     await screen.findByPlaceholderText('Message Alpha…'),
@@ -297,14 +324,7 @@ it('retains a completed reply after opening Work and keeps settings on the compa
   await user.click(screen.getByRole('button', { name: 'Work', exact: true }));
   current = withMessage(alpha, 'Alpha finished', 'chat:new-1');
   await act(async () =>
-    run.resolve({
-      agent: current,
-      result: {
-        status: 'success',
-        durationMs: 1,
-        data: { text: 'Alpha finished' },
-      },
-    }),
+    run.resolve(acceptedRun('alpha', 'chat:new-1', 'Alpha request')),
   );
   expect(await screen.findByText('Alpha finished')).not.toBeVisible();
   await user.click(screen.getByRole('button', { name: 'Settings' }));
@@ -411,6 +431,7 @@ beforeEach(() => {
     schedules: [],
   });
   routes = mockSessionRoutes();
+  mockRuns();
 });
 
 afterEach(() => {
@@ -495,7 +516,7 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
     const interval = vi.spyOn(window, 'setInterval');
-    const runAgent = vi.spyOn(daemon, 'runAgent');
+    const startRun = vi.mocked(daemon.startRun);
 
     render(<ViewHarness />);
     await openChat();
@@ -506,7 +527,7 @@ describe('ViewHarness workspace controller', () => {
     expect(interval.mock.calls.some(([, delay]) => delay === 10_000)).toBe(
       false,
     );
-    expect(runAgent).not.toHaveBeenCalled();
+    expect(startRun).not.toHaveBeenCalled();
   });
   it('makes the workspace inert while settings are open and restores trigger focus on close', async () => {
     const user = userEvent.setup();
@@ -603,10 +624,7 @@ describe('ViewHarness workspace controller', () => {
       agents: [later, beta, alpha],
     });
     mockProviders();
-    const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
-      agent: alpha,
-      result: { status: 'success', durationMs: 1, data: { text: 'done' } },
-    });
+    const startRun = vi.mocked(daemon.startRun);
 
     render(<ViewHarness />);
     await openChat();
@@ -617,11 +635,11 @@ describe('ViewHarness workspace controller', () => {
     await user.type(screen.getByPlaceholderText('Message Alpha…'), 'Hello');
     await user.click(screen.getByRole('button', { name: 'Send' }));
     await waitFor(() =>
-      expect(runAgent).toHaveBeenCalledWith(
+      expect(startRun).toHaveBeenCalledWith(
         'agent-a',
-        'Hello',
-        expect.objectContaining({ clientRequestId: expect.any(String) }),
         'chat:new-1',
+        { text: 'Hello', mode: 'queue' },
+        expect.any(String),
       ),
     );
     expect(daemon.createSession).toHaveBeenCalledWith('agent-a');
@@ -671,18 +689,11 @@ describe('ViewHarness workspace controller', () => {
     mockProviders();
     vi.spyOn(daemon, 'deleteAgent').mockResolvedValue({ deleted: true });
     messagesFromSnapshot(() => current);
-    const runAgent = vi
-      .spyOn(daemon, 'runAgent')
-      .mockImplementation(async (_id, _text, _metadata, roomId) => {
-        current = withMessage(next, 'Next is responsive', roomId);
-        return {
-          agent: current,
-          result: {
-            status: 'success',
-            durationMs: 1,
-            data: { text: 'Next is responsive' },
-          },
-        };
+    const startRun = vi
+      .mocked(daemon.startRun)
+      .mockImplementation(async (id, sessionId, input) => {
+        current = withMessage(next, 'Next is responsive', sessionId);
+        return acceptedRun(id, sessionId, input.text);
       });
     const removeItem = vi
       .spyOn(Storage.prototype, 'removeItem')
@@ -704,11 +715,11 @@ describe('ViewHarness workspace controller', () => {
     await user.type(screen.getByPlaceholderText('Message Next…'), 'Continue');
     await user.click(screen.getByRole('button', { name: 'Send' }));
     await waitFor(() =>
-      expect(runAgent).toHaveBeenCalledWith(
+      expect(startRun).toHaveBeenCalledWith(
         'agent-next',
-        'Continue',
-        expect.objectContaining({ clientRequestId: expect.any(String) }),
         'chat:new-1',
+        { text: 'Continue', mode: 'queue' },
+        expect.any(String),
       ),
     );
     expect(await screen.findByText('Next is responsive')).toBeVisible();
@@ -893,8 +904,8 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
-    const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
-    const send = vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+    const run = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+    const send = vi.mocked(daemon.startRun).mockReturnValue(run.promise);
     render(<ViewHarness />);
     await openChat();
     const input = await screen.findByPlaceholderText('Message Nova…');
@@ -917,7 +928,7 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
-    vi.spyOn(daemon, 'runAgent').mockRejectedValue(new Error('Network failed'));
+    vi.mocked(daemon.startRun).mockRejectedValue(new Error('Network failed'));
     render(<ViewHarness />);
     await openChat();
     const input = await screen.findByPlaceholderText('Message Nova…');
@@ -942,8 +953,8 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
     vi.spyOn(daemon, 'updateAgent').mockResolvedValue({ agent: updated });
-    const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
-    vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+    const run = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+    vi.mocked(daemon.startRun).mockReturnValue(run.promise);
     render(<ViewHarness />);
     await openChat();
     await user.type(
@@ -979,7 +990,7 @@ describe('ViewHarness workspace controller', () => {
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [nova] });
     mockProviders();
-    vi.spyOn(daemon, 'runAgent').mockRejectedValue(
+    vi.mocked(daemon.startRun).mockRejectedValue(
       new Error('workspace connection failed'),
     );
 
@@ -1306,27 +1317,27 @@ describe('ViewHarness workspace controller', () => {
       screen.getByRole('navigation', { name: 'Workspace navigation' }),
     ).toBeVisible();
     expect(daemon.listAgents).toHaveBeenCalledTimes(2);
-    const runAgent = vi.spyOn(daemon, 'runAgent');
+    const startRun = vi.mocked(daemon.startRun);
     const input = screen.getByPlaceholderText('Message Nova…');
     fireEvent.change(input, { target: { value: 'Keep drafting offline' } });
     expect(input).toHaveValue('Keep drafting offline');
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
     fireEvent.keyDown(input, { key: 'Enter' });
-    expect(runAgent).not.toHaveBeenCalled();
+    expect(startRun).not.toHaveBeenCalled();
   });
 
-  it('does not re-add the previous main when its pending run resolves after poll replacement', async () => {
+  it('ignores a message accepted after the companion changed', async () => {
     const user = userEvent.setup();
     const first = snapshot('agent-a', 'Alpha', 1);
     const next = snapshot('agent-b', 'Beta', 2);
     const replacement = deferred<{ agents: DaemonSnapshot[] }>();
-    const run = deferred<Awaited<ReturnType<typeof daemon.runAgent>>>();
+    const run = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
     vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
     vi.spyOn(daemon, 'listAgents')
       .mockResolvedValueOnce({ agents: [first] })
       .mockReturnValueOnce(replacement.promise);
     mockProviders();
-    vi.spyOn(daemon, 'runAgent').mockReturnValue(run.promise);
+    vi.mocked(daemon.startRun).mockReturnValue(run.promise);
     const poll = capturePollTimer();
 
     render(<ViewHarness />);
@@ -1338,11 +1349,11 @@ describe('ViewHarness workspace controller', () => {
     );
     await user.click(screen.getByRole('button', { name: 'Send' }));
     await waitFor(() =>
-      expect(daemon.runAgent).toHaveBeenCalledWith(
+      expect(daemon.startRun).toHaveBeenCalledWith(
         'agent-a',
-        'Alpha work',
-        expect.objectContaining({ clientRequestId: expect.any(String) }),
         'chat:new-1',
+        { text: 'Alpha work', mode: 'queue' },
+        expect.any(String),
       ),
     );
 
@@ -1354,21 +1365,14 @@ describe('ViewHarness workspace controller', () => {
     await screen.findByRole('heading', { name: 'Say something to Beta' });
 
     await act(async () => {
-      run.resolve({
-        agent: withMessage(first, 'Stale Alpha reply'),
-        result: {
-          status: 'success',
-          durationMs: 1,
-          data: { text: 'Stale Alpha reply' },
-        },
-      });
+      run.resolve(acceptedRun('agent-a', 'chat:new-1', 'Alpha work'));
       await run.promise;
     });
 
     expect(
       screen.getByRole('heading', { name: 'Say something to Beta' }),
     ).toBeVisible();
-    expect(screen.queryByText('Stale Alpha reply')).not.toBeInTheDocument();
+    expect(screen.queryByText('Alpha work')).not.toBeInTheDocument();
     expect(screen.getByPlaceholderText('Message Beta…')).toBeVisible();
     expect(
       screen.queryByPlaceholderText('Message Alpha…'),
@@ -1425,183 +1429,111 @@ describe('ViewHarness workspace controller', () => {
   });
 });
 
-it('reconciles a timed-out send with its saved request ID without offering a duplicate retry', async () => {
-  const user = userEvent.setup();
-  let current = snapshot('agent-main', 'Nova', 1);
-  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
-    agents: [current],
-  }));
-  mockProviders();
-  messagesFromSnapshot(() => current);
-  const run = vi
-    .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (id, text, metadata, roomId) => {
-      current = withMessage(
-        snapshot(id, 'Nova', 1),
-        'Completed despite timeout',
-        roomId,
-      );
-      current.state.status = 'completed';
-      current.messages.unshift({
-        id: 'request',
-        agentId: id,
-        roomId: roomId ?? '',
-        role: 'user',
-        content: { text, metadata },
-        createdAtMs: 2,
-      });
-      throw Object.assign(new Error('daemon request failed (408)'), {
-        status: 408,
-      });
-    });
-  render(<ViewHarness />);
-  await openChat();
-  await user.type(
-    await screen.findByPlaceholderText('Message Nova…'),
-    'Commit',
-  );
-  await user.click(screen.getByRole('button', { name: 'Send' }));
-  await screen.findByText('Completed despite timeout');
-  await waitFor(() =>
-    expect(
-      screen.queryByRole('button', { name: 'Restore message' }),
-    ).not.toBeInTheDocument(),
-  );
-  expect(screen.queryByText(/response timed out/)).not.toBeInTheDocument();
-  expect(run).toHaveBeenCalledTimes(1);
-});
-
-it('does not mistake an older identical message for the timed-out request', async () => {
-  const user = userEvent.setup();
-  const current = snapshot('agent-main', 'Nova', 1);
-  current.messages.push({
-    id: 'old',
-    agentId: current.state.id,
-    role: 'user',
-    content: { text: 'Commit', metadata: { clientRequestId: 'older-request' } },
-    createdAtMs: 1,
-  });
-  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [current] });
-  mockProviders();
-  vi.spyOn(daemon, 'runAgent').mockRejectedValue(
-    Object.assign(new Error('timeout'), { status: 408 }),
-  );
-  render(<ViewHarness />);
-  await openChat();
-  await user.type(
-    await screen.findByPlaceholderText('Message Nova…'),
-    'Commit',
-  );
-  await user.click(screen.getByRole('button', { name: 'Send' }));
-  expect(
-    await screen.findByRole('button', { name: 'Restore message' }),
-  ).toBeVisible();
-});
-
-it('keeps a timed-out running request locked until the daemon confirms its completion', async () => {
+it('retries a message that did not reach the daemon with the same key', async () => {
   const user = fakeClock();
-  let current = snapshot('agent-main', 'Nova', 1);
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
-    agents: [current],
-  }));
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
   mockProviders();
-  messagesFromSnapshot(() => current);
-  let requestMetadata: Record<string, unknown> | undefined;
-  const run = vi
-    .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (_id, _text, metadata, roomId) => {
-      requestMetadata = metadata;
-      current = { ...current, state: { ...current.state, status: 'running' } };
-      // The run keeps going in its session after the request times out.
-      setSessionFields(roomId ?? '', { activeRuns: 1 });
-      throw Object.assign(new Error('timeout'), { status: 408 });
-    });
+  const startRun = vi.mocked(daemon.startRun);
+  startRun.mockRejectedValueOnce(
+    new DaemonConnectionError('', new TypeError('Failed to fetch')),
+  );
   render(<ViewHarness />);
   await openChat();
-  const input = await screen.findByPlaceholderText('Message Nova…');
-  await user.type(input, 'Long work');
-  await user.click(screen.getByRole('button', { name: 'Send' }));
-  await screen.findByText(/Checking the daemon for completion/);
-  expect(
-    screen.queryByRole('button', { name: 'Restore message' }),
-  ).not.toBeInTheDocument();
-  current = withMessage(
-    snapshot('agent-main', 'Nova', 1),
-    'Long work completed',
-    'chat:new-1',
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'Plan the week',
   );
-  current.state.status = 'completed';
-  current.messages.unshift({
-    id: 'long-request',
-    agentId: current.state.id,
-    roomId: 'chat:new-1',
-    role: 'user',
-    content: { text: 'Long work', metadata: requestMetadata },
-    createdAtMs: 2,
-  });
-  setSessionFields('chat:new-1', { activeRuns: 0 });
-  await elapse(SESSION_MESSAGES_POLL_MS);
-  await screen.findByText('Long work completed');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(
+    await screen.findByText('Not delivered yet · retrying…'),
+  ).toBeVisible();
+  expect(screen.getByText('Plan the week')).toBeVisible();
+  await elapse(SEND_RETRY_DELAYS_MS[0]);
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(2));
+  expect(startRun.mock.calls[1][3]).toBe(startRun.mock.calls[0][3]);
   await waitFor(() =>
     expect(
-      screen.queryByText(/Checking the daemon for completion/),
+      screen.queryByText('Not delivered yet · retrying…'),
     ).not.toBeInTheDocument(),
   );
-  expect(run).toHaveBeenCalledTimes(1);
   expect(
     screen.queryByRole('button', { name: 'Restore message' }),
   ).not.toBeInTheDocument();
 });
 
-it('does not keep a timed-out send locked while a check-in runs in another session', async () => {
+it('returns a message the daemon refused to the recovery panel without retrying', async () => {
   const user = userEvent.setup();
-  // The check-in's run makes the agent as a whole report running.
-  const busy = snapshot('agent-main', 'Nova', 1);
-  busy.state.status = 'running';
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [busy] });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  const startRun = vi.mocked(daemon.startRun).mockRejectedValue(
+    new DaemonHttpError(429, {
+      error:
+        'This companion already has 8 queued messages; wait for one to start',
+    }),
+  );
+  render(<ViewHarness />);
+  await openChat();
+  await user.type(
+    await screen.findByPlaceholderText('Message Nova…'),
+    'One more thing',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(
+    await screen.findByText(
+      'This companion already has 8 queued messages; wait for one to start',
+    ),
+  ).toBeVisible();
+  await user.click(screen.getByRole('button', { name: 'Restore message' }));
+  expect(screen.getByPlaceholderText('Message Nova…')).toHaveValue(
+    'One more thing',
+  );
+  expect(startRun).toHaveBeenCalledTimes(1);
+});
+
+it('keeps the composer usable while the session has a reply in progress', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
   mockProviders();
   routes.sessions.push(
-    sessionFixture('schedule:daily', {
-      kind: 'checkin',
-      origin: 'schedule',
-      title: 'Daily check-in',
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
       activeRuns: 1,
       lastActivityAtMs: Date.now(),
     }),
   );
-  const run = vi
-    .spyOn(daemon, 'runAgent')
-    .mockRejectedValue(Object.assign(new Error('timeout'), { status: 408 }));
+  window.history.replaceState(null, '', '/#/s/room-7');
   render(<ViewHarness />);
-  await openChat();
-  await user.type(
-    await screen.findByPlaceholderText('Message Nova…'),
-    'Plan my week',
-  );
-  await user.click(screen.getByRole('button', { name: 'Send' }));
 
-  expect(
-    await screen.findByRole('button', { name: 'Restore message' }),
-  ).toBeVisible();
-  expect(screen.getByText(/has not confirmed this message/)).toBeVisible();
-  expect(
-    screen.queryByText(/Checking the daemon for completion/),
-  ).not.toBeInTheDocument();
-  expect(run).toHaveBeenCalledTimes(1);
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, 'And one more{Enter}');
+
+  expect(daemon.startRun).toHaveBeenCalledWith(
+    'agent-main',
+    'room-7',
+    { text: 'And one more', mode: 'queue' },
+    expect.any(String),
+  );
 });
 
-it('does not declare a send unconfirmed while it waits behind another run in its room', async () => {
-  const user = fakeClock();
-  // The agent reads idle between runs; only the session knows its room is busy.
-  let current = snapshot('agent-main', 'Nova', 1);
+it('sends a session’s messages one at a time, in the order written', async () => {
+  const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
-    agents: [current],
-  }));
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
   mockProviders();
   routes.sessions.push(
     sessionFixture('room-7', {
@@ -1610,113 +1542,96 @@ it('does not declare a send unconfirmed while it waits behind another run in its
       lastActivityAtMs: Date.now(),
     }),
   );
-  messagesFromSnapshot(() => current);
-  let requestMetadata: Record<string, unknown> | undefined;
-  const run = vi
-    .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (_id, _text, metadata) => {
-      requestMetadata = metadata;
-      // Another run in this room went first; this request is queued behind it.
-      setSessionFields('room-7', { activeRuns: 1 });
-      throw Object.assign(new Error('timeout'), { status: 408 });
-    });
+  const first = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+  const startRun = vi.mocked(daemon.startRun);
+  startRun.mockReturnValueOnce(first.promise);
   window.history.replaceState(null, '', '/#/s/room-7');
   render(<ViewHarness />);
+
   const input = await screen.findByPlaceholderText('Message Nova…');
   await waitFor(() => expect(input).toBeEnabled());
-  await user.type(input, 'Queued thought');
-  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await user.type(input, 'First{Enter}');
+  await user.type(input, 'Second{Enter}');
 
-  await screen.findByText(/Checking the daemon for completion/);
-  // The session is read again because its room is still busy.
-  const reads = sessionReads('room-7');
-  await elapse(SESSION_MESSAGES_POLL_MS);
-  expect(sessionReads('room-7')).toBeGreaterThan(reads);
-  expect(screen.queryByText(/has not confirmed/)).not.toBeInTheDocument();
-  expect(
-    screen.queryByRole('button', { name: 'Restore message' }),
-  ).not.toBeInTheDocument();
-
-  current = structuredClone(current);
-  current.messages.push(
-    {
-      id: 'queued-request',
-      agentId: 'agent-main',
-      roomId: 'room-7',
-      role: 'user',
-      content: { text: 'Queued thought', metadata: requestMetadata },
-      createdAtMs: 5,
-    },
-    {
-      id: 'queued-reply',
-      agentId: 'agent-main',
-      roomId: 'room-7',
-      role: 'assistant',
-      content: { text: 'Answered after the queue' },
-      createdAtMs: 6,
-    },
+  expect(screen.getByText('Second')).toBeVisible();
+  expect(startRun).toHaveBeenCalledTimes(1);
+  await act(async () =>
+    first.resolve(acceptedRun('agent-main', 'room-7', 'First')),
   );
-  setSessionFields('room-7', { activeRuns: 0 });
-  await elapse(SESSION_MESSAGES_POLL_MS);
-  expect(await screen.findByText('Answered after the queue')).toBeVisible();
-  await waitFor(() =>
-    expect(
-      screen.queryByText(/Checking the daemon for completion/),
-    ).not.toBeInTheDocument(),
-  );
-  expect(
-    screen.queryByRole('button', { name: 'Restore message' }),
-  ).not.toBeInTheDocument();
-  // The record read when the send settled replaces the listed one at once.
-  expect(input).toBeEnabled();
-  expect(screen.queryByText('Nova is thinking')).not.toBeInTheDocument();
-  expect(run).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(2));
+  expect(startRun.mock.calls.map(([, , body]) => body.text)).toEqual([
+    'First',
+    'Second',
+  ]);
 });
 
-it('does not clear a newer recovery entry when an older identical send is confirmed', async () => {
+it('gives a restored message that was edited a new key', async () => {
   const user = userEvent.setup();
-  let current = snapshot('agent-main', 'Nova', 1);
-  let firstMetadata: Record<string, unknown> | undefined;
-  let calls = 0;
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockImplementation(async () => ({
-    agents: [current],
-  }));
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
   mockProviders();
-  vi.spyOn(daemon, 'runAgent').mockImplementation(
-    async (id, text, metadata) => {
-      if (++calls === 1) {
-        firstMetadata = metadata;
-        throw new Error('Network lost');
-      }
-      current = snapshot(id, 'Nova', 1);
-      current.messages.push({
-        id: 'older',
-        agentId: id,
-        role: 'user',
-        content: { text, metadata: firstMetadata },
-        createdAtMs: 2,
-      });
-      throw Object.assign(new Error('timeout'), { status: 408 });
-    },
+  routes.sessions.push(
+    sessionFixture('room-7', {
+      title: 'Weekend plans',
+      origin: 'api',
+      lastActivityAtMs: Date.now(),
+    }),
   );
+  const startRun = vi.mocked(daemon.startRun);
+  startRun.mockRejectedValueOnce(
+    new DaemonHttpError(503, { error: 'The control plane could not be saved' }),
+  );
+  window.history.replaceState(null, '', '/#/s/room-7');
   render(<ViewHarness />);
-  await openChat();
+
   const input = await screen.findByPlaceholderText('Message Nova…');
-  await user.type(input, 'Commit');
-  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, 'Book the train{Enter}');
   await user.click(
-    await screen.findByRole('button', { name: 'Dismiss recoverable message' }),
-  );
-  await user.type(input, 'Commit');
-  await user.click(screen.getByRole('button', { name: 'Send' }));
-  expect(
     await screen.findByRole('button', { name: 'Restore message' }),
-  ).toBeVisible();
-  expect(screen.getByText(/1 recoverable message/)).toBeVisible();
+  );
+  await user.type(input, ' tonight{Enter}');
+
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(2));
+  const [, , , firstKey] = startRun.mock.calls[0];
+  const [, , body, editedKey] = startRun.mock.calls[1];
+  expect(body.text).toBe('Book the train tonight');
+  expect(editedKey).not.toBe(firstKey);
 });
 
-it('opens an existing session from the sidebar, marks it read, and sends in its room', async () => {
+it('replies to a check-in through the runs route', async () => {
+  const user = userEvent.setup();
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  routes.sessions.push(
+    sessionFixture('schedule:daily', {
+      kind: 'checkin',
+      origin: 'schedule',
+      title: 'Daily check-in',
+      lastActivityAtMs: Date.now(),
+    }),
+  );
+  window.history.replaceState(null, '', '/#/s/schedule%3Adaily');
+  render(<ViewHarness />);
+
+  const input = await screen.findByPlaceholderText('Reply to this check-in…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await user.type(input, 'Goals are on track{Enter}');
+
+  expect(daemon.startRun).toHaveBeenCalledWith(
+    'agent-main',
+    'schedule:daily',
+    { text: 'Goals are on track', mode: 'queue' },
+    expect.any(String),
+  );
+});
+
+it('opens an existing session from the sidebar, marks it read, and sends to it', async () => {
   const user = userEvent.setup();
   let current = withMessage(
     snapshot('agent-main', 'Nova', 1),
@@ -1738,35 +1653,28 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
   );
   messagesFromSnapshot(() => current);
   const run = vi
-    .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (id, text, metadata, roomId) => {
+    .mocked(daemon.startRun)
+    .mockImplementation(async (id, sessionId, input) => {
       current = structuredClone(current);
       current.messages.push(
         {
           id: 'user-2',
           agentId: id,
-          roomId: roomId ?? '',
+          roomId: sessionId,
           role: 'user',
-          content: { text, metadata },
+          content: { text: input.text },
           createdAtMs: 3,
         },
         {
           id: 'reply-2',
           agentId: id,
-          roomId: roomId ?? '',
+          roomId: sessionId,
           role: 'assistant',
           content: { text: 'Saturday works' },
           createdAtMs: 4,
         },
       );
-      return {
-        agent: current,
-        result: {
-          status: 'success',
-          durationMs: 1,
-          data: { text: 'Saturday works' },
-        },
-      };
+      return acceptedRun(id, sessionId, input.text);
     });
   render(<ViewHarness />);
 
@@ -1787,9 +1695,9 @@ it('opens an existing session from the sidebar, marks it read, and sends in its 
 
   expect(run).toHaveBeenCalledWith(
     'agent-main',
-    'Does Saturday work?',
-    expect.objectContaining({ clientRequestId: expect.any(String) }),
     'room-7',
+    { text: 'Does Saturday work?', mode: 'queue' },
+    expect.any(String),
   );
   expect(daemon.createSession).not.toHaveBeenCalled();
   expect(await screen.findByText('Saturday works')).toBeVisible();
@@ -1805,10 +1713,7 @@ it('keeps the composer disabled until the open session record loads', async () =
   // An archived legacy session is not listed, so its record is read on its own.
   const record = deferred<Session>();
   vi.mocked(daemon.getSession).mockReturnValue(record.promise);
-  const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
-    agent: snapshot('agent-main', 'Nova', 1),
-    result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
-  });
+  const startRun = vi.mocked(daemon.startRun);
   window.history.replaceState(null, '', '/#/s/legacy-room%3Aabc');
   render(<ViewHarness />);
 
@@ -1827,11 +1732,11 @@ it('keeps the composer disabled until the open session record loads', async () =
   await user.type(input, 'Hello again');
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
-  expect(runAgent).toHaveBeenCalledWith(
+  expect(startRun).toHaveBeenCalledWith(
     'agent-main',
-    'Hello again',
-    expect.objectContaining({ clientRequestId: expect.any(String) }),
-    'direct:agent-main',
+    'legacy-room:abc',
+    { text: 'Hello again', mode: 'queue' },
+    expect.any(String),
   );
 });
 
@@ -2009,15 +1914,12 @@ it('creates one session for the first send and moves text typed meanwhile into i
     await creating.promise;
     return createListed(agentId);
   });
-  const runAgent = vi
-    .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (id, text, _metadata, roomId) => {
+  const startRun = vi
+    .mocked(daemon.startRun)
+    .mockImplementation(async (id, sessionId, input) => {
       // The daemon titles a new chat from its first message.
-      setSessionFields(roomId ?? '', { title: text });
-      return {
-        agent: snapshot(id, 'Nova', 1),
-        result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
-      };
+      setSessionFields(sessionId, { title: input.text });
+      return acceptedRun(id, sessionId, input.text);
     });
   render(<ViewHarness />);
   await openChat();
@@ -2032,12 +1934,12 @@ it('creates one session for the first send and moves text typed meanwhile into i
     'A follow-up',
   );
   expect(createSession).toHaveBeenCalledTimes(1);
-  expect(runAgent).toHaveBeenCalledTimes(1);
-  expect(runAgent).toHaveBeenCalledWith(
+  expect(startRun).toHaveBeenCalledTimes(1);
+  expect(startRun).toHaveBeenCalledWith(
     'agent-main',
-    'First question',
-    expect.objectContaining({ clientRequestId: expect.any(String) }),
     'chat:new-1',
+    { text: 'First question', mode: 'queue' },
+    expect.any(String),
   );
   await screen.findByRole('button', { name: 'First question' });
   await user.click(screen.getByRole('button', { name: 'New chat' }));
@@ -2069,10 +1971,7 @@ it('stays in a session opened while the first send was creating its chat', async
     await creating.promise;
     return createListed(agentId);
   });
-  const runAgent = vi.spyOn(daemon, 'runAgent').mockResolvedValue({
-    agent: current,
-    result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
-  });
+  const startRun = vi.mocked(daemon.startRun);
   render(<ViewHarness />);
   await openChat();
   await user.type(
@@ -2086,11 +1985,11 @@ it('stays in a session opened while the first send was creating its chat', async
 
   await act(async () => creating.resolve());
   await waitFor(() =>
-    expect(runAgent).toHaveBeenCalledWith(
+    expect(startRun).toHaveBeenCalledWith(
       'agent-main',
-      'Plan the launch',
-      expect.objectContaining({ clientRequestId: expect.any(String) }),
       'chat:new-1',
+      { text: 'Plan the launch', mode: 'queue' },
+      expect.any(String),
     ),
   );
   expect(window.location.hash).toBe('#/s/room-7');
@@ -2104,10 +2003,6 @@ it('opens the new session on a page that still shows the conversation', async ()
     agents: [snapshot('agent-main', 'Nova', 1)],
   });
   mockProviders();
-  vi.spyOn(daemon, 'runAgent').mockResolvedValue({
-    agent: snapshot('agent-main', 'Nova', 1),
-    result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
-  });
   // Approvals arrives in a later release; until then it shows the chat.
   window.history.replaceState(null, '', '/#/approvals');
   render(<ViewHarness />);
@@ -2135,18 +2030,15 @@ it('keeps a page open when the first send creates its session, then returns to t
     await creating.promise;
     return createListed(agentId);
   });
-  const runAgent = vi
-    .spyOn(daemon, 'runAgent')
-    .mockImplementation(async (id, _text, _metadata, roomId) => {
+  const startRun = vi
+    .mocked(daemon.startRun)
+    .mockImplementation(async (id, sessionId, input) => {
       current = withMessage(
         snapshot(id, 'Nova', 1),
         'Launch plan ready',
-        roomId,
+        sessionId,
       );
-      return {
-        agent: current,
-        result: { status: 'success', durationMs: 1, data: { text: 'ok' } },
-      };
+      return acceptedRun(id, sessionId, input.text);
     });
   render(<ViewHarness />);
   await openChat();
@@ -2159,11 +2051,11 @@ it('keeps a page open when the first send creates its session, then returns to t
 
   await act(async () => creating.resolve());
   await waitFor(() =>
-    expect(runAgent).toHaveBeenCalledWith(
+    expect(startRun).toHaveBeenCalledWith(
       'agent-main',
-      'Plan the launch',
-      expect.objectContaining({ clientRequestId: expect.any(String) }),
       'chat:new-1',
+      { text: 'Plan the launch', mode: 'queue' },
+      expect.any(String),
     ),
   );
   expect(window.location.hash).toBe('#/work');
@@ -2185,7 +2077,7 @@ it('asks for a daemon update instead of failing sends when sessions are missing'
   vi.mocked(daemon.listSessions).mockRejectedValue(
     new DaemonTooOldError('agent-main'),
   );
-  const runAgent = vi.spyOn(daemon, 'runAgent');
+  const startRun = vi.mocked(daemon.startRun);
   render(<ViewHarness />);
 
   expect(await screen.findByText('Update the daemon')).toBeVisible();
@@ -2195,7 +2087,7 @@ it('asks for a daemon update instead of failing sends when sessions are missing'
   fireEvent.keyDown(input, { key: 'Enter' });
   expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
   expect(daemon.createSession).not.toHaveBeenCalled();
-  expect(runAgent).not.toHaveBeenCalled();
+  expect(startRun).not.toHaveBeenCalled();
 });
 
 it('keeps an opened page when the open session finishes deleting behind it', async () => {
@@ -2276,12 +2168,8 @@ it('keeps the open session while a sidebar search filters it out', async () => {
   await screen.findByText('No sessions match.');
 
   expect(screen.getByRole('heading', { name: 'Daily check-in' })).toBeVisible();
-  expect(screen.getByRole('note')).toHaveTextContent(
-    'Replying to a check-in is not available yet.',
-  );
-  expect(
-    screen.queryByPlaceholderText('Message Nova…'),
-  ).not.toBeInTheDocument();
+  // Check-ins take replies from M3 on (spec §15.3).
+  expect(screen.getByPlaceholderText('Reply to this check-in…')).toBeVisible();
 });
 
 it('shows a failed header action in the session view', async () => {
@@ -2531,60 +2419,20 @@ it('keeps each session’s own messages and draft when switching between them', 
   expect(composer()).toHaveValue('Draft for B');
 });
 
-it('replies to a Telegram session through its connector', async () => {
+it('replies to a Telegram session through the runs route', async () => {
   const user = userEvent.setup();
-  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
-  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
-    agents: [snapshot('agent-main', 'Nova', 1)],
-  });
-  mockProviders();
-  vi.spyOn(daemon, 'listConnectors').mockResolvedValue({
-    connectors: [
-      {
-        id: 'tg-1',
-        agentId: 'agent-main',
-        roomId: 'telegram:tg-1',
-        type: 'telegram',
-        bot: { id: '1', username: 'nova_bot', displayName: 'Nova' },
-        approvedChat: null,
-        pendingPairing: null,
-        status: 'ready',
-        enabled: true,
-        createdAtMs: 1,
-        updatedAtMs: 1,
-      },
-    ],
-  });
-  routes.sessions.push(
-    sessionFixture('telegram:tg-1', {
-      kind: 'telegram',
-      origin: 'telegram',
-      title: 'Telegram · @nova_bot',
-      lastActivityAtMs: Date.now(),
-    }),
-  );
-  const runAgent = vi.spyOn(daemon, 'runAgent');
-  const reply = vi.spyOn(daemon, 'sendConnectorMessage').mockResolvedValue({
-    messages: [],
-    result: { status: 'success', durationMs: 1 },
-    deliveryQueued: true,
-  });
-  window.history.replaceState(null, '', '/#/s/telegram%3Atg-1');
-  render(<ViewHarness />);
-
-  await user.type(
-    await screen.findByPlaceholderText('Reply on Telegram…'),
-    'On my way',
-  );
+  const reply = vi.spyOn(daemon, 'sendConnectorMessage');
+  const input = await openTelegramSession();
+  await user.type(input, 'On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
-  expect(reply).toHaveBeenCalledWith(
+  expect(daemon.startRun).toHaveBeenCalledWith(
     'agent-main',
-    'tg-1',
-    'On my way',
-    expect.stringMatching(/^telegram-/),
+    'telegram:tg-1',
+    { text: 'On my way', mode: 'queue' },
+    expect.any(String),
   );
-  expect(runAgent).not.toHaveBeenCalled();
+  expect(reply).not.toHaveBeenCalled();
 });
 
 /** A Telegram session with its ready connector, opened in the harness. */
@@ -2631,13 +2479,37 @@ async function openTelegramSession() {
   return input;
 }
 
+/** The first Telegram reply's run (`run_1`) ends as `status`: its messages
+ *  are committed when it ends, and the ledger then holds how it ended. */
+function endTelegramRun(status: 'completed' | 'failed') {
+  const startRun = vi.mocked(daemon.startRun);
+  vi.mocked(daemon.sessionMessages).mockImplementation(async () => ({
+    messages: startRun.mock.calls.length
+      ? [
+          {
+            id: 'reply-1',
+            role: 'assistant',
+            text: 'Be right there',
+            attachments: [],
+            metadata: { runId: 'run_1' },
+            createdAtMs: 2,
+          },
+        ]
+      : [],
+    nextBefore: null,
+  }));
+  vi.spyOn(daemon, 'sessionRuns').mockResolvedValue([
+    runFixture('run_1', {
+      sessionId: 'telegram:tg-1',
+      source: 'telegram',
+      status,
+    }),
+  ]);
+}
+
 it('reports a Telegram reply that is queued for delivery', async () => {
   const user = userEvent.setup();
-  vi.spyOn(daemon, 'sendConnectorMessage').mockResolvedValue({
-    messages: [],
-    result: { status: 'success', durationMs: 1 },
-    deliveryQueued: true,
-  });
+  endTelegramRun('completed');
   const input = await openTelegramSession();
   await user.type(input, 'On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
@@ -2645,18 +2517,32 @@ it('reports a Telegram reply that is queued for delivery', async () => {
   expect(await screen.findByText('Queued for Telegram delivery')).toBeVisible();
 });
 
-it('resends a restored Telegram reply with its key and gives a new reply a new key', async () => {
+it('does not report delivery for a Telegram reply whose run failed', async () => {
   const user = userEvent.setup();
-  const reply = vi
-    .spyOn(daemon, 'sendConnectorMessage')
-    .mockRejectedValueOnce(
-      Object.assign(new Error('daemon request failed (408)'), { status: 408 }),
-    )
-    .mockResolvedValue({
-      messages: [],
-      result: { status: 'success', durationMs: 1 },
-      deliveryQueued: false,
-    });
+  endTelegramRun('failed');
+  const input = await openTelegramSession();
+  await user.type(input, 'On my way');
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+
+  expect(await screen.findByText('Be right there')).toBeVisible();
+  await waitFor(() =>
+    expect(daemon.sessionRuns).toHaveBeenCalledWith(
+      'agent-main',
+      'telegram:tg-1',
+    ),
+  );
+  await act(async () => {
+    await vi.mocked(daemon.sessionRuns).mock.results[0].value;
+  });
+  expect(
+    screen.queryByText('Queued for Telegram delivery'),
+  ).not.toBeInTheDocument();
+});
+
+it('resends a restored message with its key and gives a new message a new key', async () => {
+  const user = userEvent.setup();
+  const startRun = vi.mocked(daemon.startRun);
+  startRun.mockRejectedValueOnce(new Error('Telegram is reconnecting'));
   const input = await openTelegramSession();
   await user.type(input, 'On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
@@ -2666,22 +2552,21 @@ it('resends a restored Telegram reply with its key and gives a new reply a new k
   expect(input).toHaveValue('On my way');
   await user.click(screen.getByRole('button', { name: 'Send' }));
 
-  // The daemon joins a retry that reuses the key instead of sending twice.
-  await waitFor(() => expect(reply).toHaveBeenCalledTimes(2));
-  const [, , , firstKey] = reply.mock.calls[0];
-  expect(reply.mock.calls[1]).toEqual([
+  // The daemon joins a resend that reuses the key instead of sending twice.
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(2));
+  const [, , , firstKey] = startRun.mock.calls[0];
+  expect(startRun.mock.calls[1]).toEqual([
     'agent-main',
-    'tg-1',
-    'On my way',
+    'telegram:tg-1',
+    { text: 'On my way', mode: 'queue' },
     firstKey,
   ]);
 
   await user.type(input, 'Running late');
   await user.click(screen.getByRole('button', { name: 'Send' }));
-  await waitFor(() => expect(reply).toHaveBeenCalledTimes(3));
-  const [, , text, newKey] = reply.mock.calls[2];
-  expect(text).toBe('Running late');
-  expect(newKey).toMatch(/^telegram-/);
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(3));
+  const [, , body, newKey] = startRun.mock.calls[2];
+  expect(body.text).toBe('Running late');
   expect(newKey).not.toBe(firstKey);
 });
 

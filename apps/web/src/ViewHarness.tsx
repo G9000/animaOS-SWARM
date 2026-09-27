@@ -6,7 +6,11 @@ import {
   useRef,
   useState,
 } from 'react';
-import type { Session, SessionMessage } from '@animaOS-SWARM/sdk';
+import {
+  isTerminalRunStatus,
+  type RunMode,
+  type Session,
+} from '@animaOS-SWARM/sdk';
 
 import { AlertIcon } from './components/icons';
 import { CompanionSetup } from './components/onboarding/CompanionSetup';
@@ -19,6 +23,7 @@ import { WorkspaceShell, availablePage } from './components/WorkspaceShell';
 import { useAgentIntegrations } from './hooks/useAgentIntegrations';
 import { useCompanionSessions } from './hooks/useCompanionSessions';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
+import { useSessionSends } from './hooks/useSessionSends';
 import {
   SESSION_MESSAGES_POLL_MS,
   useSessionMessages,
@@ -34,10 +39,9 @@ import {
 import { selectMainAgent } from './lib/agent-access';
 import { useHashRoute, type HashRoute } from './lib/hash-route';
 import { exportFileName, sessionKey } from './lib/session-groups';
-import {
-  createTelegramIdempotencyKey,
-  safeIntegrationError,
-} from './lib/telegram';
+import { loadDraft, storeDraft } from './lib/drafts';
+import type { PendingBubble } from './lib/transcript';
+import { safeIntegrationError } from './lib/telegram';
 
 interface AgentOperation {
   generation: number;
@@ -48,19 +52,21 @@ interface AgentOperation {
 interface FailedDraft {
   requestId: string;
   text: string;
-  /** A failed Telegram reply keeps its key, so resending it is joined, not doubled. */
+  /** A failed message keeps its key, so resending it unchanged is joined, not doubled. */
   idempotencyKey?: string;
 }
 
 type ChatState = {
   draft: string;
   failedDrafts: FailedDraft[];
+  /** A new chat is creating its session; its first message waits. */
   sending: boolean;
   error: string | null;
-  /** A restored Telegram reply; sent again unchanged, it reuses its key. */
+  /** A restored message; sent again unchanged, it reuses its key. */
   resend: { text: string; idempotencyKey: string } | null;
-  /** The last Telegram reply was accepted and waits for delivery. */
-  deliveryQueued: boolean;
+  /** The last Telegram reply's run; `queued` once it completed while the
+   *  connector had an approved chat, which queues its reply for delivery. */
+  delivery: { runId: string; queued: boolean } | null;
 };
 
 const EMPTY_CHAT: ChatState = {
@@ -69,35 +75,9 @@ const EMPTY_CHAT: ChatState = {
   sending: false,
   error: null,
   resend: null,
-  deliveryQueued: false,
+  delivery: null,
 };
 const HOME_CONVERSATION = 'home';
-/** The daemon's largest message page, so a busy session still shows the request. */
-const REQUEST_CHECK_PAGE = 200;
-
-/** A send whose outcome is unknown: its request failed in transit or timed out. */
-interface UncertainSend {
-  agentId: string;
-  sessionId: string;
-  key: string;
-  text: string;
-  /** Timed out: the run may still be queued or running, so the chat stays locked. */
-  waiting: boolean;
-}
-
-/** What the send's session said when it was last read again. */
-interface SendCheck {
-  activeRuns: number;
-  delivered: boolean;
-}
-
-/** A committed user message with this request ID means its blocking run
- *  finished (M2 runs commit their messages together). */
-function carriesRequest(message: SessionMessage, requestId: string): boolean {
-  return (
-    message.role === 'user' && message.metadata.clientRequestId === requestId
-  );
-}
 
 function httpStatus(error: unknown): unknown {
   return typeof error === 'object' && error !== null && 'status' in error
@@ -112,29 +92,6 @@ function chatKey(agentId: string, conversation: string): string {
 
 function sessionConversation(sessionId: string): string {
   return `session:${sessionId}`;
-}
-
-// Drafts are saved per agent and conversation in session storage (spec
-// §15.5), so a reload keeps them. Without storage they live in memory only.
-function draftStorageKey(key: string): string {
-  return `animaos.draft.${key.replace('\u0000', '/')}`;
-}
-
-function loadDraft(key: string): string {
-  try {
-    return window.sessionStorage.getItem(draftStorageKey(key)) ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function storeDraft(key: string, draft: string) {
-  try {
-    if (draft) window.sessionStorage.setItem(draftStorageKey(key), draft);
-    else window.sessionStorage.removeItem(draftStorageKey(key));
-  } catch {
-    // Storage is full or blocked: the draft stays in memory for this page.
-  }
 }
 
 function chatState(chats: Record<string, ChatState>, key: string): ChatState {
@@ -305,7 +262,7 @@ export function ViewHarness() {
   const activeSession =
     listedSession ??
     (knownSession && knownSession.id === routeSessionId ? knownSession : null);
-  // The composer waits for the record: a send needs the session's room.
+  // The composer waits for the record: a send needs the session's kind.
   const sessionLoading = routeSessionId !== null && activeSession === null;
   const [messagesRefresh, setMessagesRefresh] = useState(0);
   const history = useSessionMessages(
@@ -383,135 +340,56 @@ export function ViewHarness() {
   const setWorkspaceError = (error: string | null) => {
     if (activeChatKey) updateChat(activeChatKey, { error });
   };
+  /** Conversations whose new chat is still creating its session. */
   const pendingSendsRef = useRef(new Set<string>());
-  const uncertainSendsRef = useRef(new Map<string, UncertainSend>());
-  // A timed-out send is settled from its own session, never from the agent's
-  // status: that also reads "running" for a check-in or Telegram turn in
-  // another session, and it can read idle while this request is still
-  // queued behind another run in its room (not yet in the run ledger).
-  const sendChecksRef = useRef(new Map<string, SendCheck>());
-  const [sendCheckRevision, setSendCheckRevision] = useState(0);
-  const mountedRef = useRef(true);
-  const checkTimersRef = useRef(new Set<number>());
-  useEffect(() => {
-    mountedRef.current = true;
-    const timers = checkTimersRef.current;
-    return () => {
-      mountedRef.current = false;
-      for (const timer of timers) window.clearTimeout(timer);
-      timers.clear();
-    };
-  }, []);
-  /** A fresh record replaces the listed or known copy, so its active runs
-   *  stop holding the composer before the next list poll. */
-  const adoptSessionRecord = (session: Session) => {
-    const key = sessionKey(session);
-    if (listedSessionsRef.current.some((item) => sessionKey(item) === key))
-      sessions.upsert(session);
-    setKnownSession((current) =>
-      current && sessionKey(current) === key ? session : current,
-    );
-  };
-  /** Reads a timed-out send's session and then its messages, again while the
-   *  session has active runs. Reading the session first means a page read
-   *  after it reports none already holds what those runs committed. */
-  const checkUncertainSend = async (requestId: string) => {
-    const pending = uncertainSendsRef.current.get(requestId);
-    if (!pending?.waiting || !mountedRef.current) return;
-    let check: SendCheck | null = null;
-    let record: Session | null = null;
-    try {
-      const session = await daemon.getSession(
-        pending.agentId,
-        pending.sessionId,
-      );
-      const page = await daemon.sessionMessages(
-        pending.agentId,
-        pending.sessionId,
-        { limit: REQUEST_CHECK_PAGE },
-      );
-      record = session;
-      check = {
-        activeRuns: session.activeRuns,
-        delivered: page.messages.some((message) =>
-          carriesRequest(message, requestId),
-        ),
-      };
-    } catch (caught) {
-      // A deleted session has nothing left to wait for; other failures retry.
-      if (httpStatus(caught) === 404)
-        check = { activeRuns: 0, delivered: false };
-    }
-    if (
-      !mountedRef.current ||
-      uncertainSendsRef.current.get(requestId) !== pending
-    )
-      return;
-    if (check) {
-      sendChecksRef.current.set(requestId, check);
-      setSendCheckRevision((value) => value + 1);
-      if (check.delivered || check.activeRuns === 0) {
-        if (record) adoptSessionRecord(record);
-        return;
-      }
-    }
-    const timer = window.setTimeout(() => {
-      checkTimersRef.current.delete(timer);
-      void checkUncertainSend(requestId);
-    }, SESSION_MESSAGES_POLL_MS);
-    checkTimersRef.current.add(timer);
-  };
-  useEffect(() => {
-    for (const [requestId, pending] of uncertainSendsRef.current) {
-      const snapshot = agentSnapshots.find(
-        (item) => item.state.id === pending.agentId,
-      );
-      if (!snapshot) continue;
-      const check = sendChecksRef.current.get(requestId);
-      const delivered =
-        check?.delivered === true ||
-        snapshot.messages.some(
-          (message) =>
-            message.role === 'user' &&
-            message.content.metadata?.clientRequestId === requestId,
-        ) ||
-        history.messages.some((message) => carriesRequest(message, requestId));
-      // A timed-out send stays locked until its session has no active runs.
-      if (!delivered && (!pending.waiting || !check || check.activeRuns > 0))
-        continue;
-      sendChecksRef.current.delete(requestId);
-      if (delivered) uncertainSendsRef.current.delete(requestId);
-      else
-        uncertainSendsRef.current.set(requestId, {
-          ...pending,
-          waiting: false,
+  // Messages go to the runs route (spec §4.2): the daemon queues them, so
+  // the composer stays usable while the companion works.
+  const sends = useSessionSends({
+    onAccepted: (item, result) => {
+      if (!availableAgentIdsRef.current.has(item.agentId)) return;
+      if (item.telegram && !result.steer)
+        updateChat(item.conversation, {
+          delivery: { runId: result.run.id, queued: false },
         });
-      if (pending.waiting) pendingSendsRef.current.delete(pending.key);
-      updateChat(pending.key, (current) => {
-        const index = delivered
-          ? current.failedDrafts.findIndex(
-              (item) => item.requestId === requestId,
+      refreshConversation();
+    },
+    onFailed: (item, caught) => {
+      if (!availableAgentIdsRef.current.has(item.agentId)) return;
+      updateChat(item.conversation, (current) => ({
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: item.key, text: item.text, idempotencyKey: item.key },
+        ],
+        error: item.telegram
+          ? safeIntegrationError(caught)
+          : errorMessage(caught),
+      }));
+    },
+  });
+  const openPending = useMemo(
+    (): PendingBubble[] =>
+      activeSession
+        ? sends.sends
+            .filter(
+              (item) =>
+                item.agentId === activeSession.agentId &&
+                item.sessionId === activeSession.id,
             )
-          : -1;
-        const remaining = current.failedDrafts.filter(
-          (_, position) => position !== index,
-        );
-        return {
-          failedDrafts: remaining,
-          sending: pending.waiting ? false : current.sending,
-          error:
-            current.sending && !pending.waiting
-              ? current.error
-              : delivered
-                ? remaining.length
-                  ? current.error
-                  : null
-                : 'The daemon has not confirmed this message. Check the conversation before restoring it.',
-        };
-      });
-      if (delivered) setMessagesRefresh((value) => value + 1);
-    }
-  }, [agentSnapshots, history.messages, sendCheckRevision, updateChat]);
+            .map(
+              (item): PendingBubble => ({
+                key: item.key,
+                text: item.text,
+                createdAtMs: item.createdAtMs,
+                status: item.steeringRunId
+                  ? 'steering'
+                  : item.failures > 0
+                    ? 'retrying'
+                    : 'sending',
+              }),
+            )
+        : [],
+    [activeSession, sends.sends],
+  );
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null,
   );
@@ -540,6 +418,48 @@ export function ViewHarness() {
           (item) => item.roomId === activeSession.roomId,
         ) ?? null)
       : null;
+  // The connector queues a Telegram reply for delivery when its run
+  // completes while it has an approved chat. A run's messages are committed
+  // when it ends, so their arrival prompts a read of how it ended.
+  const awaitedDelivery = chat.delivery?.queued ? null : chat.delivery?.runId;
+  const deliveryApproved = activeConnector?.approvedChat != null;
+  const deliveryReadsRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (
+      !awaitedDelivery ||
+      !activeSession ||
+      !activeChatKey ||
+      deliveryReadsRef.current.has(awaitedDelivery) ||
+      !history.messages.some(
+        (message) => message.metadata.runId === awaitedDelivery,
+      )
+    )
+      return;
+    const runId = awaitedDelivery;
+    const key = activeChatKey;
+    deliveryReadsRef.current.add(runId);
+    void daemon
+      .sessionRuns(activeSession.agentId, activeSession.id)
+      .then((runs) => {
+        const run = runs.find((item) => item.id === runId);
+        if (!run || !isTerminalRunStatus(run.status)) return;
+        const queued = run.status === 'completed' && deliveryApproved;
+        updateChat(key, (current) =>
+          current.delivery?.runId === runId
+            ? { delivery: queued ? { runId, queued } : null }
+            : {},
+        );
+      })
+      .catch(() => undefined)
+      .finally(() => deliveryReadsRef.current.delete(runId));
+  }, [
+    activeChatKey,
+    activeSession,
+    awaitedDelivery,
+    deliveryApproved,
+    history.messages,
+    updateChat,
+  ]);
   useLayoutEffect(() => {
     if (previousSelectedMainIdRef.current === agentId) return;
 
@@ -757,6 +677,7 @@ export function ViewHarness() {
       }
       availableAgentIdsRef.current.delete(targetAgentId);
       removeAgentSnapshot(targetAgentId);
+      sends.forgetAgent(targetAgentId);
       try {
         clearCheckins(targetAgentId);
       } catch {
@@ -775,77 +696,29 @@ export function ViewHarness() {
     void sessions.refresh();
   };
 
-  /** One blocking run in a session's room (spec §4.9). */
-  const runInSession = async (
-    targetId: string,
-    session: Pick<Session, 'id' | 'roomId'>,
+  /** Hands a message to the send queue (spec §4.2): retried with its key,
+   *  in order with the session's other messages. */
+  const queueSend = (
+    target: Pick<Session, 'agentId' | 'id' | 'kind'>,
+    conversation: string,
     text: string,
-    key: string,
-    preserveDraft = false,
+    idempotencyKey: string,
+    mode: RunMode = 'queue',
   ) => {
     if (
-      !availableAgentIdsRef.current.has(targetId) ||
-      connection !== 'online' ||
-      pendingSendsRef.current.has(key) ||
+      !availableAgentIdsRef.current.has(target.agentId) ||
       resetInFlightRef.current !== null
     )
       return;
-    const clientRequestId = crypto.randomUUID();
-    pendingSendsRef.current.add(key);
-    updateChat(key, {
-      sending: true,
-      error: null,
-      ...(preserveDraft ? {} : { draft: '' }),
+    sends.send({
+      key: idempotencyKey,
+      agentId: target.agentId,
+      sessionId: target.id,
+      conversation,
+      text,
+      mode,
+      telegram: target.kind === 'telegram',
     });
-    try {
-      const { agent: updatedAgent, result } = await daemon.runAgent(
-        targetId,
-        text,
-        { clientRequestId },
-        session.roomId,
-      );
-      if (
-        availableAgentIdsRef.current.has(targetId) &&
-        updatedAgent.state.id === targetId
-      ) {
-        acceptAgentSnapshot(updatedAgent);
-        if (result.status === 'error')
-          updateChat(key, { error: result.error ?? 'run failed' });
-      }
-    } catch (caught) {
-      if (availableAgentIdsRef.current.has(targetId)) {
-        const timedOut =
-          caught instanceof Error &&
-          'status' in caught &&
-          caught.status === 408;
-        uncertainSendsRef.current.set(clientRequestId, {
-          agentId: targetId,
-          sessionId: session.id,
-          key,
-          text,
-          waiting: timedOut,
-        });
-        updateChat(key, (current) => ({
-          failedDrafts: [
-            ...current.failedDrafts,
-            { requestId: clientRequestId, text },
-          ],
-          error: timedOut
-            ? 'The response timed out. Checking the daemon for completion—do not resend yet.'
-            : errorMessage(caught),
-        }));
-        if (timedOut) {
-          void refreshAgents();
-          void checkUncertainSend(clientRequestId);
-        }
-      }
-    } finally {
-      if (!uncertainSendsRef.current.get(clientRequestId)?.waiting) {
-        pendingSendsRef.current.delete(key);
-        updateChat(key, { sending: false });
-      }
-      refreshConversation();
-    }
   };
 
   /** A new chat becomes a session with its first message (spec §3.3). */
@@ -895,52 +768,7 @@ export function ViewHarness() {
         lastConversationRef.current = created;
       else navigate(created, { replace: true });
     }
-    await runInSession(targetId, session, text, target, true);
-  };
-
-  /** An owner turn in a Telegram session goes out through its connector. */
-  const replyOnTelegram = async (
-    targetId: string,
-    connectorId: string,
-    text: string,
-    key: string,
-    idempotencyKey: string,
-  ) => {
-    if (pendingSendsRef.current.has(key)) return;
-    pendingSendsRef.current.add(key);
-    updateChat(key, {
-      sending: true,
-      error: null,
-      draft: '',
-      resend: null,
-      deliveryQueued: false,
-    });
-    try {
-      const response = await daemon.sendConnectorMessage(
-        targetId,
-        connectorId,
-        text,
-        idempotencyKey,
-      );
-      updateChat(key, {
-        deliveryQueued: response.deliveryQueued,
-        ...(response.result.status === 'error'
-          ? { error: response.result.error ?? 'run failed' }
-          : {}),
-      });
-    } catch (caught) {
-      updateChat(key, (current) => ({
-        failedDrafts: [
-          ...current.failedDrafts,
-          { requestId: crypto.randomUUID(), text, idempotencyKey },
-        ],
-        error: safeIntegrationError(caught),
-      }));
-    } finally {
-      pendingSendsRef.current.delete(key);
-      updateChat(key, { sending: false });
-      refreshConversation();
-    }
+    queueSend(session, target, text, crypto.randomUUID());
   };
 
   const send = () => {
@@ -957,24 +785,17 @@ export function ViewHarness() {
       void startChat(agent.id, text);
       return;
     }
-    // Until its record loads, the session's room and kind are unknown.
+    // Until its record loads, the session's kind is unknown.
     if (!activeSession) return;
+    if (activeSession.kind === 'telegram' && !activeConnector) return;
     const key = chatKey(agent.id, sessionConversation(routeSessionId));
-    if (activeSession.kind === 'telegram') {
-      // A restored reply sent unchanged keeps its key; anything else is new.
-      if (activeConnector)
-        void replyOnTelegram(
-          agent.id,
-          activeConnector.id,
-          text,
-          key,
-          chat.resend?.text === text
-            ? chat.resend.idempotencyKey
-            : createTelegramIdempotencyKey(),
-        );
-      return;
-    }
-    void runInSession(activeSession.agentId, activeSession, text, key);
+    // A restored message sent unchanged keeps its key; anything else is new.
+    const idempotencyKey =
+      chat.resend?.text === text
+        ? chat.resend.idempotencyKey
+        : crypto.randomUUID();
+    updateChat(key, { draft: '', error: null, resend: null, delivery: null });
+    queueSend(activeSession, key, text, idempotencyKey);
   };
 
   const newChat = () => navigate({ kind: 'home' });
@@ -1108,6 +929,7 @@ export function ViewHarness() {
       agent={agent}
       session={activeSession}
       messages={routeSessionId ? chatMessages : []}
+      pending={openPending}
       hasOlder={history.hasOlder}
       loadingOlder={history.loadingOlder}
       onLoadOlder={() => void history.loadOlder()}
@@ -1119,11 +941,8 @@ export function ViewHarness() {
         draft,
         setDraft,
         sending,
-        disabled:
-          resetting ||
-          sessionLoading ||
-          daemonTooOld ||
-          (activeSession?.activeRuns ?? 0) > 0,
+        // Usable while the companion works: messages queue (spec §15.3).
+        disabled: resetting || sessionLoading || daemonTooOld,
         offline: connection === 'offline',
         onSend: send,
         error: workspaceError,
@@ -1190,7 +1009,7 @@ export function ViewHarness() {
               </p>
             </div>
           ) : null}
-          {chat.deliveryQueued ? (
+          {chat.delivery?.queued ? (
             <p
               role="status"
               className="px-4 pt-3 text-center font-mono text-[10px] text-mint"
