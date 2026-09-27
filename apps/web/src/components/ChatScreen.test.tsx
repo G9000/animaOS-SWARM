@@ -499,7 +499,7 @@ describe('Composer commands and live replies', () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
-  it('wires the input to the open command menu as a combobox', () => {
+  it('wires the input to the open command menu as a combobox, and picking an option keeps focus in the input', async () => {
     const props = composerProps({ draft: '/co' });
     render(<Composer {...props} />);
     const input = screen.getByRole('textbox', { name: 'Message Nova' });
@@ -509,7 +509,11 @@ describe('Composer commands and live replies', () => {
     expect(input).toHaveAttribute('aria-expanded', 'true');
     expect(input).toHaveAttribute('aria-controls', listbox.id);
     expect(input).toHaveAttribute('aria-activedescendant', option.id);
-    expect(document.activeElement).not.toBe(listbox);
+
+    input.focus();
+    expect(document.activeElement).toBe(input);
+    await userEvent.click(option);
+    expect(document.activeElement).toBe(input);
   });
 
   it('closes the combobox wiring once no command matches', () => {
