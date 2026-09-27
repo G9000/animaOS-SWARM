@@ -1,6 +1,6 @@
 import { act, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SessionMessage } from '@animaOS-SWARM/sdk';
+import type { Run, SessionMessage } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
 import {
@@ -187,6 +187,81 @@ describe('useLiveSession', () => {
     rerender({ session: { agentId: 'agent-main', sessionId: 'chat:b' } });
     expect(result.current.announcement).toBe('');
     await flush();
+    // Back in room-7 the old reply is not announced again.
+    rerender({});
+    expect(result.current.announcement).toBe('');
+    await flush();
+  });
+
+  it('counts the open session’s active runs only while the stream is open', async () => {
+    const { events, result } = setup();
+    await flush();
+    expect(result.current.activeRunCount).toBe(null);
+    events.streams[0].push(snapshotEvent([snapshotRun(room7Run())]));
+    await flush(20);
+    expect(result.current.activeRunCount).toBe(1);
+    events.streams[0].push(
+      runEvent('run.completed', { ...room7Run(), status: 'completed' }, 2),
+    );
+    await flush(20);
+    expect(result.current.activeRunCount).toBe(0);
+    events.streams[0].end();
+    await flush(20);
+    expect(result.current.activeRunCount).toBe(null);
+    await flush(LIVE_REFRESH_DELAY_MS);
+  });
+
+  it('reports which ledger read landed, numbering each one it asks for', async () => {
+    const reads: ((runs: Run[]) => void)[] = [];
+    vi.mocked(daemon.sessionRuns).mockImplementation(
+      () => new Promise((resolve) => reads.push(resolve)),
+    );
+    const { result } = setup();
+    await flush();
+    expect(result.current.ledger).toEqual({
+      requested: 0,
+      landed: null,
+      runs: [],
+    });
+
+    let asked = 0;
+    act(() => {
+      asked = result.current.refreshRuns();
+    });
+    expect(asked).toBe(1);
+    await flush();
+    const run = room7Run();
+    await act(async () => reads[1]([run]));
+    expect(result.current.ledger).toEqual({
+      requested: 1,
+      landed: 1,
+      runs: [run],
+    });
+  });
+
+  it('shows an accepted run until the stream or a later ledger read has it', async () => {
+    const reads: ((runs: Run[]) => void)[] = [];
+    vi.mocked(daemon.sessionRuns).mockImplementation(
+      () => new Promise((resolve) => reads.push(resolve)),
+    );
+    const { result } = setup();
+    await flush();
+    await act(async () => reads[0]([]));
+
+    const accepted = runFixture('run_1', { sessionId: 'room-7' });
+    act(() => {
+      result.current.seedRun(accepted);
+      // Another session's run is not shown here.
+      result.current.seedRun(runFixture('run_x', { sessionId: 'chat:b' }));
+    });
+    expect(result.current.runs.map((item) => item.run.id)).toEqual(['run_1']);
+
+    act(() => {
+      result.current.refreshRuns();
+    });
+    await flush();
+    await act(async () => reads[1]([]));
+    expect(result.current.runs).toEqual([]);
   });
 
   it('re-reads the ledger once for a run its history shows but the view thinks is still running', async () => {

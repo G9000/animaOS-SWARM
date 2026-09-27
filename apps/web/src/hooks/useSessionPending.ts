@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { SessionMessage } from '@animaOS-SWARM/sdk';
+import type { Run, SessionMessage } from '@animaOS-SWARM/sdk';
 
 import type { LiveRun } from '../lib/session-events';
 import type { PendingBubble } from '../lib/transcript';
@@ -16,14 +16,34 @@ export interface SessionPendingOptions {
   messages: readonly SessionMessage[];
   /** The open session's runs, from its stream and ledger. */
   runs: readonly LiveRun[];
-  /** Reads the open session's newest messages again. */
-  refreshMessages: () => Promise<void>;
+  /** The open session's ledger reads: the newest asked for, the one whose
+   *  runs are on screen (null before its first), and those runs. */
+  ledger: { requested: number; landed: number | null; runs: readonly Run[] };
+  /** Reads the open session's newest messages again; true once that
+   *  read's page is on screen. */
+  refreshMessages: () => Promise<boolean>;
+  /** Reads the open session's ledger again; returns that read's number. */
+  refreshRuns: () => number;
   /** A steer that no run took and no history holds: its text goes to the
    *  composer's recovery panel. */
   onRecover: (send: SessionSend) => void;
 }
 
-const NO_RUNS: ReadonlySet<string> = new Set();
+/** The runs a steer cannot have become: those its session had when it was
+ *  sent, including a ledger read begun by then (`before`). */
+interface SteerBaseline {
+  ids: Set<string>;
+  before: number;
+}
+
+/** A failed reply's steer, waiting for history and the ledger to be read
+ *  again after the failure. */
+interface RecoveryCheck {
+  /** History's read, begun after the failure: `read` once it was applied. */
+  history: 'reading' | 'read';
+  /** The ledger read begun after the failure. */
+  ledgerRead: number;
+}
 
 /** A reply that ended without being able to take a steer. */
 function endedBadly(status: string): boolean {
@@ -62,8 +82,10 @@ function shownSteers(
  * and makes one it could not queue an `interrupted` run to send again).
  * While the reply it joined shows it as taken, the run shows the text and
  * the bubble steps aside. A reconnect settles nothing. If the reply ends
- * `failed` or `interrupted` and history, read again afterwards, still does
- * not hold it, the text moves to the recovery panel.
+ * `failed` or `interrupted`, the text moves to the recovery panel only once
+ * a history read and a ledger read, both begun after the failure, have
+ * landed without it (the daemon announces a steer's own run after the
+ * failure, so a ledger read may be the first to show it).
  */
 export function useSessionPending({
   sends,
@@ -71,7 +93,9 @@ export function useSessionPending({
   session,
   messages,
   runs,
+  ledger,
   refreshMessages,
+  refreshRuns,
   onRecover,
 }: SessionPendingOptions): PendingBubble[] {
   const agentId = session?.agentId ?? null;
@@ -84,13 +108,12 @@ export function useSessionPending({
     [sends, agentId, sessionId],
   );
 
-  /** The runs each steer's session had when it was sent: none of them is
-   *  the run the steer may become. */
-  const baselinesRef = useRef(new Map<string, ReadonlySet<string>>());
-  /** Steers whose failed reply prompted a read of history, by how far
-   *  that went. */
-  const checksRef = useRef(new Map<string, 'reading' | 'read' | 'recovered'>());
-  const [checksLanded, setChecksLanded] = useState(0);
+  const baselinesRef = useRef(new Map<string, SteerBaseline>());
+  const checksRef = useRef(new Map<string, RecoveryCheck>());
+  /** Steers already handed to the recovery panel, until they leave the
+   *  queue. */
+  const recoveredRef = useRef(new Set<string>());
+  const [historyReads, setHistoryReads] = useState(0);
   const onRecoverRef = useRef(onRecover);
   useEffect(() => {
     onRecoverRef.current = onRecover;
@@ -102,6 +125,11 @@ export function useSessionPending({
       mountedRef.current = false;
     };
   }, []);
+  // Another session's history and ledger say nothing about these steers:
+  // a recovery starts over when their session opens again.
+  useEffect(() => {
+    checksRef.current.clear();
+  }, [agentId, sessionId]);
 
   useEffect(() => {
     const baselines = baselinesRef.current;
@@ -110,46 +138,85 @@ export function useSessionPending({
     for (const key of baselines.keys())
       if (!queued.has(key)) baselines.delete(key);
     for (const key of checks.keys()) if (!queued.has(key)) checks.delete(key);
-    for (const send of open)
-      if (send.mode === 'steer' && !baselines.has(send.key))
-        baselines.set(send.key, new Set(runs.map((item) => item.run.id)));
+    for (const key of recoveredRef.current)
+      if (!queued.has(key)) recoveredRef.current.delete(key);
+    for (const send of open) {
+      if (send.mode !== 'steer') continue;
+      let baseline = baselines.get(send.key);
+      if (!baseline) {
+        baseline = {
+          ids: new Set(runs.map((item) => item.run.id)),
+          before: ledger.requested,
+        };
+        baselines.set(send.key, baseline);
+      }
+      // A ledger read begun before the steer went out cannot hold its run,
+      // even when it lands later.
+      if (ledger.landed !== null && ledger.landed <= baseline.before)
+        for (const run of ledger.runs) baseline.ids.add(run.id);
+    }
 
     for (const send of open) {
-      if (!send.steeringRunId) continue;
-      const baseline = baselines.get(send.key) ?? NO_RUNS;
+      if (!send.steeringRunId || recoveredRef.current.has(send.key)) continue;
+      const baseline = baselines.get(send.key);
       const inHistory = messages.some(
         (message) => message.metadata.clientRequestId === send.key,
       );
       const ownRun = runs.some(
         (item) =>
           item.run.id !== send.steeringRunId &&
-          !baseline.has(item.run.id) &&
+          !baseline?.ids.has(item.run.id) &&
           item.run.input.text === send.text,
       );
       if (inHistory || ownRun) {
+        checks.delete(send.key);
         settle(send.key);
         continue;
       }
       const joined = runs.find((item) => item.run.id === send.steeringRunId);
       if (!joined || !endedBadly(joined.run.status)) continue;
       const check = checks.get(send.key);
-      if (check === undefined) {
-        // Its message may be committed with the failed reply: read history
-        // again, with a read that starts now, before deciding.
-        checks.set(send.key, 'reading');
+      if (!check) {
+        // Its message may be committed with the failed reply, or its own
+        // run announced after it: read both again, from now, first.
+        const started: RecoveryCheck = {
+          history: 'reading',
+          ledgerRead: refreshRuns(),
+        };
+        checks.set(send.key, started);
         const key = send.key;
-        void refreshMessages().then(() => {
-          if (!mountedRef.current || checks.get(key) !== 'reading') return;
-          checks.set(key, 'read');
-          setChecksLanded((value) => value + 1);
+        void refreshMessages().then((applied) => {
+          if (!mountedRef.current || checks.get(key) !== started) return;
+          // A read that was discarded or failed proves nothing: the next
+          // pass asks again.
+          if (applied) started.history = 'read';
+          else checks.delete(key);
+          setHistoryReads((value) => value + 1);
         });
-      } else if (check === 'read') {
-        checks.set(send.key, 'recovered');
+        continue;
+      }
+      if (
+        check.history === 'read' &&
+        ledger.landed !== null &&
+        ledger.landed >= check.ledgerRead
+      ) {
+        checks.delete(send.key);
+        recoveredRef.current.add(send.key);
         settle(send.key);
         onRecoverRef.current(send);
       }
     }
-  }, [open, sends, messages, runs, checksLanded, settle, refreshMessages]);
+  }, [
+    open,
+    sends,
+    messages,
+    runs,
+    ledger,
+    historyReads,
+    settle,
+    refreshMessages,
+    refreshRuns,
+  ]);
 
   return useMemo(() => {
     const shown = shownSteers(open, runs);

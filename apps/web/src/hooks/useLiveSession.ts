@@ -16,7 +16,7 @@ import {
 } from '../lib/session-events';
 import { mergeSessionRuns } from '../lib/transcript';
 import { useAgentEvents, type AgentStreamStatus } from './useAgentEvents';
-import { useSessionRuns } from './useSessionRuns';
+import { useSessionLedger } from './useSessionRuns';
 
 /** Live events of one kind settle this long before what they change is read. */
 export const LIVE_REFRESH_DELAY_MS = 150;
@@ -56,13 +56,32 @@ export interface LiveSessionView {
   runs: LiveRun[];
   /** The open session's reply in progress. */
   activeRun: Run | null;
+  /** The open session's runs still going, as the open stream counts them
+   *  (its snapshot has every active run); null while it is not open. */
+  activeRunCount: number | null;
   /** The newest finished reply, for a polite live region (spec §15.5). */
   announcement: string;
-  /** Reads the open session's ledger again. */
-  refreshRuns: () => void;
+  /** The open session's ledger reads: the newest one asked for, the one
+   *  whose runs are on screen (null before the session's first), and those
+   *  runs. */
+  ledger: { requested: number; landed: number | null; runs: readonly Run[] };
+  /** Reads the open session's ledger again; returns that read's number. */
+  refreshRuns: () => number;
+  /** Shows a run the daemon just accepted into the open session until the
+   *  stream or a later ledger read has it. */
+  seedRun: (run: Run) => void;
+}
+
+/** An accepted run shown before the stream or the ledger has it. */
+interface SeededRun {
+  key: string;
+  run: Run;
+  /** The newest ledger read asked for when it was accepted. */
+  after: number;
 }
 
 const NO_WATCHED: readonly string[] = [];
+const NO_SEEDS: readonly SeededRun[] = [];
 
 function clearTimers(timers: Map<Refresh, number>, kinds: readonly Refresh[]) {
   for (const kind of kinds) {
@@ -96,13 +115,21 @@ export function useLiveSession({
   const sessionId = session?.sessionId ?? null;
   const key =
     sessionAgentId && sessionId ? `${sessionAgentId}\u0000${sessionId}` : null;
+  // Ledger reads are numbered, so a caller can wait for one that began
+  // after something happened.
+  const runsRequestRef = useRef(0);
   const [runsRefresh, setRunsRefresh] = useState(0);
-  const refreshRuns = useCallback(
-    () => setRunsRefresh((value) => value + 1),
-    [],
-  );
-  const ledger = useSessionRuns(sessionAgentId, sessionId, runsRefresh);
+  const refreshRuns = useCallback(() => {
+    runsRequestRef.current += 1;
+    setRunsRefresh(runsRequestRef.current);
+    return runsRequestRef.current;
+  }, []);
+  const ledger = useSessionLedger(sessionAgentId, sessionId, runsRefresh);
 
+  const [announced, setAnnounced] = useState<{
+    key: string;
+    text: string;
+  } | null>(null);
   const timersRef = useRef(new Map<Refresh, number>());
   // A companion's refreshes end with it (and with the view); the open
   // session's end when another opens, which reads its own on open.
@@ -111,6 +138,9 @@ export function useLiveSession({
     return () => clearTimers(timers, ['sessions', ...SESSION_REFRESHES]);
   }, [agentId]);
   useEffect(() => {
+    // A reply announced in the session left behind is not read again when
+    // it is reopened.
+    setAnnounced(null);
     const timers = timersRef.current;
     return () => clearTimers(timers, SESSION_REFRESHES);
   }, [key]);
@@ -126,10 +156,6 @@ export function useLiveSession({
     );
   };
 
-  const [announced, setAnnounced] = useState<{
-    key: string;
-    text: string;
-  } | null>(null);
   /** Finished replies already announced, so a repeat is not read again. */
   const announcedRunsRef = useRef(new Set<string>());
   const announce = (openKey: string, runId: string) => {
@@ -177,22 +203,54 @@ export function useLiveSession({
   };
   const live = useAgentEvents(agentId, onEvent);
 
-  const runs = useMemo(
-    () =>
-      sessionAgentId && sessionId
-        ? mergeSessionRuns(
-            sessionLiveRuns(live.state, sessionAgentId, sessionId),
-            ledger,
-          )
-        : [],
-    [sessionAgentId, sessionId, live.state, ledger],
+  // Accepted runs fill the gap between the daemon's answer and the
+  // stream's `run.queued` or the ledger's next read (spec §15.2).
+  const [seeds, setSeeds] = useState(NO_SEEDS);
+  const keyRef = useRef(key);
+  keyRef.current = key;
+  const seedRun = useCallback((run: Run) => {
+    const runKey = `${run.agentId}\u0000${run.sessionId}`;
+    if (runKey !== keyRef.current) return;
+    const seed = { key: runKey, run, after: runsRequestRef.current };
+    setSeeds((current) => [
+      ...current.filter((item) => item.run.id !== run.id),
+      seed,
+    ]);
+  }, []);
+  const seedAnswered = useCallback(
+    (seed: SeededRun) =>
+      seed.key !== key ||
+      seed.run.id in live.state.runs ||
+      (ledger.landed !== null && ledger.landed > seed.after) ||
+      ledger.runs.some((run) => run.id === seed.run.id),
+    [key, live.state, ledger],
   );
+  useEffect(() => {
+    setSeeds((current) => {
+      const kept = current.filter((seed) => !seedAnswered(seed));
+      return kept.length === current.length ? current : kept;
+    });
+  }, [seedAnswered]);
+
+  const runs = useMemo(() => {
+    if (!sessionAgentId || !sessionId) return [];
+    const seeded = seeds
+      .filter((seed) => !seedAnswered(seed))
+      .map((seed) => seed.run);
+    return mergeSessionRuns(
+      sessionLiveRuns(live.state, sessionAgentId, sessionId),
+      seeded.length > 0 ? [...ledger.runs, ...seeded] : ledger.runs,
+    );
+  }, [sessionAgentId, sessionId, live.state, ledger, seeds, seedAnswered]);
   const activeRun = runs.find((item) => isActiveRun(item.run))?.run ?? null;
+  const streamOpen = live.status === 'open';
+  const activeRunCount = streamOpen
+    ? runs.filter((item) => !isTerminalRunStatus(item.run.status)).length
+    : null;
 
   // Without the stream nothing says a run ended: the listing's count moving
   // does (the sidebar polls).
   const listedRef = useRef<{ key: string; count: number } | null>(null);
-  const streamOpen = live.status === 'open';
   useEffect(() => {
     if (!key || listedActiveRuns === null) return;
     const previous = listedRef.current;
@@ -236,12 +294,24 @@ export function useLiveSession({
     if (stale) refreshRuns();
   }, [key, messages, runs, watchedRunIds, refreshRuns]);
 
+  const ledgerView = useMemo(
+    () => ({
+      requested: runsRefresh,
+      landed: ledger.landed,
+      runs: ledger.runs,
+    }),
+    [runsRefresh, ledger],
+  );
+
   return {
     status: live.status,
     state: live.state,
     runs,
     activeRun,
+    activeRunCount,
     announcement: announced && announced.key === key ? announced.text : '',
+    ledger: ledgerView,
     refreshRuns,
+    seedRun,
   };
 }

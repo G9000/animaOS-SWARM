@@ -3643,3 +3643,106 @@ it('polls slowly while the stream is open and reads full records for Settings', 
     expect(vi.mocked(daemon.listAgents).mock.calls.length).toBe(fullReads + 1),
   );
 });
+
+it('does not offer a failed reply’s steer twice when the ledger shows it as its own run', async () => {
+  const { stream, run } = await steerIntoRunningReply();
+  // The commit failed: the joined run fails first, and the steer's own
+  // `failed_before_start` run is announced only after a second save, so
+  // the ledger read after the failure is the first to show it.
+  const ledger = deferred<Awaited<ReturnType<typeof daemon.sessionRuns>>>();
+  vi.mocked(daemon.sessionRuns).mockReturnValue(ledger.promise);
+  const failed = {
+    ...run,
+    status: 'failed' as const,
+    finishedAtMs: Date.now(),
+    error: { code: 'commit_failed', message: 'The reply could not be saved' },
+  };
+  const readMessages = vi.mocked(daemon.sessionMessages);
+  const before = readMessages.mock.calls.length;
+  act(() => stream.push(runEvent('run.failed', failed, 2)));
+  // History, read again at once, lands first, without the steer.
+  await waitFor(() =>
+    expect(readMessages.mock.calls.length).toBeGreaterThan(before),
+  );
+  await act(async () => {
+    await readMessages.mock.results[before].value;
+  });
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByText('Joining the reply in progress…')).toBeVisible();
+
+  await act(async () =>
+    ledger.resolve([
+      runFixture('run_8', {
+        sessionId: 'room-7',
+        status: 'interrupted',
+        createdAtMs: Date.now(),
+        error: {
+          code: 'failed_before_start',
+          message:
+            'The run this message joined failed before reading it; send it again.',
+        },
+        input: { text: 'also check trains', attachmentIds: [], skill: null },
+      }),
+      failed,
+    ]),
+  );
+  expect(
+    await screen.findByText(
+      'The run this message joined failed before reading it; send it again.',
+    ),
+  ).toBeVisible();
+  expect(screen.getByText('also check trains')).toBeVisible();
+  expect(
+    screen.queryByText('Joining the reply in progress…'),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+});
+
+it('does not announce a session’s last reply again when it is reopened', async () => {
+  const user = userEvent.setup();
+  routes.sessions.push(
+    sessionFixture('chat:other', {
+      title: 'Other plans',
+      lastActivityAtMs: Date.now() - 1,
+    }),
+  );
+  const { stream } = await openLiveSession();
+  const run = runningRun();
+  act(() =>
+    stream.push(
+      snapshotEvent([snapshotRun(run)]),
+      runEvent(
+        'run.completed',
+        { ...run, status: 'completed', finishedAtMs: Date.now() },
+        2,
+      ),
+    ),
+  );
+  expect(await screen.findByText('Nova replied.')).toBeInTheDocument();
+  const region = () => document.querySelector('p.sr-only[aria-live="polite"]');
+
+  await user.click(screen.getByRole('button', { name: 'Other plans' }));
+  await screen.findByRole('heading', { name: 'Other plans' });
+  expect(region()?.textContent).toBe('');
+  await user.click(screen.getByRole('button', { name: 'Weekend plans' }));
+  await screen.findByRole('heading', { name: 'Weekend plans' });
+  expect(region()?.textContent).toBe('');
+});
+
+it('shows an accepted message as its queued run right after the daemon accepts it', async () => {
+  const user = userEvent.setup();
+  const { input } = await openLiveSession();
+  // Without the stream, the ledger's next read is slow to answer.
+  const ledger = deferred<Awaited<ReturnType<typeof daemon.sessionRuns>>>();
+  vi.mocked(daemon.sessionRuns).mockReturnValue(ledger.promise);
+
+  await user.type(input, 'Book the train{Enter}');
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(1));
+  expect(await screen.findByText('Queued')).toBeVisible();
+  expect(screen.getByText('Book the train')).toBeVisible();
+  expect(screen.queryByText('Sending…')).not.toBeInTheDocument();
+});

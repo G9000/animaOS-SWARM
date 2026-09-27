@@ -114,8 +114,11 @@ export function useSessionMessages(
     setOlderError(null);
   }, [agentId, sessionId]);
 
-  const refresh = useCallback(async () => {
-    if (!agentId || !sessionId) return;
+  /** Reads the newest page; true once that page is what the view shows,
+   *  false when the read failed or a newer read or another session
+   *  superseded it. */
+  const refresh = useCallback(async (): Promise<boolean> => {
+    if (!agentId || !sessionId) return false;
     const sessionEpoch = generation.current;
     const request = ++refreshGeneration.current;
     try {
@@ -126,7 +129,7 @@ export function useSessionMessages(
         sessionEpoch !== generation.current ||
         request !== refreshGeneration.current
       )
-        return;
+        return false;
       const previous = messagesRef.current;
       const merged = mergeNewest(previous, page.messages);
       messagesRef.current = merged;
@@ -140,18 +143,20 @@ export function useSessionMessages(
       missingRef.current = false;
       setMissing(false);
       setNewestError(null);
+      return true;
     } catch (caught) {
       if (
         sessionEpoch !== generation.current ||
         request !== refreshGeneration.current
       )
-        return;
+        return false;
       if (httpStatus(caught) === 404) {
         missingRef.current = true;
         setMissing(true);
       } else {
         setNewestError(errorText(caught));
       }
+      return false;
     }
   }, [agentId, sessionId]);
 

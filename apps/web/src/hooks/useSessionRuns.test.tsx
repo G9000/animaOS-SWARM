@@ -4,7 +4,11 @@ import { DaemonHttpError } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
 import { runFixture } from '../test/live';
-import { SESSION_RUNS_LIMIT, useSessionRuns } from './useSessionRuns';
+import {
+  SESSION_RUNS_LIMIT,
+  useSessionLedger,
+  useSessionRuns,
+} from './useSessionRuns';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -47,5 +51,30 @@ describe('useSessionRuns', () => {
     expect(result.current).toEqual([]);
     await waitFor(() => expect(daemon.sessionRuns).toHaveBeenCalledTimes(2));
     expect(result.current).toEqual([]);
+  });
+
+  it('says which refresh the runs on screen were read for', async () => {
+    const list = vi
+      .spyOn(daemon, 'sessionRuns')
+      .mockResolvedValueOnce([runFixture('run_1')])
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce([runFixture('run_2')]);
+    const { result, rerender } = renderHook(
+      ({ sessionId, refresh }) =>
+        useSessionLedger('agent-main', sessionId, refresh),
+      { initialProps: { sessionId: 'chat:1', refresh: 4 } },
+    );
+    expect(result.current.landed).toBe(null);
+    await waitFor(() => expect(result.current.landed).toBe(4));
+
+    // A failed read keeps what landed before.
+    rerender({ sessionId: 'chat:1', refresh: 5 });
+    await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    expect(result.current).toEqual({ runs: [runFixture('run_1')], landed: 4 });
+
+    // Another session has landed nothing until its own read does.
+    rerender({ sessionId: 'chat:2', refresh: 5 });
+    expect(result.current).toEqual({ runs: [], landed: null });
+    await waitFor(() => expect(result.current.landed).toBe(5));
   });
 });

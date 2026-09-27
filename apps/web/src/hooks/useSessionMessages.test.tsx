@@ -571,6 +571,79 @@ describe('useSessionMessages', () => {
     ]);
   });
 
+  it('says whether a refresh’s page reached the view', async () => {
+    capturePolls();
+    let answer: (page: SessionMessagePage) => void = () => undefined;
+    const read = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockResolvedValueOnce({ messages: [], nextBefore: null });
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useSessionMessages('agent-main', sessionId),
+      { initialProps: { sessionId: 'chat:1' } },
+    );
+    await waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+
+    read.mockResolvedValueOnce({
+      messages: [message('m1', 1)],
+      nextBefore: null,
+    });
+    let applied: boolean | undefined;
+    await act(async () => {
+      applied = await result.current.refresh();
+    });
+    expect(applied).toBe(true);
+
+    read.mockRejectedValueOnce(new Error('offline'));
+    await act(async () => {
+      applied = await result.current.refresh();
+    });
+    expect(applied).toBe(false);
+
+    // A newer read supersedes it.
+    read
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            answer = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        messages: [message('m2', 2)],
+        nextBefore: null,
+      });
+    let first: Promise<boolean> = Promise.resolve(true);
+    act(() => {
+      first = result.current.refresh();
+    });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    answer({ messages: [], nextBefore: null });
+    await act(async () => {
+      applied = await first;
+    });
+    expect(applied).toBe(false);
+
+    // So does a change of session while it reads.
+    read.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    );
+    act(() => {
+      first = result.current.refresh();
+    });
+    read.mockResolvedValue({ messages: [], nextBefore: null });
+    rerender({ sessionId: 'chat:2' });
+    answer({ messages: [message('m3', 3)], nextBefore: null });
+    await act(async () => {
+      applied = await first;
+    });
+    expect(applied).toBe(false);
+    expect(result.current.messages).toEqual([]);
+  });
+
   it('polls at the interval its caller gives', async () => {
     const armed: number[] = [];
     vi.spyOn(window, 'setTimeout').mockImplementation(((

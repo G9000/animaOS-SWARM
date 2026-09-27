@@ -8,7 +8,6 @@ import {
 } from 'react';
 import {
   isTerminalRunStatus,
-  type Run,
   type RunMode,
   type Session,
 } from '@animaOS-SWARM/sdk';
@@ -25,6 +24,7 @@ import { useAgentIntegrations } from './hooks/useAgentIntegrations';
 import { useCompanionSessions } from './hooks/useCompanionSessions';
 import { useDaemonBootstrap } from './hooks/useDaemonBootstrap';
 import { useLiveSession } from './hooks/useLiveSession';
+import { useSessionCommands } from './hooks/useSessionCommands';
 import { useSessionPending } from './hooks/useSessionPending';
 import { useSessionSends } from './hooks/useSessionSends';
 import { useTranscriptActions } from './hooks/useTranscriptActions';
@@ -45,13 +45,7 @@ import { selectMainAgent } from './lib/agent-access';
 import { useHashRoute, type HashRoute } from './lib/hash-route';
 import { exportFileName, sessionKey } from './lib/session-groups';
 import { loadDraft, storeDraft } from './lib/drafts';
-import {
-  SLASH_COMMANDS,
-  parseSlashCommand,
-  runSlashCommand,
-  type SlashCommandHandlers,
-} from './lib/slash-commands';
-import type { HelperTarget } from './lib/transcript';
+import { SLASH_COMMANDS } from './lib/slash-commands';
 import { safeIntegrationError } from './lib/telegram';
 
 interface AgentOperation {
@@ -384,6 +378,8 @@ export function ViewHarness() {
         updateChat(item.conversation, {
           delivery: { runId: result.run.id, queued: false },
         });
+      // Its row shows at once, not only once the stream or ledger has it.
+      if (!result.steer) live.seedRun(result.run);
       refreshConversation();
     },
     onFailed: (item, caught) => {
@@ -433,7 +429,9 @@ export function ViewHarness() {
     session: activeSession ? openRoute : null,
     messages: history.messages,
     runs: live.runs,
+    ledger: live.ledger,
     refreshMessages: history.refresh,
+    refreshRuns: live.refreshRuns,
     onRecover: (item) => {
       if (!availableAgentIdsRef.current.has(item.agentId)) return;
       // A new key when sent again: the steer's may still name its old run.
@@ -445,19 +443,15 @@ export function ViewHarness() {
       }));
     },
   });
-  // The stream knows each active run (its snapshot and events), so a
-  // listing read before its newest events does not keep "is thinking" up.
+  // A listing read before the stream's newest events does not keep
+  // "is thinking" up: the open stream counts the active runs.
+  const { activeRunCount } = live;
   const viewedSession = useMemo(
     () =>
-      activeSession && live.status === 'open'
-        ? {
-            ...activeSession,
-            activeRuns: live.runs.filter(
-              (item) => !isTerminalRunStatus(item.run.status),
-            ).length,
-          }
+      activeSession && activeRunCount !== null
+        ? { ...activeSession, activeRuns: activeRunCount }
         : activeSession,
-    [activeSession, live.status, live.runs],
+    [activeSession, activeRunCount],
   );
   const [settingsSaveError, setSettingsSaveError] = useState<string | null>(
     null,
@@ -823,83 +817,7 @@ export function ViewHarness() {
     queueSend(session, target, text, crypto.randomUUID());
   };
 
-  /** The commands the composer runs itself (spec §15.3). */
-  const slashHandlers = (): SlashCommandHandlers => {
-    const handlers: SlashCommandHandlers = {
-      new: () => newChat(),
-      help: () => setDraft('/'),
-      search: (words) => setSessionQuery(words),
-      model: () => openSettings(),
-    };
-    const session = activeSession;
-    if (!session) return handlers;
-    if (activeRun && session.capabilities.stop) {
-      const run = activeRun;
-      handlers.stop = () => void stopRun(run);
-    }
-    if (session.capabilities.rename)
-      handlers.rename = (title) => void renameSession(session, title);
-    if (session.capabilities.archive)
-      handlers.archive = () => void archiveSession(session, !session.archived);
-    if (session.capabilities.export)
-      handlers.export = () => void exportSession(session);
-    if (session.capabilities.compact)
-      handlers.compact = () => void compactSession(session);
-    return handlers;
-  };
-
-  const submit = (mode: RunMode, override?: string) => {
-    if (
-      !agent ||
-      connection !== 'online' ||
-      resetInFlightRef.current !== null ||
-      daemonTooOld
-    )
-      return;
-    const text = (override ?? draft).trim();
-    if (!text) return;
-    const command = parseSlashCommand(text);
-    if (command && activeChatKey) {
-      updateChat(activeChatKey, { draft: '', error: null });
-      const problem = runSlashCommand(command, slashHandlers());
-      // A command that cannot run here says why and stays in the composer.
-      if (problem) updateChat(activeChatKey, { draft: text, error: problem });
-      return;
-    }
-    if (!routeSessionId) {
-      void startChat(agent.id, text);
-      return;
-    }
-    // Until its record loads, the session's kind is unknown.
-    if (!activeSession) return;
-    if (activeSession.kind === 'telegram' && !activeConnector) return;
-    const key = chatKey(agent.id, sessionConversation(routeSessionId));
-    // A restored message sent unchanged keeps its key; anything else is new.
-    const idempotencyKey =
-      chat.resend?.text === text
-        ? chat.resend.idempotencyKey
-        : crypto.randomUUID();
-    updateChat(key, { draft: '', error: null, resend: null, delivery: null });
-    queueSend(
-      activeSession,
-      key,
-      text,
-      idempotencyKey,
-      mode === 'steer' && activeRun && activeSession.capabilities.steer
-        ? 'steer'
-        : 'queue',
-    );
-  };
-  const send = (override?: string) => submit('queue', override);
-  const steer = () => submit('steer');
-
   const newChat = () => navigate({ kind: 'home' });
-  const openSession = (session: Session) =>
-    navigate({
-      kind: 'session',
-      sessionId: session.id,
-      ...(session.agentId !== agentId ? { agentId: session.agentId } : {}),
-    });
   const renameSession = async (session: Session, title: string) => {
     try {
       await daemon.updateSession(session.agentId, session.id, { title });
@@ -954,62 +872,42 @@ export function ViewHarness() {
     }
   };
 
-  /** A fresh record replaces the listed or known copy. */
-  const adoptSessionRecord = (session: Session) => {
-    const key = sessionKey(session);
-    if (listedSessionsRef.current.some((item) => sessionKey(item) === key))
-      sessions.upsert(session);
-    setKnownSession((current) =>
-      current && sessionKey(current) === key ? session : current,
-    );
-  };
-
-  /** Stops a run (spec §4.6): the reply in progress, or a queued message. */
-  const stopRun = async (run: Pick<Run, 'agentId' | 'id'>) => {
-    try {
-      await daemon.stopRun(run.agentId, run.id);
-      live.refreshRuns();
-    } catch (caught) {
-      setWorkspaceError(errorMessage(caught));
-    }
-  };
-
-  /** Folds earlier turns into the session summary (spec §5.4); the summary
-   *  arrives with `session.updated`. */
-  const compactSession = async (session: Session) => {
-    try {
-      adoptSessionRecord(
-        await daemon.compactSession(session.agentId, session.id),
-      );
-      setWorkspaceError(null);
-    } catch (caught) {
-      setWorkspaceError(errorMessage(caught));
-    }
-  };
-
-  /** Sends a failed or interrupted run's message again, as a new message. */
-  const sendAgain = (run: Run) => {
-    if (
-      !agent ||
-      !activeSession ||
-      run.agentId !== activeSession.agentId ||
-      run.sessionId !== activeSession.id
-    )
-      return;
-    queueSend(
-      activeSession,
-      chatKey(agent.id, sessionConversation(activeSession.id)),
-      run.input.text,
-      crypto.randomUUID(),
-    );
-  };
-
-  const openTarget = (target: HelperTarget) =>
-    navigate({
-      kind: 'session',
-      sessionId: target.sessionId,
-      ...(target.agentId !== agentId ? { agentId: target.agentId } : {}),
-    });
+  const commands = useSessionCommands({
+    companionId: agentId,
+    canSend: () =>
+      agent !== null &&
+      connection === 'online' &&
+      resetInFlightRef.current === null &&
+      !daemonTooOld,
+    routeSessionId,
+    session: activeSession,
+    chatKey: activeChatKey,
+    draft,
+    resend: chat.resend,
+    telegramReady: activeConnector !== null,
+    activeRun,
+    updateChat,
+    startChat: (text) => {
+      if (agent) void startChat(agent.id, text);
+    },
+    queueSend,
+    refreshRuns: live.refreshRuns,
+    setError: setWorkspaceError,
+    navigate,
+    listedSessions: sessions.sessions,
+    upsertSession: sessions.upsert,
+    setKnownSession,
+    newChat,
+    showCommands: () => setDraft('/'),
+    search: setSessionQuery,
+    chooseModel: openSettings,
+    rename: renameSession,
+    archive: archiveSession,
+    exportSession,
+  });
+  const { stopRun } = commands;
+  const openSession = (session: Session) =>
+    commands.openTarget({ agentId: session.agentId, sessionId: session.id });
   const transcriptActions = useTranscriptActions({
     session: activeSession,
     // A Telegram session's messages need its connector.
@@ -1017,9 +915,9 @@ export function ViewHarness() {
     liveRuns: live.state.runs,
     sessions: sessions.sessions,
     stopRun: (run) => void stopRun(run),
-    sendAgain,
-    compact: (session) => void compactSession(session),
-    openSession: openTarget,
+    sendAgain: commands.sendAgain,
+    compact: (session) => void commands.compactSession(session),
+    openSession: commands.openTarget,
   });
 
   if (connection === 'unknown' || (connection === 'online' && !loaded)) {
@@ -1123,7 +1021,7 @@ export function ViewHarness() {
         // Usable while the companion works: messages queue (spec §15.3).
         disabled: resetting || sessionLoading || daemonTooOld,
         offline: connection === 'offline',
-        onSend: send,
+        onSend: commands.send,
         error: workspaceError,
         onDismissError: () => setWorkspaceError(null),
         commands: SLASH_COMMANDS,
@@ -1133,7 +1031,9 @@ export function ViewHarness() {
             ? () => void stopRun(activeRun)
             : undefined,
         onSteer:
-          activeRun && activeSession?.capabilities.steer ? steer : undefined,
+          activeRun && activeSession?.capabilities.steer
+            ? commands.steer
+            : undefined,
         recovery:
           failedDraft && !sending
             ? {
