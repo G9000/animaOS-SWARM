@@ -265,7 +265,10 @@ async fn a_retried_steer_is_answered_once_and_a_changed_text_conflicts() {
         message(&agent_id, "key-2", "also this", SessionRunMode::Steer),
     )
     .await;
-    assert!(matches!(&retried, AcceptedRun::Replayed(record) if record.id == first.id));
+    assert!(
+        matches!(&retried, AcceptedRun::ReplayedSteer(record) if record.id == first.id),
+        "still waiting in the run it joined: {retried:?}"
+    );
     let start = coordinator.web_start(
         agent_id.clone(),
         "chat:s".into(),

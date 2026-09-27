@@ -181,6 +181,10 @@ pub(crate) enum AcceptedRun {
     Replayed(RunRecord),
     /// Joined the session's active run as a steer (202, spec §4.7): that run.
     Steered(RunRecord),
+    /// The key was used within 24 hours for a steer that still waits in the
+    /// running run it joined: that run, answered as a steer (200, final fix
+    /// wave S2-C).
+    ReplayedSteer(RunRecord),
 }
 
 /// What a run's execution left in its steering (spec §4.7).
@@ -273,7 +277,8 @@ fn replayed(
 }
 
 /// A reused key of a steer within the window (spec §4.2): the run it joined,
-/// found in the ledger; a different session or text is a conflict. The run's transcript
+/// found in the ledger, as a steer while it still waits there; a different
+/// session or text is a conflict. The run's transcript
 /// is read only for a steer it already took in, and only its session's room
 /// (audit M28).
 fn steer_replay(
@@ -298,9 +303,14 @@ fn steer_replay(
     if !same {
         return Err(ApiError::conflict(IDEMPOTENCY_KEY_REUSED));
     }
-    Ok(Some(AcceptedRun::Replayed(
-        state.with_live_tools(run.clone()),
-    )))
+    // Still waiting in the run it joined: answered as the steer it is.
+    let waiting = pending.is_some() && run.status.is_in_flight();
+    let run = state.with_live_tools(run.clone());
+    Ok(Some(if waiting {
+        AcceptedRun::ReplayedSteer(run)
+    } else {
+        AcceptedRun::Replayed(run)
+    }))
 }
 
 /// The text of the steer `run` took in with `key`, from its session's room.

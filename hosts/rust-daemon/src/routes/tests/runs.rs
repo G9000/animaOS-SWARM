@@ -1867,6 +1867,59 @@ async fn a_steer_into_the_active_run_answers_202_with_a_pending_steer() {
     wait_for(&state, &key_two, RunStatus::Completed).await;
 }
 
+/// Final fix wave S2-C (review B, Minor 3): a retried steer still pending on
+/// the running run it joined is answered as a steer, `200` with that run and
+/// `steer: { status: "pending" }`; once it became a message of its own, the
+/// retry is answered with that run.
+#[tokio::test]
+async fn a_retried_steer_still_pending_is_answered_as_a_steer() {
+    let gate = Gate::new();
+    let (app, state, agent) = app_with_chat(ScriptedModel::gated(vec![], gate.clone())).await;
+    let first = accept_message(&app, &agent, "key-1").await;
+    gate.entered().await;
+    let steer = || {
+        start_request(
+            &agent,
+            "chat:plans",
+            Some("key-2"),
+            json!({"text": "and also", "mode": "steer"}),
+        )
+    };
+    let joined = app.clone().oneshot(steer()).await.unwrap();
+    assert_eq!(joined.status(), StatusCode::ACCEPTED);
+
+    let retried = app.clone().oneshot(steer()).await.unwrap();
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(retried.headers()["cache-control"], "no-store");
+    let body = json_body(retried).await;
+    assert_eq!(body["run"]["id"], first.as_str());
+    assert_eq!(body["run"]["status"], "running");
+    assert_eq!(body["steer"]["status"], "pending");
+
+    // One model call ends the first run, so the steer becomes its own message.
+    gate.release();
+    gate.entered().await;
+    gate.release();
+    let own = loop {
+        let found = state
+            .read()
+            .await
+            .runs
+            .find_by_idempotency_key(&agent, "key-2", 0)
+            .map(|record| record.id.clone());
+        if let Some(id) = found {
+            break id;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    wait_for(&state, &own, RunStatus::Completed).await;
+    let after = app.clone().oneshot(steer()).await.unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+    let body = json_body(after).await;
+    assert_eq!(body["run"]["id"], own.as_str());
+    assert!(body.get("steer").is_none(), "no longer a pending steer");
+}
+
 fn compact_request(agent: &str, session: &str, origin: &str) -> Request<Body> {
     Request::builder()
         .method("POST")

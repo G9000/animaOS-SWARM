@@ -128,7 +128,7 @@ fn run_limit(uri: &Uri) -> Result<usize, ApiError> {
     ),
     request_body = StartRunRequest,
     responses(
-        (status = 200, description = "The key was used for this message within 24 hours: the original run, nothing created", body = RunEnvelope),
+        (status = 200, description = "The key was used for this message within 24 hours: the original run, nothing created; a retried steer still waiting in the run it joined is that run with steer.status pending", body = RunEnvelope),
         (status = 202, description = "Accepted: the queued run, or the active run a steer joined (with steer.status pending)", body = RunEnvelope),
         (status = 400, description = "Missing or invalid key, empty text with no attachments, text over 32 KiB, over 10 or unknown attachments, unknown skill, steer on a kind that cannot steer, or a body over 256 KiB", body = ErrorBody),
         (status = 403, description = "Local owner required", body = ErrorBody),
@@ -271,16 +271,23 @@ fn accepted_response(accepted: Result<AcceptedRun, ApiError>) -> Response {
         Ok(AcceptedRun::Replayed(record)) => {
             no_store(json_response(StatusCode::OK, &RunEnvelope::of(&record)))
         }
-        Ok(AcceptedRun::Steered(record)) => no_store(json_response(
-            StatusCode::ACCEPTED,
-            &RunEnvelope {
-                run: RunResponse::from(&record),
-                steer: Some(SteerStatusResponse {
-                    status: "pending".into(),
-                }),
-            },
-        )),
+        Ok(AcceptedRun::Steered(record)) => {
+            no_store(json_response(StatusCode::ACCEPTED, &pending_steer(&record)))
+        }
+        Ok(AcceptedRun::ReplayedSteer(record)) => {
+            no_store(json_response(StatusCode::OK, &pending_steer(&record)))
+        }
         Err(error) => rejected(error),
+    }
+}
+
+/// The run a steer joined, with the steer still waiting in it.
+fn pending_steer(record: &crate::runs::RunRecord) -> RunEnvelope {
+    RunEnvelope {
+        run: RunResponse::from(record),
+        steer: Some(SteerStatusResponse {
+            status: "pending".into(),
+        }),
     }
 }
 
