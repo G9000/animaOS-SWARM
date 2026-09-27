@@ -357,7 +357,11 @@ impl ToolRegistry {
                     ),
                     optional_parameter(
                         "limit",
-                        integer_parameter("Most sessions to return, 1 to 10 (default 5)", 1),
+                        bounded_integer_parameter(
+                            "Most sessions to return, 1 to 10 (default 5)",
+                            1,
+                            conversations::MAX_RESULTS as u64,
+                        ),
                     ),
                 ]),
             ),
@@ -900,6 +904,15 @@ fn non_blank_string_parameter(description: &str) -> DataValue {
 fn integer_parameter(description: &str, minimum: u64) -> DataValue {
     let mut schema = typed_parameter_schema("integer", description);
     schema.insert("minimum".into(), DataValue::Number(minimum as f64));
+    DataValue::Object(schema)
+}
+
+/// `integer_parameter` with a `maximum` too.
+fn bounded_integer_parameter(description: &str, minimum: u64, maximum: u64) -> DataValue {
+    let DataValue::Object(mut schema) = integer_parameter(description, minimum) else {
+        unreachable!("integer_parameter builds an object schema");
+    };
+    schema.insert("maximum".into(), DataValue::Number(maximum as f64));
     DataValue::Object(schema)
 }
 

@@ -8,7 +8,7 @@ use super::ToolExecutionContext;
 use crate::sessions::views::{SessionView, MAX_SEARCH_QUERY_CHARS};
 
 const DEFAULT_RESULTS: usize = 5;
-const MAX_RESULTS: usize = 10;
+pub(super) const MAX_RESULTS: usize = 10;
 
 fn excerpts(query: &str, views: &[SessionView]) -> String {
     if views.is_empty() {

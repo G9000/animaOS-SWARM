@@ -383,6 +383,15 @@ fn registry_encodes_parameter_constraints() {
     for property in ["offset", "limit"] {
         assert_property_schema(&registry, "read_file", property, "integer", Some(0.0), None);
     }
+    // Final fix wave S2-L (deferred T14): the schema says what the tool enforces.
+    assert_property_schema(
+        &registry,
+        "search_conversations",
+        "limit",
+        "integer",
+        Some(1.0),
+        Some(10.0),
+    );
     assert_property_schema(
         &registry,
         "memory_add",
