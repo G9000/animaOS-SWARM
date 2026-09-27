@@ -10,6 +10,14 @@ import {
   type SessionCommandOptions,
 } from './useSessionCommands';
 
+function deferred<Value>() {
+  let resolve!: (value: Value) => void;
+  const promise = new Promise<Value>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 const CHAT_KEY = 'agent-main\u0000session:room-7';
 const readOnly = {
   send: false,
@@ -165,6 +173,32 @@ describe('useSessionCommands', () => {
       error: 'Add a title after /rename.',
     });
     expect(options.queueSend).not.toHaveBeenCalled();
+  });
+
+  it('shows Compact pending while a manual compaction is in flight (S3b-C)', async () => {
+    const pending = deferred<Session>();
+    vi.spyOn(daemon, 'compactSession').mockReturnValue(pending.promise);
+    const { result, options } = setup();
+
+    expect(result.current.compacting).toBe(false);
+    act(() => void result.current.compactSession(options.session!));
+    expect(result.current.compacting).toBe(true);
+
+    await act(async () =>
+      pending.resolve(sessionFixture('room-7', { summary: 'Plans so far' })),
+    );
+    expect(result.current.compacting).toBe(false);
+  });
+
+  it('clears Compact pending even when the compaction fails', async () => {
+    vi.spyOn(daemon, 'compactSession').mockRejectedValue(
+      new Error('model unavailable'),
+    );
+    const { result, options } = setup();
+
+    await act(async () => result.current.compactSession(options.session!));
+    expect(result.current.compacting).toBe(false);
+    expect(options.setError).toHaveBeenCalledWith('model unavailable');
   });
 
   it('offers no session command a read-only session lacks', () => {

@@ -280,7 +280,12 @@ const TranscriptEntry = memo(function TranscriptEntry({
         <PendingMessage pending={item.pending} renderMessage={renderBubble} />
       );
     case 'trimmed':
-      return <TrimmedDivider onCompact={actions?.onCompact} />;
+      return (
+        <TrimmedDivider
+          onCompact={actions?.onCompact}
+          compacting={actions?.compacting}
+        />
+      );
   }
 });
 

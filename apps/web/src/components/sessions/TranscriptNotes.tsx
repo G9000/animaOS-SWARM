@@ -1,7 +1,15 @@
 import { MarkdownMessage } from '../MarkdownMessage';
 
-/** Where the companion's view of the session begins (spec §5.3). */
-export function TrimmedDivider({ onCompact }: { onCompact?: () => void }) {
+/** Where the companion's view of the session begins (spec §5.3). Manual
+ *  Compact disables and shows progress while its request is in flight
+ *  (S3b-C). */
+export function TrimmedDivider({
+  onCompact,
+  compacting = false,
+}: {
+  onCompact?: () => void;
+  compacting?: boolean;
+}) {
   return (
     <div className="context-trimmed">
       {/* The separator role belongs on a decorative element, never one
@@ -14,8 +22,9 @@ export function TrimmedDivider({ onCompact }: { onCompact?: () => void }) {
           type="button"
           className="studio-tool-button"
           onClick={onCompact}
+          disabled={compacting}
         >
-          Compact
+          {compacting ? 'Compacting…' : 'Compact'}
         </button>
       )}
     </div>

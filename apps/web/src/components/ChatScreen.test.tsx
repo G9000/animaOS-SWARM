@@ -287,6 +287,25 @@ describe('MessageList', () => {
     expect(separator.contains(button)).toBe(false);
   });
 
+  it('disables Compact and shows its progress while pending (S3b-C)', () => {
+    const onCompact = vi.fn();
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        items={[{ kind: 'trimmed', key: 'trimmed' }]}
+        actions={{ onCompact, compacting: true }}
+      />,
+    );
+
+    const button = screen.getByRole('button', { name: 'Compacting…' });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(onCompact).not.toHaveBeenCalled();
+  });
+
   it('renders a helper session’s delegated turn from the delegating companion, not the owner', () => {
     render(
       <MessageList

@@ -42,6 +42,8 @@ export interface TranscriptActionOptions {
   /** Sends a run's message again; false when it could not go. */
   sendAgain: (run: Run) => boolean;
   compact: (session: Session) => void;
+  /** A manual Compact is in flight (S3b-C). */
+  compacting: boolean;
   openSession: (target: HelperTarget) => void;
 }
 
@@ -64,6 +66,7 @@ export function useTranscriptActions({
   stopRun,
   sendAgain,
   compact,
+  compacting,
   openSession,
 }: TranscriptActionOptions): TranscriptActions {
   const latestRef = useRef({ stopRun, sendAgain, compact, openSession });
@@ -97,12 +100,15 @@ export function useTranscriptActions({
         : {}),
       resentRunIds: resent,
       ...(compactable
-        ? { onCompact: () => latestRef.current.compact(compactable) }
+        ? {
+            onCompact: () => latestRef.current.compact(compactable),
+            compacting,
+          }
         : {}),
       helperSession: (step) =>
         helperSessionTarget(step, liveRunsRef.current, sessions),
       onOpenSession: (target) => latestRef.current.openSession(target),
     }),
-    [cancellable, canResend, compactable, sessions, resent],
+    [cancellable, canResend, compactable, sessions, resent, compacting],
   );
 }

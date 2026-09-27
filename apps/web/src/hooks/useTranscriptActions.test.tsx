@@ -68,6 +68,7 @@ describe('useTranscriptActions', () => {
       stopRun: vi.fn(),
       sendAgain: vi.fn(),
       compact: vi.fn(),
+      compacting: false,
       openSession: vi.fn(),
       ...overrides,
     };
@@ -83,6 +84,29 @@ describe('useTranscriptActions', () => {
     expect(options.stopRun).toHaveBeenCalledWith(run);
     expect(options.sendAgain).toHaveBeenCalledWith(run);
     expect(options.compact).toHaveBeenCalledWith(options.session);
+    expect(result.current.compacting).toBe(false);
+  });
+
+  it('reports a manual compaction in flight (S3b-C)', () => {
+    const options: TranscriptActionOptions = {
+      session: sessionFixture('room-7'),
+      resendable: true,
+      liveRuns: {},
+      sessions: [],
+      stopRun: vi.fn(),
+      sendAgain: vi.fn(),
+      compact: vi.fn(),
+      compacting: true,
+      openSession: vi.fn(),
+    };
+    const { result, rerender } = renderHook(
+      (props: TranscriptActionOptions) => useTranscriptActions(props),
+      { initialProps: options },
+    );
+    expect(result.current.compacting).toBe(true);
+
+    rerender({ ...options, compacting: false });
+    expect(result.current.compacting).toBe(false);
   });
 
   it('offers nothing a read-only session cannot do', () => {
@@ -115,6 +139,7 @@ describe('useTranscriptActions', () => {
       stopRun: vi.fn(),
       sendAgain: vi.fn(),
       compact: vi.fn(),
+      compacting: false,
       openSession: vi.fn(),
     };
     const { result, rerender } = renderHook(

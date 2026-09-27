@@ -1,4 +1,10 @@
-import { useMemo, useRef, type Dispatch, type SetStateAction } from 'react';
+import {
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from 'react';
 import type { Run, RunMode, Session } from '@animaOS-SWARM/sdk';
 
 import { daemon } from '../lib/daemon-api';
@@ -84,6 +90,9 @@ export interface SessionCommands {
   sendAgain: (run: Run) => boolean;
   /** Opens a session, another agent's (a helper's) by its agent. */
   openTarget: (target: HelperTarget) => void;
+  /** A manual Compact is in flight (spec §15.2, S3b-C): the trimmed
+   *  divider's button disables and shows "Compacting…" meanwhile. */
+  compacting: boolean;
 }
 
 /**
@@ -97,7 +106,8 @@ export function useSessionCommands(
 ): SessionCommands {
   const latest = useRef(options);
   latest.current = options;
-  return useMemo(() => {
+  const [compacting, setCompacting] = useState(false);
+  const commands = useMemo(() => {
     /** A fresh record replaces the listed or known copy. */
     const adoptSession = (session: Session) => {
       const { listedSessions, upsertSession, setKnownSession } = latest.current;
@@ -119,12 +129,15 @@ export function useSessionCommands(
     };
 
     const compactSession = async (session: Session) => {
+      setCompacting(true);
       try {
         // The summary itself arrives with `session.updated`.
         adoptSession(await daemon.compactSession(session.agentId, session.id));
         latest.current.setError(null);
       } catch (caught) {
         latest.current.setError(errorMessage(caught));
+      } finally {
+        setCompacting(false);
       }
     };
 
@@ -225,6 +238,7 @@ export function useSessionCommands(
         }),
     };
   }, []);
+  return { ...commands, compacting };
 }
 
 function errorMessage(error: unknown): string {

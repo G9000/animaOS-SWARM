@@ -70,6 +70,8 @@ export interface TranscriptActions {
    *  used up. */
   resentRunIds?: ReadonlySet<string>;
   onCompact?: () => void;
+  /** A manual Compact is in flight (spec §15.2, S3b-C). */
+  compacting?: boolean;
   helperSession?: (step: ToolStep) => HelperTarget | null;
   onOpenSession?: (target: HelperTarget) => void;
 }

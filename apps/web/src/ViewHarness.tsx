@@ -957,6 +957,7 @@ export function ViewHarness() {
     stopRun: (run) => void stopRun(run),
     sendAgain: commands.sendAgain,
     compact: (session) => void commands.compactSession(session),
+    compacting: commands.compacting,
     openSession: commands.openTarget,
   });
 
