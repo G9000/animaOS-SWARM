@@ -34,6 +34,7 @@ function message(key: string, sessionId = 'chat:1'): NewSessionSend {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  sessionStorage.clear();
 });
 
 describe('isRetryableSendError', () => {
@@ -236,6 +237,72 @@ describe('useSessionSends', () => {
     await act(async () => result.current.send(message('c')));
     expect(startRun).toHaveBeenCalledTimes(2);
     expect(onAccepted.mock.calls.map(([send]) => send.key)).toEqual(['c']);
+  });
+
+  it('persists each unaccepted send, and drops it once the daemon accepts it (S3b-A)', async () => {
+    const first = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+    vi.spyOn(daemon, 'startRun').mockReturnValue(first.promise);
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted: vi.fn(), onFailed: vi.fn() }),
+    );
+
+    act(() => result.current.send(message('a')));
+    expect(
+      JSON.parse(sessionStorage.getItem('animaos.pendingSends') ?? 'null'),
+    ).toEqual([
+      {
+        key: 'a',
+        text: 'text a',
+        conversation: 'agent-main\u0000session:chat:1',
+        createdAtMs: expect.any(Number),
+      },
+    ]);
+
+    await act(async () => first.resolve({ run: runFixture('run_1') }));
+    await waitFor(() => expect(result.current.sends).toEqual([]));
+    expect(sessionStorage.getItem('animaos.pendingSends')).toBeNull();
+  });
+
+  it('restores a send left over from a previous load to the recovery panel, its key reused (S3b-A)', () => {
+    sessionStorage.setItem(
+      'animaos.pendingSends',
+      JSON.stringify([
+        {
+          key: 'r',
+          text: 'still retrying',
+          conversation: 'agent-main\u0000session:chat:1',
+          createdAtMs: 1000,
+        },
+      ]),
+    );
+    const onRestore = vi.fn();
+    renderHook(() =>
+      useSessionSends({ onAccepted: vi.fn(), onFailed: vi.fn(), onRestore }),
+    );
+
+    expect(onRestore).toHaveBeenCalledTimes(1);
+    expect(onRestore).toHaveBeenCalledWith({
+      key: 'r',
+      text: 'still retrying',
+      conversation: 'agent-main\u0000session:chat:1',
+      createdAtMs: 1000,
+    });
+    // Handed off once: a second mount finds nothing left to restore.
+    expect(sessionStorage.getItem('animaos.pendingSends')).toBeNull();
+  });
+
+  it('never throws when session storage is blocked (S3b-A)', async () => {
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('full', 'QuotaExceededError');
+    });
+    vi.spyOn(daemon, 'startRun').mockResolvedValue({ run: runFixture('r') });
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted: vi.fn(), onFailed: vi.fn() }),
+    );
+
+    await act(async () => {
+      expect(() => result.current.send(message('a'))).not.toThrow();
+    });
   });
 
   it('stops retrying once the page closes', async () => {

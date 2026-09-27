@@ -48,10 +48,72 @@ export function isRetryableSendError(error: unknown): boolean {
 export interface SessionSendCallbacks {
   onAccepted: (send: SessionSend, result: StartRunResult) => void;
   onFailed: (send: SessionSend, error: unknown) => void;
+  /** A send still unaccepted when the page last closed (spec §15.5, S3b-A):
+   *  handed back once, on the next load, for the recovery panel to offer. */
+  onRestore?: (send: PersistedSend) => void;
 }
 
 function laneOf(send: Pick<SessionSend, 'agentId' | 'sessionId'>): string {
   return `${send.agentId}\u0000${send.sessionId}`;
+}
+
+/** Enough of an unaccepted send to offer it back in the recovery panel:
+ *  never its mode, telegram flag, retry count, or steer state. */
+export interface PersistedSend {
+  /** Reused as the resend's Idempotency-Key, so it joins rather than
+   *  doubles a request that did reach the daemon. */
+  key: string;
+  text: string;
+  /** The chat it belongs to (ViewHarness's chatKey). */
+  conversation: string;
+  createdAtMs: number;
+}
+
+const PENDING_SENDS_STORAGE_KEY = 'animaos.pendingSends';
+
+function isPersistedSend(value: unknown): value is PersistedSend {
+  if (typeof value !== 'object' || value === null) return false;
+  const item = value as Record<string, unknown>;
+  return (
+    typeof item.key === 'string' &&
+    typeof item.text === 'string' &&
+    typeof item.conversation === 'string' &&
+    typeof item.createdAtMs === 'number'
+  );
+}
+
+function loadPendingSends(): PersistedSend[] {
+  try {
+    const raw = window.sessionStorage.getItem(PENDING_SENDS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter(isPersistedSend) : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePendingSends(sends: readonly PersistedSend[]): void {
+  try {
+    if (sends.length === 0)
+      window.sessionStorage.removeItem(PENDING_SENDS_STORAGE_KEY);
+    else
+      window.sessionStorage.setItem(
+        PENDING_SENDS_STORAGE_KEY,
+        JSON.stringify(sends),
+      );
+  } catch {
+    // Storage is full or blocked: unaccepted sends live in memory only.
+  }
+}
+
+function toPersisted(send: SessionSend): PersistedSend {
+  return {
+    key: send.key,
+    text: send.text,
+    conversation: send.conversation,
+    createdAtMs: send.createdAtMs,
+  };
 }
 
 /** Sends in flight: one request at a time per session, so the daemon
@@ -62,6 +124,7 @@ export class SendQueue {
   private readonly busy = new Set<string>();
   private readonly timers = new Map<number, string>();
   private closed = false;
+  private restored = false;
 
   constructor(private callbacks: SessionSendCallbacks) {}
 
@@ -101,6 +164,16 @@ export class SendQueue {
 
   open(): void {
     this.closed = false;
+    // Once per instance (a page load), not on React's StrictMode
+    // close-then-reopen: the first read already emptied storage.
+    if (!this.restored) {
+      this.restored = true;
+      const leftOver = loadPendingSends();
+      if (leftOver.length > 0) {
+        savePendingSends([]);
+        for (const send of leftOver) this.callbacks.onRestore?.(send);
+      }
+    }
     for (const lane of new Set(this.sends.map(laneOf))) this.pump(lane);
   }
 
@@ -116,6 +189,7 @@ export class SendQueue {
 
   private set(next: SessionSend[]): void {
     this.sends = next;
+    savePendingSends(next.map(toPersisted));
     for (const listener of this.listeners) listener();
   }
 

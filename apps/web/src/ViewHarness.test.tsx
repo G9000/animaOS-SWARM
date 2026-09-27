@@ -1946,6 +1946,36 @@ it('keeps drafts in memory when session storage refuses them', async () => {
   );
 });
 
+it('offers a message still retrying when the page reloads before it is answered (S3b-A)', async () => {
+  const user = userEvent.setup();
+  const alpha = snapshot('alpha', 'Alpha', 1);
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({ agents: [alpha] });
+  mockProviders();
+  vi.mocked(daemon.startRun).mockReturnValue(new Promise(() => {}));
+  const first = render(<ViewHarness />);
+  await user.type(
+    await screen.findByPlaceholderText('Message Alpha…'),
+    'Still on its way',
+  );
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(1));
+  first.unmount();
+
+  render(<ViewHarness />);
+  await user.click(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  );
+  expect(screen.getByPlaceholderText('Message Alpha…')).toHaveValue(
+    'Still on its way',
+  );
+  // The restored key is reused: sending it again joins, not doubles.
+  await user.click(screen.getByRole('button', { name: 'Send' }));
+  await waitFor(() => expect(daemon.startRun).toHaveBeenCalledTimes(2));
+  const keys = vi.mocked(daemon.startRun).mock.calls.map(([, , , key]) => key);
+  expect(keys[1]).toBe(keys[0]);
+});
+
 it('creates one session for the first send and moves text typed meanwhile into it', async () => {
   const user = userEvent.setup();
   vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });

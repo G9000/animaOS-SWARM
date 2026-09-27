@@ -378,6 +378,15 @@ export function ViewHarness() {
   // Messages go to the runs route (spec §4.2): the daemon queues them, so
   // the composer stays usable while the companion works.
   const sends = useSessionSends({
+    // A send still unaccepted when the page last closed (S3b-A): offered
+    // back in that chat's recovery panel, its key reused if it is resent.
+    onRestore: (item) =>
+      updateChat(item.conversation, (current) => ({
+        failedDrafts: [
+          ...current.failedDrafts,
+          { requestId: item.key, text: item.text, idempotencyKey: item.key },
+        ],
+      })),
     onAccepted: (item, result) => {
       if (!availableAgentIdsRef.current.has(item.agentId)) return;
       if (item.telegram && !result.steer)
