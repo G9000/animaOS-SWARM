@@ -22,6 +22,7 @@ import {
   type SessionMessage,
   type SessionMessageOptions,
   type SessionUpdateInput,
+  type StartRunInput,
 } from '@animaOS-SWARM/sdk';
 
 const setupClient = createDaemonClient({
@@ -150,7 +151,7 @@ export type ScheduleTarget =
   | { type: 'workspace' }
   | { type: 'connector'; connectorId: string };
 export interface ScheduleOutcome {
-  status: 'silent' | 'spoke' | 'error';
+  status: 'silent' | 'spoke' | 'error' | 'stopped';
   occurredAtMs: number;
   errorCode: string | null;
 }
@@ -361,6 +362,26 @@ export const daemon = {
   ) => setupClient.sessions.messages(agentId, sessionId, options),
   exportSession: (agentId: string, sessionId: string) =>
     setupClient.sessions.exportMarkdown(agentId, sessionId),
+  /** Accepts a message into a session (spec §4.2). */
+  startRun: (
+    agentId: string,
+    sessionId: string,
+    input: StartRunInput,
+    idempotencyKey: string,
+  ) => setupClient.runs.start(agentId, sessionId, input, { idempotencyKey }),
+  stopRun: (agentId: string, runId: string) =>
+    setupClient.runs.stop(agentId, runId),
+  sessionRuns: (
+    agentId: string,
+    sessionId: string,
+    options: { limit?: number; signal?: AbortSignal } = {},
+  ) => setupClient.runs.listForSession(agentId, sessionId, options),
+  compactSession: (agentId: string, sessionId: string) =>
+    setupClient.sessions.compact(agentId, sessionId),
+  /** The companion's live event stream (spec §6). */
+  agentEvents: (agentId: string, options: { signal?: AbortSignal } = {}) =>
+    setupClient.events.stream(agentId, options),
+  listAgentSummaries: () => setupClient.agents.listSummaries(),
   cancelAgentJob: (id: string, jobId: string, input: { revision: number }) =>
     setupClient.agents.cancelJob(id, jobId, input),
   retryAgentJob: (id: string, jobId: string, input: AgentJobRetryInput) =>

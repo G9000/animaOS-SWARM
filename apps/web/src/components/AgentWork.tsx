@@ -345,7 +345,9 @@ export function AgentProactiveView({
                 ? 'No update needed'
                 : schedule.lastOutcome.status === 'spoke'
                   ? 'Posted an update'
-                  : 'Run failed'}
+                  : schedule.lastOutcome.status === 'stopped'
+                    ? 'Stopped by owner'
+                    : 'Run failed'}
               {schedule.lastOutcome.errorCode
                 ? ` (${schedule.lastOutcome.errorCode})`
                 : ''}

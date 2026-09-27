@@ -7,6 +7,8 @@ import { ConnectorsClient } from './connectors.js';
 import { MemoriesClient } from './memories.js';
 import { SwarmsClient } from './swarms.js';
 import { SessionsClient } from './sessions.js';
+import { RunsClient } from './runs.js';
+import { AgentEventsClient } from './events.js';
 import type { DaemonCapabilities } from './capabilities.js';
 
 const DEFAULT_BASE_URL = 'http://127.0.0.1:8080';
@@ -71,6 +73,8 @@ export class DaemonClient {
   readonly memories: MemoriesClient;
   readonly swarms: SwarmsClient;
   readonly sessions: SessionsClient;
+  readonly runs: RunsClient;
+  readonly events: AgentEventsClient;
 
   private readonly baseUrl: string;
   private readonly fetchImpl: FetchLike;
@@ -93,6 +97,8 @@ export class DaemonClient {
     this.memories = new MemoriesClient(this);
     this.swarms = new SwarmsClient(this);
     this.sessions = new SessionsClient(this);
+    this.runs = new RunsClient(this);
+    this.events = new AgentEventsClient(this);
   }
 
   async health(): Promise<DaemonHealth> {

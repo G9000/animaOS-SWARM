@@ -174,4 +174,16 @@ describe('sessions client', () => {
       '/api/agents/agent%2Fmissing',
     ]);
   });
+
+  it('compacts a session and returns its record', async () => {
+    const { sessions, requests } = transport(() =>
+      Response.json({ session }, { status: 202 }),
+    );
+
+    expect(await sessions.compact('agent/a', 'chat:1')).toEqual(session);
+    expect(requests[0].url).toBe(
+      '/api/agents/agent%2Fa/sessions/chat%3A1/compact',
+    );
+    expect(requests[0].init?.method).toBe('POST');
+  });
 });

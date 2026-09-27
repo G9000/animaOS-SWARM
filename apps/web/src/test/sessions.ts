@@ -22,6 +22,7 @@ export function sessionFixture(
     parentAgentId: null,
     summary: null,
     contextTrimmed: null,
+    compactionError: null,
     messageCount: 0,
     preview: null,
     activeRuns: 0,

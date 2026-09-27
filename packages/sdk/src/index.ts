@@ -28,6 +28,7 @@ export { DaemonTooOldError, SessionsClient } from './sessions.js';
 export type {
   Session,
   SessionCapabilities,
+  SessionCompactionError,
   SessionContextTrimmed,
   SessionKind,
   SessionListOptions,
@@ -42,6 +43,23 @@ export type {
   SessionTitleSource,
   SessionUpdateInput,
 } from './sessions.js';
+export { RunsClient, isTerminalRunStatus } from './runs.js';
+export type {
+  Run,
+  RunMode,
+  RunSource,
+  RunStatus,
+  RunTokenUsage,
+  StartRunInput,
+  StartRunResult,
+} from './runs.js';
+export { AgentEventsClient, isRunLifecycleEvent } from './events.js';
+export type {
+  AgentEvent,
+  LiveToolCard,
+  RunLifecycleEventType,
+  SnapshotRun,
+} from './events.js';
 export { ChatGptClient } from './chatgpt.js';
 export type { ChatGptLogin, ChatGptStatus } from './chatgpt.js';
 export type {
