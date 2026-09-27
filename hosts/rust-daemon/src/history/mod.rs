@@ -276,6 +276,20 @@ pub(crate) fn searchable_text(message: &Message) -> &str {
     cap_at_byte_boundary(display_text(message), MAX_INDEXED_TEXT_BYTES)
 }
 
+/// Bytes of a message beyond the indexed prefix a snippet may read: a match
+/// lies in the prefix, and its excerpt needs little more.
+pub(crate) const SNIPPET_MARGIN_BYTES: usize = 1024;
+
+/// The text a search snippet is cut from: [`display_text`] capped at the
+/// indexed prefix plus [`SNIPPET_MARGIN_BYTES`], so an oversized message is
+/// never scanned whole to build an excerpt (M2 residual Minor).
+pub(crate) fn snippet_text(message: &Message) -> &str {
+    cap_at_byte_boundary(
+        display_text(message),
+        MAX_INDEXED_TEXT_BYTES + SNIPPET_MARGIN_BYTES,
+    )
+}
+
 /// `text` cut to at most `max_bytes` bytes, backing up to the nearest char
 /// boundary so a multi-byte UTF-8 character is never split.
 fn cap_at_byte_boundary(text: &str, max_bytes: usize) -> &str {
@@ -497,5 +511,16 @@ mod tests {
             &prompt[..MAX_INDEXED_TEXT_BYTES],
             "the index keeps the capped, suffix-free prompt"
         );
+    }
+
+    #[test]
+    fn a_snippet_reads_at_most_the_indexed_prefix_and_a_margin() {
+        let huge = message_with_text(&"a".repeat(MAX_INDEXED_TEXT_BYTES * 4));
+        assert_eq!(
+            snippet_text(&huge).len(),
+            MAX_INDEXED_TEXT_BYTES + SNIPPET_MARGIN_BYTES
+        );
+        let small = message_with_text("hello");
+        assert_eq!(snippet_text(&small), "hello");
     }
 }

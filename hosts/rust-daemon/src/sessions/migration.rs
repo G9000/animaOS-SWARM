@@ -28,10 +28,14 @@ pub(crate) struct ToolGrantSet {
     pub(crate) write_class: &'static [&'static str],
 }
 
-/// M2 adds no tools. M3 (`search_conversations`), M5 (`load_skill`,
-/// `propose_skill`), and M6 (`list_automations`, `create_automation`,
-/// `pause_automation`) append their grant sets here.
-pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[];
+/// Grant sets in the order they shipped. M5 (`load_skill`, `propose_skill`)
+/// and M6 (`list_automations`, `create_automation`, `pause_automation`)
+/// append theirs.
+pub(crate) const TOOL_GRANTS: &[ToolGrantSet] = &[ToolGrantSet {
+    id: "m3-search-conversations",
+    read_class: &["search_conversations"],
+    write_class: &[],
+}];
 
 /// Legacy check-ins ran in a fresh `room-*` room per tick. Those rooms become
 /// the automation's `schedule:<id>` session, and so do their ledger runs;
@@ -1219,6 +1223,49 @@ mod tests {
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
         assert_eq!(tools, ["read_file"]);
+    }
+
+    #[test]
+    fn the_search_conversations_grant_reaches_non_helper_agents_only() {
+        // Ruling 1 (M3 Task 14 pre-flight audit): TOOL_GRANTS must not grant
+        // search_conversations to helper agents, even one whose pre-M3 tools
+        // otherwise match a companion's.
+        let registry = crate::tools::ToolRegistry::new();
+        let mut companion = config("companion", &[]);
+        companion.tools = Some(registry.resolve_descriptors(["calculate"]).unwrap());
+        let mut state = DaemonState::new();
+        let companion_id = state.create_agent(companion).unwrap().state.id;
+        let mut helper = config(
+            "helper",
+            &[
+                ("workspaceRole", "helper"),
+                ("parentAgentId", companion_id.as_str()),
+            ],
+        );
+        helper.tools = Some(registry.resolve_descriptors(["calculate"]).unwrap());
+        let helper_id = state.create_agent(helper).unwrap().state.id;
+
+        let changed = state.apply_pending_tool_grants(TOOL_GRANTS);
+
+        assert_eq!(changed, vec![companion_id.clone()]);
+        let names = |id: &str| {
+            state
+                .get_agent(id)
+                .unwrap()
+                .state
+                .config
+                .tools
+                .unwrap_or_default()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&companion_id), ["calculate", "search_conversations"]);
+        assert_eq!(
+            names(&helper_id),
+            ["calculate"],
+            "the migration grant never reaches a helper agent"
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ const COMMON_TOOLS = [
   'recent_memories',
   'get_current_time',
   'calculate',
+  'search_conversations',
 ] as const;
 
 const OBSERVE_TOOLS = [

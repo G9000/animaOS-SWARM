@@ -144,6 +144,76 @@ async fn tool_execution_context_rejects_registered_but_unconfigured_write_tool()
     );
 }
 
+#[tokio::test]
+async fn search_conversations_without_a_workspace_run_answers_plainly() {
+    // Controller ruling 2 (M3 Task 14 pre-flight audit, M14): a run outside
+    // a workspace agent coordinator (no `context.team`) must not panic or
+    // read the daemon state; it answers with this exact message.
+    let context = ToolExecutionContext::new(
+        Arc::new(AsyncRwLock::new(MemoryManager::new())),
+        Arc::new(AsyncRwLock::new(MemoryEmbeddingRuntime::disabled())),
+        None,
+        ToolRegistry::new(),
+        new_shared_process_manager_with_limit(DEFAULT_MAX_BACKGROUND_PROCESSES),
+        None,
+        None,
+    );
+    let agent = AgentState {
+        id: "agent-no-team".into(),
+        name: "no-team".into(),
+        status: AgentStatus::Running,
+        config: AgentConfig {
+            name: "no-team".into(),
+            model: "deterministic".into(),
+            bio: None,
+            lore: None,
+            knowledge: None,
+            topics: None,
+            adjectives: None,
+            style: None,
+            provider: None,
+            system: None,
+            tools: Some(
+                ToolRegistry::new()
+                    .resolve_descriptors(["search_conversations"])
+                    .unwrap(),
+            ),
+            plugins: None,
+            settings: None,
+        },
+        created_at_ms: 1,
+        token_usage: Default::default(),
+    };
+    let user_message = Message {
+        id: "message-no-team".into(),
+        agent_id: agent.id.clone(),
+        room_id: "room-no-team".into(),
+        content: Content {
+            text: "search".into(),
+            ..Content::default()
+        },
+        role: MessageRole::User,
+        created_at_ms: 1,
+    };
+    let result = context
+        .execute_tool(
+            agent,
+            user_message,
+            ToolCall {
+                id: "search-no-team".into(),
+                name: "search_conversations".into(),
+                args: BTreeMap::from([("query".into(), DataValue::String("lisbon".into()))]),
+            },
+        )
+        .await;
+
+    assert_eq!(result.status, TaskStatus::Error);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Conversation search is unavailable in this execution context")
+    );
+}
+
 #[test]
 fn registry_resolves_canonical_descriptors() {
     let registry = ToolRegistry::new();
@@ -225,6 +295,7 @@ fn registry_defines_every_registered_tool_schema() {
         ),
         ("get_current_time", &[][..], &[][..]),
         ("calculate", &["expression"][..], &[][..]),
+        ("search_conversations", &["query"][..], &["limit"][..]),
         ("read_file", &["file_path"][..], &["offset", "limit"][..]),
         ("list_dir", &["path"][..], &[][..]),
         ("glob", &["pattern"][..], &["path"][..]),
