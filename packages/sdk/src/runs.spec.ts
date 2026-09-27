@@ -23,6 +23,7 @@ const run = {
   agentId: 'agent/a',
   sessionId: 'chat:1',
   source: 'web',
+  idempotencyKey: 'key-1',
   status: 'queued',
 };
 
@@ -32,14 +33,14 @@ describe('runs client', () => {
       Response.json({ run }, { status: 202 }),
     );
 
-    expect(
-      await runs.start(
-        'agent/a',
-        'chat:1',
-        { text: 'Plan the week', mode: 'queue' },
-        { idempotencyKey: 'key-1' },
-      ),
-    ).toEqual({ run });
+    const accepted = await runs.start(
+      'agent/a',
+      'chat:1',
+      { text: 'Plan the week', mode: 'queue' },
+      { idempotencyKey: 'key-1' },
+    );
+    expect(accepted).toEqual({ run });
+    expect(accepted.run.idempotencyKey).toBe('key-1');
 
     const [request] = requests;
     expect(request.url).toBe('/api/agents/agent%2Fa/sessions/chat%3A1/runs');

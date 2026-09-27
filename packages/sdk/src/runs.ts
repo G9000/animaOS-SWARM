@@ -31,6 +31,9 @@ export interface Run {
   sessionId: string;
   source: RunSource;
   sourceRef: string | null;
+  /** The `Idempotency-Key` the run was accepted or started with, so a client
+   *  matches its own sends; `null` for a run without one. */
+  idempotencyKey: string | null;
   status: RunStatus;
   input: { text: string; attachmentIds: string[]; skill: string | null };
   createdAtMs: number;
