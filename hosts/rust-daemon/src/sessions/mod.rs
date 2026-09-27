@@ -9,6 +9,7 @@ pub(crate) mod migration;
 pub(crate) mod pruning;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod titles;
 pub(crate) mod views;
 
 use std::collections::{HashMap, HashSet, VecDeque};

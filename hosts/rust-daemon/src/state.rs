@@ -1518,6 +1518,10 @@ pub(crate) struct DaemonState {
     pub(crate) event_fanout: EventFanout,
     /// Live runs and per-agent event streams (spec §6).
     pub(crate) live: crate::live::LiveHub,
+    /// AI titles for new chats (spec §12.3). Only `app::serve` turns them on;
+    /// test and embedding states leave them off, so no test model is ever
+    /// asked for a title it did not script.
+    pub(crate) generated_titles: bool,
     pub(crate) db: Option<Arc<dyn DatabaseAdapter>>,
 }
 
@@ -1671,6 +1675,7 @@ impl DaemonState {
             process_manager: new_shared_process_manager_with_limit(max_background_processes),
             event_fanout,
             live: crate::live::LiveHub::new(crate::live::DEFAULT_SESSION_EVENT_BUFFER),
+            generated_titles: false,
             db: None,
         }
     }

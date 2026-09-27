@@ -210,7 +210,14 @@ pub async fn serve(listener: TcpListener, config: DaemonConfig) -> io::Result<()
 
     configure_persistence(&state, &config).await?;
 
-    state.write().await.chatgpt_auth = chatgpt_auth;
+    {
+        let mut guard = state.write().await;
+        guard.chatgpt_auth = chatgpt_auth;
+        // AI titles for new chats (spec §12.3): only the real daemon turns
+        // them on, so test and embedding states never see an unscripted
+        // model call.
+        guard.set_generated_titles(true);
+    }
     serve_with_state(listener, state, config, shutdown_signal()).await
 }
 

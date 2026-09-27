@@ -13,6 +13,13 @@ impl DaemonState {
         self.live = hub;
     }
 
+    /// Turns AI titles for new chats on or off (spec §12.3); only
+    /// `app::serve` turns them on. The field itself (`pub(crate)`) is the
+    /// getter: `agent_runs::titles::title_session` reads it directly.
+    pub(crate) fn set_generated_titles(&mut self, enabled: bool) {
+        self.generated_titles = enabled;
+    }
+
     /// `record` with the tools its live run started since the ledger record
     /// was last written, so saves and reads made mid-run report them (spec
     /// §4.8). Terminal records already hold their final list.

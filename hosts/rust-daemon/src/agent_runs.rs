@@ -24,6 +24,7 @@ use crate::state::DaemonState;
 mod compact;
 mod queue;
 mod stop;
+mod titles;
 
 #[allow(unused_imports)] // The tests use the rest.
 pub(crate) use self::queue::{
@@ -338,6 +339,10 @@ pub(crate) struct AgentRunCoordinator {
     control_plane_transactions: Arc<Mutex<()>>,
     /// How long a compaction's store read and model call may take.
     compaction_timeout: std::time::Duration,
+    /// How long a title call may take before it is treated like a failed
+    /// call (controller ruling, M3 pre-flight audit): the model adapter has
+    /// no request timeout of its own.
+    title_timeout: std::time::Duration,
 }
 
 impl AgentRunCoordinator {
@@ -595,6 +600,9 @@ impl AgentRunCoordinator {
             compaction_timeout: std::time::Duration::from_millis(
                 crate::sessions::compaction::COMPACTION_TIMEOUT_MS,
             ),
+            title_timeout: std::time::Duration::from_millis(
+                crate::sessions::titles::TITLE_TIMEOUT_MS,
+            ),
         }
     }
 
@@ -602,6 +610,13 @@ impl AgentRunCoordinator {
     #[cfg(test)]
     pub(crate) fn with_compaction_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.compaction_timeout = timeout;
+        self
+    }
+
+    /// A shorter title-call deadline, so tests need not wait thirty seconds.
+    #[cfg(test)]
+    pub(crate) fn with_title_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.title_timeout = timeout;
         self
     }
 
@@ -1682,6 +1697,15 @@ impl AgentRunCoordinator {
             }
             live_run.publish(live_run.session_event(LiveEventBody::SessionUpdated));
             live_run.publish_record(finished);
+            if finished.status == RunStatus::Completed {
+                self.title_after_first_reply(
+                    &agent_id,
+                    &session_id,
+                    &room_id,
+                    &change_set,
+                    &result,
+                );
+            }
         }
         // Disarmed only once the terminal event is out, so a panic before it
         // still ends the run's events.
@@ -2018,6 +2042,8 @@ mod steer_tests;
 mod stop_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+mod title_tests;
 #[cfg(test)]
 mod tests {
     use super::{AgentRunCoordinator, AgentRunRequest, RunRoom};
