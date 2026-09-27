@@ -92,7 +92,6 @@ impl ScriptedModel {
     }
 
     /// Also scripts the `generate` calls (a summary or a title).
-    #[allow(dead_code)] // M3 Tasks 12 and 13 script summaries and titles.
     pub(crate) fn with_secondary(steps: Vec<Step>, secondary: Vec<Step>) -> Arc<Self> {
         Self::build(steps, secondary, None)
     }
@@ -113,7 +112,6 @@ impl ScriptedModel {
     }
 
     /// Every `generate` request (compaction and titles), oldest first.
-    #[allow(dead_code)] // M3 Tasks 12 and 13 read the summary and title requests.
     pub(crate) fn secondary_requests(&self) -> Vec<ModelGenerateRequest> {
         self.secondary_requests.lock().unwrap().clone()
     }

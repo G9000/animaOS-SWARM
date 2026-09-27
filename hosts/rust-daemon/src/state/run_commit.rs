@@ -5,14 +5,13 @@ use std::sync::Arc;
 use anima_core::primitives::now_millis;
 use anima_core::{
     select_context, AgentRuntime, AgentRuntimeSnapshot, AgentState, AgentStatus, Content,
-    ContextSummary, DataValue, Message, MessageRole, Provider, RuntimeRunBase, TokenEstimator,
-    REVISED_METADATA_KEY,
+    ContextSummary, Message, MessageRole, Provider, RuntimeRunBase, TokenEstimator,
 };
 
 use super::DaemonState;
 use crate::runs::{RunChangeSet, RunError, RunOutcome, RunSource, RunStatus, AGENT_DELETED};
 use crate::sessions::context::{
-    newest_left_out, uncovered_pruned_through, ContextBudget, SessionSummaryProvider,
+    model_visible, newest_left_out, uncovered_pruned_through, ContextBudget, SessionSummaryProvider,
 };
 use crate::tools::ToolExecutionContext;
 
@@ -38,8 +37,10 @@ pub(crate) struct RunContextReport {
     /// newest dropped turn's last message, or the newest pruned message when
     /// the summary does not reach it (audit I5) and it is newer.
     pub(crate) trimmed_through: Option<String>,
-    /// Every message the selection left out, oldest first (compaction's
-    /// input, Task 12); pruned messages are not in the control plane.
+    /// Every hot message the selection left out, oldest first: compaction's
+    /// input, which takes it once compaction is decided (Task 12 ruling 4).
+    /// Pruned messages are not in the control plane; compaction reads them
+    /// back from the history store.
     pub(crate) dropped: Vec<Message>,
 }
 
@@ -60,12 +61,9 @@ impl DaemonState {
         .with_mail(self.mail_manager.clone())
     }
 
-    /// The room's messages the model may see, oldest first: everything but
-    /// silent check-in pairs (spec §5.2) and drafts an evaluator sent back
-    /// (`revised`; controller ruling, M3 pre-flight audit M17), which stay in
-    /// the transcript because nothing streamed is retracted. The system
-    /// message right after such a draft goes too (fix round 1): it is the
-    /// evaluator's request to revise an answer the model no longer sees.
+    /// The room's hot messages the model may see, oldest first
+    /// (`sessions::context::model_visible`): no silent check-in pair, no
+    /// revised draft, and no revision request after one.
     pub(crate) fn model_visible_history(&self, agent_id: &str, room_id: &str) -> Vec<Message> {
         let Some(canonical) = self.agents.get(agent_id) else {
             return Vec::new();
@@ -75,18 +73,7 @@ impl DaemonState {
             .iter()
             .filter(|message| message.room_id == room_id)
             .collect();
-        let hidden = crate::sessions::hidden_message_ids(room.iter().copied());
-        room.iter()
-            .enumerate()
-            .filter(|&(index, message)| {
-                let revision_request = message.role == MessageRole::System
-                    && index
-                        .checked_sub(1)
-                        .is_some_and(|previous| is_revised_draft(room[previous]));
-                !hidden.contains(&message.id) && !is_revised_draft(message) && !revision_request
-            })
-            .map(|(_, message)| (*message).clone())
-            .collect()
+        model_visible(room).into_iter().cloned().collect()
     }
 
     /// An isolated runtime for one run of `agent_id` in `room_id` (spec §4.4
@@ -285,16 +272,6 @@ impl DaemonState {
         }
         state
     }
-}
-
-/// A draft an evaluator sent back (spec §4.5: kept, marked `revised`).
-fn is_revised_draft(message: &Message) -> bool {
-    message
-        .content
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get(REVISED_METADATA_KEY))
-        == Some(&DataValue::Bool(true))
 }
 
 #[cfg(test)]

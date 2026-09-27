@@ -18,7 +18,6 @@ pub(crate) enum LiveEventBody {
     RunQueued(RunRecord),
     RunStarted(RunRecord),
     RunAwaitingApproval(RunRecord),
-    #[allow(dead_code)] // M3 Task 12 publishes compaction progress.
     RunProgress {
         phase: &'static str,
     },

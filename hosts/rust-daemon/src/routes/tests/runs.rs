@@ -1709,3 +1709,250 @@ async fn a_steer_into_the_active_run_answers_202_with_a_pending_steer() {
     };
     wait_for(&state, &key_two, RunStatus::Completed).await;
 }
+
+fn compact_request(agent: &str, session: &str, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/agents/{agent}/sessions/{}/compact",
+            session.replace(':', "%3A")
+        ))
+        .header("host", "127.0.0.1:8080")
+        .header("origin", origin)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// Appends the user/assistant turns `turns` (`u<n>`, `a<n>`) to `room`'s
+/// hot tail; a later call continues the numbering instead of repeating ids.
+fn seed_turns(state: &mut DaemonState, agent: &str, room: &str, turns: std::ops::Range<usize>) {
+    let messages = turns
+        .flat_map(|turn| {
+            [
+                (
+                    format!("u{turn}"),
+                    anima_core::MessageRole::User,
+                    format!("question {turn}"),
+                ),
+                (
+                    format!("a{turn}"),
+                    anima_core::MessageRole::Assistant,
+                    format!("answer {turn}"),
+                ),
+            ]
+        })
+        .map(|(id, role, text)| anima_core::Message {
+            id,
+            agent_id: agent.into(),
+            room_id: room.into(),
+            content: Content {
+                text,
+                ..Content::default()
+            },
+            role,
+            created_at_ms: 1,
+        })
+        .collect();
+    state
+        .agents
+        .get_mut(agent)
+        .unwrap()
+        .apply_run_delta(&anima_core::RuntimeRunDelta {
+            messages,
+            events: Vec::new(),
+            event_total: 0,
+            token_usage: TokenUsage::default(),
+            step_count: 0,
+            last_task: None,
+            status: anima_core::AgentStatus::Idle,
+        });
+}
+
+/// The session's summary once it arrives, within five seconds.
+async fn arrived_summary(
+    state: &Arc<RwLock<DaemonState>>,
+    agent: &str,
+) -> crate::sessions::SessionSummary {
+    for _ in 0..500 {
+        let summary = state
+            .read()
+            .await
+            .sessions
+            .get(agent, "chat:plans")
+            .and_then(|session| session.summary.clone());
+        if let Some(summary) = summary {
+            return summary;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the summary never arrived");
+}
+
+#[tokio::test]
+async fn compacting_a_session_folds_all_but_its_newest_turn_into_the_summary() {
+    let (app, state, agent) = app_with_chat(ScriptedModel::with_secondary(
+        vec![],
+        vec![Step::Text(vec!["Questions one and two, answered."])],
+    ))
+    .await;
+    seed_turns(&mut *state.write().await, &agent, "chat:plans", 0..3);
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+
+    let response = app
+        .oneshot(compact_request(&agent, "chat:plans", OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(json_body(response).await["session"]["id"], "chat:plans");
+
+    let summary = arrived_summary(&state, &agent).await;
+    assert_eq!(summary.text, "Questions one and two, answered.");
+    assert_eq!(summary.through_message_id, "a1");
+    assert_eq!(summary.source_message_count, 4);
+    let updated = events_until(&mut subscription, "session.updated").await;
+    assert_eq!(updated.last().unwrap()["sessionId"], "chat:plans");
+}
+
+#[tokio::test]
+async fn compaction_is_refused_for_read_only_kinds_short_sessions_and_active_runs() {
+    use utoipa::OpenApi;
+
+    let gate = Gate::new();
+    let (app, state, agent) = app_with_chat(ScriptedModel::gated(vec![], gate.clone())).await;
+    {
+        let mut guard = state.write().await;
+        guard.sessions.insert(SessionRecord::new(
+            &agent,
+            "job:1",
+            SessionKind::Job,
+            SessionOrigin::Job,
+            "Job".into(),
+            TitleSource::System,
+            1,
+        ));
+        seed_turns(&mut guard, &agent, "chat:plans", 0..1);
+    }
+
+    let refused = app
+        .clone()
+        .oneshot(compact_request(
+            &agent,
+            "chat:plans",
+            "https://untrusted.example",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(refused.headers()["cache-control"], "no-store");
+    for (session, message) in [
+        ("job:1", "This session cannot be compacted"),
+        ("chat:plans", "Nothing to compact yet"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(compact_request(&agent, session, OWNER_ORIGIN))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{session}");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(json_body(response).await["error"], message);
+    }
+    let unknown = app
+        .clone()
+        .oneshot(compact_request(&agent, "chat:none", OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    seed_turns(&mut *state.write().await, &agent, "chat:plans", 1..3);
+    accept_message(&app, &agent, "key-1").await;
+    gate.entered().await;
+    let busy = app
+        .clone()
+        .oneshot(compact_request(&agent, "chat:plans", OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(busy).await["error"],
+        "A run in this session is still in progress"
+    );
+    gate.release();
+
+    let document = crate::routes::ApiDoc::openapi();
+    let compact = document.paths.paths["/api/agents/{agent_id}/sessions/{session_id}/compact"]
+        .post
+        .as_ref()
+        .expect("compaction is documented");
+    assert_eq!(compact.tags.as_deref(), Some(&["sessions".to_string()][..]));
+    let compact = serde_json::to_value(compact).unwrap();
+    for status in ["202", "403", "404", "409"] {
+        assert!(
+            compact["responses"].get(status).is_some(),
+            "compaction documents {status}"
+        );
+    }
+}
+
+/// Controller ruling 2 (Task 12): turns pruning removed are something to
+/// compact even when one turn is all the hot tail holds.
+#[tokio::test]
+async fn a_pruned_session_with_one_hot_turn_can_still_be_compacted() {
+    let model = ScriptedModel::with_secondary(
+        vec![],
+        vec![Step::Text(vec!["An earlier question, answered."])],
+    );
+    let (app, state, agent) = app_with_chat(model.clone()).await;
+    let store = {
+        let mut guard = state.write().await;
+        seed_turns(&mut guard, &agent, "chat:plans", 1..2);
+        guard
+            .sessions
+            .get_mut(&agent, "chat:plans")
+            .unwrap()
+            .pruned_through = Some(crate::sessions::SessionPrunedThrough {
+            message_id: "a0".into(),
+            created_at_ms: 1,
+        });
+        guard.history.store()
+    };
+    let row = |id: &str, role, text: &str, created_at_ms| crate::history::HistoryMessage {
+        agent_id: agent.clone(),
+        session_id: "chat:plans".into(),
+        hidden: false,
+        message: anima_core::Message {
+            id: id.into(),
+            agent_id: agent.clone(),
+            room_id: "chat:plans".into(),
+            content: Content {
+                text: text.into(),
+                ..Content::default()
+            },
+            role,
+            created_at_ms,
+        },
+    };
+    store
+        .upsert_messages(&[
+            row("u0", anima_core::MessageRole::User, "question 0", 0),
+            row("a0", anima_core::MessageRole::Assistant, "answer 0", 1),
+        ])
+        .await
+        .unwrap();
+
+    let response = app
+        .oneshot(compact_request(&agent, "chat:plans", OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let summary = arrived_summary(&state, &agent).await;
+    assert_eq!(summary.through_message_id, "a0");
+    assert_eq!(summary.source_message_count, 2);
+    assert!(model.secondary_requests()[0].messages[0]
+        .content
+        .text
+        .ends_with("New turns:\nOwner: question 0\nCompanion: answer 0"));
+}

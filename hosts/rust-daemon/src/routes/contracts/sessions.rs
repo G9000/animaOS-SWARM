@@ -80,6 +80,13 @@ pub(crate) struct SessionContextTrimmedResponse {
 
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct SessionCompactionErrorResponse {
+    pub(crate) message: String,
+    pub(crate) at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SessionMatchResponse {
     /// `null` when only the title matched.
     pub(crate) message_id: Option<String>,
@@ -106,6 +113,8 @@ pub(crate) struct SessionResponse {
     pub(crate) parent_agent_id: Option<String>,
     pub(crate) summary: Option<SessionSummaryResponse>,
     pub(crate) context_trimmed: Option<SessionContextTrimmedResponse>,
+    /// The last failed compaction, until one succeeds (spec §5.4).
+    pub(crate) compaction_error: Option<SessionCompactionErrorResponse>,
     pub(crate) message_count: usize,
     pub(crate) preview: Option<String>,
     pub(crate) active_runs: usize,
@@ -148,6 +157,12 @@ impl From<&SessionView> for SessionResponse {
                 SessionContextTrimmedResponse {
                     dropped_through_message_id: trimmed.dropped_through_message_id.clone(),
                     at_ms: trimmed.at_ms,
+                }
+            }),
+            compaction_error: record.compaction_error.as_ref().map(|error| {
+                SessionCompactionErrorResponse {
+                    message: error.message.clone(),
+                    at_ms: error.at_ms,
                 }
             }),
             message_count: view.message_count,

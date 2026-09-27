@@ -21,6 +21,7 @@ use crate::runs::{
 };
 use crate::state::DaemonState;
 
+mod compact;
 mod queue;
 mod stop;
 
@@ -1138,10 +1139,10 @@ impl AgentRunCoordinator {
         // before any model work (the run-start save that already existed).
         let transaction = self.control_plane_transaction().await;
         let (
-            mut runtime,
+            runtime,
             tool_context,
             base,
-            context,
+            mut context,
             previous_trimmed,
             run_id,
             session_id,
@@ -1366,6 +1367,27 @@ impl AgentRunCoordinator {
             live_run.publish(live_run.session_event(LiveEventBody::SessionCreated));
         }
         live_run.publish_record(&started);
+        // Spec §5.4: turns about to leave the context are summarized first;
+        // if that fails the run goes on with the trimmed context.
+        let rebuilt = self
+            .compact_before_run(
+                &live_run,
+                &started,
+                &room_id,
+                &content,
+                runtime.config(),
+                &mut context,
+            )
+            .await;
+        let (mut runtime, tool_context, base, context) = match rebuilt {
+            Some(rebuilt) => (
+                rebuilt.runtime,
+                rebuilt.tools,
+                rebuilt.base,
+                rebuilt.context,
+            ),
+            None => (runtime, tool_context, base, context),
+        };
 
         // Phase B: per-run configuration applies only to this isolated copy. The
         // canonical configuration is never rewritten; a PATCH during the run
@@ -1962,6 +1984,8 @@ async fn persist_task_result_memory(
     }
 }
 
+#[cfg(test)]
+mod compaction_tests;
 #[cfg(test)]
 mod context_tests;
 #[cfg(test)]

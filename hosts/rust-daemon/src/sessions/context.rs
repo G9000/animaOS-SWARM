@@ -1,10 +1,15 @@
 //! A run's context (spec §5): its token budget, the session summary it
 //! carries as data, and the trimmed indicator.
 
-use anima_core::{AgentConfig, AgentRuntime, DataValue, Message, Provider, ProviderResult};
+use std::borrow::Borrow;
+
+use anima_core::{
+    AgentConfig, AgentRuntime, DataValue, Message, MessageRole, Provider, ProviderResult,
+    REVISED_METADATA_KEY,
+};
 use async_trait::async_trait;
 
-use super::{SessionContextTrimmed, SessionPrunedThrough, SessionRecord};
+use super::{hidden_message_ids, SessionContextTrimmed, SessionPrunedThrough, SessionRecord};
 use crate::history::MessageOrder;
 
 /// Agent setting that fixes the context budget (spec §5.1).
@@ -77,6 +82,44 @@ impl ContextBudget {
             .saturating_sub(self.reply_reserve_tokens)
             .saturating_sub(current_message_tokens)
     }
+}
+
+/// The messages of one room, in transcript order, that the model may see:
+/// everything but silent check-in pairs (spec §5.2) and drafts an evaluator
+/// sent back (`revised`; controller ruling, M3 pre-flight audit M17), which
+/// stay in the transcript because nothing streamed is retracted. The system
+/// message right after such a draft goes too (Task 11 fix round 1): it is the
+/// evaluator's request to revise an answer the model no longer sees. The hot
+/// tail and the pruned turns compaction reads back from the history store
+/// (Task 12 controller ruling 1) share this one filter.
+pub(crate) fn model_visible<M: Borrow<Message>>(room: Vec<M>) -> Vec<M> {
+    let hidden = hidden_message_ids(room.iter().map(Borrow::borrow));
+    let keep: Vec<bool> = room
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let message: &Message = message.borrow();
+            let revision_request = message.role == MessageRole::System
+                && index
+                    .checked_sub(1)
+                    .is_some_and(|previous| is_revised_draft(room[previous].borrow()));
+            !hidden.contains(&message.id) && !is_revised_draft(message) && !revision_request
+        })
+        .collect();
+    room.into_iter()
+        .zip(keep)
+        .filter_map(|(message, keep)| keep.then_some(message))
+        .collect()
+}
+
+/// A draft an evaluator sent back (spec §4.5: kept, marked `revised`).
+fn is_revised_draft(message: &Message) -> bool {
+    message
+        .content
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(REVISED_METADATA_KEY))
+        == Some(&DataValue::Bool(true))
 }
 
 /// The session's compaction summary as a run context part, framed as data

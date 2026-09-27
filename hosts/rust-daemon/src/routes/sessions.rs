@@ -18,6 +18,8 @@ use super::{parse_json_body, ApiError, AppState};
 use crate::agent_runs::HELPER_MUST_RUN_THROUGH_COMPANION;
 use crate::history::HistoryDeletion;
 use crate::live::{LiveEvent, LiveEventBody};
+use crate::sessions::compaction::manual_compaction_input;
+use crate::sessions::context::uncovered_pruned_through;
 use crate::sessions::views::{
     self, MessagePageError, MessagePageRequest, SessionCursor, SessionListQuery,
     DEFAULT_MESSAGE_PAGE, DEFAULT_SESSION_PAGE, MAX_MESSAGE_PAGE, MAX_SEARCH_QUERY_CHARS,
@@ -533,6 +535,65 @@ pub(super) async fn delete_session(
         StatusCode::OK,
         &DeleteResponse { deleted: true },
     ))
+}
+
+#[utoipa::path(post, path = "/api/agents/{agent_id}/sessions/{session_id}/compact", tag = "sessions",
+    params(("agent_id" = String, Path), ("session_id" = String, Path, description = "Percent-encoded session id")),
+    responses(
+        (status = 202, description = "Compaction started: every uncovered turn but the newest, and any pruned turns the summary does not cover, is folded into the summary, which arrives with session.updated", body = SessionEnvelope),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent or session not found", body = ErrorBody),
+        (status = 409, description = "The kind cannot be compacted, a run is active, or there is nothing to compact yet", body = ErrorBody)
+    ))]
+pub(super) async fn compact_session(
+    State(state): State<AppState>,
+    Path((agent_id, session_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    if !is_valid_session_id(&session_id) {
+        return rejected(ApiError::not_found());
+    }
+    let (room_id, input, pruned) = {
+        let guard = state.daemon.read().await;
+        let record = match guard.sessions.get(&agent_id, &session_id) {
+            Some(record) if guard.agents.contains_key(&agent_id) => record,
+            _ => return rejected(ApiError::not_found()),
+        };
+        if !record
+            .capabilities(views::automation_exists(&guard, record))
+            .compact
+        {
+            return rejected(ApiError::conflict("This session cannot be compacted"));
+        }
+        let room_id = record.room_id().to_string();
+        let history = guard.model_visible_history(&agent_id, &room_id);
+        (
+            room_id,
+            manual_compaction_input(&history, record.summary.as_ref()),
+            // Pruned turns the summary does not cover are compacted too
+            // (controller ruling 2, Task 12).
+            uncovered_pruned_through(record, &history).is_some(),
+        )
+    };
+    if input.is_empty() && !pruned {
+        return rejected(ApiError::conflict("Nothing to compact yet"));
+    }
+    // No run starts in the room until the summary is saved.
+    let Some(reservation) = state.agent_runs.try_reserve_room(&agent_id, &room_id) else {
+        return rejected(ApiError::conflict(SESSION_RUN_IN_PROGRESS));
+    };
+    let runs = state.agent_runs.clone();
+    let (agent, session) = (agent_id.clone(), session_id.clone());
+    tokio::spawn(async move {
+        let _reservation = reservation;
+        if let Err(error) = runs.compact_session(&agent, &session, &input).await {
+            warn!(agent_id = %agent, session_id = %session, error = %error, "session compaction failed");
+        }
+    });
+    session_response(&state, &agent_id, &session_id, StatusCode::ACCEPTED).await
 }
 
 #[utoipa::path(get, path = "/api/agents/{agent_id}/sessions/{session_id}/export", tag = "sessions",

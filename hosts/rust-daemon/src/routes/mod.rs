@@ -168,6 +168,7 @@ use crate::runtime_model::provider_summaries;
         schedules::import_legacy_schedules,
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
         sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
+        sessions::compact_session,
         events::agent_events,
         runs::start_session_run, runs::list_session_runs, runs::get_run, runs::stop_run,
     ),
@@ -498,6 +499,10 @@ fn router_with_services_with_policies(
         .route(
             "/api/agents/{agent_id}/sessions/{session_id}/export",
             get(sessions::export_session),
+        )
+        .route(
+            "/api/agents/{agent_id}/sessions/{session_id}/compact",
+            axum::routing::post(sessions::compact_session),
         )
         .route(
             "/api/agents/{agent_id}/sessions/{session_id}/runs",
