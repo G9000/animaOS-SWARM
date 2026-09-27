@@ -18,18 +18,32 @@ export type HashPage = (typeof HASH_PAGES)[number];
 
 export type HashRoute =
   | { kind: 'home' }
-  | { kind: 'session'; sessionId: string }
+  | {
+      kind: 'session';
+      sessionId: string;
+      /** Set for another agent's session, such as a helper's. */
+      agentId?: string;
+    }
   | { kind: 'page'; page: HashPage };
 
-const SESSION_ID = /^[A-Za-z0-9._:-]{1,200}$/;
+/** Session ids (spec §3.1); agent ids fit the same pattern. */
+const ROUTE_ID = /^[A-Za-z0-9._:-]{1,200}$/;
 
-/** `#/s/<sessionId>` or `#/<page>`; anything else is a new chat. */
+/** `#/s/<sessionId>`, `#/s/<agentId>/<sessionId>` for another agent's
+ *  session, or `#/<page>`; anything else is a new chat. */
 export function parseHashRoute(hash: string): HashRoute {
   const path = hash.startsWith('#') ? hash.slice(1) : hash;
   if (path.startsWith('/s/')) {
     try {
-      const sessionId = decodeURIComponent(path.slice(3));
-      if (SESSION_ID.test(sessionId)) return { kind: 'session', sessionId };
+      const parts = path
+        .slice(3)
+        .split('/')
+        .map((part) => decodeURIComponent(part));
+      if (parts.every((part) => ROUTE_ID.test(part))) {
+        if (parts.length === 1) return { kind: 'session', sessionId: parts[0] };
+        if (parts.length === 2)
+          return { kind: 'session', agentId: parts[0], sessionId: parts[1] };
+      }
     } catch {
       // A malformed escape opens a new chat.
     }
@@ -46,7 +60,9 @@ export function formatHashRoute(route: HashRoute): string {
     case 'home':
       return '#/';
     case 'session':
-      return `#/s/${encodeURIComponent(route.sessionId)}`;
+      return route.agentId
+        ? `#/s/${encodeURIComponent(route.agentId)}/${encodeURIComponent(route.sessionId)}`
+        : `#/s/${encodeURIComponent(route.sessionId)}`;
     case 'page':
       return `#/${route.page}`;
   }

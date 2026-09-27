@@ -63,6 +63,7 @@ function SessionRow({
   const [renaming, setRenaming] = useState(false);
   const [title, setTitle] = useState(session.title);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
+  const rowRef = useRef<HTMLDivElement>(null);
   const closeMenu = () => {
     setMenuOpen(false);
     setConfirmDelete(false);
@@ -78,9 +79,24 @@ function SessionRow({
     setTitle(session.title);
   };
 
+  // A press anywhere else closes the menu, so one row menu is open at a
+  // time (M2 T16).
+  useEffect(() => {
+    if (!menuOpen) return;
+    const closeOutside = (event: Event) => {
+      if (rowRef.current && !rowRef.current.contains(event.target as Node)) {
+        setMenuOpen(false);
+        setConfirmDelete(false);
+      }
+    };
+    document.addEventListener('pointerdown', closeOutside);
+    return () => document.removeEventListener('pointerdown', closeOutside);
+  }, [menuOpen]);
+
   return (
     <div
       className="session-row"
+      ref={rowRef}
       onKeyDown={(event) => {
         if (event.key === 'Escape' && menuOpen) {
           event.stopPropagation();

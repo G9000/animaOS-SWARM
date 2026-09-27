@@ -48,6 +48,24 @@ describe('hash routes', () => {
     );
   });
 
+  it('names another agent’s session by agent and session', () => {
+    expect(parseHashRoute('#/s/helper-7/room%3A9')).toEqual({
+      kind: 'session',
+      agentId: 'helper-7',
+      sessionId: 'room:9',
+    });
+    expect(
+      formatHashRoute({
+        kind: 'session',
+        agentId: 'helper-7',
+        sessionId: 'room:9',
+      }),
+    ).toBe('#/s/helper-7/room%3A9');
+    for (const hash of ['#/s/helper-7/', '#/s/a/b/c', '#/s/bad%20agent/room']) {
+      expect(parseHashRoute(hash)).toEqual({ kind: 'home' });
+    }
+  });
+
   it('follows the location and navigates with or without a history entry', () => {
     window.history.replaceState(null, '', '/#/work');
     const { result } = renderHook(() => useHashRoute());

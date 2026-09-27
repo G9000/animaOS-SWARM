@@ -7,7 +7,11 @@ import {
   type DaemonSnapshot,
   type DaemonWorkspaceState,
 } from '../lib/daemon-api';
-import { useDaemonBootstrap } from './useDaemonBootstrap';
+import {
+  BOOTSTRAP_POLL_MS,
+  BOOTSTRAP_SUMMARY_POLL_MS,
+  useDaemonBootstrap,
+} from './useDaemonBootstrap';
 
 vi.mock('../lib/daemon-api', async () => {
   const actual =
@@ -23,6 +27,7 @@ vi.mock('../lib/daemon-api', async () => {
       listAgents: vi.fn(),
       listProviders: vi.fn(),
       getWorkspace: vi.fn(),
+      listAgentSummaries: vi.fn(),
     },
   };
 });
@@ -76,6 +81,7 @@ const healthMock = vi.mocked(daemon.health);
 const listAgentsMock = vi.mocked(daemon.listAgents);
 const listProvidersMock = vi.mocked(daemon.listProviders);
 const getWorkspaceMock = vi.mocked(daemon.getWorkspace);
+const listAgentSummariesMock = vi.mocked(daemon.listAgentSummaries);
 
 const unconfiguredWorkspace: DaemonWorkspaceState = {
   configured: false,
@@ -125,6 +131,7 @@ beforeEach(() => {
   listProvidersMock.mockReset();
   getWorkspaceMock.mockReset();
   getWorkspaceMock.mockResolvedValue(unconfiguredWorkspace);
+  listAgentSummariesMock.mockReset();
 });
 
 afterEach(() => {
@@ -656,5 +663,63 @@ describe('useDaemonBootstrap', () => {
 
     expect(result.current.workspace).toBeNull();
     expect(result.current.connection).toBe('online');
+  });
+
+  it('polls agent summaries every 30 seconds while the event stream is open', async () => {
+    vi.useFakeTimers();
+    const known: DaemonSnapshot = {
+      ...snapshot('known', 10),
+      messageCount: 1,
+      messages: [
+        {
+          id: 'm1',
+          agentId: 'known',
+          roomId: 'chat:1',
+          role: 'assistant',
+          content: { text: 'Hello' },
+          createdAtMs: 11,
+        },
+      ],
+    };
+    resolveBootstrap([known]);
+    listAgentSummariesMock.mockResolvedValue([
+      {
+        state: { ...known.state, status: 'running' },
+        messageCount: 2,
+        eventCount: 3,
+        lastTask: null,
+      },
+    ]);
+    const { result, rerender } = renderHook(
+      ({ live }) => useDaemonBootstrap({ live }),
+      { initialProps: { live: true } },
+    );
+    await flushBootstrap();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BOOTSTRAP_POLL_MS);
+    });
+    expect(listAgentsMock).toHaveBeenCalledTimes(1);
+    expect(listAgentSummariesMock).not.toHaveBeenCalled();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(
+        BOOTSTRAP_SUMMARY_POLL_MS - BOOTSTRAP_POLL_MS,
+      );
+    });
+    expect(listAgentSummariesMock).toHaveBeenCalledTimes(1);
+    expect(result.current.agents).toEqual([
+      {
+        ...known,
+        state: { ...known.state, status: 'running' },
+        messageCount: 2,
+        eventCount: 3,
+      },
+    ]);
+
+    rerender({ live: false });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BOOTSTRAP_POLL_MS);
+    });
+    expect(listAgentsMock).toHaveBeenCalledTimes(2);
   });
 });

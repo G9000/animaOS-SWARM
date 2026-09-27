@@ -11,8 +11,10 @@ import { daemon } from '../lib/daemon-api';
 
 /** Messages per page (the daemon default). */
 export const SESSION_MESSAGE_PAGE = 50;
-/** The open session re-reads its newest page this often until M3's stream. */
+/** The open session re-reads its newest page this often without the stream. */
 export const SESSION_MESSAGES_POLL_MS = 3_000;
+/** With the stream open, message events refresh the page; this is a backstop. */
+export const SESSION_MESSAGES_LIVE_POLL_MS = 30_000;
 
 /**
  * The newest page always replaces the tail from its first message onward.
@@ -70,6 +72,7 @@ export function useSessionMessages(
   agentId: string | null,
   sessionId: string | null,
   refreshKey = 0,
+  pollMs = SESSION_MESSAGES_POLL_MS,
 ) {
   const [messages, setMessages] = useState<SessionMessage[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
@@ -202,14 +205,14 @@ export function useSessionMessages(
       timer = window.setTimeout(() => {
         timer = undefined;
         void refresh().finally(schedule);
-      }, SESSION_MESSAGES_POLL_MS);
+      }, pollMs);
     };
     void refresh().finally(schedule);
     return () => {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentId, sessionId, refresh, refreshKey]);
+  }, [agentId, sessionId, refresh, refreshKey, pollMs]);
 
   return {
     messages,

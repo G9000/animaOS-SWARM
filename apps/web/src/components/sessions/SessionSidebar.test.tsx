@@ -490,4 +490,30 @@ describe('SessionSidebar', () => {
       expect(screen.getByRole('button', { name: 'Old notes' })).toHaveFocus(),
     );
   });
+
+  it('keeps one row menu open at a time and closes it on a press elsewhere', async () => {
+    const user = userEvent.setup();
+    renderSidebar({
+      sessions: [
+        sessionFixture('chat:a', { title: 'Plan A' }),
+        sessionFixture('chat:b', { title: 'Plan B' }),
+      ],
+    });
+
+    await user.click(
+      screen.getByRole('button', { name: 'Actions for Plan A' }),
+    );
+    expect(screen.getByRole('menu', { name: 'Plan A actions' })).toBeVisible();
+    await user.click(
+      screen.getByRole('button', { name: 'Actions for Plan B' }),
+    );
+    expect(
+      screen.queryByRole('menu', { name: 'Plan A actions' }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole('menu', { name: 'Plan B actions' })).toBeVisible();
+    await user.click(
+      screen.getByRole('searchbox', { name: 'Search sessions' }),
+    );
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+  });
 });

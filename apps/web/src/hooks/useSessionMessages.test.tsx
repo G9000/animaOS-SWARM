@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { daemon } from '../lib/daemon-api';
 import {
+  SESSION_MESSAGES_LIVE_POLL_MS,
   SESSION_MESSAGES_POLL_MS,
   mergeNewest,
   useSessionMessages,
@@ -568,5 +569,34 @@ describe('useSessionMessages', () => {
       'm2',
       'm3',
     ]);
+  });
+
+  it('polls at the interval its caller gives', async () => {
+    const armed: number[] = [];
+    vi.spyOn(window, 'setTimeout').mockImplementation(((
+      handler: TimerHandler,
+      timeout?: number,
+    ) => {
+      if (timeout === SESSION_MESSAGES_LIVE_POLL_MS) {
+        armed.push(timeout);
+        return armed.length;
+      }
+      return nativeSetTimeout(handler, timeout);
+    }) as typeof window.setTimeout);
+    vi.spyOn(daemon, 'sessionMessages').mockResolvedValue({
+      messages: [],
+      nextBefore: null,
+    });
+
+    renderHook(() =>
+      useSessionMessages(
+        'agent-main',
+        'chat:1',
+        0,
+        SESSION_MESSAGES_LIVE_POLL_MS,
+      ),
+    );
+
+    await waitFor(() => expect(armed).toEqual([SESSION_MESSAGES_LIVE_POLL_MS]));
   });
 });
