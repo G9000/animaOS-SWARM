@@ -249,7 +249,8 @@ impl ProviderModelAdapter {
         sink: &dyn ModelStreamSink,
     ) -> Result<(), String> {
         let api_key = self.key_required(&credential, "ANTHROPIC_API_KEY", "anthropic")?;
-        for attempt in 0..2 {
+        let mut retried = false;
+        loop {
             let mut body = build_anthropic_body(config, request)?;
             body["stream"] = serde_json::Value::Bool(true);
             let response = self
@@ -261,7 +262,12 @@ impl ProviderModelAdapter {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|error| transport_error("Anthropic", "stream request", error))?;
+                .map_err(|error| {
+                    after_retry(
+                        retried,
+                        transport_error("Anthropic", "stream request", error),
+                    )
+                })?;
             if response.status().is_success() {
                 if is_json_response(&response) {
                     let payload = response_payload(response, "Anthropic", Some(&api_key)).await?;
@@ -269,15 +275,15 @@ impl ProviderModelAdapter {
                 }
                 return consume_anthropic_sse(response, sink).await;
             }
-            let retry = retryable(response.status()) && attempt == 0;
+            let retry = !retried && retryable(response.status());
             let error = response_payload(response, "Anthropic", Some(&api_key))
                 .await
                 .unwrap_err();
             if !retry {
-                return Err(error);
+                return Err(after_retry(retried, error));
             }
+            retried = true;
         }
-        Err("Anthropic stream retry exhausted".into())
     }
 
     async fn stream_openai_compatible(
@@ -291,7 +297,8 @@ impl ProviderModelAdapter {
         shape: OpenAiRequestShape,
     ) -> Result<(), String> {
         let provider_name = provider.label;
-        for attempt in 0..2 {
+        let mut retried = false;
+        loop {
             let mut body = build_openai_compatible_body(config, request)?;
             shape_openai_body(&mut body, shape);
             body["stream"] = serde_json::Value::Bool(true);
@@ -306,10 +313,12 @@ impl ProviderModelAdapter {
             if let Some(api_key) = api_key {
                 builder = builder.bearer_auth(api_key);
             }
-            let response = builder
-                .send()
-                .await
-                .map_err(|error| transport_error(provider_name, "stream request", error))?;
+            let response = builder.send().await.map_err(|error| {
+                after_retry(
+                    retried,
+                    transport_error(provider_name, "stream request", error),
+                )
+            })?;
             if response.status().is_success() {
                 if is_json_response(&response) {
                     let payload = response_payload(response, provider_name, api_key).await?;
@@ -321,15 +330,15 @@ impl ProviderModelAdapter {
                 }
                 return consume_openai_sse(response, sink, provider).await;
             }
-            let retry = retryable(response.status()) && attempt == 0;
+            let retry = !retried && retryable(response.status());
             let error = response_payload(response, provider_name, api_key)
                 .await
                 .unwrap_err();
             if !retry {
-                return Err(error);
+                return Err(after_retry(retried, error));
             }
+            retried = true;
         }
-        Err(format!("{provider_name} stream retry exhausted"))
     }
 
     async fn stream_google(
@@ -345,7 +354,8 @@ impl ProviderModelAdapter {
             credential.base_url.trim_end_matches('/'),
             config.model
         );
-        for attempt in 0..2 {
+        let mut retried = false;
+        loop {
             let response = self
                 .client
                 .post(&endpoint)
@@ -354,7 +364,9 @@ impl ProviderModelAdapter {
                 .json(&build_google_body(config, request)?)
                 .send()
                 .await
-                .map_err(|error| transport_error("Google", "stream request", error))?;
+                .map_err(|error| {
+                    after_retry(retried, transport_error("Google", "stream request", error))
+                })?;
             if response.status().is_success() {
                 if is_json_response(&response) {
                     let payload = response_payload(response, "Google", Some(&api_key)).await?;
@@ -362,23 +374,15 @@ impl ProviderModelAdapter {
                 }
                 return consume_google_sse(response, sink, &api_key).await;
             }
-            let status = response.status();
+            let retry = !retried && retryable(response.status());
             let error = response_payload(response, "Google", Some(&api_key))
                 .await
                 .unwrap_err();
-            // A non-retryable failure surfaces immediately, at either attempt. A
-            // retryable failure on attempt 0 retries once; if attempt 1 *also*
-            // fails retryably, that is reported as exhaustion rather than the raw
-            // second error (unlike attempt == 0's gate alone, which would make the
-            // trailing "retry exhausted" below unreachable).
-            if !retryable(status) {
-                return Err(error);
+            if !retry {
+                return Err(after_retry(retried, error));
             }
-            if attempt == 1 {
-                return Err("Google stream retry exhausted".into());
-            }
+            retried = true;
         }
-        Err("Google stream retry exhausted".into())
     }
 
     async fn stream_ollama_native(
@@ -532,6 +536,16 @@ impl ModelAdapter for ProviderModelAdapter {
 
 fn retryable(status: reqwest::StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
+}
+
+/// A stream request retries a 429 or 5xx answer once. When that one retry also
+/// fails, the call returns the second attempt's own error, marked as such.
+fn after_retry(retried: bool, error: String) -> String {
+    if retried {
+        format!("after one retry: {error}")
+    } else {
+        error
+    }
 }
 
 async fn response_payload(

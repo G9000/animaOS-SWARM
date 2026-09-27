@@ -1664,12 +1664,11 @@ async fn google_stream_retries_one_retryable_response_then_succeeds() {
     assert_eq!(response.content.text, "ok");
 }
 
-// --- Controller ruling M14: a Google stream that fails retryably on both attempts
-// returns the "Google stream retry exhausted" sentinel rather than the raw second
-// failure (a non-retryable failure still surfaces its own message immediately).
+// --- S1-E (reverses M14): a stream whose one retry also fails returns that second
+// attempt's own error, prefixed "after one retry: ", from every provider path.
 
 #[tokio::test]
-async fn google_stream_retry_exhausted_after_two_retryable_failures() {
+async fn google_stream_returns_the_second_error_after_one_retry() {
     let calls = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
@@ -1693,7 +1692,7 @@ async fn google_stream_retry_exhausted_after_two_retryable_failures() {
         .await
         .unwrap_err();
 
-    assert_eq!(error, "Google stream retry exhausted");
+    assert_eq!(error, "after one retry: Google API error (503): temporary");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -2223,4 +2222,86 @@ async fn ollama_with_tools_asks_for_and_reports_stream_usage() {
     assert_eq!(response.usage.prompt_tokens, 26);
     assert_eq!(response.usage.completion_tokens, 5);
     assert_eq!(response.usage.total_tokens, 31);
+}
+
+/// Answers 503 "first failure" once, then `second` (status and body) every time.
+async fn failing_twice_server(
+    path: &'static str,
+    second: (axum::http::StatusCode, &'static str),
+) -> (String, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        path,
+        post({
+            let calls = Arc::clone(&calls);
+            move || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "first failure")
+                    } else {
+                        second
+                    }
+                }
+            }
+        }),
+    );
+    (spawn_server(app).await, calls)
+}
+
+#[tokio::test]
+async fn anthropic_and_openai_streams_return_the_second_error_after_one_retry() {
+    let (base_url, calls) = failing_twice_server(
+        "/v1/messages",
+        (axum::http::StatusCode::TOO_MANY_REQUESTS, "second failure"),
+    )
+    .await;
+    let error = adapter_with(&[("anthropic", Some("key"), &base_url)])
+        .stream(
+            &agent_config("anthropic", false),
+            &request(),
+            &FrameSink(Mutex::new(Vec::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "after one retry: Anthropic API error (429): second failure"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let (base_url, calls) = failing_twice_server(
+        "/v1/chat/completions",
+        (axum::http::StatusCode::BAD_REQUEST, "second failure"),
+    )
+    .await;
+    let error = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))])
+        .stream(
+            &agent_config("openai", false),
+            &request(),
+            &FrameSink(Mutex::new(Vec::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "after one retry: OpenAI API error (400): second failure"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // A first failure that is not retryable still surfaces as itself.
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async { (axum::http::StatusCode::BAD_REQUEST, "bad request") }),
+    );
+    let base_url = spawn_server(app).await;
+    let error = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))])
+        .stream(
+            &agent_config("openai", false),
+            &request(),
+            &FrameSink(Mutex::new(Vec::new())),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, "OpenAI API error (400): bad request");
 }
