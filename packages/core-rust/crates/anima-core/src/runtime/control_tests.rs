@@ -399,3 +399,50 @@ fn steers_join_the_conversation_before_the_next_model_call() {
     }));
     assert!(control.steering.drain().is_empty());
 }
+
+/// Task 2 review carry-forward: a stop leaves the steers the run never
+/// drained in the inbox, so the host decides what becomes of them (spec
+/// §4.7; the daemon turns them into interrupted records, audit M8).
+#[test]
+fn a_stop_leaves_the_steers_it_never_drained_in_the_inbox_for_the_host() {
+    let control = RunControl::new();
+    let model = Arc::new(ScriptedModel::new(&["call-a"]));
+    let (mut runtime, frames) = controlled(model.clone(), &control);
+    let steering = control.steering.clone();
+    let cancel = control.cancel.clone();
+
+    let result = block_on(
+        runtime.run_with_tools(text("plan my week"), move |_, _, _| {
+            steering
+                .push(text("Also book the gym"))
+                .expect("the inbox is open while the run works");
+            cancel.cancel();
+            async move { TaskResult::success(text("calendar read"), 0) }
+        }),
+    );
+
+    assert_eq!(result.error.as_deref(), Some(RUN_STOPPED_ERROR));
+    assert_eq!(
+        model.calls(),
+        1,
+        "the stop lands before the next model call"
+    );
+    assert!(
+        runtime
+            .messages()
+            .iter()
+            .all(|message| message.content.text != "Also book the gym"),
+        "a steer the run never drained is not part of its transcript"
+    );
+    assert!(!frames
+        .0
+        .lock_recover()
+        .iter()
+        .any(|frame| matches!(frame, RunFrame::Steered { .. })));
+    assert!(!control.steering.is_closed(), "the host closes the inbox");
+    assert_eq!(
+        control.steering.close(),
+        vec![text("Also book the gym")],
+        "the host gets the steer back"
+    );
+}
