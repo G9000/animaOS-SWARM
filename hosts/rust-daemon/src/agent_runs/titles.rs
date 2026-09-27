@@ -30,8 +30,14 @@ fn is_unusable_reply(message: &Message) -> bool {
 
 impl AgentRunCoordinator {
     /// Starts a background title for the session of a run that just
-    /// committed; nothing it does can affect the run.
-    pub(crate) fn title_after_first_reply(
+    /// committed; nothing it does can affect the run. A brief read here
+    /// (no lock held across the spawn or any further `.await`) skips the
+    /// spawn entirely for the common case of a non-chat session or one that
+    /// already has its title, so most completed runs (jobs, check-ins,
+    /// Telegram turns, helpers) never pay for a background task or a model
+    /// call. `title_session` repeats the check once it runs, since the
+    /// state can still change in between (fix round 1, review Minor 1).
+    pub(crate) async fn title_after_first_reply(
         &self,
         agent_id: &str,
         session_id: &str,
@@ -51,6 +57,17 @@ impl AgentRunCoordinator {
         else {
             return;
         };
+        {
+            let guard = self.state.read().await;
+            let Some(session) = guard.sessions.get(agent_id, session_id) else {
+                return;
+            };
+            if session.kind != SessionKind::Chat
+                || session.title_source != TitleSource::FirstMessage
+            {
+                return;
+            }
+        }
         let run_messages: HashSet<String> = change_set.message_ids.iter().cloned().collect();
         let coordinator = self.clone();
         let (agent_id, session_id, room_id) = (

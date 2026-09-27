@@ -1704,7 +1704,8 @@ impl AgentRunCoordinator {
                     &room_id,
                     &change_set,
                     &result,
-                );
+                )
+                .await;
             }
         }
         // Disarmed only once the terminal event is out, so a panic before it

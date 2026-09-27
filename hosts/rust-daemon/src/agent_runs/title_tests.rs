@@ -5,8 +5,19 @@ use std::time::Duration;
 use anima_core::{DataValue, MessageRole};
 
 use super::test_support::{chat_request, coordinator_with, events_until, ScriptedModel, Step};
-use crate::sessions::test_support::{message, seed_messages};
+use crate::sessions::test_support::{message, seed_messages, within};
 use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
+
+/// Waits (bounded by `within`, 5 seconds) until `model` has received a
+/// secondary (title) call.
+async fn wait_for_title_call(model: &ScriptedModel) {
+    within("a title call", async {
+        while model.secondary_requests().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
 
 #[tokio::test]
 async fn a_new_chat_is_named_after_its_first_completed_reply() {
@@ -101,6 +112,37 @@ async fn titles_stay_off_unless_enabled_and_follow_the_agent_setting() {
     );
 }
 
+/// Review Minor 1/2 (fix round 1): a non-chat session (here, a Telegram
+/// room, by its `telegram:` room-id prefix — spec §3.1) is never titled, and
+/// `title_after_first_reply`'s own cheap check must catch it before a
+/// background task, let alone a model call, is ever started.
+#[tokio::test]
+async fn a_completed_reply_in_a_non_chat_session_is_never_titled() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["Hello!"])]);
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    coordinator.state.write().await.set_generated_titles(true);
+
+    coordinator
+        .run(chat_request(&agent_id, "telegram:12345", "hello there"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        model.secondary_requests().is_empty(),
+        "a Telegram session is never AI-titled"
+    );
+    let guard = coordinator.state.read().await;
+    assert_eq!(
+        guard
+            .sessions
+            .get(&agent_id, "telegram:12345")
+            .unwrap()
+            .kind,
+        SessionKind::Telegram
+    );
+}
+
 #[tokio::test]
 async fn an_unusable_or_failed_title_leaves_the_first_message_title() {
     for secondary in [Step::Text(vec!["Lisbon"]), Step::Fail("rate limited")] {
@@ -112,12 +154,7 @@ async fn an_unusable_or_failed_title_leaves_the_first_message_title() {
             .run(chat_request(&agent_id, "chat:keep", "Plan the offsite"))
             .await
             .unwrap();
-        for _ in 0..500 {
-            if !model.secondary_requests().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_title_call(&model).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let guard = coordinator.state.read().await;
@@ -173,12 +210,7 @@ async fn a_stopped_or_incomplete_earlier_reply_does_not_block_the_title() {
             .run(chat_request(&agent_id, "chat:early", "Anything new?"))
             .await
             .unwrap();
-        for _ in 0..500 {
-            if !model.secondary_requests().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_for_title_call(&model).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let guard = coordinator.state.read().await;
@@ -206,12 +238,7 @@ async fn a_title_call_that_never_answers_times_out_and_keeps_the_first_message_t
         .run(chat_request(&agent_id, "chat:slow", "Plan the offsite"))
         .await
         .unwrap();
-    for _ in 0..500 {
-        if !model.secondary_requests().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_title_call(&model).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let guard = coordinator.state.read().await;
