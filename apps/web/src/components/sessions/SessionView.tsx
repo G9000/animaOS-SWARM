@@ -5,13 +5,18 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
-import type { Session } from '@animaOS-SWARM/sdk';
+import { isTerminalRunStatus, type Session } from '@animaOS-SWARM/sdk';
 
+import type { LiveRun } from '../../lib/session-events';
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
 import type { SlashCommand } from '../../lib/slash-commands';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
-import { buildTranscript, type PendingBubble } from '../../lib/transcript';
+import {
+  buildTranscript,
+  type PendingBubble,
+  type TranscriptActions,
+} from '../../lib/transcript';
 import { ghostBtnCls } from '../ui-bits';
 
 export interface SessionComposerState {
@@ -43,6 +48,13 @@ export interface SessionViewProps {
   messages: ChatMessage[];
   /** Messages on their way to the daemon (spec §15.5). */
   pending?: readonly PendingBubble[];
+  /** The session's runs from its stream and ledger (spec §15.2). */
+  runs?: readonly LiveRun[];
+  actions?: TranscriptActions;
+  /** Set for helper sessions: who wrote their user turns. */
+  delegatedBy?: string | null;
+  /** Read politely to screen readers when a reply finishes (spec §15.5). */
+  announcement?: string;
   hasOlder: boolean;
   loadingOlder: boolean;
   onLoadOlder: () => void;
@@ -180,6 +192,7 @@ function SessionHeader({
 }
 
 const EMPTY_PENDING: readonly PendingBubble[] = [];
+const EMPTY_RUNS: readonly LiveRun[] = [];
 
 /** One session (or a new chat): its transcript and composer (spec §15.2). */
 export function SessionView({
@@ -187,6 +200,10 @@ export function SessionView({
   session,
   messages,
   pending = EMPTY_PENDING,
+  runs = EMPTY_RUNS,
+  actions,
+  delegatedBy = null,
+  announcement = '',
   hasOlder,
   loadingOlder,
   onLoadOlder,
@@ -206,9 +223,12 @@ export function SessionView({
     () => ({ ...agent, messages }),
     [agent, messages],
   );
+  const trimmedThrough =
+    session?.contextTrimmed?.droppedThroughMessageId ?? null;
   const items = useMemo(
-    () => buildTranscript({ messages, pending }),
-    [messages, pending],
+    () =>
+      buildTranscript({ messages, pending, runs, trimmedThrough, delegatedBy }),
+    [messages, pending, runs, trimmedThrough, delegatedBy],
   );
   if (missing) {
     return (
@@ -223,6 +243,12 @@ export function SessionView({
       </section>
     );
   }
+  // A run the transcript shows speaks for itself; the thinking indicator
+  // covers active runs it does not know about (no stream).
+  const thinking =
+    composer.sending ||
+    ((session?.activeRuns ?? 0) > 0 &&
+      !runs.some((item) => !isTerminalRunStatus(item.run.status)));
   const footer = sessionFooter(session, telegramAvailable);
   return (
     <section
@@ -238,10 +264,17 @@ export function SessionView({
         />
       ) : null}
       {notice}
+      {session?.compactionError ? (
+        <p role="status" className="px-4 pt-3 text-xs text-ink-3">
+          Earlier messages could not be summarized:{' '}
+          {session.compactionError.message}
+        </p>
+      ) : null}
       <MessageList
         agent={conversation}
         items={items}
-        sending={composer.sending || (session?.activeRuns ?? 0) > 0}
+        actions={actions}
+        sending={thinking}
         scrollerRef={scrollerRef}
         onSuggestion={onSuggestion}
         hasOlder={hasOlder}
@@ -281,6 +314,9 @@ export function SessionView({
           )}
         </div>
       )}
+      <p className="sr-only" aria-live="polite" aria-atomic="true">
+        {announcement}
+      </p>
     </section>
   );
 }
