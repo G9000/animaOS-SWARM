@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -13,6 +14,14 @@ import type { AgentDetail, ChatMessage } from '../lib/types';
 import { AlertIcon, BoltIcon, PulseIcon, SendIcon } from './icons';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ErrorBanner, formatTime } from './ui-bits';
+import {
+  buildTranscript,
+  type TranscriptActions,
+  type TranscriptItem,
+} from '../lib/transcript';
+import { PendingMessage, RunActivity, ToolBlock } from './sessions/RunActivity';
+import { RunOutcomeCard } from './sessions/RunOutcomeCard';
+import { DelegatedTurn, TrimmedDivider } from './sessions/TranscriptNotes';
 
 /* ── Messages ── */
 function EventPill({ message }: { message: ChatMessage }) {
@@ -29,11 +38,20 @@ function EventPill({ message }: { message: ChatMessage }) {
   );
 }
 
+/** Why a reply is partial (spec §4.5, §4.6). */
+function messageFlag(message: ChatMessage): string | null {
+  const metadata = message.content.metadata;
+  if (metadata?.stopped === true) return 'Stopped';
+  if (metadata?.incomplete === true) return 'Incomplete';
+  return null;
+}
+
 function Bubble({ message }: { message: ChatMessage }) {
   if (message.role !== 'User' && message.role !== 'Assistant') {
     return <EventPill message={message} />;
   }
   const isUser = message.role === 'User';
+  const flag = messageFlag(message);
   return (
     <div
       className={`animate-msg-in flex ${isUser ? 'justify-end' : 'justify-start'}`}
@@ -52,6 +70,7 @@ function Bubble({ message }: { message: ChatMessage }) {
         </div>
         <div className="studio-message-meta mt-1 px-1 font-mono text-[10px] text-ink-3">
           <span>{formatTime(message.created_at_ms)}</span>
+          {flag && <span className="message-flag">{flag}</span>}
           <CopyMessage text={message.content.text} />
         </div>
       </div>
@@ -174,6 +193,68 @@ function ThinkingIndicator({ name }: { name: string }) {
   );
 }
 
+function anchorIds(item: TranscriptItem): string[] {
+  switch (item.kind) {
+    case 'message':
+    case 'delegated':
+    case 'revised':
+      return [item.message.id];
+    case 'tools':
+      return item.messageIds;
+    default:
+      return [];
+  }
+}
+
+const renderBubble = (message: ChatMessage) => <Bubble message={message} />;
+
+function TranscriptEntry({
+  item,
+  agentName,
+  actions,
+}: {
+  item: TranscriptItem;
+  agentName: string;
+  actions?: TranscriptActions;
+}) {
+  switch (item.kind) {
+    case 'message':
+      return <Bubble message={item.message} />;
+    case 'revised':
+      return (
+        <details className="revised-draft">
+          <summary>Earlier draft (revised)</summary>
+          <Bubble message={item.message} />
+        </details>
+      );
+    case 'delegated':
+      return (
+        <DelegatedTurn from={item.from} text={item.message.content.text} />
+      );
+    case 'tools':
+      return <ToolBlock steps={item.steps} active={false} actions={actions} />;
+    case 'run':
+      return (
+        <RunActivity
+          live={item.live}
+          agentName={agentName}
+          actions={actions}
+          renderMessage={renderBubble}
+        />
+      );
+    case 'outcome':
+      return (
+        <RunOutcomeCard run={item.run} onSendAgain={actions?.onSendAgain} />
+      );
+    case 'pending':
+      return (
+        <PendingMessage pending={item.pending} renderMessage={renderBubble} />
+      );
+    case 'trimmed':
+      return <TrimmedDivider onCompact={actions?.onCompact} />;
+  }
+}
+
 export const MessageList = memo(function MessageList({
   agent,
   sending,
@@ -183,6 +264,8 @@ export const MessageList = memo(function MessageList({
   loadingOlder = false,
   onLoadOlder,
   emptyState,
+  items,
+  actions,
 }: {
   agent: AgentDetail;
   sending: boolean;
@@ -194,6 +277,10 @@ export const MessageList = memo(function MessageList({
   onLoadOlder?: () => void;
   /** Replaces the welcome screen for sessions that are not new chats. */
   emptyState?: ReactNode;
+  /** The session's transcript with its live runs and sends (spec §15.2);
+   *  built from `agent.messages` when absent. */
+  items?: readonly TranscriptItem[];
+  actions?: TranscriptActions;
 }) {
   const [awayFromBottom, setAwayFromBottom] = useState(false);
   const [highlight, setHighlight] = useState<string | null>(null);
@@ -204,6 +291,10 @@ export const MessageList = memo(function MessageList({
     firstId: firstMessageId,
     height: 0,
   });
+  const transcript = useMemo(
+    () => items ?? buildTranscript({ messages: agent.messages }),
+    [items, agent.messages],
+  );
   const jumpToMessage = useCallback((id: string) => {
     atBottom.current = false;
     setAwayFromBottom(true);
@@ -220,7 +311,7 @@ export const MessageList = memo(function MessageList({
       const element = scrollerRef.current;
       if (element) element.scrollTop = element.scrollHeight;
     }
-  }, [agent.messages, sending, scrollerRef]);
+  }, [transcript, sending, scrollerRef]);
   // Keep the reading position when older messages are prepended.
   useLayoutEffect(() => {
     const element = scrollerRef.current;
@@ -261,7 +352,7 @@ export const MessageList = memo(function MessageList({
             }
           }}
         >
-          {agent.messages.length === 0 && !sending ? (
+          {transcript.length === 0 && !sending ? (
             (emptyState ?? (
               <EmptyState agentName={agent.name} onPick={onSuggestion} />
             ))
@@ -279,19 +370,31 @@ export const MessageList = memo(function MessageList({
                     : 'Load older messages'}
                 </button>
               )}
-              {agent.messages.map((m) => (
-                <div
-                  key={m.id}
-                  ref={(element) => {
-                    if (element) messageElements.current.set(m.id, element);
-                    else messageElements.current.delete(m.id);
-                  }}
-                  data-search-match={highlight === m.id || undefined}
-                  className="studio-message-anchor"
-                >
-                  <Bubble message={m} />
-                </div>
-              ))}
+              {transcript.map((item) => {
+                const ids = anchorIds(item);
+                return (
+                  <div
+                    key={item.key}
+                    ref={(element) => {
+                      for (const id of ids) {
+                        if (element) messageElements.current.set(id, element);
+                        else messageElements.current.delete(id);
+                      }
+                    }}
+                    data-search-match={
+                      (highlight !== null && ids.includes(highlight)) ||
+                      undefined
+                    }
+                    className="studio-message-anchor"
+                  >
+                    <TranscriptEntry
+                      item={item}
+                      agentName={agent.name}
+                      actions={actions}
+                    />
+                  </div>
+                );
+              })}
               {sending && <ThinkingIndicator name={agent.name} />}
             </div>
           )}

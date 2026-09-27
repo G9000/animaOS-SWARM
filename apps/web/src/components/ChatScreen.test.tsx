@@ -125,7 +125,8 @@ describe('MessageList', () => {
     expect(await navigator.clipboard.readText()).toBe('**bold**');
     expect(screen.getByRole('button', { name: 'Copied' })).toBeVisible();
   });
-  it('renders Markdown for user and assistant bubbles while keeping event pills literal', () => {
+  it('renders Markdown bubbles, literal event pills, and tool results as cards', async () => {
+    const user = userEvent.setup();
     const scrollerRef = { current: null };
     render(
       <MessageList
@@ -141,11 +142,65 @@ describe('MessageList', () => {
       screen.getByRole('heading', { level: 2, name: 'Heading' }),
     ).toBeVisible();
     expect(screen.getByText('system · **system marker**')).toBeVisible();
-    expect(screen.getByText('tool · ## tool marker')).toBeVisible();
     expect(screen.getByText('system · **system marker**').tagName).toBe('SPAN');
+    // Tool messages are no longer grey pills (spec §15.1).
+    expect(screen.queryByText(/^tool · /)).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Used 1 tool · <1s' }));
+    await user.click(screen.getByRole('button', { name: /^tool\b/ }));
+    expect(screen.getByText('## tool marker').tagName).toBe('PRE');
     expect(
       screen.queryByRole('heading', { name: 'tool marker' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('labels a stopped reply', () => {
+    render(
+      <MessageList
+        agent={{
+          ...agent,
+          messages: [
+            {
+              id: 'stopped',
+              role: 'Assistant',
+              content: { text: 'Half an answer', metadata: { stopped: true } },
+              created_at_ms: 1_725_000_000_000,
+            },
+          ],
+        }}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Stopped')).toBeVisible();
+  });
+
+  it('renders a helper session’s delegated turn from the delegating companion, not the owner', () => {
+    render(
+      <MessageList
+        agent={agent}
+        sending={false}
+        scrollerRef={{ current: null }}
+        onSuggestion={vi.fn()}
+        items={[
+          {
+            kind: 'delegated',
+            key: 'delegated-1',
+            from: 'Nova',
+            message: {
+              id: 'delegated-1',
+              role: 'User',
+              content: { text: 'Compare vendors' },
+              created_at_ms: 1_725_000_000_000,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText('From Nova')).toBeVisible();
+    expect(screen.getByText('Compare vendors')).toBeVisible();
   });
 
   it('retains the conversation label and message timestamps', () => {
