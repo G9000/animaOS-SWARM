@@ -1272,7 +1272,7 @@ fn openai_request_shape_follows_the_provider_and_its_default_endpoint() {
             .unwrap()
     };
     let shape = |id: &str, base_url: &str| {
-        let shape = super::adapter::openai_request_shape(definition(id), base_url);
+        let shape = super::adapter::openai_request_shape(definition(id), base_url, "gpt-4o-mini");
         (shape.stream_usage, shape.max_completion_tokens)
     };
     assert_eq!(shape("openai", "https://api.openai.com/v1"), (true, true));
@@ -2077,4 +2077,59 @@ async fn a_google_stream_without_any_candidate_fails() {
     )
     .unwrap_err();
     assert_eq!(error, "Google blocked the prompt: PROHIBITED_CONTENT");
+}
+
+// --- S1-C: OpenAI reasoning models reject a non-default temperature.
+
+#[test]
+fn openai_reasoning_models_get_no_temperature_and_max_completion_tokens() {
+    let openai = provider_definitions()
+        .iter()
+        .find(|definition| definition.id == "openai")
+        .unwrap();
+    let shaped = |base_url: &str, model: &str| {
+        let mut config = agent_config("openai", false);
+        config.model = model.into();
+        let mut body =
+            crate::openai_compatible::build_openai_compatible_body(&config, &request()).unwrap();
+        assert_eq!(body["temperature"], 0.2, "the request asks for 0.2");
+        assert_eq!(body["max_tokens"], 512);
+        let shape = super::adapter::openai_request_shape(openai, base_url, model);
+        super::adapter::shape_openai_body(&mut body, shape);
+        body
+    };
+
+    for model in [
+        "o1",
+        "o1-mini",
+        "o3",
+        "o3-mini",
+        "o4-mini",
+        "gpt-5",
+        "gpt-5-mini",
+        "gpt-5.1",
+    ] {
+        let body = shaped("https://api.openai.com/v1", model);
+        assert!(body.get("temperature").is_none(), "{model}: {body}");
+        assert_eq!(body["max_completion_tokens"], 512, "{model}");
+        assert!(body.get("max_tokens").is_none(), "{model}");
+    }
+
+    for model in [
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "gpt-5-chat-latest",
+        "gpt-5.1-chat-latest",
+    ] {
+        let body = shaped("https://api.openai.com/v1", model);
+        assert_eq!(body["temperature"], 0.2, "{model}");
+        assert_eq!(body["max_completion_tokens"], 512, "{model}");
+        assert!(body.get("max_tokens").is_none(), "{model}");
+    }
+
+    // A custom endpoint keeps the request as the agent asked for it.
+    let body = shaped("https://my-proxy.example/v1", "o3");
+    assert_eq!(body["temperature"], 0.2);
+    assert_eq!(body["max_tokens"], 512);
+    assert!(body.get("max_completion_tokens").is_none());
 }

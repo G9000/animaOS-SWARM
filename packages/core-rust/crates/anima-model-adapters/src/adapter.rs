@@ -25,16 +25,21 @@ pub(crate) struct OpenAiRequestShape {
     pub(crate) stream_usage: bool,
     /// Send `max_completion_tokens` instead of `max_tokens`.
     pub(crate) max_completion_tokens: bool,
+    /// Leave `temperature` out.
+    pub(crate) omit_temperature: bool,
 }
 
 /// `stream_options.include_usage` goes only to endpoints that document it:
 /// any vLLM server, and OpenAI and DeepSeek at their own default endpoints (a
 /// custom base URL may be Azure or a strict proxy that rejects the field).
 /// OpenAI's own endpoint gets `max_completion_tokens`, which its reasoning
-/// models require instead of `max_tokens` (spec §12.4).
+/// models require instead of `max_tokens` (spec §12.4), and no `temperature`
+/// for those reasoning models, which reject any but the default (so a 0.2
+/// compaction or title call still works for them).
 pub(crate) fn openai_request_shape(
     definition: &ProviderDefinition,
     base_url: &str,
+    model: &str,
 ) -> OpenAiRequestShape {
     let default_endpoint = base_url
         .trim_end_matches('/')
@@ -46,14 +51,30 @@ pub(crate) fn openai_request_shape(
             _ => false,
         },
         max_completion_tokens: definition.id == "openai" && default_endpoint,
+        omit_temperature: definition.id == "openai"
+            && default_endpoint
+            && is_openai_reasoning_model(model),
     }
 }
 
-fn shape_openai_body(body: &mut serde_json::Value, shape: OpenAiRequestShape) {
-    if !shape.max_completion_tokens {
+/// OpenAI's reasoning model ids: `o1*`, `o3*`, `o4*`, and `gpt-5*` except the
+/// `-chat` variants, which are ordinary chat models.
+fn is_openai_reasoning_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    ["o1", "o3", "o4"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
+        || (model.starts_with("gpt-5") && !model.contains("-chat"))
+}
+
+pub(crate) fn shape_openai_body(body: &mut serde_json::Value, shape: OpenAiRequestShape) {
+    let Some(object) = body.as_object_mut() else {
         return;
+    };
+    if shape.omit_temperature {
+        object.remove("temperature");
     }
-    if let Some(object) = body.as_object_mut() {
+    if shape.max_completion_tokens {
         if let Some(max_tokens) = object.remove("max_tokens") {
             object.insert("max_completion_tokens".into(), max_tokens);
         }
@@ -449,7 +470,7 @@ impl ModelAdapter for ProviderModelAdapter {
                     credential.api_key.as_deref(),
                     config,
                     request,
-                    openai_request_shape(definition, &credential.base_url),
+                    openai_request_shape(definition, &credential.base_url, &config.model),
                 )
                 .await
             }
@@ -503,7 +524,7 @@ impl ModelAdapter for ProviderModelAdapter {
                     config,
                     request,
                     sink,
-                    openai_request_shape(definition, &credential.base_url),
+                    openai_request_shape(definition, &credential.base_url, &config.model),
                 )
                 .await
             }
