@@ -8,6 +8,7 @@ import {
 import type { Session } from '@animaOS-SWARM/sdk';
 
 import { SESSION_KIND_LABELS } from '../../lib/session-groups';
+import type { SlashCommand } from '../../lib/slash-commands';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
 import { buildTranscript, type PendingBubble } from '../../lib/transcript';
@@ -19,7 +20,7 @@ export interface SessionComposerState {
   sending: boolean;
   disabled: boolean;
   offline: boolean;
-  onSend: () => void;
+  onSend: (text?: string) => void;
   error: string | null;
   onDismissError: () => void;
   recovery?: {
@@ -28,6 +29,11 @@ export interface SessionComposerState {
     restore: () => void;
     dismiss: () => void;
   };
+  commands?: readonly SlashCommand[];
+  /** This session's reply is in progress (spec §15.3). */
+  runActive?: boolean;
+  onStop?: () => void;
+  onSteer?: () => void;
 }
 
 export interface SessionViewProps {
@@ -260,6 +266,10 @@ export function SessionView({
           error={composer.error}
           onDismissError={composer.onDismissError}
           recovery={composer.recovery}
+          commands={composer.commands}
+          runActive={composer.runActive}
+          onStop={composer.onStop}
+          onSteer={composer.onSteer}
         />
       ) : (
         <div className="session-footer-note" role="note">

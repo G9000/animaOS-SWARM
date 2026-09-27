@@ -218,3 +218,36 @@
   height: 1px;
   overflow: hidden;
 }
+/* Composer command menu (spec §15.3). */
+.slash-menu {
+  margin-bottom: 8px;
+  overflow: hidden;
+  border: 1px solid var(--color-line);
+  border-radius: 12px;
+  background: var(--color-panel);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.4);
+}
+.slash-menu-option {
+  display: flex;
+  cursor: pointer;
+  align-items: baseline;
+  gap: 10px;
+  padding: 7px 12px;
+  color: var(--color-ink-2);
+  font-size: 12px;
+}
+.slash-menu-option[aria-selected='true'] {
+  background: rgb(255 255 255 / 0.05);
+  color: var(--color-ink);
+}
+.slash-menu-name {
+  flex-shrink: 0;
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+}
+.slash-menu-description {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

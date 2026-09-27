@@ -2,6 +2,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -11,7 +12,7 @@ import {
 import { ConversationTools } from './ConversationTools';
 import { CopyMessage } from './CopyMessage';
 import type { AgentDetail, ChatMessage } from '../lib/types';
-import { AlertIcon, BoltIcon, PulseIcon, SendIcon } from './icons';
+import { AlertIcon, BoltIcon, PulseIcon, SendIcon, StopIcon } from './icons';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ErrorBanner, formatTime } from './ui-bits';
 import {
@@ -22,6 +23,8 @@ import {
 import { PendingMessage, RunActivity, ToolBlock } from './sessions/RunActivity';
 import { RunOutcomeCard } from './sessions/RunOutcomeCard';
 import { DelegatedTurn, TrimmedDivider } from './sessions/TranscriptNotes';
+import { slashSuggestions, type SlashCommand } from '../lib/slash-commands';
+import { SlashCommandMenu } from './sessions/SlashCommandMenu';
 
 /* ── Messages ── */
 function EventPill({ message }: { message: ChatMessage }) {
@@ -455,6 +458,10 @@ export function Composer({
   onDismissError,
   offline = false,
   recovery,
+  commands,
+  runActive = false,
+  onStop,
+  onSteer,
 }: {
   agentName: string;
   /** The textarea's name and placeholder; defaults to "Message <agent>". */
@@ -463,7 +470,8 @@ export function Composer({
   setDraft: (v: string) => void;
   sending: boolean;
   disabled: boolean;
-  onSend: () => void;
+  /** Sends the draft, or `text` — a command picked from the menu. */
+  onSend: (text?: string) => void;
   error: string | null;
   onDismissError: () => void;
   offline?: boolean;
@@ -473,9 +481,30 @@ export function Composer({
     restore: () => void;
     dismiss: () => void;
   };
+  /** The slash commands the menu offers (spec §15.3); none without them. */
+  commands?: readonly SlashCommand[];
+  /** This session's reply is in progress: Send becomes Stop and
+   *  ⌘/Ctrl+Enter steers it (spec §15.3). */
+  runActive?: boolean;
+  onStop?: () => void;
+  onSteer?: () => void;
 }) {
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const menuId = useId();
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [dismissedFor, setDismissedFor] = useState<string | null>(null);
   const inputLabel = label ?? `Message ${agentName}`;
+  const suggestions = commands ? slashSuggestions(draft, commands) : [];
+  const menuOpen = suggestions.length > 0 && dismissedFor !== draft;
+  const selected = menuOpen
+    ? suggestions[Math.min(activeIndex, suggestions.length - 1)]
+    : null;
+  const canSend = !disabled && !sending && !offline && draft.trim().length > 0;
+  const steerable = runActive && onSteer !== undefined;
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [draft]);
 
   useEffect(() => {
     const el = taRef.current;
@@ -483,6 +512,16 @@ export function Composer({
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 192)}px`;
   }, [draft]);
+
+  /** Runs a command that needs nothing more; completes one that does. */
+  const pick = (command: SlashCommand, complete = false) => {
+    if (command.needs || complete) {
+      setDraft(`/${command.name}${command.needs ? ' ' : ''}`);
+      taRef.current?.focus();
+      return;
+    }
+    if (!disabled && !offline) onSend(`/${command.name}`);
+  };
 
   return (
     <div className="studio-composer safe-composer sticky bottom-0 z-10 bg-gradient-to-t from-abyss via-abyss/95 to-transparent px-4 pt-3 sm:px-6">
@@ -528,6 +567,14 @@ export function Composer({
             />
           </div>
         )}
+        {menuOpen && (
+          <SlashCommandMenu
+            id={menuId}
+            commands={suggestions}
+            activeName={selected?.name ?? null}
+            onPick={(command) => pick(command)}
+          />
+        )}
         <div className="studio-composer-box glass-strong focus-glow flex items-end gap-2 rounded-2xl p-2 transition-all duration-200">
           <textarea
             data-workspace-composer
@@ -536,38 +583,88 @@ export function Composer({
             disabled={disabled}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
-              if (
-                e.key === 'Enter' &&
-                !e.shiftKey &&
-                !e.nativeEvent.isComposing &&
-                e.keyCode !== 229
-              ) {
+              const composing = e.nativeEvent.isComposing || e.keyCode === 229;
+              if (selected) {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  const step = e.key === 'ArrowDown' ? 1 : -1;
+                  setActiveIndex(
+                    (index) =>
+                      (Math.min(index, suggestions.length - 1) +
+                        step +
+                        suggestions.length) %
+                      suggestions.length,
+                  );
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setDismissedFor(draft);
+                  return;
+                }
+                if (
+                  e.key === 'Tab' ||
+                  (e.key === 'Enter' && !e.shiftKey && !composing)
+                ) {
+                  e.preventDefault();
+                  pick(selected, e.key === 'Tab');
+                  return;
+                }
+              }
+              if (e.key === 'Enter' && !e.shiftKey && !composing) {
                 e.preventDefault();
-                if (!disabled && !sending && !offline && draft.trim()) onSend();
+                if (!canSend) return;
+                if ((e.metaKey || e.ctrlKey) && steerable) onSteer?.();
+                else onSend();
               }
             }}
             rows={1}
             aria-label={inputLabel}
+            aria-autocomplete={commands ? 'list' : undefined}
+            aria-expanded={commands ? menuOpen : undefined}
+            aria-controls={menuOpen ? menuId : undefined}
+            aria-activedescendant={
+              selected ? `${menuId}-${selected.name}` : undefined
+            }
             placeholder={`${inputLabel}…`}
             className="max-h-48 flex-1 resize-none bg-transparent px-3 py-2 text-sm leading-relaxed text-ink placeholder-ink-3 outline-none"
           />
-          <button
-            onClick={onSend}
-            disabled={disabled || sending || offline || !draft.trim()}
-            aria-label="Send"
-            className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-accent-fg shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
-          >
-            <SendIcon size={15} />
-          </button>
+          {runActive && onStop ? (
+            <button
+              type="button"
+              onClick={onStop}
+              aria-label="Stop"
+              className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl border border-line-strong bg-panel-2 text-ink transition hover:bg-panel active:scale-95"
+            >
+              <StopIcon size={15} />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => onSend()}
+              disabled={!canSend}
+              aria-label="Send"
+              className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-xl bg-accent text-accent-fg shadow-lg shadow-accent/25 transition hover:bg-accent/90 active:scale-95 disabled:cursor-not-allowed disabled:opacity-25 disabled:shadow-none disabled:active:scale-100"
+            >
+              <SendIcon size={15} />
+            </button>
+          )}
         </div>
         <div className="mt-2 flex items-center justify-between px-2 font-mono text-[10px] text-ink-3">
-          <span>⏎ send · ⇧⏎ new line</span>
+          <span>
+            {steerable
+              ? '⏎ queue · ⌘⏎ steer · ⇧⏎ new line'
+              : '⏎ send · ⇧⏎ new line'}
+          </span>
           <span>
             {offline
               ? 'Offline · your draft stays here'
               : sending
                 ? 'Working on your message…'
-                : 'Your space. Your pace.'}
+                : runActive
+                  ? 'Replying · you can keep writing'
+                  : 'Your space. Your pace.'}
           </span>
         </div>
       </div>

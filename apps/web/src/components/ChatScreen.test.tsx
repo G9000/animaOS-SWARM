@@ -1,9 +1,10 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentDetail } from '../lib/types';
 import { formatTime } from './ui-bits';
 import { Composer, MessageList } from './ChatScreen';
+import { SLASH_COMMANDS } from '../lib/slash-commands';
 
 const messages: AgentDetail['messages'] = [
   {
@@ -377,5 +378,147 @@ describe('Composer keyboard safety', () => {
     view.rerender(<Composer {...props} />);
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(onSend).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('Composer commands and live replies', () => {
+  function composerProps(
+    overrides: Partial<Parameters<typeof Composer>[0]> = {},
+  ) {
+    return {
+      agentName: 'Nova',
+      draft: '',
+      setDraft: vi.fn(),
+      sending: false,
+      disabled: false,
+      onSend: vi.fn(),
+      error: null,
+      onDismissError: vi.fn(),
+      commands: SLASH_COMMANDS,
+      ...overrides,
+    };
+  }
+
+  it('offers the matching commands and runs one with Enter', () => {
+    const props = composerProps({ draft: '/co' });
+    render(<Composer {...props} />);
+
+    const menu = screen.getByRole('listbox', { name: 'Commands' });
+    expect(within(menu).getAllByRole('option')).toHaveLength(1);
+    expect(
+      within(menu).getByRole('option', { selected: true }),
+    ).toHaveTextContent('/compact');
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Message Nova' }), {
+      key: 'Enter',
+    });
+    expect(props.onSend).toHaveBeenCalledWith('/compact');
+  });
+
+  it('completes a command that needs more text instead of running it', () => {
+    const props = composerProps({ draft: '/re' });
+    const view = render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.setDraft).toHaveBeenCalledWith('/rename ');
+    expect(props.onSend).not.toHaveBeenCalled();
+
+    view.rerender(<Composer {...props} draft="/n" />);
+    fireEvent.keyDown(input, { key: 'Tab' });
+    expect(props.setDraft).toHaveBeenLastCalledWith('/new');
+  });
+
+  it('moves through commands with the arrow keys, picks by click, and closes with Escape', async () => {
+    const props = composerProps({ draft: '/' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(screen.getByRole('option', { selected: true })).toHaveTextContent(
+      '/stop',
+    );
+    expect(input).toHaveAttribute(
+      'aria-activedescendant',
+      screen.getByRole('option', { selected: true }).id,
+    );
+    await userEvent.click(screen.getByRole('option', { name: /\/export/ }));
+    expect(props.onSend).toHaveBeenCalledWith('/export');
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+
+  it('shows no command menu without commands', () => {
+    render(
+      <Composer {...composerProps({ draft: '/', commands: undefined })} />,
+    );
+    expect(screen.queryByRole('listbox')).not.toBeInTheDocument();
+  });
+
+  it('turns Send into Stop and steers with Ctrl+Enter while a reply runs', async () => {
+    const props = composerProps({
+      draft: 'also check flights',
+      runActive: true,
+      onStop: vi.fn(),
+      onSteer: vi.fn(),
+    });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    expect(
+      screen.queryByRole('button', { name: 'Send' }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    expect(props.onStop).toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter', ctrlKey: true });
+    expect(props.onSteer).toHaveBeenCalledTimes(1);
+    expect(props.onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(props.onSend).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('⏎ queue · ⌘⏎ steer · ⇧⏎ new line')).toBeVisible();
+  });
+
+  it('does not steer or send while composing IME text', () => {
+    const props = composerProps({
+      draft: 'more context',
+      commands: undefined,
+      runActive: true,
+      onStop: vi.fn(),
+      onSteer: vi.fn(),
+    });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    fireEvent.keyDown(input, {
+      key: 'Enter',
+      ctrlKey: true,
+      isComposing: true,
+    });
+    expect(props.onSteer).not.toHaveBeenCalled();
+    expect(props.onSend).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
+  it('wires the input to the open command menu as a combobox', () => {
+    const props = composerProps({ draft: '/co' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+    const listbox = screen.getByRole('listbox');
+    const option = screen.getByRole('option', { selected: true });
+
+    expect(input).toHaveAttribute('aria-expanded', 'true');
+    expect(input).toHaveAttribute('aria-controls', listbox.id);
+    expect(input).toHaveAttribute('aria-activedescendant', option.id);
+    expect(document.activeElement).not.toBe(listbox);
+  });
+
+  it('closes the combobox wiring once no command matches', () => {
+    const props = composerProps({ draft: 'hello' });
+    render(<Composer {...props} />);
+    const input = screen.getByRole('textbox', { name: 'Message Nova' });
+
+    expect(input).toHaveAttribute('aria-expanded', 'false');
+    expect(input).not.toHaveAttribute('aria-controls');
+    expect(input).not.toHaveAttribute('aria-activedescendant');
   });
 });
