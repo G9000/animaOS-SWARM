@@ -8,11 +8,12 @@ use anima_core::{DataValue, MessageRole};
 use axum::http::StatusCode;
 
 use super::test_support::{
-    add_chat, calculate_call, coordinator_with, events_until, quiet_for, Gate, ScriptedModel, Step,
+    add_chat, calculate_call, chat_request, coordinator_with, events_until, quiet_for, Gate,
+    ScriptedModel, Step,
 };
 use super::{AcceptRun, AcceptedRun, AgentRunCoordinator, SessionRunMode};
 use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
-use crate::runs::{RunLedger, RunRecord, RunSource, RunStatus};
+use crate::runs::{RunLedger, RunRecord, RunSource, RunStatus, RunStopRequest};
 
 fn message(agent_id: &str, key: &str, text: &str, mode: SessionRunMode) -> AcceptRun {
     AcceptRun {
@@ -597,7 +598,7 @@ async fn steers_left_beyond_the_queue_cap_are_offered_again_instead() {
 
     let refused = wait_for_key(&coordinator, &agent_id, "steer-2", RunStatus::Interrupted).await;
     let error = refused.error.as_ref().unwrap();
-    assert_eq!(error.code, "queue_full");
+    assert_eq!(error.code, "queue_full_before_start");
     assert_eq!(
         error.message,
         "Eight messages were already waiting when the run this message joined ended; it is safe to send it again."
@@ -650,7 +651,17 @@ async fn a_backward_clock_step_does_not_reorder_a_sessions_messages() {
         ("steer", SessionRunMode::Steer),
         ("third", SessionRunMode::Queue),
     ] {
-        accept(&coordinator, message(&agent_id, key, key, mode)).await;
+        let accepted = accept(&coordinator, message(&agent_id, key, key, mode)).await;
+        match mode {
+            SessionRunMode::Queue => assert!(
+                matches!(accepted, AcceptedRun::Created(_)),
+                "{key}: {accepted:?}"
+            ),
+            SessionRunMode::Steer => assert!(
+                matches!(accepted, AcceptedRun::Steered(_)),
+                "{key}: {accepted:?}"
+            ),
+        }
     }
     assert!(readings.lock().unwrap().is_empty());
 
@@ -665,11 +676,61 @@ async fn a_backward_clock_step_does_not_reorder_a_sessions_messages() {
     assert_eq!(order, ["running", "first", "second", "steer", "third"]);
 }
 
+/// The runs a failed run's steers become (fix round 1): each is offered
+/// again as `interrupted` (`failed_before_start`) in the change that fails
+/// the run, saved with it and announced once saved, and a retried key
+/// answers with it.
+async fn assert_offered_again_as_failed_before_start(
+    coordinator: &AgentRunCoordinator,
+    agent_id: &str,
+    run_id: &str,
+    events: &[serde_json::Value],
+) {
+    let guard = coordinator.state.read().await;
+    let offered = guard
+        .runs
+        .find_by_idempotency_key(agent_id, "key-2", 0)
+        .expect("the steer is offered again")
+        .clone();
+    assert_eq!(offered.status, RunStatus::Interrupted);
+    let error = offered.error.as_ref().unwrap();
+    assert_eq!(error.code, "failed_before_start");
+    assert_eq!(
+        error.message,
+        "The run this message joined failed before reading it; send it again."
+    );
+    assert_eq!(offered.input.text, "also this");
+    assert_eq!(offered.session_id, "chat:s");
+    assert_eq!(offered.started_at_ms, None);
+    assert!(guard.runs.get(run_id).unwrap().pending_steers.is_empty());
+    assert!(
+        events.iter().any(
+            |event| event["type"] == "run.interrupted" && event["runId"] == offered.id.as_str()
+        ),
+        "announced once saved: {events:?}"
+    );
+    let restored = restarted(guard.control_plane_snapshot().runs, agent_id);
+    assert_eq!(
+        restored.for_session(agent_id, "chat:s").len(),
+        2,
+        "a restart offers it only once"
+    );
+    drop(guard);
+    let retried = accept(
+        coordinator,
+        message(agent_id, "key-2", "also this", SessionRunMode::Steer),
+    )
+    .await;
+    assert!(
+        matches!(&retried, AcceptedRun::Replayed(record) if record.id == offered.id),
+        "{retried:?}"
+    );
+}
+
 /// A steer the run took in is part of the run's result: when that result
-/// cannot be saved, the steer goes back to the run's saved steers, so it is
-/// not lost and a restart offers it again.
+/// cannot be saved, the steer is offered again instead of being lost.
 #[tokio::test]
-async fn a_steer_taken_in_by_a_run_whose_result_cannot_be_saved_is_kept() {
+async fn a_steer_of_a_run_whose_result_cannot_be_saved_is_offered_again() {
     let gate = Gate::new();
     let model = ScriptedModel::gated(
         vec![
@@ -680,6 +741,8 @@ async fn a_steer_taken_in_by_a_run_whose_result_cannot_be_saved_is_kept() {
     );
     let (coordinator, agent_id) = coordinator_with(model.clone()).await;
     add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
     let AcceptedRun::Created(first) = accept(
         &coordinator,
         message(&agent_id, "key-1", "compute", SessionRunMode::Queue),
@@ -712,16 +775,217 @@ async fn a_steer_taken_in_by_a_run_whose_result_cannot_be_saved_is_kept() {
         .install_test_control_plane_save_gate(true);
     save_gate.release.add_permits(1);
     gate.release();
+    let mut events = events_until(&mut subscription, "run.failed").await;
+    events.extend(quiet_for(&mut subscription).await);
     let failed = wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Failed).await;
     assert_eq!(failed.error.as_ref().unwrap().code, "commit_failed");
 
+    assert_offered_again_as_failed_before_start(&coordinator, &agent_id, &first.id, &events).await;
+}
+
+/// The same for a result its source refused (`commit_rejected`).
+#[tokio::test]
+async fn a_steer_of_a_run_whose_result_is_refused_is_offered_again() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(
+        vec![
+            Step::Tools(vec![calculate_call("call-1", "1+1")]),
+            Step::Text(vec!["ok"]),
+        ],
+        gate.clone(),
+    );
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+    let running = {
+        let coordinator = coordinator.clone();
+        let request = chat_request(&agent_id, "chat:s", "compute");
+        tokio::spawn(async move {
+            coordinator
+                .run_with_commit(request, |_, _| {
+                    Err(crate::routes::ApiError::conflict("the source refused it"))
+                })
+                .await
+        })
+    };
+    gate.entered().await;
+    let AcceptedRun::Steered(joined) = accept(
+        &coordinator,
+        message(&agent_id, "key-2", "also this", SessionRunMode::Steer),
+    )
+    .await
+    else {
+        panic!("steered");
+    };
+    gate.release();
+    // Taken in before the second call, whose result the source refuses.
+    gate.entered().await;
+    gate.release();
+    running.await.unwrap().unwrap_err();
+    let mut events = events_until(&mut subscription, "run.failed").await;
+    events.extend(quiet_for(&mut subscription).await);
+    let failed = coordinator
+        .state
+        .read()
+        .await
+        .runs
+        .get(&joined.id)
+        .cloned()
+        .unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    assert_eq!(failed.error.as_ref().unwrap().code, "commit_rejected");
+
+    assert_offered_again_as_failed_before_start(&coordinator, &agent_id, &joined.id, &events).await;
+}
+
+/// The same for a run whose task panicked while it held the steer.
+#[tokio::test]
+async fn a_steer_of_a_run_that_crashed_is_offered_again() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Panic("the model crashed")], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+    let AcceptedRun::Created(first) = accept(
+        &coordinator,
+        message(&agent_id, "key-1", "compute", SessionRunMode::Queue),
+    )
+    .await
+    else {
+        panic!("queued");
+    };
+    gate.entered().await;
+    let AcceptedRun::Steered(_) = accept(
+        &coordinator,
+        message(&agent_id, "key-2", "also this", SessionRunMode::Steer),
+    )
+    .await
+    else {
+        panic!("steered");
+    };
+    gate.release();
+    let events = events_until(&mut subscription, "run.interrupted").await;
+    let failed = wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Failed).await;
+    assert_eq!(failed.error.as_ref().unwrap().code, "run_aborted");
+
+    assert_offered_again_as_failed_before_start(&coordinator, &agent_id, &first.id, &events).await;
+}
+
+/// A steer whose save succeeds after the run's inbox closed is refused by
+/// the inbox; the run's end, waiting for that save's transaction, finds it
+/// on the run's record alone and makes it the next queued message.
+#[tokio::test]
+async fn a_steer_saved_as_its_run_finished_becomes_the_next_message() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["First answer"])], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let hub = coordinator.state.read().await.live.clone();
+    let AcceptedRun::Created(first) = accept(
+        &coordinator,
+        message(&agent_id, "key-1", "hello", SessionRunMode::Queue),
+    )
+    .await
+    else {
+        panic!("queued");
+    };
+    gate.entered().await;
+    let control = hub.runs().control(&first.id).unwrap();
+    // The steer's acceptance save is held.
+    let save_gate = coordinator
+        .state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(false);
+    let steering = {
+        let coordinator = coordinator.clone();
+        let request = message(&agent_id, "key-2", "one more thing", SessionRunMode::Steer);
+        tokio::spawn(async move { accept(&coordinator, request).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), save_gate.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    // Meanwhile the run's only model call ends and its inbox closes.
+    gate.release();
+    for _ in 0..500 {
+        if control.steering.is_closed() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(control.steering.is_closed());
+    save_gate.release.add_permits(1);
+
+    let answer = steering.await.unwrap();
+    assert!(
+        matches!(&answer, AcceptedRun::Steered(record) if record.id == first.id),
+        "{answer:?}"
+    );
+    gate.release();
+    let second = wait_for_key(&coordinator, &agent_id, "key-2", RunStatus::Completed).await;
+    assert_eq!(second.input.text, "one more thing");
+    wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Completed).await;
     let guard = coordinator.state.read().await;
-    let record = guard.runs.get(&first.id).unwrap();
-    assert_eq!(record.pending_steers.len(), 1);
-    assert_eq!(record.pending_steers[0].text, "also this");
-    let restored = restarted(guard.control_plane_snapshot().runs, &agent_id);
-    let offered = restored
-        .find_by_idempotency_key(&agent_id, "key-2", 0)
-        .expect("a restart offers it again");
-    assert_eq!(offered.error.as_ref().unwrap().code, "restart_before_start");
+    assert!(guard.runs.get(&first.id).unwrap().pending_steers.is_empty());
+    assert_eq!(guard.runs.for_session(&agent_id, "chat:s").len(), 2);
+    assert_eq!(model.requests().len(), 2);
+}
+
+/// A run whose stop is saved but whose signal has not reached it yet ends
+/// normally; the steers it left are still interrupted, not requeued, since
+/// the stop is read from its record under the transaction (fix round 1).
+#[tokio::test]
+async fn a_saved_stop_that_has_not_reached_the_run_still_keeps_its_steers_from_running() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["First answer"])], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let AcceptedRun::Created(first) = accept(
+        &coordinator,
+        message(&agent_id, "key-1", "hello", SessionRunMode::Queue),
+    )
+    .await
+    else {
+        panic!("queued");
+    };
+    gate.entered().await;
+    let AcceptedRun::Steered(_) = accept(
+        &coordinator,
+        message(
+            &agent_id,
+            "key-2",
+            "and the weather?",
+            SessionRunMode::Steer,
+        ),
+    )
+    .await
+    else {
+        panic!("steered");
+    };
+    // The stop is saved; its signal comes only after that save.
+    coordinator
+        .state
+        .write()
+        .await
+        .runs
+        .get_mut(&first.id)
+        .unwrap()
+        .stop = Some(RunStopRequest {
+        requested_at_ms: anima_core::primitives::now_millis(),
+    });
+    gate.release();
+
+    let interrupted = wait_for_key(&coordinator, &agent_id, "key-2", RunStatus::Interrupted).await;
+    assert_eq!(
+        interrupted.error.as_ref().unwrap().code,
+        "stopped_before_start"
+    );
+    wait_for_key(&coordinator, &agent_id, "key-1", RunStatus::Completed).await;
+    gate.release.add_permits(2);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(model.requests().len(), 1, "the steer never ran");
 }

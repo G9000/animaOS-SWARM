@@ -33,6 +33,8 @@ pub(crate) enum Step {
     /// Streams these chunks, then never finishes: the call ends only when
     /// the run drops it (a stop).
     Hold(Vec<&'static str>),
+    /// Panics, as a crashing adapter would.
+    Panic(&'static str),
 }
 
 /// Holds each model call open: a call adds an `entered` permit when it
@@ -184,6 +186,7 @@ impl ModelAdapter for ScriptedModel {
             Step::Tools(calls) => Ok(response(String::new(), Some(calls))),
             Step::Fail(error) => Err(error.to_string()),
             Step::Hold(_) => std::future::pending().await,
+            Step::Panic(message) => panic!("{message}"),
         }
     }
 
@@ -217,6 +220,7 @@ impl ModelAdapter for ScriptedModel {
                 }
                 std::future::pending().await
             }
+            Step::Panic(message) => panic!("{message}"),
         }
     }
 }

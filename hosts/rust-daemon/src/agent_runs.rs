@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use crate::app::SharedDaemonState;
-use crate::live::{committed_message_events, LiveEventBody, LiveRun, LiveRunEnd};
+use crate::live::{committed_message_events, run_status_event, LiveEventBody, LiveRun, LiveRunEnd};
 use crate::memory_store::MemoryMutation;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::{
@@ -1258,8 +1258,12 @@ impl AgentRunCoordinator {
             guard.runs.insert(record);
             // Armed before anything else can fail, so a panic before the start
             // save cannot leave a permanently in-flight record.
-            let in_flight =
-                InFlightRunGuard::new(Arc::clone(&self.state), run_id.clone(), live_run.end());
+            let in_flight = InFlightRunGuard::new(
+                Arc::clone(&self.state),
+                self.control_plane_transactions(),
+                run_id.clone(),
+                live_run.end(),
+            );
             (
                 runtime,
                 tool_context,
@@ -1535,11 +1539,15 @@ impl AgentRunCoordinator {
                 return Err(ApiError::not_found());
             }
             if let Err(error) = commit(&mut guard, &outcome) {
-                guard.rollback_run(&change_set, RunError::new(COMMIT_REJECTED, error.message()));
+                let offered = guard
+                    .rollback_run(&change_set, RunError::new(COMMIT_REJECTED, error.message()));
                 if let Some(record) = guard.runs.get(&run_id) {
                     live_run.publish_record(record);
                 }
-                apply_run_rollback(&mut guard, &mut rollback)?;
+                let rolled_back = apply_run_rollback(&mut guard, &mut rollback);
+                drop(guard);
+                save_offered_steers(&self.state, offered).await;
+                rolled_back?;
                 return Err(error);
             }
             let snapshot = guard
@@ -1559,11 +1567,15 @@ impl AgentRunCoordinator {
         };
         if let Err(error) = persist_request.save().await {
             let mut guard = self.state.write().await;
-            guard.rollback_run(&change_set, RunError::new(COMMIT_FAILED, error.to_string()));
+            let offered =
+                guard.rollback_run(&change_set, RunError::new(COMMIT_FAILED, error.to_string()));
             if let Some(record) = guard.runs.get(&run_id) {
                 live_run.publish_record(record);
             }
-            apply_run_rollback(&mut guard, &mut rollback)?;
+            let rolled_back = apply_run_rollback(&mut guard, &mut rollback);
+            drop(guard);
+            save_offered_steers(&self.state, offered).await;
+            rolled_back?;
             return Err(ApiError::service_unavailable(error.to_string()));
         }
         // Only a durable commit reaches the history store (spec §13.1). It is
@@ -1729,22 +1741,58 @@ fn validate_run_request(
     Ok(())
 }
 
+/// Saves the `interrupted` runs a failed run's steers became, together with
+/// that failed run, and announces them only once saved (spec §6); unsaved,
+/// they wait in the ledger for the next save. The caller holds the
+/// control-plane transaction.
+async fn save_offered_steers(state: &SharedDaemonState, offered: Vec<RunRecord>) {
+    let Some(first) = offered.first() else {
+        return;
+    };
+    let (persist, hub, parent) = {
+        let mut guard = state.write().await;
+        (
+            guard.control_plane_persist_request(),
+            guard.live.clone(),
+            guard.live_parent_agent(&first.agent_id, &first.session_id),
+        )
+    };
+    match persist.save().await {
+        Ok(()) => {
+            for record in &offered {
+                hub.publish(run_status_event(record), parent.as_deref());
+            }
+        }
+        Err(error) => {
+            warn!(run_id = %first.id, error = %error, "could not save the steers a failed run held");
+        }
+    }
+}
+
 /// Marks a started run failed if its task ends without finishing it (for
 /// example, a panic in a tool), so a crashed run never stays in flight and
 /// never blocks deletion or task edits. A run that stopped before publishing
 /// its terminal event gets one here, with the ledger's status: `failed` for a
 /// run this marks, otherwise whatever its commit recorded (a panic after
-/// `commit_run`).
+/// `commit_run`). The steers a run it marks failed still held are offered
+/// again in the same change (Task 9 fix round 1).
 struct InFlightRunGuard {
     state: SharedDaemonState,
+    transactions: Arc<Mutex<()>>,
     run_id: Option<String>,
     live: LiveRunEnd,
 }
 
 impl InFlightRunGuard {
-    fn new(state: SharedDaemonState, run_id: String, live: LiveRunEnd) -> Self {
+    fn new(
+        state: SharedDaemonState,
+        transactions: Arc<Mutex<()>>,
+        run_id: String,
+        live: LiveRunEnd,
+    ) -> Self {
         Self {
             state,
+            transactions,
             run_id: Some(run_id),
             live,
         }
@@ -1768,23 +1816,34 @@ impl Drop for InFlightRunGuard {
             return;
         };
         let state = Arc::clone(&self.state);
+        let transactions = Arc::clone(&self.transactions);
         let live = self.live.clone();
         handle.spawn(async move {
-            let mut guard = state.write().await;
-            let Some(record) = guard.runs.get_mut(&run_id) else {
-                return;
+            let offered = {
+                let mut guard = state.write().await;
+                let Some(record) = guard.runs.get_mut(&run_id) else {
+                    return;
+                };
+                if !record.status.is_terminal() {
+                    record.finish(
+                        RunStatus::Failed,
+                        Some(RunError::new(
+                            RUN_ABORTED,
+                            "The run stopped unexpectedly before its result was saved",
+                        )),
+                        anima_core::primitives::now_millis(),
+                    );
+                }
+                live.publish_record(record);
+                guard
+                    .runs
+                    .offer_steers_of_failed_run(&run_id, anima_core::primitives::now_millis())
             };
-            if !record.status.is_terminal() {
-                record.finish(
-                    RunStatus::Failed,
-                    Some(RunError::new(
-                        RUN_ABORTED,
-                        "The run stopped unexpectedly before its result was saved",
-                    )),
-                    anima_core::primitives::now_millis(),
-                );
+            if !offered.is_empty() {
+                // Taken after the state lock is released (lock order).
+                let _transaction = transactions.lock_owned().await;
+                save_offered_steers(&state, offered).await;
             }
-            live.publish_record(record);
         });
     }
 }

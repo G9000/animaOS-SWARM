@@ -156,7 +156,15 @@ impl DaemonState {
     /// `step.delta` events, never as `message.created`, and the run's
     /// `run.failed` event (`commit_rejected`, `commit_failed`, or
     /// `agent_deleted`) tells them to drop it.
-    pub(crate) fn rollback_run(&mut self, change_set: &RunChangeSet, error: RunError) {
+    ///
+    /// Returns the `interrupted` runs the failed run's steers became in this
+    /// same change (Task 9 fix round 1): the caller saves them with it and
+    /// announces them once saved.
+    pub(crate) fn rollback_run(
+        &mut self,
+        change_set: &RunChangeSet,
+        error: RunError,
+    ) -> Vec<crate::runs::RunRecord> {
         if let (Some(runtime), Some(undo)) = (
             self.agents.get_mut(&change_set.agent_id),
             change_set.undo.clone(),
@@ -165,8 +173,7 @@ impl DaemonState {
         }
         if let Some(record) = self.runs.get_mut(&change_set.run_id) {
             record.reply_message_id = None;
-            // The steers its transcript took in are saved with it again, so
-            // a restart offers them to send again (audit I3).
+            // The steers its transcript took in did not stand with it.
             record.revert_steers(&crate::agent_runs::steers_taken_in(
                 &change_set.delta.messages,
             ));
@@ -175,6 +182,8 @@ impl DaemonState {
         if let Some(undo) = change_set.session_undo.clone() {
             self.sessions.revert_commit(undo);
         }
+        self.runs
+            .offer_steers_of_failed_run(&change_set.run_id, now_millis())
     }
 
     /// Reports `Running` while any run of the agent is in flight (spec §4.4 item 5).

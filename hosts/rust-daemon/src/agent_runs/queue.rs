@@ -194,7 +194,8 @@ pub(super) struct SteerLeftovers {
     /// Keys of the steers its transcript took in: they stay on its record
     /// until its result is saved with them.
     pub(super) taken: HashSet<String>,
-    /// Whether its owner stopped it.
+    /// Whether its control was cancelled; a stop saved on its record counts
+    /// too.
     pub(super) stopped: bool,
 }
 
@@ -249,15 +250,20 @@ fn replayed(
     )
 }
 
-/// A reused key of a steer (spec §4.2): the run it joined, found in the
-/// ledger; a different session or text is a conflict. The run's transcript
+/// A reused key of a steer within the window (spec §4.2): the run it joined,
+/// found in the ledger; a different session or text is a conflict. The run's transcript
 /// is read only for a steer it already took in, and only its session's room
 /// (audit M28).
-fn steer_replay(state: &DaemonState, request: &AcceptRun) -> Result<Option<AcceptedRun>, ApiError> {
-    let Some((run, pending)) = state
-        .runs
-        .find_steer(&request.agent_id, &request.idempotency_key)
-    else {
+fn steer_replay(
+    state: &DaemonState,
+    request: &AcceptRun,
+    now_ms: u64,
+) -> Result<Option<AcceptedRun>, ApiError> {
+    let Some((run, pending)) = state.runs.find_steer(
+        &request.agent_id,
+        &request.idempotency_key,
+        now_ms.saturating_sub(IDEMPOTENCY_WINDOW_MS),
+    ) else {
         return Ok(None);
     };
     let same = run.session_id == request.session_id
@@ -394,7 +400,7 @@ impl AgentRunCoordinator {
             ) {
                 return answer;
             }
-            if let Some(answer) = steer_replay(&guard, &request)? {
+            if let Some(answer) = steer_replay(&guard, &request, now_ms)? {
                 return Ok(answer);
             }
             let capabilities =
@@ -568,6 +574,13 @@ impl AgentRunCoordinator {
         let transaction = self.control_plane_transaction().await;
         let (records, parent, hub, persist) = {
             let mut guard = self.state.write().await;
+            // Read under the transaction: a stop whose save was still in
+            // progress when the run's execution ended counts as a stop.
+            let stopped = left.stopped
+                || guard
+                    .runs
+                    .get(&left.run_id)
+                    .is_some_and(|record| record.stop.is_some());
             let steers = take_leftover_steers(&mut guard, &left.run_id, left.unread, &left.taken);
             if steers.is_empty() {
                 return;
@@ -600,7 +613,7 @@ impl AgentRunCoordinator {
                         },
                         accepted_at_ms,
                     );
-                    let refused = if left.stopped {
+                    let refused = if stopped {
                         Some((STOPPED_BEFORE_START, STOPPED_BEFORE_START_MESSAGE))
                     } else if open_slots == 0 {
                         Some((QUEUE_FULL_BEFORE_START, QUEUE_FULL_BEFORE_START_MESSAGE))

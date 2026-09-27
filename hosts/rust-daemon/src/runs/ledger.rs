@@ -43,9 +43,15 @@ pub(crate) const STOPPED_BEFORE_START_MESSAGE: &str =
 /// A steer its run left behind when eight messages were already waiting
 /// (controller ruling, M3 pre-flight audit M9): kept as an `interrupted` run to
 /// send again instead of passing the queue cap.
-pub(crate) const QUEUE_FULL_BEFORE_START: &str = "queue_full";
+pub(crate) const QUEUE_FULL_BEFORE_START: &str = "queue_full_before_start";
 pub(crate) const QUEUE_FULL_BEFORE_START_MESSAGE: &str =
     "Eight messages were already waiting when the run this message joined ended; it is safe to send it again.";
+/// A steer held by a run that failed (its result refused or unsaved, or its
+/// task crashed) before its transcript was saved (Task 9 fix round 1): kept
+/// as an `interrupted` run to send again.
+pub(crate) const FAILED_BEFORE_START: &str = "failed_before_start";
+pub(crate) const FAILED_BEFORE_START_MESSAGE: &str =
+    "The run this message joined failed before reading it; send it again.";
 /// A deleted agent's queued message (spec §4.4 item 6).
 pub(crate) const AGENT_DELETED_BEFORE_START_MESSAGE: &str =
     "The companion was deleted before this message ran";
@@ -170,6 +176,15 @@ pub(crate) struct RunSteer {
     pub(crate) accepted_at_ms: u64,
 }
 
+/// A steer a run's committed transcript took in: its key, which answers a
+/// retry within the idempotency window of its acceptance (spec §4.2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SteeredKey {
+    pub(crate) idempotency_key: String,
+    pub(crate) accepted_at_ms: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunRecord {
@@ -216,7 +231,7 @@ pub(crate) struct RunRecord {
     /// Keys of the steers this run's committed transcript took in, so a
     /// retried one is answered with this run (spec §4.2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) steered_keys: Vec<String>,
+    pub(crate) steered_keys: Vec<SteeredKey>,
     /// Set once the history store holds this terminal record (spec §4.1).
     #[serde(default)]
     pub(crate) mirrored: bool,
@@ -319,8 +334,15 @@ impl RunRecord {
                 .any(|steer| steer.idempotency_key == pending.idempotency_key)
         });
         for steer in taken {
-            if !self.steered_keys.contains(&steer.idempotency_key) {
-                self.steered_keys.push(steer.idempotency_key.clone());
+            if !self
+                .steered_keys
+                .iter()
+                .any(|steered| steered.idempotency_key == steer.idempotency_key)
+            {
+                self.steered_keys.push(SteeredKey {
+                    idempotency_key: steer.idempotency_key.clone(),
+                    accepted_at_ms: steer.accepted_at_ms,
+                });
             }
         }
     }
@@ -331,8 +353,11 @@ impl RunRecord {
         if taken.is_empty() {
             return;
         }
-        self.steered_keys
-            .retain(|key| !taken.iter().any(|steer| &steer.idempotency_key == key));
+        self.steered_keys.retain(|steered| {
+            !taken
+                .iter()
+                .any(|steer| steer.idempotency_key == steered.idempotency_key)
+        });
         for steer in taken {
             if !self
                 .pending_steers
@@ -575,13 +600,15 @@ impl RunLedger {
             .collect()
     }
 
-    /// The run of this agent a steer sent with `key` joined, and the steer
-    /// while that run still holds it (spec §4.2, §4.7). Only the ledger's
-    /// records are read, never a transcript (audit M28).
+    /// The run of this agent a steer sent with `key` at or after `since_ms`
+    /// joined, and the steer while that run still holds it (spec §4.2,
+    /// §4.7). Only the ledger's records are read, never a transcript (audit
+    /// M28).
     pub(crate) fn find_steer(
         &self,
         agent_id: &str,
         key: &str,
+        since_ms: u64,
     ) -> Option<(&RunRecord, Option<&RunSteer>)> {
         self.records
             .values()
@@ -590,16 +617,54 @@ impl RunLedger {
                 if let Some(steer) = record
                     .pending_steers
                     .iter()
-                    .find(|steer| steer.idempotency_key == key)
+                    .find(|steer| steer.idempotency_key == key && steer.accepted_at_ms >= since_ms)
                 {
                     return Some((record, Some(steer)));
                 }
                 record
                     .steered_keys
                     .iter()
-                    .any(|steered| steered == key)
+                    .any(|steered| {
+                        steered.idempotency_key == key && steered.accepted_at_ms >= since_ms
+                    })
                     .then_some((record, None))
             })
+    }
+
+    /// Makes each steer a failed run still holds an `interrupted` run of its
+    /// own to send again (`failed_before_start`) and returns them as
+    /// inserted; a run in any other state keeps its steers.
+    pub(crate) fn offer_steers_of_failed_run(
+        &mut self,
+        run_id: &str,
+        now_ms: u64,
+    ) -> Vec<RunRecord> {
+        let Some(record) = self
+            .records
+            .get_mut(run_id)
+            .filter(|record| record.status == RunStatus::Failed)
+        else {
+            return Vec::new();
+        };
+        let offered = record
+            .steers_to_send_again()
+            .into_iter()
+            .map(|mut steer| {
+                steer.finish(
+                    RunStatus::Interrupted,
+                    Some(RunError::new(
+                        FAILED_BEFORE_START,
+                        FAILED_BEFORE_START_MESSAGE,
+                    )),
+                    now_ms,
+                );
+                steer
+            })
+            .collect::<Vec<_>>();
+        for record in &offered {
+            self.insert(record.clone());
+        }
+        offered
     }
 
     pub(crate) fn has_in_flight_idempotency_key(&self, agent_id: &str, key: &str) -> bool {
@@ -871,13 +936,19 @@ mod tests {
             text: "and this".into(),
             accepted_at_ms: 43,
         }];
-        steered.steered_keys = vec!["key-3".into()];
+        steered.steered_keys = vec![SteeredKey {
+            idempotency_key: "key-3".into(),
+            accepted_at_ms: 44,
+        }];
         let written = serde_json::to_value(&steered).unwrap();
         assert_eq!(
             written["pendingSteers"],
             json!([{"idempotencyKey": "key-2", "text": "and this", "acceptedAtMs": 43}])
         );
-        assert_eq!(written["steeredKeys"], json!(["key-3"]));
+        assert_eq!(
+            written["steeredKeys"],
+            json!([{"idempotencyKey": "key-3", "acceptedAtMs": 44}])
+        );
         assert_eq!(
             serde_json::from_value::<RunRecord>(written).unwrap(),
             steered
@@ -1045,6 +1116,57 @@ mod tests {
         assert!(failed.pending_steers.is_empty());
         assert!(!failed.mirrored, "the history store gets the change");
         assert_eq!(ledger.for_agent("agent-a").len(), 5);
+    }
+
+    /// Fix round 1 (Task 9 review 7a): a steer's key answers for the same
+    /// 24 hours as a run's, counted from when the steer was accepted.
+    #[test]
+    fn steer_keys_are_found_per_agent_within_the_idempotency_window() {
+        let now = 10 * IDEMPOTENCY_WINDOW_MS;
+        let since = now - IDEMPOTENCY_WINDOW_MS;
+        let mut ledger = RunLedger::default();
+        let mut run = record("agent-a", since - 100);
+        run.pending_steers = vec![
+            RunSteer {
+                idempotency_key: "old-pending".into(),
+                text: "old".into(),
+                accepted_at_ms: since - 1,
+            },
+            RunSteer {
+                idempotency_key: "pending".into(),
+                text: "new".into(),
+                accepted_at_ms: since,
+            },
+        ];
+        run.steered_keys = vec![
+            SteeredKey {
+                idempotency_key: "old-steered".into(),
+                accepted_at_ms: since - 1,
+            },
+            SteeredKey {
+                idempotency_key: "steered".into(),
+                accepted_at_ms: now,
+            },
+        ];
+        ledger.insert(run.clone());
+
+        let (found, pending) = ledger.find_steer("agent-a", "pending", since).unwrap();
+        assert_eq!(found.id, run.id);
+        assert_eq!(pending.unwrap().text, "new");
+        let (found, pending) = ledger.find_steer("agent-a", "steered", since).unwrap();
+        assert_eq!(found.id, run.id);
+        assert!(pending.is_none());
+        for expired in ["old-pending", "old-steered"] {
+            assert!(
+                ledger.find_steer("agent-a", expired, since).is_none(),
+                "{expired}"
+            );
+            assert!(
+                ledger.find_steer("agent-a", expired, 0).is_some(),
+                "{expired}"
+            );
+        }
+        assert!(ledger.find_steer("agent-b", "pending", 0).is_none());
     }
 
     #[test]

@@ -404,6 +404,7 @@ async fn an_aborted_run_is_announced_as_failed() {
     // What a panicking or aborted run task leaves behind.
     drop(InFlightRunGuard::new(
         std::sync::Arc::clone(&coordinator.state),
+        coordinator.control_plane_transactions(),
         run_id.clone(),
         live_run.end(),
     ));
