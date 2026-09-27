@@ -54,4 +54,24 @@ describe('runSlashCommand', () => {
       '/stop is not available here.',
     );
   });
+
+  it('refuses extra text after a command that takes none, discarding nothing (S3b-D)', () => {
+    const newChat = vi.fn();
+    const help = vi.fn();
+    expect(
+      runSlashCommand(parseSlashCommand('/new write a poem')!, {
+        new: newChat,
+      }),
+    ).toBe('/new takes no text.');
+    expect(newChat).not.toHaveBeenCalled();
+    expect(runSlashCommand(parseSlashCommand('/help me')!, { help })).toBe(
+      '/help takes no text.',
+    );
+    expect(help).not.toHaveBeenCalled();
+    // Still runs with no text at all.
+    expect(
+      runSlashCommand(parseSlashCommand('/new')!, { new: newChat }),
+    ).toBeNull();
+    expect(newChat).toHaveBeenCalledWith('');
+  });
 });

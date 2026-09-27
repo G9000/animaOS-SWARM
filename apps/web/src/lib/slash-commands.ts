@@ -89,6 +89,9 @@ export function runSlashCommand(
   if (!handler) return `/${command.name} is not available here.`;
   if (command.needs && !argument)
     return `Add ${command.needs} after /${command.name}.`;
+  // An argument-less command with text after it (S3b-D): refused, not
+  // silently ignored, so the extra text is never discarded.
+  if (!command.needs && argument) return `/${command.name} takes no text.`;
   handler(argument);
   return null;
 }

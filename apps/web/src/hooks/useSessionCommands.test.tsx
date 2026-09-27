@@ -201,6 +201,23 @@ describe('useSessionCommands', () => {
     expect(options.setError).toHaveBeenCalledWith('model unavailable');
   });
 
+  it('keeps the draft when a command that takes no text gets some (S3b-D)', () => {
+    const { result, options } = setup({ draft: '/new write a poem' });
+    act(() => result.current.send());
+    expect(options.updateChat).toHaveBeenLastCalledWith(CHAT_KEY, {
+      draft: '/new write a poem',
+      error: '/new takes no text.',
+    });
+    expect(options.newChat).not.toHaveBeenCalled();
+
+    act(() => result.current.send('/help me'));
+    expect(options.updateChat).toHaveBeenLastCalledWith(CHAT_KEY, {
+      draft: '/help me',
+      error: '/help takes no text.',
+    });
+    expect(options.showCommands).not.toHaveBeenCalled();
+  });
+
   it('offers no session command a read-only session lacks', () => {
     const { result, options } = setup({
       session: sessionFixture('job:1', { kind: 'job', capabilities: readOnly }),
