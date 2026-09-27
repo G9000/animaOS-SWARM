@@ -1,5 +1,6 @@
 mod live_state;
 mod run_commit;
+pub(crate) mod run_stop;
 mod runtime_events;
 mod session_state;
 mod swarm_relationships;

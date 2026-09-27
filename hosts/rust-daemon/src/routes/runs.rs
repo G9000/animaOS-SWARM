@@ -133,7 +133,7 @@ fn run_limit(uri: &Uri) -> Result<usize, ApiError> {
         (status = 400, description = "Missing or invalid key, empty text with no attachments, text over 32 KiB, over 10 or unknown attachments, unknown skill, steer on a kind that cannot steer, or a body over 256 KiB", body = ErrorBody),
         (status = 403, description = "Local owner required", body = ErrorBody),
         (status = 404, description = "Agent or session not found", body = ErrorBody),
-        (status = 409, description = "The kind cannot receive messages (a job or helper session, or a Telegram session without its connector), the agent is a helper, or the key was used for a different message", body = ErrorBody),
+        (status = 409, description = "The kind cannot receive messages (a job or helper session, or a Telegram session without its connector), the agent is a helper or is being deleted, or the key was used for a different message", body = ErrorBody),
         (status = 429, description = "Eight messages are already waiting for this companion", body = ErrorBody),
         (status = 503, description = "The control plane could not be saved", body = ErrorBody)
     ))]
@@ -349,4 +349,29 @@ pub(super) async fn get_run(
         },
     };
     no_store(json_response(StatusCode::OK, &RunEnvelope::of(&record)))
+}
+
+#[utoipa::path(post, path = "/api/agents/{agent_id}/runs/{run_id}/stop", tag = "runs",
+    params(("agent_id" = String, Path), ("run_id" = String, Path)),
+    responses(
+        (status = 202, description = "Stop accepted: a queued run is cancelled; a running run stops at its next checkpoint; a finished run is returned as it is", body = RunEnvelope),
+        (status = 403, description = "Local owner required", body = ErrorBody),
+        (status = 404, description = "Agent or run not found", body = ErrorBody),
+        (status = 503, description = "The stop could not be saved", body = ErrorBody)
+    ))]
+pub(super) async fn stop_run(
+    State(state): State<AppState>,
+    Path((agent_id, run_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = authorize(&state, &request, false) {
+        return response;
+    }
+    match state.agent_runs.stop_run(&agent_id, &run_id).await {
+        Ok(record) => no_store(json_response(
+            StatusCode::ACCEPTED,
+            &RunEnvelope::of(&record),
+        )),
+        Err(error) => rejected(error),
+    }
 }

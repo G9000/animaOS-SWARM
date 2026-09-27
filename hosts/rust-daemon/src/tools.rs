@@ -75,6 +75,9 @@ pub(crate) struct ToolExecutionContext {
     /// Task-list revision this run last saw; `todo_write` only replaces the
     /// list it saw (spec §4.4 item 8). Shared by clones within one run.
     pub(super) todo_revision: Arc<std::sync::Mutex<Option<String>>>,
+    /// The run's stop signal; the bash polling loop kills its child when it
+    /// is set (spec §4.6).
+    pub(super) cancel: Option<anima_core::CancelSignal>,
 }
 
 impl ToolExecutionContext {
@@ -105,6 +108,7 @@ impl ToolExecutionContext {
             calendar,
             mail: None,
             todo_revision: Arc::new(std::sync::Mutex::new(None)),
+            cancel: None,
         }
     }
 
@@ -146,6 +150,12 @@ impl ToolExecutionContext {
     /// Starts this run's compare-and-swap baseline for `todo_write`.
     pub(crate) fn with_todo_baseline(mut self, revision: Option<String>) -> Self {
         self.todo_revision = Arc::new(std::sync::Mutex::new(revision));
+        self
+    }
+
+    /// Hands the run's stop signal to the tools that can honor it.
+    pub(crate) fn with_cancel(mut self, cancel: Option<anima_core::CancelSignal>) -> Self {
+        self.cancel = cancel;
         self
     }
 

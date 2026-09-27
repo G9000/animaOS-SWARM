@@ -15,7 +15,7 @@ use crate::app::SharedDaemonState;
 use crate::connectors::runtime::{ConnectorManager, ConnectorRuntimeStatus};
 use crate::connectors::{OutboundDeliveryState, TelegramOutboundRecord};
 use crate::routes::ApiError;
-use crate::runs::RunSource;
+use crate::runs::{RunOutcome, RunSource, RunStatus};
 
 const CHECKIN_SENTINEL: &str = "CHECKIN_OK";
 const CHECKIN_SUFFIX: &str = "(This is a scheduled check-in. If you have nothing worth saying right now, reply with exactly CHECKIN_OK and nothing else.)";
@@ -92,6 +92,47 @@ pub(crate) enum ScheduleOutcomeStatus {
     Silent,
     Spoke,
     Failed,
+    /// The owner stopped the run; the schedule stays enabled (spec §4.6).
+    Stopped,
+}
+
+impl ScheduleOutcomeStatus {
+    /// The name clients see (`error` for a failure, as before M3).
+    pub(crate) const fn contract_name(&self) -> &'static str {
+        match self {
+            Self::Silent => "silent",
+            Self::Spoke => "spoke",
+            Self::Failed => "error",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// A check-in run's outcome (spec §4.6, §9.2).
+pub(crate) fn checkin_outcome_status(outcome: &RunOutcome) -> ScheduleOutcomeStatus {
+    if outcome.status == RunStatus::Cancelled {
+        ScheduleOutcomeStatus::Stopped
+    } else if outcome.result.status == TaskStatus::Error {
+        ScheduleOutcomeStatus::Failed
+    } else if outcome
+        .result
+        .data
+        .as_ref()
+        .is_some_and(|content| is_silent_checkin_reply(&content.text))
+    {
+        ScheduleOutcomeStatus::Silent
+    } else {
+        ScheduleOutcomeStatus::Spoke
+    }
+}
+
+/// The error code a check-in outcome records.
+pub(crate) fn checkin_error_code(status: &ScheduleOutcomeStatus) -> Option<String> {
+    match status {
+        ScheduleOutcomeStatus::Failed => Some("schedule_run_failed".into()),
+        ScheduleOutcomeStatus::Stopped => Some("schedule_run_stopped".into()),
+        ScheduleOutcomeStatus::Silent | ScheduleOutcomeStatus::Spoke => None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,6 +507,30 @@ async fn reconcile_interrupted(
     let _transaction = inner.runs.control_plane_transaction().await;
     let (previous, persist) = {
         let mut state = inner.state.write().await;
+        // Occurrences whose run the owner stopped before a restart could
+        // record its outcome: the saved stop survives the restart on the
+        // interrupted run, and a stop keeps the schedule enabled (spec §4.6,
+        // audit M24).
+        let stopped: BTreeSet<String> = state
+            .schedules
+            .values()
+            .filter(|s| !active_schedules.contains(&s.id) && unresolved_occurrence(s))
+            .filter(|s| {
+                let fired = s
+                    .last_fired
+                    .as_ref()
+                    .expect("an unresolved occurrence fired");
+                state
+                    .runs
+                    .find_by_idempotency_key(&s.agent_id, &fired.run_idempotency_key, 0)
+                    .is_some_and(|run| {
+                        run.source == RunSource::Schedule
+                            && run.source_ref.as_deref() == Some(s.id.as_str())
+                            && run.stop.is_some()
+                    })
+            })
+            .map(|s| s.id.clone())
+            .collect();
         let mut previous = Vec::new();
         for schedule in state
             .schedules
@@ -473,11 +538,21 @@ async fn reconcile_interrupted(
             .filter(|s| !active_schedules.contains(&s.id) && unresolved_occurrence(s))
         {
             previous.push(schedule.clone());
-            schedule.enabled = false;
-            schedule.last_safe_outcome = Some(ScheduleSafeOutcome {
-                status: ScheduleOutcomeStatus::Failed,
-                occurred_at_ms: now.max(schedule.last_fired.as_ref().unwrap().fired_at_ms),
-                error_code: Some("schedule_run_interrupted".into()),
+            let occurred_at_ms = now.max(schedule.last_fired.as_ref().unwrap().fired_at_ms);
+            schedule.last_safe_outcome = Some(if stopped.contains(&schedule.id) {
+                let status = ScheduleOutcomeStatus::Stopped;
+                ScheduleSafeOutcome {
+                    error_code: checkin_error_code(&status),
+                    status,
+                    occurred_at_ms,
+                }
+            } else {
+                schedule.enabled = false;
+                ScheduleSafeOutcome {
+                    status: ScheduleOutcomeStatus::Failed,
+                    occurred_at_ms,
+                    error_code: Some("schedule_run_interrupted".into()),
+                }
             });
             schedule.updated_at_ms = now.max(schedule.updated_at_ms);
         }
@@ -601,22 +676,11 @@ async fn execute_claimed(inner: &Arc<SchedulerInner>, record: ScheduledPromptRec
             request,
             move |state, outcome| {
                 let result = &outcome.result;
-                let status = if result.status == TaskStatus::Error {
-                    ScheduleOutcomeStatus::Failed
-                } else if result
-                    .data
-                    .as_ref()
-                    .is_some_and(|content| is_silent_checkin_reply(&content.text))
-                {
-                    ScheduleOutcomeStatus::Silent
-                } else {
-                    ScheduleOutcomeStatus::Spoke
-                };
+                let status = checkin_outcome_status(outcome);
                 let safe = ScheduleSafeOutcome {
                     status: status.clone(),
                     occurred_at_ms: now,
-                    error_code: (status == ScheduleOutcomeStatus::Failed)
-                        .then(|| "schedule_run_failed".into()),
+                    error_code: checkin_error_code(&status),
                 };
                 let schedule = state
                     .schedules
@@ -1124,6 +1188,224 @@ mod tests {
                 "{id} should finish"
             );
         }
+    }
+
+    #[test]
+    fn a_stopped_check_in_is_its_own_outcome_and_keeps_the_schedule() {
+        let outcome = |status: RunStatus, result: anima_core::TaskResult<Content>| RunOutcome {
+            run_id: "run_1".into(),
+            session_id: "schedule:s".into(),
+            reply_message_id: None,
+            result,
+            status,
+        };
+        let reply = |text: &str| {
+            anima_core::TaskResult::success(
+                Content {
+                    text: text.into(),
+                    ..Content::default()
+                },
+                1,
+            )
+        };
+        let stopped = checkin_outcome_status(&outcome(
+            RunStatus::Cancelled,
+            anima_core::TaskResult::error("stopped", 1),
+        ));
+        assert_eq!(stopped, ScheduleOutcomeStatus::Stopped);
+        assert_eq!(
+            checkin_error_code(&stopped).as_deref(),
+            Some("schedule_run_stopped")
+        );
+        assert_eq!(stopped.contract_name(), "stopped");
+        assert_eq!(
+            checkin_outcome_status(&outcome(
+                RunStatus::Failed,
+                anima_core::TaskResult::error("boom", 1)
+            )),
+            ScheduleOutcomeStatus::Failed
+        );
+        assert_eq!(
+            checkin_outcome_status(&outcome(RunStatus::Completed, reply(CHECKIN_SENTINEL))),
+            ScheduleOutcomeStatus::Silent
+        );
+        assert_eq!(
+            checkin_outcome_status(&outcome(RunStatus::Completed, reply("Heads up"))),
+            ScheduleOutcomeStatus::Spoke
+        );
+        assert_eq!(
+            serde_json::to_value(ScheduleOutcomeStatus::Stopped).unwrap(),
+            "stopped"
+        );
+        for (status, name) in [
+            (ScheduleOutcomeStatus::Silent, "silent"),
+            (ScheduleOutcomeStatus::Spoke, "spoke"),
+            (ScheduleOutcomeStatus::Failed, "error"),
+        ] {
+            assert_eq!(status.contract_name(), name);
+        }
+        assert_eq!(
+            checkin_error_code(&ScheduleOutcomeStatus::Failed).as_deref(),
+            Some("schedule_run_failed")
+        );
+        assert_eq!(checkin_error_code(&ScheduleOutcomeStatus::Spoke), None);
+    }
+
+    /// The id of the agent's running check-in once it streamed `text`.
+    async fn running_check_in(state: &SharedDaemonState, agent_id: &str, text: &str) -> String {
+        for _ in 0..500 {
+            {
+                let guard = state.read().await;
+                let found = guard
+                    .runs
+                    .active_records()
+                    .into_iter()
+                    .find(|record| {
+                        record.agent_id == agent_id
+                            && record.status == RunStatus::Running
+                            && guard
+                                .live
+                                .runs()
+                                .view(&record.id)
+                                .is_some_and(|view| view.text == text)
+                    })
+                    .map(|record| record.id.clone());
+                if let Some(run_id) = found {
+                    return run_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no check-in streamed {text:?}");
+    }
+
+    /// Controller ruling (M3 pre-flight audit M24, spec §4.6): a check-in
+    /// its owner stops records `stopped`, its schedule stays enabled, and it
+    /// fires again at its next occurrence.
+    #[tokio::test]
+    async fn a_stopped_check_in_records_stopped_and_keeps_its_schedule() {
+        use crate::agent_runs::test_support::{ScriptedModel, Step};
+        let daemon = DaemonState::with_model_adapter(ScriptedModel::new(vec![
+            Step::Hold(vec!["Checking"]),
+            Step::Text(vec![CHECKIN_SENTINEL]),
+        ]));
+        let (service, state, agent_id, _) = service_with_daemon(daemon);
+        let record = due_schedule(&service, &agent_id).await;
+        let now = now_ms();
+        let ticking = {
+            let service = service.clone();
+            tokio::spawn(async move { service.tick_at(now).await })
+        };
+        let run_id = running_check_in(&state, &agent_id, "Checking").await;
+
+        let stopping = service
+            .inner
+            .runs
+            .stop_run(&agent_id, &run_id)
+            .await
+            .unwrap();
+        assert_eq!(stopping.source, RunSource::Schedule);
+        assert_eq!(ticking.await.unwrap().unwrap(), 1);
+
+        {
+            let guard = state.read().await;
+            let schedule = &guard.schedules[&record.id];
+            assert!(schedule.enabled, "a stop is not a failure");
+            let outcome = schedule.last_safe_outcome.as_ref().unwrap();
+            assert_eq!(outcome.status, ScheduleOutcomeStatus::Stopped);
+            assert_eq!(outcome.error_code.as_deref(), Some("schedule_run_stopped"));
+            let run = guard.runs.get(&run_id).unwrap();
+            assert_eq!(run.status, RunStatus::Cancelled);
+            assert_eq!(run.error.as_ref().unwrap().code, "stopped");
+        }
+        // Later ticks leave the resolved occurrence alone.
+        reconcile_interrupted(&service.inner, now_ms(), &BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(state.read().await.schedules[&record.id].enabled);
+
+        let next = state.read().await.schedules[&record.id].next_due_at_ms;
+        assert_eq!(service.tick_at(next).await.unwrap(), 1, "it fires again");
+        assert_eq!(
+            state.read().await.schedules[&record.id]
+                .last_safe_outcome
+                .as_ref()
+                .unwrap()
+                .status,
+            ScheduleOutcomeStatus::Silent
+        );
+    }
+
+    /// ...and a stop saved just before a restart, before the check-in could
+    /// commit, keeps the schedule enabled too: the restarted daemon records
+    /// the occurrence as `stopped` instead of disabling it as interrupted
+    /// (audit M24).
+    #[tokio::test]
+    async fn a_check_in_stopped_just_before_a_restart_keeps_its_schedule() {
+        use crate::agent_runs::test_support::{ScriptedModel, Step};
+        let daemon =
+            DaemonState::with_model_adapter(ScriptedModel::new(vec![Step::Hold(vec!["Checking"])]));
+        let (service, state, agent_id, _) = service_with_daemon(daemon);
+        let record = due_schedule(&service, &agent_id).await;
+        let now = now_ms();
+        let ticking = {
+            let service = service.clone();
+            tokio::spawn(async move { service.tick_at(now).await })
+        };
+        let run_id = running_check_in(&state, &agent_id, "Checking").await;
+        // What the stop saves is what a crash right after its save leaves.
+        let save_gate = state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(false);
+        let stopping = {
+            let runs = service.inner.runs.clone();
+            let (agent_id, run_id) = (agent_id.clone(), run_id.clone());
+            tokio::spawn(async move { runs.stop_run(&agent_id, &run_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), save_gate.entered.acquire())
+            .await
+            .expect("the stop saves")
+            .unwrap()
+            .forget();
+        let on_disk = state.read().await.control_plane_snapshot();
+        save_gate.release.add_permits(1);
+        stopping.await.unwrap().unwrap();
+        ticking.await.unwrap().unwrap();
+
+        let mut restarted = DaemonState::new();
+        restarted.restore_control_plane_snapshot(on_disk).unwrap();
+        {
+            let interrupted = restarted.runs.get(&run_id).unwrap();
+            assert_eq!(interrupted.status, RunStatus::Interrupted);
+            assert_eq!(
+                interrupted.error.as_ref().unwrap().code,
+                "restart_during_run"
+            );
+            assert!(interrupted.stop.is_some(), "the saved stop survives");
+        }
+        let restarted = Arc::new(RwLock::new(restarted));
+        let runs = AgentRunCoordinator::new(Arc::clone(&restarted), Arc::new(Semaphore::new(2)));
+        let connectors = ConnectorManager::new(
+            Arc::clone(&restarted),
+            runs.clone(),
+            Arc::new(InMemoryCredentialStore::default()),
+            Arc::new(NoopTelegram),
+        );
+        let service = SchedulerService::new(Arc::clone(&restarted), runs, connectors);
+        reconcile_interrupted(&service.inner, now_ms(), &BTreeSet::new())
+            .await
+            .unwrap();
+
+        let guard = restarted.read().await;
+        let schedule = &guard.schedules[&record.id];
+        assert!(
+            schedule.enabled,
+            "a stopped occurrence is not an interrupted one"
+        );
+        let outcome = schedule.last_safe_outcome.as_ref().unwrap();
+        assert_eq!(outcome.status, ScheduleOutcomeStatus::Stopped);
+        assert_eq!(outcome.error_code.as_deref(), Some("schedule_run_stopped"));
     }
 
     #[tokio::test]

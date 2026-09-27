@@ -8,7 +8,8 @@ pub(crate) use ledger::{
     RunStopRequest, AGENT_DELETED, COMMIT_FAILED, COMMIT_REJECTED, IDEMPOTENCY_WINDOW_MS,
     MAX_RUN_ATTACHMENTS, MAX_RUN_INPUT_TEXT_BYTES, MAX_RUN_STEPS, MAX_RUN_TOOLS_STARTED,
     MAX_TERMINAL_RUNS_PER_AGENT, RESTART_BEFORE_START, RESTART_DURING_RUN, RUN_ABORTED, RUN_FAILED,
-    RUN_STOPPED, STOPPED_BY_OWNER, TERMINAL_RUN_RETENTION_MS,
+    RUN_STOPPED, STOPPED_BEFORE_START, STOPPED_BEFORE_START_MESSAGE, STOPPED_BY_OWNER,
+    TERMINAL_RUN_RETENTION_MS,
 };
 
 use anima_core::{
@@ -141,17 +142,28 @@ impl RunOutcome {
         }
     }
 
-    /// The ledger error for a failed run.
+    /// A run its owner stopped (spec §4.6) ends `cancelled`, with no reply.
+    pub(crate) fn with_stop(mut self, stopped: bool) -> Self {
+        if stopped {
+            self.status = RunStatus::Cancelled;
+            self.reply_message_id = None;
+        }
+        self
+    }
+
+    /// The ledger error for a failed or stopped run.
     pub(crate) fn error(&self) -> Option<RunError> {
-        (self.status == RunStatus::Failed).then(|| {
-            RunError::new(
+        match self.status {
+            RunStatus::Failed => Some(RunError::new(
                 RUN_FAILED,
                 self.result
                     .error
                     .clone()
                     .unwrap_or_else(|| "run failed".to_string()),
-            )
-        })
+            )),
+            RunStatus::Cancelled => Some(RunError::new(RUN_STOPPED, STOPPED_BY_OWNER)),
+            _ => None,
+        }
     }
 }
 
@@ -247,6 +259,33 @@ mod tests {
             failure.error(),
             Some(RunError::new(RUN_FAILED, "model unavailable"))
         );
+    }
+
+    #[test]
+    fn a_stopped_outcome_is_cancelled_without_a_reply() {
+        let change_set = RunChangeSet::new(
+            "run_3".into(),
+            "agent-1".into(),
+            "room-a".into(),
+            RuntimeRunDelta {
+                messages: vec![message("partial", MessageRole::Assistant, None)],
+                events: vec![],
+                event_total: 0,
+                token_usage: TokenUsage::default(),
+                step_count: 1,
+                last_task: None,
+                status: AgentStatus::Idle,
+            },
+        );
+        let stopped = RunOutcome::new(&change_set, TaskResult::error("stopped", 1)).with_stop(true);
+        assert_eq!(stopped.status, RunStatus::Cancelled);
+        assert_eq!(stopped.reply_message_id, None);
+        assert_eq!(
+            stopped.error(),
+            Some(RunError::new(RUN_STOPPED, STOPPED_BY_OWNER))
+        );
+        let failed = RunOutcome::new(&change_set, TaskResult::error("boom", 1)).with_stop(false);
+        assert_eq!(failed.status, RunStatus::Failed);
     }
 
     #[test]

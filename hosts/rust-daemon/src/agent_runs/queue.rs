@@ -35,6 +35,19 @@ pub(crate) const RUN_NOT_QUEUED: &str = "This run is no longer waiting to start"
 pub(crate) const RUN_STOPPED_BEFORE_START: &str = "This run was stopped before it started";
 const RUN_ENDED_BEFORE_START: &str = "The run stopped unexpectedly before it started";
 
+/// Metadata an owner message's content carries: its idempotency key, and
+/// for a steer when it was accepted (Task 9 pushes steers with both; a stop
+/// turns the ones its run never read into runs to send again, audit M8).
+pub(crate) const CLIENT_REQUEST_ID_METADATA_KEY: &str = "clientRequestId";
+pub(crate) const ACCEPTED_AT_METADATA_KEY: &str = "acceptedAtMs";
+
+pub(super) fn metadata_text<'a>(content: &'a Content, key: &str) -> Option<&'a str> {
+    match content.metadata.as_ref()?.get(key)? {
+        DataValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
 /// How a message joins its session (spec §4.2, §4.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionRunMode {
@@ -139,6 +152,9 @@ impl AgentRunCoordinator {
             };
             if is_helper_config(runtime.config()) {
                 return Err(ApiError::conflict(HELPER_MUST_RUN_THROUGH_COMPANION));
+            }
+            if self.is_being_deleted(&request.agent_id) {
+                return Err(ApiError::conflict(super::AGENT_BEING_DELETED));
             }
             let model = runtime.config().model.clone();
             let provider = runtime.config().provider.clone();
@@ -297,7 +313,7 @@ impl AgentRunCoordinator {
                             text,
                             attachments: None,
                             metadata: Some(BTreeMap::from([(
-                                "clientRequestId".to_string(),
+                                CLIENT_REQUEST_ID_METADATA_KEY.to_string(),
                                 DataValue::String(idempotency_key.clone()),
                             )])),
                         },
@@ -381,16 +397,24 @@ impl AgentRunCoordinator {
                     }
                 }
             };
-            let still_queued = self
-                .state
-                .read()
-                .await
-                .runs
-                .get(&next.run_id)
-                .is_some_and(|record| record.status == RunStatus::Queued);
+            // Looked at under the control-plane transaction, so a stop or an
+            // agent deletion whose save is still in flight is never acted on:
+            // were that save to fail and be put back, a run dropped here
+            // would stay queued with nothing left to start it.
+            let still_queued = {
+                let _transaction = self.control_plane_transaction().await;
+                let guard = self.state.read().await;
+                let queued = guard
+                    .runs
+                    .get(&next.run_id)
+                    .is_some_and(|record| record.status == RunStatus::Queued);
+                if !queued {
+                    // Stopped, or settled some other way, while it waited.
+                    guard.live.runs().remove(&next.run_id);
+                }
+                queued
+            };
             if !still_queued {
-                // Stopped, or settled some other way, while it waited.
-                self.state.read().await.live.runs().remove(&next.run_id);
                 continue;
             }
             // Its own task, so a panic cannot take the session's queue with it.

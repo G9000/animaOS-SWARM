@@ -6,77 +6,16 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use serde_json::Value;
 
-use super::test_support::{chat_request, coordinator_with, next_event, Gate, ScriptedModel};
+use super::test_support::{
+    accept, accept_web, add_chat, chat_request, coordinator_with, is_terminal, next_event,
+    quiet_for, wait_for, Gate, ScriptedModel,
+};
 use super::{
-    AcceptRun, AcceptedRun, AdmitMode, AgentRunCoordinator, QueuedRunStart, SessionRunMode,
-    MAX_QUEUED_RUNS_PER_AGENT, RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START,
+    AcceptedRun, AdmitMode, AgentRunCoordinator, QueuedRunStart, MAX_QUEUED_RUNS_PER_AGENT,
+    RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START,
 };
 use crate::runs::{RunLedger, RunRecord, RunSource, RunStart, RunStatus};
 use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource, DEFAULT_CHAT_TITLE};
-
-async fn add_chat(coordinator: &AgentRunCoordinator, agent_id: &str, session_id: &str) {
-    coordinator
-        .state
-        .write()
-        .await
-        .sessions
-        .insert(SessionRecord::new(
-            agent_id,
-            session_id,
-            SessionKind::Chat,
-            SessionOrigin::Web,
-            "Chat".into(),
-            TitleSource::Owner,
-            1,
-        ));
-}
-
-fn accept(agent_id: &str, session_id: &str, key: &str) -> AcceptRun {
-    AcceptRun {
-        agent_id: agent_id.into(),
-        session_id: session_id.into(),
-        text: key.into(),
-        idempotency_key: key.into(),
-        mode: SessionRunMode::Queue,
-        source: RunSource::Web,
-        source_ref: None,
-    }
-}
-
-/// Accepts `key` as a web message (its text is the key) and returns the run id.
-async fn accept_web(
-    coordinator: &AgentRunCoordinator,
-    agent_id: &str,
-    session_id: &str,
-    key: &str,
-) -> String {
-    let start = coordinator.web_start(agent_id.into(), session_id.into(), key.into(), key.into());
-    match coordinator
-        .accept_run(accept(agent_id, session_id, key), start)
-        .await
-        .unwrap()
-    {
-        AcceptedRun::Created(record) => record.id,
-        other => panic!("expected a new run, got {other:?}"),
-    }
-}
-
-async fn wait_for(coordinator: &AgentRunCoordinator, run_id: &str, status: RunStatus) {
-    for _ in 0..500 {
-        if coordinator
-            .state
-            .read()
-            .await
-            .runs
-            .get(run_id)
-            .is_some_and(|record| record.status == status)
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("run {run_id} never became {status:?}");
-}
 
 #[tokio::test]
 async fn cancelled_admission_waits_leave_no_room_or_slot_entries() {
@@ -663,20 +602,22 @@ async fn an_accepted_run_whose_start_save_fails_ends_with_one_terminal_event() {
     assert!(model.requests().is_empty());
 }
 
-fn is_terminal(event: &Value) -> bool {
-    matches!(
-        event["type"].as_str(),
-        Some("run.completed" | "run.failed" | "run.cancelled" | "run.interrupted")
-    )
-}
+#[tokio::test]
+async fn an_agent_being_deleted_refuses_new_messages() {
+    let (coordinator, agent_id) = coordinator_with(ScriptedModel::new(vec![])).await;
+    add_chat(&coordinator, &agent_id, "chat:d").await;
 
-/// A subscription's events for the next 200 ms, as JSON.
-async fn quiet_for(subscription: &mut crate::live::LiveSubscription) -> Vec<Value> {
-    let mut events = Vec::new();
-    while let Ok(Some(crate::live::LiveDelivery::Event(event))) =
-        tokio::time::timeout(Duration::from_millis(200), subscription.next()).await
-    {
-        events.push(event.to_json(0));
-    }
-    events
+    let deleting = coordinator.begin_agent_deletion(&agent_id);
+    let start = coordinator.web_start(agent_id.clone(), "chat:d".into(), "k1".into(), "k1".into());
+    let error = coordinator
+        .accept_run(accept(&agent_id, "chat:d", "k1"), start)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status(), StatusCode::CONFLICT);
+    assert_eq!(error.message(), "This companion is being deleted");
+    assert!(coordinator.is_being_deleted(&agent_id));
+
+    drop(deleting);
+    assert!(!coordinator.is_being_deleted(&agent_id));
+    accept_web(&coordinator, &agent_id, "chat:d", "k2").await;
 }

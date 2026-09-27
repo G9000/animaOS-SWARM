@@ -13,9 +13,12 @@ use anima_core::{
 use async_trait::async_trait;
 use tokio::sync::{RwLock, Semaphore};
 
-use super::{AgentRunCoordinator, AgentRunRequest, RunRoom};
+use super::{
+    AcceptRun, AcceptedRun, AgentRunCoordinator, AgentRunRequest, RunRoom, SessionRunMode,
+};
 use crate::live::{LiveDelivery, LiveEvent, LiveSubscription};
-use crate::runs::RunSource;
+use crate::runs::{RunSource, RunStatus};
+use crate::sessions::{SessionKind, SessionOrigin, SessionRecord, TitleSource};
 use crate::state::DaemonState;
 
 /// One scripted model call.
@@ -326,4 +329,90 @@ pub(crate) async fn events_until(
             return events;
         }
     }
+}
+
+/// Adds an owner-titled chat `session_id` to `agent_id`.
+pub(crate) async fn add_chat(coordinator: &AgentRunCoordinator, agent_id: &str, session_id: &str) {
+    coordinator
+        .state
+        .write()
+        .await
+        .sessions
+        .insert(SessionRecord::new(
+            agent_id,
+            session_id,
+            SessionKind::Chat,
+            SessionOrigin::Web,
+            "Chat".into(),
+            TitleSource::Owner,
+            1,
+        ));
+}
+
+/// A web message to queue whose text is its key.
+pub(crate) fn accept(agent_id: &str, session_id: &str, key: &str) -> AcceptRun {
+    AcceptRun {
+        agent_id: agent_id.into(),
+        session_id: session_id.into(),
+        text: key.into(),
+        idempotency_key: key.into(),
+        mode: SessionRunMode::Queue,
+        source: RunSource::Web,
+        source_ref: None,
+    }
+}
+
+/// Accepts `key` as a web message (its text is the key) and returns the run id.
+pub(crate) async fn accept_web(
+    coordinator: &AgentRunCoordinator,
+    agent_id: &str,
+    session_id: &str,
+    key: &str,
+) -> String {
+    let start = coordinator.web_start(agent_id.into(), session_id.into(), key.into(), key.into());
+    match coordinator
+        .accept_run(accept(agent_id, session_id, key), start)
+        .await
+        .unwrap()
+    {
+        AcceptedRun::Created(record) => record.id,
+        other => panic!("expected a new run, got {other:?}"),
+    }
+}
+
+/// Waits (up to five seconds) until the ledger holds `run_id` with `status`.
+pub(crate) async fn wait_for(coordinator: &AgentRunCoordinator, run_id: &str, status: RunStatus) {
+    for _ in 0..500 {
+        if coordinator
+            .state
+            .read()
+            .await
+            .runs
+            .get(run_id)
+            .is_some_and(|record| record.status == status)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("run {run_id} never became {status:?}");
+}
+
+/// Whether `event` (as JSON) ends a run.
+pub(crate) fn is_terminal(event: &serde_json::Value) -> bool {
+    matches!(
+        event["type"].as_str(),
+        Some("run.completed" | "run.failed" | "run.cancelled" | "run.interrupted")
+    )
+}
+
+/// A subscription's events for the next 200 ms, as JSON.
+pub(crate) async fn quiet_for(subscription: &mut LiveSubscription) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    while let Ok(Some(LiveDelivery::Event(event))) =
+        tokio::time::timeout(Duration::from_millis(200), subscription.next()).await
+    {
+        events.push(event.to_json(0));
+    }
+    events
 }

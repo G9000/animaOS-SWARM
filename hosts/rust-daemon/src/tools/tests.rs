@@ -1365,12 +1365,40 @@ fn multi_edit_workspace_file_is_atomic_on_missing_match() {
 #[test]
 fn execute_bash_command_runs_shell_command() {
     let workspace = create_temp_workspace("bash");
-    let result = execute_bash_command_from_root(&workspace, "echo hello", 5_000, ".")
+    let result = execute_bash_command_from_root(&workspace, "echo hello", 5_000, ".", None)
         .expect("bash command result");
 
     assert_eq!(result.status, "success");
     assert!(result.output.to_ascii_lowercase().contains("hello"));
 
+    fs::remove_dir_all(workspace).expect("remove workspace");
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_bash_command_kills_its_child_when_the_run_is_stopped() {
+    let workspace = create_temp_workspace("bash-stop");
+    let signal = anima_core::CancelSignal::new();
+    let canceller = {
+        let signal = signal.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            signal.cancel();
+        })
+    };
+    let started = std::time::Instant::now();
+
+    let result =
+        execute_bash_command_from_root(&workspace, "exec sleep 30", 60_000, ".", Some(&signal))
+            .expect("bash command result");
+
+    canceller.join().unwrap();
+    assert_eq!(result.status, "error");
+    assert_eq!(result.output, "Command stopped by owner");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the child was killed, not waited for"
+    );
     fs::remove_dir_all(workspace).expect("remove workspace");
 }
 

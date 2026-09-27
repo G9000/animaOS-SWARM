@@ -22,13 +22,15 @@ use crate::runs::{
 use crate::state::DaemonState;
 
 mod queue;
+mod stop;
 
-#[allow(unused_imports)] // The tests and Tasks 8–9 use the rest.
+#[allow(unused_imports)] // The tests and Task 9 use the rest.
 pub(crate) use self::queue::{
     AcceptRun, AcceptedRun, QueuedRunStart, QueuedStartError, SessionRunMode,
-    IDEMPOTENCY_KEY_REUSED, QUEUE_FULL, RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START,
-    SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
+    ACCEPTED_AT_METADATA_KEY, CLIENT_REQUEST_ID_METADATA_KEY, IDEMPOTENCY_KEY_REUSED, QUEUE_FULL,
+    RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START, SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
 };
+pub(crate) use self::stop::AGENT_BEING_DELETED;
 
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
 
@@ -329,6 +331,7 @@ pub(crate) struct AgentRunCoordinator {
     agent_slots: AgentSlotMap,
     waiting_budget: WaitingBudgetMap,
     session_queues: self::queue::SessionQueueMap,
+    deleting_agents: self::stop::DeletingAgents,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
 }
@@ -581,6 +584,7 @@ impl AgentRunCoordinator {
             agent_slots: Arc::new(StdMutex::new(HashMap::new())),
             waiting_budget: Arc::new(StdMutex::new(HashMap::new())),
             session_queues: Arc::new(StdMutex::new(HashMap::new())),
+            deleting_agents: Arc::new(StdMutex::new(HashMap::new())),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
         }
@@ -1199,7 +1203,15 @@ impl AgentRunCoordinator {
                 first_text: &content.text,
                 now_ms,
             });
-            let record = match accepted.as_deref() {
+            // A run started by a run whose stop is already saved (a helper or
+            // delegation its tool was still starting) is stopped too (spec
+            // §4.6): its stop is saved with its start, and its control is
+            // cancelled once that save succeeds, before it runs.
+            let inherited_stop = parent
+                .as_ref()
+                .and_then(|link| guard.runs.get(&link.run_id))
+                .and_then(|parent| parent.stop.clone());
+            let mut record = match accepted.as_deref() {
                 // An accepted run starts from its queued record (spec §4.2),
                 // still queued: the lookup above ran under this same lock.
                 Some(accepted_id) => {
@@ -1229,6 +1241,9 @@ impl AgentRunCoordinator {
                     now_ms,
                 ),
             };
+            if inherited_stop.is_some() && record.stop.is_none() {
+                record.stop = inherited_stop;
+            }
             let run_id = record.id.clone();
             // Registered before the start save, so a stop can reach the run
             // from the moment it is durable (spec §4.6).
@@ -1305,6 +1320,10 @@ impl AgentRunCoordinator {
             drop(guard);
             in_flight.disarm();
             return Err(ApiError::service_unavailable(error.to_string()));
+        }
+        if started.stop.is_some() {
+            // Saved: the run stops at its first checkpoint.
+            live_run.control().cancel.cancel();
         }
         drop(transaction);
         // Announced only once durable (spec §6).
@@ -1394,7 +1413,8 @@ impl AgentRunCoordinator {
                 run_id: run_id.clone(),
                 session_id: session_id.clone(),
                 agent_id: agent_id.clone(),
-            }));
+            }))
+            .with_cancel(Some(live_run.control().cancel));
         let history = runtime.messages().to_vec();
         let helper_timeout = helper_parent(&runtime.state()).is_some().then(|| {
             original_config
@@ -1444,6 +1464,15 @@ impl AgentRunCoordinator {
             execution.await
         };
         live_run.flush();
+        // A stopped run's steers it never read are not requeued: its inbox
+        // closes, and each becomes a run to send again (audit M8). A steer
+        // arriving from now on is refused by the inbox and queued instead.
+        if live_run.control().cancel.is_cancelled() {
+            let unread = live_run.control().steering.close();
+            if !unread.is_empty() {
+                self.interrupt_steers(&agent_id, &session_id, unread).await;
+            }
+        }
 
         // Phase C: merge exactly this run's changes, let the source commit, then
         // save; a rejected or undurable commit removes exactly those changes
@@ -1466,7 +1495,10 @@ impl AgentRunCoordinator {
                 room_id.clone(),
                 runtime.run_delta_since(&base),
             );
-            let outcome = RunOutcome::new(&change_set, result.clone());
+            // A run its owner stopped ends `cancelled`, never `failed` (spec §4.6).
+            let stopped = live_run.control().cancel.is_cancelled()
+                && result.error.as_deref() == Some(anima_core::RUN_STOPPED_ERROR);
+            let outcome = RunOutcome::new(&change_set, result.clone()).with_stop(stopped);
             if !guard.commit_run(&mut change_set, &outcome) {
                 // The agent was deleted while this run executed (spec §4.4 item 6).
                 if let Some(record) = guard.runs.get(&run_id) {
@@ -1788,6 +1820,8 @@ async fn persist_task_result_memory(
 mod live_tests;
 #[cfg(test)]
 mod queue_tests;
+#[cfg(test)]
+mod stop_tests;
 #[cfg(test)]
 pub(crate) mod test_support;
 #[cfg(test)]

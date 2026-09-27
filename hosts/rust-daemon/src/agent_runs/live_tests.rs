@@ -318,6 +318,10 @@ async fn a_stop_through_the_registered_control_ends_a_held_model_call() {
     assert_eq!(terminal.run_id.as_deref(), Some(run_id.as_str()));
     let announced = terminal.to_json(1);
     let expected = run_status_event(&ledger).to_json(1);
+    assert_eq!(
+        announced["type"], "run.cancelled",
+        "a stop is not a failure"
+    );
     assert_eq!(announced["type"], expected["type"]);
     assert_eq!(
         announced["run"], expected["run"],

@@ -54,8 +54,15 @@ pub(super) fn execute_bash(
         // worker thread; running it directly on a tokio worker would block the
         // entire runtime. spawn_blocking moves it onto the blocking pool.
         let configured_root = ctx_workspace_root(&context).map(Path::to_path_buf);
+        let cancel = context.cancel.clone();
         let result = tokio::task::spawn_blocking(move || {
-            execute_bash_command(configured_root.as_deref(), &command, timeout_ms, &cwd)
+            execute_bash_command(
+                configured_root.as_deref(),
+                &command,
+                timeout_ms,
+                &cwd,
+                cancel.as_ref(),
+            )
         })
         .await;
         match result {

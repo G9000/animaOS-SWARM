@@ -1254,3 +1254,413 @@ fn the_openapi_document_lists_the_session_run_routes_under_runs() {
     );
     assert!(description.contains("50 finished runs"), "{description}");
 }
+
+fn stop_request(agent: &str, run_id: &str, origin: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/api/agents/{agent}/runs/{run_id}/stop"))
+        .header("host", "127.0.0.1:8080")
+        .header("origin", origin)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn accept_message(app: &axum::Router, agent: &str, key: &str) -> String {
+    let body = json_body(
+        app.clone()
+            .oneshot(start_request(
+                agent,
+                "chat:plans",
+                Some(key),
+                json!({ "text": key }),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    body["run"]["id"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn stopping_a_queued_message_cancels_it_before_it_starts() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![], gate.clone());
+    let (app, state, agent) = app_with_chat(model.clone()).await;
+    let first = accept_message(&app, &agent, "key-1").await;
+    gate.entered().await;
+    let second = accept_message(&app, &agent, "key-2").await;
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+
+    let stopped = app
+        .clone()
+        .oneshot(stop_request(&agent, &second, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), StatusCode::ACCEPTED);
+    assert_eq!(stopped.headers()["cache-control"], "no-store");
+    let body = json_body(stopped).await;
+    assert_eq!(body["run"]["status"], "cancelled");
+    assert_eq!(body["run"]["error"]["code"], "stopped");
+    assert!(body["run"]["stop"]["requestedAtMs"].as_u64().is_some());
+    let events = events_until(&mut subscription, "run.cancelled").await;
+    assert_eq!(events.last().unwrap()["runId"], second.as_str());
+
+    gate.release();
+    wait_for(&state, &first, RunStatus::Completed).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(model.requests().len(), 1, "the stopped message never ran");
+    let guard = state.read().await;
+    assert_eq!(guard.runs.get(&second).unwrap().started_at_ms, None);
+    assert!(guard.live.runs().control(&second).is_none());
+}
+
+#[tokio::test]
+async fn stopping_is_idempotent_and_a_finished_run_is_answered_as_it_is() {
+    let (app, state, agent) =
+        app_with_chat(ScriptedModel::new(vec![Step::Hold(vec!["Thinking"])])).await;
+    let run_id = accept_message(&app, &agent, "key-1").await;
+    for _ in 0..500 {
+        if state
+            .read()
+            .await
+            .live
+            .runs()
+            .view(&run_id)
+            .is_some_and(|view| view.text == "Thinking")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let first = json_body(
+        app.clone()
+            .oneshot(stop_request(&agent, &run_id, OWNER_ORIGIN))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let again = app
+        .clone()
+        .oneshot(stop_request(&agent, &run_id, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::ACCEPTED);
+    let again = json_body(again).await;
+    assert_eq!(
+        again["run"]["stop"]["requestedAtMs"],
+        first["run"]["stop"]["requestedAtMs"]
+    );
+
+    wait_for(&state, &run_id, RunStatus::Cancelled).await;
+    let finished = app
+        .clone()
+        .oneshot(stop_request(&agent, &run_id, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(finished.status(), StatusCode::ACCEPTED);
+    assert_eq!(json_body(finished).await["run"]["status"], "cancelled");
+
+    for (agent_id, id) in [
+        (agent.as_str(), "run_missing"),
+        ("missing", run_id.as_str()),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(stop_request(agent_id, id, OWNER_ORIGIN))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    let refused = app
+        .oneshot(stop_request(&agent, &run_id, "https://untrusted.example"))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+}
+
+/// A finished run the ledger no longer holds is answered from the history
+/// store, as it is; another agent's is not found.
+#[tokio::test]
+async fn stopping_a_run_only_the_history_store_holds_answers_it_as_it_is() {
+    let (app, state, agent) = app_with_chat(ScriptedModel::new(vec![])).await;
+    let other = state
+        .write()
+        .await
+        .create_agent(test_config("other"))
+        .unwrap()
+        .state
+        .id;
+    let run_id = accept_message(&app, &agent, "key-1").await;
+    let finished = wait_for(&state, &run_id, RunStatus::Completed).await;
+    let history = {
+        let mut guard = state.write().await;
+        guard.runs.remove(&run_id);
+        guard.history.clone()
+    };
+    history.store().upsert_runs(&[finished]).await.unwrap();
+
+    let answered = app
+        .clone()
+        .oneshot(stop_request(&agent, &run_id, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(answered.status(), StatusCode::ACCEPTED);
+    assert_eq!(answered.headers()["cache-control"], "no-store");
+    let body = json_body(answered).await;
+    assert_eq!(body["run"]["id"], run_id.as_str());
+    assert_eq!(body["run"]["status"], "completed");
+    assert!(
+        body["run"]["stop"].is_null(),
+        "a finished run is not changed"
+    );
+    let through_other = app
+        .oneshot(stop_request(&other, &run_id, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(through_other.status(), StatusCode::NOT_FOUND);
+}
+
+/// Controller ruling (M3 pre-flight audit M25): a run owned by a helper is
+/// stopped through the helper's own route; its companion's run goes on.
+#[tokio::test]
+async fn a_helpers_run_is_stopped_through_the_helpers_route() {
+    use crate::agent_runs::test_support::lead_config;
+    use anima_core::ToolCall;
+
+    let spawn = ToolCall {
+        id: "spawn-1".into(),
+        name: "spawn_helper".into(),
+        args: std::collections::BTreeMap::from([
+            ("name".to_string(), DataValue::String("Researcher".into())),
+            ("task".to_string(), DataValue::String("Look into it".into())),
+        ]),
+    };
+    let model = ScriptedModel::new(vec![
+        Step::Tools(vec![spawn]),
+        Step::Hold(vec!["Looking"]),
+        Step::Text(vec!["I will look myself"]),
+    ]);
+    let mut daemon = DaemonState::with_model_adapter(model.clone());
+    let companion = daemon
+        .create_agent(lead_config("Companion"))
+        .unwrap()
+        .state
+        .id;
+    daemon.sessions.insert(SessionRecord::new(
+        &companion,
+        "chat:plans",
+        SessionKind::Chat,
+        SessionOrigin::Web,
+        "Plans".into(),
+        TitleSource::Owner,
+        1,
+    ));
+    let state = Arc::new(RwLock::new(daemon));
+    let app = router(state.clone(), DaemonConfig::default());
+    let lead_run = accept_message(&app, &companion, "key-1").await;
+    let (helper, helper_run) = 'found: {
+        for _ in 0..500 {
+            {
+                let guard = state.read().await;
+                let found = guard.runs.active_records().into_iter().find(|record| {
+                    record.parent_run_id.as_deref() == Some(lead_run.as_str())
+                        && guard
+                            .live
+                            .runs()
+                            .view(&record.id)
+                            .is_some_and(|view| view.text == "Looking")
+                });
+                if let Some(record) = found {
+                    break 'found (record.agent_id.clone(), record.id.clone());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the helper never ran");
+    };
+
+    let through_companion = app
+        .clone()
+        .oneshot(stop_request(&companion, &helper_run, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(through_companion.status(), StatusCode::NOT_FOUND);
+    let stopped = app
+        .clone()
+        .oneshot(stop_request(&helper, &helper_run, OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(stopped.status(), StatusCode::ACCEPTED);
+    assert_eq!(stopped.headers()["cache-control"], "no-store");
+    let body = json_body(stopped).await;
+    assert_eq!(body["run"]["agentId"], helper.as_str());
+    assert!(body["run"]["stop"]["requestedAtMs"].as_u64().is_some());
+
+    let helper_record = wait_for(&state, &helper_run, RunStatus::Cancelled).await;
+    assert_eq!(helper_record.error.unwrap().code, "stopped");
+    let lead_record = wait_for(&state, &lead_run, RunStatus::Completed).await;
+    assert!(
+        lead_record.stop.is_none(),
+        "only the helper's run was stopped"
+    );
+    assert_eq!(model.requests().len(), 3);
+}
+
+#[tokio::test]
+async fn deleting_an_agent_cancels_the_messages_still_waiting_to_start() {
+    let model = ScriptedModel::new(vec![]);
+    let mut daemon = DaemonState::with_model_adapter(model.clone());
+    let agent = daemon
+        .create_agent(test_config("companion"))
+        .unwrap()
+        .state
+        .id;
+    daemon.sessions.insert(SessionRecord::new(
+        &agent,
+        "chat:plans",
+        SessionKind::Chat,
+        SessionOrigin::Web,
+        "Plans".into(),
+        TitleSource::Owner,
+        1,
+    ));
+    let state = Arc::new(RwLock::new(daemon));
+    // No global permit: an accepted message waits at admission, still queued.
+    let limiter = Arc::new(Semaphore::new(0));
+    let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+    let manager = ConnectorManager::new(
+        Arc::clone(&state),
+        runs.clone(),
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(CountingTelegramTransport::default()),
+    );
+    let app = router_with_services(
+        Arc::clone(&state),
+        DaemonConfig::default(),
+        Arc::clone(&limiter),
+        runs.clone(),
+        manager.clone(),
+        true,
+    );
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+    let run_id = accept_message(&app, &agent, "key-1").await;
+    assert_eq!(
+        state.read().await.runs.get(&run_id).unwrap().status,
+        RunStatus::Queued
+    );
+
+    manager.delete_agent(agent.clone()).await.unwrap();
+
+    let events = events_until(&mut subscription, "run.cancelled").await;
+    let cancelled = events.last().unwrap();
+    assert_eq!(cancelled["runId"], run_id.as_str());
+    assert_eq!(cancelled["run"]["error"]["code"], "agent_deleted");
+    assert_eq!(
+        cancelled["run"]["error"]["message"],
+        "The companion was deleted before this message ran"
+    );
+    // Review race (iv): the admission wait ends and its session queue goes.
+    for _ in 0..500 {
+        if !runs.has_session_queue(&agent, "chat:plans") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!runs.has_session_queue(&agent, "chat:plans"));
+    {
+        let guard = state.read().await;
+        assert!(
+            guard.runs.get(&run_id).is_none(),
+            "a deleted agent's runs leave the ledger"
+        );
+        assert!(guard.live.runs().control(&run_id).is_none());
+    }
+    limiter.add_permits(1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(model.requests().is_empty(), "the message never ran");
+    manager.shutdown().await;
+}
+
+/// A deletion whose save fails deletes nothing: the waiting message stays
+/// queued with its control and runs once a permit frees up.
+#[tokio::test]
+async fn a_failed_agent_deletion_keeps_its_waiting_messages() {
+    let model = ScriptedModel::new(vec![Step::Text(vec!["Still here"])]);
+    let mut daemon = DaemonState::with_model_adapter(model.clone());
+    let agent = daemon
+        .create_agent(test_config("companion"))
+        .unwrap()
+        .state
+        .id;
+    daemon.sessions.insert(SessionRecord::new(
+        &agent,
+        "chat:plans",
+        SessionKind::Chat,
+        SessionOrigin::Web,
+        "Plans".into(),
+        TitleSource::Owner,
+        1,
+    ));
+    let state = Arc::new(RwLock::new(daemon));
+    let limiter = Arc::new(Semaphore::new(0));
+    let runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&limiter));
+    let manager = ConnectorManager::new(
+        Arc::clone(&state),
+        runs.clone(),
+        Arc::new(InMemoryCredentialStore::default()),
+        Arc::new(CountingTelegramTransport::default()),
+    );
+    // Accepted through the coordinator: the router's mail manager would
+    // take the one-shot save gate below with its own start-up save.
+    let run_id =
+        crate::agent_runs::test_support::accept_web(&runs, &agent, "chat:plans", "key-1").await;
+    let save_gate = state
+        .write()
+        .await
+        .install_test_control_plane_save_gate(true);
+    save_gate.release.add_permits(1);
+
+    let error = manager.delete_agent(agent.clone()).await.unwrap_err();
+    assert_eq!(error, ConnectorManagerError::Persistence);
+    assert!(!runs.is_being_deleted(&agent));
+    {
+        let guard = state.read().await;
+        assert!(guard.get_agent(&agent).is_some());
+        assert_eq!(guard.runs.get(&run_id).unwrap().status, RunStatus::Queued);
+        assert!(!guard
+            .live
+            .runs()
+            .control(&run_id)
+            .expect("its control stays")
+            .cancel
+            .is_cancelled());
+    }
+
+    limiter.add_permits(1);
+    wait_for(&state, &run_id, RunStatus::Completed).await;
+    assert_eq!(model.requests().len(), 1);
+    manager.shutdown().await;
+}
+
+#[test]
+fn the_openapi_document_lists_the_stop_route_under_runs() {
+    use utoipa::OpenApi;
+
+    let document = crate::routes::ApiDoc::openapi();
+    let stop = document.paths.paths["/api/agents/{agent_id}/runs/{run_id}/stop"]
+        .post
+        .as_ref()
+        .expect("stopping a run is documented");
+    assert_eq!(stop.tags.as_deref(), Some(&["runs".to_string()][..]));
+    let stop = serde_json::to_value(stop).unwrap();
+    for status in ["202", "403", "404", "503"] {
+        assert!(
+            stop["responses"].get(status).is_some(),
+            "stop documents {status}"
+        );
+    }
+}

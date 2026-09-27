@@ -21,6 +21,7 @@ use crate::agent_runs::{AgentRunCoordinator, AgentRunRequest, RunRoom};
 use crate::app::SharedDaemonState;
 use crate::connectors::{InboundProcessingState, OutboundDeliveryState, TelegramOutboundRecord};
 use crate::history::HistoryDeletion;
+use crate::live::run_status_event;
 use crate::routes::{AgentRunEnvelope, AgentRuntimeSnapshotResponse, ApiError, TaskResultResponse};
 use crate::runs::{RunOutcome, RunSource};
 use crate::schedules::{ScheduleOutcomeStatus, ScheduleSafeOutcome, ScheduleTarget};
@@ -1562,6 +1563,8 @@ impl ConnectorManager {
         tokio::spawn(async move {
             let _lifecycle = manager.lifecycle_lock.lock().await;
             manager.ensure_open()?;
+            // New messages are refused while the deletion runs (spec §4.2).
+            let _deleting = manager.runs.begin_agent_deletion(&agent_id);
             {
                 let state = manager.state.read().await;
                 if state.get_agent(&agent_id).is_none() {
@@ -1622,7 +1625,7 @@ impl ConnectorManager {
             // protocol): a crash right after a successful save still replays
             // this deletion on restart.
             let deletion = HistoryDeletion::agent(&agent_id);
-            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, previous_runs, previous_sessions, persist) = {
+            let (agent_snapshot, previous_connectors, previous_inbound, previous_outbound, previous_schedules, cancelled_queued, previous_runs, previous_sessions, persist) = {
                 let mut state = manager.state.write().await;
                 let agent_snapshot = state.get_agent(&agent_id);
                 let previous_connectors = previous
@@ -1672,6 +1675,9 @@ impl ConnectorManager {
                 // agents that no longer exist, so they would never be
                 // mirrored and never pruned (Controller ruling 2, M2
                 // pre-flight audit, carried forward from Task 6).
+                // Its queued messages never run (spec §4.4 item 6); cancelled
+                // first so they leave the ledger with its other terminal runs.
+                let cancelled_queued = state.runs.cancel_queued_for_agent(&agent_id, now);
                 let previous_runs = state.runs.remove_terminal_for_agent(&agent_id);
                 // Without this, a deleted agent's session records stay in the
                 // registry until a restart (fix round 1, M2 review).
@@ -1684,6 +1690,7 @@ impl ConnectorManager {
                     previous_inbound,
                     previous_outbound,
                     previous_schedules,
+                    cancelled_queued,
                     previous_runs,
                     previous_sessions,
                     persist,
@@ -1702,6 +1709,10 @@ impl ConnectorManager {
                     for run in previous_runs {
                         state.runs.insert(run);
                     }
+                    // The queued messages wait on, as they were.
+                    for (queued, _) in &cancelled_queued {
+                        state.runs.insert(queued.clone());
+                    }
                     for session in previous_sessions {
                         state.sessions.insert(session);
                     }
@@ -1715,6 +1726,18 @@ impl ConnectorManager {
                 manager.restore_agent_delete_configuration(&previous).await?;
                 drop(_transaction);
                 return Err(ConnectorManagerError::Persistence);
+            }
+            // Durable now: the cancelled messages stop waiting and are
+            // announced; their controls go with them.
+            {
+                let state = manager.state.read().await;
+                for (_, cancelled) in &cancelled_queued {
+                    if let Some(control) = state.live.runs().control(&cancelled.id) {
+                        control.cancel.cancel();
+                    }
+                    state.live.runs().remove(&cancelled.id);
+                    state.live.publish(run_status_event(cancelled), None);
+                }
             }
             // Durable now: the history rows may go (spec §3.3).
             let history = manager.state.read().await.history.clone();

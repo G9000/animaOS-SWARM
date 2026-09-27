@@ -169,7 +169,7 @@ use crate::runtime_model::provider_summaries;
         sessions::list_sessions, sessions::get_session, sessions::list_session_messages,
         sessions::create_session, sessions::update_session, sessions::delete_session, sessions::export_session,
         events::agent_events,
-        runs::start_session_run, runs::list_session_runs, runs::get_run,
+        runs::start_session_run, runs::list_session_runs, runs::get_run, runs::stop_run,
     ),
     components(schemas(self::contracts::AgentSummariesEnvelope)),
     tags(
@@ -504,6 +504,10 @@ fn router_with_services_with_policies(
             get(runs::list_session_runs).post(runs::start_session_run),
         )
         .route("/api/agents/{agent_id}/runs/{run_id}", get(runs::get_run))
+        .route(
+            "/api/agents/{agent_id}/runs/{run_id}/stop",
+            axum::routing::post(runs::stop_run),
+        )
         .route("/api/ready", get(ready_entry))
         .route(
             "/api/workspace",
@@ -1297,7 +1301,7 @@ async fn get_agent_entry(
     tag = "agents",
     params(("agent_id" = String, Path, description = "Agent identifier")),
     responses(
-        (status = 200, description = "Agent deleted", body = DeleteResponse),
+        (status = 200, description = "Agent deleted; its messages still waiting to start are cancelled (agent_deleted)", body = DeleteResponse),
         (status = 403, description = "Local owner authorization required", body = ErrorBody),
         (status = 404, description = "Not found", body = ErrorBody),
         (status = 409, description = "The agent has a run in progress", body = ErrorBody)

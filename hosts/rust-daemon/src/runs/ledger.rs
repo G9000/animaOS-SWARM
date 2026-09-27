@@ -33,6 +33,14 @@ pub(crate) const COMMIT_FAILED: &str = "commit_failed";
 pub(crate) const AGENT_DELETED: &str = "agent_deleted";
 pub(crate) const RUN_STOPPED: &str = "stopped";
 pub(crate) const STOPPED_BY_OWNER: &str = "Stopped by owner";
+/// A steer its run never read because the owner stopped the run (controller
+/// ruling, M3 pre-flight audit M8): kept as an `interrupted` run to send again.
+pub(crate) const STOPPED_BEFORE_START: &str = "stopped_before_start";
+pub(crate) const STOPPED_BEFORE_START_MESSAGE: &str =
+    "The run was stopped before this message reached it; it is safe to send it again.";
+/// A deleted agent's queued message (spec §4.4 item 6).
+pub(crate) const AGENT_DELETED_BEFORE_START_MESSAGE: &str =
+    "The companion was deleted before this message ran";
 
 /// Ledger states (spec §4.1). M1 produces `Running`, `Completed`, `Failed`,
 /// and `Interrupted`; the others arrive with async runs and approvals.
@@ -128,8 +136,7 @@ impl RunError {
     }
 }
 
-/// A persisted stop request (spec §4.6); set from M3 on.
-#[allow(dead_code)]
+/// A persisted stop request (spec §4.6).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunStopRequest {
@@ -441,6 +448,31 @@ impl RunLedger {
             .collect::<Vec<_>>();
         ids.into_iter()
             .filter_map(|id| self.records.remove(&id))
+            .collect()
+    }
+
+    /// Cancels a deleted agent's queued runs (spec §4.4 item 6) and returns
+    /// each as it was and as it is now.
+    pub(crate) fn cancel_queued_for_agent(
+        &mut self,
+        agent_id: &str,
+        now_ms: u64,
+    ) -> Vec<(RunRecord, RunRecord)> {
+        self.records
+            .values_mut()
+            .filter(|record| record.agent_id == agent_id && record.status == RunStatus::Queued)
+            .map(|record| {
+                let queued = record.clone();
+                record.finish(
+                    RunStatus::Cancelled,
+                    Some(RunError::new(
+                        AGENT_DELETED,
+                        AGENT_DELETED_BEFORE_START_MESSAGE,
+                    )),
+                    now_ms,
+                );
+                (queued, record.clone())
+            })
             .collect()
     }
 
@@ -1160,6 +1192,41 @@ mod tests {
 
     /// Carry-forward (M2 T17 Minor 9): a message still waiting to start keeps
     /// its session active, so the web never declares the send unconfirmed.
+    /// A deleted agent's queued runs are cancelled, each returned as it was
+    /// and as it is now; its running runs and other agents' runs are not
+    /// touched (spec §4.4 item 6; M3 Task 7 review Minor 3).
+    #[test]
+    fn a_deleted_agents_queued_runs_are_cancelled_and_returned_before_and_after() {
+        let mut ledger = RunLedger::default();
+        let queued = RunRecord::queued(start("agent-a"), 10);
+        let running = record("agent-a", 11);
+        let other = RunRecord::queued(start("agent-b"), 12);
+        for record in [&queued, &running, &other] {
+            ledger.insert(record.clone());
+        }
+
+        let cancelled = ledger.cancel_queued_for_agent("agent-a", 20);
+
+        assert_eq!(cancelled.len(), 1);
+        let (before, after) = &cancelled[0];
+        assert_eq!(before, &queued);
+        assert_eq!(after.id, queued.id);
+        assert_eq!(after.status, RunStatus::Cancelled);
+        assert_eq!(after.finished_at_ms, Some(20));
+        assert_eq!(after.started_at_ms, None);
+        assert_eq!(
+            after.error,
+            Some(RunError::new(
+                AGENT_DELETED,
+                "The companion was deleted before this message ran"
+            ))
+        );
+        assert_eq!(ledger.get(&queued.id), Some(after));
+        assert_eq!(ledger.get(&running.id), Some(&running));
+        assert_eq!(ledger.get(&other.id), Some(&other));
+        assert!(ledger.cancel_queued_for_agent("agent-a", 30).is_empty());
+    }
+
     #[test]
     fn a_queued_run_alone_keeps_its_session_active() {
         let mut ledger = RunLedger::default();
