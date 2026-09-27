@@ -336,6 +336,8 @@ pub(crate) struct AgentRunCoordinator {
     deleting_agents: self::stop::DeletingAgents,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
+    /// How long a compaction's store read and model call may take.
+    compaction_timeout: std::time::Duration,
 }
 
 impl AgentRunCoordinator {
@@ -590,7 +592,17 @@ impl AgentRunCoordinator {
             deleting_agents: Arc::new(StdMutex::new(HashMap::new())),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
+            compaction_timeout: std::time::Duration::from_millis(
+                crate::sessions::compaction::COMPACTION_TIMEOUT_MS,
+            ),
         }
+    }
+
+    /// A shorter compaction deadline, so tests need not wait two minutes.
+    #[cfg(test)]
+    pub(crate) fn with_compaction_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.compaction_timeout = timeout;
+        self
     }
 
     /// Concurrent runs per non-helper agent across different rooms (spec §4.3).
@@ -1367,15 +1379,33 @@ impl AgentRunCoordinator {
             live_run.publish(live_run.session_event(LiveEventBody::SessionCreated));
         }
         live_run.publish_record(&started);
+        // A helper's deadline starts before its compaction, which counts
+        // toward it (Task 12 fix round 1).
+        let helper_deadline = config_helper_parent(runtime.config()).is_some().then(|| {
+            let timeout_ms = runtime
+                .config()
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.timeout_ms)
+                .unwrap_or(MAX_HELPER_RUN_MS)
+                .min(MAX_HELPER_RUN_MS);
+            (
+                timeout_ms,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms),
+            )
+        });
         // Spec §5.4: turns about to leave the context are summarized first;
         // if that fails the run goes on with the trimmed context.
         let rebuilt = self
             .compact_before_run(
                 &live_run,
                 &started,
-                &room_id,
-                &content,
-                runtime.config(),
+                self::compact::RunCompaction {
+                    room_id: &room_id,
+                    input: &content,
+                    config: runtime.config(),
+                    deadline: helper_deadline.map(|(_, deadline)| deadline),
+                },
                 &mut context,
             )
             .await;
@@ -1473,14 +1503,6 @@ impl AgentRunCoordinator {
             }))
             .with_cancel(Some(live_run.control().cancel));
         let history = runtime.messages().to_vec();
-        let helper_timeout = helper_parent(&runtime.state()).is_some().then(|| {
-            original_config
-                .settings
-                .as_ref()
-                .and_then(|settings| settings.timeout_ms)
-                .unwrap_or(MAX_HELPER_RUN_MS)
-                .min(MAX_HELPER_RUN_MS)
-        });
         let execution = async {
             runtime
                 .run_in_room_with_context_and_tools(
@@ -1504,13 +1526,11 @@ impl AgentRunCoordinator {
                 )
                 .await
         };
-        let result = if let Some(timeout_ms) = helper_timeout {
+        let result = if let Some((timeout_ms, deadline)) = helper_deadline {
             // This is a cooperative execution deadline, not an effect rollback.
             // Synchronous work must finish before yielding; process tools are
             // excluded because dropping their future would leave children alive.
-            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), execution)
-                .await
-            {
+            match tokio::time::timeout_at(deadline, execution).await {
                 Ok(result) => result,
                 Err(_) => {
                     runtime.mark_failed("Helper task timed out", timeout_ms);

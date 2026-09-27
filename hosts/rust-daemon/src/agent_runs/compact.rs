@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anima_core::primitives::now_millis;
 use anima_core::{AgentConfig, CancelSignal, Content, Message};
+use tokio::time::Instant;
 use tracing::warn;
 
 use super::AgentRunCoordinator;
@@ -13,7 +14,7 @@ use crate::live::{LiveEvent, LiveEventBody, LiveRun};
 use crate::runs::RunRecord;
 use crate::sessions::compaction::{
     auto_compact_enabled, compaction_input_chars, pruned_turns, summarize, PrunedSpan,
-    COMPACTING_PHASE,
+    COMPACTING_PHASE, COMPACTION_TIMED_OUT,
 };
 use crate::sessions::context::{mark_context_trimmed, newest_left_out, ContextBudget};
 use crate::sessions::{SessionCompactionError, SessionSummary};
@@ -22,15 +23,19 @@ use crate::state::{RunBuild, RunContextReport};
 /// A provider error is cut to this many characters on the session.
 const MAX_COMPACTION_ERROR_CHARS: usize = 500;
 const SESSION_GONE: &str = "The session no longer exists";
+/// The pruned span to compact is missing from the history store.
+const NO_EARLIER_TURNS: &str = "Earlier turns could not be read: none were found";
 
 /// What a run brings to its automatic compaction.
-struct RunCompaction<'a> {
-    room_id: &'a str,
-    input: &'a Content,
+pub(super) struct RunCompaction<'a> {
+    pub(super) room_id: &'a str,
+    pub(super) input: &'a Content,
     /// The run's own configuration: its provider and model write the
     /// summary, and the rebuilt runtime keeps it.
-    config: &'a AgentConfig,
-    cancel: CancelSignal,
+    pub(super) config: &'a AgentConfig,
+    /// A helper's execution deadline, which its compaction counts toward
+    /// (fix round 1); the compaction ends by the earlier of it and its own.
+    pub(super) deadline: Option<Instant>,
 }
 
 /// How a compaction ended.
@@ -56,15 +61,19 @@ impl AgentRunCoordinator {
     /// Folds `dropped` and the session's pruned turns no summary covers into
     /// its summary, through the newest of them, and saves it with
     /// `contextTrimmed` and `compactionError` cleared; when the call or the
-    /// save fails, the session records the error instead. The caller holds
-    /// the session's room, so no run starts meanwhile.
+    /// save fails, or the call outlasts `COMPACTION_TIMEOUT_MS`, the session
+    /// records the error instead. The caller holds the session's room, so no
+    /// run starts meanwhile, and the deadline bounds how long it holds it.
     pub(crate) async fn compact_session(
         &self,
         agent_id: &str,
         session_id: &str,
         dropped: &[Message],
     ) -> Result<(), String> {
-        match self.compact(agent_id, session_id, dropped, None).await {
+        match self
+            .compact(agent_id, session_id, dropped, None, None)
+            .await
+        {
             Compacted::Failed(error) => Err(error),
             Compacted::Nothing | Compacted::Saved(_) | Compacted::Stopped => Ok(()),
         }
@@ -82,15 +91,13 @@ impl AgentRunCoordinator {
         &self,
         live_run: &LiveRun,
         started: &RunRecord,
-        room_id: &str,
-        input: &Content,
-        config: &AgentConfig,
+        run: RunCompaction<'_>,
         context: &mut RunContextReport,
     ) -> Option<RunBuild> {
         let dropped = std::mem::take(&mut context.dropped);
         let cancel = live_run.control().cancel;
         if context.trimmed_through.is_none()
-            || !auto_compact_enabled(config)
+            || !auto_compact_enabled(run.config)
             || cancel.is_cancelled()
         {
             return None;
@@ -101,14 +108,14 @@ impl AgentRunCoordinator {
                 phase: COMPACTING_PHASE,
             },
         ));
-        let run = RunCompaction {
-            room_id,
-            input,
-            config,
-            cancel,
-        };
         match self
-            .compact(&started.agent_id, &started.session_id, &dropped, Some(run))
+            .compact(
+                &started.agent_id,
+                &started.session_id,
+                &dropped,
+                Some(&run),
+                Some(cancel),
+            )
             .await
         {
             Compacted::Saved(Some(mut rebuilt)) => {
@@ -124,14 +131,15 @@ impl AgentRunCoordinator {
     }
 
     /// One compaction. The history-store read and the model call run with
-    /// no lock held; the save takes the control-plane transaction, then the
-    /// state lock.
+    /// no lock held and end by the deadline (or at a stop); the save takes
+    /// the control-plane transaction, then the state lock.
     async fn compact(
         &self,
         agent_id: &str,
         session_id: &str,
         dropped: &[Message],
-        run: Option<RunCompaction<'_>>,
+        run: Option<&RunCompaction<'_>>,
+        cancel: Option<CancelSignal>,
     ) -> Compacted {
         let (adapter, config, previous, pruned, store, through) = {
             let guard = self.state.read().await;
@@ -157,8 +165,7 @@ impl AgentRunCoordinator {
             };
             (
                 Arc::clone(&guard.model_adapter),
-                run.as_ref()
-                    .map_or_else(|| runtime.config().clone(), |run| run.config.clone()),
+                run.map_or_else(|| runtime.config().clone(), |run| run.config.clone()),
                 session.summary.clone(),
                 pruned,
                 guard.history.store(),
@@ -187,8 +194,10 @@ impl AgentRunCoordinator {
                     Cow::Owned(turns)
                 }
             };
+            // Announced as compacting, so an empty span is an error, not
+            // silence (fix round 1).
             if turns.is_empty() {
-                return Ok(None);
+                return Err(NO_EARLIER_TURNS.to_string());
             }
             let text = summarize(
                 adapter.as_ref(),
@@ -198,22 +207,25 @@ impl AgentRunCoordinator {
                 budget_tokens,
             )
             .await?;
-            Ok::<_, String>(Some((text, turns.len())))
+            Ok::<_, String>((text, turns.len()))
         };
-        // Controller ruling 3 (audit M7): a stop ends the run at once.
-        let outcome: Result<Option<(String, usize)>, String> = match &run {
-            Some(run) => {
-                tokio::select! {
-                    outcome = work => outcome,
-                    () = run.cancel.cancelled() => return Compacted::Stopped,
-                }
+        // Controller ruling 3 (audit M7): a stop ends the run at once. Fix
+        // round 1: the read and the call end by the compaction's deadline,
+        // or a helper's earlier one; the save below is never cut short.
+        let own_deadline = Instant::now() + self.compaction_timeout;
+        let deadline = run
+            .and_then(|run| run.deadline)
+            .map_or(own_deadline, |helper| helper.min(own_deadline));
+        let stopped = async move {
+            match cancel {
+                Some(cancel) => cancel.cancelled().await,
+                None => std::future::pending().await,
             }
-            None => work.await,
         };
-        let summary = match outcome {
-            Ok(None) => return Compacted::Nothing,
-            Ok(Some(summary)) => Ok(summary),
-            Err(error) => Err(error),
+        let summary: Result<(String, usize), String> = tokio::select! {
+            outcome = work => outcome,
+            () = tokio::time::sleep_until(deadline) => Err(COMPACTION_TIMED_OUT.to_string()),
+            () = stopped => return Compacted::Stopped,
         };
 
         let now_ms = now_millis();
@@ -240,7 +252,7 @@ impl AgentRunCoordinator {
                     // The run goes on from the new summary (controller
                     // ruling 3): what its selection still leaves out is the
                     // session's `contextTrimmed`, saved with the summary.
-                    rebuilt = run.as_ref().and_then(|run| {
+                    rebuilt = run.and_then(|run| {
                         let mut build =
                             guard.build_run_runtime(agent_id, run.room_id, run.input)?;
                         // A PATCH meanwhile applies to later runs (spec §4.4).
@@ -269,8 +281,10 @@ impl AgentRunCoordinator {
             let mut guard = self.state.write().await;
             if let Some(session) = guard.sessions.get_mut(agent_id, session_id) {
                 (session.summary, session.context_trimmed) = before;
-                // Kept unsaved: the next save persists it.
+                // Kept unsaved: the next save persists it. Announced now, so
+                // the page shows it before then (fix round 1).
                 session.compaction_error = Some(compaction_error(&message, now_ms));
+                guard.publish_session_event(agent_id, session_id, LiveEventBody::SessionUpdated);
             }
             return Compacted::Failed(message);
         }

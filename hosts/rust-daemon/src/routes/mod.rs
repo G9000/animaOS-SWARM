@@ -760,12 +760,24 @@ fn router_with_services_with_policies(
 
 #[cfg(test)]
 pub(crate) fn router(state: SharedDaemonState, config: DaemonConfig) -> Router {
+    router_with_runs(state, config, |runs| runs)
+}
+
+/// `router` with its run coordinator adjusted by `configure`.
+#[cfg(test)]
+pub(crate) fn router_with_runs(
+    state: SharedDaemonState,
+    config: DaemonConfig,
+    configure: impl FnOnce(AgentRunCoordinator) -> AgentRunCoordinator,
+) -> Router {
     use crate::connectors::credentials::InMemoryCredentialStore;
     use crate::connectors::telegram::TelegramClient;
 
     let run_limiter = Arc::new(Semaphore::new(config.max_concurrent_runs));
-    let agent_runs = AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
-        .with_max_runs_per_agent(config.max_runs_per_agent);
+    let agent_runs = configure(
+        AgentRunCoordinator::new(Arc::clone(&state), Arc::clone(&run_limiter))
+            .with_max_runs_per_agent(config.max_runs_per_agent),
+    );
     let connector_manager = ConnectorManager::new(
         Arc::clone(&state),
         agent_runs.clone(),

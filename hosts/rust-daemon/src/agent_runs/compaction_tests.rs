@@ -10,7 +10,10 @@ use anima_core::{
 };
 use async_trait::async_trait;
 
-use super::test_support::{chat_request, companion_config, events_until, ScriptedModel, Step};
+use super::compact::RunCompaction;
+use super::test_support::{
+    chat_request, companion_config, events_until, is_terminal, quiet_for, ScriptedModel, Step,
+};
 use super::AgentRunCoordinator;
 use crate::app::SharedDaemonState;
 use crate::history::conformance::FlakyHistoryStore;
@@ -20,7 +23,7 @@ use crate::runs::{RunRecord, RunSource, RunStart, RunStatus};
 use crate::sessions::{
     SessionKind, SessionOrigin, SessionPrunedThrough, SessionRecord, TitleSource,
 };
-use crate::state::DaemonState;
+use crate::state::{DaemonState, RunBuild};
 
 /// A 26-token summary: with it, the newer hot turn (22) no longer fits.
 const LONG_SUMMARY: &str = "They planned a trip to Lisbon in May and asked for two hotel options.";
@@ -102,6 +105,21 @@ async fn session(
 /// summary the newer still fits.
 async fn long_session(model: Arc<dyn ModelAdapter>, auto: bool) -> (AgentRunCoordinator, String) {
     session(model, 104.0, auto).await
+}
+
+/// The compaction's own `session.updated` goes out before the run's first
+/// saved message (the run's commit sends another one after them).
+fn assert_compaction_announced(events: &[serde_json::Value]) {
+    let first_message = events
+        .iter()
+        .position(|event| event["type"] == "message.created")
+        .expect("the run saved its messages");
+    assert!(
+        events[..first_message]
+            .iter()
+            .any(|event| event["type"] == "session.updated"),
+        "the compaction's outcome is announced: {events:?}"
+    );
 }
 
 fn sent_texts(model: &ScriptedModel) -> Vec<String> {
@@ -324,12 +342,16 @@ async fn a_summary_that_cannot_be_saved_is_recorded_and_the_run_goes_on_trimmed(
     );
     let (coordinator, agent_id) = long_session(adapter.clone(), true).await;
     assert!(adapter.state.set(Arc::clone(&coordinator.state)).is_ok());
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
 
     coordinator
         .run(chat_request(&agent_id, "chat:long", "book one"))
         .await
         .unwrap();
 
+    // Fix round 1: the unsaved error is announced at once, not at the next save.
+    assert_compaction_announced(&events_until(&mut subscription, "run.completed").await);
     assert_eq!(
         sent_texts(&adapter.inner),
         ["and hotels?", "Two options", "book one"]
@@ -467,10 +489,155 @@ async fn a_stop_during_compaction_ends_the_run_at_once_as_stopped() {
             Some("a1")
         );
     }
-    let events = events_until(&mut subscription, "run.cancelled").await;
+    let mut events = events_until(&mut subscription, "run.cancelled").await;
+    events.extend(quiet_for(&mut subscription).await);
     assert!(events
         .iter()
         .any(|event| event["type"] == "run.progress" && event["phase"] == "compacting"));
+    assert_eq!(
+        events.iter().filter(|event| is_terminal(event)).count(),
+        1,
+        "one terminal event: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "session.updated")
+            .count(),
+        1,
+        "only the run's commit updates the session: {events:?}"
+    );
+}
+
+/// Fix round 1 (Important 2): a summary still unwritten at its deadline is
+/// a failed compaction, saved and announced; the run goes on trimmed.
+#[tokio::test]
+async fn a_summary_past_its_deadline_is_recorded_and_the_run_goes_on_trimmed() {
+    let model = ScriptedModel::with_secondary(
+        vec![Step::Text(vec!["Booked"])],
+        vec![Step::Hold(Vec::new())],
+    );
+    let (coordinator, agent_id) = long_session(model.clone(), true).await;
+    let coordinator = coordinator.with_compaction_timeout(Duration::from_millis(50));
+    let hub = coordinator.state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent_id).unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        coordinator.run(chat_request(&agent_id, "chat:long", "book one")),
+    )
+    .await
+    .expect("the deadline ends the summary")
+    .unwrap();
+
+    assert_eq!(
+        sent_texts(&model),
+        ["and hotels?", "Two options", "book one"]
+    );
+    {
+        let guard = coordinator.state.read().await;
+        let session = guard.sessions.get(&agent_id, "chat:long").unwrap();
+        assert_eq!(session.summary, None);
+        assert_eq!(
+            session
+                .compaction_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("The summary took longer than 2 minutes")
+        );
+        assert_eq!(
+            session
+                .context_trimmed
+                .as_ref()
+                .map(|trimmed| trimmed.dropped_through_message_id.as_str()),
+            Some("a1")
+        );
+    }
+    assert_compaction_announced(&events_until(&mut subscription, "run.completed").await);
+}
+
+/// What `run_locked` hands `compact_before_run` for "book one" in
+/// `chat:long`: the run's build, its registered live run, and its record.
+async fn run_parts(
+    coordinator: &AgentRunCoordinator,
+    agent_id: &str,
+    input: &Content,
+) -> (RunBuild, LiveRun, RunRecord) {
+    let (build, hub) = {
+        let guard = coordinator.state.read().await;
+        (
+            guard
+                .build_run_runtime(agent_id, "chat:long", input)
+                .unwrap(),
+            guard.live.clone(),
+        )
+    };
+    let record = RunRecord::running(
+        RunStart {
+            agent_id: agent_id.into(),
+            session_id: "chat:long".into(),
+            source: RunSource::Api,
+            source_ref: None,
+            idempotency_key: None,
+            text: input.text.clone(),
+            model: "gpt-5.4".into(),
+            provider: Some("openai".into()),
+            parent_run_id: None,
+        },
+        1,
+    );
+    let live_run = LiveRun::register(hub, &record, None);
+    (build, live_run, record)
+}
+
+fn book_one() -> Content {
+    Content {
+        text: "book one".into(),
+        ..Content::default()
+    }
+}
+
+/// Fix round 1 (Important 1): a helper's compaction ends by the helper's
+/// own deadline when that comes first, so the summary counts toward the
+/// helper's two minutes; its execution then runs to the same deadline.
+#[tokio::test]
+async fn a_helper_deadline_ends_its_compaction() {
+    let model = ScriptedModel::with_secondary(vec![], vec![Step::Hold(Vec::new())]);
+    let (coordinator, agent_id) = long_session(model, true).await;
+    let input = book_one();
+    let (build, live_run, record) = run_parts(&coordinator, &agent_id, &input).await;
+    let mut context = build.context;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+
+    let rebuilt = tokio::time::timeout(
+        Duration::from_secs(5),
+        coordinator.compact_before_run(
+            &live_run,
+            &record,
+            RunCompaction {
+                room_id: "chat:long",
+                input: &input,
+                config: build.runtime.config(),
+                deadline: Some(deadline),
+            },
+            &mut context,
+        ),
+    )
+    .await
+    .expect("the helper's deadline ends the summary");
+
+    assert!(rebuilt.is_none(), "the run goes on as it was built");
+    assert!(tokio::time::Instant::now() >= deadline);
+    let guard = coordinator.state.read().await;
+    let session = guard.sessions.get(&agent_id, "chat:long").unwrap();
+    assert_eq!(session.summary, None);
+    assert_eq!(
+        session
+            .compaction_error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some("The summary took longer than 2 minutes")
+    );
 }
 
 /// Task 11 review carry (controller ruling 4): a run lets go of its copy
@@ -481,44 +648,21 @@ async fn a_run_lets_go_of_its_dropped_turns_once_compaction_is_decided() {
     for auto in [false, true] {
         let model = ScriptedModel::with_secondary(vec![], vec![Step::Text(vec![LONG_SUMMARY])]);
         let (coordinator, agent_id) = long_session(model, auto).await;
-        let input = Content {
-            text: "book one".into(),
-            ..Content::default()
-        };
-        let (build, hub) = {
-            let guard = coordinator.state.read().await;
-            (
-                guard
-                    .build_run_runtime(&agent_id, "chat:long", &input)
-                    .unwrap(),
-                guard.live.clone(),
-            )
-        };
+        let input = book_one();
+        let (build, live_run, record) = run_parts(&coordinator, &agent_id, &input).await;
         let mut context = build.context;
         assert_eq!(context.dropped.len(), 2, "auto {auto}");
-        let record = RunRecord::running(
-            RunStart {
-                agent_id: agent_id.clone(),
-                session_id: "chat:long".into(),
-                source: RunSource::Api,
-                source_ref: None,
-                idempotency_key: None,
-                text: "book one".into(),
-                model: "gpt-5.4".into(),
-                provider: Some("openai".into()),
-                parent_run_id: None,
-            },
-            1,
-        );
-        let live_run = LiveRun::register(hub, &record, None);
 
         let rebuilt = coordinator
             .compact_before_run(
                 &live_run,
                 &record,
-                "chat:long",
-                &input,
-                build.runtime.config(),
+                RunCompaction {
+                    room_id: "chat:long",
+                    input: &input,
+                    config: build.runtime.config(),
+                    deadline: None,
+                },
                 &mut context,
             )
             .await;
@@ -764,6 +908,51 @@ async fn pruned_turns_the_store_cannot_read_are_a_compaction_error() {
             .starts_with("Earlier turns could not be read: "),
         "{}",
         error.message
+    );
+    assert_eq!(
+        session
+            .context_trimmed
+            .as_ref()
+            .map(|trimmed| trimmed.dropped_through_message_id.as_str()),
+        Some("p6")
+    );
+}
+
+/// Fix round 1 (Minor 6): an announced compaction whose pruned turns the
+/// history store does not have records that instead of doing nothing.
+#[tokio::test]
+async fn a_pruned_span_the_store_does_not_have_is_a_compaction_error() {
+    let model = ScriptedModel::with_secondary(vec![Step::Text(vec!["Booked"])], vec![]);
+    let (coordinator, agent_id) = session(model.clone(), 2_000.0, true).await;
+    coordinator
+        .state
+        .write()
+        .await
+        .sessions
+        .get_mut(&agent_id, "chat:long")
+        .unwrap()
+        .pruned_through = Some(SessionPrunedThrough {
+        message_id: "p6".into(),
+        created_at_ms: 8,
+    });
+
+    coordinator
+        .run(chat_request(&agent_id, "chat:long", "book one"))
+        .await
+        .unwrap();
+
+    assert!(
+        model.secondary_requests().is_empty(),
+        "nothing to summarize"
+    );
+    let guard = coordinator.state.read().await;
+    let session = guard.sessions.get(&agent_id, "chat:long").unwrap();
+    assert_eq!(
+        session
+            .compaction_error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some("Earlier turns could not be read: none were found")
     );
     assert_eq!(
         session

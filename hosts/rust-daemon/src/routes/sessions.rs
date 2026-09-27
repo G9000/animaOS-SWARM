@@ -556,7 +556,7 @@ pub(super) async fn compact_session(
     if !is_valid_session_id(&session_id) {
         return rejected(ApiError::not_found());
     }
-    let (room_id, input, pruned) = {
+    let room_id = {
         let guard = state.daemon.read().await;
         let record = match guard.sessions.get(&agent_id, &session_id) {
             Some(record) if guard.agents.contains_key(&agent_id) => record,
@@ -568,22 +568,27 @@ pub(super) async fn compact_session(
         {
             return rejected(ApiError::conflict("This session cannot be compacted"));
         }
-        let room_id = record.room_id().to_string();
-        let history = guard.model_visible_history(&agent_id, &room_id);
-        (
-            room_id,
-            manual_compaction_input(&history, record.summary.as_ref()),
-            // Pruned turns the summary does not cover are compacted too
-            // (controller ruling 2, Task 12).
-            uncovered_pruned_through(record, &history).is_some(),
-        )
+        record.room_id().to_string()
     };
-    if input.is_empty() && !pruned {
-        return rejected(ApiError::conflict("Nothing to compact yet"));
-    }
-    // No run starts in the room until the summary is saved.
+    // No run starts in the room until the summary is saved. The input is
+    // read only once the room is held (Task 12 fix round 1), so a summary a
+    // run saved just before is never folded in again.
     let Some(reservation) = state.agent_runs.try_reserve_room(&agent_id, &room_id) else {
         return rejected(ApiError::conflict(SESSION_RUN_IN_PROGRESS));
+    };
+    let input = {
+        let guard = state.daemon.read().await;
+        let Some(record) = guard.sessions.get(&agent_id, &session_id) else {
+            return rejected(ApiError::not_found());
+        };
+        let history = guard.model_visible_history(&agent_id, &room_id);
+        let input = manual_compaction_input(&history, record.summary.as_ref());
+        // Pruned turns the summary does not cover are compacted too
+        // (controller ruling 2, Task 12).
+        if input.is_empty() && uncovered_pruned_through(record, &history).is_none() {
+            return rejected(ApiError::conflict("Nothing to compact yet"));
+        }
+        input
     };
     let runs = state.agent_runs.clone();
     let (agent, session) = (agent_id.clone(), session_id.clone());

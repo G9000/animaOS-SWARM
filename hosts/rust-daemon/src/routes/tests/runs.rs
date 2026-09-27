@@ -47,6 +47,14 @@ async fn json_body(response: axum::response::Response) -> serde_json::Value {
 async fn app_with_chat(
     model: Arc<dyn ModelAdapter>,
 ) -> (axum::Router, Arc<RwLock<DaemonState>>, String) {
+    app_with_runs(model, |runs| runs).await
+}
+
+/// `app_with_chat` with its run coordinator adjusted by `configure`.
+async fn app_with_runs(
+    model: Arc<dyn ModelAdapter>,
+    configure: impl FnOnce(AgentRunCoordinator) -> AgentRunCoordinator,
+) -> (axum::Router, Arc<RwLock<DaemonState>>, String) {
     let mut daemon = DaemonState::with_model_adapter(model);
     let agent = daemon
         .create_agent(test_config("companion"))
@@ -63,7 +71,11 @@ async fn app_with_chat(
         1,
     ));
     let state = Arc::new(RwLock::new(daemon));
-    (router(state.clone(), DaemonConfig::default()), state, agent)
+    (
+        crate::routes::router_with_runs(state.clone(), DaemonConfig::default(), configure),
+        state,
+        agent,
+    )
 }
 
 async fn wait_for(state: &Arc<RwLock<DaemonState>>, run_id: &str, status: RunStatus) -> RunRecord {
@@ -1955,4 +1967,62 @@ async fn a_pruned_session_with_one_hot_turn_can_still_be_compacted() {
         .content
         .text
         .ends_with("New turns:\nOwner: question 0\nCompanion: answer 0"));
+}
+
+/// Fix round 1 (Important 2): a manual compaction still unwritten at its
+/// deadline records the error, announces it, and frees the session.
+#[tokio::test]
+async fn a_manual_compaction_past_its_deadline_is_recorded_and_frees_the_session() {
+    let (app, state, agent) = app_with_runs(
+        ScriptedModel::with_secondary(vec![], vec![Step::Hold(Vec::new())]),
+        |runs| runs.with_compaction_timeout(Duration::from_millis(50)),
+    )
+    .await;
+    seed_turns(&mut *state.write().await, &agent, "chat:plans", 0..3);
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+
+    let response = app
+        .clone()
+        .oneshot(compact_request(&agent, "chat:plans", OWNER_ORIGIN))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    events_until(&mut subscription, "session.updated").await;
+    {
+        let guard = state.read().await;
+        let session = guard.sessions.get(&agent, "chat:plans").unwrap();
+        assert_eq!(session.summary, None);
+        assert_eq!(
+            session
+                .compaction_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("The summary took longer than 2 minutes")
+        );
+    }
+    // The room is free again: the session can be deleted.
+    let mut deleted = None;
+    for _ in 0..500 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/agents/{agent}/sessions/chat%3Aplans"))
+                    .header("host", "127.0.0.1:8080")
+                    .header("origin", OWNER_ORIGIN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if response.status() != StatusCode::CONFLICT {
+            deleted = Some(response.status());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(deleted, Some(StatusCode::OK));
 }
