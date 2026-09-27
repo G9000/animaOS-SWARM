@@ -104,7 +104,10 @@ fn indented(text: &str, mut emit: impl FnMut(char)) {
     }
 }
 
-fn indent(text: &str) -> String {
+/// `text` with each line break followed by a two-space indent (see
+/// `indented`); the session summary's context part uses it too (final fix
+/// wave S2-E).
+pub(crate) fn indent(text: &str) -> String {
     let mut indented_text = String::with_capacity(text.len());
     indented(text, |character| indented_text.push(character));
     indented_text
