@@ -946,7 +946,13 @@ async fn a_web_message_whose_turn_comes_after_shutdown_began_stays_queued() {
         let runs = runs.clone();
         async move { runs.shutdown().await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..500 {
+        if runs.is_shutting_down() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(runs.is_shutting_down(), "shutdown has begun");
     assert!(
         !shutdown.is_finished(),
         "shutdown waits for the running run"

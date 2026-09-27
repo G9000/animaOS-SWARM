@@ -687,7 +687,13 @@ async fn an_accepted_run_going_when_shutdown_begins_commits_before_shutdown_retu
         let coordinator = coordinator.clone();
         async move { coordinator.shutdown().await }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..500 {
+        if coordinator.is_shutting_down() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(coordinator.is_shutting_down(), "shutdown has begun");
     assert!(
         !shutdown.is_finished(),
         "shutdown waits for the running run"
