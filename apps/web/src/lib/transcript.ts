@@ -319,9 +319,27 @@ function messageItem(
   return { kind: 'message', key: message.id, message };
 }
 
-/** The session view's transcript (spec §15.2): history with tool steps
- *  grouped, then the runs and sends not yet in history. */
-export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
+/** The loaded history as transcript items, with what placing the runs
+ *  among them needs. */
+export interface TranscriptHistory {
+  readonly items: readonly TranscriptItem[];
+  /** The index of each run's last item. */
+  readonly lastOfRun: ReadonlyMap<string, number>;
+  /** Runs whose committed partial reply is labelled "Stopped". */
+  readonly stoppedRuns: ReadonlySet<string>;
+  /** When the oldest loaded message was created; null without history. */
+  readonly oldestLoadedMs: number | null;
+}
+
+export type HistoryInput = Pick<
+  TranscriptInput,
+  'messages' | 'trimmedThrough' | 'delegatedBy'
+>;
+
+/** The session's history with tool steps grouped (spec §15.2). Built once
+ *  per history change, so its items keep their identity while the
+ *  session's runs stream and the view skips rendering them again. */
+export function buildHistory(input: HistoryInput): TranscriptHistory {
   const items: TranscriptItem[] = [];
   const lastOfRun = new Map<string, number>();
   const stoppedRuns = new Set<string>();
@@ -468,8 +486,26 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
       for (const step of item.steps)
         if (step.result === null) step.status = 'error';
 
-  const oldestLoaded =
-    input.messages.length > 0 ? input.messages[0].created_at_ms : null;
+  return {
+    items,
+    lastOfRun,
+    stoppedRuns,
+    oldestLoadedMs:
+      input.messages.length > 0 ? input.messages[0].created_at_ms : null,
+  };
+}
+
+export type LiveInput = Pick<TranscriptInput, 'runs' | 'pending'>;
+
+/** The transcript (spec §15.2): the history's own items, unchanged, with
+ *  the session's runs and sends placed among and after them. */
+export function placeRuns(
+  history: TranscriptHistory,
+  input: LiveInput,
+): TranscriptItem[] {
+  const { lastOfRun, stoppedRuns } = history;
+  const oldestLoaded = history.oldestLoadedMs;
+  const items = [...history.items];
   const inserts: { after: number; order: number; item: TranscriptItem }[] = [];
   const tail: TranscriptItem[] = [];
   for (const [order, live] of (input.runs ?? []).entries()) {
@@ -513,4 +549,10 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
   for (const pending of input.pending ?? [])
     items.push({ kind: 'pending', key: `pending:${pending.key}`, pending });
   return items;
+}
+
+/** The session view's transcript (spec §15.2): history with tool steps
+ *  grouped, then the runs and sends not yet in history. */
+export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
+  return placeRuns(buildHistory(input), input);
 }

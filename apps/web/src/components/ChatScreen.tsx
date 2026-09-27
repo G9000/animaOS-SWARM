@@ -49,7 +49,9 @@ function messageFlag(message: ChatMessage): string | null {
   return null;
 }
 
-function Bubble({ message }: { message: ChatMessage }) {
+/** Memoized on its message: a committed message renders once, however
+ *  often the transcript around it changes (a streamed reply's deltas). */
+const Bubble = memo(function Bubble({ message }: { message: ChatMessage }) {
   if (message.role !== 'User' && message.role !== 'Assistant') {
     return <EventPill message={message} />;
   }
@@ -79,7 +81,7 @@ function Bubble({ message }: { message: ChatMessage }) {
       </div>
     </div>
   );
-}
+});
 
 const SUGGESTIONS = [
   {
@@ -229,7 +231,9 @@ function anchorsFor(transcript: readonly TranscriptItem[]): string[][] {
 
 const renderBubble = (message: ChatMessage) => <Bubble message={message} />;
 
-function TranscriptEntry({
+/** Memoized on its item: history items keep their identity while a run
+ *  streams, so only the items that changed render again. */
+const TranscriptEntry = memo(function TranscriptEntry({
   item,
   agentName,
   actions,
@@ -274,7 +278,7 @@ function TranscriptEntry({
     case 'trimmed':
       return <TrimmedDivider onCompact={actions?.onCompact} />;
   }
-}
+});
 
 export const MessageList = memo(function MessageList({
   agent,

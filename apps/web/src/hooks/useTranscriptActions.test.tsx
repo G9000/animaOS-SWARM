@@ -106,6 +106,37 @@ describe('useTranscriptActions', () => {
     expect(result.current.onCompact).toBeUndefined();
   });
 
+  it('keeps its identity while live runs change, and finds a helper in the newest', () => {
+    const options: TranscriptActionOptions = {
+      session: sessionFixture('room-7'),
+      resendable: true,
+      liveRuns: {},
+      sessions: [],
+      stopRun: vi.fn(),
+      sendAgain: vi.fn(),
+      compact: vi.fn(),
+      openSession: vi.fn(),
+    };
+    const { result, rerender } = renderHook(
+      (props: TranscriptActionOptions) => useTranscriptActions(props),
+      { initialProps: options },
+    );
+    const first = result.current;
+    expect(first.helperSession?.(helperStep('helper-7'))).toBe(null);
+
+    const child = runFixture('run_h', {
+      agentId: 'helper-7',
+      sessionId: 'room-live',
+      parentRunId: 'run_7',
+    });
+    rerender({ ...options, liveRuns: { run_h: emptyLiveRun(child) } });
+    expect(result.current).toBe(first);
+    expect(result.current.helperSession?.(helperStep('helper-7'))).toEqual({
+      agentId: 'helper-7',
+      sessionId: 'room-live',
+    });
+  });
+
   it('does not send again where the message cannot go', () => {
     const { result } = actionsFor({ resendable: false });
     expect(result.current.onSendAgain).toBeUndefined();

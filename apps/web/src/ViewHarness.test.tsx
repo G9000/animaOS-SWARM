@@ -27,6 +27,7 @@ import {
   SESSION_LIST_POLL_MS,
 } from './hooks/useCompanionSessions';
 import { STREAM_RETRY_MIN_MS } from './hooks/useAgentEvents';
+import { LIVE_REFRESH_DELAY_MS } from './hooks/useLiveSession';
 import {
   SESSION_MESSAGES_LIVE_POLL_MS,
   SESSION_MESSAGES_POLL_MS,
@@ -53,6 +54,20 @@ import {
   toolStartedEvent,
 } from './test/live';
 import { ViewHarness } from './ViewHarness';
+
+/** Every Markdown render, by its text: the real component still renders. */
+const markdownRenders = vi.hoisted(() => vi.fn<(text: string) => void>());
+vi.mock('./components/MarkdownMessage', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('./components/MarkdownMessage')>();
+  return {
+    ...actual,
+    MarkdownMessage: (props: { children: string }) => {
+      markdownRenders(props.children);
+      return <actual.MarkdownMessage {...props} />;
+    },
+  };
+});
 
 const providers: DaemonProvider[] = [
   {
@@ -2749,6 +2764,63 @@ it('streams a reply into the open session with its tool steps, then shows the co
     expect(
       screen.queryByRole('button', { name: 'Stop' }),
     ).not.toBeInTheDocument(),
+  );
+});
+
+it('streams a reply without rendering unchanged history again', async () => {
+  const earlier = (
+    id: string,
+    role: SessionMessage['role'],
+    text: string,
+  ): SessionMessage => ({
+    id,
+    role,
+    text,
+    attachments: [],
+    metadata: {},
+    createdAtMs: 1,
+  });
+  vi.mocked(daemon.sessionMessages).mockResolvedValue({
+    messages: [
+      earlier('u0', 'user', 'Earlier question'),
+      earlier('a0', 'assistant', 'Earlier reply'),
+    ],
+    // Older history, so the view offers to load it.
+    nextBefore: 'cursor-1',
+  });
+  const { stream } = await openLiveSession();
+  await screen.findByText('Earlier reply');
+  const run = runningRun();
+  act(() => stream.push(snapshotEvent([]), runEvent('run.started', run, 2)));
+  await screen.findByText('Plan Saturday');
+  // The reads the stream's snapshot asks for land first: a read replaces
+  // the messages it returns.
+  await act(async () => {
+    await new Promise((resolve) =>
+      window.setTimeout(resolve, LIVE_REFRESH_DELAY_MS * 2),
+    );
+  });
+  const reads = vi.mocked(daemon.sessionMessages).mock.calls.length;
+  const rendersOf = (text: string) =>
+    markdownRenders.mock.calls.filter(([rendered]) => rendered === text).length;
+  const before = [rendersOf('Earlier question'), rendersOf('Earlier reply')];
+
+  let text = '';
+  for (let index = 0; index < 20; index += 1) {
+    const piece = `word${index} `;
+    act(() =>
+      stream.push(deltaEvent(run, 'run_7:1', text.length, piece, 3 + index)),
+    );
+    text += piece;
+    // Each delta reaches the view in a frame of its own.
+    expect(await screen.findByText(text.trim())).toBeVisible();
+  }
+
+  expect(rendersOf(text)).toBeGreaterThanOrEqual(1);
+  // Nothing but the deltas changed while they streamed.
+  expect(vi.mocked(daemon.sessionMessages).mock.calls.length).toBe(reads);
+  expect([rendersOf('Earlier question'), rendersOf('Earlier reply')]).toEqual(
+    before,
   );
 });
 

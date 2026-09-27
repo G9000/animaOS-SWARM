@@ -301,6 +301,11 @@ export function ViewHarness() {
     () => history.messages.map(toChatMessage),
     [history.messages],
   );
+  // One identity for the view's life, so a render of the page (a streamed
+  // delta, a keystroke) keeps the message list's props.
+  const loadOlderRef = useRef(history.loadOlder);
+  loadOlderRef.current = history.loadOlder;
+  const loadOlder = useCallback(() => void loadOlderRef.current(), []);
 
   const conversation = routeSessionId
     ? sessionConversation(routeSessionId)
@@ -1011,7 +1016,7 @@ export function ViewHarness() {
       announcement={live.announcement}
       hasOlder={history.hasOlder}
       loadingOlder={history.loadingOlder}
-      onLoadOlder={() => void history.loadOlder()}
+      onLoadOlder={loadOlder}
       missing={routeSessionId !== null && history.missing && !daemonTooOld}
       telegramAvailable={activeConnector !== null}
       scrollerRef={scrollerRef}

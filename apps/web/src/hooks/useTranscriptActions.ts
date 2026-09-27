@@ -48,9 +48,12 @@ export interface TranscriptActionOptions {
  * What the owner can do from the open session's transcript (spec §15.2):
  * cancel a queued message, send a failed or interrupted one again, compact
  * the session, and open a helper's session, each as the session's
- * capabilities allow. The actions keep one identity per capability, list,
- * and stream change, so a keystroke in the composer does not re-render
- * every message.
+ * capabilities allow. The actions keep one identity per capability and
+ * sessions-list change, so neither a keystroke in the composer nor a
+ * streamed delta renders every message again. A helper card reads the live
+ * runs as it renders: a live run's cards render with each of its events,
+ * and a history card again once the sessions list, read after every run's
+ * lifecycle event, changes.
  */
 export function useTranscriptActions({
   session,
@@ -66,6 +69,9 @@ export function useTranscriptActions({
   useEffect(() => {
     latestRef.current = { stopRun, sendAgain, compact, openSession };
   });
+  // Read during render, so the cards rendered with it see this render's runs.
+  const liveRunsRef = useRef(liveRuns);
+  liveRunsRef.current = liveRuns;
   const cancellable = session?.capabilities.stop === true;
   const canResend = resendable && session?.capabilities.send === true;
   const compactable = session?.capabilities.compact ? session : null;
@@ -80,9 +86,10 @@ export function useTranscriptActions({
       ...(compactable
         ? { onCompact: () => latestRef.current.compact(compactable) }
         : {}),
-      helperSession: (step) => helperSessionTarget(step, liveRuns, sessions),
+      helperSession: (step) =>
+        helperSessionTarget(step, liveRunsRef.current, sessions),
       onOpenSession: (target) => latestRef.current.openSession(target),
     }),
-    [cancellable, canResend, compactable, liveRuns, sessions],
+    [cancellable, canResend, compactable, sessions],
   );
 }

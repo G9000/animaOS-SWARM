@@ -13,7 +13,8 @@ import type { SlashCommand } from '../../lib/slash-commands';
 import type { AgentDetail, ChatMessage } from '../../lib/types';
 import { Composer, MessageList } from '../ChatScreen';
 import {
-  buildTranscript,
+  buildHistory,
+  placeRuns,
   type PendingBubble,
   type TranscriptActions,
 } from '../../lib/transcript';
@@ -193,6 +194,8 @@ function SessionHeader({
 
 const EMPTY_PENDING: readonly PendingBubble[] = [];
 const EMPTY_RUNS: readonly LiveRun[] = [];
+// One element, so a render of the view keeps the message list's props.
+const NO_MESSAGES = <p className="session-footer-note">No messages yet.</p>;
 
 /** One session (or a new chat): its transcript and composer (spec §15.2). */
 export function SessionView({
@@ -225,10 +228,15 @@ export function SessionView({
   );
   const trimmedThrough =
     session?.contextTrimmed?.droppedThroughMessageId ?? null;
+  // History is built apart from the runs and sends, so a streamed delta
+  // rebuilds only what it changes and history items keep their identity.
+  const history = useMemo(
+    () => buildHistory({ messages, trimmedThrough, delegatedBy }),
+    [messages, trimmedThrough, delegatedBy],
+  );
   const items = useMemo(
-    () =>
-      buildTranscript({ messages, pending, runs, trimmedThrough, delegatedBy }),
-    [messages, pending, runs, trimmedThrough, delegatedBy],
+    () => placeRuns(history, { runs, pending }),
+    [history, runs, pending],
   );
   if (missing) {
     return (
@@ -281,9 +289,7 @@ export function SessionView({
         loadingOlder={loadingOlder}
         onLoadOlder={onLoadOlder}
         emptyState={
-          session && session.kind !== 'chat' ? (
-            <p className="session-footer-note">No messages yet.</p>
-          ) : undefined
+          session && session.kind !== 'chat' ? NO_MESSAGES : undefined
         }
       />
       {footer.kind === 'composer' ? (
