@@ -2305,3 +2305,31 @@ async fn anthropic_and_openai_streams_return_the_second_error_after_one_retry() 
         .unwrap_err();
     assert_eq!(error, "OpenAI API error (400): bad request");
 }
+
+// --- S1-F: Google parallel calls to one tool without ids get unique ids.
+
+#[test]
+fn google_calls_without_ids_get_unique_ids_per_response() {
+    let parsed = crate::google::parse_google_response(&json!({
+        "candidates": [{
+            "content": { "parts": [
+                {"text": "Two lookups."},
+                {"functionCall": {"name": "delegate_task", "args": {"task": "research"}}},
+                {"functionCall": {"name": "delegate_task", "args": {"task": "review"}}},
+                {"functionCall": {"id": "given-id", "name": "delegate_task", "args": {}}}
+            ]}
+        }]
+    }))
+    .unwrap();
+
+    let ids: Vec<_> = parsed
+        .tool_calls
+        .unwrap()
+        .into_iter()
+        .map(|call| call.id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["call_delegate_task_0", "call_delegate_task_1", "given-id"]
+    );
+}

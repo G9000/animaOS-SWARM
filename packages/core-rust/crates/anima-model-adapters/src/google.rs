@@ -223,12 +223,15 @@ pub(super) fn parse_google_response(payload: &Value) -> Result<ModelGenerateResp
                 let empty_obj = Value::Object(Map::new());
                 let args_value = function_call.get("args").unwrap_or(&empty_obj);
                 let args = json_value_to_data_map(args_value)?;
+                // A call without an id gets one that is unique within this
+                // response, so parallel calls to one tool stay distinct.
+                let index = tool_calls.len();
                 let id = function_call
                     .get("id")
                     .and_then(Value::as_str)
                     .filter(|id| !id.is_empty())
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| format!("call_{name}"));
+                    .unwrap_or_else(|| format!("call_{name}_{index}"));
                 tool_calls.push(ToolCall { id, name, args });
             }
         }
