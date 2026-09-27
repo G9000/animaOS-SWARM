@@ -148,6 +148,52 @@ describe('applyEvent', () => {
     ]);
   });
 
+  it('keeps a card per step when two steps reuse one tool-call id', () => {
+    // Some providers number their calls per response, so `call_0` comes
+    // back in every step of a run.
+    const state = applyAll([
+      snapshotEvent([snapshotRun(running)]),
+      toolStartedEvent(running, 'call_0', 'search', 2, '{}', 'run_1:1'),
+      toolFinishedEvent(running, 'call_0', 'search', 3, {
+        stepId: 'run_1:1',
+        resultPreview: 'first',
+      }),
+      toolStartedEvent(running, 'call_0', 'search', 4, '{}', 'run_1:2'),
+      // A late start of step 1's call changes nothing.
+      toolStartedEvent(running, 'call_0', 'search', 5, '{}', 'run_1:1'),
+    ]);
+
+    expect(
+      state.runs.run_1.tools.map((tool) => [
+        tool.stepId,
+        tool.status,
+        tool.resultPreview,
+      ]),
+    ).toEqual([
+      ['run_1:1', 'success', 'first'],
+      ['run_1:2', 'running', null],
+    ]);
+
+    const finished = applyEvent(
+      state,
+      toolFinishedEvent(running, 'call_0', 'search', 6, {
+        stepId: 'run_1:2',
+        status: 'error',
+        resultPreview: 'second',
+      }),
+    );
+    expect(
+      finished.runs.run_1.tools.map((tool) => [
+        tool.stepId,
+        tool.status,
+        tool.resultPreview,
+      ]),
+    ).toEqual([
+      ['run_1:1', 'success', 'first'],
+      ['run_1:2', 'error', 'second'],
+    ]);
+  });
+
   it('adds a finished tool whose start it never saw', () => {
     const state = applyAll([
       snapshotEvent([snapshotRun(running)]),

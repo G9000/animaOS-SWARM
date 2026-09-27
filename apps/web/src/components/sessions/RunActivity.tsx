@@ -37,6 +37,23 @@ function useElapsed(
   return Math.max(0, (finishedAtMs ?? now) - startedAtMs);
 }
 
+/**
+ * Each card's key: its step and call id, which the daemon's live registry
+ * keys cards by too, since a provider may reuse a call id in every step of
+ * a run (the adapters' synthesized ids are unique within a response). A
+ * pair seen again (a recovered result beside its call's card) takes its
+ * occurrence, so no two cards share a key.
+ */
+function stepKeys(steps: readonly ToolStep[]): string[] {
+  const seen = new Map<string, number>();
+  return steps.map((step) => {
+    const base = `${step.stepId ?? ''}\u0000${step.toolCallId}`;
+    const count = seen.get(base) ?? 0;
+    seen.set(base, count + 1);
+    return count === 0 ? base : `${base}\u0000${count}`;
+  });
+}
+
 /** Tool steps as cards (spec §15.2): open while the run works, then
  *  collapsed to "Used N tools · Ns". */
 export function ToolBlock({
@@ -60,6 +77,7 @@ export function ToolBlock({
       : `Working · ${count} ${count === 1 ? 'step' : 'steps'} · ${formatElapsed(total)}`
     : `Used ${count} ${count === 1 ? 'tool' : 'tools'} · ${formatElapsed(total)}`;
   const expanded = active || open;
+  const keys = stepKeys(steps);
   return (
     <div className="tool-block" data-active={active || undefined}>
       {active ? (
@@ -77,11 +95,7 @@ export function ToolBlock({
       {expanded && count > 0 && (
         <ul className="tool-block-steps">
           {steps.map((step, index) => (
-            // `toolCallId` is not always unique: some providers (e.g. the
-            // Google adapter's `call_{name}` fallback) reuse the same id
-            // when a run calls the same tool twice, so the index breaks
-            // the tie.
-            <li key={`${index}:${step.toolCallId}`}>
+            <li key={keys[index]}>
               {step.helper ? (
                 <HelperCard
                   step={step}

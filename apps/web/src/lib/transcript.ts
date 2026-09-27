@@ -25,6 +25,9 @@ export interface ToolHelper {
 
 /** One tool call as a card shows it (spec §15.2). */
 export interface ToolStep {
+  /** The model call that made it; with `toolCallId`, the card's identity
+   *  (a provider may reuse a call id in every step). Null when unknown. */
+  stepId: string | null;
   toolCallId: string;
   name: string;
   /** The call's arguments on one short line. */
@@ -227,6 +230,7 @@ function resultText(message: ChatMessage, status: 'success' | 'error'): string {
 /** The tool cards of a run the stream is showing. */
 export function liveToolSteps(live: LiveRun): ToolStep[] {
   return live.tools.map((card) => ({
+    stepId: card.stepId,
     toolCallId: card.toolCallId,
     name: card.name,
     argumentsPreview: previewSummary(card.argumentsPreview),
@@ -349,12 +353,20 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
     const metadata = metadataOf(message);
     if (message.role === 'Tool') {
       const callId = stringField(metadata, 'toolCallId');
+      const stepId = stringField(metadata, 'stepId');
       const status = resultStatus(message, metadata);
       const result = resultText(message, status);
       const current = openBlockFor(runId);
+      // A result answers the call of its own step: a provider may reuse a
+      // call id in every step of a run.
       const step = current
         ? current.steps.find(
-            (item) => item.toolCallId === callId && item.result === null,
+            (item) =>
+              item.toolCallId === callId &&
+              item.result === null &&
+              (stepId === null ||
+                item.stepId === null ||
+                item.stepId === stepId),
           )
         : undefined;
       if (current && step) {
@@ -371,6 +383,7 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
         // A result whose call is on an older page, or not in this block,
         // still gets its own card.
         const orphan: ToolStep = {
+          stepId,
           toolCallId: callId ?? message.id,
           name: (callId && callNames.get(callId)) ?? 'tool',
           argumentsPreview: '',
@@ -404,8 +417,10 @@ export function buildTranscript(input: TranscriptInput): TranscriptItem[] {
         items.push(messageItem(message, delegatedBy));
       }
       if (calls.length > 0) {
+        const stepId = stringField(metadata, 'stepId');
         const steps = calls.map(
           (call): ToolStep => ({
+            stepId,
             toolCallId: call.id,
             name: call.name,
             argumentsPreview: argumentsSummary(call.args),

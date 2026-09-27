@@ -149,14 +149,18 @@ function updateRun(
     : { ...state, runs: { ...state.runs, [runId]: next } };
 }
 
-/** Adds a tool card or updates the one with its id; a late start never
- *  undoes a finish. */
+/** Adds a tool card or updates the one with its step and call id (a
+ *  provider may reuse a call id in every step, as the daemon's live
+ *  registry allows); a late start never undoes a finish. */
 function upsertTool(
   tools: LiveToolCard[],
   card: LiveToolCard,
   finished: boolean,
 ): LiveToolCard[] {
-  const index = tools.findIndex((tool) => tool.toolCallId === card.toolCallId);
+  const index = tools.findIndex(
+    (tool) =>
+      tool.stepId === card.stepId && tool.toolCallId === card.toolCallId,
+  );
   if (index < 0) return [...tools, card];
   const current = tools[index];
   if (!finished && current.status !== 'running') return tools;

@@ -13,6 +13,7 @@ import {
 
 function helperStep(agentId: string | null): ToolStep {
   return {
+    stepId: 'run_7:1',
     toolCallId: 'call_h',
     name: 'spawn_helper',
     argumentsPreview: 'name: Researcher',

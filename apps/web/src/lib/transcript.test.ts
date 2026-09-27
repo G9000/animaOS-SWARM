@@ -63,6 +63,7 @@ describe('buildTranscript', () => {
     expect(block.kind === 'tools' && block.messageIds).toEqual(['a1', 't1']);
     expect(block.kind === 'tools' && block.steps).toEqual([
       {
+        stepId: 'run_1:1',
         toolCallId: 'call_1',
         name: 'calculate',
         argumentsPreview: 'expression: 2+2',
@@ -241,6 +242,38 @@ describe('buildTranscript', () => {
     expect(
       items[0].kind === 'tools' && items[0].steps.map((s) => s.toolCallId),
     ).toEqual(['call_1', 'call_2']);
+  });
+
+  it('gives a result to the call of its own step when steps reuse a call id', () => {
+    // Step 1's call never got a result; step 2 reuses its id.
+    const items = buildTranscript({
+      messages: [
+        message('a1', 'Assistant', '', {
+          runId: 'run_1',
+          stepId: 'run_1:1',
+          toolCalls: [{ id: 'call_0', name: 'search', args: {} }],
+        }),
+        message('a2', 'Assistant', '', {
+          runId: 'run_1',
+          stepId: 'run_1:2',
+          toolCalls: [{ id: 'call_0', name: 'search', args: {} }],
+        }),
+        message('t2', 'Tool', 'found', {
+          runId: 'run_1',
+          stepId: 'run_1:2',
+          toolCallId: 'call_0',
+          toolStatus: 'success',
+        }),
+      ],
+    });
+
+    expect(
+      items[0].kind === 'tools' &&
+        items[0].steps.map((step) => [step.stepId, step.status, step.result]),
+    ).toEqual([
+      ['run_1:1', 'error', null],
+      ['run_1:2', 'success', 'found'],
+    ]);
   });
 
   it('hides an old failed run this page never saw stream, because it is old — not because it failed', () => {

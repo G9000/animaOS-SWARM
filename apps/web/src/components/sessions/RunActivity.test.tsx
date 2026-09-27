@@ -14,6 +14,7 @@ function renderMessage(message: ChatMessage) {
 }
 
 const step: ToolStep = {
+  stepId: 'run_1:1',
   toolCallId: 'call_1',
   name: 'calculate',
   argumentsPreview: 'expression: 2+2',
@@ -161,14 +162,22 @@ describe('ToolBlock', () => {
     });
   });
 
-  it('renders duplicate tool-call ids without a duplicate-key warning', () => {
-    // Some providers (e.g. the Google adapter's `call_{name}` fallback)
-    // reuse the same id when a run calls the same tool twice.
+  it('renders reused tool-call ids without a duplicate-key warning', () => {
+    // Some providers number their calls per response, so two steps of a
+    // run reuse one id; a recovered result can sit beside its call's card.
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     render(
-      <ToolBlock steps={[step, { ...step, toolCallId: 'call_1' }]} active />,
+      <ToolBlock
+        steps={[
+          step,
+          { ...step, stepId: 'run_1:2', result: '5' },
+          { ...step, result: 'recovered' },
+        ]}
+        active
+      />,
     );
 
+    expect(screen.getAllByRole('listitem')).toHaveLength(3);
     expect(
       errorSpy.mock.calls.some((call) =>
         String(call[0]).toLowerCase().includes('same key'),

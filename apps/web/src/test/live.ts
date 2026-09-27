@@ -133,11 +133,12 @@ export function toolStartedEvent(
   name: string,
   seq: number,
   argumentsPreview = '{}',
+  stepId = `${run.id}:1`,
 ): AgentEvent {
   return {
     type: 'tool.started',
     ...about(run, seq),
-    stepId: `${run.id}:1`,
+    stepId,
     toolCallId,
     name,
     argumentsPreview,
@@ -155,12 +156,13 @@ export function toolFinishedEvent(
     durationMs?: number;
     resultPreview?: string;
     truncated?: boolean;
+    stepId?: string;
   } = {},
 ): AgentEvent {
   return {
     type: 'tool.finished',
     ...about(run, seq),
-    stepId: `${run.id}:1`,
+    stepId: result.stepId ?? `${run.id}:1`,
     toolCallId,
     name,
     status: result.status ?? 'success',
