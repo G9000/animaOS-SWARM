@@ -24,6 +24,7 @@ use crate::state::DaemonState;
 mod compact;
 mod conversations;
 mod queue;
+mod shutdown;
 mod stop;
 mod titles;
 
@@ -33,6 +34,7 @@ pub(crate) use self::queue::{
     ACCEPTED_AT_METADATA_KEY, CLIENT_REQUEST_ID_METADATA_KEY, IDEMPOTENCY_KEY_REUSED, QUEUE_FULL,
     RUN_NOT_QUEUED, RUN_STOPPED_BEFORE_START, SESSION_CANNOT_SEND, SESSION_CANNOT_STEER,
 };
+pub(crate) use self::shutdown::is_shutting_down;
 pub(crate) use self::stop::AGENT_BEING_DELETED;
 
 pub(crate) struct AgentRunPermit(OwnedSemaphorePermit);
@@ -341,6 +343,8 @@ pub(crate) struct AgentRunCoordinator {
     session_queues: self::queue::SessionQueueMap,
     acceptance_clock: self::queue::AcceptanceClock,
     deleting_agents: self::stop::DeletingAgents,
+    /// Whether shutdown has begun, and the accepted runs going (S2-A).
+    accepted_runs: self::shutdown::AcceptedRuns,
     max_runs_per_agent: usize,
     control_plane_transactions: Arc<Mutex<()>>,
     /// How long a compaction's store read and model call may take.
@@ -601,6 +605,7 @@ impl AgentRunCoordinator {
             session_queues: Arc::new(StdMutex::new(HashMap::new())),
             acceptance_clock: self::queue::AcceptanceClock::default(),
             deleting_agents: Arc::new(StdMutex::new(HashMap::new())),
+            accepted_runs: self::shutdown::AcceptedRuns::default(),
             max_runs_per_agent: DEFAULT_MAX_RUNS_PER_AGENT,
             control_plane_transactions: Arc::new(Mutex::new(())),
             compaction_timeout: std::time::Duration::from_millis(
@@ -955,7 +960,8 @@ impl AgentRunCoordinator {
     }
 
     /// `acquire_ticket` for an accepted run, abandoned as soon as its control
-    /// is cancelled (spec §4.6: a stopped queued run never starts). Dropping
+    /// is cancelled (spec §4.6: a stopped queued run never starts) or
+    /// shutdown begins (S2-A: it stays queued for the restart). Dropping
     /// the wait releases whatever it held (see `SessionLease::drop`). Accepted
     /// runs take no waiting-budget unit: the accepted queue has its own cap.
     async fn acquire_accepted_ticket(
@@ -975,10 +981,25 @@ impl AgentRunCoordinator {
         if control.cancel.is_cancelled() {
             return Err(ApiError::conflict(RUN_STOPPED_BEFORE_START));
         }
+        // Shutdown began (S2-A): it stays queued for the restart.
+        if self.accepted_runs.is_closing() {
+            return Err(self::shutdown::shutting_down());
+        }
         let admission = Box::pin(self.acquire_ticket(request, permit_mode, None));
-        match select(admission, control.cancel.cancelled()).await {
+        let given_up = select(
+            control.cancel.cancelled(),
+            Box::pin(self.accepted_runs.closed()),
+        );
+        match select(admission, given_up).await {
+            // Shutdown began as the wait ended: the run still has not started.
+            Either::Left((Ok(_), _)) if self.accepted_runs.is_closing() => {
+                Err(self::shutdown::shutting_down())
+            }
             Either::Left((ticket, _)) => ticket,
-            Either::Right(((), _)) => Err(ApiError::conflict(RUN_STOPPED_BEFORE_START)),
+            Either::Right((Either::Left(_), _)) => {
+                Err(ApiError::conflict(RUN_STOPPED_BEFORE_START))
+            }
+            Either::Right((Either::Right(_), _)) => Err(self::shutdown::shutting_down()),
         }
     }
 

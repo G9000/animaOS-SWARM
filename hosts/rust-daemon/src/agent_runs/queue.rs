@@ -404,6 +404,10 @@ impl AgentRunCoordinator {
             if let Some(answer) = steer_replay(&guard, &request, now_ms)? {
                 return Ok(answer);
             }
+            // Shutdown has begun (S2-A); a retried key above still got its run.
+            if self.accepted_runs.is_closing() {
+                return Err(super::shutdown::shutting_down());
+            }
             let capabilities =
                 session.capabilities(crate::sessions::views::automation_exists(&guard, session));
             let retitle = session.kind == SessionKind::Chat
@@ -744,7 +748,13 @@ impl AgentRunCoordinator {
                         .run_accepted(request, run_id)
                         .await
                         .map(|_| ())
-                        .map_err(|error| QueuedStartError::Failed(error.message().to_string()))
+                        .map_err(|error| {
+                            if super::shutdown::is_shutting_down(&error) {
+                                QueuedStartError::ShuttingDown
+                            } else {
+                                QueuedStartError::Failed(error.message().to_string())
+                            }
+                        })
                 })
             },
         )
@@ -795,7 +805,8 @@ impl AgentRunCoordinator {
             .contains_key(&(agent_id.to_string(), session_id.to_string()))
     }
 
-    /// Starts a session's accepted runs one after another, in acceptance order.
+    /// Starts a session's accepted runs one after another, in acceptance
+    /// order, until shutdown begins (S2-A).
     async fn drain_session(&self, key: (String, String)) {
         loop {
             let next = {
@@ -813,6 +824,14 @@ impl AgentRunCoordinator {
                         return;
                     }
                 }
+            };
+            // Once shutdown has begun this run and the rest of the queue stay
+            // queued, saved as nothing else, so the next start interrupts
+            // them as never started (spec §4.8). Otherwise shutdown waits for
+            // it: going from here until its start ends.
+            let Some(_going) = self.accepted_runs.begin(&next.run_id) else {
+                self.end_drain(&key);
+                return;
             };
             // Looked at under the control-plane transaction, so a stop or an
             // agent deletion whose save is still in flight is never acted on:
@@ -863,6 +882,14 @@ impl AgentRunCoordinator {
                 self.settle_unstarted(&next.run_id, status, error).await;
             }
         }
+    }
+
+    /// Ends a session's drain at shutdown, leaving the runs it held queued.
+    fn end_drain(&self, key: &(String, String)) {
+        self.session_queues
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
     }
 
     /// Finishes an accepted run that never started (stopped while it waited,

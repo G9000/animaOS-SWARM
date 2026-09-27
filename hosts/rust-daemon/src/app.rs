@@ -245,6 +245,7 @@ pub(crate) async fn serve_with_state(
     runtime.scheduler.start().await;
     let connectors = runtime.connectors.clone();
     let scheduler = runtime.scheduler.clone();
+    let agent_runs = runtime.agent_runs.clone();
     let jobs = runtime.jobs.clone();
     let history = runtime.history.clone();
     let live = state.read().await.live.clone();
@@ -252,8 +253,14 @@ pub(crate) async fn serve_with_state(
     axum::serve(listener, router)
         .with_graceful_shutdown(async move {
             shutdown.await;
-            // First: graceful shutdown waits for every response to finish,
-            // and an agent event stream never ends on its own.
+            // First, while streams still carry their events: new messages
+            // are refused, queued ones stay queued for the restart, and the
+            // accepted runs already going get up to 30 seconds to commit
+            // (final fix wave S2-A), as `jobs.shutdown` finishes its runs.
+            agent_runs.shutdown().await;
+            // Then the streams: graceful shutdown, which begins once this
+            // future ends, waits for every response to finish, and an agent
+            // event stream never ends on its own.
             live.close();
             jobs.shutdown().await;
             scheduler.shutdown().await;

@@ -1096,7 +1096,15 @@ impl ConnectorManager {
                     .await
             }
         }
-        .map_err(|_| ConnectorManagerError::Persistence)?;
+        .map_err(|error| {
+            // An accepted turn whose wait shutdown ended never started
+            // (final fix wave S2-A): its session queue leaves it queued.
+            if crate::agent_runs::is_shutting_down(&error) {
+                ConnectorManagerError::WorkerStopped
+            } else {
+                ConnectorManagerError::Persistence
+            }
+        })?;
         let delivery_queued = delivery_queued && run.result.status == "success";
         Ok((run, delivery_queued))
     }

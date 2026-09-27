@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::test_support::{
     accept, accept_web, add_chat, chat_request, coordinator_with, is_terminal, next_event,
-    quiet_for, wait_for, Gate, ScriptedModel,
+    quiet_for, wait_for, Gate, ScriptedModel, Step,
 };
 use super::{
     AcceptedRun, AdmitMode, AgentRunCoordinator, QueuedRunStart, MAX_QUEUED_RUNS_PER_AGENT,
@@ -669,4 +669,130 @@ async fn an_agent_being_deleted_refuses_new_messages() {
     drop(deleting);
     assert!(!coordinator.is_being_deleted(&agent_id));
     accept_web(&coordinator, &agent_id, "chat:d", "k2").await;
+}
+
+/// Final fix wave S2-A (review B, Important 1): shutdown lets an accepted run
+/// already going commit before it returns, as `jobs.shutdown` finishes its
+/// admitted runs.
+#[tokio::test]
+async fn an_accepted_run_going_when_shutdown_begins_commits_before_shutdown_returns() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["Committed"])], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let running = accept_web(&coordinator, &agent_id, "chat:s", "key-1").await;
+    gate.entered().await;
+
+    let shutdown = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown waits for the running run"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown returns once the run committed")
+        .unwrap();
+
+    let guard = coordinator.state.read().await;
+    assert_eq!(
+        guard.runs.get(&running).unwrap().status,
+        RunStatus::Completed,
+        "committed before shutdown returned"
+    );
+    assert!(guard.agents[&agent_id]
+        .messages()
+        .iter()
+        .any(|message| message.content.text == "Committed"));
+}
+
+/// Final fix wave S2-A: a run still going when the wait's bound expires is
+/// left to the restart path (`restart_during_run`); shutdown returns anyway.
+#[tokio::test]
+async fn shutdown_stops_waiting_at_its_bound_and_leaves_the_run_to_the_restart() {
+    assert_eq!(super::shutdown::ACCEPTED_RUN_SHUTDOWN_WAIT_MS, 30_000);
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model).await;
+    let coordinator = coordinator.with_accepted_shutdown_wait(Duration::from_millis(100));
+    add_chat(&coordinator, &agent_id, "chat:s").await;
+    let running = accept_web(&coordinator, &agent_id, "chat:s", "key-1").await;
+    gate.entered().await;
+
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), coordinator.shutdown())
+        .await
+        .expect("shutdown stops waiting at its bound");
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "shutdown waited for the run first"
+    );
+    assert_eq!(
+        coordinator
+            .state
+            .read()
+            .await
+            .runs
+            .get(&running)
+            .unwrap()
+            .status,
+        RunStatus::Running,
+        "still going: the restart interrupts it"
+    );
+    gate.release();
+    wait_for(&coordinator, &running, RunStatus::Completed).await;
+}
+
+/// Final fix wave S2-A: an accepted run still waiting for an agent slot when
+/// shutdown begins gives up the wait and stays queued; it never starts.
+#[tokio::test]
+async fn a_run_waiting_for_its_slot_when_shutdown_begins_stays_queued() {
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![], gate.clone());
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    let coordinator = coordinator.with_max_runs_per_agent(1);
+    add_chat(&coordinator, &agent_id, "chat:one").await;
+    add_chat(&coordinator, &agent_id, "chat:two").await;
+    let running = accept_web(&coordinator, &agent_id, "chat:one", "key-one").await;
+    gate.entered().await;
+    let waiting = accept_web(&coordinator, &agent_id, "chat:two", "key-two").await;
+    // Most likely waiting for the only slot by now.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let shutdown = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.shutdown().await }
+    });
+    for _ in 0..500 {
+        if !coordinator.has_session_queue(&agent_id, "chat:two") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !coordinator.has_session_queue(&agent_id, "chat:two"),
+        "the waiting run gave up its wait"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown returns once the running run committed")
+        .unwrap();
+
+    let guard = coordinator.state.read().await;
+    assert_eq!(
+        guard.runs.get(&running).unwrap().status,
+        RunStatus::Completed
+    );
+    let record = guard.runs.get(&waiting).unwrap();
+    assert_eq!(record.status, RunStatus::Queued, "left queued");
+    assert_eq!(record.started_at_ms, None);
+    assert!(guard.live.runs().control(&waiting).is_some());
+    drop(guard);
+    assert_eq!(model.requests().len(), 1, "the waiting run never started");
+    assert_eq!(coordinator.lock_counts(), (0, 0));
 }

@@ -893,6 +893,151 @@ async fn a_telegram_message_whose_turn_comes_after_shutdown_stays_queued() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `app_with_chat`, also returning the router's run coordinator.
+async fn app_with_chat_and_runs(
+    model: Arc<dyn ModelAdapter>,
+) -> (
+    axum::Router,
+    Arc<RwLock<DaemonState>>,
+    String,
+    AgentRunCoordinator,
+) {
+    let mut coordinator = None;
+    let (app, state, agent) = app_with_runs(model, |runs| {
+        coordinator = Some(runs.clone());
+        runs
+    })
+    .await;
+    (
+        app,
+        state,
+        agent,
+        coordinator.expect("the router built one"),
+    )
+}
+
+/// Final fix wave S2-A (review B, Important 1): a web message whose turn
+/// comes after shutdown began stays queued, in memory and on disk, so the
+/// next start interrupts it as never started; the run already going commits
+/// before shutdown returns.
+#[tokio::test]
+async fn a_web_message_whose_turn_comes_after_shutdown_began_stays_queued() {
+    use crate::control_plane_store::{load_control_plane_snapshot, ControlPlaneStoreConfig};
+
+    let gate = Gate::new();
+    let model = ScriptedModel::gated(vec![Step::Text(vec!["First answer"])], gate.clone());
+    let (app, state, agent, runs) = app_with_chat_and_runs(model.clone()).await;
+    let path = std::env::temp_dir().join(format!(
+        "anima-session-runs-web-shutdown-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let store = ControlPlaneStoreConfig::Json(path.clone());
+    state
+        .write()
+        .await
+        .set_control_plane_store(Some(store.clone()));
+    let first = accept_message(&app, &agent, "key-1").await;
+    gate.entered().await;
+    let second = accept_message(&app, &agent, "key-2").await;
+    let hub = state.read().await.live.clone();
+    let mut subscription = hub.subscribe(&agent).unwrap();
+
+    let shutdown = tokio::spawn({
+        let runs = runs.clone();
+        async move { runs.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown waits for the running run"
+    );
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown returns once the running run committed")
+        .unwrap();
+    for _ in 0..500 {
+        if !runs.has_session_queue(&agent, "chat:plans") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!runs.has_session_queue(&agent, "chat:plans"));
+
+    {
+        let guard = state.read().await;
+        assert_eq!(guard.runs.get(&first).unwrap().status, RunStatus::Completed);
+        assert!(guard.agents[&agent]
+            .messages()
+            .iter()
+            .any(|message| message.content.text == "First answer"));
+        assert_eq!(
+            guard.runs.get(&second).unwrap().status,
+            RunStatus::Queued,
+            "left queued"
+        );
+        assert!(
+            guard.live.runs().control(&second).is_some(),
+            "still stoppable"
+        );
+    }
+    assert_eq!(model.requests().len(), 1, "the queued message never ran");
+    let events = events_until(&mut subscription, "run.completed").await;
+    assert_eq!(events.last().unwrap()["runId"], first.as_str());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), subscription.next())
+            .await
+            .is_err(),
+        "nothing started or ended the queued message"
+    );
+    let saved = load_control_plane_snapshot(&store).await.unwrap().unwrap();
+    let restored = crate::runs::RunLedger::restored(
+        saved.runs,
+        &std::collections::HashSet::from([agent.clone()]),
+        anima_core::primitives::now_millis(),
+    );
+    assert_eq!(
+        restored.get(&second).unwrap().error.as_ref().unwrap().code,
+        "restart_before_start"
+    );
+    assert_eq!(restored.get(&first).unwrap().status, RunStatus::Completed);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Final fix wave S2-A: once shutdown has begun a new message is refused
+/// with 503, and nothing is accepted.
+#[tokio::test]
+async fn a_message_sent_during_shutdown_is_refused_with_503() {
+    let model = ScriptedModel::new(vec![]);
+    let (app, state, agent, runs) = app_with_chat_and_runs(model.clone()).await;
+    runs.shutdown().await;
+
+    let response = app
+        .oneshot(start_request(
+            &agent,
+            "chat:plans",
+            Some("late-key"),
+            json!({"text": "Are you there?"}),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        json_body(response).await["error"],
+        "The daemon is shutting down; send the message again once it restarts"
+    );
+    let guard = state.read().await;
+    assert!(guard.runs.for_session(&agent, "chat:plans").is_empty());
+    assert_eq!(
+        guard.sessions.get(&agent, "chat:plans").unwrap().title,
+        DEFAULT_CHAT_TITLE,
+        "a refused message does not retitle the chat"
+    );
+    assert!(model.requests().is_empty());
+}
+
 /// Fix round 1 (review Minor 6): a retried key answers with its run even
 /// after the session stopped accepting messages or cannot take the mode.
 #[tokio::test]

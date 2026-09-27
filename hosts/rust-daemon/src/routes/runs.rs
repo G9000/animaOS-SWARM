@@ -135,7 +135,7 @@ fn run_limit(uri: &Uri) -> Result<usize, ApiError> {
         (status = 404, description = "Agent or session not found", body = ErrorBody),
         (status = 409, description = "The kind cannot receive messages (a job or helper session, or a Telegram session without its connector), the agent is a helper or is being deleted, or the key was used for a different message", body = ErrorBody),
         (status = 429, description = "Eight messages are already waiting for this companion", body = ErrorBody),
-        (status = 503, description = "The control plane could not be saved", body = ErrorBody)
+        (status = 503, description = "The control plane could not be saved, or the daemon is shutting down", body = ErrorBody)
     ))]
 pub(super) async fn start_session_run(
     State(state): State<AppState>,
@@ -185,6 +185,7 @@ pub(super) async fn start_session_run(
         // A Telegram session's message is the connector's owner turn (spec §4.2).
         Some(Some(connector_id)) => {
             let manager = state.connector_manager.clone();
+            let runs = state.agent_runs.clone();
             let (agent, text, key, connector) = (
                 agent_id.clone(),
                 input.text.clone(),
@@ -200,8 +201,11 @@ pub(super) async fn start_session_run(
                         {
                             Ok(()) => Ok(()),
                             // The connectors closed for shutdown before its
-                            // turn: it stays queued for the restart.
-                            Err(ConnectorManagerError::WorkerStopped) if manager.is_closing() => {
+                            // turn, or shutdown ended its wait for a slot or
+                            // permit: it stays queued for the restart.
+                            Err(ConnectorManagerError::WorkerStopped)
+                                if manager.is_closing() || runs.is_shutting_down() =>
+                            {
                                 Err(QueuedStartError::ShuttingDown)
                             }
                             Err(error) => Err(QueuedStartError::Failed(error.to_string())),
