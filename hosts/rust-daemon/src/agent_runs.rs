@@ -1570,9 +1570,12 @@ impl AgentRunCoordinator {
             // The next run's estimates follow this provider's count (spec
             // §5.2): the first model call's reported prompt tokens over this
             // run's uncalibrated estimate, which leaves out the system prompt
-            // and the tool schemas (the factor absorbs them, audit M10).
-            // Clamped to 0.5–2.0 and saved with this commit; a provider that
-            // reports no prompt tokens leaves the previous factor.
+            // and the tool schemas (the factor absorbs them, audit M10),
+            // clamped to 0.5–2.0. A provider that reports no prompt tokens
+            // leaves the previous factor. A rejected or unsaved commit keeps
+            // the new factor on purpose (the rollback does not undo it): it
+            // measures a model call that really happened, and the next save
+            // persists it.
             let reported_prompt_tokens = guard
                 .live
                 .runs()

@@ -10,10 +10,10 @@ use anima_core::{
 };
 
 use super::DaemonState;
-use crate::history::MessageOrder;
 use crate::runs::{RunChangeSet, RunError, RunOutcome, RunSource, RunStatus, AGENT_DELETED};
-use crate::sessions::context::{uncovered_pruned_through, ContextBudget, SessionSummaryProvider};
-use crate::sessions::SessionPrunedThrough;
+use crate::sessions::context::{
+    newest_left_out, uncovered_pruned_through, ContextBudget, SessionSummaryProvider,
+};
 use crate::tools::ToolExecutionContext;
 
 /// What a run starts from (spec §4.4 item 1, §5).
@@ -63,7 +63,9 @@ impl DaemonState {
     /// The room's messages the model may see, oldest first: everything but
     /// silent check-in pairs (spec §5.2) and drafts an evaluator sent back
     /// (`revised`; controller ruling, M3 pre-flight audit M17), which stay in
-    /// the transcript because nothing streamed is retracted.
+    /// the transcript because nothing streamed is retracted. The system
+    /// message right after such a draft goes too (fix round 1): it is the
+    /// evaluator's request to revise an answer the model no longer sees.
     pub(crate) fn model_visible_history(&self, agent_id: &str, room_id: &str) -> Vec<Message> {
         let Some(canonical) = self.agents.get(agent_id) else {
             return Vec::new();
@@ -74,9 +76,16 @@ impl DaemonState {
             .filter(|message| message.room_id == room_id)
             .collect();
         let hidden = crate::sessions::hidden_message_ids(room.iter().copied());
-        room.into_iter()
-            .filter(|message| !hidden.contains(&message.id) && !is_revised_draft(message))
-            .cloned()
+        room.iter()
+            .enumerate()
+            .filter(|&(index, message)| {
+                let revision_request = message.role == MessageRole::System
+                    && index
+                        .checked_sub(1)
+                        .is_some_and(|previous| is_revised_draft(room[previous]));
+                !hidden.contains(&message.id) && !is_revised_draft(message) && !revision_request
+            })
+            .map(|(_, message)| (*message).clone())
             .collect()
     }
 
@@ -286,22 +295,6 @@ fn is_revised_draft(message: &Message) -> bool {
         .as_ref()
         .and_then(|metadata| metadata.get(REVISED_METADATA_KEY))
         == Some(&DataValue::Bool(true))
-}
-
-/// The newer of the newest dropped message and the newest pruned message
-/// no summary covers (spec §5.3; audit I5). Pruned turns are older than the
-/// hot tail's turns except around a message pinned by an undelivered reply.
-fn newest_left_out(
-    dropped: Option<&Message>,
-    pruned: Option<&SessionPrunedThrough>,
-) -> Option<String> {
-    match (dropped, pruned) {
-        (Some(dropped), Some(pruned)) if pruned.order() > MessageOrder::of(dropped) => {
-            Some(pruned.message_id.clone())
-        }
-        (Some(dropped), _) => Some(dropped.id.clone()),
-        (None, pruned) => pruned.map(|pruned| pruned.message_id.clone()),
-    }
 }
 
 #[cfg(test)]
@@ -862,44 +855,58 @@ mod tests {
         );
     }
 
-    /// Audit I5: the trimmed indicator names the newest message left out,
-    /// whether the budget dropped it or pruning removed it.
+    /// Task 11 fix round 1: a `maxTokens` at or above the budget no longer
+    /// leaves the run without history. Without a provider the budget is the
+    /// 32,000-token fallback, so the reserve is half of it and the history
+    /// keeps the other 16,000 tokens.
     #[test]
-    fn the_trimmed_indicator_names_the_newer_of_the_dropped_and_pruned_messages() {
-        let dropped = history_message(
-            "agent-1",
-            "chat:a",
-            "dropped",
-            MessageRole::Assistant,
-            "old",
-            false,
+    fn a_max_tokens_above_the_budget_still_leaves_room_for_history() {
+        let (mut state, agent_id) = state_with_agent();
+        let mut config = state.agents[&agent_id].config().clone();
+        config
+            .settings
+            .get_or_insert_with(AgentSettings::default)
+            .max_tokens = Some(64_000);
+        state.restore_agent_config(&agent_id, config);
+        seed_history(
+            &mut state,
+            &agent_id,
+            vec![
+                history_message(
+                    &agent_id,
+                    "chat:a",
+                    "user-1",
+                    MessageRole::User,
+                    "hi",
+                    false,
+                ),
+                history_message(
+                    &agent_id,
+                    "chat:a",
+                    "assistant-1",
+                    MessageRole::Assistant,
+                    "hello",
+                    false,
+                ),
+            ],
         );
-        let pruned = |created_at_ms| crate::sessions::SessionPrunedThrough {
-            message_id: "pruned".into(),
-            created_at_ms,
-        };
-        let (older, newer) = (pruned(0), pruned(5));
-        let newest = super::newest_left_out;
-        assert_eq!(newest(None, None), None);
-        assert_eq!(newest(Some(&dropped), None).as_deref(), Some("dropped"));
-        assert_eq!(newest(None, Some(&older)).as_deref(), Some("pruned"));
-        assert_eq!(
-            newest(Some(&dropped), Some(&older)).as_deref(),
-            Some("dropped"),
-            "pruned turns are older than the hot tail's"
-        );
-        assert_eq!(
-            newest(Some(&dropped), Some(&newer)).as_deref(),
-            Some("pruned"),
-            "an old message a pending reply kept hot is dropped behind newer pruned ones"
-        );
+
+        let build = state
+            .build_run_runtime(&agent_id, "chat:a", &Content::default())
+            .unwrap();
+
+        assert_eq!(build.context.budget_tokens, 32_000);
+        assert_eq!(build.runtime.messages().len(), 2, "the history is sent");
+        assert_eq!(build.context.trimmed_through, None);
     }
 
     /// Controller ruling (M3 pre-flight audit M17): a draft an evaluator
     /// sent back (`revised: true`) stays in the transcript, since nothing
-    /// streamed is retracted, but never reaches a later run's model.
+    /// streamed is retracted, but never reaches a later run's model; nor
+    /// does the evaluator's request right after it (fix round 1), which
+    /// points at an answer the model can no longer see.
     #[test]
-    fn a_run_context_leaves_out_revised_drafts() {
+    fn a_run_context_leaves_out_revised_drafts_and_their_revision_requests() {
         let (mut state, agent_id) = state_with_agent();
         let mut draft = history_message(
             &agent_id,
@@ -917,21 +924,14 @@ mod tests {
             &mut state,
             &agent_id,
             vec![
-                history_message(
-                    &agent_id,
-                    "chat:a",
-                    "user-1",
-                    MessageRole::User,
-                    "hi",
-                    false,
-                ),
+                history_message(&agent_id, "chat:a", "user-1", MessageRole::User, "hi", false),
                 draft,
                 history_message(
                     &agent_id,
                     "chat:a",
                     "feedback",
                     MessageRole::System,
-                    "Evaluator requested a revision: be brief",
+                    "Evaluator requested a revision: be brief\nRevise your previous answer and try again.",
                     false,
                 ),
                 history_message(
@@ -942,6 +942,14 @@ mod tests {
                     "hello",
                     false,
                 ),
+                history_message(
+                    &agent_id,
+                    "chat:a",
+                    "note",
+                    MessageRole::System,
+                    "an ordinary system note",
+                    false,
+                ),
             ],
         );
         let ids = |messages: &[Message]| -> Vec<String> {
@@ -950,19 +958,17 @@ mod tests {
 
         assert_eq!(
             ids(&state.model_visible_history(&agent_id, "chat:a")),
-            ["user-1", "feedback", "final"]
+            ["user-1", "final", "note"],
+            "a system message after a kept answer stays"
         );
         let build = state
             .build_run_runtime(&agent_id, "chat:a", &Content::default())
             .unwrap();
-        assert_eq!(
-            ids(build.runtime.messages()),
-            ["user-1", "feedback", "final"]
-        );
+        assert_eq!(ids(build.runtime.messages()), ["user-1", "final", "note"]);
         assert_eq!(
             state.get_agent(&agent_id).unwrap().messages.len(),
-            4,
-            "the canonical transcript keeps the draft"
+            5,
+            "the canonical transcript keeps the draft and the request"
         );
     }
 

@@ -170,9 +170,9 @@ pub(crate) struct SessionContextTrimmed {
     pub(crate) at_ms: u64,
 }
 
-/// The newest message hot-tail pruning removed from a session (controller
-/// ruling, M3 pre-flight audit I5), with its transcript position: the turns
-/// through it are no longer in the control plane.
+/// The newest model-visible message hot-tail pruning removed from a session
+/// (controller ruling, M3 pre-flight audit I5), with its transcript
+/// position: the turns through it are no longer in the control plane.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SessionPrunedThrough {
@@ -229,9 +229,10 @@ pub(crate) struct SessionRecord {
     /// (spec §5.2 calibration; clamped 500–2000 when written).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) context_calibration_permille: Option<u32>,
-    /// The newest message hot-tail pruning removed from this session, set in
-    /// the prune's own save (audit I5): a run's context counts the pruned
-    /// turns as dropped unless the summary covers them
+    /// The newest visible message hot-tail pruning removed from this
+    /// session, set in the prune's own save (audit I5); silent check-in
+    /// pairs never move it. A run's context counts the pruned turns as
+    /// dropped unless the summary covers them
     /// (`context::uncovered_pruned_through`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pruned_through: Option<SessionPrunedThrough>,

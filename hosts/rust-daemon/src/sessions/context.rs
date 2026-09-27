@@ -26,6 +26,8 @@ pub(crate) const SESSION_SUMMARY_PROVIDER: &str = "session_summary";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextBudget {
     pub(crate) budget_tokens: u64,
+    /// `maxTokens` (or 4,096), but never more than half the budget: the
+    /// history and the current message always get the other half.
     pub(crate) reply_reserve_tokens: u64,
 }
 
@@ -52,10 +54,12 @@ impl ContextBudget {
                 })
                 .unwrap_or(FALLBACK_CONTEXT_BUDGET_TOKENS)
         });
+        // At most half the budget (Task 11 fix round 1; see `history_tokens`).
         let reply_reserve_tokens = settings
             .and_then(|settings| settings.max_tokens)
             .map(u64::from)
-            .unwrap_or(DEFAULT_REPLY_RESERVE_TOKENS);
+            .unwrap_or(DEFAULT_REPLY_RESERVE_TOKENS)
+            .min(budget_tokens / 2);
         Self {
             budget_tokens,
             reply_reserve_tokens,
@@ -63,7 +67,11 @@ impl ContextBudget {
     }
 
     /// Tokens left for history once the reply and the current message are
-    /// reserved; the current message is always sent.
+    /// reserved; the current message is always sent. The reserve is at most
+    /// half the budget, so a `maxTokens` at or above the budget still leaves
+    /// the history and the current message half of it: a window-derived
+    /// budget is only 60% of the window, which already leaves the reply its
+    /// headroom beyond the reserve.
     pub(crate) fn history_tokens(&self, current_message_tokens: u64) -> u64 {
         self.budget_tokens
             .saturating_sub(self.reply_reserve_tokens)
@@ -127,6 +135,22 @@ pub(crate) fn uncovered_pruned_through<'r>(
         .find(|message| message.id == summary.through_message_id)
         .is_some_and(|through| MessageOrder::of(through) > pruned.order());
     (!covered).then_some(pruned)
+}
+
+/// The newer of the newest dropped message and the newest pruned message
+/// no summary covers (spec §5.3; audit I5). Pruned turns are older than the
+/// hot tail's turns except around a message pinned by an undelivered reply.
+pub(crate) fn newest_left_out(
+    dropped: Option<&Message>,
+    pruned: Option<&SessionPrunedThrough>,
+) -> Option<String> {
+    match (dropped, pruned) {
+        (Some(dropped), Some(pruned)) if pruned.order() > MessageOrder::of(dropped) => {
+            Some(pruned.message_id.clone())
+        }
+        (Some(dropped), _) => Some(dropped.id.clone()),
+        (None, pruned) => pruned.map(|pruned| pruned.message_id.clone()),
+    }
 }
 
 /// Records the newest message this run's selection left out and no summary
@@ -247,6 +271,50 @@ mod tests {
         );
     }
 
+    /// Task 11 fix round 1: the reply reserve takes at most half the budget,
+    /// so a `maxTokens` at or above the budget still leaves history room.
+    #[test]
+    fn the_reply_reserve_never_takes_more_than_half_the_budget() {
+        let with_max_tokens = |provider: Option<&str>, max_tokens| {
+            let settings = AgentSettings {
+                max_tokens: Some(max_tokens),
+                ..AgentSettings::default()
+            };
+            ContextBudget::for_config(&config(provider, "gpt-4o", settings))
+        };
+        // No provider: the 32,000-token fallback.
+        let huge = with_max_tokens(None, 64_000);
+        assert_eq!(huge.budget_tokens, FALLBACK_CONTEXT_BUDGET_TOKENS);
+        assert_eq!(huge.reply_reserve_tokens, 16_000);
+        assert_eq!(huge.history_tokens(9), 16_000 - 9);
+        let odd = {
+            let mut settings = AgentSettings {
+                max_tokens: Some(10_000),
+                ..AgentSettings::default()
+            };
+            settings
+                .additional
+                .insert(CONTEXT_BUDGET_SETTING.into(), DataValue::Number(101.0));
+            ContextBudget::for_config(&config(None, "gpt-4o", settings))
+        };
+        assert_eq!(
+            odd.reply_reserve_tokens, 50,
+            "half the budget, rounded down"
+        );
+
+        let normal = with_max_tokens(Some("openai"), 16_384);
+        assert_eq!(normal.budget_tokens, 76_800);
+        assert_eq!(
+            normal.reply_reserve_tokens, 16_384,
+            "below half the budget, maxTokens is the reserve"
+        );
+        assert_eq!(
+            ContextBudget::for_config(&config(None, "gpt-4o", AgentSettings::default()))
+                .reply_reserve_tokens,
+            DEFAULT_REPLY_RESERVE_TOKENS
+        );
+    }
+
     #[test]
     fn an_invalid_budget_setting_is_ignored() {
         for value in [
@@ -309,6 +377,37 @@ mod tests {
             created_at_ms: 1,
             source_message_count: 1,
         });
+    }
+
+    /// Audit I5: the trimmed indicator names the newest message left out,
+    /// whether the budget dropped it or pruning removed it.
+    #[test]
+    fn the_trimmed_indicator_names_the_newer_of_the_dropped_and_pruned_messages() {
+        let dropped = hot("dropped", 1);
+        let pruned = |created_at_ms| SessionPrunedThrough {
+            message_id: "pruned".into(),
+            created_at_ms,
+        };
+        let (older, newer) = (pruned(0), pruned(5));
+        assert_eq!(newest_left_out(None, None), None);
+        assert_eq!(
+            newest_left_out(Some(&dropped), None).as_deref(),
+            Some("dropped")
+        );
+        assert_eq!(
+            newest_left_out(None, Some(&older)).as_deref(),
+            Some("pruned")
+        );
+        assert_eq!(
+            newest_left_out(Some(&dropped), Some(&older)).as_deref(),
+            Some("dropped"),
+            "pruned turns are older than the hot tail's"
+        );
+        assert_eq!(
+            newest_left_out(Some(&dropped), Some(&newer)).as_deref(),
+            Some("pruned"),
+            "an old message a pending reply kept hot is dropped behind newer pruned ones"
+        );
     }
 
     /// Audit I5: pruned turns are dropped context unless the summary reaches

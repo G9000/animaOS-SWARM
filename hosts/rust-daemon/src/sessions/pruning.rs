@@ -41,8 +41,8 @@ impl DaemonState {
     /// hours, not referenced by an undelivered Telegram record, and not in a
     /// session with an active run. Delivered records of pruned messages are
     /// marked `messagePruned`, and each session record keeps its newest
-    /// pruned message (`prunedThrough`, audit I5) so context selection counts
-    /// those turns as dropped. `None` when nothing may be pruned (an
+    /// pruned visible message (`prunedThrough`, audit I5) so context
+    /// selection counts those turns as dropped. `None` when nothing may be pruned (an
     /// ephemeral store, a store not yet reconciled since startup, or no
     /// candidates).
     pub(crate) fn prune_hot_tail(&mut self, now_ms: u64) -> Option<PruneUndo> {
@@ -75,7 +75,8 @@ impl DaemonState {
                 {
                     continue;
                 }
-                let room_prunable: Vec<&Message> = outside_newest_visible(&messages)
+                let hidden = hidden_message_ids(messages.iter().copied());
+                let room_prunable: Vec<&Message> = outside_newest_visible(&messages, &hidden)
                     .iter()
                     .copied()
                     .filter(|message| {
@@ -84,7 +85,14 @@ impl DaemonState {
                             && self.history.is_mirrored(&message.id)
                     })
                     .collect();
-                if let Some(newest) = room_prunable.last() {
+                // The mark names the newest pruned message the model could
+                // see: silent check-in pairs leaving take nothing out of its
+                // view, so a pass pruning only those leaves the mark alone.
+                if let Some(newest) = room_prunable
+                    .iter()
+                    .rev()
+                    .find(|message| !hidden.contains(&message.id))
+                {
                     newest_pruned.push((
                         agent_id.clone(),
                         session_id_for_room(room_id),
@@ -181,15 +189,18 @@ impl DaemonState {
 
 /// One room's messages before the turn that holds the oldest of its newest
 /// `HOT_TAIL_MESSAGES` visible messages, oldest first; `messages` are the
-/// room's messages in transcript order. Only visible messages take a place
+/// room's messages in transcript order and `hidden` their
+/// [`hidden_message_ids`]. Only visible messages take a place
 /// (Controller ruling 1, M2 pre-flight audit), so a hidden message stays
 /// while fewer than `HOT_TAIL_MESSAGES` visible messages are newer than it.
 /// The cut then moves back to the user message that starts that turn (final
 /// fix wave A1), so the window never holds a tool result without its call;
 /// while the window edge is still before a room's first user message,
 /// nothing is outside.
-fn outside_newest_visible<'m, 'a>(messages: &'m [&'a Message]) -> &'m [&'a Message] {
-    let hidden = hidden_message_ids(messages.iter().copied());
+fn outside_newest_visible<'m, 'a>(
+    messages: &'m [&'a Message],
+    hidden: &HashSet<String>,
+) -> &'m [&'a Message] {
     let mut edge = messages.len();
     let mut newer_visible = 0;
     while edge > 0 && newer_visible < HOT_TAIL_MESSAGES {
@@ -776,6 +787,92 @@ mod tests {
             Some(newer),
             "a prune of older messages keeps the newest pruned message"
         );
+    }
+
+    /// Task 11 fix round 1: the mark names the newest pruned message the
+    /// model could see. Hidden silent check-in pairs leaving the hot tail
+    /// take nothing out of the model's view, so they never move it.
+    #[tokio::test]
+    async fn the_pruned_through_mark_skips_hidden_checkin_pairs() {
+        let checkin_session = |agent: &str| {
+            crate::sessions::SessionRecord::new(
+                agent,
+                "schedule:s1",
+                crate::sessions::SessionKind::Checkin,
+                crate::sessions::SessionOrigin::Schedule,
+                "Check-in".into(),
+                crate::sessions::TitleSource::System,
+                1,
+            )
+        };
+        let visible_turns = |agent: &str, messages: &mut Vec<Message>| {
+            for index in 0..100 {
+                messages.extend(checkin_turn(
+                    agent,
+                    &format!("visible-{index:03}"),
+                    "Here is an update.",
+                    2_000 + 2 * index,
+                ));
+            }
+        };
+        let mark = |state: &DaemonState, agent: &str| {
+            state
+                .sessions
+                .get(agent, "schedule:s1")
+                .unwrap()
+                .pruned_through
+                .as_ref()
+                .map(|pruned| pruned.message_id.clone())
+        };
+
+        // The prunable prefix ends in a silent pair behind a spoken turn.
+        let (state, agent) = mirrored_state(|agent| {
+            let mut messages = Vec::new();
+            messages.extend(checkin_turn(agent, "spoken", "Nothing new.", 1_000));
+            messages.extend(checkin_turn(agent, "silent", "CHECKIN_OK", 1_002));
+            visible_turns(agent, &mut messages);
+            messages
+        })
+        .await;
+        let mut guard = state.write().await;
+        guard.sessions.insert(checkin_session(&agent));
+        let undo = guard.prune_hot_tail(NOW_MS).expect("the old turns leave");
+        assert_eq!(undo.message_ids.len(), 4);
+        assert_eq!(
+            mark(&guard, &agent).as_deref(),
+            Some("spoken-reply"),
+            "the newest visible pruned message, not the silent pair after it"
+        );
+        drop(guard);
+
+        // A pass that prunes only silent pairs leaves the mark as it was,
+        // even one older than those pairs.
+        let (state, agent) = mirrored_state(|agent| {
+            let mut messages = Vec::new();
+            for index in 0..3 {
+                messages.extend(checkin_turn(
+                    agent,
+                    &format!("silent-{index}"),
+                    "CHECKIN_OK",
+                    1_000 + 2 * index,
+                ));
+            }
+            visible_turns(agent, &mut messages);
+            messages
+        })
+        .await;
+        let mut guard = state.write().await;
+        let mut session = checkin_session(&agent);
+        session.pruned_through = Some(crate::sessions::SessionPrunedThrough {
+            message_id: "earlier".into(),
+            created_at_ms: 10,
+        });
+        guard.sessions.insert(session);
+        let undo = guard
+            .prune_hot_tail(NOW_MS)
+            .expect("the silent pairs leave");
+        assert_eq!(undo.message_ids.len(), 6, "only the three silent pairs");
+        assert_eq!(mark(&guard, &agent).as_deref(), Some("earlier"));
     }
 
     #[tokio::test]
