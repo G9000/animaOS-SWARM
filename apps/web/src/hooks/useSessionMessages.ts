@@ -83,6 +83,9 @@ export function useSessionMessages(
   // Load older is not hidden by the poll that follows it.
   const [newestError, setNewestError] = useState<string | null>(null);
   const [olderError, setOlderError] = useState<string | null>(null);
+  /** The number (in `readsStarted` order) of the newest-page read on
+   *  screen for this session; 0 before its first. */
+  const [appliedRead, setAppliedRead] = useState(0);
   // Invalidates every in-flight request (both `refresh` and `loadOlder`)
   // when the hook resets for a different agent/session.
   const generation = useRef(0);
@@ -112,7 +115,12 @@ export function useSessionMessages(
     setMissing(false);
     setNewestError(null);
     setOlderError(null);
+    setAppliedRead(0);
   }, [agentId, sessionId]);
+
+  /** Newest-page reads begun so far, by any caller (a poll, a refresh key,
+   *  an event): a read numbered above this began after now. */
+  const readsStarted = useCallback(() => refreshGeneration.current, []);
 
   /** Reads the newest page; true once that page is what the view shows,
    *  false when the read failed or a newer read or another session
@@ -143,6 +151,7 @@ export function useSessionMessages(
       missingRef.current = false;
       setMissing(false);
       setNewestError(null);
+      setAppliedRead(request);
       return true;
     } catch (caught) {
       if (
@@ -227,5 +236,7 @@ export function useSessionMessages(
     missing,
     error: newestError ?? olderError,
     refresh,
+    appliedRead,
+    readsStarted,
   };
 }

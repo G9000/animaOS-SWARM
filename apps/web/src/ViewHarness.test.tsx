@@ -3012,8 +3012,7 @@ it('says it is reconnecting when the stream drops', async () => {
 });
 
 /** A steer the harness accepted into `run_7`, the reply in progress. */
-async function steerIntoRunningReply() {
-  const user = userEvent.setup();
+async function steerIntoRunningReply(user = userEvent.setup()) {
   const live = await openLiveSession();
   const run = runningRun();
   act(() => live.stream.push(snapshotEvent([snapshotRun(run)])));
@@ -3731,6 +3730,22 @@ it('does not announce a session’s last reply again when it is reopened', async
   await user.click(screen.getByRole('button', { name: 'Weekend plans' }));
   await screen.findByRole('heading', { name: 'Weekend plans' });
   expect(region()?.textContent).toBe('');
+
+  // A new reply there is announced.
+  act(() =>
+    stream.push(
+      runEvent(
+        'run.completed',
+        runFixture('run_9', {
+          sessionId: 'room-7',
+          status: 'completed',
+          finishedAtMs: Date.now(),
+        }),
+        3,
+      ),
+    ),
+  );
+  await waitFor(() => expect(region()?.textContent).toBe('Nova replied.'));
 });
 
 it('shows an accepted message as its queued run right after the daemon accepts it', async () => {
@@ -3745,4 +3760,66 @@ it('shows an accepted message as its queued run right after the daemon accepts i
   expect(await screen.findByText('Queued')).toBeVisible();
   expect(screen.getByText('Book the train')).toBeVisible();
   expect(screen.queryByText('Sending…')).not.toBeInTheDocument();
+});
+
+it('keeps a failed reply’s steer recovery to the poll’s pace while history cannot be read', async () => {
+  const user = fakeClock();
+  vi.spyOn(daemon, 'listAgentSummaries').mockResolvedValue([
+    {
+      state: snapshot('agent-main', 'Nova', 1).state,
+      messageCount: 0,
+      eventCount: 0,
+      lastTask: null,
+    },
+  ]);
+  const { stream, run } = await steerIntoRunningReply(user);
+  await elapse(LIVE_SETTLE_MS);
+  // The daemon stops answering history right after the reply fails.
+  vi.mocked(daemon.sessionMessages).mockRejectedValue(
+    new DaemonHttpError(503, { error: 'History is unavailable' }),
+  );
+  const reads = () => ({
+    history: vi.mocked(daemon.sessionMessages).mock.calls.length,
+    ledger: vi.mocked(daemon.sessionRuns).mock.calls.length,
+  });
+  const before = reads();
+  act(() =>
+    stream.push(
+      runEvent(
+        'run.failed',
+        {
+          ...run,
+          status: 'failed',
+          finishedAtMs: Date.now(),
+          error: { code: 'model_error', message: 'provider unavailable' },
+        },
+        2,
+      ),
+    ),
+  );
+
+  const polls = 10;
+  for (let poll = 0; poll < polls; poll += 1)
+    await elapse(SESSION_MESSAGES_LIVE_POLL_MS);
+  const during = reads();
+  expect(during.history - before.history).toBeLessThanOrEqual(2 * polls);
+  expect(during.ledger - before.ledger).toBeLessThanOrEqual(2 * polls);
+  expect(
+    screen.queryByRole('button', { name: 'Restore message' }),
+  ).not.toBeInTheDocument();
+  expect(screen.getByText('Joining the reply in progress…')).toBeVisible();
+
+  // History answers again: the next poll's read, with the ledger's, moves
+  // the steer to the recovery panel.
+  vi.mocked(daemon.sessionMessages).mockResolvedValue({
+    messages: [],
+    nextBefore: null,
+  });
+  await elapse(SESSION_MESSAGES_LIVE_POLL_MS);
+  expect(
+    await screen.findByRole('button', { name: 'Restore message' }),
+  ).toBeVisible();
+  expect(
+    screen.queryByText('Joining the reply in progress…'),
+  ).not.toBeInTheDocument();
 });

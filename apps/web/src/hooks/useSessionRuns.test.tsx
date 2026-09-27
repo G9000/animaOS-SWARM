@@ -53,28 +53,36 @@ describe('useSessionRuns', () => {
     expect(result.current).toEqual([]);
   });
 
-  it('says which refresh the runs on screen were read for', async () => {
+  it('numbers each read by when it began, whichever session it is for', async () => {
     const list = vi
       .spyOn(daemon, 'sessionRuns')
       .mockResolvedValueOnce([runFixture('run_1')])
       .mockRejectedValueOnce(new Error('offline'))
-      .mockResolvedValueOnce([runFixture('run_2')]);
+      .mockResolvedValueOnce([runFixture('run_2')])
+      .mockResolvedValueOnce([runFixture('run_3')]);
     const { result, rerender } = renderHook(
       ({ sessionId, refresh }) =>
         useSessionLedger('agent-main', sessionId, refresh),
       { initialProps: { sessionId: 'chat:1', refresh: 4 } },
     );
     expect(result.current.landed).toBe(null);
-    await waitFor(() => expect(result.current.landed).toBe(4));
+    expect(result.current.started()).toBe(1);
+    await waitFor(() => expect(result.current.landed).toBe(1));
 
     // A failed read keeps what landed before.
     rerender({ sessionId: 'chat:1', refresh: 5 });
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
-    expect(result.current).toEqual({ runs: [runFixture('run_1')], landed: 4 });
+    expect(result.current.runs).toEqual([runFixture('run_1')]);
+    expect(result.current.landed).toBe(1);
 
-    // Another session has landed nothing until its own read does.
+    // Away and back with no refresh in between: the read begun on return
+    // has a number of its own, above every earlier one.
     rerender({ sessionId: 'chat:2', refresh: 5 });
-    expect(result.current).toEqual({ runs: [], landed: null });
-    await waitFor(() => expect(result.current.landed).toBe(5));
+    expect(result.current.landed).toBe(null);
+    await waitFor(() => expect(result.current.landed).toBe(3));
+    rerender({ sessionId: 'chat:1', refresh: 5 });
+    expect(result.current.landed).toBe(null);
+    await waitFor(() => expect(result.current.landed).toBe(4));
+    expect(result.current.runs).toEqual([runFixture('run_3')]);
   });
 });

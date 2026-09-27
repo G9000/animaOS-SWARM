@@ -211,32 +211,23 @@ describe('useLiveSession', () => {
     await flush(LIVE_REFRESH_DELAY_MS);
   });
 
-  it('reports which ledger read landed, numbering each one it asks for', async () => {
+  it('reports which ledger read is on screen, numbered as the reads began', async () => {
     const reads: ((runs: Run[]) => void)[] = [];
     vi.mocked(daemon.sessionRuns).mockImplementation(
       () => new Promise((resolve) => reads.push(resolve)),
     );
     const { result } = setup();
     await flush();
-    expect(result.current.ledger).toEqual({
-      requested: 0,
-      landed: null,
-      runs: [],
-    });
+    expect(result.current.ledger.landed).toBe(null);
+    expect(result.current.ledger.started()).toBe(1);
 
-    let asked = 0;
-    act(() => {
-      asked = result.current.refreshRuns();
-    });
-    expect(asked).toBe(1);
+    act(() => result.current.refreshRuns());
     await flush();
+    expect(result.current.ledger.started()).toBe(2);
     const run = room7Run();
     await act(async () => reads[1]([run]));
-    expect(result.current.ledger).toEqual({
-      requested: 1,
-      landed: 1,
-      runs: [run],
-    });
+    expect(result.current.ledger.landed).toBe(2);
+    expect(result.current.ledger.runs).toEqual([run]);
   });
 
   it('shows an accepted run until the stream or a later ledger read has it', async () => {

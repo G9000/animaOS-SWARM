@@ -644,6 +644,41 @@ describe('useSessionMessages', () => {
     expect(result.current.messages).toEqual([]);
   });
 
+  it('counts the reads it began and the newest one it applied', async () => {
+    capturePolls();
+    const read = vi
+      .spyOn(daemon, 'sessionMessages')
+      .mockResolvedValueOnce({ messages: [], nextBefore: null });
+    const { result, rerender } = renderHook(
+      ({ sessionId }) => useSessionMessages('agent-main', sessionId),
+      { initialProps: { sessionId: 'chat:1' } },
+    );
+    await waitFor(() => expect(result.current.appliedRead).toBe(1));
+    expect(result.current.readsStarted()).toBe(1);
+
+    read.mockRejectedValueOnce(new Error('offline'));
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.readsStarted()).toBe(2);
+    expect(result.current.appliedRead).toBe(1);
+
+    read.mockResolvedValueOnce({
+      messages: [message('m1', 1)],
+      nextBefore: null,
+    });
+    await act(async () => {
+      await result.current.refresh();
+    });
+    expect(result.current.appliedRead).toBe(3);
+
+    // Another session has applied nothing until its own read lands.
+    read.mockResolvedValueOnce({ messages: [], nextBefore: null });
+    rerender({ sessionId: 'chat:2' });
+    expect(result.current.appliedRead).toBe(0);
+    await waitFor(() => expect(result.current.appliedRead).toBe(4));
+  });
+
   it('polls at the interval its caller gives', async () => {
     const armed: number[] = [];
     vi.spyOn(window, 'setTimeout').mockImplementation(((

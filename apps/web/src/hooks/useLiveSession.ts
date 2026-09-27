@@ -16,7 +16,7 @@ import {
 } from '../lib/session-events';
 import { mergeSessionRuns } from '../lib/transcript';
 import { useAgentEvents, type AgentStreamStatus } from './useAgentEvents';
-import { useSessionLedger } from './useSessionRuns';
+import { useSessionLedger, type SessionLedger } from './useSessionRuns';
 
 /** Live events of one kind settle this long before what they change is read. */
 export const LIVE_REFRESH_DELAY_MS = 150;
@@ -61,12 +61,12 @@ export interface LiveSessionView {
   activeRunCount: number | null;
   /** The newest finished reply, for a polite live region (spec §15.5). */
   announcement: string;
-  /** The open session's ledger reads: the newest one asked for, the one
-   *  whose runs are on screen (null before the session's first), and those
-   *  runs. */
-  ledger: { requested: number; landed: number | null; runs: readonly Run[] };
-  /** Reads the open session's ledger again; returns that read's number. */
-  refreshRuns: () => number;
+  /** The open session's ledger: its runs on screen, the number of the read
+   *  they came from (null before the session's first), and how many reads
+   *  have begun. */
+  ledger: SessionLedger;
+  /** Reads the open session's ledger again. */
+  refreshRuns: () => void;
   /** Shows a run the daemon just accepted into the open session until the
    *  stream or a later ledger read has it. */
   seedRun: (run: Run) => void;
@@ -76,7 +76,7 @@ export interface LiveSessionView {
 interface SeededRun {
   key: string;
   run: Run;
-  /** The newest ledger read asked for when it was accepted. */
+  /** The ledger reads begun when it was accepted. */
   after: number;
 }
 
@@ -115,16 +115,15 @@ export function useLiveSession({
   const sessionId = session?.sessionId ?? null;
   const key =
     sessionAgentId && sessionId ? `${sessionAgentId}\u0000${sessionId}` : null;
-  // Ledger reads are numbered, so a caller can wait for one that began
-  // after something happened.
-  const runsRequestRef = useRef(0);
   const [runsRefresh, setRunsRefresh] = useState(0);
-  const refreshRuns = useCallback(() => {
-    runsRequestRef.current += 1;
-    setRunsRefresh(runsRequestRef.current);
-    return runsRequestRef.current;
-  }, []);
+  const refreshRuns = useCallback(
+    () => setRunsRefresh((value) => value + 1),
+    [],
+  );
+  // Its reads are numbered as they begin, so a caller can wait for one
+  // that began after something happened.
   const ledger = useSessionLedger(sessionAgentId, sessionId, runsRefresh);
+  const startedLedgerReads = ledger.started;
 
   const [announced, setAnnounced] = useState<{
     key: string;
@@ -208,15 +207,18 @@ export function useLiveSession({
   const [seeds, setSeeds] = useState(NO_SEEDS);
   const keyRef = useRef(key);
   keyRef.current = key;
-  const seedRun = useCallback((run: Run) => {
-    const runKey = `${run.agentId}\u0000${run.sessionId}`;
-    if (runKey !== keyRef.current) return;
-    const seed = { key: runKey, run, after: runsRequestRef.current };
-    setSeeds((current) => [
-      ...current.filter((item) => item.run.id !== run.id),
-      seed,
-    ]);
-  }, []);
+  const seedRun = useCallback(
+    (run: Run) => {
+      const runKey = `${run.agentId}\u0000${run.sessionId}`;
+      if (runKey !== keyRef.current) return;
+      const seed = { key: runKey, run, after: startedLedgerReads() };
+      setSeeds((current) => [
+        ...current.filter((item) => item.run.id !== run.id),
+        seed,
+      ]);
+    },
+    [startedLedgerReads],
+  );
   const seedAnswered = useCallback(
     (seed: SeededRun) =>
       seed.key !== key ||
@@ -294,15 +296,6 @@ export function useLiveSession({
     if (stale) refreshRuns();
   }, [key, messages, runs, watchedRunIds, refreshRuns]);
 
-  const ledgerView = useMemo(
-    () => ({
-      requested: runsRefresh,
-      landed: ledger.landed,
-      runs: ledger.runs,
-    }),
-    [runsRefresh, ledger],
-  );
-
   return {
     status: live.status,
     state: live.state,
@@ -310,7 +303,7 @@ export function useLiveSession({
     activeRun,
     activeRunCount,
     announcement: announced && announced.key === key ? announced.text : '',
-    ledger: ledgerView,
+    ledger,
     refreshRuns,
     seedRun,
   };

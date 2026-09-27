@@ -1,4 +1,4 @@
-import { act, renderHook } from '@testing-library/react';
+import { renderHook } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import type { Run, SessionMessage } from '@animaOS-SWARM/sdk';
 
@@ -11,8 +11,6 @@ import {
 } from './useSessionPending';
 
 const SESSION = { agentId: 'agent-main', sessionId: 'room-7' };
-/** A ledger read that landed before anything in these tests. */
-const LEDGER = { requested: 0, landed: 0, runs: [] };
 
 function send(overrides: Partial<SessionSend> = {}): SessionSend {
   return {
@@ -65,21 +63,24 @@ function steerMessage(): SessionMessage {
   };
 }
 
-/** A promise a test settles by hand. */
-function held<Value>() {
-  let resolve!: (value: Value) => void;
-  const promise = new Promise<Value>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
-}
-
+/**
+ * The hook with the reads it could start counted: `reads.history` and
+ * `reads.ledger` are the reads begun so far (history's `readsStarted`, the
+ * ledger's `started`), which a test moves as the page would.
+ */
 function setup(initial: Partial<SessionPendingOptions>) {
+  const reads = { history: 1, ledger: 1 };
   const settle = vi.fn();
   const onRecover = vi.fn();
-  const refreshMessages = vi.fn().mockResolvedValue(true);
-  let reads = 0;
-  const refreshRuns = vi.fn(() => ++reads);
+  const refreshMessages = vi.fn(() => {
+    reads.history += 1;
+  });
+  const refreshRuns = vi.fn();
+  const ledger = (landed: number | null, runs: readonly Run[] = []) => ({
+    landed,
+    runs,
+    started: () => reads.ledger,
+  });
   const view = renderHook(
     (props: Partial<SessionPendingOptions>) =>
       useSessionPending({
@@ -88,7 +89,9 @@ function setup(initial: Partial<SessionPendingOptions>) {
         session: SESSION,
         messages: [],
         runs: [],
-        ledger: LEDGER,
+        appliedRead: 1,
+        readsStarted: () => reads.history,
+        ledger: ledger(1),
         refreshMessages,
         refreshRuns,
         onRecover,
@@ -96,21 +99,21 @@ function setup(initial: Partial<SessionPendingOptions>) {
       }),
     { initialProps: initial },
   );
-  return { ...view, settle, onRecover, refreshMessages, refreshRuns };
+  return {
+    ...view,
+    reads,
+    ledger,
+    settle,
+    onRecover,
+    refreshMessages,
+    refreshRuns,
+  };
 }
 
 /** A steer seen in flight, then joined to `run_7`. */
-function steered(initial: Partial<SessionPendingOptions> = {}) {
-  const view = setup({
-    sends: [send()],
-    runs: [emptyLiveRun(joined())],
-    ...initial,
-  });
-  view.rerender({
-    ...initial,
-    sends: [steering],
-    runs: [emptyLiveRun(joined())],
-  });
+function steered() {
+  const view = setup({ sends: [send()], runs: [emptyLiveRun(joined())] });
+  view.rerender({ sends: [steering], runs: [emptyLiveRun(joined())] });
   return view;
 }
 
@@ -179,59 +182,124 @@ describe('useSessionPending', () => {
   });
 
   it('counts a same-text run from a ledger read begun before the steer as older', () => {
-    // The session's first ledger read is still on its way when the steer goes.
-    const pending = { requested: 0, landed: null, runs: [] };
+    // The session's first ledger read (read 1) is still on its way.
     const older = sameText('run_6');
-    const { rerender, settle } = setup({
+    const view = setup({
       sends: [send()],
       runs: [emptyLiveRun(joined())],
-      ledger: pending,
+      ledger: { landed: null, runs: [], started: () => 1 },
     });
-    const early = { requested: 0, landed: 0, runs: [older] };
-    rerender({
+    view.rerender({
       sends: [steering],
       runs: [emptyLiveRun(older), emptyLiveRun(joined())],
-      ledger: early,
+      ledger: view.ledger(1, [older]),
     });
-    expect(settle).not.toHaveBeenCalled();
+    expect(view.settle).not.toHaveBeenCalled();
 
-    // A read begun after the steer may hold the run it became.
+    // Read 2, begun after the steer, may hold the run it became.
+    view.reads.ledger = 2;
     const own = sameText('run_8', { createdAtMs: 20 });
-    rerender({
+    view.rerender({
       sends: [steering],
       runs: [emptyLiveRun(older), emptyLiveRun(joined()), emptyLiveRun(own)],
-      ledger: { requested: 1, landed: 1, runs: [older, own] },
+      ledger: view.ledger(2, [older, own]),
     });
-    expect(settle).toHaveBeenCalledWith('key-1');
+    expect(view.settle).toHaveBeenCalledWith('key-1');
   });
 
-  it('moves a steer to recovery only once history and the ledger were read after its run failed', async () => {
-    const history = held<boolean>();
-    const { rerender, settle, onRecover, refreshMessages, refreshRuns } =
-      steered();
-    refreshMessages.mockReturnValueOnce(history.promise);
-    rerender({ sends: [steering], runs: failedRuns });
-    expect(refreshMessages).toHaveBeenCalledTimes(1);
-    expect(refreshRuns).toHaveBeenCalledTimes(1);
+  it('never counts a read begun after the steer as older, even after leaving the session and coming back', () => {
+    const view = steered();
+    view.rerender({
+      sends: [steering],
+      session: { agentId: 'agent-main', sessionId: 'chat:b' },
+      ledger: view.ledger(null),
+    });
+    // Back in room-7 its first ledger read is read 3.
+    view.reads.ledger = 3;
+    const own = sameText('run_8', { createdAtMs: 20 });
+    view.rerender({
+      sends: [steering],
+      runs: [emptyLiveRun(joined({ status: 'completed' })), emptyLiveRun(own)],
+      ledger: view.ledger(3, [own]),
+    });
+    expect(view.settle).toHaveBeenCalledWith('key-1');
+  });
 
-    await act(async () => history.resolve(true));
-    // The ledger read begun after the failure has not landed yet.
-    expect(onRecover).not.toHaveBeenCalled();
-    rerender({
+  it('recovers a failed reply’s steer after an applied history read and a landed ledger read, both begun after the failure', () => {
+    const view = steered();
+    view.rerender({ sends: [steering], runs: failedRuns });
+    // One read of each is asked for; nothing else is started.
+    expect(view.refreshMessages).toHaveBeenCalledTimes(1);
+    expect(view.refreshRuns).toHaveBeenCalledTimes(1);
+
+    // History's read (read 2) applied; the ledger's has not landed.
+    view.rerender({ sends: [steering], runs: failedRuns, appliedRead: 2 });
+    expect(view.onRecover).not.toHaveBeenCalled();
+    expect(view.refreshRuns).toHaveBeenCalledTimes(1);
+
+    view.reads.ledger = 2;
+    view.rerender({
       sends: [steering],
       runs: failedRuns,
-      ledger: { requested: 1, landed: 1, runs: [] },
+      appliedRead: 2,
+      ledger: view.ledger(2),
     });
-    expect(onRecover).toHaveBeenCalledWith(steering);
-    expect(onRecover).toHaveBeenCalledTimes(1);
-    expect(settle).toHaveBeenCalledWith('key-1');
+    expect(view.onRecover).toHaveBeenCalledWith(steering);
+    expect(view.onRecover).toHaveBeenCalledTimes(1);
+    expect(view.settle).toHaveBeenCalledWith('key-1');
   });
 
-  it('does not recover a steer the ledger shows as its own run after the history read', async () => {
-    const { rerender, onRecover, settle } = steered();
-    await act(async () => {
-      rerender({ sends: [steering], runs: failedRuns });
+  it('starts no reads of its own while history keeps failing, and recovers on the next applied read', () => {
+    const view = steered();
+    view.rerender({ sends: [steering], runs: failedRuns });
+    view.reads.ledger = 2;
+    const landed = view.ledger(2);
+    // History's reads fail, whatever starts them (polls, events).
+    for (let poll = 0; poll < 10; poll += 1) {
+      view.reads.history += 1;
+      view.rerender({ sends: [steering], runs: failedRuns, ledger: landed });
+    }
+    expect(view.refreshMessages).toHaveBeenCalledTimes(1);
+    expect(view.refreshRuns).toHaveBeenCalledTimes(1);
+    expect(view.onRecover).not.toHaveBeenCalled();
+
+    view.rerender({
+      sends: [steering],
+      runs: failedRuns,
+      ledger: landed,
+      appliedRead: view.reads.history,
     });
+    expect(view.onRecover).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks the ledger again at most once per applied history read until one lands', () => {
+    const view = steered();
+    view.rerender({ sends: [steering], runs: failedRuns });
+    // History's own read (read 2) applies, but the ledger's read failed.
+    view.rerender({ sends: [steering], runs: failedRuns, appliedRead: 2 });
+    expect(view.refreshRuns).toHaveBeenCalledTimes(1);
+
+    // The next poll's read (read 3) applies: one more ledger read.
+    view.reads.history = 3;
+    view.rerender({ sends: [steering], runs: failedRuns, appliedRead: 3 });
+    view.rerender({ sends: [steering], runs: failedRuns, appliedRead: 3 });
+    expect(view.refreshRuns).toHaveBeenCalledTimes(2);
+    expect(view.onRecover).not.toHaveBeenCalled();
+
+    view.reads.ledger = 3;
+    view.rerender({
+      sends: [steering],
+      runs: failedRuns,
+      appliedRead: 3,
+      ledger: view.ledger(3),
+    });
+    expect(view.onRecover).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not recover a steer the ledger shows as its own run after the history read', () => {
+    const view = steered();
+    view.rerender({ sends: [steering], runs: failedRuns });
+    view.rerender({ sends: [steering], runs: failedRuns, appliedRead: 2 });
     // The daemon announces the steer's `failed_before_start` run after a
     // second save; the ledger read has it.
     const own = sameText('run_8', {
@@ -239,71 +307,53 @@ describe('useSessionPending', () => {
       createdAtMs: 20,
       error: { code: 'failed_before_start', message: 'send it again' },
     });
-    rerender({
+    view.reads.ledger = 2;
+    view.rerender({
       sends: [steering],
       runs: [...failedRuns, emptyLiveRun(own)],
-      ledger: { requested: 1, landed: 1, runs: [own] },
+      appliedRead: 2,
+      ledger: view.ledger(2, [own]),
     });
-    expect(settle).toHaveBeenCalledWith('key-1');
-    expect(onRecover).not.toHaveBeenCalled();
+    expect(view.settle).toHaveBeenCalledWith('key-1');
+    expect(view.onRecover).not.toHaveBeenCalled();
   });
 
-  it('never recovers on a history read that was discarded or failed', async () => {
-    const { rerender, onRecover, refreshMessages } = steered();
-    refreshMessages.mockResolvedValueOnce(false);
-    await act(async () => {
-      rerender({ sends: [steering], runs: failedRuns });
-    });
-    await act(async () => {
-      rerender({
-        sends: [steering],
-        runs: failedRuns,
-        ledger: { requested: 1, landed: 1, runs: [] },
-      });
-    });
-    // The next pass asks history again (and the ledger with it): nothing
-    // moves on the discarded read.
-    expect(refreshMessages).toHaveBeenCalledTimes(2);
-    expect(onRecover).not.toHaveBeenCalled();
-  });
-
-  it('starts over when the session changes during a recovery', async () => {
-    const history = held<boolean>();
-    const { rerender, onRecover, refreshMessages } = steered();
-    refreshMessages.mockReturnValueOnce(history.promise);
-    rerender({ sends: [steering], runs: failedRuns });
-    rerender({
+  it('starts over when the session changes during a recovery', () => {
+    const view = steered();
+    view.rerender({ sends: [steering], runs: failedRuns });
+    view.rerender({
       sends: [steering],
       session: { agentId: 'agent-main', sessionId: 'chat:b' },
-      runs: [],
-      ledger: { requested: 1, landed: 1, runs: [] },
+      ledger: view.ledger(null),
+      appliedRead: 0,
     });
-    await act(async () => history.resolve(true));
 
-    // Back in room-7 its history is read afresh: nothing recovers against
-    // the reset, empty page.
-    refreshMessages.mockReturnValueOnce(new Promise(() => undefined));
-    rerender({
+    // Back in room-7 its history and ledger are read afresh: the reads
+    // that landed before are not enough, nor the reset, empty page.
+    view.reads.ledger = 3;
+    view.rerender({
       sends: [steering],
       runs: failedRuns,
-      ledger: { requested: 2, landed: 2, runs: [] },
+      appliedRead: 2,
+      ledger: view.ledger(3),
     });
-    expect(onRecover).not.toHaveBeenCalled();
-    expect(refreshMessages).toHaveBeenCalledTimes(2);
+    expect(view.onRecover).not.toHaveBeenCalled();
+    expect(view.refreshMessages).toHaveBeenCalledTimes(2);
+    expect(view.refreshRuns).toHaveBeenCalledTimes(2);
   });
 
-  it('does not recover a steer that history shows the failed run took', async () => {
-    const { rerender, settle, onRecover } = steered();
-    rerender({ sends: [steering], runs: failedRuns });
-    await act(async () => {
-      rerender({
-        sends: [steering],
-        runs: failedRuns,
-        messages: [steerMessage()],
-        ledger: { requested: 1, landed: 1, runs: [] },
-      });
+  it('does not recover a steer that history shows the failed run took', () => {
+    const view = steered();
+    view.rerender({ sends: [steering], runs: failedRuns });
+    view.reads.ledger = 2;
+    view.rerender({
+      sends: [steering],
+      runs: failedRuns,
+      messages: [steerMessage()],
+      appliedRead: 2,
+      ledger: view.ledger(2),
     });
-    expect(settle).toHaveBeenCalledWith('key-1');
-    expect(onRecover).not.toHaveBeenCalled();
+    expect(view.settle).toHaveBeenCalledWith('key-1');
+    expect(view.onRecover).not.toHaveBeenCalled();
   });
 });

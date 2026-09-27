@@ -430,6 +430,8 @@ export function ViewHarness() {
     messages: history.messages,
     runs: live.runs,
     ledger: live.ledger,
+    appliedRead: history.appliedRead,
+    readsStarted: history.readsStarted,
     refreshMessages: history.refresh,
     refreshRuns: live.refreshRuns,
     onRecover: (item) => {

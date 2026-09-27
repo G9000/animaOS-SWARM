@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import type { Run, SessionMessage } from '@animaOS-SWARM/sdk';
 
 import type { LiveRun } from '../lib/session-events';
@@ -16,33 +16,45 @@ export interface SessionPendingOptions {
   messages: readonly SessionMessage[];
   /** The open session's runs, from its stream and ledger. */
   runs: readonly LiveRun[];
-  /** The open session's ledger reads: the newest asked for, the one whose
-   *  runs are on screen (null before its first), and those runs. */
-  ledger: { requested: number; landed: number | null; runs: readonly Run[] };
-  /** Reads the open session's newest messages again; true once that
-   *  read's page is on screen. */
-  refreshMessages: () => Promise<boolean>;
-  /** Reads the open session's ledger again; returns that read's number. */
-  refreshRuns: () => number;
+  /** The open session's ledger: its runs on screen, the number of the read
+   *  they came from (null before the session's first), and how many reads
+   *  have begun (reads are numbered as they begin). */
+  ledger: {
+    landed: number | null;
+    runs: readonly Run[];
+    started: () => number;
+  };
+  /** The number of the newest history read on screen (0 before one). */
+  appliedRead: number;
+  /** History reads begun so far (reads are numbered as they begin). */
+  readsStarted: () => number;
+  /** Reads the open session's newest messages again. */
+  refreshMessages: () => unknown;
+  /** Reads the open session's ledger again. */
+  refreshRuns: () => void;
   /** A steer that no run took and no history holds: its text goes to the
    *  composer's recovery panel. */
   onRecover: (send: SessionSend) => void;
 }
 
 /** The runs a steer cannot have become: those its session had when it was
- *  sent, including a ledger read begun by then (`before`). */
+ *  sent, and those of any ledger read begun by then (numbered up to
+ *  `before`). */
 interface SteerBaseline {
   ids: Set<string>;
   before: number;
 }
 
-/** A failed reply's steer, waiting for history and the ledger to be read
- *  again after the failure. */
+/** A failed reply's steer, waiting for a history read and a ledger read
+ *  begun after the failure. Reads are numbered as they begin. */
 interface RecoveryCheck {
-  /** History's read, begun after the failure: `read` once it was applied. */
-  history: 'reading' | 'read';
-  /** The ledger read begun after the failure. */
-  ledgerRead: number;
+  /** History reads begun by the failure: a read numbered above counts. */
+  historyAfter: number;
+  /** Ledger reads begun by the failure: a read numbered above counts. */
+  ledgerAfter: number;
+  /** History reads begun when the ledger was last asked: until a ledger
+   *  read lands, each applied history read numbered above asks once more. */
+  ledgerAskedAt: number;
 }
 
 /** A reply that ended without being able to take a steer. */
@@ -83,9 +95,11 @@ function shownSteers(
  * While the reply it joined shows it as taken, the run shows the text and
  * the bubble steps aside. A reconnect settles nothing. If the reply ends
  * `failed` or `interrupted`, the text moves to the recovery panel only once
- * a history read and a ledger read, both begun after the failure, have
- * landed without it (the daemon announces a steer's own run after the
- * failure, so a ledger read may be the first to show it).
+ * a history read begun after the failure was applied and a ledger read
+ * begun after it landed, both without it (the daemon announces a steer's
+ * own run after the failure, so a ledger read may be the first to show
+ * it). Failed reads are not retried here: the poll and the stream's events
+ * read again, and the ledger is asked again at most once per history read.
  */
 export function useSessionPending({
   sends,
@@ -94,6 +108,8 @@ export function useSessionPending({
   messages,
   runs,
   ledger,
+  appliedRead,
+  readsStarted,
   refreshMessages,
   refreshRuns,
   onRecover,
@@ -113,18 +129,10 @@ export function useSessionPending({
   /** Steers already handed to the recovery panel, until they leave the
    *  queue. */
   const recoveredRef = useRef(new Set<string>());
-  const [historyReads, setHistoryReads] = useState(0);
   const onRecoverRef = useRef(onRecover);
   useEffect(() => {
     onRecoverRef.current = onRecover;
   });
-  const mountedRef = useRef(true);
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
   // Another session's history and ledger say nothing about these steers:
   // a recovery starts over when their session opens again.
   useEffect(() => {
@@ -146,7 +154,7 @@ export function useSessionPending({
       if (!baseline) {
         baseline = {
           ids: new Set(runs.map((item) => item.run.id)),
-          before: ledger.requested,
+          before: ledger.started(),
         };
         baselines.set(send.key, baseline);
       }
@@ -175,36 +183,39 @@ export function useSessionPending({
       }
       const joined = runs.find((item) => item.run.id === send.steeringRunId);
       if (!joined || !endedBadly(joined.run.status)) continue;
+      const ledgerLanded = (after: number) =>
+        ledger.landed !== null && ledger.landed > after;
       const check = checks.get(send.key);
       if (!check) {
         // Its message may be committed with the failed reply, or its own
-        // run announced after it: read both again, from now, first.
-        const started: RecoveryCheck = {
-          history: 'reading',
-          ledgerRead: refreshRuns(),
-        };
-        checks.set(send.key, started);
-        const key = send.key;
-        void refreshMessages().then((applied) => {
-          if (!mountedRef.current || checks.get(key) !== started) return;
-          // A read that was discarded or failed proves nothing: the next
-          // pass asks again.
-          if (applied) started.history = 'read';
-          else checks.delete(key);
-          setHistoryReads((value) => value + 1);
+        // run announced after it: ask for one read of each, then wait for
+        // reads begun from now, whatever starts them. It never retries on
+        // its own: the poll and the stream's events keep reading.
+        const historyAfter = readsStarted();
+        const ledgerAfter = ledger.started();
+        refreshRuns();
+        refreshMessages();
+        checks.set(send.key, {
+          historyAfter,
+          ledgerAfter,
+          ledgerAskedAt: readsStarted(),
         });
         continue;
       }
-      if (
-        check.history === 'read' &&
-        ledger.landed !== null &&
-        ledger.landed >= check.ledgerRead
-      ) {
-        checks.delete(send.key);
-        recoveredRef.current.add(send.key);
-        settle(send.key);
-        onRecoverRef.current(send);
+      if (appliedRead <= check.historyAfter) continue;
+      if (!ledgerLanded(check.ledgerAfter)) {
+        // The ledger's read failed, or was superseded: ask again, at most
+        // once per history read, so at the poll's pace.
+        if (appliedRead > check.ledgerAskedAt) {
+          check.ledgerAskedAt = readsStarted();
+          refreshRuns();
+        }
+        continue;
       }
+      checks.delete(send.key);
+      recoveredRef.current.add(send.key);
+      settle(send.key);
+      onRecoverRef.current(send);
     }
   }, [
     open,
@@ -212,7 +223,8 @@ export function useSessionPending({
     messages,
     runs,
     ledger,
-    historyReads,
+    appliedRead,
+    readsStarted,
     settle,
     refreshMessages,
     refreshRuns,
