@@ -203,6 +203,58 @@ describe('RunOutcomeCard', () => {
     expect(onSendAgain).toHaveBeenCalledWith(run);
   });
 
+  it.each([
+    { source: 'web', sourceRef: null, offered: true },
+    { source: 'api', sourceRef: null, offered: true },
+    // The daemon's own note after a calendar write, recorded like an API run.
+    { source: 'api', sourceRef: 'calendar-write:w-1', offered: false },
+    // An owner turn from the console carries its connector's id.
+    { source: 'telegram', sourceRef: 'telegram-1-1', offered: true },
+    // An inbound turn (`<connector>:<update>`), which the daemon re-runs.
+    { source: 'telegram', sourceRef: 'telegram-1-1:42', offered: false },
+    { source: 'telegram', sourceRef: null, offered: false },
+    { source: 'schedule', sourceRef: 'schedule-1', offered: false },
+    { source: 'job', sourceRef: 'job-1:1', offered: false },
+    { source: 'delegation', sourceRef: null, offered: false },
+    { source: 'peer', sourceRef: null, offered: false },
+  ] as const)(
+    'offers Retry and Send again only for a message the owner wrote ($source $sourceRef)',
+    ({ source, sourceRef, offered }) => {
+      const onSendAgain = vi.fn();
+      const run = { source, sourceRef };
+      render(
+        <>
+          <RunOutcomeCard
+            run={runFixture('run_f', {
+              ...run,
+              status: 'failed',
+              error: { code: 'model_error', message: 'provider unavailable' },
+            })}
+            onSendAgain={onSendAgain}
+          />
+          <RunOutcomeCard
+            run={runFixture('run_i', {
+              ...run,
+              status: 'interrupted',
+              error: { code: 'restart_before_start', message: 'restarted' },
+            })}
+            onSendAgain={onSendAgain}
+          />
+        </>,
+      );
+
+      expect(screen.queryAllByRole('button', { name: 'Retry' })).toHaveLength(
+        offered ? 1 : 0,
+      );
+      expect(
+        screen.queryAllByRole('button', { name: 'Send again' }),
+      ).toHaveLength(offered ? 1 : 0);
+      expect(
+        screen.getByText('This reply failed: provider unavailable'),
+      ).toBeVisible();
+    },
+  );
+
   it('disables Retry and Send again once used', () => {
     const failed = runFixture('run_f', {
       status: 'failed',

@@ -9,7 +9,7 @@ import {
   runSlashCommand,
   type SlashCommandHandlers,
 } from '../lib/slash-commands';
-import type { HelperTarget } from '../lib/transcript';
+import { isOwnerWritten, type HelperTarget } from '../lib/transcript';
 
 /** The chat state a send or command changes. */
 export interface CommandChatPatch {
@@ -79,7 +79,8 @@ export interface SessionCommands {
   /** Folds earlier turns into the session summary (spec §5.4). */
   compactSession: (session: Session) => Promise<void>;
   /** Sends a failed or interrupted run's message again, as a new message;
-   *  false when it cannot go from the open session. */
+   *  false when it cannot go from the open session or the owner did not
+   *  write it. */
   sendAgain: (run: Run) => boolean;
   /** Opens a session, another agent's (a helper's) by its agent. */
   openTarget: (target: HelperTarget) => void;
@@ -207,7 +208,8 @@ export function useSessionCommands(
           !session ||
           !chatKey ||
           run.agentId !== session.agentId ||
-          run.sessionId !== session.id
+          run.sessionId !== session.id ||
+          !isOwnerWritten(run)
         )
           return false;
         queueSend(session, chatKey, run.input.text, crypto.randomUUID());

@@ -1,5 +1,7 @@
 import type { Run } from '@animaOS-SWARM/sdk';
 
+import { isOwnerWritten } from '../../lib/transcript';
+
 /** Why an interrupted run did not reply: a restart in the web's words,
  *  otherwise the daemon's own reason, such as a stop or a full queue that
  *  left a steer unread. */
@@ -25,6 +27,8 @@ export function RunOutcomeCard({
   /** Already sent again from this page: its button is used up. */
   resent?: boolean;
 }) {
+  // Only a message the owner wrote is theirs to send again.
+  const sendAgain = isOwnerWritten(run) ? onSendAgain : undefined;
   if (run.status === 'cancelled')
     return (
       <p className="run-outcome" data-outcome="stopped">
@@ -39,12 +43,12 @@ export function RunOutcomeCard({
             ? `This reply failed: ${run.error.message}`
             : 'This reply failed.'}
         </p>
-        {onSendAgain && (
+        {sendAgain && (
           <button
             type="button"
             className="studio-tool-button"
             disabled={resent}
-            onClick={() => onSendAgain(run)}
+            onClick={() => sendAgain(run)}
           >
             Retry
           </button>
@@ -60,12 +64,12 @@ export function RunOutcomeCard({
           before sending again.
         </p>
       )}
-      {onSendAgain && (
+      {sendAgain && (
         <button
           type="button"
           className="studio-tool-button"
           disabled={resent}
-          onClick={() => onSendAgain(run)}
+          onClick={() => sendAgain(run)}
         >
           Send again
         </button>

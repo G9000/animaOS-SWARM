@@ -1,9 +1,10 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import { isTerminalRunStatus, type Run } from '@animaOS-SWARM/sdk';
+import { isTerminalRunStatus } from '@animaOS-SWARM/sdk';
 
 import { isActiveRun, type LiveRun } from '../../lib/session-events';
 import {
   formatElapsed,
+  hasWrittenInput,
   liveToolSteps,
   type PendingBubble,
   type ToolStep,
@@ -14,13 +15,6 @@ import { HelperCard } from './HelperCard';
 import { ToolStepCard } from './ToolStepCard';
 
 type RenderMessage = (message: ChatMessage) => ReactNode;
-
-/** Sources whose input is a message someone wrote into the session. */
-const WRITTEN_INPUT: ReadonlySet<Run['source']> = new Set([
-  'web',
-  'api',
-  'telegram',
-]);
 
 function useElapsed(
   startedAtMs: number | null,
@@ -134,7 +128,7 @@ export function RunActivity({
       ? (run.finishedAtMs ?? run.startedAtMs)
       : null,
   );
-  const input = WRITTEN_INPUT.has(run.source)
+  const input = hasWrittenInput(run)
     ? renderMessage({
         id: `${run.id}:input`,
         role: 'User',

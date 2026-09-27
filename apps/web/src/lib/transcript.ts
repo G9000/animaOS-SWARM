@@ -290,6 +290,54 @@ export function mergeSessionRuns(
   );
 }
 
+/** Sources whose input is a message someone wrote into the session, which
+ *  a run shows as its user turn. */
+const WRITTEN_INPUT: ReadonlySet<Run['source']> = new Set([
+  'web',
+  'api',
+  'telegram',
+]);
+
+export function hasWrittenInput(run: Pick<Run, 'source'>): boolean {
+  return WRITTEN_INPUT.has(run.source);
+}
+
+/** The daemon's own note after a calendar write is applied: an `api` run
+ *  that is not the owner's turn (the daemon's `is_calendar_write_followup`). */
+const CALENDAR_WRITE_REF_PREFIX = 'calendar-write:';
+
+/** A Telegram inbound turn's ref, `<connectorId>:<updateId>`, parsed the
+ *  way the daemon's stop does (`stop_inbound`: split at the last colon, an
+ *  integer after it). Connector ids (`telegram-<ms>-<n>`) have no colon; an
+ *  owner turn sent from the console carries the bare connector id. */
+const TELEGRAM_INBOUND_REF = /:[+-]?\d+$/;
+
+/**
+ * Whether the owner wrote the run's message, so Retry and Send again may
+ * send it as theirs (spec §15.2): a web or API message, or a Telegram owner
+ * turn sent from the console. Never a check-in's prompt, a job's or a
+ * delegated or peer task, the daemon's calendar note, or a Telegram inbound
+ * turn (someone else's message, which the daemon itself re-runs on boot).
+ * A Telegram run without a ref cannot show it is an owner turn, so it is
+ * not offered.
+ */
+export function isOwnerWritten(
+  run: Pick<Run, 'source' | 'sourceRef'>,
+): boolean {
+  switch (run.source) {
+    case 'web':
+      return true;
+    case 'api':
+      return !run.sourceRef?.startsWith(CALENDAR_WRITE_REF_PREFIX);
+    case 'telegram':
+      return (
+        run.sourceRef !== null && !TELEGRAM_INBOUND_REF.test(run.sourceRef)
+      );
+    default:
+      return false;
+  }
+}
+
 /** A finished run whose outcome the owner should see (spec §15.2). */
 function hasOutcome(run: Run): boolean {
   return (

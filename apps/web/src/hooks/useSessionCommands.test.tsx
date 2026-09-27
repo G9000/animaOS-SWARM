@@ -224,6 +224,23 @@ describe('useSessionCommands', () => {
     expect(options.queueSend).toHaveBeenCalledTimes(1);
   });
 
+  it('never sends again a message the owner did not write', () => {
+    const { result, options } = setup();
+    let sent = true;
+    act(() => {
+      sent = result.current.sendAgain(
+        runFixture('run_t', {
+          sessionId: 'room-7',
+          source: 'schedule',
+          sourceRef: 'schedule-1',
+          status: 'failed',
+        }),
+      );
+    });
+    expect(sent).toBe(false);
+    expect(options.queueSend).not.toHaveBeenCalled();
+  });
+
   it('routes to another agent’s session by its agent', () => {
     const { result, options } = setup();
     result.current.openTarget({ agentId: 'helper-7', sessionId: 'room-9' });
