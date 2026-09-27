@@ -341,7 +341,7 @@ impl ProviderModelAdapter {
                     let payload = response_payload(response, "Google", Some(&api_key)).await?;
                     return emit_final(sink, parse_google_response(&payload)?).await;
                 }
-                return consume_google_sse(response, sink).await;
+                return consume_google_sse(response, sink, &api_key).await;
             }
             let status = response.status();
             let error = response_payload(response, "Google", Some(&api_key))
@@ -536,7 +536,7 @@ async fn response_payload(
         .map_err(|error| format!("{provider} response parse failed: {error}"))
 }
 
-fn sanitize_upstream_body(body: &str, api_key: Option<&str>) -> String {
+pub(crate) fn sanitize_upstream_body(body: &str, api_key: Option<&str>) -> String {
     let redacted = api_key
         .filter(|key| !key.is_empty())
         .map_or_else(|| body.to_owned(), |key| body.replace(key, "[REDACTED]"));

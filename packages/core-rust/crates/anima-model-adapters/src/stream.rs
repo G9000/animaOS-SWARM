@@ -72,7 +72,10 @@ pub(crate) async fn consume_openai_sse(
     provider: &ProviderDefinition,
 ) -> Result<(), String> {
     let mut accumulator = StreamAccumulator::new(provider.id, provider.label);
-    consume_sse_events(response, |payload| accumulator.openai(payload), sink).await?;
+    let saw_done =
+        consume_sse_events(response, |payload| accumulator.openai(payload), sink).await?;
+    // `[DONE]` is terminal, as is a finish reason (`openai` records that one).
+    accumulator.terminal |= saw_done;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
         .await
         .map_err(|_| "provider stream consumer failed".to_owned())
@@ -92,9 +95,13 @@ pub(crate) async fn consume_anthropic_sse(
 pub(crate) async fn consume_google_sse(
     response: reqwest::Response,
     sink: &dyn ModelStreamSink,
+    api_key: &str,
 ) -> Result<(), String> {
     let mut accumulator = crate::google::GoogleStreamAccumulator::default();
-    consume_sse_events(response, |payload| accumulator.push(payload), sink).await?;
+    // A Google error payload's message is upstream text, redacted like an error body.
+    consume_sse_events(response, |payload| accumulator.push(payload), sink)
+        .await
+        .map_err(|error| crate::adapter::sanitize_upstream_body(&error, Some(api_key)))?;
     sink.emit(ModelStreamFrame::Final(accumulator.finish()?))
         .await
         .map_err(|_| "provider stream consumer failed".to_owned())
@@ -154,6 +161,10 @@ struct StreamAccumulator {
     /// The provider's catalog id and label, for provider-specific stop reasons.
     provider_id: &'static str,
     provider_label: &'static str,
+    /// Whether the stream's terminal marker arrived: OpenAI-compatible `[DONE]` or a
+    /// finish reason, Anthropic `message_stop`. A stream that ends without one is an
+    /// incomplete reply, not a completed one.
+    terminal: bool,
     text: String,
     stop_reason: Option<ModelStopReason>,
     usage: StreamUsage,
@@ -184,6 +195,7 @@ impl StreamAccumulator {
         Self {
             provider_id,
             provider_label,
+            terminal: false,
             text: String::new(),
             stop_reason: None,
             usage: StreamUsage::default(),
@@ -207,6 +219,7 @@ impl StreamAccumulator {
         if let Some(reason) = choice.get("finish_reason").filter(|value| !value.is_null()) {
             let reason = self.stop_reason_for(reason, false)?;
             self.set_stop_reason(reason)?;
+            self.terminal = true;
         }
         let delta = choice
             .get("delta")
@@ -264,7 +277,11 @@ impl StreamAccumulator {
             .and_then(Value::as_str)
             .ok_or_else(stream_parse_error)?;
         match event_type {
-            "ping" | "message_stop" => Ok(None),
+            "ping" => Ok(None),
+            "message_stop" => {
+                self.terminal = true;
+                Ok(None)
+            }
             "message_start" => {
                 self.usage.merge_anthropic_start(
                     payload
@@ -411,6 +428,12 @@ impl StreamAccumulator {
     }
 
     fn finish(self) -> Result<ModelGenerateResponse, String> {
+        if !self.terminal {
+            return Err(format!(
+                "{} stream ended before it was done",
+                self.provider_label
+            ));
+        }
         let mut calls = Vec::with_capacity(self.tools.len());
         for (_, tool) in self.tools {
             if !tool.started
@@ -709,13 +732,16 @@ impl BoundedFrameReader {
     }
 }
 
+/// Feeds every SSE `data:` payload to `parse` and emits the text it returns. Returns
+/// whether an OpenAI-style `data: [DONE]` sentinel arrived.
 async fn consume_sse_events(
     response: reqwest::Response,
     mut parse: impl FnMut(&Value) -> Result<Option<String>, String>,
     sink: &dyn ModelStreamSink,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let mut body = response.bytes_stream();
     let mut reader = BoundedFrameReader::new();
+    let mut saw_done = false;
     while let Some(chunk) = body.next().await {
         let chunk = chunk
             .map_err(|error| format!("provider stream read failed: {}", error.without_url()))?;
@@ -727,6 +753,7 @@ async fn consume_sse_events(
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    saw_done = true;
                     continue;
                 }
                 let payload: Value =
@@ -744,7 +771,7 @@ async fn consume_sse_events(
     {
         return Err(stream_parse_error());
     }
-    Ok(())
+    Ok(saw_done)
 }
 
 /// The earliest blank line (`\n\n` or `\r\n\r\n`) that ends an SSE event, found in

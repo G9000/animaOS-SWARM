@@ -1904,3 +1904,177 @@ fn one_network_chunk_carrying_many_small_events_splits_before_the_event_bound() 
     reader.push(format!("{oversized}\n\n").as_bytes()).unwrap();
     assert!(reader.next_frame(event_boundary).is_err());
 }
+
+// --- S1-B: a stream with no terminal marker is not a completed reply.
+
+async fn stream_frames(
+    adapter: &ProviderModelAdapter,
+    config: &AgentConfig,
+) -> (Result<(), String>, Vec<ModelStreamFrame>) {
+    let sink = FrameSink(Mutex::new(Vec::new()));
+    let result = adapter.stream(config, &request(), &sink).await;
+    let frames = sink.0.lock().unwrap().clone();
+    (result, frames)
+}
+
+#[tokio::test]
+async fn an_openai_compatible_stream_without_done_or_a_finish_reason_is_incomplete() {
+    let base_url = sse_server(
+        "/v1/chat/completions",
+        concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Half an \"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ans\"}}]}\n\n"
+        )
+        .into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+
+    let (result, frames) = stream_frames(&adapter, &agent_config("openai", false)).await;
+
+    assert_eq!(
+        result.unwrap_err(),
+        "OpenAI stream ended before it was done"
+    );
+    assert_eq!(
+        frames,
+        vec![
+            ModelStreamFrame::TextDelta("Half an ".into()),
+            ModelStreamFrame::TextDelta("ans".into()),
+        ],
+        "the partial text streamed, and no final response followed it"
+    );
+
+    // Either terminal marker alone completes the reply.
+    for body in [
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+    ] {
+        let base_url = sse_server("/v1/chat/completions", body.into()).await;
+        let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+        let response = stream_final(&adapter, &agent_config("openai", false))
+            .await
+            .unwrap_or_else(|error| panic!("{body}: {error}"));
+        assert_eq!(response.content.text, "ok");
+    }
+}
+
+#[tokio::test]
+async fn a_truncated_provider_stream_leaves_an_incomplete_reply_in_the_runtime() {
+    let base_url = sse_server(
+        "/v1/chat/completions",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Half an ans\"}}]}\n\n".into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("openai", Some("key"), &format!("{base_url}/v1"))]);
+    let mut runtime =
+        anima_core::AgentRuntime::new(agent_config("openai", false), Arc::new(adapter));
+    runtime.init();
+
+    let result = runtime
+        .run(Content {
+            text: "hi".into(),
+            ..Content::default()
+        })
+        .await;
+
+    assert_eq!(result.status, anima_core::TaskStatus::Error);
+    assert_eq!(
+        result.error.as_deref(),
+        Some("OpenAI stream ended before it was done")
+    );
+    let reply = runtime
+        .messages()
+        .iter()
+        .find(|message| message.role == MessageRole::Assistant)
+        .expect("the partial reply is recorded");
+    assert_eq!(reply.content.text, "Half an ans");
+    assert_eq!(
+        reply
+            .content
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("incomplete")),
+        Some(&DataValue::Bool(true))
+    );
+}
+
+#[tokio::test]
+async fn an_anthropic_stream_without_message_stop_is_incomplete() {
+    let base_url = sse_server(
+        "/v1/messages",
+        concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":9}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Half\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n"
+        )
+        .into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("anthropic", Some("key"), &base_url)]);
+
+    let (result, frames) = stream_frames(&adapter, &agent_config("anthropic", false)).await;
+
+    assert_eq!(
+        result.unwrap_err(),
+        "Anthropic stream ended before it was done"
+    );
+    assert_eq!(frames, vec![ModelStreamFrame::TextDelta("Half".into())]);
+}
+
+#[tokio::test]
+async fn a_google_stream_error_payload_fails_the_call() {
+    let base_url = sse_server(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        concat!(
+            "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"Half\"}]}}]}\n\n",
+            "data: {\"error\":{\"code\":500,\"message\":\"An internal error has occurred.\",\"status\":\"INTERNAL\"}}\n\n"
+        )
+        .into(),
+    )
+    .await;
+    let adapter = adapter_with(&[("google", Some("key"), &base_url)]);
+
+    let (result, frames) = stream_frames(&adapter, &google_config(false)).await;
+
+    assert_eq!(
+        result.unwrap_err(),
+        "Google stream failed: INTERNAL: An internal error has occurred."
+    );
+    assert_eq!(frames, vec![ModelStreamFrame::TextDelta("Half".into())]);
+}
+
+#[tokio::test]
+async fn a_google_stream_without_any_candidate_fails() {
+    let blocked = sse_server(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":4}}\n\n".into(),
+    )
+    .await;
+    let (result, frames) = stream_frames(
+        &adapter_with(&[("google", Some("key"), &blocked)]),
+        &google_config(false),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "Google blocked the prompt: SAFETY");
+    assert!(frames.is_empty());
+
+    let empty = sse_server(
+        "/v1beta/models/gemini-2.0-flash:streamGenerateContent",
+        "data: {\"usageMetadata\":{\"promptTokenCount\":4,\"totalTokenCount\":4}}\n\n".into(),
+    )
+    .await;
+    let (result, _) = stream_frames(
+        &adapter_with(&[("google", Some("key"), &empty)]),
+        &google_config(false),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), "Google response missing candidates");
+
+    // The non-streamed parser (also the JSON fallback) names the block reason too.
+    let error = crate::google::parse_google_response(
+        &json!({"promptFeedback": {"blockReason": "PROHIBITED_CONTENT"}}),
+    )
+    .unwrap_err();
+    assert_eq!(error, "Google blocked the prompt: PROHIBITED_CONTENT");
+}
