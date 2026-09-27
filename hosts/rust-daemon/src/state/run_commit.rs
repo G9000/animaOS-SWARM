@@ -4,18 +4,44 @@ use std::sync::Arc;
 
 use anima_core::primitives::now_millis;
 use anima_core::{
-    AgentRuntime, AgentRuntimeSnapshot, AgentState, AgentStatus, Message, MessageRole,
-    RuntimeRunBase,
+    select_context, AgentRuntime, AgentRuntimeSnapshot, AgentState, AgentStatus, Content,
+    ContextSummary, DataValue, Message, MessageRole, Provider, RuntimeRunBase, TokenEstimator,
+    REVISED_METADATA_KEY,
 };
 
 use super::DaemonState;
+use crate::history::MessageOrder;
 use crate::runs::{RunChangeSet, RunError, RunOutcome, RunSource, RunStatus, AGENT_DELETED};
+use crate::sessions::context::{uncovered_pruned_through, ContextBudget, SessionSummaryProvider};
+use crate::sessions::SessionPrunedThrough;
 use crate::tools::ToolExecutionContext;
 
-/// Interim `schedule:` room context cap (controller ruling, M2 pre-flight
-/// audit finding 5): the newest whole turns a run's history keeps once
-/// silent check-in pairs are dropped. M3's context selection replaces this.
-const SCHEDULE_ROOM_CONTEXT_TURNS: usize = 10;
+/// What a run starts from (spec §4.4 item 1, §5).
+pub(crate) struct RunBuild {
+    pub(crate) runtime: AgentRuntime,
+    pub(crate) tools: ToolExecutionContext,
+    pub(crate) base: RuntimeRunBase,
+    pub(crate) context: RunContextReport,
+}
+
+/// How a run's history was selected (spec §5).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RunContextReport {
+    pub(crate) budget_tokens: u64,
+    /// The selected history, the summary, and the current message, estimated
+    /// without calibration: the denominator of the next calibration. It
+    /// leaves out the system prompt and the tool schemas; the factor absorbs
+    /// that fixed overhead (audit M10), so it often sits at the 2.0 clamp in
+    /// a short session and settles as the history grows.
+    pub(crate) raw_estimate_tokens: u64,
+    /// The newest message left out that no summary covers (spec §5.3): the
+    /// newest dropped turn's last message, or the newest pruned message when
+    /// the summary does not reach it (audit I5) and it is newer.
+    pub(crate) trimmed_through: Option<String>,
+    /// Every message the selection left out, oldest first (compaction's
+    /// input, Task 12); pruned messages are not in the control plane.
+    pub(crate) dropped: Vec<Message>,
+}
 
 impl DaemonState {
     /// A tool context wired to this daemon's memory, workspace, and connectors.
@@ -34,54 +60,102 @@ impl DaemonState {
         .with_mail(self.mail_manager.clone())
     }
 
-    /// An isolated runtime for one run of `agent_id` in `room_id`: the
-    /// canonical state and counters with a trimmed copy of that room's
-    /// history, the standard providers, evaluators, and database, and no
-    /// Running→Failed restore conversion. In every room the copy starts at
-    /// the first user message, so it never opens mid-turn (final fix wave
-    /// A2); a `schedule:` room's copy also drops silent check-in pairs
-    /// and keeps only the newest [`SCHEDULE_ROOM_CONTEXT_TURNS`] turns (the
-    /// interim schedule-room cap). The run base counts the trimmed copy, and
-    /// the canonical runtime and its transcript are not touched.
+    /// The room's messages the model may see, oldest first: everything but
+    /// silent check-in pairs (spec §5.2) and drafts an evaluator sent back
+    /// (`revised`; controller ruling, M3 pre-flight audit M17), which stay in
+    /// the transcript because nothing streamed is retracted.
+    pub(crate) fn model_visible_history(&self, agent_id: &str, room_id: &str) -> Vec<Message> {
+        let Some(canonical) = self.agents.get(agent_id) else {
+            return Vec::new();
+        };
+        let room: Vec<&Message> = canonical
+            .messages()
+            .iter()
+            .filter(|message| message.room_id == room_id)
+            .collect();
+        let hidden = crate::sessions::hidden_message_ids(room.iter().copied());
+        room.into_iter()
+            .filter(|message| !hidden.contains(&message.id) && !is_revised_draft(message))
+            .cloned()
+            .collect()
+    }
+
+    /// An isolated runtime for one run of `agent_id` in `room_id` (spec §4.4
+    /// item 1) whose history is the room's model-visible messages selected
+    /// as whole turns within the agent's budget (spec §5.2): silent check-in
+    /// pairs and revised drafts are hidden, the session summary covers what
+    /// it summarizes and joins the context as data, and the current `input`
+    /// and the reply are reserved first. Every room's copy starts at a user
+    /// message, so it never opens mid-turn (final fix wave A2): providers
+    /// reject a tool result whose call is missing. The report names what was
+    /// left out, including pruned turns no summary covers (audit I5). The
+    /// canonical transcript is only read, never written; the run base counts
+    /// the selected copy, so run deltas and commits see exactly what the run
+    /// appends.
     pub(crate) fn build_run_runtime(
         &self,
         agent_id: &str,
         room_id: &str,
-    ) -> Option<(AgentRuntime, ToolExecutionContext, RuntimeRunBase)> {
+        input: &Content,
+    ) -> Option<RunBuild> {
         let canonical = self.agents.get(agent_id)?;
-        let mut history: Vec<Message> = canonical
-            .messages()
+        let history = self.model_visible_history(agent_id, room_id);
+        let session = self
+            .sessions
+            .get(agent_id, &crate::sessions::session_id_for_room(room_id));
+        let summary = session
+            .and_then(|session| session.summary.as_ref())
+            .map(|summary| ContextSummary {
+                text: summary.text.clone(),
+                through_message_id: summary.through_message_id.clone(),
+            });
+        let estimator = TokenEstimator::new(
+            session
+                .and_then(|session| session.context_calibration_permille)
+                .map_or(1.0, |permille| f64::from(permille) / 1000.0),
+        );
+        let budget = ContextBudget::for_config(canonical.config());
+        let selection = select_context(
+            &history,
+            summary.as_ref(),
+            budget.history_tokens(estimator.text_tokens(&input.text)),
+            &estimator,
+        );
+        let raw = TokenEstimator::default();
+        let raw_estimate_tokens = selection
+            .messages
             .iter()
-            .filter(|message| message.room_id == room_id)
-            .cloned()
-            .collect();
-        // Interim context guard (controller ruling, M2 pre-flight audit
-        // finding 5): a `schedule:` room's history drops silent check-in
-        // pairs (the same rule `crate::sessions::hidden_message_ids` gives
-        // session views) and keeps only the newest whole turns. M3's context
-        // selection replaces this for every room.
-        if crate::sessions::schedule_id_of_room(room_id).is_some() {
-            history = recent_turns(history);
-        }
-        // Every room (final fix wave A2): providers reject a tool result
-        // whose call is missing, so a history that starts mid-turn (after a
-        // prune, with an old assistant message kept alone because an
-        // undelivered Telegram record still names it, or in a legacy
-        // transcript) loses its messages before the first user message.
-        // `run_base` below reads this trimmed copy's own length, so run
-        // deltas and commits still see exactly what this run appends; the
-        // canonical transcript above is only read, never written.
-        let first_turn = crate::sessions::turn_starts(&history)
-            .next()
-            .unwrap_or(history.len());
-        history.drain(..first_turn);
+            .map(TokenEstimator::raw_message_tokens)
+            .sum::<u64>()
+            + raw.text_tokens(&input.text)
+            + summary
+                .as_ref()
+                .map_or(0, |summary| raw.text_tokens(&summary.text));
+        let pruned = session.and_then(|session| uncovered_pruned_through(session, &history));
+        let context = RunContextReport {
+            budget_tokens: budget.budget_tokens,
+            raw_estimate_tokens,
+            trimmed_through: newest_left_out(selection.dropped.last(), pruned),
+            dropped: selection.dropped,
+        };
         let mut runtime = AgentRuntime::from_snapshot(
-            canonical.run_snapshot(history),
+            canonical.run_snapshot(selection.messages),
             Arc::clone(&self.model_adapter),
         );
         self.wire_runtime(&mut runtime);
+        if let Some(summary) = summary {
+            let mut providers = crate::components::default_providers(Arc::clone(&self.memory));
+            providers
+                .push(Arc::new(SessionSummaryProvider { text: summary.text }) as Arc<dyn Provider>);
+            runtime.set_providers(providers);
+        }
         let base = runtime.run_base();
-        Some((runtime, self.tool_execution_context(), base))
+        Some(RunBuild {
+            runtime,
+            tools: self.tool_execution_context(),
+            base,
+            context,
+        })
     }
 
     /// Merges a finished run into its agent's canonical record and finalizes
@@ -204,24 +278,30 @@ impl DaemonState {
     }
 }
 
-/// `history` with silent check-in pairs excluded and only the newest
-/// [`SCHEDULE_ROOM_CONTEXT_TURNS`] whole turns kept, cut at a turn start
-/// ([`crate::sessions::turn_starts`]) so a tool-call turn is never split from
-/// its results. With fewer turns nothing is cut here; `build_run_runtime`
-/// drops any messages before the first user message in every room.
-fn recent_turns(history: Vec<Message>) -> Vec<Message> {
-    let hidden = crate::sessions::hidden_message_ids(history.iter());
-    let mut visible: Vec<Message> = history
-        .into_iter()
-        .filter(|message| !hidden.contains(&message.id))
-        .collect();
-    let cutoff = crate::sessions::turn_starts(&visible)
-        .rev()
-        .nth(SCHEDULE_ROOM_CONTEXT_TURNS - 1);
-    if let Some(cutoff) = cutoff {
-        visible.drain(..cutoff);
+/// A draft an evaluator sent back (spec §4.5: kept, marked `revised`).
+fn is_revised_draft(message: &Message) -> bool {
+    message
+        .content
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(REVISED_METADATA_KEY))
+        == Some(&DataValue::Bool(true))
+}
+
+/// The newer of the newest dropped message and the newest pruned message
+/// no summary covers (spec §5.3; audit I5). Pruned turns are older than the
+/// hot tail's turns except around a message pinned by an undelivered reply.
+fn newest_left_out(
+    dropped: Option<&Message>,
+    pruned: Option<&SessionPrunedThrough>,
+) -> Option<String> {
+    match (dropped, pruned) {
+        (Some(dropped), Some(pruned)) if pruned.order() > MessageOrder::of(dropped) => {
+            Some(pruned.message_id.clone())
+        }
+        (Some(dropped), _) => Some(dropped.id.clone()),
+        (None, pruned) => pruned.map(|pruned| pruned.message_id.clone()),
     }
-    visible
 }
 
 #[cfg(test)]
@@ -353,19 +433,17 @@ mod tests {
         run_id: &str,
         text: &str,
     ) -> (RunChangeSet, RunOutcome) {
-        let (mut runtime, _tools, base) = state
-            .build_run_runtime(agent_id, room_id)
+        let input = Content {
+            text: text.into(),
+            ..Content::default()
+        };
+        let build = state
+            .build_run_runtime(agent_id, room_id, &input)
             .expect("agent exists");
+        let (mut runtime, base) = (build.runtime, build.base);
         let history = runtime.messages().to_vec();
         let result = runtime
-            .run_in_room_with_context(
-                room_id.into(),
-                history,
-                Content {
-                    text: text.into(),
-                    ..Content::default()
-                },
-            )
+            .run_in_room_with_context(room_id.into(), history, input)
             .await;
         let change_set = RunChangeSet::new(
             run_id.into(),
@@ -386,12 +464,18 @@ mod tests {
 
         assert!(state.commit_run(&mut change_set, &outcome));
 
-        let (other_room, _, _) = state.build_run_runtime(&agent_id, "room-b").unwrap();
+        let other_room = state
+            .build_run_runtime(&agent_id, "room-b", &Content::default())
+            .unwrap()
+            .runtime;
         assert!(
             other_room.messages().is_empty(),
             "a room starts without other rooms' history"
         );
-        let (same_room, _, _) = state.build_run_runtime(&agent_id, "room-a").unwrap();
+        let same_room = state
+            .build_run_runtime(&agent_id, "room-a", &Content::default())
+            .unwrap()
+            .runtime;
         assert_eq!(same_room.messages().len(), 2);
         assert!(
             same_room.events().is_empty(),
@@ -577,8 +661,7 @@ mod tests {
     }
 
     /// Appends messages straight to the agent's canonical transcript, bypassing
-    /// the run machinery: `build_run_runtime` only reads `self.agents`, so its
-    /// interim `schedule:` room guard needs a long history to trim, not a real run.
+    /// the run machinery: `build_run_runtime` only reads `self.agents`.
     fn seed_history(state: &mut DaemonState, agent_id: &str, messages: Vec<Message>) {
         state
             .agents
@@ -595,12 +678,26 @@ mod tests {
             });
     }
 
-    /// Ruling test 1/2 (M2 pre-flight audit, finding 5): a `schedule:` room
-    /// with 30 prior ticks, half silent, gives the model at most 10 visible
-    /// turns and no `CHECKIN_OK` pairs.
+    /// The agent's budget with a 10-token reply reserve.
+    fn set_budget(state: &mut DaemonState, agent_id: &str, budget: f64) {
+        let mut config = state.agents[agent_id].config().clone();
+        let settings = config.settings.get_or_insert_with(AgentSettings::default);
+        settings.max_tokens = Some(10);
+        settings
+            .additional
+            .insert("contextBudgetTokens".into(), DataValue::Number(budget));
+        state.restore_agent_config(agent_id, config);
+    }
+
+    /// Replaces the M2 interim schedule-room guard (ruling test 1/2): silent
+    /// check-in pairs never reach the model, and the newest spoken turns that
+    /// fit the budget do. Each spoken turn is 21 tokens ("Check status" 11 +
+    /// "Reply NN" 10); "next" is 9 and the reserve 10, so 124 leaves 105: five
+    /// turns.
     #[test]
-    fn schedule_room_context_hides_silent_checkins_and_keeps_the_newest_ten_turns() {
+    fn a_run_context_hides_silent_checkins_and_keeps_the_newest_turns_that_fit() {
         let (mut state, agent_id) = state_with_agent();
+        set_budget(&mut state, &agent_id, 124.0);
         let room = crate::sessions::schedule_room_id("schedule-1");
         let mut messages = Vec::new();
         for tick in 0..30u32 {
@@ -629,130 +726,243 @@ mod tests {
         }
         seed_history(&mut state, &agent_id, messages);
 
-        let (runtime, _tools, _base) = state.build_run_runtime(&agent_id, &room).unwrap();
+        let build = state
+            .build_run_runtime(
+                &agent_id,
+                &room,
+                &Content {
+                    text: "next".into(),
+                    ..Content::default()
+                },
+            )
+            .unwrap();
 
-        let expected: HashSet<String> = (11..30)
+        let expected: HashSet<String> = (21..30)
             .step_by(2)
             .flat_map(|tick| [format!("user-{tick}"), format!("assistant-{tick}")])
             .collect();
-        let actual: HashSet<String> = runtime.messages().iter().map(|m| m.id.clone()).collect();
+        let actual: HashSet<String> = build
+            .runtime
+            .messages()
+            .iter()
+            .map(|message| message.id.clone())
+            .collect();
+        assert_eq!(actual, expected, "the newest five spoken turns fit");
+        assert!(build
+            .runtime
+            .messages()
+            .iter()
+            .all(|message| message.content.text.trim() != "CHECKIN_OK"));
         assert_eq!(
-            actual, expected,
-            "the newest 10 spoken turns remain; every silent check-in pair is dropped"
+            build.context.trimmed_through.as_deref(),
+            Some("assistant-19")
         );
+        assert_eq!(build.context.dropped.len(), 20, "ten spoken turns left out");
+        assert_eq!(build.context.budget_tokens, 124);
         assert_eq!(
-            runtime
-                .messages()
-                .iter()
-                .filter(|message| message.role == MessageRole::User)
-                .count(),
-            10,
-            "at most 10 visible turns reach the model"
-        );
-        assert!(
-            runtime
-                .messages()
-                .iter()
-                .all(|message| message.content.text.trim() != "CHECKIN_OK"),
-            "no CHECKIN_OK pair leaks into the model's context"
+            build.context.raw_estimate_tokens,
+            5 * 21 + 9,
+            "the kept turns and the current message, without calibration"
         );
     }
 
-    /// Ruling test 2/2: a tool-call turn is kept whole even when it sits at
-    /// the newest-10-turns cutoff boundary.
+    /// Ruling test 2/2: a tool-call turn is kept or dropped whole. The
+    /// newest turn is 19 tokens, the tool turn 42, the oldest 20.
     #[test]
-    fn schedule_room_context_keeps_a_tool_call_turn_whole() {
+    fn a_tool_call_turn_is_kept_or_dropped_whole() {
         let (mut state, agent_id) = state_with_agent();
         let room = crate::sessions::schedule_room_id("schedule-2");
-        let mut messages = vec![
-            history_message(&agent_id, &room, "user-0", MessageRole::User, "old", false),
-            history_message(
-                &agent_id,
-                &room,
-                "assistant-0",
-                MessageRole::Assistant,
-                "old reply",
-                false,
-            ),
-            history_message(
-                &agent_id,
-                &room,
-                "user-1",
-                MessageRole::User,
-                "run the tool",
-                false,
-            ),
-            history_message(
-                &agent_id,
-                &room,
-                "assistant-1-call",
-                MessageRole::Assistant,
-                "using a tool",
-                false,
-            ),
-            history_message(
-                &agent_id,
-                &room,
-                "tool-1-result",
-                MessageRole::Tool,
-                "tool output",
-                false,
-            ),
-            history_message(
-                &agent_id,
-                &room,
-                "assistant-1-final",
-                MessageRole::Assistant,
-                "done",
-                false,
-            ),
-        ];
-        for tick in 2..11u32 {
-            messages.push(history_message(
-                &agent_id,
-                &room,
-                &format!("user-{tick}"),
-                MessageRole::User,
-                "tick",
-                false,
-            ));
-            messages.push(history_message(
-                &agent_id,
-                &room,
-                &format!("assistant-{tick}"),
-                MessageRole::Assistant,
-                "reply",
-                false,
-            ));
-        }
-        seed_history(&mut state, &agent_id, messages);
-
-        let (runtime, _tools, _base) = state.build_run_runtime(&agent_id, &room).unwrap();
-
-        let ids: Vec<&str> = runtime.messages().iter().map(|m| m.id.as_str()).collect();
-        assert!(
-            !ids.contains(&"user-0") && !ids.contains(&"assistant-0"),
-            "the oldest turn is trimmed away"
+        seed_history(
+            &mut state,
+            &agent_id,
+            vec![
+                history_message(&agent_id, &room, "user-0", MessageRole::User, "old", false),
+                history_message(
+                    &agent_id,
+                    &room,
+                    "assistant-0",
+                    MessageRole::Assistant,
+                    "old reply",
+                    false,
+                ),
+                history_message(
+                    &agent_id,
+                    &room,
+                    "user-1",
+                    MessageRole::User,
+                    "run the tool",
+                    false,
+                ),
+                history_message(
+                    &agent_id,
+                    &room,
+                    "assistant-1-call",
+                    MessageRole::Assistant,
+                    "using a tool",
+                    false,
+                ),
+                history_message(
+                    &agent_id,
+                    &room,
+                    "tool-1-result",
+                    MessageRole::Tool,
+                    "tool output",
+                    false,
+                ),
+                history_message(
+                    &agent_id,
+                    &room,
+                    "assistant-1-final",
+                    MessageRole::Assistant,
+                    "done",
+                    false,
+                ),
+                history_message(&agent_id, &room, "user-2", MessageRole::User, "tick", false),
+                history_message(
+                    &agent_id,
+                    &room,
+                    "assistant-2",
+                    MessageRole::Assistant,
+                    "reply",
+                    false,
+                ),
+            ],
         );
-        for id in [
-            "user-1",
-            "assistant-1-call",
-            "tool-1-result",
-            "assistant-1-final",
-        ] {
-            assert!(
-                ids.contains(&id),
-                "the tool-call turn at the cutoff stays whole: missing {id}"
-            );
-        }
-        assert_eq!(
-            runtime
+        let input = Content {
+            text: "next".into(),
+            ..Content::default()
+        };
+        let ids = |state: &DaemonState| -> Vec<String> {
+            state
+                .build_run_runtime(&agent_id, &room, &input)
+                .unwrap()
+                .runtime
                 .messages()
                 .iter()
-                .filter(|message| message.role == MessageRole::User)
-                .count(),
-            10,
-            "10 turns remain: the tool-call turn plus 9 simple ticks"
+                .map(|message| message.id.clone())
+                .collect()
+        };
+
+        // 49 for history: the newest turn fits, the tool turn does not.
+        set_budget(&mut state, &agent_id, 68.0);
+        assert_eq!(ids(&state), ["user-2", "assistant-2"]);
+
+        // 75 for history: the tool turn fits whole, the oldest turn does not.
+        set_budget(&mut state, &agent_id, 94.0);
+        assert_eq!(
+            ids(&state),
+            [
+                "user-1",
+                "assistant-1-call",
+                "tool-1-result",
+                "assistant-1-final",
+                "user-2",
+                "assistant-2"
+            ]
+        );
+    }
+
+    /// Audit I5: the trimmed indicator names the newest message left out,
+    /// whether the budget dropped it or pruning removed it.
+    #[test]
+    fn the_trimmed_indicator_names_the_newer_of_the_dropped_and_pruned_messages() {
+        let dropped = history_message(
+            "agent-1",
+            "chat:a",
+            "dropped",
+            MessageRole::Assistant,
+            "old",
+            false,
+        );
+        let pruned = |created_at_ms| crate::sessions::SessionPrunedThrough {
+            message_id: "pruned".into(),
+            created_at_ms,
+        };
+        let (older, newer) = (pruned(0), pruned(5));
+        let newest = super::newest_left_out;
+        assert_eq!(newest(None, None), None);
+        assert_eq!(newest(Some(&dropped), None).as_deref(), Some("dropped"));
+        assert_eq!(newest(None, Some(&older)).as_deref(), Some("pruned"));
+        assert_eq!(
+            newest(Some(&dropped), Some(&older)).as_deref(),
+            Some("dropped"),
+            "pruned turns are older than the hot tail's"
+        );
+        assert_eq!(
+            newest(Some(&dropped), Some(&newer)).as_deref(),
+            Some("pruned"),
+            "an old message a pending reply kept hot is dropped behind newer pruned ones"
+        );
+    }
+
+    /// Controller ruling (M3 pre-flight audit M17): a draft an evaluator
+    /// sent back (`revised: true`) stays in the transcript, since nothing
+    /// streamed is retracted, but never reaches a later run's model.
+    #[test]
+    fn a_run_context_leaves_out_revised_drafts() {
+        let (mut state, agent_id) = state_with_agent();
+        let mut draft = history_message(
+            &agent_id,
+            "chat:a",
+            "draft",
+            MessageRole::Assistant,
+            "first try",
+            false,
+        );
+        draft.content.metadata = Some(BTreeMap::from([(
+            anima_core::REVISED_METADATA_KEY.to_string(),
+            DataValue::Bool(true),
+        )]));
+        seed_history(
+            &mut state,
+            &agent_id,
+            vec![
+                history_message(
+                    &agent_id,
+                    "chat:a",
+                    "user-1",
+                    MessageRole::User,
+                    "hi",
+                    false,
+                ),
+                draft,
+                history_message(
+                    &agent_id,
+                    "chat:a",
+                    "feedback",
+                    MessageRole::System,
+                    "Evaluator requested a revision: be brief",
+                    false,
+                ),
+                history_message(
+                    &agent_id,
+                    "chat:a",
+                    "final",
+                    MessageRole::Assistant,
+                    "hello",
+                    false,
+                ),
+            ],
+        );
+        let ids = |messages: &[Message]| -> Vec<String> {
+            messages.iter().map(|message| message.id.clone()).collect()
+        };
+
+        assert_eq!(
+            ids(&state.model_visible_history(&agent_id, "chat:a")),
+            ["user-1", "feedback", "final"]
+        );
+        let build = state
+            .build_run_runtime(&agent_id, "chat:a", &Content::default())
+            .unwrap();
+        assert_eq!(
+            ids(build.runtime.messages()),
+            ["user-1", "feedback", "final"]
+        );
+        assert_eq!(
+            state.get_agent(&agent_id).unwrap().messages.len(),
+            4,
+            "the canonical transcript keeps the draft"
         );
     }
 

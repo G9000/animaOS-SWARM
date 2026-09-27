@@ -553,6 +553,55 @@ async fn a_start_whose_record_left_the_queue_changes_no_session_state() {
     assert!(model.requests().is_empty());
 }
 
+/// Task 11 ruling (audit M6): the trimmed indicator is marked only after
+/// the accepted-record check, so a refused start leaves a stale indicator
+/// as it was, although this empty session's selection would clear it.
+#[tokio::test]
+async fn a_start_whose_record_left_the_queue_keeps_the_trimmed_indicator() {
+    let model = ScriptedModel::new(vec![]);
+    let (coordinator, agent_id) = coordinator_with(model.clone()).await;
+    add_chat(&coordinator, &agent_id, "chat:kept").await;
+    let stale = crate::sessions::SessionContextTrimmed {
+        dropped_through_message_id: "gone".into(),
+        at_ms: 1,
+    };
+    coordinator
+        .state
+        .write()
+        .await
+        .sessions
+        .get_mut(&agent_id, "chat:kept")
+        .unwrap()
+        .context_trimmed = Some(stale.clone());
+    let settled = seeded_accepted_run(
+        &coordinator,
+        &agent_id,
+        "chat:kept",
+        RunStatus::Completed,
+        false,
+    )
+    .await;
+
+    let refused = coordinator
+        .run_accepted(seeded_request(&agent_id, "chat:kept"), settled)
+        .await
+        .unwrap_err();
+
+    assert_eq!(refused.message(), RUN_NOT_QUEUED);
+    assert_eq!(
+        coordinator
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&agent_id, "chat:kept")
+            .unwrap()
+            .context_trimmed,
+        Some(stale)
+    );
+    assert!(model.requests().is_empty());
+}
+
 /// An accepted run whose start save fails is settled once, as never
 /// started, so its streams hear exactly one terminal event, matching the
 /// ledger.

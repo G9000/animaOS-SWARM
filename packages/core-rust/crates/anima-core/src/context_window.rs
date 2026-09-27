@@ -109,6 +109,11 @@ fn clamp_calibration(value: f64) -> f64 {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextSummary {
     pub text: String,
+    /// Must be the id of a turn-final message (the last message of a turn,
+    /// the one before the next user message). The selection starts at the
+    /// first user message after it, so with an id inside a turn the rest of
+    /// that turn (for example tool results whose call the summary covers)
+    /// would be neither summarized, sent, nor reported as dropped.
     pub through_message_id: String,
 }
 
@@ -305,6 +310,42 @@ mod tests {
         let everything = select_context(&history, None, 1_000, &TokenEstimator::default());
         assert_eq!(everything.messages.len(), 6);
         assert!(everything.dropped.is_empty());
+    }
+
+    /// Task 3 review carry-forward: the first run of a new session has no
+    /// history, or (after a restart mid-turn or a prune) no user message.
+    #[test]
+    fn an_empty_history_or_one_without_a_user_message_selects_and_drops_nothing() {
+        let empty = select_context(&[], None, 1_000, &TokenEstimator::default());
+        assert!(empty.messages.is_empty());
+        assert!(empty.dropped.is_empty());
+        assert_eq!(empty.summarized, 0);
+        assert_eq!(empty.estimated_tokens, 0);
+
+        let no_user = vec![
+            message("orphan-result", MessageRole::Tool, 32),
+            message("orphan-reply", MessageRole::Assistant, 32),
+        ];
+        let selection = select_context(&no_user, None, 1_000, &TokenEstimator::default());
+        assert!(
+            selection.messages.is_empty(),
+            "no turn opens in this history"
+        );
+        assert!(
+            selection.dropped.is_empty(),
+            "messages without a turn opening are left out silently"
+        );
+        assert_eq!(selection.estimated_tokens, 0);
+
+        let summary = ContextSummary {
+            text: "s".repeat(64),
+            through_message_id: "orphan-result".into(),
+        };
+        let summarized =
+            select_context(&no_user, Some(&summary), 1_000, &TokenEstimator::default());
+        assert!(summarized.messages.is_empty());
+        assert_eq!(summarized.summarized, 1);
+        assert_eq!(summarized.estimated_tokens, 24, "only the summary counts");
     }
 
     #[test]

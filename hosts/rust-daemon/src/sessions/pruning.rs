@@ -8,7 +8,7 @@ use anima_core::{AgentRuntimeSnapshot, Message};
 use tokio::sync::MutexGuard;
 use tracing::warn;
 
-use super::{hidden_message_ids, session_id_for_room};
+use super::{hidden_message_ids, session_id_for_room, SessionPrunedThrough};
 use crate::app::SharedDaemonState;
 #[cfg(test)]
 use crate::connectors::OutboundDeliveryState;
@@ -28,6 +28,9 @@ pub(crate) const PRUNE_INTERVAL_MS: u64 = 10 * 60 * 1_000;
 pub(crate) struct PruneUndo {
     agents: Vec<AgentRuntimeSnapshot>,
     marked_outbound: Vec<String>,
+    /// `(agent, session, previous pruned_through)` of each session record
+    /// this pass moved forward.
+    sessions: Vec<(String, String, Option<SessionPrunedThrough>)>,
     pub(crate) message_ids: Vec<String>,
 }
 
@@ -37,7 +40,9 @@ impl DaemonState {
     /// visible messages (the window keeps that turn whole), older than 24
     /// hours, not referenced by an undelivered Telegram record, and not in a
     /// session with an active run. Delivered records of pruned messages are
-    /// marked `messagePruned`. `None` when nothing may be pruned (an
+    /// marked `messagePruned`, and each session record keeps its newest
+    /// pruned message (`prunedThrough`, audit I5) so context selection counts
+    /// those turns as dropped. `None` when nothing may be pruned (an
     /// ephemeral store, a store not yet reconciled since startup, or no
     /// candidates).
     pub(crate) fn prune_hot_tail(&mut self, now_ms: u64) -> Option<PruneUndo> {
@@ -53,6 +58,7 @@ impl DaemonState {
             .collect::<HashSet<_>>();
         let active_sessions = self.runs.active_sessions();
         let mut prunable_by_agent = Vec::new();
+        let mut newest_pruned = Vec::new();
         for (agent_id, runtime) in &self.agents {
             let mut rooms: HashMap<&str, Vec<&Message>> = HashMap::new();
             for message in runtime.messages() {
@@ -69,16 +75,23 @@ impl DaemonState {
                 {
                     continue;
                 }
-                prunable.extend(
-                    outside_newest_visible(&messages)
-                        .iter()
-                        .filter(|message| {
-                            message.created_at_ms <= cutoff
-                                && !undelivered_references.contains(message.id.as_str())
-                                && self.history.is_mirrored(&message.id)
-                        })
-                        .map(|message| message.id.clone()),
-                );
+                let room_prunable: Vec<&Message> = outside_newest_visible(&messages)
+                    .iter()
+                    .copied()
+                    .filter(|message| {
+                        message.created_at_ms <= cutoff
+                            && !undelivered_references.contains(message.id.as_str())
+                            && self.history.is_mirrored(&message.id)
+                    })
+                    .collect();
+                if let Some(newest) = room_prunable.last() {
+                    newest_pruned.push((
+                        agent_id.clone(),
+                        session_id_for_room(room_id),
+                        SessionPrunedThrough::of(newest),
+                    ));
+                }
+                prunable.extend(room_prunable.iter().map(|message| message.id.clone()));
             }
             if !prunable.is_empty() {
                 prunable_by_agent.push((agent_id.clone(), prunable));
@@ -115,6 +128,21 @@ impl DaemonState {
                 undo.marked_outbound.push(id.clone());
             }
         }
+        // Saved with the prune (audit I5). A pass that only removes messages
+        // older than an earlier pass's newest keeps that newest.
+        for (agent_id, session_id, through) in newest_pruned {
+            let Some(record) = self.sessions.get_mut(&agent_id, &session_id) else {
+                continue;
+            };
+            let newer = record
+                .pruned_through
+                .as_ref()
+                .is_none_or(|previous| through.order() > previous.order());
+            if newer {
+                let previous = record.pruned_through.replace(through);
+                undo.sessions.push((agent_id, session_id, previous));
+            }
+        }
         Some(undo)
     }
 
@@ -137,6 +165,15 @@ impl DaemonState {
                 if !still_pruned.contains(&record.agent_id) {
                     record.message_pruned = false;
                 }
+            }
+        }
+        // Sessions whose messages stay pruned keep their newest pruned one.
+        for (agent_id, session_id, previous) in undo.sessions {
+            if still_pruned.contains(&agent_id) {
+                continue;
+            }
+            if let Some(record) = self.sessions.get_mut(&agent_id, &session_id) {
+                record.pruned_through = previous;
             }
         }
     }
@@ -635,6 +672,109 @@ mod tests {
         assert!(
             !guard.history.is_mirrored("a000"),
             "pruned ids are no longer hot"
+        );
+    }
+
+    /// Controller ruling (M3 pre-flight audit I5): the prune records each
+    /// session's newest pruned message in the same save, so context
+    /// selection can count those turns as dropped; a failed save puts the
+    /// previous value back, and an older prune never moves it back.
+    #[tokio::test]
+    async fn pruning_records_each_sessions_newest_pruned_message_with_its_save() {
+        let (state, agent) = mirrored_state(|agent| {
+            let mut messages = room(agent, "chat:a", "a", 204);
+            messages.extend(room(agent, "chat:b", "b", 202));
+            messages
+        })
+        .await;
+        {
+            let mut guard = state.write().await;
+            guard.sessions.insert(crate::sessions::SessionRecord::new(
+                &agent,
+                "chat:a",
+                crate::sessions::SessionKind::Chat,
+                crate::sessions::SessionOrigin::Web,
+                "A".into(),
+                crate::sessions::TitleSource::Owner,
+                1,
+            ));
+        }
+        let pruned_through = |state: &DaemonState| {
+            state
+                .sessions
+                .get(&agent, "chat:a")
+                .unwrap()
+                .pruned_through
+                .clone()
+        };
+        let transactions = Arc::new(Mutex::new(()));
+        let gate = state
+            .write()
+            .await
+            .install_test_control_plane_save_gate(true);
+        gate.release.add_permits(1);
+
+        prune_once(&state, &transactions, NOW_MS)
+            .await
+            .expect_err("the save failed");
+        assert_eq!(pruned_through(&*state.read().await), None);
+
+        assert_eq!(
+            prune_once(&state, &transactions, NOW_MS).await,
+            Ok(4 + 2),
+            "a000–a003 and b000–b001 leave; chat:b has no session record"
+        );
+        assert_eq!(
+            pruned_through(&*state.read().await),
+            Some(crate::sessions::SessionPrunedThrough {
+                message_id: "a003".into(),
+                created_at_ms: 1_003,
+            })
+        );
+
+        // One more turn pushes a004–a005 out: the mark moves forward.
+        let history = state.read().await.history.clone();
+        let grow = |prefix: &'static str| {
+            let state = Arc::clone(&state);
+            let history = history.clone();
+            let agent = agent.clone();
+            async move {
+                seed_messages(
+                    &mut *state.write().await,
+                    &agent,
+                    room(&agent, "chat:a", prefix, 2),
+                );
+                history
+                    .flush_once(&state, &Mutex::new(()), NOW_MS)
+                    .await
+                    .unwrap();
+            }
+        };
+        grow("y").await;
+        assert_eq!(prune_once(&state, &transactions, NOW_MS).await, Ok(2));
+        assert_eq!(
+            pruned_through(&*state.read().await).map(|pruned| pruned.message_id),
+            Some("a005".to_string())
+        );
+
+        // A pass that removes only messages older than the mark keeps it.
+        let newer = crate::sessions::SessionPrunedThrough {
+            message_id: "a999".into(),
+            created_at_ms: 1_999,
+        };
+        state
+            .write()
+            .await
+            .sessions
+            .get_mut(&agent, "chat:a")
+            .unwrap()
+            .pruned_through = Some(newer.clone());
+        grow("z").await;
+        assert_eq!(prune_once(&state, &transactions, NOW_MS).await, Ok(2));
+        assert_eq!(
+            pruned_through(&*state.read().await),
+            Some(newer),
+            "a prune of older messages keeps the newest pruned message"
         );
     }
 

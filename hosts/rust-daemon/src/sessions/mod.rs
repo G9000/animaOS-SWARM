@@ -3,6 +3,7 @@
 //! valid session id; those map to a stable `legacy-room:<hash>` id and keep
 //! their room on the record.
 
+pub(crate) mod context;
 pub(crate) mod migration;
 pub(crate) mod pruning;
 #[cfg(test)]
@@ -169,6 +170,34 @@ pub(crate) struct SessionContextTrimmed {
     pub(crate) at_ms: u64,
 }
 
+/// The newest message hot-tail pruning removed from a session (controller
+/// ruling, M3 pre-flight audit I5), with its transcript position: the turns
+/// through it are no longer in the control plane.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionPrunedThrough {
+    pub(crate) message_id: String,
+    pub(crate) created_at_ms: u64,
+}
+
+impl SessionPrunedThrough {
+    pub(crate) fn of(message: &Message) -> Self {
+        Self {
+            message_id: message.id.clone(),
+            created_at_ms: message.created_at_ms,
+        }
+    }
+
+    /// The message's place in its session's transcript order.
+    pub(crate) fn order(&self) -> crate::history::MessageOrder {
+        crate::history::MessageOrder {
+            created_at_ms: self.created_at_ms,
+            ordinal: crate::history::message_ordinal(&self.message_id),
+            id: self.message_id.clone(),
+        }
+    }
+}
+
 /// The stored session record (spec §3.2). Derived fields are computed per
 /// response and never stored.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +225,16 @@ pub(crate) struct SessionRecord {
     pub(crate) summary: Option<SessionSummary>,
     #[serde(default)]
     pub(crate) context_trimmed: Option<SessionContextTrimmed>,
+    /// The last run's reported prompt tokens over its estimate, in permille
+    /// (spec §5.2 calibration; clamped 500–2000 when written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context_calibration_permille: Option<u32>,
+    /// The newest message hot-tail pruning removed from this session, set in
+    /// the prune's own save (audit I5): a run's context counts the pruned
+    /// turns as dropped unless the summary covers them
+    /// (`context::uncovered_pruned_through`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pruned_through: Option<SessionPrunedThrough>,
     /// The transcript room when it differs from `id`: a legacy room whose id
     /// is not a valid session id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,6 +269,8 @@ impl SessionRecord {
             parent_agent_id: None,
             summary: None,
             context_trimmed: None,
+            context_calibration_permille: None,
+            pruned_through: None,
             room_id: room,
         }
     }
@@ -1486,6 +1527,28 @@ mod tests {
         assert!(!minimal.archived);
         assert_eq!(minimal.summary, None);
         assert_eq!(minimal.last_read_at_ms, None);
+        // M3 fields read as unset from a snapshot written before them.
+        assert_eq!(minimal.context_calibration_permille, None);
+        assert_eq!(minimal.pruned_through, None);
+        let mut context = chat_record("agent-1", "chat:x", 1);
+        let unset = serde_json::to_value(&context).unwrap();
+        assert_eq!(unset.get("contextCalibrationPermille"), None);
+        assert_eq!(unset.get("prunedThrough"), None);
+        context.context_calibration_permille = Some(1_250);
+        context.pruned_through = Some(SessionPrunedThrough {
+            message_id: "m-1".into(),
+            created_at_ms: 7,
+        });
+        let value = serde_json::to_value(&context).unwrap();
+        assert_eq!(value["contextCalibrationPermille"], 1_250);
+        assert_eq!(
+            value["prunedThrough"],
+            serde_json::json!({ "messageId": "m-1", "createdAtMs": 7 })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(value).unwrap(),
+            context
+        );
         assert_eq!(SessionKind::parse("checkin"), Some(SessionKind::Checkin));
         assert_eq!(SessionKind::parse("chats"), None);
         assert_eq!(SessionOrigin::Delegation.as_str(), "delegation");

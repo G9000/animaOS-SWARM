@@ -6,6 +6,9 @@ mod session_state;
 mod swarm_relationships;
 mod swarm_runtime;
 mod swarm_tools;
+pub(crate) use self::run_commit::RunBuild;
+#[allow(unused_imports)] // M3 Task 12's compaction takes a run's `RunContextReport`.
+pub(crate) use self::run_commit::RunContextReport;
 pub(crate) use self::session_state::RunSessionRequest;
 
 use std::collections::{HashMap, HashSet};

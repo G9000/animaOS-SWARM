@@ -1141,6 +1141,8 @@ impl AgentRunCoordinator {
             mut runtime,
             tool_context,
             base,
+            context,
+            previous_trimmed,
             run_id,
             session_id,
             session_created,
@@ -1169,7 +1171,12 @@ impl AgentRunCoordinator {
                     return Err(ApiError::conflict(RUN_NOT_QUEUED));
                 }
             }
-            let Some((runtime, tool_context, base)) = guard.build_run_runtime(&agent_id, &room_id)
+            let Some(crate::state::RunBuild {
+                runtime,
+                tools: tool_context,
+                base,
+                context,
+            }) = guard.build_run_runtime(&agent_id, &room_id, &content)
             else {
                 return Err(ApiError::not_found());
             };
@@ -1205,6 +1212,19 @@ impl AgentRunCoordinator {
                 first_text: &content.text,
                 now_ms,
             });
+            // Spec §5.3: saved with the run start below; restored if that
+            // fails. After the accepted-record check above, so a rejected
+            // start leaves no session change behind (audit M6).
+            let previous_trimmed = guard
+                .sessions
+                .get_mut(&agent_id, &session_id)
+                .map(|session| {
+                    crate::sessions::context::mark_context_trimmed(
+                        session,
+                        context.trimmed_through.as_deref(),
+                        now_ms,
+                    )
+                });
             // A run started by a run whose stop is already saved (a helper or
             // delegation its tool was still starting) is stopped too (spec
             // §4.6): its stop is saved with its start, and its control is
@@ -1269,6 +1289,8 @@ impl AgentRunCoordinator {
                 runtime,
                 tool_context,
                 base,
+                context,
+                previous_trimmed,
                 run_id,
                 session_id,
                 session_created,
@@ -1320,6 +1342,12 @@ impl AgentRunCoordinator {
                     anima_core::primitives::now_millis(),
                 );
                 live_run.publish_record(&failed);
+            }
+            if let (Some(previous), Some(session)) = (
+                previous_trimmed,
+                guard.sessions.get_mut(&agent_id, &session_id),
+            ) {
+                session.context_trimmed = previous;
             }
             if session_created {
                 guard.sessions.remove(&agent_id, &session_id);
@@ -1538,6 +1566,25 @@ impl AgentRunCoordinator {
                     live_run.publish_record(record);
                 }
                 return Err(ApiError::not_found());
+            }
+            // The next run's estimates follow this provider's count (spec
+            // §5.2): the first model call's reported prompt tokens over this
+            // run's uncalibrated estimate, which leaves out the system prompt
+            // and the tool schemas (the factor absorbs them, audit M10).
+            // Clamped to 0.5–2.0 and saved with this commit; a provider that
+            // reports no prompt tokens leaves the previous factor.
+            let reported_prompt_tokens = guard
+                .live
+                .runs()
+                .steps(&run_id)
+                .first()
+                .map(|step| step.usage.prompt_tokens)
+                .filter(|tokens| *tokens > 0);
+            if let Some(reported) = reported_prompt_tokens {
+                let factor = anima_core::calibration_factor(reported, context.raw_estimate_tokens);
+                if let Some(session) = guard.sessions.get_mut(&agent_id, &session_id) {
+                    session.context_calibration_permille = Some((factor * 1000.0).round() as u32);
+                }
             }
             if let Err(error) = commit(&mut guard, &outcome) {
                 let offered = guard
@@ -1912,6 +1959,8 @@ async fn persist_task_result_memory(
     }
 }
 
+#[cfg(test)]
+mod context_tests;
 #[cfg(test)]
 mod live_tests;
 #[cfg(test)]
