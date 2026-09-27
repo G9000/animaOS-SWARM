@@ -52,6 +52,11 @@ function sameText(id: string, overrides: Partial<Run> = {}): Run {
   });
 }
 
+/** The run the daemon made of the steer: it carries the steer's key. */
+function ownRun(id: string, overrides: Partial<Run> = {}): Run {
+  return sameText(id, { idempotencyKey: 'key-1', ...overrides });
+}
+
 function steerMessage(): SessionMessage {
   return {
     id: 'm-steer',
@@ -76,9 +81,8 @@ function setup(initial: Partial<SessionPendingOptions>) {
     reads.history += 1;
   });
   const refreshRuns = vi.fn();
-  const ledger = (landed: number | null, runs: readonly Run[] = []) => ({
+  const ledger = (landed: number | null) => ({
     landed,
-    runs,
     started: () => reads.ledger,
   });
   const view = renderHook(
@@ -157,72 +161,64 @@ describe('useSessionPending', () => {
     expect(settle).not.toHaveBeenCalled();
   });
 
-  it('settles a steer that became a run of its own, but not on an older run with the same text', () => {
-    const older = sameText('run_6');
-    const { rerender, settle } = setup({
-      sends: [send()],
-      runs: [emptyLiveRun(older), emptyLiveRun(joined())],
-    });
+  it('settles a steer that became a run of its own, found by its key', () => {
+    const { rerender, settle } = steered();
+    const own = ownRun('run_8', { status: 'interrupted', createdAtMs: 20 });
     rerender({
       sends: [steering],
-      runs: [emptyLiveRun(older), emptyLiveRun(joined())],
-    });
-    expect(settle).not.toHaveBeenCalled();
-
-    const own = sameText('run_8', { status: 'interrupted', createdAtMs: 20 });
-    rerender({
-      sends: [steering],
-      runs: [
-        emptyLiveRun(older),
-        emptyLiveRun(joined({ status: 'cancelled' })),
-        emptyLiveRun(own),
-      ],
+      runs: [emptyLiveRun(joined({ status: 'cancelled' })), emptyLiveRun(own)],
     });
     expect(settle).toHaveBeenCalledWith('key-1');
   });
 
-  it('counts a same-text run from a ledger read begun before the steer as older', () => {
-    // The session's first ledger read (read 1) is still on its way.
-    const older = sameText('run_6');
-    const view = setup({
-      sends: [send()],
-      runs: [emptyLiveRun(joined())],
-      ledger: { landed: null, runs: [], started: () => 1 },
+  it('never takes another message with the same text for the steer’s own run', () => {
+    const view = steered();
+    // Sent after the steer, with the same words, under a key of its own.
+    const other = sameText('run_8', {
+      idempotencyKey: 'key-2',
+      createdAtMs: 20,
     });
+    view.reads.ledger = 2;
     view.rerender({
       sends: [steering],
-      runs: [emptyLiveRun(older), emptyLiveRun(joined())],
-      ledger: view.ledger(1, [older]),
+      runs: [emptyLiveRun(joined()), emptyLiveRun(other)],
+      ledger: view.ledger(2),
     });
     expect(view.settle).not.toHaveBeenCalled();
-
-    // Read 2, begun after the steer, may hold the run it became.
-    view.reads.ledger = 2;
-    const own = sameText('run_8', { createdAtMs: 20 });
-    view.rerender({
-      sends: [steering],
-      runs: [emptyLiveRun(older), emptyLiveRun(joined()), emptyLiveRun(own)],
-      ledger: view.ledger(2, [older, own]),
-    });
-    expect(view.settle).toHaveBeenCalledWith('key-1');
   });
 
-  it('never counts a read begun after the steer as older, even after leaving the session and coming back', () => {
+  it('finds the steer’s own run after leaving the session and coming back', () => {
     const view = steered();
     view.rerender({
       sends: [steering],
       session: { agentId: 'agent-main', sessionId: 'chat:b' },
       ledger: view.ledger(null),
     });
-    // Back in room-7 its first ledger read is read 3.
     view.reads.ledger = 3;
-    const own = sameText('run_8', { createdAtMs: 20 });
+    const own = ownRun('run_8', { createdAtMs: 20 });
     view.rerender({
       sends: [steering],
       runs: [emptyLiveRun(joined({ status: 'completed' })), emptyLiveRun(own)],
-      ledger: view.ledger(3, [own]),
+      ledger: view.ledger(3),
     });
     expect(view.settle).toHaveBeenCalledWith('key-1');
+  });
+
+  it('hides a message once a run with its key shows it, so its text shows once', () => {
+    const queued = send({ key: 'k-q', mode: 'queue', text: 'Book the train' });
+    const { result, rerender, settle } = setup({ sends: [queued] });
+    expect(result.current.map((item) => item.key)).toEqual(['k-q']);
+
+    // The stream announced its run before the daemon's answer arrived.
+    const run = runFixture('run_q', {
+      sessionId: 'room-7',
+      idempotencyKey: 'k-q',
+      input: { text: 'Book the train', attachmentIds: [], skill: null },
+    });
+    rerender({ sends: [queued], runs: [emptyLiveRun(run)] });
+    expect(result.current).toEqual([]);
+    // Only hidden: the queue settles it once its answer arrives.
+    expect(settle).not.toHaveBeenCalled();
   });
 
   it('recovers a failed reply’s steer after an applied history read and a landed ledger read, both begun after the failure', () => {
@@ -302,7 +298,7 @@ describe('useSessionPending', () => {
     view.rerender({ sends: [steering], runs: failedRuns, appliedRead: 2 });
     // The daemon announces the steer's `failed_before_start` run after a
     // second save; the ledger read has it.
-    const own = sameText('run_8', {
+    const own = ownRun('run_8', {
       status: 'interrupted',
       createdAtMs: 20,
       error: { code: 'failed_before_start', message: 'send it again' },
@@ -312,7 +308,7 @@ describe('useSessionPending', () => {
       sends: [steering],
       runs: [...failedRuns, emptyLiveRun(own)],
       appliedRead: 2,
-      ledger: view.ledger(2, [own]),
+      ledger: view.ledger(2),
     });
     expect(view.settle).toHaveBeenCalledWith('key-1');
     expect(view.onRecover).not.toHaveBeenCalled();

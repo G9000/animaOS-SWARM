@@ -184,6 +184,33 @@ describe('useSessionSends', () => {
     expect(result.current.sends).toEqual([]);
   });
 
+  it('keeps a retried steer that the daemon answers as a steer', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    // The first attempt joined the run, but its answer was lost.
+    vi.spyOn(daemon, 'startRun')
+      .mockRejectedValueOnce(new DaemonConnectionError('', new Error('down')))
+      .mockResolvedValue({
+        run: runFixture('run_1', { status: 'running' }),
+        steer: { status: 'pending' },
+      });
+    const onAccepted = vi.fn();
+    const { result } = renderHook(() =>
+      useSessionSends({ onAccepted, onFailed: vi.fn() }),
+    );
+
+    act(() => result.current.send({ ...message('s'), mode: 'steer' }));
+    await waitFor(() => expect(result.current.sends[0]?.failures).toBe(1));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SEND_RETRY_DELAYS_MS[0]);
+    });
+
+    await waitFor(() =>
+      expect(result.current.sends[0]?.steeringRunId).toBe('run_1'),
+    );
+    expect(result.current.sends.map((send) => send.key)).toEqual(['s']);
+    expect(onAccepted).toHaveBeenCalledTimes(1);
+  });
+
   it('forgets a deleted companion’s sends without reporting them', async () => {
     const first = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
     const startRun = vi

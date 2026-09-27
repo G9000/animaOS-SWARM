@@ -3168,15 +3168,17 @@ it('keeps a steer through a reconnect until its message is in history', async ()
 });
 
 it('shows a steer the reply did not take as a queued message of its own', async () => {
-  const { stream, run } = await steerIntoRunningReply();
+  const { stream, run, key } = await steerIntoRunningReply();
 
-  // The reply ended before its next model call: the daemon queued the steer.
+  // The reply ended before its next model call: the daemon queued the
+  // steer, under the steer's own key.
   act(() =>
     stream.push(
       runEvent(
         'run.queued',
         runFixture('run_8', {
           sessionId: 'room-7',
+          idempotencyKey: key,
           createdAtMs: Date.now(),
           input: { text: 'also check trains', attachmentIds: [], skill: null },
         }),
@@ -3405,6 +3407,31 @@ it('shows an accepted message as its queued run until the reply begins', async (
   );
   expect(screen.getByText('Book the train')).toBeVisible();
   expect(screen.getByRole('button', { name: 'Stop' })).toBeVisible();
+});
+
+it('shows a message once when its run arrives before the daemon’s answer', async () => {
+  const user = userEvent.setup();
+  const answer = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+  vi.mocked(daemon.startRun).mockReturnValue(answer.promise);
+  const { input, stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  await user.type(input, 'Book the train{Enter}');
+  expect(await screen.findByText('Sending…')).toBeVisible();
+  const [[, , , key]] = vi.mocked(daemon.startRun).mock.calls;
+  const run = runFixture('run_1', {
+    sessionId: 'room-7',
+    idempotencyKey: key,
+    createdAtMs: Date.now(),
+    input: { text: 'Book the train', attachmentIds: [], skill: null },
+  });
+
+  act(() => stream.push(runEvent('run.queued', run, 2)));
+  expect(await screen.findByText('Queued')).toBeVisible();
+  expect(screen.getAllByText('Book the train')).toHaveLength(1);
+  expect(screen.queryByText('Sending…')).not.toBeInTheDocument();
+
+  await act(async () => answer.resolve({ run }));
+  expect(screen.getAllByText('Book the train')).toHaveLength(1);
 });
 
 it('shows an accepted message from the ledger without the event stream', async () => {
@@ -3773,7 +3800,7 @@ it('polls slowly while the stream is open and reads full records for Settings', 
 });
 
 it('does not offer a failed reply’s steer twice when the ledger shows it as its own run', async () => {
-  const { stream, run } = await steerIntoRunningReply();
+  const { stream, run, key } = await steerIntoRunningReply();
   // The commit failed: the joined run fails first, and the steer's own
   // `failed_before_start` run is announced only after a second save, so
   // the ledger read after the failure is the first to show it.
@@ -3804,6 +3831,7 @@ it('does not offer a failed reply’s steer twice when the ledger shows it as it
     ledger.resolve([
       runFixture('run_8', {
         sessionId: 'room-7',
+        idempotencyKey: key,
         status: 'interrupted',
         createdAtMs: Date.now(),
         error: {

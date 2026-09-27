@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from 'react';
-import type { Run, SessionMessage } from '@animaOS-SWARM/sdk';
+import type { SessionMessage } from '@animaOS-SWARM/sdk';
 
 import type { LiveRun } from '../lib/session-events';
 import type { PendingBubble } from '../lib/transcript';
@@ -16,12 +16,11 @@ export interface SessionPendingOptions {
   messages: readonly SessionMessage[];
   /** The open session's runs, from its stream and ledger. */
   runs: readonly LiveRun[];
-  /** The open session's ledger: its runs on screen, the number of the read
-   *  they came from (null before the session's first), and how many reads
-   *  have begun (reads are numbered as they begin). */
+  /** The open session's ledger: the number of the read on screen (null
+   *  before the session's first), and how many reads have begun (reads are
+   *  numbered as they begin). */
   ledger: {
     landed: number | null;
-    runs: readonly Run[];
     started: () => number;
   };
   /** The number of the newest history read on screen (0 before one). */
@@ -35,14 +34,6 @@ export interface SessionPendingOptions {
   /** A steer that no run took and no history holds: its text goes to the
    *  composer's recovery panel. */
   onRecover: (send: SessionSend) => void;
-}
-
-/** The runs a steer cannot have become: those its session had when it was
- *  sent, and those of any ledger read begun by then (numbered up to
- *  `before`). */
-interface SteerBaseline {
-  ids: Set<string>;
-  before: number;
 }
 
 /** A failed reply's steer, waiting for a history read and a ledger read
@@ -88,10 +79,12 @@ function shownSteers(
 
 /**
  * The open session's sends as pending bubbles (spec §15.5), and the steers'
- * lifecycle (M3 audit I3, web part). A steer's text stays on screen until
- * history holds its message (`clientRequestId`, the send's key) or it shows
- * as a run of its own (the daemon queues a steer its reply did not take,
- * and makes one it could not queue an `interrupted` run to send again).
+ * lifecycle (M3 audit I3, web part). A send's bubble steps aside once a run
+ * with its key (`Run.idempotencyKey`) shows it, so its text shows once. A
+ * steer's text stays on screen until history holds its message
+ * (`clientRequestId`, the send's key) or it shows as a run of its own, found
+ * by its key (the daemon queues a steer its reply did not take, and makes
+ * one it could not queue an `interrupted` run to send again).
  * While the reply it joined shows it as taken, the run shows the text and
  * the bubble steps aside. A reconnect settles nothing. If the reply ends
  * `failed` or `interrupted`, the text moves to the recovery panel only once
@@ -124,7 +117,6 @@ export function useSessionPending({
     [sends, agentId, sessionId],
   );
 
-  const baselinesRef = useRef(new Map<string, SteerBaseline>());
   const checksRef = useRef(new Map<string, RecoveryCheck>());
   /** Steers already handed to the recovery panel, until they leave the
    *  queue. */
@@ -140,42 +132,20 @@ export function useSessionPending({
   }, [agentId, sessionId]);
 
   useEffect(() => {
-    const baselines = baselinesRef.current;
     const checks = checksRef.current;
     const queued = new Set(sends.map((item) => item.key));
-    for (const key of baselines.keys())
-      if (!queued.has(key)) baselines.delete(key);
     for (const key of checks.keys()) if (!queued.has(key)) checks.delete(key);
     for (const key of recoveredRef.current)
       if (!queued.has(key)) recoveredRef.current.delete(key);
-    for (const send of open) {
-      if (send.mode !== 'steer') continue;
-      let baseline = baselines.get(send.key);
-      if (!baseline) {
-        baseline = {
-          ids: new Set(runs.map((item) => item.run.id)),
-          before: ledger.started(),
-        };
-        baselines.set(send.key, baseline);
-      }
-      // A ledger read begun before the steer went out cannot hold its run,
-      // even when it lands later.
-      if (ledger.landed !== null && ledger.landed <= baseline.before)
-        for (const run of ledger.runs) baseline.ids.add(run.id);
-    }
 
     for (const send of open) {
       if (!send.steeringRunId || recoveredRef.current.has(send.key)) continue;
-      const baseline = baselines.get(send.key);
       const inHistory = messages.some(
         (message) => message.metadata.clientRequestId === send.key,
       );
-      const ownRun = runs.some(
-        (item) =>
-          item.run.id !== send.steeringRunId &&
-          !baseline?.ids.has(item.run.id) &&
-          item.run.input.text === send.text,
-      );
+      // The run the daemon made of the steer carries the steer's key; a
+      // message with the same words is another message.
+      const ownRun = runs.some((item) => item.run.idempotencyKey === send.key);
       if (inHistory || ownRun) {
         checks.delete(send.key);
         settle(send.key);
@@ -232,6 +202,10 @@ export function useSessionPending({
 
   return useMemo(() => {
     const shown = shownSteers(open, runs);
+    // A run with the send's key shows its text (the stream can announce it
+    // before the daemon's answer arrives).
+    for (const item of runs)
+      if (item.run.idempotencyKey) shown.add(item.run.idempotencyKey);
     return open
       .filter((item) => !shown.has(item.key))
       .map(
