@@ -270,6 +270,28 @@ describe('SessionSidebar', () => {
     expect(helperTrigger).toHaveFocus();
   });
 
+  it('closes the row menu and its delete confirmation on a press outside it', async () => {
+    const user = userEvent.setup();
+    const plans = sessionFixture('chat:plans', {
+      title: 'Plans',
+      lastActivityAtMs: NOW.getTime(),
+    });
+    renderSidebar({ sessions: [plans] });
+    const rowTrigger = screen.getByRole('button', {
+      name: 'Actions for Plans',
+    });
+
+    await user.click(rowTrigger);
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }));
+    expect(screen.getByText(/memories are kept/i)).toBeVisible();
+    fireEvent.pointerDown(document.body);
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument();
+    // Reopened, the menu shows its actions, not the confirmation.
+    await user.click(rowTrigger);
+    expect(screen.getByRole('menuitem', { name: 'Delete' })).toBeVisible();
+    expect(screen.queryByText(/memories are kept/i)).not.toBeInTheDocument();
+  });
+
   // C: sidebar paging.
   it('shows a keyboard-reachable Load more sessions button while more sessions remain', async () => {
     const onLoadMore = vi.fn();

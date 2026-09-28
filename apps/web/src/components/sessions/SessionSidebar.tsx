@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from 'react';
 import type { Session, SessionKind } from '@animaOS-SWARM/sdk';
 
 import {
@@ -64,10 +70,10 @@ function SessionRow({
   const [title, setTitle] = useState(session.title);
   const menuTriggerRef = useRef<HTMLButtonElement>(null);
   const rowRef = useRef<HTMLDivElement>(null);
-  const closeMenu = () => {
+  const closeMenu = useCallback(() => {
     setMenuOpen(false);
     setConfirmDelete(false);
-  };
+  }, []);
   // Controller ruling 1 (M2 pre-flight audit): Escape closes the row menu
   // and returns focus to the trigger that opened it.
   const closeMenuToTrigger = () => {
@@ -84,14 +90,12 @@ function SessionRow({
   useEffect(() => {
     if (!menuOpen) return;
     const closeOutside = (event: Event) => {
-      if (rowRef.current && !rowRef.current.contains(event.target as Node)) {
-        setMenuOpen(false);
-        setConfirmDelete(false);
-      }
+      if (rowRef.current && !rowRef.current.contains(event.target as Node))
+        closeMenu();
     };
     document.addEventListener('pointerdown', closeOutside);
     return () => document.removeEventListener('pointerdown', closeOutside);
-  }, [menuOpen]);
+  }, [menuOpen, closeMenu]);
 
   return (
     <div
