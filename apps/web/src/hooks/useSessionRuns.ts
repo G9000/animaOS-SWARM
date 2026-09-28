@@ -46,18 +46,27 @@ export function useSessionLedger(
     if (!key || !agentId || !sessionId) return;
     let current = true;
     const read = ++readsRef.current;
-    daemon.sessionRuns(agentId, sessionId, { limit: SESSION_RUNS_LIMIT }).then(
-      (runs) => {
-        if (current) setLoaded({ key, runs, landed: read });
-      },
-      (caught) => {
-        // A daemon without the route, or a deleted session, has none.
-        if (current && httpStatus(caught) === 404)
-          setLoaded({ key, runs: [], landed: read });
-      },
-    );
+    // A read the view no longer wants (another session opened, a newer
+    // read began, or the view closed) is aborted, not just ignored (T20).
+    const controller = new AbortController();
+    daemon
+      .sessionRuns(agentId, sessionId, {
+        limit: SESSION_RUNS_LIMIT,
+        signal: controller.signal,
+      })
+      .then(
+        (runs) => {
+          if (current) setLoaded({ key, runs, landed: read });
+        },
+        (caught) => {
+          // A daemon without the route, or a deleted session, has none.
+          if (current && httpStatus(caught) === 404)
+            setLoaded({ key, runs: [], landed: read });
+        },
+      );
     return () => {
       current = false;
+      controller.abort();
     };
   }, [key, agentId, sessionId, refreshKey]);
   return useMemo(

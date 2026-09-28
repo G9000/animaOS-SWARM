@@ -2640,7 +2640,7 @@ it('does not report delivery for a Telegram reply whose run failed', async () =>
     expect(daemon.sessionRuns).toHaveBeenCalledWith(
       'agent-main',
       'telegram:tg-1',
-      { limit: 20 },
+      { limit: 20, signal: expect.any(AbortSignal) },
     ),
   );
   await act(async () => {

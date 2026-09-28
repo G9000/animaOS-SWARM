@@ -30,11 +30,34 @@ describe('useSessionRuns', () => {
     );
     expect(list).toHaveBeenCalledWith('agent-main', 'chat:1', {
       limit: SESSION_RUNS_LIMIT,
+      signal: expect.any(AbortSignal),
     });
     rerender({ refresh: 1 });
     await waitFor(() =>
       expect(result.current.map((run) => run.id)).toEqual(['run_2', 'run_1']),
     );
+  });
+
+  it('aborts a read in flight when the session changes or the view closes (T20)', () => {
+    const list = vi
+      .spyOn(daemon, 'sessionRuns')
+      .mockReturnValue(new Promise<never>(() => {}));
+    const { rerender, unmount } = renderHook(
+      ({ sessionId }) => useSessionRuns('agent-main', sessionId),
+      { initialProps: { sessionId: 'chat:1' } },
+    );
+    const signalOf = (index: number) => {
+      const signal = list.mock.calls[index][2]?.signal;
+      if (!signal) throw new Error('no signal');
+      return signal;
+    };
+
+    expect(signalOf(0).aborted).toBe(false);
+    rerender({ sessionId: 'chat:2' });
+    expect(signalOf(0).aborted).toBe(true);
+    expect(signalOf(1).aborted).toBe(false);
+    unmount();
+    expect(signalOf(1).aborted).toBe(true);
   });
 
   it('shows no runs of another session, nor any when the route is missing', async () => {
