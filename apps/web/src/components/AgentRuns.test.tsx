@@ -451,3 +451,26 @@ it('retains goal selection and changes the request key when its linkage changes'
     create.mock.calls[0][1].requestKey,
   );
 });
+
+it('labels an attempt the owner stopped as Stopped', async () => {
+  vi.spyOn(daemon, 'agentJobs').mockResolvedValue([
+    {
+      ...job,
+      status: 'failed',
+      attempts: [
+        {
+          attempt: 1,
+          status: 'stopped',
+          startedAtMs: 1,
+          finishedAtMs: 2,
+          result: null,
+          error: null,
+          resultTruncated: false,
+          review: null,
+        },
+      ],
+    },
+  ]);
+  render(<AgentRunsView agentId="a" />);
+  expect(await screen.findByText(/Saved attempt 1 · Stopped/)).toBeVisible();
+});
