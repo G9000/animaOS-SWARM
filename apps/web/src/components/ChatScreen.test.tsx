@@ -493,7 +493,31 @@ describe('Composer commands and live replies', () => {
     expect(props.onSend).not.toHaveBeenCalled();
     fireEvent.keyDown(input, { key: 'Enter' });
     expect(props.onSend).toHaveBeenCalledTimes(1);
-    expect(screen.getByText('⏎ queue · ⌘⏎ steer · ⇧⏎ new line')).toBeVisible();
+    // jsdom reports no Mac platform, so the hint names Ctrl+Enter (S3b-E).
+    expect(
+      screen.getByText('⏎ queue · Ctrl+Enter steer · ⇧⏎ new line'),
+    ).toBeVisible();
+  });
+
+  it('shows the ⌘ steer hint on a Mac', () => {
+    vi.stubGlobal('navigator', { ...navigator, platform: 'MacIntel' });
+    try {
+      render(
+        <Composer
+          {...composerProps({
+            draft: 'and Sunday?',
+            runActive: true,
+            onStop: vi.fn(),
+            onSteer: vi.fn(),
+          })}
+        />,
+      );
+      expect(
+        screen.getByText('⏎ queue · ⌘⏎ steer · ⇧⏎ new line'),
+      ).toBeVisible();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('does not steer or send while composing IME text', () => {
@@ -518,14 +542,17 @@ describe('Composer commands and live replies', () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
-  it('wires the input to the open command menu as a combobox, and picking an option keeps focus in the input', async () => {
+  it('wires the input to the open command menu, and picking an option keeps focus in the input', async () => {
     const props = composerProps({ draft: '/co' });
     render(<Composer {...props} />);
     const input = screen.getByRole('textbox', { name: 'Message Nova' });
     const listbox = screen.getByRole('listbox');
     const option = screen.getByRole('option', { selected: true });
 
-    expect(input).toHaveAttribute('aria-expanded', 'true');
+    // A textbox takes aria-autocomplete, aria-controls and
+    // aria-activedescendant, but not aria-expanded (S3b-E).
+    expect(input).not.toHaveAttribute('aria-expanded');
+    expect(input).toHaveAttribute('aria-autocomplete', 'list');
     expect(input).toHaveAttribute('aria-controls', listbox.id);
     expect(input).toHaveAttribute('aria-activedescendant', option.id);
 
@@ -535,12 +562,12 @@ describe('Composer commands and live replies', () => {
     expect(document.activeElement).toBe(input);
   });
 
-  it('closes the combobox wiring once no command matches', () => {
+  it('drops the menu wiring once no command matches', () => {
     const props = composerProps({ draft: 'hello' });
     render(<Composer {...props} />);
     const input = screen.getByRole('textbox', { name: 'Message Nova' });
 
-    expect(input).toHaveAttribute('aria-expanded', 'false');
+    expect(input).not.toHaveAttribute('aria-expanded');
     expect(input).not.toHaveAttribute('aria-controls');
     expect(input).not.toHaveAttribute('aria-activedescendant');
   });

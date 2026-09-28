@@ -230,11 +230,13 @@ describe('SessionView', () => {
       'aria-live',
       'polite',
     );
-    expect(
-      screen.getByText(
-        'Earlier messages could not be summarized: model unavailable',
-      ),
-    ).toBeVisible();
+    const note = screen.getByText(
+      'Earlier messages could not be summarized: model unavailable',
+    );
+    expect(note).toBeVisible();
+    // The note sits inside a status region that stays mounted, so its text
+    // is announced when it arrives (S3b-E).
+    expect(note.closest('[role="status"]')).not.toBeNull();
   });
 
   it('still says the companion is thinking about a run it has no view of', () => {

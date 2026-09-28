@@ -183,11 +183,13 @@ export function RunActivity({
           actions={actions}
         />
       )}
-      {live.phase === 'compacting' && (
-        <p className="run-phase" role="status">
-          Compacting earlier messages…
-        </p>
-      )}
+      {/* The status region stays mounted and only its text changes, so a
+       *  screen reader announces the phase when it starts (S3b-E). */}
+      <div role="status">
+        {live.phase === 'compacting' && (
+          <p className="run-phase">Compacting earlier messages…</p>
+        )}
+      </div>
       {live.steps
         .filter((step) => step.text)
         .map((step) => (

@@ -15,6 +15,7 @@ import type { AgentDetail, ChatMessage } from '../lib/types';
 import { AlertIcon, BoltIcon, PulseIcon, SendIcon, StopIcon } from './icons';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ErrorBanner, formatTime } from './ui-bits';
+import { isMacPlatform } from '../lib/platform';
 import {
   buildTranscript,
   type TranscriptActions,
@@ -639,7 +640,6 @@ export function Composer({
             rows={1}
             aria-label={inputLabel}
             aria-autocomplete={commands ? 'list' : undefined}
-            aria-expanded={commands ? menuOpen : undefined}
             aria-controls={menuOpen ? menuId : undefined}
             aria-activedescendant={
               selected ? `${menuId}-${selected.name}` : undefined
@@ -671,7 +671,8 @@ export function Composer({
         <div className="mt-2 flex items-center justify-between px-2 font-mono text-[10px] text-ink-3">
           <span>
             {steerable
-              ? '⏎ queue · ⌘⏎ steer · ⇧⏎ new line'
+              ? // Ctrl+Enter on every non-Mac platform, never ⌘⏎ (S3b-E).
+                `⏎ queue · ${isMacPlatform() ? '⌘⏎' : 'Ctrl+Enter'} steer · ⇧⏎ new line`
               : '⏎ send · ⇧⏎ new line'}
           </span>
           <span>

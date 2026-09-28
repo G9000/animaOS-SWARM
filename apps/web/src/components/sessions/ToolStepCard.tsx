@@ -19,7 +19,7 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
         type="button"
         className="tool-step-toggle"
         aria-expanded={open}
-        aria-controls={resultId}
+        aria-controls={open ? resultId : undefined}
         onClick={() => setOpen((value) => !value)}
       >
         <span className="tool-step-icon" aria-hidden>
@@ -42,6 +42,9 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
           </span>
         )}
       </button>
+      {/* Mounted only while open (a long result is never kept in the DOM),
+       *  so aria-controls above names the region only when it exists
+       *  (S3b-E). */}
       {open && (
         <div id={resultId} className="tool-step-result">
           {step.result === null ? (

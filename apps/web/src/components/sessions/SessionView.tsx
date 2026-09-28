@@ -272,12 +272,16 @@ export function SessionView({
         />
       ) : null}
       {notice}
-      {session?.compactionError ? (
-        <p role="status" className="px-4 pt-3 text-xs text-ink-3">
-          Earlier messages could not be summarized:{' '}
-          {session.compactionError.message}
-        </p>
-      ) : null}
+      {/* Mounted empty and filled when an error arrives, so it is
+       *  announced (S3b-E). */}
+      <div role="status">
+        {session?.compactionError ? (
+          <p className="px-4 pt-3 text-xs text-ink-3">
+            Earlier messages could not be summarized:{' '}
+            {session.compactionError.message}
+          </p>
+        ) : null}
+      </div>
       <MessageList
         agent={conversation}
         items={items}

@@ -111,6 +111,32 @@ describe('RunActivity', () => {
     );
     expect(screen.queryByText('Check in on goals')).not.toBeInTheDocument();
   });
+
+  it('keeps its status region mounted so the compacting phase is announced when it starts (S3b-E)', () => {
+    const run = runFixture('run_p', {
+      status: 'running',
+      startedAtMs: Date.now(),
+    });
+    const { rerender } = render(
+      <RunActivity
+        agentName="Nova"
+        renderMessage={renderMessage}
+        live={emptyLiveRun(run)}
+      />,
+    );
+    const region = screen.getByRole('status');
+    expect(region).toBeEmptyDOMElement();
+
+    rerender(
+      <RunActivity
+        agentName="Nova"
+        renderMessage={renderMessage}
+        live={{ ...emptyLiveRun(run), phase: 'compacting' }}
+      />,
+    );
+    expect(screen.getByRole('status')).toBe(region);
+    expect(region).toHaveTextContent('Compacting earlier messages…');
+  });
 });
 
 describe('ToolBlock', () => {
@@ -130,6 +156,21 @@ describe('ToolBlock', () => {
     await user.click(toggle);
     await user.click(screen.getAllByRole('button', { name: /calculate/ })[0]);
     expect(screen.getByText('Result shortened to 2 KiB.')).toBeVisible();
+  });
+
+  it('names its result region in aria-controls only while the card is open (S3b-E)', async () => {
+    const user = userEvent.setup();
+    render(<ToolBlock steps={[step]} active />);
+
+    const card = screen.getByRole('button', { name: /calculate/ });
+    expect(card).toHaveAttribute('aria-expanded', 'false');
+    expect(card).not.toHaveAttribute('aria-controls');
+
+    await user.click(card);
+    const controlsId = card.getAttribute('aria-controls');
+    expect(controlsId).toBeTruthy();
+    expect(document.getElementById(controlsId!)).toBeInTheDocument();
+    expect(screen.getByText('4')).toBeVisible();
   });
 
   it('opens a helper’s session from its card', async () => {
