@@ -131,7 +131,9 @@ export class DaemonClient {
       body,
     });
 
-    const payload = await readResponseBody(response);
+    const payload = await this.readWithConnectionErrors(path, () =>
+      readResponseBody(response),
+    );
     if (!response.ok) {
       throw new DaemonHttpError(response.status, payload);
     }
@@ -151,10 +153,12 @@ export class DaemonClient {
     if (!response.ok) {
       throw new DaemonHttpError(
         response.status,
-        await readResponseBody(response),
+        await this.readWithConnectionErrors(path, () =>
+          readResponseBody(response),
+        ),
       );
     }
-    return response.text();
+    return this.readWithConnectionErrors(path, () => response.text());
   }
 
   async *subscribe<T = unknown>(
@@ -239,6 +243,23 @@ export class DaemonClient {
   ): Promise<Response> {
     try {
       return await this.fetchImpl(this.url(path), init);
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw error;
+      }
+
+      throw new DaemonConnectionError(this.url(path), error);
+    }
+  }
+
+  /** A body that fails after its headers (the connection dropped midway)
+   *  is a connection error too, not a bare TypeError (T18). */
+  private async readWithConnectionErrors<T>(
+    path: string,
+    read: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await read();
     } catch (error) {
       if (error instanceof Error && error.name === 'AbortError') {
         throw error;
