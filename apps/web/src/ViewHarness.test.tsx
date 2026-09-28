@@ -3144,6 +3144,40 @@ it('coalesces the reads a burst of accepted sends asks for', async () => {
   ]);
 });
 
+it('reads an unlisted open session again when the stream reports it changed', async () => {
+  vi.spyOn(daemon, 'health').mockResolvedValue({ status: 'ok' });
+  vi.spyOn(daemon, 'listAgents').mockResolvedValue({
+    agents: [snapshot('agent-main', 'Nova', 1)],
+  });
+  mockProviders();
+  // An archived session is not listed, so its record is read on its own.
+  const record = sessionFixture('room-9', {
+    title: 'Earlier chat',
+    archived: true,
+  });
+  vi.mocked(daemon.getSession).mockResolvedValue(record);
+  window.history.replaceState(null, '', '/#/s/room-9');
+  const events = scriptedAgentEvents();
+  render(<ViewHarness />);
+  const input = await screen.findByPlaceholderText('Message Nova…');
+  await waitFor(() => expect(input).toBeEnabled());
+  await waitFor(() => expect(events.streams).toHaveLength(1));
+  const stream = events.streams[0];
+  act(() => stream.push(snapshotEvent([])));
+
+  vi.mocked(daemon.getSession).mockResolvedValue({
+    ...record,
+    title: 'Renamed on Telegram',
+    compactionError: { message: 'The model timed out', atMs: 2 },
+  });
+  act(() => stream.push(sessionEvent('session.updated', 'room-9', 2)));
+
+  expect(
+    await screen.findByText(/could not be summarized: The model timed out/),
+  ).toBeVisible();
+  expect(screen.getAllByText('Renamed on Telegram').length).toBeGreaterThan(0);
+});
+
 it('says it is reconnecting when the stream drops', async () => {
   const { stream } = await openLiveSession();
   act(() => stream.push(snapshotEvent([])));

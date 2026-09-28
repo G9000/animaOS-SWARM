@@ -110,6 +110,23 @@ describe('useLiveSession', () => {
     expect(refreshMessages).not.toHaveBeenCalled();
   });
 
+  it('reads the open session’s record again when only it is updated', async () => {
+    const refreshSession = vi.fn();
+    const { events } = setup({ refreshSession });
+    await flush();
+    events.streams[0].push(snapshotEvent([]));
+    await flush(LIVE_REFRESH_DELAY_MS);
+    expect(refreshSession).not.toHaveBeenCalled();
+
+    events.streams[0].push(
+      sessionEvent('session.updated', 'chat:other', 2),
+      sessionEvent('session.updated', 'room-7', 3),
+      sessionEvent('session.updated', 'room-7', 4),
+    );
+    await flush(LIVE_REFRESH_DELAY_MS);
+    expect(refreshSession).toHaveBeenCalledTimes(1);
+  });
+
   it('drops a pending refresh when the view unmounts', async () => {
     const { events, refreshSessions, refreshMessages, unmount } = setup();
     await flush();

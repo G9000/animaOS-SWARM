@@ -21,9 +21,9 @@ import { useSessionLedger, type SessionLedger } from './useSessionRuns';
 /** Live events of one kind settle this long before what they change is read. */
 export const LIVE_REFRESH_DELAY_MS = 150;
 
-type Refresh = 'sessions' | 'messages' | 'runs';
+type Refresh = 'sessions' | 'session' | 'messages' | 'runs';
 /** The refreshes that belong to the open session, not the whole sidebar. */
-const SESSION_REFRESHES: readonly Refresh[] = ['messages', 'runs'];
+const SESSION_REFRESHES: readonly Refresh[] = ['session', 'messages', 'runs'];
 
 export interface LiveSessionTarget {
   agentId: string;
@@ -45,6 +45,9 @@ export interface LiveSessionOptions {
   watchedRunIds?: readonly string[];
   refreshSessions: () => void;
   refreshMessages: () => void;
+  /** Reads the open session's own record again, for one the sidebar does
+   *  not list (S3b-G). */
+  refreshSession?: () => void;
 }
 
 export interface LiveSessionView {
@@ -98,8 +101,9 @@ function clearTimers(timers: Map<Refresh, number>, kinds: readonly Refresh[]) {
 /**
  * The companion's event stream as the open session uses it (spec §6,
  * §15.5): session events refresh the sidebar, message events the open
- * session, and lifecycle events its ledger runs, each after a 150 ms
- * settle; a snapshot or resync refreshes all three. Without the stream
+ * session (and `session.updated` its record), and lifecycle events its
+ * ledger runs, each after a 150 ms settle; a snapshot or resync refreshes
+ * the sidebar, messages and ledger. Without the stream
  * the ledger is read again when the listing's count of active runs moves,
  * and, once per run, when history shows a run the view thinks is still
  * going (or one it waits for).
@@ -113,6 +117,7 @@ export function useLiveSession({
   watchedRunIds = NO_WATCHED,
   refreshSessions,
   refreshMessages,
+  refreshSession,
 }: LiveSessionOptions): LiveSessionView {
   const sessionAgentId = session?.agentId ?? null;
   const sessionId = session?.sessionId ?? null;
@@ -205,6 +210,9 @@ export function useLiveSession({
     )
       refreshSoon('messages', refreshMessages);
     if (lifecycle) refreshSoon('runs', refreshRuns);
+    // Its title, trimmed context and compaction error live on its record.
+    if (event.type === 'session.updated' && refreshSession)
+      refreshSoon('session', refreshSession);
     if (event.type === 'run.completed') announce(key, event.run.id);
   };
   const live = useAgentEvents(agentId, onEvent);

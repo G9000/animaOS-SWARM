@@ -247,6 +247,8 @@ export function ViewHarness() {
   // search) keeps its last known record and is read again on its own.
   const [knownSession, setKnownSession] = useState<Session | null>(null);
   const [sessionReadError, setSessionReadError] = useState<string | null>(null);
+  // Bumped when the stream says the open session changed (S3b-G).
+  const [sessionRereads, setSessionRereads] = useState(0);
   useEffect(() => {
     if (listedSession) setKnownSession(listedSession);
   }, [listedSession]);
@@ -276,7 +278,7 @@ export function ViewHarness() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [routeAgentId, routeSessionId, sessionListed]);
+  }, [routeAgentId, routeSessionId, sessionListed, sessionRereads]);
   const activeSession =
     listedSession ??
     (knownSession &&
@@ -452,6 +454,8 @@ export function ViewHarness() {
     watchedRunIds,
     refreshSessions: () => void refreshSessions(),
     refreshMessages: () => setMessagesRefresh((value) => value + 1),
+    // A listed session is read again with the sidebar.
+    refreshSession: () => setSessionRereads((value) => value + 1),
   });
   useEffect(() => {
     setStreamOpen(live.status === 'open');
