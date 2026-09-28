@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use anima_core::{
     content_retry_key, AgentCommunicationRoute, AgentConfig, AgentConfigUpdate, AgentSettings,
-    AgentState, Content, DataValue, RunControl, TaskResult,
+    AgentState, Content, DataValue, RunControl, TaskResult, TaskStatus,
 };
 use anima_memory::{MemoryType, NewMemory};
 use futures::future::{select, Either};
@@ -1612,13 +1612,22 @@ impl AgentRunCoordinator {
                     // Cancelled first, then dropped (final fix wave S2-H): the
                     // grace lets the runtime keep its partial text and give
                     // each requested tool call its cancelled result, so no
-                    // call is left without one when the helper is reused.
+                    // call is left without one when the helper is reused. If
+                    // the run instead finishes with a success inside the
+                    // grace (residual fix R3), that result is kept as is: the
+                    // parent gets the reply, and no `TaskFailed` is recorded
+                    // over a run the runtime already completed.
                     live_run.control().cancel.cancel();
                     let grace = std::time::Duration::from_millis(HELPER_CANCEL_GRACE_MS);
-                    let _ = tokio::time::timeout(grace, &mut execution).await;
+                    let graced = tokio::time::timeout(grace, &mut execution).await;
                     drop(execution);
-                    runtime.mark_failed("Helper task timed out", timeout_ms);
-                    TaskResult::error("Helper task timed out", timeout_ms)
+                    match graced {
+                        Ok(result) if result.status == TaskStatus::Success => result,
+                        _ => {
+                            runtime.mark_failed("Helper task timed out", timeout_ms);
+                            TaskResult::error("Helper task timed out", timeout_ms)
+                        }
+                    }
                 }
             }
         } else {
@@ -2903,6 +2912,115 @@ mod tests {
             let helper = agents.iter().find(|a| a.state.id != lead.id).unwrap();
             assert_eq!(helper.state.status, AgentStatus::Failed);
             assert!(!coordinator.is_agent_busy(&helper.state.id));
+        }
+    }
+
+    /// Residual fix R3 (scoped re-review of the M3 fix wave): the model call
+    /// itself can answer before the deadline, but the reflection-memory
+    /// evaluator that runs after it (spec: no cancellation checkpoint exists
+    /// past a model call that already answered) can still be mid-flight,
+    /// genuinely blocked, when the deadline elapses. If it then finishes
+    /// inside the S2-H cancel grace, the parent must get that reply, not
+    /// "Helper task timed out", and no failure is recorded over a run the
+    /// runtime already completed.
+    #[tokio::test]
+    async fn a_helper_finishing_inside_the_grace_keeps_its_success_result() {
+        let entered = Arc::new(Semaphore::new(0));
+        let proceed = Arc::new(Semaphore::new(0));
+        let adapter = Arc::new(SignalThenAnswerAdapter {
+            entered: entered.clone(),
+            proceed: proceed.clone(),
+        });
+        let state = Arc::new(RwLock::new(DaemonState::with_model_adapter(adapter)));
+        let coordinator = AgentRunCoordinator::new(state.clone(), Arc::new(Semaphore::new(2)));
+        let mut lead = helper_lead(&coordinator).await;
+        lead.config.settings.as_mut().unwrap().timeout_ms = Some(50);
+        state
+            .write()
+            .await
+            .restore_agent_config(&lead.id, lead.config.clone());
+        let memory = state.read().await.memory_handle();
+
+        let running = {
+            let coordinator = coordinator.clone();
+            let lead = lead.clone();
+            tokio::spawn(async move {
+                execute_helper_tool(&coordinator, &lead, true, "Slow helper").await
+            })
+        };
+        // The helper's provider context (a memory *read*) and its top-of-loop
+        // stop checkpoint have already passed cleanly once the model call is
+        // entered; only now do we take memory's write lock, so it is the
+        // reflection-memory evaluator (run right after the model answers,
+        // with no cancellation checkpoint before its own completion) that
+        // blocks on it, not anything earlier.
+        tokio::time::timeout(Duration::from_secs(3), entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let held = memory.write().await;
+        proceed.add_permits(1);
+        // The 50ms deadline elapses while the evaluator is genuinely stuck on
+        // the held lock; release it well inside the 2s grace.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The tool call itself always "succeeds" by returning a JSON envelope
+        // describing the helper's own run outcome; that envelope is the
+        // signal under test here.
+        let envelope: serde_json::Value =
+            serde_json::from_str(&result.data.unwrap().text).expect("a JSON envelope");
+        assert_eq!(envelope["status"], "success", "envelope: {envelope}");
+        assert!(envelope["error"].is_null(), "envelope: {envelope}");
+        assert_eq!(envelope["result"]["text"], "Helper task completed");
+
+        let helper = state
+            .read()
+            .await
+            .list_agents()
+            .into_iter()
+            .find(|agent| agent.state.id != lead.id)
+            .unwrap();
+        assert_ne!(
+            helper.state.status,
+            AgentStatus::Failed,
+            "a success inside the grace must not be turned into a failure"
+        );
+    }
+
+    /// Signals `entered` as soon as it is called, then waits for the test's
+    /// go-ahead (`proceed`) before answering. Used to grab the memory lock
+    /// only once the model call is genuinely in flight, past the provider
+    /// context read and the top-of-loop stop checkpoint.
+    struct SignalThenAnswerAdapter {
+        entered: Arc<Semaphore>,
+        proceed: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl ModelAdapter for SignalThenAnswerAdapter {
+        fn provider(&self) -> &str {
+            "signal-then-answer"
+        }
+
+        async fn generate(
+            &self,
+            _config: &AgentConfig,
+            _request: &ModelGenerateRequest,
+        ) -> Result<ModelGenerateResponse, String> {
+            self.entered.add_permits(1);
+            self.proceed
+                .acquire()
+                .await
+                .expect("proceed semaphore should remain open")
+                .forget();
+            Ok(model_response("Helper task completed"))
         }
     }
 
