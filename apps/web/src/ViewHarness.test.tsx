@@ -3110,6 +3110,40 @@ it('refreshes the sidebar when the stream reports a session change', async () =>
   ).toBeVisible();
 });
 
+it('coalesces the reads a burst of accepted sends asks for', async () => {
+  const user = userEvent.setup();
+  const { input, stream } = await openLiveSession();
+  act(() => stream.push(snapshotEvent([])));
+  const settle = () =>
+    act(async () => {
+      await new Promise((resolve) =>
+        window.setTimeout(resolve, LIVE_REFRESH_DELAY_MS * 2),
+      );
+    });
+  await settle();
+  const first = deferred<Awaited<ReturnType<typeof daemon.startRun>>>();
+  const startRun = vi.mocked(daemon.startRun);
+  startRun.mockReturnValueOnce(first.promise);
+  for (let index = 1; index <= 8; index += 1)
+    await user.type(input, `Message ${index}{Enter}`);
+  const reads = () => [
+    vi.mocked(daemon.listSessions).mock.calls.length,
+    vi.mocked(daemon.sessionMessages).mock.calls.length,
+    vi.mocked(daemon.sessionRuns).mock.calls.length,
+  ];
+  const before = reads();
+
+  await act(async () =>
+    first.resolve(acceptedRun('agent-main', 'room-7', 'Message 1')),
+  );
+  await waitFor(() => expect(startRun).toHaveBeenCalledTimes(8));
+  await settle();
+  // One read of each kind once the burst settles: 3, not 24.
+  expect(reads().map((count, index) => count - before[index])).toEqual([
+    1, 1, 1,
+  ]);
+});
+
 it('says it is reconnecting when the stream drops', async () => {
   const { stream } = await openLiveSession();
   act(() => stream.push(snapshotEvent([])));

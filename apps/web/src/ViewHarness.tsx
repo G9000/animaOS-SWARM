@@ -395,7 +395,8 @@ export function ViewHarness() {
         });
       // Its row shows at once, not only once the stream or ledger has it.
       if (!result.steer) live.seedRun(result.run);
-      refreshConversation();
+      // A burst of sends settles into one read of each kind (S3b-F).
+      live.refreshAllSoon();
     },
     onFailed: (item, caught) => {
       if (!availableAgentIdsRef.current.has(item.agentId)) return;
@@ -774,12 +775,6 @@ export function ViewHarness() {
         setResetting(false);
       }
     }
-  };
-
-  const refreshConversation = () => {
-    setMessagesRefresh((value) => value + 1);
-    live.refreshRuns();
-    void sessions.refresh();
   };
 
   /** Hands a message to the send queue (spec §4.2): retried with its key,

@@ -67,6 +67,9 @@ export interface LiveSessionView {
   ledger: SessionLedger;
   /** Reads the open session's ledger again. */
   refreshRuns: () => void;
+  /** Reads the sidebar, the open session's messages and its ledger again
+   *  once a burst settles, as a stream event's refreshes do (S3b-F). */
+  refreshAllSoon: () => void;
   /** Shows a run the daemon just accepted into the open session until the
    *  stream or a later ledger read has it. */
   seedRun: (run: Run) => void;
@@ -172,12 +175,16 @@ export function useLiveSession({
     }));
   };
 
+  const refreshAllSoon = () => {
+    refreshSoon('sessions', refreshSessions);
+    refreshSoon('messages', refreshMessages);
+    refreshSoon('runs', refreshRuns);
+  };
+
   const onEvent = (event: AgentEvent) => {
     if (event.type === 'stream.snapshot' || event.type === 'stream.resync') {
       // A new stream, or one that fell behind: read again what is shown.
-      refreshSoon('sessions', refreshSessions);
-      refreshSoon('messages', refreshMessages);
-      refreshSoon('runs', refreshRuns);
+      refreshAllSoon();
       return;
     }
     const lifecycle = isRunLifecycleEvent(event);
@@ -312,6 +319,7 @@ export function useLiveSession({
     announcement: announced && announced.key === key ? announced.text : '',
     ledger,
     refreshRuns,
+    refreshAllSoon,
     seedRun,
   };
 }
